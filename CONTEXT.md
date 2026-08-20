@@ -68,3 +68,14 @@ _Avoid_: Automatic test update, test fixing, diff checking
 Framing proposed code diffs, repository agent files, and task instructions strictly as untrusted data inputs within immutable coordinator-compiled prompts, preventing prompt injection or policy subversion.
 _Avoid_: Direct prompt concatenation, prompt inclusion, template merging
 
+**Passed attestation**:
+An immutable, portable proof manifest binding all stage evidence hashes and policy versions to the delivered commit SHA via a Merkle root.
+_Avoid_: Passed badge, CI summary, merge certificate
+
+**Stage evidence**:
+Deterministically captured, content-hashed logs, outputs, and findings proving execution of a specific validation stage against an exact candidate commit OID.
+_Avoid_: Step logs, task output, console dump
+
+**Attestation provenance**:
+The cryptographic and ledger linkage tying each verification artifact to the exact candidate commit OID, base commit OID, stage round, and worker identity.
+_Avoid_: Run metadata, artifact tracking
