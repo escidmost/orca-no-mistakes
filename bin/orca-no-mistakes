@@ -1,0 +1,8 @@
+#!/usr/bin/env node
+
+import { main } from '../scripts/orca-no-mistakes.ts'
+
+main(process.argv.slice(2)).catch((error) => {
+  console.error(error instanceof Error ? error.message : String(error))
+  process.exitCode = 1
+})
