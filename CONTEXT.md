@@ -79,3 +79,11 @@ _Avoid_: Step logs, task output, console dump
 **Attestation provenance**:
 The cryptographic and ledger linkage tying each verification artifact to the exact candidate commit OID, base commit OID, stage round, and worker identity.
 _Avoid_: Run metadata, artifact tracking
+
+**Checks-passed**:
+An intermediate, non-terminal pipeline milestone proving that local validation and remote CI on the candidate commit OID are complete and green, signalling readiness for merge.
+_Avoid_: Ready to merge, green, pre-pass
+
+**Delivery proof**:
+Authoritative forge API facts confirming that the exact candidate commit was merged into the target base branch under non-bypass policy.
+_Avoid_: Merge receipt, push log, landed confirmation
