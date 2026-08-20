@@ -23,3 +23,11 @@ _Avoid_: Phase, priority bucket
 **Proposed change**:
 The exact submitted Git ref and commit set being considered for validation and delivery.
 _Avoid_: Current branch, working tree, HEAD
+
+**Adapter validation ledger**:
+A repository-scoped persistent database storing semantic leases, gate resolver provenance, findings overrides, and commit-bound Passed attestations.
+_Avoid_: Run cache, state file, log database
+
+**Semantic lease**:
+An adapter-managed single-occupancy lease over a repository branch preventing concurrent pipeline validation collisions.
+_Avoid_: File lock, worker mutex, process lock

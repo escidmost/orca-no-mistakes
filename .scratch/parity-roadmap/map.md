@@ -22,6 +22,8 @@ An Orca-native replacement is accepted only after comparing how much authority, 
 
 - [Find Orca's Native Guarantee Boundary](https://linear.app/escidmore/issue/ONM-5/find-orcas-native-guarantee-boundary): Orca owns durable orchestration custody; this project must own exact Git change, policy, and Passed evidence, with generic occupancy and provenance gaps considered for Orca upstream.
 - [Find GitHub's Authoritative PR and CI Proof Surface](https://linear.app/escidmore/issue/ONM-10/find-githubs-authoritative-pr-and-ci-proof-surface): Authoritative proof requires reconciled commit-bound API facts and a guarded non-bypass transition; webhooks and worker claims are wakeups or analysis, not evidence.
+- [Choose the Orca Upstream Dependency Boundary](https://linear.app/escidmore/issue/ONM-8/choose-the-orca-upstream-dependency-boundary): Parity releases do not block on upstream Orca releases; core safety invariants are maintained via an adapter SQLite ledger, with generic occupancy, resolver provenance, and audit gaps tracked as author-contributed Orca upstream PRs.
+
 
 ## Not yet specified
 
