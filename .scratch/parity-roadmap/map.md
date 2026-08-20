@@ -28,10 +28,10 @@ An Orca-native replacement is accepted only after comparing how much authority, 
 - [Choose Evidence and Attestation Provenance](https://linear.app/escidmore/issue/ONM-7/choose-evidence-and-attestation-provenance): Raw stage logs and execution telemetry are retained locally in the SQLite domain ledger and filesystem artifact store, bound cryptographically to exact candidate commit SHAs, stage rounds, and worker identities. The coordinator publishes an immutable Passed Attestation manifest with a Merkle proof root to GitHub via a single sticky collapsible PR comment, and retains evidence indefinitely until explicit operator pruning.
 - [Define the Proof Carried by Passed](https://linear.app/escidmore/issue/ONM-12/define-the-proof-carried-by-passed): Passed is a deterministic Merkle attestation of exit-code-zero validation, 0 unaddressed findings/signed waivers, base policy provenance, dual-anchored CI completeness, and GitHub API-proven non-bypass delivery.
 - [Choose the Orca Upstream Dependency Boundary](https://linear.app/escidmore/issue/ONM-8/choose-the-orca-upstream-dependency-boundary): Parity releases do not block on upstream Orca releases; core safety invariants are maintained via an adapter SQLite ledger, with generic occupancy, resolver provenance, and audit gaps tracked as author-contributed Orca upstream PRs.
+- [Draw the Shippable Parity Releases](https://linear.app/escidmore/issue/ONM-4/draw-the-shippable-parity-releases): Ship Local Adversarial Validation Core, Guarded Remote Delivery and Branch Custody, Authoritative PR/CI Proof and Guarded Merge, then Resilient Coordinator Recovery and Custody Sync; each release requires live adversarial Git and Orca evidence.
 
 ## Not yet specified
 
-- The final number, names, and boundaries of releases depend on the custody, policy, recovery, and provider-proof decisions.
 - The migration path from the current prototype depends on the chosen authoritative custody and coordinator-recovery models.
 - The provider interface beyond GitHub depends on what the first deterministic GitHub integration proves reusable.
 - The exact migration sequence from synchronous hooks to durable submission depends on the custody and recovery decisions.

@@ -22,4 +22,4 @@ Which identified generic gaps should become Orca upstream changes, which need sa
   5. Headless / disconnected control-plane durability for SSH environments.
 - **Version Gating**: The adapter enforces an Orca CLI minimum version fence (`>= 1.4.185`) and probes capabilities fail-closed at startup.
 
-Documented in ADR: `docs/adr/0002-orca-upstream-dependency-boundary.md`
+Documented in ADR: `docs/adr/0009-orca-upstream-dependency-boundary.md`

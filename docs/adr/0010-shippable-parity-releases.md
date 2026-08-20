@@ -1,4 +1,4 @@
-# 0001: Four Shippable Parity Releases
+# 0010: Four Shippable Parity Releases
 
 To restore the original meaning of Passed without compromising safety or blocking on unresolved remote proofs, we divide the delivery of Orca No-Mistakes into four independently shippable parity releases: Local Validation Core, Guarded Push Delivery, Authoritative CI Proof & Merge, and Resilient Recovery & Custody Synchronization.
 
