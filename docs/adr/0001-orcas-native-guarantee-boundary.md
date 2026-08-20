@@ -1,20 +1,27 @@
 # Orca Native Guarantee Boundary
 
-Orca provides the authoritative runtime for durable runs, task dispatch, mailbox delivery, worker lifecycle, and decision-gate mechanics. We decided that `orca-no-mistakes` will not reimplement a standalone daemon, supervisor, or worktree manager, but will instead operate as a domain ledger and policy coordinator layered directly over Orca. The adapter relies on Orca workspaces with branch-level single-occupancy leases, maintains gate resolver provenance in a local SQLite ledger, and reconciles Git custody via preserved recovery refs.
-
 ## Status
 
 Accepted
 
+## Context
+
+Orca provides durable orchestration without understanding Git custody, repository policy, or the evidence required for Passed. Reimplementing Orca's scheduler and worker lifecycle would create a duplicate, weaker authority, while relying on Orca alone would leave the domain guarantees unowned.
+
+## Decision
+
+Orca is authoritative for Runs, Tasks, Dispatches, mailbox delivery, worker questions and replies, decision gates, lifecycle stops, terminal release, and worker recovery. `orca-no-mistakes` owns the domain ledger for the exact proposed change, repository and branch semantic leases, exact-commit worktree custody, trusted policy execution, Git reconciliation after failure or cancellation, delivery evidence, and the final commit-bound Passed attestation.
+
 ## Considered Options
 
-- **Custom Standalone Daemon**: Rebuild no-mistakes' original daemon, process supervisor, and worktree isolation layer inside the adapter. Rejected because Orca's native run and dispatch primitives already provide durable lifecycle guarantees, and duplicating them creates split authority.
-- **Upstream Orca Enhancements**: Propose atomic worktree leasing and gate provenance schema changes directly to Orca core before shipping. Rejected in favor of keeping all guarantee mechanisms self-contained within the adapter ledger to maintain independence.
-- **Adapter Domain Ledger over Orca**: Use Orca natively for task dispatch and decision gates while the adapter manages branch occupancy, Git custody, gate audit provenance, and Passed attestations. Accepted.
+- **Custom standalone daemon**: rejected because Orca already provides durable orchestration and worker lifecycle management.
+- **Rely on Orca for Git custody and Passed proof**: rejected because Orca is intentionally unaware of Git and forge policy.
+- **Block on upstream Orca enhancements**: rejected; generic enhancements may land asynchronously, while the adapter must provide its safety guarantees immediately.
+- **Adapter domain ledger over Orca**: accepted.
 
 ## Consequences
 
-- The adapter eliminates daemon management overhead and leverages Orca's native lifecycle and crash resilience.
-- Concurrent validation runs on the same branch or repository will be rejected at the adapter boundary rather than isolated into parallel worktrees.
-- All gate provenance, finding history, and final Passed evidence are recorded in a dedicated local SQLite database managed by the adapter.
-- Aborted or failed runs with unmerged pipeline modifications are safely anchored under `refs/no-mistakes/recover/<run_id>` for user recovery.
+- The adapter does not implement its own task scheduler, worker daemon, or terminal supervisor.
+- Concurrent validation runs on the same repository branch are rejected through adapter-owned semantic leases.
+- Gate provenance, finding history, commit checkpoints, and Passed evidence are recorded in the adapter's SQLite domain ledger.
+- Unmerged pipeline commits from failed or cancelled runs are anchored under recovery refs for deterministic custody recovery.
