@@ -51,3 +51,20 @@ _Avoid_: All green, CI complete, checks passed
 **Delivered tree integrity**:
 The post-delivery proof confirming that the commit on the target base branch preserves the exact tree and ancestry of the tested candidate change.
 _Avoid_: Merged cleanly, landed successfully
+
+**Trusted validation policy**:
+The invariant rules, reviewer prompts, agent execution constraints, and CI requirements sourced from the trusted base commit that cannot be modified or bypassed by an untrusted proposed change.
+_Avoid_: Local config, test settings, branch policy
+
+**Guarded policy evolution**:
+The model permitting a proposed change to add tests, modify project configurations, and update documentation while subjecting all policy relaxations and test modifications to adversarial intent reconciliation and human gating.
+_Avoid_: Free config editing, static policy locking, unconstrained config
+
+**Intent reconciliation**:
+Adversarial verification confirming that every modification or deletion of existing tests, configurations, or validation constraints in a proposed change is explicitly justified by the user's declared intent.
+_Avoid_: Automatic test update, test fixing, diff checking
+
+**Untrusted data framing**:
+Framing proposed code diffs, repository agent files, and task instructions strictly as untrusted data inputs within immutable coordinator-compiled prompts, preventing prompt injection or policy subversion.
+_Avoid_: Direct prompt concatenation, prompt inclusion, template merging
+
