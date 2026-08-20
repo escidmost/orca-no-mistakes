@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from 'node:child_process'
-import { chmod, mkdir, readFile, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -103,7 +103,20 @@ export async function runPipeline(
 
   const repo = await git.assertReady()
   const runId = await orca.createRun(`no-mistakes: ${intent}`)
-  const evidenceDir = path.join(homedir(), '.orca-no-mistakes', 'evidence', runId)
+  const evidenceBase = path.join(homedir(), '.orca-no-mistakes', 'evidence')
+  const evidenceDir = path.resolve(evidenceBase, runId)
+  if (!runId.trim() || !isWithin(evidenceBase, evidenceDir)) {
+    throw new Error('Orca returned an unsafe Run ID')
+  }
+  await mkdir(evidenceBase, { recursive: true })
+  await mkdir(evidenceDir, { recursive: true })
+  const [canonicalEvidenceBase, canonicalEvidenceDir] = await Promise.all([
+    realpath(evidenceBase),
+    realpath(evidenceDir)
+  ])
+  if (!isWithin(canonicalEvidenceBase, canonicalEvidenceDir)) {
+    throw new Error('Orca returned an unsafe Run ID')
+  }
   const stageTasks = new Map<StageName, string>()
   let previousTask: string | undefined
   let retainedFixer: WorkerResult | undefined
@@ -121,9 +134,15 @@ export async function runPipeline(
   try {
     for (const stage of PIPELINE_STEPS) {
       const taskId = stageTasks.get(stage)!
-      await orca.setWorktreeStatus(`no-mistakes ${stage} (${stageIndex(stage)}/9)`, 'in-progress')
+      await orca.setWorktreeStatus(
+        `no-mistakes ${stage} (${stageIndex(stage)}/${PIPELINE_STEPS.length})`,
+        'in-progress'
+      )
       let round = 0
-      let report = await executeStage(stage, round, taskId, intent, evidenceDir, repo, orca, git)
+      let attempt = 0
+      const runStage = async () =>
+        await executeStage(stage, attempt++, taskId, intent, evidenceDir, repo, orca, git)
+      let report = await runStage()
 
       while (actionableFindings(report).length > 0) {
         const actionable = actionableFindings(report)
@@ -133,18 +152,19 @@ export async function runPipeline(
 
         if (asksUser) {
           const deliveryStage = stage === 'push' || stage === 'pr' || stage === 'ci'
+          const gateOptions = deliveryStage ? ['retry', 'stop'] : ['approve', 'fix', 'skip', 'stop']
           const gateId = await orca.createGate(
             taskId,
-            gateQuestion(stage, report),
-            deliveryStage ? ['retry', 'stop'] : ['approve', 'fix', 'skip', 'stop']
+            gateQuestion(stage, report, gateOptions),
+            gateOptions
           )
           const resolution = (await orca.waitForGate(gateId)).trim()
-          const decision = resolution.toLowerCase().split(/\s|:/, 1)[0]
+          const decision = gateDecision(resolution)
           if (!deliveryStage && (decision === 'approve' || decision === 'skip')) {
             break
           }
           if (deliveryStage && decision === 'retry') {
-            report = await executeStage(stage, round, taskId, intent, evidenceDir, repo, orca, git)
+            report = await runStage()
             continue
           } else if (!deliveryStage && decision === 'fix') {
             shouldFix = true
@@ -162,7 +182,7 @@ export async function runPipeline(
         }
 
         round += 1
-        retainedFixer = await runFixer(
+        const nextFixer = await runFixer(
           stage,
           round,
           taskId,
@@ -174,10 +194,14 @@ export async function runPipeline(
           orca,
           git
         )
+        if (retainedFixer) {
+          await orca.finishWorker(retainedFixer, 'release')
+        }
+        retainedFixer = nextFixer
         if (stage === 'pr' || stage === 'ci') {
           await repushAfterDeliveryFix(stage, taskId, repo.branch, orca, git)
         }
-        report = await executeStage(stage, round, taskId, intent, evidenceDir, repo, orca, git)
+        report = await runStage()
       }
 
       await orca.completeTask(taskId, report)
@@ -187,7 +211,7 @@ export async function runPipeline(
       await orca.finishWorker(retainedFixer, 'release')
       retainedFixer = undefined
     }
-    await orca.setWorktreeStatus('no-mistakes passed all 9 stages', 'completed')
+    await orca.setWorktreeStatus(`no-mistakes passed all ${PIPELINE_STEPS.length} stages`, 'completed')
     return { runId, steps: PIPELINE_STEPS }
   } catch (error) {
     if (retainedFixer) {
@@ -201,7 +225,7 @@ export async function runPipeline(
 
 async function executeStage(
   stage: StageName,
-  round: number,
+  attempt: number,
   taskId: string,
   intent: string,
   evidenceDir: string,
@@ -218,12 +242,12 @@ async function executeStage(
   if (stage === 'push') {
     return await git.push(repo.branch)
   }
-  return await runReviewer(stage, round, taskId, intent, evidenceDir, repo, orca)
+  return await runReviewer(stage, attempt, taskId, intent, evidenceDir, repo, orca)
 }
 
 async function runReviewer(
   stage: StageName,
-  round: number,
+  attempt: number,
   parentTask: string,
   intent: string,
   evidenceDir: string,
@@ -234,20 +258,20 @@ async function runReviewer(
     stage,
     intent,
     repo,
-    path.join(evidenceDir, `${stage}-${round + 1}.json`)
+    path.join(evidenceDir, `${stage}-${attempt + 1}.json`)
   )
-  const childTask = await orca.createTask(`[${stage} check ${round + 1}]\n${prompt}`, {
+  const childTask = await orca.createTask(`[${stage} check ${attempt + 1}]\n${prompt}`, {
     parent: parentTask
   })
   const worker = await orca.startWorker(childTask, {
-    name: `no-mistakes-${stage}-${round + 1}`,
+    name: `no-mistakes-${stage}-${attempt + 1}`,
     prompt,
     role: 'reviewer',
     stage,
     worktree: 'new-child'
   })
   try {
-    return validateReport(worker.report, stage)
+    return await validateReport(worker.report, stage, evidenceDir)
   } finally {
     await orca.finishWorker(worker, 'release')
     if (worker.worktreeId) {
@@ -283,7 +307,7 @@ async function runFixer(
     worktree: 'current'
   })
   try {
-    validateReport(worker.report, stage)
+    await validateReport(worker.report, stage, path.dirname(reportPath))
     await git.assertClean()
     const after = await git.head()
     if (before === after) {
@@ -307,13 +331,14 @@ async function repushAfterDeliveryFix(
   for (;;) {
     const report = await git.push(branch)
     if (actionableFindings(report).length === 0) return
+    const gateOptions = ['retry', 'stop']
     const gateId = await orca.createGate(
       taskId,
-      `${stage} produced a new commit, but repush failed. Resolve with retry or stop. ${gateQuestion('push', report)}`,
-      ['retry', 'stop']
+      `${stage} produced a new commit, but repush failed. ${gateQuestion('push', report, gateOptions)}`,
+      gateOptions
     )
-    const resolution = (await orca.waitForGate(gateId)).trim().toLowerCase()
-    if (resolution !== 'retry') {
+    const resolution = (await orca.waitForGate(gateId)).trim()
+    if (gateDecision(resolution) !== 'retry') {
       throw new Error(`${stage} repush stopped the pipeline: ${resolution}`)
     }
   }
@@ -323,7 +348,11 @@ function actionableFindings(report: StageReport): Finding[] {
   return report.findings.filter((finding) => finding.action !== 'no-op')
 }
 
-function validateReport(report: StageReport, stage: StageName): StageReport {
+async function validateReport(
+  report: StageReport,
+  stage: StageName,
+  evidenceRoot: string
+): Promise<StageReport> {
   if (
     !report ||
     !Array.isArray(report.findings) ||
@@ -349,6 +378,24 @@ function validateReport(report: StageReport, stage: StageName): StageReport {
       throw new Error(`${stage} worker returned an invalid finding`)
     }
   }
+  const artifacts = report.artifacts ?? []
+  const canonicalEvidenceRoot = artifacts.length > 0 ? await realpath(evidenceRoot) : evidenceRoot
+  for (const artifact of artifacts) {
+    const resolved = path.resolve(evidenceRoot, artifact)
+    if (!isWithin(evidenceRoot, resolved)) {
+      throw new Error(`${stage} worker returned an unsafe artifact path`)
+    }
+    let canonicalArtifact: string
+    try {
+      await stat(resolved)
+      canonicalArtifact = await realpath(resolved)
+    } catch {
+      throw new Error(`${stage} worker returned a missing artifact`)
+    }
+    if (!isWithin(canonicalEvidenceRoot, canonicalArtifact)) {
+      throw new Error(`${stage} worker returned an unsafe artifact path`)
+    }
+  }
   return report
 }
 
@@ -361,7 +408,7 @@ function stageIndex(stage: StageName): number {
 }
 
 function stageTaskSpec(stage: StageName, intent: string): string {
-  return `[${stage}] no-mistakes stage ${stageIndex(stage)}/9. Intent: ${intent}`
+  return `[${stage}] no-mistakes stage ${stageIndex(stage)}/${PIPELINE_STEPS.length}. Intent: ${intent}`
 }
 
 function checkerBrief(stage: StageName): string {
@@ -415,8 +462,13 @@ Fix all listed findings without changing unrelated behavior. Run one focused ver
 Write {"findings":[],"summary":"what was fixed and committed","tested":["focused command"]} to ${reportPath}, creating its parent directory if needed. Then report exactly once with worker_done: keep --body to the required three-sentence executive summary and pass --report-path ${reportPath}.`
 }
 
-function gateQuestion(stage: StageName, report: StageReport): string {
-  return `${stage} needs a human decision. Resolve with approve, skip, fix[: guidance], or stop. Findings: ${JSON.stringify(actionableFindings(report))}`
+function gateQuestion(stage: StageName, report: StageReport, options: string[]): string {
+  const choices = options.map((option) => (option === 'fix' ? 'fix[: guidance]' : option)).join(', ')
+  return `${stage} needs a human decision. Resolve with ${choices}. Findings: ${JSON.stringify(actionableFindings(report))}`
+}
+
+function gateDecision(resolution: string): string {
+  return resolution.trim().toLowerCase().split(/[\s:]/, 1)[0]
 }
 
 type CommandResult = { code: number; stderr: string; stdout: string }
@@ -425,10 +477,16 @@ async function command(
   executable: string,
   args: string[],
   cwd: string,
-  options: { allowFailure?: boolean } = {}
+  options: { allowFailure?: boolean; timeoutMs?: number } = {}
 ): Promise<CommandResult> {
   return await new Promise((resolve, reject) => {
     const child = spawn(executable, args, { cwd, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] })
+    const timeoutMs = options.timeoutMs ?? 120_000
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      child.kill('SIGKILL')
+    }, timeoutMs)
     let stdout = ''
     let stderr = ''
     child.stdout.setEncoding('utf8').on('data', (chunk: string) => {
@@ -437,8 +495,21 @@ async function command(
     child.stderr.setEncoding('utf8').on('data', (chunk: string) => {
       stderr += chunk
     })
-    child.on('error', reject)
+    child.on('error', (error) => {
+      clearTimeout(timer)
+      reject(error)
+    })
     child.on('close', (code) => {
+      clearTimeout(timer)
+      if (timedOut) {
+        const message = `${executable} ${args.slice(0, 2).join(' ')} timed out after ${timeoutMs}ms`
+        if (options.allowFailure) {
+          resolve({ code: 124, stdout, stderr: `${stderr}${stderr ? '\n' : ''}${message}` })
+        } else {
+          reject(new Error(message))
+        }
+        return
+      }
       if (code === 0 || options.allowFailure) {
         resolve({ code: code ?? 1, stdout, stderr })
       } else {
@@ -572,6 +643,7 @@ export class CliOrca implements OrcaOperations {
         ...(this.#runId ? ['--run', this.#runId] : []),
         '--json'
       ])
+      worker.deliveryId = undefined
     }
   }
 
@@ -675,7 +747,7 @@ export class CliOrca implements OrcaOperations {
           error: result.cancelled ? 'orchestration wait was cancelled' : 'orchestration connection was lost'
         }
       }
-      if (!Array.isArray(result.messages)) {
+      if (!Array.isArray(result.messages) || result.messages.length === 0) {
         return { deliveryId: result.deliveryId, error: 'orchestration check returned no messages' }
       }
       for (const message of result.messages) {
@@ -689,7 +761,10 @@ export class CliOrca implements OrcaOperations {
           return { deliveryId: result.deliveryId, error: `worker ${dispatchId} returned invalid metadata` }
         }
         if (payload.dispatchId !== dispatchId) {
-          throw new Error(`unexpected orchestration message while waiting for ${dispatchId}`)
+          return {
+            deliveryId: result.deliveryId,
+            error: `unexpected orchestration message while waiting for ${dispatchId}`
+          }
         }
         if (message.type !== 'worker_done') {
           return {
@@ -709,13 +784,25 @@ export class CliOrca implements OrcaOperations {
         if (typeof payload.reportPath !== 'string') {
           return { deliveryId: result.deliveryId, error: `worker ${dispatchId} returned no report path` }
         }
-        const reportPath = path.resolve(payload.reportPath)
-        const evidenceRoot = path.join(homedir(), '.orca-no-mistakes', 'evidence')
-        const relative = path.relative(evidenceRoot, reportPath)
-        if (relative.startsWith('..') || path.isAbsolute(relative)) {
+        const requestedReportPath = path.resolve(payload.reportPath)
+        const evidenceBase = path.join(homedir(), '.orca-no-mistakes', 'evidence')
+        const evidenceRoot = this.#runId ? path.resolve(evidenceBase, this.#runId) : undefined
+        if (
+          !evidenceRoot ||
+          !isWithin(evidenceBase, evidenceRoot) ||
+          !isWithin(evidenceRoot, requestedReportPath)
+        ) {
           return { deliveryId: result.deliveryId, error: `worker ${dispatchId} used an unsafe report path` }
         }
         try {
+          const [canonicalBase, canonicalRoot, reportPath] = await Promise.all([
+            realpath(evidenceBase),
+            realpath(evidenceRoot),
+            realpath(requestedReportPath)
+          ])
+          if (!isWithin(canonicalBase, canonicalRoot) || !isWithin(canonicalRoot, reportPath)) {
+            return { deliveryId: result.deliveryId, error: `worker ${dispatchId} used an unsafe report path` }
+          }
           const report = JSON.parse(await readFile(reportPath, 'utf8')) as StageReport
           return { deliveryId: result.deliveryId, report }
         } catch (error) {
@@ -758,12 +845,25 @@ export class CliOrca implements OrcaOperations {
   }
 
   async #json<T = unknown>(args: string[], acceptFailure = false): Promise<T> {
-    const result = await command(this.#command, args, this.#cwd, { allowFailure: acceptFailure })
+    const result = await command(this.#command, args, this.#cwd, {
+      allowFailure: acceptFailure,
+      timeoutMs: args.includes('--wait') ? 910_000 : undefined
+    })
     if (result.code !== 0 && !result.stdout.trim()) {
       throw new Error(result.stderr.trim() || `${this.#command} failed with exit ${result.code}`)
     }
-    return unwrapJson<T>(result.stdout)
+    try {
+      return unwrapJson<T>(result.stdout)
+    } catch {
+      const detail = result.stderr.trim() || result.stdout.trim() || 'empty output'
+      throw new Error(`${this.#command} ${args.slice(0, 2).join(' ')} returned invalid JSON: ${detail}`)
+    }
   }
+}
+
+function isWithin(root: string, target: string): boolean {
+  const relative = path.relative(path.resolve(root), path.resolve(target))
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))
 }
 
 type GitShellOptions = { base?: string; expectedHead?: string; repo: string }
@@ -889,7 +989,11 @@ export async function installGitGate(options: InstallOptions): Promise<string> {
   const hook = `#!/bin/sh
 set -u
 unset $(git rev-parse --local-env-vars)
-while read oldrev newrev refname; do
+while read -r oldrev newrev refname; do
+  case "$newrev" in
+    *[!0]*) ;;
+    *) continue ;;
+  esac
   case "$refname" in
     refs/heads/*)
       intent=\${ORCA_NO_MISTAKES_INTENT:-$(git -C ${shellQuote(repo)} config --get orca-no-mistakes.intent 2>/dev/null || true)}
@@ -910,20 +1014,53 @@ function shellQuote(value: string): string {
 
 type CliFlags = Record<string, string | boolean>
 
+const BOOLEAN_FLAGS = new Set(['force'])
+const VALUE_FLAGS = new Set([
+  'base',
+  'fixer-effort',
+  'fixer-model',
+  'head',
+  'intent',
+  'max-fix-rounds',
+  'repo',
+  'reviewer-model'
+])
+const COMMAND_FLAGS: Record<string, Set<string>> = {
+  install: new Set(['force', 'intent', 'repo']),
+  run: new Set([
+    'base',
+    'fixer-effort',
+    'fixer-model',
+    'head',
+    'intent',
+    'max-fix-rounds',
+    'repo',
+    'reviewer-model'
+  ])
+}
+
 function parseCli(argv: string[]): { command: string; flags: CliFlags } {
   const [subcommand = 'run', ...rest] = argv
+  const allowedFlags = COMMAND_FLAGS[subcommand]
+  if (!allowedFlags) throw new Error(`unknown command: ${subcommand}`)
   const flags: CliFlags = {}
   for (let index = 0; index < rest.length; index += 1) {
     const arg = rest[index]
     if (!arg.startsWith('--')) throw new Error(`unexpected argument: ${arg}`)
-    const name = arg.slice(2)
-    const next = rest[index + 1]
-    if (!next || next.startsWith('--')) {
+    const equals = arg.indexOf('=')
+    const name = arg.slice(2, equals < 0 ? undefined : equals)
+    const inlineValue = equals < 0 ? undefined : arg.slice(equals + 1)
+    if (!allowedFlags.has(name)) throw new Error(`--${name} is not valid for ${subcommand}`)
+    if (BOOLEAN_FLAGS.has(name)) {
+      if (inlineValue !== undefined) throw new Error(`--${name} does not take a value`)
       flags[name] = true
-    } else {
-      flags[name] = next
-      index += 1
+      continue
     }
+    if (!VALUE_FLAGS.has(name)) throw new Error(`unknown flag: --${name}`)
+    const value = inlineValue ?? rest[index + 1]
+    if (!value || value.startsWith('--')) throw new Error(`--${name} requires a value`)
+    flags[name] = value
+    if (inlineValue === undefined) index += 1
   }
   return { command: subcommand, flags }
 }

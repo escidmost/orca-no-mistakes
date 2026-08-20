@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 
@@ -10,6 +11,7 @@ import {
   GitShell,
   PIPELINE_STEPS,
   installGitGate,
+  main,
   runPipeline,
   type Finding,
   type GitOperations,
@@ -59,6 +61,8 @@ class FakeOrca implements OrcaOperations {
   readonly calls: string[] = []
   readonly tasks: { deps: string[]; id: string; parent?: string; spec: string }[] = []
   readonly launches: WorkerLaunch[] = []
+  readonly fixerDispatches: string[] = []
+  readonly gates: { options: string[]; question: string }[] = []
   readonly completedStages: string[] = []
   readonly removedWorktrees: string[] = []
   readonly reports = new Map<string, StageReport[]>()
@@ -66,14 +70,16 @@ class FakeOrca implements OrcaOperations {
   #taskNumber = 0
   #dispatchNumber = 0
   #git: FakeGit
+  #runId: string
 
-  constructor(git: FakeGit) {
+  constructor(git: FakeGit, runId = `test-run-${randomUUID()}`) {
     this.#git = git
+    this.#runId = runId
   }
 
   async createRun(objective: string): Promise<string> {
     this.calls.push(`run:${objective}`)
-    return 'run-1'
+    return this.#runId
   }
 
   async createTask(spec: string, options: { deps?: string[]; parent?: string } = {}): Promise<string> {
@@ -90,6 +96,7 @@ class FakeOrca implements OrcaOperations {
     const report = reports.shift() ?? pass(stage)
     this.reports.set(stage, reports)
     if (launch.role === 'fixer') {
+      this.fixerDispatches.push(dispatchId)
       this.#git.advanceHead()
     }
     return {
@@ -120,7 +127,8 @@ class FakeOrca implements OrcaOperations {
     this.calls.push(`complete:${taskId}:${report.summary}`)
   }
 
-  async createGate(taskId: string, question: string): Promise<string> {
+  async createGate(taskId: string, question: string, options: string[]): Promise<string> {
+    this.gates.push({ options, question })
     this.calls.push(`gate:${taskId}:${question}`)
     return 'gate-1'
   }
@@ -173,12 +181,12 @@ test('runs the nine-stage adversarial pipeline with fixes, gates, and isolation'
     git
   )
 
-  assert.equal(result.runId, 'run-1')
+  assert.match(result.runId, /^test-run-/)
   assert.deepEqual(result.steps, PIPELINE_STEPS)
   assert.deepEqual(orca.completedStages, PIPELINE_STEPS)
 
   const stageTasks = orca.tasks.slice(0, PIPELINE_STEPS.length)
-  assert.equal(stageTasks.length, 9)
+  assert.equal(stageTasks.length, PIPELINE_STEPS.length)
   assert.deepEqual(stageTasks[0].deps, [])
   for (let index = 1; index < stageTasks.length; index += 1) {
     assert.deepEqual(stageTasks[index].deps, [stageTasks[index - 1].id])
@@ -197,6 +205,10 @@ test('runs the nine-stage adversarial pipeline with fixes, gates, and isolation'
   assert.equal(fixerLaunches[0].worktree, 'current')
   assert.equal(fixerLaunches[1].terminal, 'term-fixer')
   assert.equal(fixerLaunches[2].terminal, 'term-fixer')
+  assert.ok(
+    orca.fixerDispatches.every((dispatchId) => orca.calls.includes(`release:${dispatchId}`)),
+    'every retained fixer dispatch is eventually released'
+  )
   assert.ok(orca.calls.some((call) => call.startsWith('gate:') && call.includes('docs-1')))
   assert.equal(orca.removedWorktrees.length, orca.launches.filter((launch) => launch.worktree === 'new-child').length)
   assert.ok(git.calls.indexOf('rebase:main') < git.calls.indexOf('push:feature'))
@@ -209,7 +221,10 @@ test('runs the nine-stage adversarial pipeline with fixes, gates, and isolation'
     orca.tasks.find((task) => task.spec.startsWith('[review fix 1]'))?.spec ?? '',
     /Null input crashes the command/
   )
-  assert.equal(orca.calls.at(-1), 'status:completed:no-mistakes passed all 9 stages')
+  assert.equal(
+    orca.calls.at(-1),
+    `status:completed:no-mistakes passed all ${PIPELINE_STEPS.length} stages`
+  )
 })
 
 test('delivery failures require a successful retry instead of approval', async () => {
@@ -234,6 +249,65 @@ test('delivery failures require a successful retry instead of approval', async (
   assert.equal(git.calls.filter((call) => call === 'push:feature').length, 2)
   assert.equal(orca.launches.filter((launch) => launch.role === 'fixer').length, 0)
   assert.ok(orca.calls.some((call) => call.startsWith('gate:') && call.includes('push-failed')))
+  assert.deepEqual(orca.gates[0].options, ['retry', 'stop'])
+  assert.doesNotMatch(orca.gates[0].question, /approve|skip|fix/)
+})
+
+test('fails after the configured fix-round limit', async () => {
+  const git = new FakeGit()
+  const orca = new FakeOrca(git)
+  const finding: Finding = {
+    id: 'persistent',
+    severity: 'error',
+    action: 'auto-fix',
+    description: 'The same defect remains.'
+  }
+  orca.reports.set('review', [
+    { findings: [finding], summary: 'first failure' },
+    pass('fix committed'),
+    { findings: [finding], summary: 'still failing' }
+  ])
+
+  await assert.rejects(
+    runPipeline({ intent: 'Bound automatic repairs.', maxFixRounds: 1 }, orca, git),
+    /review still has findings after 1 fix rounds: still failing/
+  )
+  assert.ok(orca.calls.some((call) => call.includes('status:in-review:no-mistakes stopped:')))
+})
+
+test('unknown gate decisions stop the pipeline and update worktree status', async () => {
+  const git = new FakeGit()
+  const orca = new FakeOrca(git)
+  orca.gateResolution = 'later'
+  orca.reports.set('document', [
+    {
+      findings: [
+        {
+          id: 'docs-choice',
+          severity: 'warning',
+          action: 'ask-user',
+          description: 'Documentation ownership is unclear.'
+        }
+      ],
+      summary: 'decision needed'
+    }
+  ])
+
+  await assert.rejects(
+    runPipeline({ intent: 'Reject unknown decisions.' }, orca, git),
+    /document gate stopped the pipeline: later/
+  )
+  assert.ok(orca.calls.some((call) => call.includes('status:in-review:no-mistakes stopped:')))
+})
+
+test('unsafe Orca Run IDs cannot escape the evidence directory', async () => {
+  const git = new FakeGit()
+  const orca = new FakeOrca(git, '../outside-evidence')
+  await assert.rejects(
+    runPipeline({ intent: 'Confine Run evidence.' }, orca, git),
+    /Orca returned an unsafe Run ID/
+  )
+  assert.equal(orca.tasks.length, 0)
 })
 
 test('malformed reviewer findings fail closed and still clean up the worker', async () => {
@@ -262,6 +336,32 @@ test('malformed reviewer findings fail closed and still clean up the worker', as
   assert.equal(orca.removedWorktrees.length, 1)
 })
 
+test('reviewer artifacts must exist under the run evidence directory', async () => {
+  const git = new FakeGit()
+  const orca = new FakeOrca(git)
+  orca.reports.set('review', [
+    { findings: [], summary: 'unsafe evidence', artifacts: ['/tmp/outside-evidence.log'] }
+  ])
+
+  await assert.rejects(
+    runPipeline({ intent: 'Confine reviewer evidence.' }, orca, git),
+    /review worker returned an unsafe artifact path/
+  )
+  assert.ok(orca.calls.some((call) => call.startsWith('release:')))
+  assert.equal(orca.removedWorktrees.length, 1)
+
+  const missingOrca = new FakeOrca(git)
+  missingOrca.reports.set('review', [
+    { findings: [], summary: 'missing evidence', artifacts: ['missing.log'] }
+  ])
+  await assert.rejects(
+    runPipeline({ intent: 'Require reviewer evidence.' }, missingOrca, git),
+    /review worker returned a missing artifact/
+  )
+  assert.ok(missingOrca.calls.some((call) => call.startsWith('release:')))
+  assert.equal(missingOrca.removedWorktrees.length, 1)
+})
+
 test('install makes plain git push no-mistakes usable without an upstream branch', async () => {
   const temp = await mkdtemp(path.join(tmpdir(), 'orca-no-mistakes-'))
   const repo = path.join(temp, 'repo')
@@ -276,7 +376,10 @@ test('install makes plain git push no-mistakes usable without an upstream branch
 
     const gate = await installGitGate({ repo, intent: 'Test the gate.' })
     const hook = path.join(gate, 'hooks', 'post-receive')
-    assert.match(await readFile(hook, 'utf8'), /unset \$\(git rev-parse --local-env-vars\)/)
+    const hookSource = await readFile(hook, 'utf8')
+    assert.match(hookSource, /unset \$\(git rev-parse --local-env-vars\)/)
+    assert.match(hookSource, /read -r oldrev newrev refname/)
+    assert.match(hookSource, /\*\[!0\]\*\) ;;/)
     await writeFile(hook, '#!/bin/sh\nexit 0\n')
     await chmod(hook, 0o755)
 
@@ -292,12 +395,28 @@ test('install makes plain git push no-mistakes usable without an upstream branch
   }
 })
 
+test('CLI accepts equals syntax and preserves negative numeric values', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'orca-cli-'))
+  try {
+    git(temp, 'init', '-b', 'feature')
+    await assert.rejects(
+      main(['run', `--repo=${temp}`, '--intent=Validate parsing.', '--max-fix-rounds=-1']),
+      /maxFixRounds must be a non-negative integer/
+    )
+    await assert.rejects(main(['install', '--repo']), /--repo requires a value/)
+    await assert.rejects(main(['run', '--force', '--intent=x']), /--force is not valid for run/)
+    await assert.rejects(main(['install', '--base=main']), /--base is not valid for install/)
+  } finally {
+    await rm(temp, { recursive: true, force: true })
+  }
+})
+
 test('CliOrca creates a fixer once and reuses its terminal without creation flags', async () => {
   const temp = await mkdtemp(path.join(tmpdir(), 'orca-cli-'))
   const fakeOrca = path.join(temp, 'orca')
   const callsPath = path.join(temp, 'calls.jsonl')
   const countPath = path.join(temp, 'count')
-  const evidence = path.join(process.env.HOME!, '.orca-no-mistakes', 'evidence', 'adapter-test')
+  const evidence = path.join(homedir(), '.orca-no-mistakes', 'evidence', 'adapter-test')
   const reportOne = path.join(evidence, 'one.json')
   const reportTwo = path.join(evidence, 'two.json')
   try {
@@ -311,7 +430,9 @@ import fs from 'node:fs'
 const args = process.argv.slice(2)
 fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
 const out = (result) => console.log(JSON.stringify({ result }))
-if (args[0] === 'orchestration' && args[1] === 'worker-start') {
+if (args[0] === 'orchestration' && args[1] === 'run-create') {
+  out({ run: { id: 'adapter-test' } })
+} else if (args[0] === 'orchestration' && args[1] === 'worker-start') {
   const reused = args.includes('--terminal')
   out({ dispatchId: reused ? 'dispatch-2' : 'dispatch-1', state: 'ready', effects: [] })
 } else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
@@ -335,6 +456,7 @@ if (args[0] === 'orchestration' && args[1] === 'worker-start') {
       fixerModel: 'gpt-5.6',
       fixerEffort: 'high'
     })
+    await orca.createRun('adapter test')
 
     const first = await orca.startWorker('task-1', {
       name: 'first-fixer',
