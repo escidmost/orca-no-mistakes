@@ -23,3 +23,15 @@ _Avoid_: Phase, priority bucket
 **Proposed change**:
 The exact submitted Git ref and commit set being considered for validation and delivery.
 _Avoid_: Current branch, working tree, HEAD
+
+**Domain ledger**:
+A durable local store tracking proposed change identity, branch semantic leases, commit-bound stage checkpoints, and custody states across coordinator restarts.
+_Avoid_: Run cache, coordinator DB, session store
+
+**Branch custody**:
+Ownership of the proposed change Git branch and worktree, transitioning between operator-owned, pipeline-owned, and custody-returned.
+_Avoid_: Git lock, branch checkout, working branch state
+
+**Custody recovery**:
+Returning custody of unpublished pipeline commits or rebased heads from a terminal run to the operator using three-way containment proof and recovery anchor refs.
+_Avoid_: Force checkout, branch overwrite, git restore

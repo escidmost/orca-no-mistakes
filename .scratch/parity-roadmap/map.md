@@ -22,6 +22,7 @@ An Orca-native replacement is accepted only after comparing how much authority, 
 
 - [Find Orca's Native Guarantee Boundary](https://linear.app/escidmore/issue/ONM-5/find-orcas-native-guarantee-boundary): Orca owns durable orchestration custody; this project must own exact Git change, policy, and Passed evidence, with generic occupancy and provenance gaps considered for Orca upstream.
 - [Find GitHub's Authoritative PR and CI Proof Surface](https://linear.app/escidmore/issue/ONM-10/find-githubs-authoritative-pr-and-ci-proof-surface): Authoritative proof requires reconciled commit-bound API facts and a guarded non-bypass transition; webhooks and worker claims are wakeups or analysis, not evidence.
+- [Choose the Coordinator Recovery Model](https://linear.app/escidmore/issue/ONM-3/choose-the-coordinator-recovery-model): Pipeline state and Git custody live in a dedicated SQLite domain ledger while delegating durable worker/gate lifecycle to Orca. On restart, the coordinator rebinds Orca runs with generation fencing, opportunistically adopts healthy workers (with clean checkpoint restart fallbacks), reattaches to durable decision gates, and preserves stranded commits under recovery refs with three-way containment proof.
 
 ## Not yet specified
 
