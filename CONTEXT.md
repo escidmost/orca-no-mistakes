@@ -35,3 +35,19 @@ _Avoid_: Git lock, branch checkout, working branch state
 **Custody recovery**:
 Returning custody of unpublished pipeline commits or rebased heads from a terminal run to the operator using three-way containment proof and recovery anchor refs.
 _Avoid_: Force checkout, branch overwrite, git restore
+
+**Reconciliation snapshot**:
+An immutable record of pull-request, candidate commit, and check-run facts queried directly against exact forge and Git object identifiers.
+_Avoid_: Status poll, PR fetch, API cache
+
+**Guarded delivery transition**:
+An atomic forge transition executed with non-bypass credentials that fails closed if the candidate head or target branch changes.
+_Avoid_: PR merge, auto-merge, push-on-green
+
+**Dual-anchored check completeness**:
+The proof that all intended CI checks ran, established by matching observed check runs against both a trusted repository policy manifest and forge branch rulesets.
+_Avoid_: All green, CI complete, checks passed
+
+**Delivered tree integrity**:
+The post-delivery proof confirming that the commit on the target base branch preserves the exact tree and ancestry of the tested candidate change.
+_Avoid_: Merged cleanly, landed successfully
