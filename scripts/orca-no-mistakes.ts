@@ -477,16 +477,19 @@ async function command(
   executable: string,
   args: string[],
   cwd: string,
-  options: { allowFailure?: boolean; timeoutMs?: number } = {}
+  options: { allowFailure?: boolean; timeoutMs?: number | null } = {}
 ): Promise<CommandResult> {
   return await new Promise((resolve, reject) => {
     const child = spawn(executable, args, { cwd, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] })
-    const timeoutMs = options.timeoutMs ?? 120_000
+    const timeoutMs = options.timeoutMs === undefined ? 120_000 : options.timeoutMs
     let timedOut = false
-    const timer = setTimeout(() => {
-      timedOut = true
-      child.kill('SIGKILL')
-    }, timeoutMs)
+    const timer =
+      timeoutMs === null
+        ? undefined
+        : setTimeout(() => {
+            timedOut = true
+            child.kill('SIGKILL')
+          }, timeoutMs)
     let stdout = ''
     let stderr = ''
     child.stdout.setEncoding('utf8').on('data', (chunk: string) => {
@@ -496,11 +499,11 @@ async function command(
       stderr += chunk
     })
     child.on('error', (error) => {
-      clearTimeout(timer)
+      if (timer) clearTimeout(timer)
       reject(error)
     })
     child.on('close', (code) => {
-      clearTimeout(timer)
+      if (timer) clearTimeout(timer)
       if (timedOut) {
         const message = `${executable} ${args.slice(0, 2).join(' ')} timed out after ${timeoutMs}ms`
         if (options.allowFailure) {
@@ -953,7 +956,22 @@ function failureReport(id: string, action: FindingAction, description: string): 
   }
 }
 
-type InstallOptions = { force?: boolean; intent?: string; repo: string }
+type InstallOptions = { force?: boolean; repo: string }
+
+export async function pushToGate(options: { intent: string; repo: string }): Promise<void> {
+  const intent = options.intent.trim()
+  if (!intent) throw new Error('push requires --intent')
+  if (intent.includes('\n') || intent.includes('\0')) {
+    throw new Error('--intent must be a single line')
+  }
+  const repo = path.resolve(options.repo)
+  await command(
+    'git',
+    ['-C', repo, 'push', '--push-option', `no-mistakes.intent=${intent}`, 'no-mistakes'],
+    repo,
+    { timeoutMs: null }
+  )
+}
 
 export async function installGitGate(options: InstallOptions): Promise<string> {
   const repo = path.resolve(options.repo)
@@ -965,6 +983,10 @@ export async function installGitGate(options: InstallOptions): Promise<string> {
   } catch {
     await command('git', ['init', '--bare', gateDir], repo)
   }
+  const hooksDir = path.join(gateDir, 'hooks')
+  await mkdir(hooksDir, { recursive: true })
+  await command('git', [`--git-dir=${gateDir}`, 'config', 'core.hooksPath', hooksDir], repo)
+  await command('git', [`--git-dir=${gateDir}`, 'config', 'receive.advertisePushOptions', 'true'], repo)
 
   const existing = await command('git', ['-C', repo, 'remote', 'get-url', 'no-mistakes'], repo, {
     allowFailure: true
@@ -978,16 +1000,33 @@ export async function installGitGate(options: InstallOptions): Promise<string> {
     ['-C', repo, 'remote', existingUrl ? 'set-url' : 'add', 'no-mistakes', gateDir],
     repo
   )
-  if (options.intent) {
-    await command('git', ['-C', repo, 'config', 'orca-no-mistakes.intent', options.intent], repo)
-  }
+  await command('git', ['-C', repo, 'config', '--unset-all', 'orca-no-mistakes.intent'], repo, {
+    allowFailure: true
+  })
 
-  const hooksDir = path.join(gateDir, 'hooks')
-  await mkdir(hooksDir, { recursive: true })
-  const hookPath = path.join(hooksDir, 'post-receive')
   const scriptPath = fileURLToPath(import.meta.url)
-  const hook = `#!/bin/sh
+  const readPushIntent = `intent=
+option_index=0
+option_count=\${GIT_PUSH_OPTION_COUNT:-0}
+while [ "$option_index" -lt "$option_count" ]; do
+  eval "option=\\$GIT_PUSH_OPTION_$option_index"
+  case "$option" in
+    no-mistakes.intent=*)
+      [ -z "$intent" ] || { echo 'no-mistakes: multiple per-push intents were provided' >&2; exit 1; }
+      intent=\${option#no-mistakes.intent=}
+      ;;
+  esac
+  option_index=$((option_index + 1))
+done
+[ -n "$intent" ] || { echo 'no-mistakes: per-push intent is required; use orca-no-mistakes push --intent "..."' >&2; exit 1; }
+`
+  const preReceivePath = path.join(hooksDir, 'pre-receive')
+  await writeFile(preReceivePath, `#!/bin/sh\nset -u\n${readPushIntent}`, 'utf8')
+  await chmod(preReceivePath, 0o755)
+  const postReceivePath = path.join(hooksDir, 'post-receive')
+  const postReceive = `#!/bin/sh
 set -u
+${readPushIntent}
 unset $(git rev-parse --local-env-vars)
 while read -r oldrev newrev refname; do
   case "$newrev" in
@@ -996,15 +1035,13 @@ while read -r oldrev newrev refname; do
   esac
   case "$refname" in
     refs/heads/*)
-      intent=\${ORCA_NO_MISTAKES_INTENT:-$(git -C ${shellQuote(repo)} config --get orca-no-mistakes.intent 2>/dev/null || true)}
-      [ -n "$intent" ] || intent="Validate and safely deliver \${refname#refs/heads/} at $newrev."
       ${shellQuote(process.execPath)} ${shellQuote(scriptPath)} run --repo ${shellQuote(repo)} --head "$newrev" --intent "$intent" || exit $?
       ;;
   esac
 done
 `
-  await writeFile(hookPath, hook, 'utf8')
-  await chmod(hookPath, 0o755)
+  await writeFile(postReceivePath, postReceive, 'utf8')
+  await chmod(postReceivePath, 0o755)
   return gateDir
 }
 
@@ -1026,7 +1063,8 @@ const VALUE_FLAGS = new Set([
   'reviewer-model'
 ])
 const COMMAND_FLAGS: Record<string, Set<string>> = {
-  install: new Set(['force', 'intent', 'repo']),
+  install: new Set(['force', 'repo']),
+  push: new Set(['intent', 'repo']),
   run: new Set([
     'base',
     'fixer-effort',
@@ -1074,7 +1112,8 @@ export async function main(argv: string[]): Promise<void> {
   if (argv.length === 0 || argv[0] === '--help' || argv[0] === '-h' || argv.includes('--help')) {
     console.log(`Usage:
   orca-no-mistakes run --intent <text> [--repo <path>] [--base <branch>] [--head <sha>]
-  orca-no-mistakes install [--repo <path>] [--intent <text>] [--force]
+  orca-no-mistakes push --intent <text> [--repo <path>]
+  orca-no-mistakes install [--repo <path>] [--force]
 
 Run options:
   --reviewer-model <model>
@@ -1087,11 +1126,17 @@ Run options:
   if (parsed.command === 'install') {
     const gate = await installGitGate({
       repo,
-      intent: stringFlag(parsed.flags, 'intent'),
       force: parsed.flags.force === true
     })
     console.log(`Installed git remote no-mistakes -> ${gate}`)
-    console.log('Run: git push no-mistakes')
+    console.log('Run: orca-no-mistakes push --intent "Describe this exact commit set"')
+    return
+  }
+  if (parsed.command === 'push') {
+    const intent = stringFlag(parsed.flags, 'intent')
+    if (!intent) throw new Error('push requires --intent')
+    await pushToGate({ repo, intent })
+    console.log('Submitted to the local no-mistakes gate; check the Orca Run for the pipeline outcome')
     return
   }
   if (parsed.command !== 'run') throw new Error(`unknown command: ${parsed.command}`)

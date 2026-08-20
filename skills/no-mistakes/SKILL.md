@@ -9,6 +9,7 @@ disable-model-invocation: true
 Use this skill only when the user invokes `/no-mistakes`.
 
 1. Require a concise, explicit statement of intent. If the invocation does not make the intended behavior clear, ask one question before starting.
+   Treat intent as specific to this invocation; never read it from or persist it to repository configuration or environment variables.
 2. Confirm the current branch contains only committed work and is not the default branch. Do not edit the worktree after starting the pipeline.
 3. Run:
 

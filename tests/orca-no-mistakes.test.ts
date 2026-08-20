@@ -362,7 +362,7 @@ test('reviewer artifacts must exist under the run evidence directory', async () 
   assert.equal(missingOrca.removedWorktrees.length, 1)
 })
 
-test('install makes plain git push no-mistakes usable without an upstream branch', async () => {
+test('install requires per-push intent without persisting a fallback', async () => {
   const temp = await mkdtemp(path.join(tmpdir(), 'orca-no-mistakes-'))
   const repo = path.join(temp, 'repo')
   try {
@@ -373,23 +373,55 @@ test('install makes plain git push no-mistakes usable without an upstream branch
     await writeFile(path.join(repo, 'README.md'), 'test\n')
     git(repo, 'add', 'README.md')
     git(repo, 'commit', '-m', 'initial')
+    git(repo, 'config', 'orca-no-mistakes.intent', 'stale intent')
 
-    const gate = await installGitGate({ repo, intent: 'Test the gate.' })
-    const hook = path.join(gate, 'hooks', 'post-receive')
-    const hookSource = await readFile(hook, 'utf8')
-    assert.match(hookSource, /unset \$\(git rev-parse --local-env-vars\)/)
-    assert.match(hookSource, /read -r oldrev newrev refname/)
-    assert.match(hookSource, /\*\[!0\]\*\) ;;/)
-    await writeFile(hook, '#!/bin/sh\nexit 0\n')
-    await chmod(hook, 0o755)
+    const gate = await installGitGate({ repo })
+    const hooks = path.join(gate, 'hooks')
+    const preReceive = path.join(hooks, 'pre-receive')
+    const postReceive = path.join(hooks, 'post-receive')
+    const hookSource = await readFile(postReceive, 'utf8')
+    assert.match(hookSource, /GIT_PUSH_OPTION_COUNT/)
+    assert.doesNotMatch(hookSource, /ORCA_NO_MISTAKES_INTENT|orca-no-mistakes\.intent/)
+    assert.match(await readFile(preReceive, 'utf8'), /per-push intent is required/)
+    assert.equal(git(repo, `--git-dir=${gate}`, 'config', '--get', 'core.hooksPath'), hooks)
+    assert.equal(git(repo, `--git-dir=${gate}`, 'config', '--get', 'receive.advertisePushOptions'), 'true')
+    assert.throws(() => git(repo, 'config', '--get', 'orca-no-mistakes.intent'))
+    await writeFile(postReceive, '#!/bin/sh\nexit 0\n')
+    await chmod(postReceive, 0o755)
 
-    git(repo, 'push', 'no-mistakes')
+    assert.throws(() => git(repo, 'push', 'no-mistakes'))
+    git(repo, 'push', '--push-option=no-mistakes.intent=Test this commit set.', 'no-mistakes')
 
-    assert.equal(git(repo, 'config', '--get', 'orca-no-mistakes.intent'), 'Test the gate.')
     assert.equal(
       git(repo, `--git-dir=${gate}`, 'rev-parse', 'refs/heads/feature'),
       git(repo, 'rev-parse', 'HEAD')
     )
+  } finally {
+    await rm(temp, { recursive: true, force: true })
+  }
+})
+
+test('push sends intent through Git push options', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'orca-push-intent-'))
+  const repo = path.join(temp, 'repo')
+  const receivedIntent = path.join(temp, 'received-intent')
+  try {
+    await mkdir(repo)
+    git(repo, 'init', '-b', 'feature')
+    git(repo, 'config', 'user.email', 'test@example.com')
+    git(repo, 'config', 'user.name', 'Test User')
+    await writeFile(path.join(repo, 'README.md'), 'test\n')
+    git(repo, 'add', 'README.md')
+    git(repo, 'commit', '-m', 'initial')
+
+    const gate = await installGitGate({ repo })
+    const hook = path.join(gate, 'hooks', 'post-receive')
+    await writeFile(hook, `#!/bin/sh\nprintf '%s' "$GIT_PUSH_OPTION_0" > '${receivedIntent}'\n`)
+    await chmod(hook, 0o755)
+
+    await main(['push', `--repo=${repo}`, '--intent=Explain this exact commit set.'])
+
+    assert.equal(await readFile(receivedIntent, 'utf8'), 'no-mistakes.intent=Explain this exact commit set.')
   } finally {
     await rm(temp, { recursive: true, force: true })
   }
@@ -404,6 +436,7 @@ test('CLI accepts equals syntax and preserves negative numeric values', async ()
       /maxFixRounds must be a non-negative integer/
     )
     await assert.rejects(main(['install', '--repo']), /--repo requires a value/)
+    await assert.rejects(main(['install', '--intent=x']), /--intent is not valid for install/)
     await assert.rejects(main(['run', '--force', '--intent=x']), /--force is not valid for run/)
     await assert.rejects(main(['install', '--base=main']), /--base is not valid for install/)
   } finally {
