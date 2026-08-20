@@ -23,3 +23,15 @@ _Avoid_: Phase, priority bucket
 **Proposed change**:
 The exact submitted Git ref and commit set being considered for validation and delivery.
 _Avoid_: Current branch, working tree, HEAD
+
+**Semantic lease**:
+An exclusive reservation acquired on a Git ref or workspace preventing concurrent pipeline validation runs.
+_Avoid_: Mutex, worktree lock, workspace lease
+
+**Preserved head**:
+A Git ref anchoring unmerged pipeline or auto-fix commits after a run terminates, enabling deterministic recovery.
+_Avoid_: Orphan commit, lost commit, backup branch
+
+**Validation ledger**:
+The authoritative local store recording runs, tasks, gate decisions, actor provenance, and Passed attestations.
+_Avoid_: Audit log, database cache, status table
