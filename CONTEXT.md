@@ -110,3 +110,11 @@ _Avoid_: Override, pass-through, ignore
 **Waiver**:
 An explicit human bypass of a validation stage without verification, recorded in the evidence ledger.
 _Avoid_: Skip-pass, exception
+
+**Branch semantic lease**:
+An exclusive reservation acquired for a repository branch that prevents concurrent pipeline validation runs.
+_Avoid_: Mutex, worktree lock, workspace lease
+
+**Preserved head**:
+A Git ref anchoring unmerged pipeline or auto-fix commits after a run terminates, enabling deterministic recovery.
+_Avoid_: Orphan commit, lost commit, backup branch
