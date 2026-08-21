@@ -18,7 +18,7 @@ npm link
 orca-no-mistakes install --repo /path/to/repo
 ```
 
-The installer creates a local bare gate under the repository's Git directory and configures the `no-mistakes` remote. It never replaces an unrelated remote unless `--force` is supplied. The gate receives the local push, runs the pipeline synchronously, and leaves delivery to `origin` exclusively to the pipeline's push stage.
+The installer creates a local bare gate under the repository's Git directory and configures the `orca-no-mistakes` remote. It never replaces an unrelated remote unless `--force` is supplied. The gate receives the local push, runs the pipeline synchronously, and leaves delivery to `origin` exclusively to the pipeline's push stage.
 
 ## Run
 

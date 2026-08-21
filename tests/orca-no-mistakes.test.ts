@@ -389,8 +389,8 @@ test('install requires per-push intent without persisting a fallback', async () 
     await writeFile(postReceive, '#!/bin/sh\nexit 0\n')
     await chmod(postReceive, 0o755)
 
-    assert.throws(() => git(repo, 'push', 'no-mistakes'))
-    git(repo, 'push', '--push-option=no-mistakes.intent=Test this commit set.', 'no-mistakes')
+    assert.throws(() => git(repo, 'push', 'orca-no-mistakes'))
+    git(repo, 'push', '--push-option=no-mistakes.intent=Test this commit set.', 'orca-no-mistakes')
 
     assert.equal(
       git(repo, `--git-dir=${gate}`, 'rev-parse', 'refs/heads/feature'),

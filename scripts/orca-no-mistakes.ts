@@ -967,7 +967,7 @@ export async function pushToGate(options: { intent: string; repo: string }): Pro
   const repo = path.resolve(options.repo)
   await command(
     'git',
-    ['-C', repo, 'push', '--push-option', `no-mistakes.intent=${intent}`, 'no-mistakes'],
+    ['-C', repo, 'push', '--push-option', `no-mistakes.intent=${intent}`, 'orca-no-mistakes'],
     repo,
     { timeoutMs: null }
   )
@@ -988,16 +988,16 @@ export async function installGitGate(options: InstallOptions): Promise<string> {
   await command('git', [`--git-dir=${gateDir}`, 'config', 'core.hooksPath', hooksDir], repo)
   await command('git', [`--git-dir=${gateDir}`, 'config', 'receive.advertisePushOptions', 'true'], repo)
 
-  const existing = await command('git', ['-C', repo, 'remote', 'get-url', 'no-mistakes'], repo, {
+  const existing = await command('git', ['-C', repo, 'remote', 'get-url', 'orca-no-mistakes'], repo, {
     allowFailure: true
   })
   const existingUrl = existing.stdout.trim()
   if (existingUrl && path.resolve(repo, existingUrl) !== gateDir && !options.force) {
-    throw new Error('remote no-mistakes already exists; pass --force to replace it')
+    throw new Error('remote orca-no-mistakes already exists; pass --force to replace it')
   }
   await command(
     'git',
-    ['-C', repo, 'remote', existingUrl ? 'set-url' : 'add', 'no-mistakes', gateDir],
+    ['-C', repo, 'remote', existingUrl ? 'set-url' : 'add', 'orca-no-mistakes', gateDir],
     repo
   )
   await command('git', ['-C', repo, 'config', '--unset-all', 'orca-no-mistakes.intent'], repo, {
@@ -1128,7 +1128,7 @@ Run options:
       repo,
       force: parsed.flags.force === true
     })
-    console.log(`Installed git remote no-mistakes -> ${gate}`)
+    console.log(`Installed git remote orca-no-mistakes -> ${gate}`)
     console.log('Run: orca-no-mistakes push --intent "Describe this exact commit set"')
     return
   }

@@ -26,7 +26,7 @@ Install the local Git gate once per repository when needed:
 orca-no-mistakes install --repo /path/to/repo
 ```
 
-Use `--force` only to replace an existing unrelated `no-mistakes` remote intentionally.
+Use `--force` only to replace an existing unrelated `orca-no-mistakes` remote intentionally.
 
 ## Invocation
 

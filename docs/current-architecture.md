@@ -6,7 +6,7 @@ This document describes implemented behavior in version `0.1.0`. The ADRs under 
 
 `orca-no-mistakes` supports three commands:
 
-- `install` creates a bare local gate under the repository's Git directory and configures the `no-mistakes` remote.
+- `install` creates a bare local gate under the repository's Git directory and configures the `orca-no-mistakes` remote.
 - `run` executes the pipeline directly and returns a meaningful process exit status.
 - `push` sends one single-line intent as a Git push option to the installed gate.
 
