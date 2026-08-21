@@ -44,24 +44,29 @@ Use the local Git gate only when the user asked to push:
 orca-no-mistakes push --repo /path/to/repo --intent "<user objective and constraints>"
 ```
 
-Direct `run` supplies a meaningful exit status. The Git gate runs synchronously, but Git may still report a successful push when the hook's pipeline fails; inspect the Orca Run after `push`.
+Direct `run` and the Git gate launch the coordinator detached in a dedicated Orca terminal and return immediately with `{"detached":true,"terminalHandle":"..."}`. This avoids blocking the caller and allows the originating session to receive and resolve decision gates via `orca orchestration gate-resolve`. (Pass `--attached` to run synchronously in the foreground).
 
-Available direct-run controls are `--base`, `--head`, `--reviewer-model`, `--fixer-model`, `--fixer-effort`, and `--max-fix-rounds`. Workers launch with the `opencode` agent on model `openai/gpt-5.6-luna` at max reasoning effort by default; the default maximum is three fix rounds.
+Available direct-run controls are `--attached`, `--base`, `--head`, `--notify`, `--reviewer-model`, `--fixer-model`, `--fixer-effort`, and `--max-fix-rounds`. Runs are detached by default; passing `--attached` provides synchronous execution. Workers launch with the `opencode` agent on model `openai/gpt-5.6-luna` at max reasoning effort by default; the default maximum is 3 automated fix rounds, after which an exhaustion gate opens.
 
 ## Gates
 
-The direct command waits while an Orca gate is pending. Inspect and resolve it from the Orca app or a separate terminal:
+A detached run returns before any gate opens; an `--attached` run waits while an Orca gate is pending. Inspect and resolve the gate from the Orca app or a separate terminal:
 
 ```bash
 orca orchestration gate-list --run <run-id> --status pending --json
 orca orchestration gate-resolve --id <gate-id> --resolution <decision> --json
 ```
 
-Validation-stage decisions are `approve`, `fix`, `skip`, and `stop`. A fix may include guidance, for example `--resolution "fix: preserve the public API"`. Delivery-stage decisions are only `retry` and `stop`.
+Validation-stage decisions are `approve`, `fix`, `skip`, and `stop`. Delivery-stage decisions are only `retry` and `stop`.
+
+A `fix` resolution supports targeted finding selection, per-finding instructions, and global guidance:
+- Plain text syntax: `--resolution "fix: id1, id2: guidance"` or `--resolution "fix [id1, id2] - guidance"`.
+- JSON syntax: `--resolution '{"action":"fix","findingIds":["id1"],"instructions":{"id1":"instruction"},"guidance":"global guidance"}'`.
+- Resolving with `fix` without IDs targets all actionable findings. Unselected findings are evaluated in subsequent re-review passes.
 
 Escalate every `ask-user` finding to the user before resolving it. Relay its ID, file and line when present, and full description. Do not choose `approve` or `skip` on the user's behalf.
 
-Current behavior automatically fixes reports whose actionable findings are all `auto-fix`. After the configured fix-round limit, the run fails rather than opening an exhaustion gate. Current `approve` and `skip` decisions allow a validation stage to complete with findings; they do not establish the target architecture's `Passed` proof.
+Current behavior automatically fixes reports whose actionable findings are all `auto-fix`. After the configured fix-round limit, the coordinator opens an exhaustion gate for operator direction. Current `approve` and `skip` decisions allow a validation stage to complete with findings; they do not establish the target architecture's `Passed` proof.
 
 ## Result
 

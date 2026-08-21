@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -12,6 +12,7 @@ import {
   PIPELINE_STEPS,
   installGitGate,
   main,
+  parseGateResolution,
   runPipeline,
   type Finding,
   type GitOperations,
@@ -289,9 +290,10 @@ test('delivery failures require a successful retry instead of approval', async (
   assert.doesNotMatch(orca.gates[0].question, /approve|skip|fix/)
 })
 
-test('fails after the configured fix-round limit', async () => {
+test('opens an exhaustion gate when automatic fix limit is reached and stops on stop decision', async () => {
   const git = new FakeGit()
   const orca = new FakeOrca(git)
+  orca.gateResolution = 'stop'
   const finding: Finding = {
     id: 'persistent',
     severity: 'error',
@@ -306,9 +308,32 @@ test('fails after the configured fix-round limit', async () => {
 
   await assert.rejects(
     runPipeline({ intent: 'Bound automatic repairs.', maxFixRounds: 1 }, orca, git),
-    /review still has findings after 1 fix rounds: still failing/
+    /review gate stopped the pipeline: stop/
   )
+  assert.ok(orca.calls.some((call) => call.includes('reached the limit of 1 fix rounds')))
   assert.ok(orca.calls.some((call) => call.includes('status:in-review:no-mistakes stopped:')))
+})
+
+test('exhaustion gate allows user to authorize another fix round', async () => {
+  const git = new FakeGit()
+  const orca = new FakeOrca(git)
+  orca.gateResolution = 'fix: persistent: try alternative fix'
+  const finding: Finding = {
+    id: 'persistent',
+    severity: 'error',
+    action: 'auto-fix',
+    description: 'The same defect remains.'
+  }
+  orca.reports.set('review', [
+    { findings: [finding], summary: 'first failure' },
+    pass('fix committed'),
+    { findings: [finding], summary: 'still failing' },
+    pass('clean rereview after exhaustion fix')
+  ])
+
+  const result = await runPipeline({ intent: 'Exhaustion fix test', maxFixRounds: 1 }, orca, git)
+  assert.equal(result.steps.length, PIPELINE_STEPS.length)
+  assert.ok(orca.calls.some((call) => call.includes('reached the limit of 1 fix rounds')))
 })
 
 test('unknown gate decisions stop the pipeline and update worktree status', async () => {
@@ -370,6 +395,29 @@ test('malformed reviewer findings fail closed and still clean up the worker', as
 
   assert.ok(orca.calls.some((call) => call.startsWith('release:')))
   assert.equal(orca.removedWorktrees.length, 1)
+})
+
+test('reviewer findings without IDs receive deterministic IDs', async () => {
+  const git = new FakeGit()
+  const orca = new FakeOrca(git)
+  orca.reports.set('review', [
+    {
+      findings: [
+        {
+          severity: 'error',
+          action: 'auto-fix',
+          description: 'This valid finding omitted its ID.'
+        } as unknown as Finding
+      ],
+      summary: 'missing ID'
+    },
+    pass('clean rereview')
+  ])
+
+  await runPipeline({ intent: 'Normalize reviewer IDs.' }, orca, git)
+
+  const fixer = orca.launches.find((launch) => launch.role === 'fixer')
+  assert.match(fixer?.prompt ?? '', /"id":"review-[0-9a-f]{12}"/)
 })
 
 test('reviewer artifacts must exist under the run evidence directory', async () => {
@@ -480,6 +528,109 @@ test('CLI accepts equals syntax and preserves negative numeric values', async ()
   }
 })
 
+test('run starts an attached coordinator in a dedicated Orca terminal', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'orca-detached-run-'))
+  const origin = path.join(temp, 'origin.git')
+  const repo = path.join(temp, 'repo')
+  const fakeOrca = path.join(temp, 'orca')
+  const callsPath = path.join(temp, 'calls.jsonl')
+  const previousCommand = process.env.ORCA_CLI_COMMAND
+  const previousHandle = process.env.ORCA_TERMINAL_HANDLE
+  try {
+    git(temp, 'init', '--bare', origin)
+    git(temp, 'clone', origin, repo)
+    git(repo, 'config', 'user.email', 'test@example.com')
+    git(repo, 'config', 'user.name', 'Test User')
+    git(repo, 'checkout', '-b', 'main')
+    await writeFile(path.join(repo, 'README.md'), 'main\n')
+    git(repo, 'add', 'README.md')
+    git(repo, 'commit', '-m', 'main')
+    git(repo, 'push', '-u', 'origin', 'main')
+    git(temp, `--git-dir=${origin}`, 'symbolic-ref', 'HEAD', 'refs/heads/main')
+    git(repo, 'checkout', '-b', 'feature')
+
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+const result = args[0] === 'terminal' && args[1] === 'create'
+  ? { terminal: { handle: 'detached-coordinator' } }
+  : { accepted: true }
+console.log(JSON.stringify({ result }))
+`
+    )
+    await chmod(fakeOrca, 0o755)
+    process.env.ORCA_CLI_COMMAND = fakeOrca
+    process.env.ORCA_TERMINAL_HANDLE = 'originating-opencode'
+
+    await main(['run', `--repo=${repo}`, '--intent=Validate detached coordination.'])
+
+    const calls = (await readFile(callsPath, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as string[])
+    const terminalCreate = calls.find((args) => args[0] === 'terminal' && args[1] === 'create')
+    const terminalSend = calls.find((args) => args[0] === 'terminal' && args[1] === 'send')
+    const commandText = terminalSend?.[terminalSend.indexOf('--text') + 1] ?? ''
+    const worktree = terminalCreate?.[terminalCreate.indexOf('--worktree') + 1]?.replace(/^path:/, '')
+    assert.equal(worktree ? await realpath(worktree) : '', await realpath(repo))
+    assert.ok(commandText.includes("'--attached'"))
+    assert.ok(commandText.includes("'--notify' 'originating-opencode'"))
+    assert.ok(commandText.includes("'--intent' 'Validate detached coordination.'"))
+    assert.ok(!calls.some((args) => args[0] === 'orchestration'))
+  } finally {
+    if (previousCommand === undefined) delete process.env.ORCA_CLI_COMMAND
+    else process.env.ORCA_CLI_COMMAND = previousCommand
+    if (previousHandle === undefined) delete process.env.ORCA_TERMINAL_HANDLE
+    else process.env.ORCA_TERMINAL_HANDLE = previousHandle
+    await rm(temp, { recursive: true, force: true })
+  }
+})
+
+test('CliOrca notifies the originating terminal when a gate opens', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'orca-gate-notify-'))
+  const fakeOrca = path.join(temp, 'orca')
+  const callsPath = path.join(temp, 'calls.jsonl')
+  try {
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+const result = args[1] === 'run-create'
+  ? { run: { id: 'gate-run' } }
+  : args[1] === 'gate-create'
+    ? { gate: { id: 'gate-review' } }
+    : { message: { id: 'gate-notification' } }
+console.log(JSON.stringify({ result }))
+`
+    )
+    await chmod(fakeOrca, 0o755)
+    const orca = new CliOrca({
+      command: fakeOrca,
+      cwd: temp,
+      notifyHandle: 'originating-opencode'
+    })
+    await orca.createRun('gate notification')
+    assert.equal(await orca.createGate('task-review', 'Choose a review action.'), 'gate-review')
+
+    const calls = (await readFile(callsPath, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as string[])
+    const sent = calls.find((args) => args[0] === 'orchestration' && args[1] === 'send')
+    assert.ok(sent?.includes('originating-opencode'))
+    assert.ok(sent?.includes('gate-run'))
+    assert.ok(sent?.includes('question'))
+    assert.ok(sent?.includes('Choose a review action.\nGate: gate-review'))
+  } finally {
+    await rm(temp, { recursive: true, force: true })
+  }
+})
+
 test('CliOrca creates a fixer once and reuses its terminal without creation flags', async () => {
   const temp = await mkdtemp(path.join(tmpdir(), 'orca-cli-'))
   const fakeOrca = path.join(temp, 'orca')
@@ -508,10 +659,10 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
   out({ accepted: true })
 } else if (args[0] === 'terminal' && args[1] === 'show') {
   out({ terminal: { connected: true, title: 'OpenCode', preview: 'ready' } })
-} else if (args[0] === 'orchestration' && args[1] === 'worker-start') {
+} else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
   const count = fs.existsSync(${JSON.stringify(startCountPath)}) ? Number(fs.readFileSync(${JSON.stringify(startCountPath)}, 'utf8')) : 0
   fs.writeFileSync(${JSON.stringify(startCountPath)}, String(count + 1))
-  out({ dispatchId: 'dispatch-' + (count + 1), state: 'ready', effects: [] })
+  out({ dispatch: { id: 'dispatch-' + (count + 1), status: 'dispatched' }, injected: true, preamble: 'authenticated' })
 } else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
   const count = fs.existsSync(${JSON.stringify(countPath)}) ? Number(fs.readFileSync(${JSON.stringify(countPath)}, 'utf8')) : 0
   fs.writeFileSync(${JSON.stringify(countPath)}, String(count + 1))
@@ -519,8 +670,6 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
   const taskId = count === 0 ? 'task-1' : 'task-2'
   const reportPath = count === 0 ? ${JSON.stringify(reportOne)} : ${JSON.stringify(reportTwo)}
   out({ deliveryId: 'delivery-' + count, messages: [{ type: 'worker_done', body: 'Fixed the issue. Verified the change. Nothing remains.', payload: JSON.stringify({ taskId, dispatchId, outcome: 'succeeded', reportPath }) }] })
-} else if (args[0] === 'orchestration' && args[1] === 'worker-show') {
-  out({ worker: { agent_terminal_handle: 'fixer-terminal' } })
 } else {
   out({ ok: true })
 }
@@ -557,14 +706,18 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       .trim()
       .split('\n')
       .map((line) => JSON.parse(line) as string[])
-    const starts = calls.filter((args) => args[1] === 'worker-start')
+    const starts = calls.filter((args) => args[1] === 'dispatch')
     assert.equal(starts.length, 2)
-    assert.ok(starts[0].includes('--terminal'))
+    assert.ok(starts[0].includes('--to'))
+    assert.ok(starts[0].includes('--inject'))
+    assert.ok(starts[0].includes('--return-preamble'))
     assert.ok(!starts[0].includes('--agent'))
     assert.ok(!starts[0].includes('--model'))
     assert.ok(!starts[0].includes('--effort'))
     assert.ok(!starts[0].includes('--name'))
-    assert.ok(starts[1].includes('--terminal'))
+    assert.ok(starts[1].includes('--to'))
+    assert.ok(starts[1].includes('--inject'))
+    assert.ok(starts[1].includes('--return-preamble'))
     assert.ok(!starts[1].includes('--agent'))
     assert.ok(!starts[1].includes('--model'))
     assert.ok(!starts[1].includes('--effort'))
@@ -575,7 +728,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
   }
 })
 
-test('CliOrca boots a fresh opencode terminal before worker-start', async () => {
+test('CliOrca boots a fresh opencode terminal before authenticated dispatch', async () => {
   const temp = await mkdtemp(path.join(tmpdir(), 'orca-cli-'))
   const fakeOrca = path.join(temp, 'orca')
   const callsPath = path.join(temp, 'calls.jsonl')
@@ -603,12 +756,10 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
   out({ accepted: true })
 } else if (args[0] === 'terminal' && args[1] === 'show') {
   out({ terminal: { connected: true, title: 'OC | OpenCode Discussion', preview: 'ready' } })
-} else if (args[0] === 'orchestration' && args[1] === 'worker-start') {
-  out({ dispatchId: 'dispatch-review', state: 'ready', effects: [] })
+} else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
+  out({ dispatch: { id: 'dispatch-review', status: 'dispatched' }, injected: true, preamble: 'authenticated' })
 } else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
   out({ deliveryId: 'delivery-review', messages: [{ type: 'worker_done', body: 'Reviewed. Verified. Nothing remains.', payload: JSON.stringify({ taskId: 'task-review', dispatchId: 'dispatch-review', outcome: 'succeeded', reportPath: ${JSON.stringify(reportPath)} }) }] })
-} else if (args[0] === 'orchestration' && args[1] === 'worker-show') {
-  out({ worker: { agent_terminal_handle: 'worker-shell' } })
 } else {
   out({ ok: true })
 }
@@ -633,7 +784,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       .map((line) => JSON.parse(line) as string[])
     const worktreeCreate = calls.find((args) => args[0] === 'worktree' && args[1] === 'create')
     const terminalSend = calls.find((args) => args[0] === 'terminal' && args[1] === 'send')
-    const workerStart = calls.find((args) => args[0] === 'orchestration' && args[1] === 'worker-start')
+    const dispatch = calls.find((args) => args[0] === 'orchestration' && args[1] === 'dispatch')
     assert.ok(worktreeCreate?.includes('--base-branch'))
     assert.ok(worktreeCreate?.includes('feature'))
     assert.deepEqual(terminalSend?.slice(0, 6), [
@@ -644,9 +795,12 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       '--text',
       "'opencode'"
     ])
-    assert.ok(workerStart?.includes('--terminal'))
-    assert.ok(!workerStart?.includes('--agent'))
-    assert.ok(!workerStart?.includes('--name'))
+    assert.ok(dispatch?.includes('--to'))
+    assert.ok(dispatch?.includes('worker-shell'))
+    assert.ok(dispatch?.includes('--inject'))
+    assert.ok(dispatch?.includes('--return-preamble'))
+    assert.ok(!dispatch?.includes('--agent'))
+    assert.ok(!dispatch?.includes('--name'))
   } finally {
     await rm(temp, { recursive: true, force: true })
     await rm(evidence, { recursive: true, force: true })
@@ -697,4 +851,195 @@ test('bundled skill never collides with the no-mistakes skill name', async () =>
   const skills = await readdir(new URL('../skills', import.meta.url), 'utf8')
   assert.ok(skills.includes('orca-no-mistakes'))
   assert.ok(!skills.includes('no-mistakes'))
+})
+
+test('parseGateResolution parses actions, finding IDs, guidance, and JSON overrides', () => {
+  const findings: Finding[] = [
+    { id: 'f-1', severity: 'error', action: 'ask-user', description: 'Issue 1' },
+    { id: 'f-2', severity: 'warning', action: 'ask-user', description: 'Issue 2' },
+    { id: 'f-3', severity: 'info', action: 'auto-fix', description: 'Issue 3' }
+  ]
+
+  assert.deepEqual(parseGateResolution('approve', findings), {
+    action: 'approve',
+    guidance: '',
+    selectedFindings: []
+  })
+  assert.deepEqual(parseGateResolution('skip', findings), {
+    action: 'skip',
+    guidance: '',
+    selectedFindings: []
+  })
+  assert.deepEqual(parseGateResolution('stop', findings), {
+    action: 'stop',
+    guidance: '',
+    selectedFindings: []
+  })
+
+  // Plain fix without IDs targets all available
+  const allFix = parseGateResolution('fix', findings)
+  assert.equal(allFix.action, 'fix')
+  assert.equal(allFix.guidance, '')
+  assert.deepEqual(allFix.selectedFindings, findings)
+
+  // Fix with specific IDs and guidance
+  const selectiveFix = parseGateResolution('fix: f-1, f-3: make it robust', findings)
+  assert.equal(selectiveFix.action, 'fix')
+  assert.equal(selectiveFix.guidance, 'make it robust')
+  assert.deepEqual(
+    selectiveFix.selectedFindings.map((f) => f.id),
+    ['f-1', 'f-3']
+  )
+
+  // Fix with single ID in brackets
+  const bracketFix = parseGateResolution('fix [f-2] - please fix this specific issue', findings)
+  assert.equal(bracketFix.action, 'fix')
+  assert.equal(bracketFix.guidance, 'please fix this specific issue')
+  assert.deepEqual(
+    bracketFix.selectedFindings.map((f) => f.id),
+    ['f-2']
+  )
+
+  // JSON resolution with per-finding instructions
+  const jsonFix = parseGateResolution(
+    JSON.stringify({
+      action: 'fix',
+      findingIds: ['f-2'],
+      instructions: { 'f-2': 'add input validation' },
+      guidance: 'overall context'
+    }),
+    findings
+  )
+  assert.equal(jsonFix.action, 'fix')
+  assert.equal(jsonFix.guidance, 'overall context')
+  assert.equal(jsonFix.selectedFindings.length, 1)
+  assert.equal(jsonFix.selectedFindings[0].id, 'f-2')
+  assert.match(jsonFix.selectedFindings[0].description, /add input validation/)
+
+  // Fail-closed test cases
+  assert.deepEqual(parseGateResolution('', findings), {
+    action: 'unknown',
+    guidance: '',
+    selectedFindings: []
+  })
+  assert.deepEqual(parseGateResolution('invalid-decision', findings), {
+    action: 'unknown',
+    guidance: 'invalid-decision',
+    selectedFindings: []
+  })
+  assert.deepEqual(parseGateResolution(JSON.stringify({ guidance: 'missing action' }), findings), {
+    action: 'unknown',
+    guidance: '',
+    selectedFindings: []
+  })
+  assert.deepEqual(parseGateResolution(JSON.stringify({ action: 'invalid' }), findings), {
+    action: 'unknown',
+    guidance: '',
+    selectedFindings: []
+  })
+  assert.deepEqual(
+    parseGateResolution(JSON.stringify({ action: 'fix', findingIds: ['nonexistent'] }), findings),
+    {
+      action: 'fix',
+      guidance: '',
+      selectedFindings: []
+    }
+  )
+  assert.deepEqual(parseGateResolution('fix [nonexistent] - some text', findings), {
+    action: 'fix',
+    guidance: 'some text',
+    selectedFindings: []
+  })
+  assert.deepEqual(parseGateResolution('fix: f-9: some text', findings), {
+    action: 'fix',
+    guidance: 'f-9: some text',
+    selectedFindings: []
+  })
+})
+
+test('fails closed when fix gate resolution selects zero valid findings', async () => {
+  const git = new FakeGit()
+  const orca = new FakeOrca(git)
+  const finding: Finding = {
+    id: 'review-1',
+    severity: 'error',
+    action: 'ask-user',
+    description: 'First issue'
+  }
+  orca.gateResolution = 'fix [nonexistent-id]'
+  orca.reports.set('review', [{ findings: [finding], summary: 'found 1 issue' }])
+
+  await assert.rejects(
+    runPipeline({ intent: 'Fail closed test' }, orca, git),
+    /review fix gate resolved with no matching findings/
+  )
+})
+
+test('runs selective fix on human gate and sends only chosen findings to fixer', async () => {
+  const git = new FakeGit()
+  const orca = new FakeOrca(git)
+  const finding1: Finding = {
+    id: 'review-1',
+    severity: 'error',
+    action: 'ask-user',
+    description: 'First issue'
+  }
+  const finding2: Finding = {
+    id: 'review-2',
+    severity: 'warning',
+    action: 'ask-user',
+    description: 'Second issue'
+  }
+
+  orca.gateResolution = 'fix: review-2: handle edge case'
+  orca.reports.set('review', [
+    { findings: [finding1, finding2], summary: 'found 2 issues' },
+    pass('clean rereview')
+  ])
+
+  const result = await runPipeline({ intent: 'Selective fix test' }, orca, git)
+  assert.equal(result.steps.length, PIPELINE_STEPS.length)
+
+  // The fixer task should only contain review-2
+  const fixerTask = orca.tasks.find((task) => task.spec.startsWith('[review fix 1]'))
+  assert.ok(fixerTask)
+  assert.match(fixerTask.spec, /review-2/)
+  assert.match(fixerTask.spec, /handle edge case/)
+  assert.ok(!fixerTask.spec.includes('"id":"review-1"'))
+})
+
+test('CliOrca creates gate successfully even if advisory notification fails', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'orca-gate-error-'))
+  const fakeOrca = path.join(temp, 'orca')
+  const callsPath = path.join(temp, 'calls.jsonl')
+  try {
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+if (args[1] === 'run-create') {
+  console.log(JSON.stringify({ result: { run: { id: 'gate-run' } } }))
+} else if (args[1] === 'gate-create') {
+  console.log(JSON.stringify({ result: { gate: { id: 'gate-review' } } }))
+} else if (args[0] === 'orchestration' && args[1] === 'send') {
+  console.error('terminal offline')
+  process.exit(1)
+} else {
+  console.log(JSON.stringify({ result: { ok: true } }))
+}
+`
+    )
+    await chmod(fakeOrca, 0o755)
+    const orca = new CliOrca({
+      command: fakeOrca,
+      cwd: temp,
+      notifyHandle: 'disconnected-terminal'
+    })
+    await orca.createRun('gate notification error')
+    assert.equal(await orca.createGate('task-review', 'Choose a review action.'), 'gate-review')
+  } finally {
+    await rm(temp, { recursive: true, force: true })
+  }
 })

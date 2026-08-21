@@ -7,7 +7,7 @@ This document describes implemented behavior in version `0.1.0`. The ADRs under 
 `orca-no-mistakes` supports three commands:
 
 - `install` creates a bare local gate under the repository's Git directory and configures the `orca-no-mistakes` remote.
-- `run` executes the pipeline directly and returns a meaningful process exit status.
+- `run` launches the coordinator detached in a dedicated Orca terminal tab, returning `{"detached":true,"terminalHandle":"..."}` and notifying the originating terminal when decision gates open (pass `--attached` to run synchronously in the foreground).
 - `push` sends one single-line intent as a Git push option to the installed gate.
 
 The runner requires a clean, committed, named feature branch, rejects the detected default branch, verifies an `origin` remote, and optionally checks an expected `--head` SHA. It fetches and rebases onto the selected base before validation continues.
@@ -24,9 +24,9 @@ Reviewers run as fresh opencode workers in disposable child worktrees. Fixes run
 
 ## Findings and gates
 
-Findings are `auto-fix`, `ask-user`, or `no-op`. Reports containing only actionable `auto-fix` findings enter the fix loop automatically. The default maximum is three fix rounds.
+Findings are `auto-fix`, `ask-user`, or `no-op`. Reports containing only actionable `auto-fix` findings enter the fix loop automatically. The default maximum is three automated fix rounds, configurable via `--max-fix-rounds`. When the fix-round limit is reached with actionable findings remaining, the coordinator opens an exhaustion decision gate.
 
-An `ask-user` finding opens an Orca decision gate. Validation stages offer `approve`, `fix`, `skip`, and `stop`; delivery stages offer only `retry` and `stop`. `approve` and `skip` currently let a validation stage complete with unresolved findings. Fix exhaustion currently fails the run instead of opening an escalation gate.
+An `ask-user` finding or fix exhaustion opens an Orca decision gate. Validation stages offer `approve`, `fix`, `skip`, and `stop`; delivery stages offer only `retry` and `stop`. `approve` and `skip` currently let a validation stage complete with unresolved findings.
 
 PR and CI stages are adversarial worker reports. They are not deterministic GitHub API reconciliation, exact-check completeness proof, guarded merge, or delivered-tree verification.
 
@@ -44,8 +44,8 @@ Fixers mutate the active worktree. There is no branch semantic lease, duplicate-
 
 ## Outcome
 
-Direct success prints `{"runId":...,"steps":[...]}` after every stage task completes. The coordinator attempts to mark the Orca worktree completed; on failure it throws, sets a nonzero direct-run exit status, and attempts to mark the worktree in review. Worktree-status update failures are logged as warnings rather than changing the pipeline result.
+An attached run prints `{"runId":...,"steps":[...]}` after every stage task completes. A detached run prints `{"detached":true,"terminalHandle":"..."}` immediately, and the stage result appears in the dedicated Orca terminal. The coordinator attempts to mark the Orca worktree completed; on failure it throws, sets a nonzero direct-run exit status, and attempts to mark the worktree in review. Worktree-status update failures are logged as warnings rather than changing the pipeline result.
 
 Current completion is not the domain `Passed` outcome. It does not prove that required commands ran deterministically, that policy came from a trusted base, that CI was complete on an exact commit, or that the delivered target-branch tree preserved the tested candidate.
 
-Most subprocess commands time out after 120 seconds; worker orchestration uses longer waits. Gate polling and the installed Git gate can wait indefinitely for human resolution or pipeline completion. `ORCA_CLI_COMMAND` overrides the Orca executable; the default is `orca` on macOS and `orca-ide` on Linux.
+Most subprocess commands time out after 120 seconds; worker orchestration uses longer waits. Gate polling inside the detached coordinator waits for human resolution or pipeline completion, while CLI commands return immediately to prevent agent deadlocks. `ORCA_CLI_COMMAND` overrides the Orca executable; the default is `orca` on macOS and `orca-ide` on Linux.

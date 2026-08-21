@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { chmod, mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
@@ -87,6 +88,8 @@ export type PipelineResult = {
 
 type RepoState = Awaited<ReturnType<GitOperations['assertReady']>>
 
+export const DEFAULT_MAX_FIX_ROUNDS = 3
+
 export async function runPipeline(
   options: PipelineOptions,
   orca: OrcaOperations,
@@ -96,7 +99,7 @@ export async function runPipeline(
   if (!intent) {
     throw new Error('--intent is required')
   }
-  const maxFixRounds = options.maxFixRounds ?? 3
+  const maxFixRounds = options.maxFixRounds ?? DEFAULT_MAX_FIX_ROUNDS
   if (!Number.isInteger(maxFixRounds) || maxFixRounds < 0) {
     throw new Error('maxFixRounds must be a non-negative integer')
   }
@@ -146,39 +149,45 @@ export async function runPipeline(
 
       while (actionableFindings(report).length > 0) {
         const actionable = actionableFindings(report)
+        const autoFixable = actionable.filter((finding) => finding.action === 'auto-fix')
         const asksUser = actionable.some((finding) => finding.action === 'ask-user')
-        let shouldFix = !asksUser
+        const exhausted = round >= maxFixRounds
+        let targetFindings: Finding[] = actionable
+        let shouldFix = !asksUser && !exhausted
         let guidance = ''
 
-        if (asksUser) {
+        if (asksUser || exhausted) {
           const deliveryStage = stage === 'push' || stage === 'pr' || stage === 'ci'
           const gateOptions = deliveryStage ? ['retry', 'stop'] : ['approve', 'fix', 'skip', 'stop']
           const gateId = await orca.createGate(
             taskId,
-            gateQuestion(stage, report, gateOptions),
+            gateQuestion(stage, report, gateOptions, exhausted ? maxFixRounds : undefined),
             gateOptions
           )
           const resolution = (await orca.waitForGate(gateId)).trim()
-          const decision = gateDecision(resolution)
-          if (!deliveryStage && (decision === 'approve' || decision === 'skip')) {
+          const decision = parseGateResolution(resolution, actionable)
+          if (!deliveryStage && (decision.action === 'approve' || decision.action === 'skip')) {
             break
           }
-          if (deliveryStage && decision === 'retry') {
+          if (deliveryStage && decision.action === 'retry') {
             report = await runStage()
             continue
-          } else if (!deliveryStage && decision === 'fix') {
+          } else if (!deliveryStage && decision.action === 'fix') {
+            if (decision.selectedFindings.length === 0) {
+              throw new Error(`${stage} fix gate resolved with no matching findings: ${resolution}`)
+            }
             shouldFix = true
-            guidance = resolution.slice(3).replace(/^\s*:\s*/, '')
+            targetFindings = decision.selectedFindings
+            guidance = decision.guidance
           } else {
             throw new Error(`${stage} gate stopped the pipeline: ${resolution}`)
           }
+        } else {
+          targetFindings = autoFixable
         }
 
-        if (!shouldFix) {
+        if (!shouldFix || targetFindings.length === 0) {
           break
-        }
-        if (round >= maxFixRounds) {
-          throw new Error(`${stage} still has findings after ${round} fix rounds: ${report.summary}`)
         }
 
         round += 1
@@ -187,7 +196,7 @@ export async function runPipeline(
           round,
           taskId,
           intent,
-          report,
+          targetFindings,
           guidance,
           path.join(evidenceDir, `fixer-${stage}-${round}.json`),
           retainedFixer,
@@ -285,7 +294,7 @@ async function runFixer(
   round: number,
   parentTask: string,
   intent: string,
-  report: StageReport,
+  findings: Finding[],
   guidance: string,
   reportPath: string,
   retainedFixer: WorkerResult | undefined,
@@ -294,7 +303,7 @@ async function runFixer(
 ): Promise<WorkerResult> {
   await git.assertClean()
   const before = await git.head()
-  const prompt = fixerPrompt(stage, intent, report, guidance, reportPath)
+  const prompt = fixerPrompt(stage, intent, findings, guidance, reportPath)
   const childTask = await orca.createTask(`[${stage} fix ${round}]\n${prompt}`, {
     parent: parentTask
   })
@@ -363,7 +372,31 @@ async function validateReport(
   ) {
     throw new Error(`${stage} worker returned an invalid report`)
   }
-  for (const finding of report.findings) {
+  const normalizedReport = {
+    ...report,
+    findings: report.findings.map((finding) => {
+      if (!finding || typeof finding !== 'object') return finding
+      return {
+        ...finding,
+        id:
+          typeof finding.id === 'string' && finding.id.trim()
+            ? finding.id
+            : `${stage}-${createHash('sha256')
+                .update(
+                  JSON.stringify([
+                    finding.file,
+                    finding.line,
+                    finding.description,
+                    finding.action,
+                    finding.severity
+                  ])
+                )
+                .digest('hex')
+                .slice(0, 12)}`
+      }
+    })
+  }
+  for (const finding of normalizedReport.findings) {
     if (
       !finding ||
       typeof finding.id !== 'string' ||
@@ -378,7 +411,7 @@ async function validateReport(
       throw new Error(`${stage} worker returned an invalid finding`)
     }
   }
-  const artifacts = report.artifacts ?? []
+  const artifacts = normalizedReport.artifacts ?? []
   const canonicalEvidenceRoot = artifacts.length > 0 ? await realpath(evidenceRoot) : evidenceRoot
   for (const artifact of artifacts) {
     const resolved = path.resolve(evidenceRoot, artifact)
@@ -396,7 +429,7 @@ async function validateReport(
       throw new Error(`${stage} worker returned an unsafe artifact path`)
     }
   }
-  return report
+  return normalizedReport
 }
 
 function optionalStringArray(value: string[] | undefined): boolean {
@@ -633,27 +666,146 @@ function fixerInstructions(stage: StageName): string {
 function fixerPrompt(
   stage: StageName,
   intent: string,
-  report: StageReport,
+  findings: Finding[],
   guidance: string,
   reportPath: string
 ): string {
   return `You are the durable fixer for the ${stage} phase of an active no-mistakes run.
 
 User intent: ${intent}
-Findings: ${JSON.stringify(actionableFindings(report))}
+Findings: ${JSON.stringify(findings)}
 ${guidance ? `User guidance: ${guidance}\n` : ''}
 ${fixerInstructions(stage)}
 
 Write {"findings":[],"summary":"what was fixed and committed","tested":["focused command"]} to ${reportPath}, creating its parent directory if needed. Then report exactly once with worker_done: keep --body to the required three-sentence executive summary and pass --report-path ${reportPath}.`
 }
 
-function gateQuestion(stage: StageName, report: StageReport, options: string[]): string {
-  const choices = options.map((option) => (option === 'fix' ? 'fix[: guidance]' : option)).join(', ')
-  return `${stage} needs a human decision. Resolve with ${choices}. Findings: ${JSON.stringify(actionableFindings(report))}`
+function gateQuestion(
+  stage: StageName,
+  report: StageReport,
+  options: string[],
+  exhaustedLimit?: number
+): string {
+  const choices = options.map((option) => (option === 'fix' ? 'fix [id1,id2][: guidance]' : option)).join(', ')
+  const prefix =
+    exhaustedLimit !== undefined
+      ? `${stage} reached the limit of ${exhaustedLimit} fix rounds with actionable findings remaining.`
+      : `${stage} needs a human decision.`
+  return `${prefix} Resolve with ${choices}. Findings: ${JSON.stringify(actionableFindings(report))}`
 }
 
 function gateDecision(resolution: string): string {
   return resolution.trim().toLowerCase().split(/[\s:]/, 1)[0]
+}
+
+export type GateDecision = {
+  action: 'approve' | 'fix' | 'retry' | 'skip' | 'stop' | 'unknown'
+  guidance: string
+  selectedFindings: Finding[]
+}
+
+export function parseGateResolution(resolution: string, availableFindings: Finding[]): GateDecision {
+  const trimmed = resolution.trim()
+  if (!trimmed) {
+    return { action: 'unknown', guidance: '', selectedFindings: [] }
+  }
+
+  if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+    try {
+      const parsed = JSON.parse(trimmed) as {
+        action?: string
+        findingIds?: string[]
+        guidance?: string
+        instructions?: Record<string, string>
+      }
+      if (typeof parsed.action !== 'string') {
+        return { action: 'unknown', guidance: '', selectedFindings: [] }
+      }
+      const rawAction = parsed.action.toLowerCase()
+      const action =
+        rawAction === 'approve' ||
+        rawAction === 'skip' ||
+        rawAction === 'stop' ||
+        rawAction === 'retry' ||
+        rawAction === 'fix'
+          ? rawAction
+          : 'unknown'
+      if (action !== 'fix') {
+        return { action, guidance: parsed.guidance ?? '', selectedFindings: [] }
+      }
+      let selected = availableFindings
+      if (Array.isArray(parsed.findingIds)) {
+        const idSet = new Set(parsed.findingIds)
+        selected = availableFindings.filter((f) => idSet.has(f.id))
+      }
+      if (parsed.instructions) {
+        selected = selected.map((f) => {
+          const inst = parsed.instructions?.[f.id]
+          return inst ? { ...f, description: `${f.description} (User instruction: ${inst})` } : f
+        })
+      }
+      return { action: 'fix', guidance: parsed.guidance ?? '', selectedFindings: selected }
+    } catch {
+      return { action: 'unknown', guidance: trimmed, selectedFindings: [] }
+    }
+  }
+
+  const rawAction = gateDecision(trimmed)
+  if (rawAction === 'approve' || rawAction === 'skip' || rawAction === 'stop' || rawAction === 'retry') {
+    return { action: rawAction, guidance: '', selectedFindings: [] }
+  }
+  if (rawAction !== 'fix') {
+    return { action: 'unknown', guidance: trimmed, selectedFindings: [] }
+  }
+
+  const remainder = trimmed.slice(3).replace(/^[\s:]+/, '').trim()
+  if (!remainder) {
+    return { action: 'fix', guidance: '', selectedFindings: availableFindings }
+  }
+
+  const bracketMatch = remainder.match(/^\[([^\]]+)\](.*)$/)
+  if (bracketMatch) {
+    const rawIds = bracketMatch[1].split(/[\s,]+/).filter(Boolean)
+    const availableIds = new Set(availableFindings.map((f) => f.id))
+    const selectedIds = new Set(rawIds.filter((id) => availableIds.has(id)))
+    const guidance = bracketMatch[2].replace(/^[\s:=-]+/, '').trim()
+    const selected = availableFindings.filter((f) => selectedIds.has(f.id))
+    return { action: 'fix', guidance, selectedFindings: selected }
+  }
+
+  const availableIds = new Set(availableFindings.map((f) => f.id))
+  const tokenRegex = /[a-zA-Z0-9_-]+/g
+  const matchedTokens: string[] = []
+  let match: RegExpExecArray | null
+  while ((match = tokenRegex.exec(remainder)) !== null) {
+    if (availableIds.has(match[0]) && !matchedTokens.includes(match[0])) {
+      matchedTokens.push(match[0])
+    }
+  }
+
+  if (matchedTokens.length > 0) {
+    const selectedIds = new Set(matchedTokens)
+    const selected = availableFindings.filter((f) => selectedIds.has(f.id))
+    let guidance = remainder
+    for (const id of matchedTokens) {
+      guidance = guidance.replace(new RegExp(`\\b${id}\\b`, 'g'), '')
+    }
+    guidance = guidance.replace(/^[\s,;:[\]|=-]+/, '').trim()
+    return { action: 'fix', guidance, selectedFindings: selected }
+  }
+
+  const candidateTokens = remainder
+    .split(':')[0]
+    .split(',')
+    .map((token) => token.trim())
+    .filter(Boolean)
+  const looksLikeIdList =
+    candidateTokens.length > 0 && candidateTokens.every((token) => /^[A-Za-z0-9_-]+$/.test(token))
+  if (looksLikeIdList) {
+    return { action: 'fix', guidance: remainder, selectedFindings: [] }
+  }
+
+  return { action: 'fix', guidance: remainder, selectedFindings: availableFindings }
 }
 
 type CommandResult = { code: number; stderr: string; stdout: string }
@@ -728,7 +880,12 @@ type CliOrcaOptions = {
   cwd: string
   fixerEffort?: string
   fixerModel?: string
+  notifyHandle?: string
   reviewerModel?: string
+}
+
+function resolveOrcaCommand(override?: string): string {
+  return override ?? process.env.ORCA_CLI_COMMAND ?? (process.platform === 'linux' ? 'orca-ide' : 'orca')
 }
 
 export class CliOrca implements OrcaOperations {
@@ -736,15 +893,16 @@ export class CliOrca implements OrcaOperations {
   readonly #cwd: string
   readonly #fixerEffort?: string
   readonly #fixerModel?: string
+  readonly #notifyHandle?: string
   readonly #reviewerModel?: string
   #runId?: string
 
   constructor(options: CliOrcaOptions) {
-    this.#command =
-      options.command ?? process.env.ORCA_CLI_COMMAND ?? (process.platform === 'linux' ? 'orca-ide' : 'orca')
+    this.#command = resolveOrcaCommand(options.command)
     this.#cwd = options.cwd
     this.#fixerEffort = options.fixerEffort
     this.#fixerModel = options.fixerModel
+    this.#notifyHandle = options.notifyHandle
     this.#reviewerModel = options.reviewerModel
   }
 
@@ -771,67 +929,61 @@ export class CliOrca implements OrcaOperations {
   }
 
   async startWorker(taskId: string, launch: WorkerLaunch): Promise<WorkerResult> {
-    // Start opencode before worker-start can deliver its preamble to a shell.
+    // Start opencode first, then use dispatch injection so the preamble carries its capability.
     const prepared =
       !launch.terminal
         ? launch.worktree === 'new-child'
           ? await this.#prepareNewChildWorker(launch)
           : await this.#prepareCurrentWorker(launch)
         : undefined
-    const args = ['orchestration', 'worker-start', '--task', taskId]
+    const terminalHandle = prepared?.terminalHandle ?? launch.terminal
+    if (!terminalHandle) throw new Error('fresh workers must be prepared with an existing terminal')
+    const args = [
+      'orchestration',
+      'dispatch',
+      '--task',
+      taskId,
+      '--to',
+      terminalHandle,
+      '--inject',
+      '--return-preamble'
+    ]
     if (this.#runId) args.push('--run', this.#runId)
-    if (prepared) {
-      args.push('--worktree', `path:${prepared.worktreePath}`, '--terminal', prepared.terminalHandle)
-    } else if (launch.terminal) {
-      args.push('--terminal', launch.terminal)
-    } else {
-      throw new Error('fresh workers must be prepared with an existing terminal')
-    }
     args.push('--json')
     let receipt: {
-      dispatchId: string
-      effects?: { action?: string; id?: string; kind?: string }[]
-      state: string
+      dispatch: { id: string; status: string } | null
+      injected?: boolean
     }
     try {
       receipt = await this.#json<{
-        dispatchId: string
-        effects?: { action?: string; id?: string; kind?: string }[]
-        state: string
+        dispatch: { id: string; status: string } | null
+        injected?: boolean
       }>(args, true)
     } catch (error) {
       if (prepared) await this.#cleanupPreparedWorker(prepared)
       throw error
     }
-    if (!receipt || typeof receipt.dispatchId !== 'string' || typeof receipt.state !== 'string') {
+    const dispatchId = receipt?.dispatch?.id
+    if (!dispatchId || receipt.injected !== true) {
       if (prepared) await this.#cleanupPreparedWorker(prepared)
-      throw new Error('worker-start returned an invalid receipt')
+      throw new Error('dispatch returned an invalid receipt')
     }
-    const worktreeId =
-      prepared?.worktreeId ??
-      receipt.effects?.find((effect) => effect.kind === 'worktree' && effect.action === 'created')?.id
-    if (receipt.state !== 'ready') {
-      await this.#cleanupFailedWorker(receipt.dispatchId, worktreeId)
-      throw new Error(`worker ${receipt.dispatchId} did not start: ${receipt.state}`)
-    }
+    const worktreeId = prepared?.worktreeId
     let deliveryId: string | undefined
     try {
-      const result = await this.#waitForWorker(taskId, receipt.dispatchId)
+      const result = await this.#waitForWorker(taskId, dispatchId)
       deliveryId = result.deliveryId
       if (result.error) throw new Error(result.error)
-      const shown = await this.#json<{
-        worker: { agent_terminal_handle: string | null }
-      }>(['orchestration', 'worker-show', '--dispatch', receipt.dispatchId, '--json'])
       return {
         deliveryId,
         report: result.report!,
         taskId,
-        dispatchId: receipt.dispatchId,
-        terminalHandle: shown.worker.agent_terminal_handle ?? undefined,
+        dispatchId,
+        terminalHandle,
         worktreeId
       }
     } catch (error) {
-      await this.#cleanupFailedWorker(receipt.dispatchId, worktreeId, deliveryId)
+      await this.#cleanupFailedWorker(dispatchId, terminalHandle, worktreeId, deliveryId)
       throw error
     }
   }
@@ -875,7 +1027,7 @@ export class CliOrca implements OrcaOperations {
           `path:${worktree.path}`,
           '--json'
         ])
-        terminalHandle = createdTerminal.terminal.handle
+        terminalHandle = createdTerminal?.terminal?.handle ?? ''
       }
       if (!terminalHandle) throw new Error('terminal create returned an invalid receipt')
 
@@ -899,7 +1051,7 @@ export class CliOrca implements OrcaOperations {
         `path:${this.#cwd}`,
         '--json'
       ])
-      prepared.terminalHandle = created.terminal.handle
+      prepared.terminalHandle = created?.terminal?.handle ?? ''
       if (!prepared.terminalHandle) throw new Error('terminal create returned an invalid receipt')
       const model = launch.role === 'reviewer' ? this.#reviewerModel : this.#fixerModel
       const variant = launch.role === 'fixer' ? this.#fixerEffort : undefined
@@ -960,13 +1112,12 @@ export class CliOrca implements OrcaOperations {
   }
 
   async finishWorker(worker: WorkerResult, disposition: 'release' | 'retain'): Promise<void> {
-    await this.#json([
-      'orchestration',
-      disposition === 'release' ? 'worker-release' : 'worker-retain',
-      '--dispatch',
-      worker.dispatchId,
-      '--json'
-    ])
+    if (disposition === 'release' && worker.terminalHandle) {
+      await this.#json(
+        ['terminal', 'close', '--terminal', worker.terminalHandle, '--tab', '--json'],
+        true
+      ).catch(() => {})
+    }
     if (worker.deliveryId) {
       await this.#json([
         'orchestration',
@@ -1015,6 +1166,26 @@ export class CliOrca implements OrcaOperations {
       JSON.stringify(options),
       '--json'
     ])
+    if (this.#notifyHandle) {
+      await this.#json([
+        'orchestration',
+        'send',
+        '--to',
+        this.#notifyHandle,
+        ...(this.#runId ? ['--run', this.#runId] : []),
+        '--subject',
+        'no-mistakes decision required',
+        '--body',
+        `${question}\nGate: ${result.gate.id}`,
+        '--type',
+        'question',
+        '--priority',
+        'high',
+        '--json'
+      ]).catch((error) => {
+        console.error(`warning: could not notify terminal ${this.#notifyHandle}: ${String(error)}`)
+      })
+    }
     return result.gate.id
   }
 
@@ -1150,11 +1321,16 @@ export class CliOrca implements OrcaOperations {
 
   async #cleanupFailedWorker(
     dispatchId: string,
+    terminalHandle: string,
     worktreeId?: string,
     deliveryId?: string
   ): Promise<void> {
     await this.#json(
-      ['orchestration', 'worker-release', '--dispatch', dispatchId, '--json'],
+      ['orchestration', 'worker-abandon', '--dispatch', dispatchId, '--json'],
+      true
+    ).catch(() => {})
+    await this.#json(
+      ['terminal', 'close', '--terminal', terminalHandle, '--tab', '--json'],
       true
     ).catch(() => {})
     if (worktreeId) {
@@ -1381,7 +1557,7 @@ function shellQuote(value: string): string {
 
 type CliFlags = Record<string, string | boolean>
 
-const BOOLEAN_FLAGS = new Set(['force'])
+const BOOLEAN_FLAGS = new Set(['attached', 'force'])
 const VALUE_FLAGS = new Set([
   'base',
   'fixer-effort',
@@ -1389,6 +1565,7 @@ const VALUE_FLAGS = new Set([
   'head',
   'intent',
   'max-fix-rounds',
+  'notify',
   'repo',
   'reviewer-model'
 ])
@@ -1396,12 +1573,14 @@ const COMMAND_FLAGS: Record<string, Set<string>> = {
   install: new Set(['force', 'repo']),
   push: new Set(['intent', 'repo']),
   run: new Set([
+    'attached',
     'base',
     'fixer-effort',
     'fixer-model',
     'head',
     'intent',
     'max-fix-rounds',
+    'notify',
     'repo',
     'reviewer-model'
   ])
@@ -1438,6 +1617,62 @@ function stringFlag(flags: CliFlags, name: string): string | undefined {
   return typeof value === 'string' ? value : undefined
 }
 
+async function launchDetachedRun(root: string, flags: CliFlags): Promise<string> {
+  const orcaCommand = resolveOrcaCommand()
+  const created = unwrapJson<{ terminal: { handle: string } }>(
+    (
+      await command(
+        orcaCommand,
+        ['terminal', 'create', '--worktree', `path:${root}`, '--title', 'no-mistakes', '--json'],
+        root
+      )
+    ).stdout
+  )
+  const terminalHandle = created?.terminal?.handle
+  if (!terminalHandle) throw new Error('terminal create returned an invalid receipt')
+
+  const attachedArgs = ['run', '--attached', '--repo', root]
+  for (const name of COMMAND_FLAGS.run) {
+    if (name === 'attached' || name === 'notify' || name === 'repo') continue
+    const value = stringFlag(flags, name)
+    if (value !== undefined) attachedArgs.push(`--${name}`, value)
+  }
+  const notifyHandle = stringFlag(flags, 'notify') ?? process.env.ORCA_TERMINAL_HANDLE
+  if (notifyHandle) attachedArgs.push('--notify', notifyHandle)
+  const quotedCommand = [process.execPath, fileURLToPath(import.meta.url), ...attachedArgs]
+    .map(shellQuote)
+    .join(' ')
+  const coordinatorCommand = process.env.ORCA_CLI_COMMAND
+    ? `ORCA_CLI_COMMAND=${shellQuote(process.env.ORCA_CLI_COMMAND)} ${quotedCommand}`
+    : quotedCommand
+
+  try {
+    await command(
+      orcaCommand,
+      [
+        'terminal',
+        'send',
+        '--terminal',
+        terminalHandle,
+        '--text',
+        coordinatorCommand,
+        '--enter',
+        '--json'
+      ],
+      root
+    )
+  } catch (error) {
+    await command(
+      orcaCommand,
+      ['terminal', 'close', '--terminal', terminalHandle, '--tab', '--json'],
+      root,
+      { allowFailure: true }
+    )
+    throw error
+  }
+  return terminalHandle
+}
+
 export async function main(argv: string[]): Promise<void> {
   if (argv.length === 0 || argv[0] === '--help' || argv[0] === '-h' || argv.includes('--help')) {
     console.log(`Usage:
@@ -1472,21 +1707,31 @@ Run options:
   if (parsed.command !== 'run') throw new Error(`unknown command: ${parsed.command}`)
   const intent = stringFlag(parsed.flags, 'intent')
   if (!intent) throw new Error('run requires --intent')
+  const maxFixRoundsValue = parsed.flags['max-fix-rounds']
+  if (maxFixRoundsValue === true) throw new Error('--max-fix-rounds requires a number')
+  const maxFixRounds = maxFixRoundsValue === undefined ? undefined : Number(maxFixRoundsValue)
+  if (maxFixRounds !== undefined && (!Number.isInteger(maxFixRounds) || maxFixRounds < 0)) {
+    throw new Error('maxFixRounds must be a non-negative integer')
+  }
   const git = new GitShell({
     repo,
     base: stringFlag(parsed.flags, 'base'),
     expectedHead: stringFlag(parsed.flags, 'head')
   })
   const root = (await command('git', ['-C', repo, 'rev-parse', '--show-toplevel'], repo)).stdout.trim()
+  if (parsed.flags.attached !== true) {
+    await git.assertReady()
+    const terminalHandle = await launchDetachedRun(root, parsed.flags)
+    console.log(JSON.stringify({ detached: true, terminalHandle }))
+    return
+  }
   const orca = new CliOrca({
     cwd: root,
     reviewerModel: stringFlag(parsed.flags, 'reviewer-model'),
     fixerModel: stringFlag(parsed.flags, 'fixer-model'),
-    fixerEffort: stringFlag(parsed.flags, 'fixer-effort')
+    fixerEffort: stringFlag(parsed.flags, 'fixer-effort'),
+    notifyHandle: stringFlag(parsed.flags, 'notify')
   })
-  const maxFixRoundsValue = parsed.flags['max-fix-rounds']
-  if (maxFixRoundsValue === true) throw new Error('--max-fix-rounds requires a number')
-  const maxFixRounds = maxFixRoundsValue === undefined ? undefined : Number(maxFixRoundsValue)
   const result = await runPipeline({ intent, maxFixRounds }, orca, git)
   console.log(JSON.stringify(result))
 }
