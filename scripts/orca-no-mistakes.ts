@@ -1333,7 +1333,7 @@ export class CliOrca implements OrcaOperations {
           'check',
           '--wait',
           '--types',
-          'worker_done,escalation,question',
+          'worker_done,escalation,question,heartbeat',
           '--timeout-ms',
           '900000',
           ...(this.#runId ? ['--run', this.#runId] : []),
@@ -1371,6 +1371,7 @@ export class CliOrca implements OrcaOperations {
       if (!Array.isArray(result.messages) || result.messages.length === 0) {
         return { deliveryId: result.deliveryId, error: 'orchestration check returned no messages' }
       }
+      let heartbeatOnly = true
       for (const message of result.messages) {
         let payload: Record<string, unknown>
         try {
@@ -1387,6 +1388,14 @@ export class CliOrca implements OrcaOperations {
             error: `unexpected orchestration message while waiting for ${dispatchId}`
           }
         }
+        if (message.type === 'heartbeat') {
+          if (payload.taskId !== taskId) {
+            return { deliveryId: result.deliveryId, error: `worker ${dispatchId} heartbeated for the wrong task` }
+          }
+          lastActivityAt = Date.now()
+          continue
+        }
+        heartbeatOnly = false
         if (message.type !== 'worker_done') {
           return {
             deliveryId: result.deliveryId,
@@ -1432,6 +1441,19 @@ export class CliOrca implements OrcaOperations {
             error: `worker ${dispatchId} report could not be read: ${String(error)}`
           }
         }
+      }
+      if (heartbeatOnly) {
+        if (result.deliveryId) {
+          await this.#json([
+            'orchestration',
+            'check',
+            '--ack',
+            result.deliveryId,
+            ...(this.#runId ? ['--run', this.#runId] : []),
+            '--json'
+          ])
+        }
+        continue
       }
     }
   }

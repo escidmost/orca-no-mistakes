@@ -869,6 +869,8 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
   if (count === 0) {
     console.log(JSON.stringify({ _keepalive: true, _heartbeat: true, elapsedMs: 15000, deadlineMs: 900000 }))
     process.exitCode = 1
+  } else if (count === 1) {
+    out({ deliveryId: 'delivery-heartbeat', messages: [{ type: 'heartbeat', body: 'still reviewing', payload: JSON.stringify({ taskId: 'task-review', dispatchId: 'dispatch-review' }) }] })
   } else {
     out({ deliveryId: 'delivery-review', messages: [{ type: 'worker_done', body: 'Reviewed. Verified. Nothing remains.', payload: JSON.stringify({ taskId: 'task-review', dispatchId: 'dispatch-review', outcome: 'succeeded', reportPath: ${JSON.stringify(reportPath)} }) }] })
   }
@@ -913,7 +915,21 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     assert.ok(dispatch?.includes('--return-preamble'))
     assert.ok(!dispatch?.includes('--agent'))
     assert.ok(!dispatch?.includes('--name'))
-    assert.equal(calls.filter((args) => args[0] === 'orchestration' && args[1] === 'check').length, 2)
+    assert.equal(
+      calls.filter(
+        (args) => args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')
+      ).length,
+      3
+    )
+    assert.ok(
+      calls.some(
+        (args) =>
+          args[0] === 'orchestration' &&
+          args[1] === 'check' &&
+          args.includes('--ack') &&
+          args.includes('delivery-heartbeat')
+      )
+    )
     assert.ok(calls.filter((args) => args[0] === 'terminal' && args[1] === 'show').length >= 3)
   } finally {
     await rm(temp, { recursive: true, force: true })
