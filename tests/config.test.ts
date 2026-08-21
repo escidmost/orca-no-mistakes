@@ -163,6 +163,38 @@ test('fails closed on unknown keys in auto_fix configuration', () => {
   )
 })
 
+test('fails closed on unknown stage names in stages configuration', () => {
+  assert.throws(
+    () => parseConfig({ stages: { unknown_stage_name: {} } }),
+    (err: Error) => {
+      assert.match(err.message, /Invalid configuration/)
+      assert.match(err.message, /Unrecognized key\(s\) 'unknown_stage_name' at 'stages'/)
+      return true
+    }
+  )
+})
+
+test('deepMerge prevents prototype pollution from __proto__ and constructor payloads', () => {
+  const payload = JSON.parse('{"agent_args_override":{"__proto__":{"polluted":"yes"}}}')
+  const merged = deepMerge({}, payload)
+  assert.equal((Object.prototype as unknown as { polluted?: string }).polluted, undefined)
+  assert.equal(({} as { polluted?: string }).polluted, undefined)
+})
+
+test('allow_review_autofix: true overrides baseline in resolveRoleConfig and resolvePipelineConfig', () => {
+  const repoGlobalConfig: OrcaNoMistakesConfig = {
+    defaults: {
+      auto_fix: { allow_review_autofix: true }
+    }
+  }
+  const role = resolveRoleConfig('review', 'reviewer', { repoGlobalConfig })
+  assert.equal(role.auto_fix.allow_review_autofix, true)
+
+  const pipeline = resolvePipelineConfig({ repoGlobalConfig })
+  assert.equal(pipeline.auto_fix.allow_review_autofix, true)
+  assert.equal(pipeline.stages.review.reviewer.auto_fix.allow_review_autofix, true)
+})
+
 test('fails closed on invalid types for configuration fields', () => {
   assert.throws(
     () => parseConfig({ auto_fix: { max_rounds: -1 } }),

@@ -100,7 +100,7 @@ export function formatZodError(error: z.ZodError): string {
   const issues = error.issues.map((issue) => {
     const path = issue.path.join('.')
     if (issue.code === 'unrecognized_keys') {
-      const keys = ((issue as unknown as { keys?: string[] }).keys ?? []).map((k: string) => `'${k}'`).join(', ')
+      const keys = issue.keys.map((k: string) => `'${k}'`).join(', ')
       return path ? `Unrecognized key(s) ${keys} at '${path}'` : `Unrecognized key(s) ${keys}`
     }
     return path ? `Invalid value at '${path}': ${issue.message}` : issue.message
@@ -142,8 +142,9 @@ export function deepMerge<T = unknown>(target: unknown, source: unknown): T {
 
   const result: Record<string, unknown> = structuredClone(target) as Record<string, unknown>
   for (const [key, val] of Object.entries(source as Record<string, unknown>)) {
+    if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue
     if (val !== undefined) {
-      result[key] = key in result && result[key] !== undefined ? deepMerge(result[key], val) : structuredClone(val)
+      result[key] = Object.hasOwn(result, key) && result[key] !== undefined ? deepMerge(result[key], val) : structuredClone(val)
     }
   }
   return result as T
@@ -244,7 +245,9 @@ export function resolvePipelineConfig(options: ResolverOptions = {}): ResolvedPi
   const autoFix = [
     { ...BASELINE_AUTO_FIX },
     u?.auto_fix,
+    extractBase(u?.defaults)?.auto_fix,
     r?.auto_fix,
+    extractBase(r?.defaults)?.auto_fix,
     c?.auto_fix,
     c?.max_fix_rounds !== undefined ? { max_rounds: c.max_fix_rounds } : undefined
   ].reduce<AutoFixConfig>((acc, item) => (item ? deepMerge(acc, item) : acc), {})
@@ -252,7 +255,9 @@ export function resolvePipelineConfig(options: ResolverOptions = {}): ResolvedPi
   const agentArgs = [
     {},
     u?.agent_args_override,
+    extractBase(u?.defaults)?.agent_args_override,
     r?.agent_args_override,
+    extractBase(r?.defaults)?.agent_args_override,
     c?.agent_args_override
   ].reduce<AgentArgsOverride>((acc, item) => (item ? deepMerge(acc, item) : acc), {})
 

@@ -8,7 +8,6 @@ import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 import { PIPELINE_STEPS, type StageName } from './config.ts'
-export { PIPELINE_STEPS, type StageName } from './config.ts'
 export type FindingAction = 'ask-user' | 'auto-fix' | 'no-op'
 
 export type Finding = {
