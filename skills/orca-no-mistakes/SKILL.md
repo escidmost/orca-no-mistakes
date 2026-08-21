@@ -63,6 +63,7 @@ A `fix` resolution supports targeted finding selection, per-finding instructions
 - Plain text syntax: `--resolution "fix: id1, id2: guidance"` or `--resolution "fix [id1, id2] - guidance"`.
 - JSON syntax: `--resolution '{"action":"fix","findingIds":["id1"],"instructions":{"id1":"instruction"},"guidance":"global guidance"}'`.
 - Resolving with `fix` without IDs targets all actionable findings. Unselected findings are evaluated in subsequent re-review passes.
+- Copy IDs exactly from the gate question. If none of the supplied IDs match a reported finding, the run stops with `<stage> fix gate resolved with no matching findings`.
 
 Escalate every `ask-user` finding to the user before resolving it. Relay its ID, file and line when present, and full description. Do not choose `approve` or `skip` on the user's behalf.
 

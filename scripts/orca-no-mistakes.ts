@@ -374,16 +374,17 @@ async function validateReport(
   }
   const normalizedReport = {
     ...report,
-    findings: report.findings.map((finding) => {
+    findings: report.findings.map((finding, index) => {
       if (!finding || typeof finding !== 'object') return finding
       return {
         ...finding,
         id:
-          typeof finding.id === 'string' && finding.id.trim()
-            ? finding.id
+          typeof finding.id === 'string' && /^[A-Za-z0-9_-]+$/.test(finding.id.trim())
+            ? finding.id.trim()
             : `${stage}-${createHash('sha256')
                 .update(
                   JSON.stringify([
+                    index,
                     finding.file,
                     finding.line,
                     finding.description,
@@ -953,18 +954,20 @@ export class CliOrca implements OrcaOperations {
     let receipt: {
       dispatch: { id: string; status: string } | null
       injected?: boolean
+      preamble?: string
     }
     try {
       receipt = await this.#json<{
         dispatch: { id: string; status: string } | null
         injected?: boolean
+        preamble?: string
       }>(args, true)
     } catch (error) {
       if (prepared) await this.#cleanupPreparedWorker(prepared)
       throw error
     }
     const dispatchId = receipt?.dispatch?.id
-    if (!dispatchId || receipt.injected !== true) {
+    if (!dispatchId || receipt.injected !== true || !receipt.preamble?.trim()) {
       if (prepared) await this.#cleanupPreparedWorker(prepared)
       throw new Error('dispatch returned an invalid receipt')
     }
@@ -1166,7 +1169,7 @@ export class CliOrca implements OrcaOperations {
       JSON.stringify(options),
       '--json'
     ])
-    if (this.#notifyHandle) {
+    if (this.#notifyHandle && this.#notifyHandle !== process.env.ORCA_TERMINAL_HANDLE) {
       await this.#json([
         'orchestration',
         'send',

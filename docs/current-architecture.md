@@ -7,7 +7,7 @@ This document describes implemented behavior in version `0.1.0`. The ADRs under 
 `orca-no-mistakes` supports three commands:
 
 - `install` creates a bare local gate under the repository's Git directory and configures the `orca-no-mistakes` remote.
-- `run` launches the coordinator detached in a dedicated Orca terminal tab, returning `{"detached":true,"terminalHandle":"..."}` and notifying the originating terminal when decision gates open (pass `--attached` to run synchronously in the foreground).
+- `run` launches the coordinator detached in a dedicated Orca terminal tab and returns `{"detached":true,"terminalHandle":"..."}`. If `--notify <handle>` is passed or `ORCA_TERMINAL_HANDLE` is set, the coordinator also notifies that terminal when a decision gate opens. Pass `--attached` to run synchronously in the foreground.
 - `push` sends one single-line intent as a Git push option to the installed gate.
 
 The runner requires a clean, committed, named feature branch, rejects the detected default branch, verifies an `origin` remote, and optionally checks an expected `--head` SHA. It fetches and rebases onto the selected base before validation continues.

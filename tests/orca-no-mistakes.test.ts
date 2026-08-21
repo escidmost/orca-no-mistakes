@@ -955,6 +955,12 @@ test('parseGateResolution parses actions, finding IDs, guidance, and JSON overri
     guidance: 'f-9: some text',
     selectedFindings: []
   })
+
+  // Free-text guidance with no ID list targets every available finding
+  const guidedFix = parseGateResolution('fix please handle the null case first', findings)
+  assert.equal(guidedFix.action, 'fix')
+  assert.equal(guidedFix.guidance, 'please handle the null case first')
+  assert.deepEqual(guidedFix.selectedFindings, findings)
 })
 
 test('fails closed when fix gate resolution selects zero valid findings', async () => {
