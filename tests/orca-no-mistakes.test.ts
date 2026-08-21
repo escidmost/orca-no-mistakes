@@ -1165,6 +1165,9 @@ test('a held branch semantic lease fails closed and --force-lease reclaims it', 
     /branch feature is already leased by run run-holder/
   )
   assert.equal(ledger.leaseFor('/repo', 'feature')?.run_id, 'run-holder')
+  const loser = ledger.listRuns().find((run) => run.intent === 'Second concurrent attempt.')
+  assert.ok(loser)
+  assert.equal(ledger.runStatus(loser.run_id), 'failed')
 
   await runPipeline(
     { forceLease: true, intent: 'Forceful reclaim.' },
