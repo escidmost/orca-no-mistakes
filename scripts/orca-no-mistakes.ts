@@ -874,6 +874,7 @@ function unwrapJson<T>(stdout: string): T {
 
 const DEFAULT_WORKER_AGENT = 'opencode'
 const WORKER_AGENT_READY_TIMEOUT_MS = 60_000
+const WORKER_IDLE_TIMEOUT_MS = 1_800_000
 
 type PreparedWorker = {
   terminalHandle: string
@@ -983,7 +984,7 @@ export class CliOrca implements OrcaOperations {
     const worktreeId = prepared?.worktreeId
     let deliveryId: string | undefined
     try {
-      const result = await this.#waitForWorker(taskId, dispatchId)
+      const result = await this.#waitForWorker(taskId, dispatchId, terminalHandle)
       deliveryId = result.deliveryId
       if (result.error) throw new Error(result.error)
       return {
@@ -1307,9 +1308,11 @@ export class CliOrca implements OrcaOperations {
 
   async #waitForWorker(
     taskId: string,
-    dispatchId: string
+    dispatchId: string,
+    terminalHandle: string
   ): Promise<{ deliveryId?: string; error?: string; report?: StageReport }> {
-    const deadline = Date.now() + 1800000
+    let lastActivityAt = Date.now()
+    let lastOutputAt = await this.#workerOutputAt(terminalHandle)
     for (;;) {
       const result = await this.#json<{
         _heartbeat?: boolean
@@ -1339,10 +1342,21 @@ export class CliOrca implements OrcaOperations {
         true
       )
       if (result._keepalive || result._heartbeat || result.timedOut) {
-        if (Date.now() >= deadline) {
+        const outputAt = await this.#workerOutputAt(terminalHandle)
+        if (outputAt === undefined) {
           return {
             deliveryId: result.deliveryId,
-            error: `worker ${dispatchId} timed out waiting for orchestration check`
+            error: `worker ${dispatchId} terminal disconnected`
+          }
+        }
+        if (lastOutputAt === undefined || outputAt > lastOutputAt) {
+          lastOutputAt = outputAt
+          lastActivityAt = Date.now()
+        }
+        if (Date.now() - lastActivityAt >= WORKER_IDLE_TIMEOUT_MS) {
+          return {
+            deliveryId: result.deliveryId,
+            error: `worker ${dispatchId} was inactive for ${WORKER_IDLE_TIMEOUT_MS}ms`
           }
         }
         await new Promise((resolve) => setTimeout(resolve, 250))
@@ -1420,6 +1434,14 @@ export class CliOrca implements OrcaOperations {
         }
       }
     }
+  }
+
+  async #workerOutputAt(terminalHandle: string): Promise<number | undefined> {
+    const result = await this.#json<{
+      terminal?: { connected?: boolean; lastOutputAt?: number }
+    }>(['terminal', 'show', '--terminal', terminalHandle, '--json'], true)
+    if (result.terminal?.connected === false) return undefined
+    return typeof result.terminal?.lastOutputAt === 'number' ? result.terminal.lastOutputAt : 0
   }
 
   async #cleanupFailedWorker(

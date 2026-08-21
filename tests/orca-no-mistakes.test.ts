@@ -859,7 +859,8 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
 } else if (args[0] === 'terminal' && args[1] === 'send') {
   out({ accepted: true })
 } else if (args[0] === 'terminal' && args[1] === 'show') {
-  out({ terminal: { connected: true, title: 'OC | OpenCode Discussion', preview: 'ready' } })
+  const count = fs.existsSync(${JSON.stringify(checkCountPath)}) ? Number(fs.readFileSync(${JSON.stringify(checkCountPath)}, 'utf8')) : 0
+  out({ terminal: { connected: true, lastOutputAt: count, title: 'OC | OpenCode Discussion', preview: 'ready' } })
 } else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
   out({ dispatch: { id: 'dispatch-review', status: 'dispatched' }, injected: true, preamble: 'authenticated' })
 } else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
@@ -913,6 +914,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     assert.ok(!dispatch?.includes('--agent'))
     assert.ok(!dispatch?.includes('--name'))
     assert.equal(calls.filter((args) => args[0] === 'orchestration' && args[1] === 'check').length, 2)
+    assert.ok(calls.filter((args) => args[0] === 'terminal' && args[1] === 'show').length >= 3)
   } finally {
     await rm(temp, { recursive: true, force: true })
     await rm(evidence, { recursive: true, force: true })
