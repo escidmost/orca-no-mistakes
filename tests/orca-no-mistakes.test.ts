@@ -1683,3 +1683,98 @@ test('failed commit application stops the pipeline and cleans up the fixer', asy
   assert.ok(orca.removedWorktrees.includes('wt-gate-ca'))
   assert.ok(git.calls.includes('delete-branch:no-mistakes-gate-ca'))
 })
+
+test('a fixer that rewrites or merges history still lands on the gate branch', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'orca-rebase-harvest-'))
+  try {
+    const repo = await seedOriginRepo(temp)
+    git(repo, 'checkout', '-b', 'feature')
+    await writeFile(path.join(repo, 'feature.txt'), 'feature\n')
+    git(repo, 'add', 'feature.txt')
+    git(repo, 'commit', '-m', 'feature')
+
+    git(repo, 'checkout', 'main')
+    await writeFile(path.join(repo, 'upstream.txt'), 'upstream\n')
+    git(repo, 'add', 'upstream.txt')
+    git(repo, 'commit', '-m', 'upstream')
+    git(repo, 'push', 'origin', 'main')
+    git(repo, 'checkout', 'feature')
+
+    const gatePath = path.join(temp, 'gate')
+    git(repo, 'worktree', 'add', gatePath, '-b', 'no-mistakes-gate-harvest', 'feature')
+    const gateShell = new GitShell({ repo: gatePath })
+    await gateShell.assertReady()
+    const base = git(gatePath, 'rev-parse', 'HEAD')
+
+    const rebaseWorker = path.join(temp, 'worker-rebase')
+    git(gatePath, 'worktree', 'add', rebaseWorker, '-b', 'no-mistakes-fixer-rebase', base)
+    git(rebaseWorker, 'rebase', 'origin/main')
+    const rebasedHead = git(rebaseWorker, 'rev-parse', 'HEAD')
+    assert.notEqual(rebasedHead, base)
+
+    const rebaseApplied = await gateShell.applyWorktreeCommits(rebaseWorker, base)
+    assert.deepEqual(rebaseApplied.findings, [])
+    assert.equal(git(gatePath, 'rev-parse', 'HEAD'), rebasedHead)
+    assert.equal(git(gatePath, 'rev-list', '--count', 'origin/main..HEAD'), '1')
+    await gateShell.assertClean()
+
+    git(repo, 'checkout', 'main')
+    await writeFile(path.join(repo, 'upstream-2.txt'), 'upstream 2\n')
+    git(repo, 'add', 'upstream-2.txt')
+    git(repo, 'commit', '-m', 'upstream 2')
+    git(repo, 'push', 'origin', 'main')
+    git(repo, 'checkout', 'feature')
+
+    const mergeBase = git(gatePath, 'rev-parse', 'HEAD')
+    const mergeWorker = path.join(temp, 'worker-merge')
+    git(gatePath, 'worktree', 'add', mergeWorker, '-b', 'no-mistakes-fixer-ci', mergeBase)
+    git(mergeWorker, 'fetch', 'origin', 'main')
+    git(mergeWorker, 'merge', '--no-ff', '--no-edit', 'origin/main')
+    const mergedHead = git(mergeWorker, 'rev-parse', 'HEAD')
+    assert.equal(git(mergeWorker, 'rev-list', '--count', '--merges', `${mergeBase}..HEAD`), '1')
+
+    const mergeApplied = await gateShell.applyWorktreeCommits(mergeWorker, mergeBase)
+    assert.deepEqual(mergeApplied.findings, [])
+    assert.equal(git(gatePath, 'rev-parse', 'HEAD'), mergedHead)
+    await gateShell.assertClean()
+  } finally {
+    await rm(temp, { recursive: true, force: true })
+  }
+})
+
+test('run status is reported on the initiating worktree, not the gate', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'orca-status-target-'))
+  const fakeOrca = path.join(temp, 'orca')
+  const callsPath = path.join(temp, 'calls.jsonl')
+  const operatorWorktree = path.join(temp, 'operator')
+  try {
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+console.log(JSON.stringify({ result: { worktree: { id: 'wt-operator' } } }))
+`
+    )
+    await chmod(fakeOrca, 0o755)
+    const orca = new CliOrca({
+      command: fakeOrca,
+      cwd: temp,
+      statusWorktree: operatorWorktree
+    })
+    await orca.setWorktreeStatus('no-mistakes review (1/9)', 'in-progress')
+
+    const calls = (await readFile(callsPath, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as string[])
+    const set = calls.find((args) => args[0] === 'worktree' && args[1] === 'set')
+    assert.ok(set)
+    assert.equal(set[set.indexOf('--worktree') + 1], `path:${operatorWorktree}`)
+    assert.ok(set.includes('no-mistakes review (1/9)'))
+    assert.ok(set.includes('in-progress'))
+  } finally {
+    await rm(temp, { recursive: true, force: true })
+  }
+})

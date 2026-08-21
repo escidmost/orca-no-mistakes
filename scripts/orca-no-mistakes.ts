@@ -902,6 +902,7 @@ type CliOrcaOptions = {
   fixerModel?: string
   notifyHandle?: string
   reviewerModel?: string
+  statusWorktree?: string
 }
 
 function resolveOrcaCommand(override?: string): string {
@@ -915,6 +916,7 @@ export class CliOrca implements OrcaOperations {
   readonly #fixerModel?: string
   readonly #notifyHandle?: string
   readonly #reviewerModel?: string
+  readonly #statusWorktree?: string
   #runId?: string
 
   constructor(options: CliOrcaOptions) {
@@ -924,6 +926,7 @@ export class CliOrca implements OrcaOperations {
     this.#fixerModel = options.fixerModel
     this.#notifyHandle = options.notifyHandle
     this.#reviewerModel = options.reviewerModel
+    this.#statusWorktree = options.statusWorktree
   }
 
   async createRun(objective: string): Promise<string> {
@@ -1282,7 +1285,8 @@ export class CliOrca implements OrcaOperations {
   }
 
   async setWorktreeStatus(comment: string, status?: string): Promise<void> {
-    const args = ['worktree', 'set', '--worktree', 'active', '--comment', comment]
+    const target = this.#statusWorktree ? `path:${this.#statusWorktree}` : 'active'
+    const args = ['worktree', 'set', '--worktree', target, '--comment', comment]
     if (status) args.push('--workspace-status', status)
     args.push('--json')
     try {
@@ -1588,15 +1592,17 @@ export class GitShell implements GitOperations {
         `uncommitted changes left in ${sourcePath}:\n${dirty}`
       )
     }
-    if ((await sourceGit(['rev-list', '--count', `${base}..${sourceHead}`])) === '0') {
+    if (sourceHead === base) {
       return { findings: [], summary: `no commits in ${base.slice(0, 12)}..${sourceHead.slice(0, 12)}` }
     }
-    const pick = await this.#git(['cherry-pick', `${base}..${sourceHead}`], true)
-    if (!pick.failed) {
-      return { findings: [], summary: `applied ${sourceHead.slice(0, 12)} onto the gate branch` }
+    const appendOnly = await this.#git(['merge-base', '--is-ancestor', base, sourceHead], true)
+    const advance = appendOnly.failed
+      ? await this.#git(['reset', '--hard', sourceHead], true)
+      : await this.#git(['merge', '--ff-only', sourceHead], true)
+    if (advance.failed) {
+      return failureReport('fix-apply-failed', 'ask-user', advance.output)
     }
-    await this.#git(['cherry-pick', '--abort'], true)
-    return failureReport('fix-apply-failed', 'ask-user', pick.output)
+    return { findings: [], summary: `applied ${sourceHead.slice(0, 12)} onto the gate branch` }
   }
 
   async deleteBranch(name: string): Promise<void> {
@@ -1866,6 +1872,7 @@ async function launchDetachedRun(repoState: RepoState, flags: RawCliFlags): Prom
       `NO_MISTAKES_DELIVERY_BRANCH=${shellQuote(repoState.branch)}`,
       `NO_MISTAKES_GATE_BRANCH=${shellQuote(gate.branch)}`,
       `NO_MISTAKES_GATE_WORKTREE_ID=${shellQuote(gate.id)}`,
+      `NO_MISTAKES_ORIGIN_WORKTREE=${shellQuote(root)}`,
       ...(process.env.ORCA_CLI_COMMAND ? [`ORCA_CLI_COMMAND=${shellQuote(process.env.ORCA_CLI_COMMAND)}`] : []),
       quotedCommand
     ].join(' ')
@@ -1979,6 +1986,7 @@ Run options:
   const launchedGate = {
     branch: process.env.NO_MISTAKES_GATE_BRANCH,
     deliveryBranch: process.env.NO_MISTAKES_DELIVERY_BRANCH,
+    originWorktree: process.env.NO_MISTAKES_ORIGIN_WORKTREE,
     worktreeId: process.env.NO_MISTAKES_GATE_WORKTREE_ID
   }
   if (
@@ -1994,7 +2002,7 @@ Run options:
         deliveryBranch: launchedGate.deliveryBranch,
         gate: { branch: launchedGate.branch, worktreeId: launchedGate.worktreeId }
       },
-      new CliOrca({ cwd: repo, ...orcaOptions }),
+      new CliOrca({ cwd: repo, statusWorktree: launchedGate.originWorktree, ...orcaOptions }),
       git
     )
     console.log(JSON.stringify(result))
@@ -2014,7 +2022,7 @@ Run options:
       deliveryBranch: repoState.branch,
       gate: { branch: gate.branch, worktreeId: gate.id }
     },
-    new CliOrca({ cwd: gate.path, ...orcaOptions }),
+    new CliOrca({ cwd: gate.path, statusWorktree: repoState.root, ...orcaOptions }),
     new GitShell({
       repo: gate.path,
       base: stringFlag(parsed.flags, 'base'),
