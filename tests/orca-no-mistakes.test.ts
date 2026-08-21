@@ -753,6 +753,7 @@ test('CliOrca boots a fresh opencode terminal before authenticated dispatch', as
   const temp = await mkdtemp(path.join(tmpdir(), 'orca-cli-'))
   const fakeOrca = path.join(temp, 'orca')
   const callsPath = path.join(temp, 'calls.jsonl')
+  const checkCountPath = path.join(temp, 'check-count')
   const evidence = path.join(homedir(), '.orca-no-mistakes', 'evidence', 'adapter-new-child')
   const reportPath = path.join(evidence, 'review.json')
   const worktreeId = 'repo-id::/tmp/worker'
@@ -780,7 +781,14 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
 } else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
   out({ dispatch: { id: 'dispatch-review', status: 'dispatched' }, injected: true, preamble: 'authenticated' })
 } else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
-  out({ deliveryId: 'delivery-review', messages: [{ type: 'worker_done', body: 'Reviewed. Verified. Nothing remains.', payload: JSON.stringify({ taskId: 'task-review', dispatchId: 'dispatch-review', outcome: 'succeeded', reportPath: ${JSON.stringify(reportPath)} }) }] })
+  const count = fs.existsSync(${JSON.stringify(checkCountPath)}) ? Number(fs.readFileSync(${JSON.stringify(checkCountPath)}, 'utf8')) : 0
+  fs.writeFileSync(${JSON.stringify(checkCountPath)}, String(count + 1))
+  if (count === 0) {
+    console.log(JSON.stringify({ _keepalive: true, _heartbeat: true, elapsedMs: 15000, deadlineMs: 900000 }))
+    process.exitCode = 1
+  } else {
+    out({ deliveryId: 'delivery-review', messages: [{ type: 'worker_done', body: 'Reviewed. Verified. Nothing remains.', payload: JSON.stringify({ taskId: 'task-review', dispatchId: 'dispatch-review', outcome: 'succeeded', reportPath: ${JSON.stringify(reportPath)} }) }] })
+  }
 } else {
   out({ ok: true })
 }
@@ -822,6 +830,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     assert.ok(dispatch?.includes('--return-preamble'))
     assert.ok(!dispatch?.includes('--agent'))
     assert.ok(!dispatch?.includes('--name'))
+    assert.equal(calls.filter((args) => args[0] === 'orchestration' && args[1] === 'check').length, 2)
   } finally {
     await rm(temp, { recursive: true, force: true })
     await rm(evidence, { recursive: true, force: true })

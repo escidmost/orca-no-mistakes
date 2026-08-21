@@ -1242,6 +1242,8 @@ export class CliOrca implements OrcaOperations {
   ): Promise<{ deliveryId?: string; error?: string; report?: StageReport }> {
     for (;;) {
       const result = await this.#json<{
+        _heartbeat?: boolean
+        _keepalive?: boolean
         cancelled?: boolean
         connectionLost?: boolean
         deliveryId?: string
@@ -1252,18 +1254,21 @@ export class CliOrca implements OrcaOperations {
           type?: string
         }[]
         timedOut?: boolean
-      }>([
-        'orchestration',
-        'check',
-        '--wait',
-        '--types',
-        'worker_done,escalation,question',
-        '--timeout-ms',
-        '900000',
-        ...(this.#runId ? ['--run', this.#runId] : []),
-        '--json'
-      ])
-      if (result.timedOut) continue
+      }>(
+        [
+          'orchestration',
+          'check',
+          '--wait',
+          '--types',
+          'worker_done,escalation,question',
+          '--timeout-ms',
+          '900000',
+          ...(this.#runId ? ['--run', this.#runId] : []),
+          '--json'
+        ],
+        true
+      )
+      if (result._keepalive || result._heartbeat || result.timedOut) continue
       if (result.cancelled || result.connectionLost) {
         return {
           deliveryId: result.deliveryId,
