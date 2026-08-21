@@ -460,6 +460,30 @@ test('reviewer artifacts must exist under the run evidence directory', async () 
   assert.equal(missingOrca.removedWorktrees.length, 1)
 })
 
+test('reviewer URL references are not treated as local artifacts', async () => {
+  const git = new FakeGit()
+  const orca = new FakeOrca(git)
+  orca.reports.set('review', [
+    {
+      findings: [
+        {
+          id: 'documented-finding',
+          severity: 'error',
+          action: 'auto-fix',
+          description: 'The report cites external documentation.'
+        }
+      ],
+      summary: 'external reference',
+      artifacts: ['https://docs.example.com/reference']
+    },
+    pass('clean rereview')
+  ])
+
+  await runPipeline({ intent: 'Ignore external artifact references.' }, orca, git)
+
+  assert.ok(orca.launches.some((launch) => launch.role === 'fixer'))
+})
+
 test('install requires per-push intent without persisting a fallback', async () => {
   const temp = await mkdtemp(path.join(tmpdir(), 'orca-no-mistakes-'))
   const repo = path.join(temp, 'repo')
@@ -571,7 +595,9 @@ const args = process.argv.slice(2)
 fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
 const result = args[0] === 'terminal' && args[1] === 'create'
   ? { terminal: { handle: 'detached-coordinator' } }
-  : { accepted: true }
+  : args[0] === 'terminal' && args[1] === 'show'
+    ? { terminal: { connected: true, preview: 'ready shell prompt' } }
+    : { accepted: true }
 console.log(JSON.stringify({ result }))
 `
     )
@@ -608,7 +634,7 @@ test('CliOrca notifies the originating terminal when a gate opens', async () => 
   const fakeOrca = path.join(temp, 'orca')
   const callsPath = path.join(temp, 'calls.jsonl')
   const previousHandle = process.env.ORCA_TERMINAL_HANDLE
-  delete process.env.ORCA_TERMINAL_HANDLE
+  process.env.ORCA_TERMINAL_HANDLE = 'coordinator-opencode'
   try {
     await writeFile(
       fakeOrca,
@@ -638,10 +664,66 @@ console.log(JSON.stringify({ result }))
       .split('\n')
       .map((line) => JSON.parse(line) as string[])
     const sent = calls.find((args) => args[0] === 'orchestration' && args[1] === 'send')
+    const wake = calls.find((args) => args[0] === 'terminal' && args[1] === 'send')
     assert.ok(sent?.includes('originating-opencode'))
     assert.ok(sent?.includes('gate-run'))
     assert.ok(sent?.includes('question'))
     assert.ok(sent?.includes('Choose a review action.\nGate: gate-review'))
+    assert.ok(wake?.includes('originating-opencode'))
+    assert.ok(wake?.includes('--enter'))
+    assert.ok(wake?.some((value) => value.includes('no-mistakes gate response')))
+  } finally {
+    if (previousHandle === undefined) delete process.env.ORCA_TERMINAL_HANDLE
+    else process.env.ORCA_TERMINAL_HANDLE = previousHandle
+    await rm(temp, { recursive: true, force: true })
+  }
+})
+
+test('CliOrca applies gate responses through the bound coordinator', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'orca-gate-response-'))
+  const fakeOrca = path.join(temp, 'orca')
+  const callsPath = path.join(temp, 'calls.jsonl')
+  const resolvedPath = path.join(temp, 'resolved')
+  const previousHandle = process.env.ORCA_TERMINAL_HANDLE
+  process.env.ORCA_TERMINAL_HANDLE = 'coordinator-opencode'
+  try {
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+const out = (result) => console.log(JSON.stringify({ result }))
+if (args[1] === 'run-create') {
+  out({ run: { id: 'gate-run' } })
+} else if (args[1] === 'gate-create') {
+  out({ gate: { id: 'gate-review' } })
+} else if (args[1] === 'gate-list') {
+  out({ gates: [{ id: 'gate-review', status: fs.existsSync(${JSON.stringify(resolvedPath)}) ? 'resolved' : 'pending', resolution: 'fix: verified' }] })
+} else if (args[1] === 'check' && args.includes('--types')) {
+  out({ messages: [{ id: 'response-message', from_handle: 'originating-opencode', subject: 'no-mistakes gate response', body: JSON.stringify({ gateId: 'gate-review', resolution: 'fix: verified' }) }] })
+} else if (args[1] === 'gate-resolve') {
+  fs.writeFileSync(${JSON.stringify(resolvedPath)}, 'yes')
+  out({ gate: { id: 'gate-review', status: 'resolved' } })
+} else {
+  out({ ok: true })
+}
+`
+    )
+    await chmod(fakeOrca, 0o755)
+    const orca = new CliOrca({ command: fakeOrca, cwd: temp, notifyHandle: 'originating-opencode' })
+    await orca.createRun('gate response')
+
+    assert.equal(await orca.createGate('task-review', 'Choose a review action.'), 'gate-review')
+    assert.equal(await orca.waitForGate('gate-review'), 'fix: verified')
+
+    const calls = (await readFile(callsPath, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as string[])
+    const resolved = calls.find((args) => args[1] === 'gate-resolve')
+    assert.ok(resolved?.includes('fix: verified'))
+    assert.ok(calls.some((args) => args[1] === 'check' && args.includes('--ack')))
   } finally {
     if (previousHandle === undefined) delete process.env.ORCA_TERMINAL_HANDLE
     else process.env.ORCA_TERMINAL_HANDLE = previousHandle
