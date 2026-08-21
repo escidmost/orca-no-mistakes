@@ -86,6 +86,23 @@ export async function runPipeline(
   orca: OrcaOperations,
   git: GitOperations
 ): Promise<PipelineResult> {
+  try {
+    return await runPipelineSteps(options, orca, git)
+  } finally {
+    if (options.gate?.worktreeId) {
+      await orca.removeWorktree(options.gate.worktreeId).catch(() => {})
+    }
+    if (options.gate?.branch) {
+      await git.deleteBranch(options.gate.branch).catch(() => {})
+    }
+  }
+}
+
+async function runPipelineSteps(
+  options: PipelineOptions,
+  orca: OrcaOperations,
+  git: GitOperations
+): Promise<PipelineResult> {
   const intent = options.intent.trim()
   if (!intent) {
     throw new Error('--intent is required')
@@ -208,13 +225,6 @@ export async function runPipeline(
     const message = error instanceof Error ? error.message : String(error)
     await orca.setWorktreeStatus(`no-mistakes stopped: ${message}`, 'in-review').catch(() => {})
     throw error
-  } finally {
-    if (options.gate?.worktreeId) {
-      await orca.removeWorktree(options.gate.worktreeId).catch(() => {})
-    }
-    if (options.gate?.branch) {
-      await git.deleteBranch(options.gate.branch).catch(() => {})
-    }
   }
 }
 
@@ -1501,6 +1511,7 @@ export class GitShell implements GitOperations {
   readonly #requestedBase?: string
   readonly #expectedHead?: string
   readonly #repo: string
+  #gitCommonDir?: string
   #state?: RepoState
 
   constructor(options: GitShellOptions) {
@@ -1511,6 +1522,9 @@ export class GitShell implements GitOperations {
 
   async assertReady(): Promise<RepoState> {
     const root = (await this.#git(['rev-parse', '--show-toplevel'])).stdout.trim()
+    this.#gitCommonDir = (
+      await this.#git(['rev-parse', '--path-format=absolute', '--git-common-dir'])
+    ).stdout.trim()
     await this.assertClean()
     const branch = (await this.#git(['branch', '--show-current'])).stdout.trim()
     if (!branch) throw new Error('no-mistakes requires a named feature branch')
@@ -1556,13 +1570,23 @@ export class GitShell implements GitOperations {
   }
 
   async applyWorktreeCommits(sourcePath: string, base: string): Promise<StageReport> {
-    const sourceHead = (
-      await command('git', ['-C', path.resolve(sourcePath), 'rev-parse', 'HEAD'], this.#repo, {
-        allowFailure: true
-      })
-    ).stdout.trim()
+    const source = path.resolve(sourcePath)
+    const sourceGit = async (args: string[]): Promise<string> =>
+      (await command('git', ['-C', source, ...args], this.#repo, { allowFailure: true })).stdout.trim()
+    const sourceHead = await sourceGit(['rev-parse', 'HEAD'])
     if (!sourceHead) {
       return failureReport('fix-apply-failed', 'ask-user', `could not read HEAD in ${sourcePath}`)
+    }
+    const dirty = await sourceGit(['status', '--porcelain'])
+    if (dirty) {
+      return failureReport(
+        'fix-apply-failed',
+        'ask-user',
+        `uncommitted changes left in ${sourcePath}:\n${dirty}`
+      )
+    }
+    if ((await sourceGit(['rev-list', '--count', `${base}..${sourceHead}`])) === '0') {
+      return { findings: [], summary: `no commits in ${base.slice(0, 12)}..${sourceHead.slice(0, 12)}` }
     }
     const pick = await this.#git(['cherry-pick', `${base}..${sourceHead}`], true)
     if (!pick.failed) {
@@ -1573,7 +1597,8 @@ export class GitShell implements GitOperations {
   }
 
   async deleteBranch(name: string): Promise<void> {
-    await this.#git(['branch', '-D', name])
+    if (!this.#gitCommonDir) throw new Error('deleteBranch requires assertReady first')
+    await command('git', ['--git-dir', this.#gitCommonDir, 'branch', '-D', name], this.#gitCommonDir)
   }
 
   async #detectBase(): Promise<string> {
@@ -1961,7 +1986,11 @@ Run options:
     gatePath = gate.path
     gateBranch = gate.branch
     gateWorktreeId = gate.id
-    pipelineGit = new GitShell({ repo: gate.path, expectedHead: expectedHead ?? repoState.head })
+    pipelineGit = new GitShell({
+      repo: gate.path,
+      base: stringFlag(parsed.flags, 'base'),
+      expectedHead: expectedHead ?? repoState.head
+    })
   }
   const orca = new CliOrca({
     cwd: gatePath,

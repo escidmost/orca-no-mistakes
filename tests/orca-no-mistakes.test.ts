@@ -1076,9 +1076,26 @@ test('GitShell rebases a clean feature branch and delivers it to origin', async 
       git(gatePath, 'rev-parse', 'HEAD')
     )
 
+    const workerHead = git(workerPath, 'rev-parse', 'HEAD')
+    await writeFile(path.join(workerPath, 'dirty.txt'), 'uncommitted\n')
+    git(workerPath, 'add', 'dirty.txt')
+    const dirtyApply = await gateShell.applyWorktreeCommits(workerPath, workerHead)
+    assert.equal(dirtyApply.findings[0].id, 'fix-apply-failed')
+    assert.match(dirtyApply.findings[0].description, /uncommitted changes/)
+    git(workerPath, 'reset', '--hard')
+
+    const gateHeadBefore = git(gatePath, 'rev-parse', 'HEAD')
+    const emptyApply = await gateShell.applyWorktreeCommits(workerPath, workerHead)
+    assert.deepEqual(emptyApply.findings, [])
+    assert.equal(git(gatePath, 'rev-parse', 'HEAD'), gateHeadBefore)
+
     git(gatePath, 'worktree', 'remove', workerPath)
     await gateShell.deleteBranch('no-mistakes-fixer-y')
-    assert.throws(() => git(gatePath, 'rev-parse', '--verify', 'no-mistakes-fixer-y'))
+    assert.throws(() => git(repo, 'rev-parse', '--verify', 'no-mistakes-fixer-y'))
+
+    git(repo, 'worktree', 'remove', '--force', gatePath)
+    await gateShell.deleteBranch('no-mistakes-gate-x')
+    assert.throws(() => git(repo, 'rev-parse', '--verify', 'no-mistakes-gate-x'))
   } finally {
     await rm(temp, { recursive: true, force: true })
   }
