@@ -7,19 +7,8 @@ import { homedir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-export const PIPELINE_STEPS = [
-  'intent',
-  'rebase',
-  'review',
-  'test',
-  'document',
-  'lint',
-  'push',
-  'pr',
-  'ci'
-] as const
-
-export type StageName = (typeof PIPELINE_STEPS)[number]
+import { PIPELINE_STEPS, type StageName } from './config.ts'
+export { PIPELINE_STEPS, type StageName } from './config.ts'
 export type FindingAction = 'ask-user' | 'auto-fix' | 'no-op'
 
 export type Finding = {

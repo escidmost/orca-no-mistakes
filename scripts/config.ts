@@ -1,6 +1,18 @@
 import { z } from 'zod'
 import YAML from 'yaml'
-import { PIPELINE_STEPS, type StageName } from './orca-no-mistakes.ts'
+
+export const PIPELINE_STEPS = [
+  'intent',
+  'rebase',
+  'review',
+  'test',
+  'document',
+  'lint',
+  'push',
+  'pr',
+  'ci'
+] as const
+export type StageName = (typeof PIPELINE_STEPS)[number]
 
 export const ROLES = ['reviewer', 'fixer'] as const
 export type RoleName = (typeof ROLES)[number]
@@ -14,16 +26,10 @@ export const AgentSpecSchema = z.strictObject({
 })
 export type AgentSpec = z.infer<typeof AgentSpecSchema>
 
-export const AgentEntrySchema = z.union([
-  z.string().min(1),
-  AgentSpecSchema
-])
+export const AgentEntrySchema = z.union([z.string().min(1), AgentSpecSchema])
 export type AgentEntry = z.infer<typeof AgentEntrySchema>
 
-export const AgentConfigSchema = z.union([
-  AgentEntrySchema,
-  z.array(AgentEntrySchema).nonempty()
-])
+export const AgentConfigSchema = z.union([AgentEntrySchema, z.array(AgentEntrySchema).nonempty()])
 export type AgentConfig = z.infer<typeof AgentConfigSchema>
 
 export const AutoFixConfigSchema = z.strictObject({
@@ -35,10 +41,7 @@ export type AutoFixConfig = z.infer<typeof AutoFixConfigSchema>
 
 export const AgentArgsOverrideSchema = z.record(
   z.string(),
-  z.union([
-    z.array(z.string()),
-    z.record(z.string(), z.string())
-  ])
+  z.union([z.array(z.string()), z.record(z.string(), z.string())])
 )
 export type AgentArgsOverride = z.infer<typeof AgentArgsOverrideSchema>
 
@@ -53,14 +56,7 @@ export const RoleConfigSchema = z.strictObject({
 })
 export type RoleConfig = z.infer<typeof RoleConfigSchema>
 
-export const StageConfigSchema = z.strictObject({
-  agent: AgentConfigSchema.optional(),
-  model: z.string().min(1).optional(),
-  effort: z.string().min(1).optional(),
-  variant: z.string().min(1).optional(),
-  timeout_ms: z.number().int().positive().optional(),
-  agent_args_override: AgentArgsOverrideSchema.optional(),
-  auto_fix: AutoFixConfigSchema.optional(),
+export const StageConfigSchema = RoleConfigSchema.extend({
   reviewer: RoleConfigSchema.optional(),
   fixer: RoleConfigSchema.optional()
 })
@@ -69,17 +65,12 @@ export type StageConfig = z.infer<typeof StageConfigSchema>
 export const DefaultsConfigSchema = StageConfigSchema
 export type DefaultsConfig = z.infer<typeof DefaultsConfigSchema>
 
-export const StagesConfigSchema = z.strictObject({
-  intent: StageConfigSchema.optional(),
-  rebase: StageConfigSchema.optional(),
-  review: StageConfigSchema.optional(),
-  test: StageConfigSchema.optional(),
-  document: StageConfigSchema.optional(),
-  lint: StageConfigSchema.optional(),
-  push: StageConfigSchema.optional(),
-  pr: StageConfigSchema.optional(),
-  ci: StageConfigSchema.optional()
-})
+export const StagesConfigSchema = z.strictObject(
+  Object.fromEntries(PIPELINE_STEPS.map((s) => [s, StageConfigSchema.optional()])) as Record<
+    StageName,
+    ReturnType<typeof StageConfigSchema.optional>
+  >
+)
 export type StagesConfig = z.infer<typeof StagesConfigSchema>
 
 export const OrcaNoMistakesConfigSchema = z.strictObject({
@@ -91,15 +82,8 @@ export const OrcaNoMistakesConfigSchema = z.strictObject({
 })
 export type OrcaNoMistakesConfig = z.infer<typeof OrcaNoMistakesConfigSchema>
 
-export const CliFlagsSchema = z.strictObject({
-  agent: AgentConfigSchema.optional(),
-  model: z.string().min(1).optional(),
-  effort: z.string().min(1).optional(),
-  variant: z.string().min(1).optional(),
-  timeout_ms: z.number().int().positive().optional(),
+export const CliFlagsSchema = RoleConfigSchema.extend({
   max_fix_rounds: z.number().int().nonnegative().optional(),
-  auto_fix: AutoFixConfigSchema.optional(),
-  agent_args_override: AgentArgsOverrideSchema.optional(),
   intent: z.string().optional(),
   reviewer: RoleConfigSchema.optional(),
   fixer: RoleConfigSchema.optional()
@@ -125,39 +109,27 @@ export function formatZodError(error: z.ZodError): string {
 }
 
 export function parseConfig(input: unknown): OrcaNoMistakesConfig {
-  if (input === null || input === undefined) {
-    return {}
-  }
+  if (input === null || input === undefined) return {}
   const result = OrcaNoMistakesConfigSchema.safeParse(input)
-  if (!result.success) {
-    throw new Error(formatZodError(result.error))
-  }
+  if (!result.success) throw new Error(formatZodError(result.error))
   return result.data
 }
 
 export function parseConfigYaml(yamlStr: string): OrcaNoMistakesConfig {
-  const trimmed = yamlStr.trim()
-  if (!trimmed) {
-    return {}
-  }
-  let parsed: unknown
+  if (!yamlStr.trim()) return {}
   try {
-    parsed = YAML.parse(yamlStr)
+    return parseConfig(YAML.parse(yamlStr))
   } catch (err) {
+    if (err instanceof Error && err.message.startsWith('Invalid configuration:')) throw err
     const msg = err instanceof Error ? err.message : String(err)
     throw new Error(`YAML parse error: ${msg}`)
   }
-  return parseConfig(parsed)
 }
 
 export function deepMerge<T = unknown>(target: unknown, source: unknown): T {
-  if (source === undefined) {
-    return clone(target) as T
-  }
-  if (target === undefined) {
-    return clone(source) as T
-  }
+  if (source === undefined) return target !== undefined ? (structuredClone(target) as T) : (undefined as T)
   if (
+    target === undefined ||
     typeof target !== 'object' ||
     target === null ||
     Array.isArray(target) ||
@@ -165,51 +137,20 @@ export function deepMerge<T = unknown>(target: unknown, source: unknown): T {
     source === null ||
     Array.isArray(source)
   ) {
-    return clone(source) as T
+    return structuredClone(source) as T
   }
 
-  const result: Record<string, unknown> = {}
-  const targetObj = target as Record<string, unknown>
-  const sourceObj = source as Record<string, unknown>
-
-  for (const key of Object.keys(targetObj)) {
-    if (targetObj[key] !== undefined) {
-      result[key] = clone(targetObj[key])
+  const result: Record<string, unknown> = structuredClone(target) as Record<string, unknown>
+  for (const [key, val] of Object.entries(source as Record<string, unknown>)) {
+    if (val !== undefined) {
+      result[key] = key in result && result[key] !== undefined ? deepMerge(result[key], val) : structuredClone(val)
     }
   }
-
-  for (const key of Object.keys(sourceObj)) {
-    const sourceVal = sourceObj[key]
-    if (sourceVal !== undefined) {
-      if (key in result && result[key] !== undefined) {
-        result[key] = deepMerge(result[key], sourceVal)
-      } else {
-        result[key] = clone(sourceVal)
-      }
-    }
-  }
-
   return result as T
 }
 
-function clone<T>(val: T): T {
-  if (val === null || typeof val !== 'object') {
-    return val
-  }
-  if (Array.isArray(val)) {
-    return val.map((item) => clone(item)) as unknown as T
-  }
-  const res: Record<string, unknown> = {}
-  for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
-    if (v !== undefined) {
-      res[k] = clone(v)
-    }
-  }
-  return res as unknown as T
-}
-
-function extractBaseRoleFields(config: StageConfig | DefaultsConfig | undefined): RoleConfig {
-  if (!config) return {}
+function extractBase(config: StageConfig | DefaultsConfig | undefined): RoleConfig | undefined {
+  if (!config) return undefined
   const { reviewer, fixer, ...base } = config
   return base
 }
@@ -239,83 +180,47 @@ export function resolveRoleConfig(
   role: RoleName,
   options: ResolverOptions = {}
 ): ResolvedRoleConfig {
-  const { userGlobalConfig, repoGlobalConfig, cliFlags } = options
+  const { userGlobalConfig: u, repoGlobalConfig: r, cliFlags: c } = options
+  const directCli = c ? { ...c, reviewer: undefined, fixer: undefined, max_fix_rounds: undefined } : undefined
 
-  // Baseline layer
-  let resolved: RoleConfig = {
-    auto_fix: { ...BASELINE_AUTO_FIX }
-  }
+  // 5-Tier precedence layers from lowest (Tier 5: User Global) to highest (Tier 1: CLI Flags)
+  const layers: (RoleConfig | undefined)[] = [
+    { auto_fix: { ...BASELINE_AUTO_FIX } },
+    // Tier 5: User Global
+    u?.auto_fix ? { auto_fix: u.auto_fix } : undefined,
+    u?.agent_args_override ? { agent_args_override: u.agent_args_override } : undefined,
+    extractBase(u?.defaults),
+    u?.defaults?.[role],
+    extractBase(u?.stages?.[stage]),
+    u?.stages?.[stage]?.[role],
+    // Tier 4: Repo Global
+    r?.auto_fix ? { auto_fix: r.auto_fix } : undefined,
+    r?.agent_args_override ? { agent_args_override: r.agent_args_override } : undefined,
+    extractBase(r?.defaults),
+    r?.defaults?.[role],
+    // Tier 3: Stage Default
+    extractBase(r?.stages?.[stage]),
+    // Tier 2: Stage Role
+    r?.stages?.[stage]?.[role],
+    // Tier 1: CLI Flags
+    directCli,
+    c?.max_fix_rounds !== undefined ? { auto_fix: { max_rounds: c.max_fix_rounds } } : undefined,
+    c?.[role]
+  ]
 
-  // Tier 5: User Global Config (~/.config/orca-no-mistakes/config.yaml)
-  if (userGlobalConfig) {
-    // 5a. User global defaults & top-level auto_fix / agent_args_override
-    resolved = deepMerge(resolved, {
-      auto_fix: userGlobalConfig.auto_fix,
-      agent_args_override: userGlobalConfig.agent_args_override
-    })
-    resolved = deepMerge(resolved, extractBaseRoleFields(userGlobalConfig.defaults))
-    // 5b. User global role-specific defaults
-    if (userGlobalConfig.defaults?.[role]) {
-      resolved = deepMerge(resolved, userGlobalConfig.defaults[role])
-    }
-    // 5c. User global stage defaults
-    if (userGlobalConfig.stages?.[stage]) {
-      resolved = deepMerge(resolved, extractBaseRoleFields(userGlobalConfig.stages[stage]))
-      // 5d. User global stage role overrides
-      if (userGlobalConfig.stages[stage]?.[role]) {
-        resolved = deepMerge(resolved, userGlobalConfig.stages[stage]![role])
-      }
-    }
-  }
-
-  // Tier 4: Repository Global Config (.orca/no-mistakes.yaml)
-  if (repoGlobalConfig) {
-    // 4a. Repo global defaults & top-level auto_fix / agent_args_override
-    resolved = deepMerge(resolved, {
-      auto_fix: repoGlobalConfig.auto_fix,
-      agent_args_override: repoGlobalConfig.agent_args_override
-    })
-    resolved = deepMerge(resolved, extractBaseRoleFields(repoGlobalConfig.defaults))
-    // 4b. Repo global role-specific defaults
-    if (repoGlobalConfig.defaults?.[role]) {
-      resolved = deepMerge(resolved, repoGlobalConfig.defaults[role])
-    }
-  }
-
-  // Tier 3: Stage Default Config (stages.<stage>)
-  if (repoGlobalConfig?.stages?.[stage]) {
-    resolved = deepMerge(resolved, extractBaseRoleFields(repoGlobalConfig.stages[stage]))
-  }
-
-  // Tier 2: Stage Role Config (stages.<stage>.<role>)
-  if (repoGlobalConfig?.stages?.[stage]?.[role]) {
-    resolved = deepMerge(resolved, repoGlobalConfig.stages[stage]![role])
-  }
-
-  // Tier 1: CLI Flags (Highest precedence)
-  if (cliFlags) {
-    const { max_fix_rounds, reviewer, fixer, ...directCli } = cliFlags
-    resolved = deepMerge(resolved, directCli)
-    if (max_fix_rounds !== undefined) {
-      resolved = deepMerge(resolved, { auto_fix: { max_rounds: max_fix_rounds } })
-    }
-    const roleCli = role === 'reviewer' ? reviewer : fixer
-    if (roleCli) {
-      resolved = deepMerge(resolved, roleCli)
-    }
-  }
+  const merged = layers.reduce<RoleConfig>((acc, layer) => (layer ? deepMerge(acc, layer) : acc), {})
 
   return {
-    agent: resolved.agent,
-    model: resolved.model,
-    effort: resolved.effort,
-    variant: resolved.variant,
-    timeout_ms: resolved.timeout_ms,
-    agent_args_override: resolved.agent_args_override,
+    agent: merged.agent,
+    model: merged.model,
+    effort: merged.effort,
+    variant: merged.variant,
+    timeout_ms: merged.timeout_ms,
+    agent_args_override: merged.agent_args_override,
     auto_fix: {
-      enabled: resolved.auto_fix?.enabled ?? BASELINE_AUTO_FIX.enabled,
-      max_rounds: resolved.auto_fix?.max_rounds ?? BASELINE_AUTO_FIX.max_rounds,
-      allow_review_autofix: resolved.auto_fix?.allow_review_autofix ?? BASELINE_AUTO_FIX.allow_review_autofix
+      enabled: merged.auto_fix?.enabled ?? BASELINE_AUTO_FIX.enabled,
+      max_rounds: merged.auto_fix?.max_rounds ?? BASELINE_AUTO_FIX.max_rounds,
+      allow_review_autofix: merged.auto_fix?.allow_review_autofix ?? BASELINE_AUTO_FIX.allow_review_autofix
     }
   }
 }
@@ -335,84 +240,54 @@ export interface ResolvedPipelineConfig {
 }
 
 export function resolvePipelineConfig(options: ResolverOptions = {}): ResolvedPipelineConfig {
-  const { userGlobalConfig, repoGlobalConfig, cliFlags } = options
+  const { userGlobalConfig: u, repoGlobalConfig: r, cliFlags: c } = options
+  const autoFix = [
+    { ...BASELINE_AUTO_FIX },
+    u?.auto_fix,
+    r?.auto_fix,
+    c?.auto_fix,
+    c?.max_fix_rounds !== undefined ? { max_rounds: c.max_fix_rounds } : undefined
+  ].reduce<AutoFixConfig>((acc, item) => (item ? deepMerge(acc, item) : acc), {})
 
-  let rootAutoFix: AutoFixConfig = { ...BASELINE_AUTO_FIX }
-  let rootAgentArgs: AgentArgsOverride = {}
+  const agentArgs = [
+    {},
+    u?.agent_args_override,
+    r?.agent_args_override,
+    c?.agent_args_override
+  ].reduce<AgentArgsOverride>((acc, item) => (item ? deepMerge(acc, item) : acc), {})
 
-  if (userGlobalConfig?.auto_fix) {
-    rootAutoFix = deepMerge(rootAutoFix, userGlobalConfig.auto_fix)
-  }
-  if (userGlobalConfig?.agent_args_override) {
-    rootAgentArgs = deepMerge(rootAgentArgs, userGlobalConfig.agent_args_override)
-  }
-  if (repoGlobalConfig?.auto_fix) {
-    rootAutoFix = deepMerge(rootAutoFix, repoGlobalConfig.auto_fix)
-  }
-  if (repoGlobalConfig?.agent_args_override) {
-    rootAgentArgs = deepMerge(rootAgentArgs, repoGlobalConfig.agent_args_override)
-  }
-  if (cliFlags?.auto_fix) {
-    rootAutoFix = deepMerge(rootAutoFix, cliFlags.auto_fix)
-  }
-  if (cliFlags?.max_fix_rounds !== undefined) {
-    rootAutoFix = deepMerge(rootAutoFix, { max_rounds: cliFlags.max_fix_rounds })
-  }
-  if (cliFlags?.agent_args_override) {
-    rootAgentArgs = deepMerge(rootAgentArgs, cliFlags.agent_args_override)
-  }
-
-  const intent = cliFlags?.intent ?? repoGlobalConfig?.intent ?? userGlobalConfig?.intent
-
-  const stages = {} as Record<StageName, { reviewer: ResolvedRoleConfig; fixer: ResolvedRoleConfig }>
-  for (const stage of PIPELINE_STEPS) {
-    stages[stage] = {
-      reviewer: resolveRoleConfig(stage, 'reviewer', options),
-      fixer: resolveRoleConfig(stage, 'fixer', options)
-    }
-  }
+  const stages = Object.fromEntries(
+    PIPELINE_STEPS.map((stage) => [
+      stage,
+      {
+        reviewer: resolveRoleConfig(stage, 'reviewer', options),
+        fixer: resolveRoleConfig(stage, 'fixer', options)
+      }
+    ])
+  ) as Record<StageName, { reviewer: ResolvedRoleConfig; fixer: ResolvedRoleConfig }>
 
   return {
-    intent,
+    intent: c?.intent ?? r?.intent ?? u?.intent,
     auto_fix: {
-      enabled: rootAutoFix.enabled ?? BASELINE_AUTO_FIX.enabled,
-      max_rounds: rootAutoFix.max_rounds ?? BASELINE_AUTO_FIX.max_rounds,
-      allow_review_autofix: rootAutoFix.allow_review_autofix ?? BASELINE_AUTO_FIX.allow_review_autofix
+      enabled: autoFix.enabled ?? BASELINE_AUTO_FIX.enabled,
+      max_rounds: autoFix.max_rounds ?? BASELINE_AUTO_FIX.max_rounds,
+      allow_review_autofix: autoFix.allow_review_autofix ?? BASELINE_AUTO_FIX.allow_review_autofix
     },
-    agent_args_override: rootAgentArgs,
+    agent_args_override: agentArgs,
     stages
   }
 }
 
 export function normalizeAgentSpec(
   agent: AgentConfig | undefined,
-  fallbackDefaults?: { model?: string; effort?: string; variant?: string; timeout_ms?: number }
+  fallbackDefaults?: Partial<AgentSpec>
 ): AgentSpec[] {
-  if (!agent) {
-    return []
-  }
-  const entries = Array.isArray(agent) ? agent : [agent]
-  return entries.map((entry) => {
-    if (typeof entry === 'string') {
-      const spec: AgentSpec = { harness: entry }
-      if (fallbackDefaults?.model) spec.model = fallbackDefaults.model
-      if (fallbackDefaults?.effort) spec.effort = fallbackDefaults.effort
-      if (fallbackDefaults?.variant) spec.variant = fallbackDefaults.variant
-      if (fallbackDefaults?.timeout_ms) spec.timeout_ms = fallbackDefaults.timeout_ms
-      return spec
-    }
-    const spec: AgentSpec = {
-      harness: entry.harness,
-      model: entry.model ?? fallbackDefaults?.model,
-      effort: entry.effort ?? fallbackDefaults?.effort,
-      variant: entry.variant ?? fallbackDefaults?.variant,
-      timeout_ms: entry.timeout_ms ?? fallbackDefaults?.timeout_ms
-    }
-    const cleanSpec: AgentSpec = { harness: spec.harness }
-    if (spec.model !== undefined) cleanSpec.model = spec.model
-    if (spec.effort !== undefined) cleanSpec.effort = spec.effort
-    if (spec.variant !== undefined) cleanSpec.variant = spec.variant
-    if (spec.timeout_ms !== undefined) cleanSpec.timeout_ms = spec.timeout_ms
-    return cleanSpec
+  if (!agent) return []
+  const list = Array.isArray(agent) ? agent : [agent]
+  return list.map((item) => {
+    const base = typeof item === 'string' ? { harness: item } : item
+    return Object.fromEntries(
+      Object.entries({ ...fallbackDefaults, ...base }).filter(([_, v]) => v !== undefined)
+    ) as unknown as AgentSpec
   })
 }
