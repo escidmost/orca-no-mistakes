@@ -278,9 +278,9 @@ async function runReviewer(
   try {
     return await validateReport(worker.report, stage, evidenceDir)
   } finally {
-    await orca.finishWorker(worker)
+    await orca.finishWorker(worker).catch(() => {})
     if (worker.worktreeId) {
-      await orca.removeWorktree(worker.worktreeId)
+      await orca.removeWorktree(worker.worktreeId).catch(() => {})
     }
   }
 }
@@ -1860,6 +1860,7 @@ async function launchDetachedRun(repoState: RepoState, flags: RawCliFlags): Prom
       .join(' ')
     const coordinatorCommand = [
       `NO_MISTAKES_DELIVERY_BRANCH=${shellQuote(repoState.branch)}`,
+      `NO_MISTAKES_GATE_BRANCH=${shellQuote(gate.branch)}`,
       `NO_MISTAKES_GATE_WORKTREE_ID=${shellQuote(gate.id)}`,
       ...(process.env.ORCA_CLI_COMMAND ? [`ORCA_CLI_COMMAND=${shellQuote(process.env.ORCA_CLI_COMMAND)}`] : []),
       quotedCommand
@@ -1962,52 +1963,58 @@ Run options:
     base: stringFlag(parsed.flags, 'base'),
     expectedHead
   })
+  const orcaOptions = {
+    reviewerModel: stringFlag(parsed.flags, 'reviewer-model'),
+    fixerModel: stringFlag(parsed.flags, 'fixer-model'),
+    fixerEffort: stringFlag(parsed.flags, 'fixer-effort'),
+    notifyHandle: stringFlag(parsed.flags, 'notify')
+  }
+  // Attached mode always orchestrates inside a per-run gate worktree. When the
+  // detached launcher pre-created one, this process was started inside it.
+  const launchedGate = {
+    branch: process.env.NO_MISTAKES_GATE_BRANCH,
+    deliveryBranch: process.env.NO_MISTAKES_DELIVERY_BRANCH,
+    worktreeId: process.env.NO_MISTAKES_GATE_WORKTREE_ID
+  }
+  if (
+    parsed.flags.attached === true &&
+    launchedGate.branch &&
+    launchedGate.deliveryBranch &&
+    launchedGate.worktreeId
+  ) {
+    const result = await runPipeline(
+      {
+        intent,
+        maxFixRounds,
+        deliveryBranch: launchedGate.deliveryBranch,
+        gate: { branch: launchedGate.branch, worktreeId: launchedGate.worktreeId }
+      },
+      new CliOrca({ cwd: repo, ...orcaOptions }),
+      git
+    )
+    console.log(JSON.stringify(result))
+    return
+  }
   const repoState = await git.assertReady()
   if (parsed.flags.attached !== true) {
     const terminalHandle = await launchDetachedRun(repoState, parsed.flags)
     console.log(JSON.stringify({ detached: true, terminalHandle }))
     return
   }
-  // Attached mode always orchestrates inside a per-run gate worktree. When the
-  // detached launcher pre-created one, this process was started inside it.
-  let gatePath = repoState.root
-  let deliveryBranch = repoState.branch
-  let pipelineGit: GitShell = git
-  let gateBranch = repoState.branch
-  let gateWorktreeId: string | undefined
-  if (
-    process.env.NO_MISTAKES_DELIVERY_BRANCH &&
-    process.env.NO_MISTAKES_GATE_WORKTREE_ID
-  ) {
-    deliveryBranch = process.env.NO_MISTAKES_DELIVERY_BRANCH
-    gateWorktreeId = process.env.NO_MISTAKES_GATE_WORKTREE_ID
-  } else {
-    const gate = await createGateWorktree(repoState.root, repoState.root, gateName())
-    gatePath = gate.path
-    gateBranch = gate.branch
-    gateWorktreeId = gate.id
-    pipelineGit = new GitShell({
-      repo: gate.path,
-      base: stringFlag(parsed.flags, 'base'),
-      expectedHead: expectedHead ?? repoState.head
-    })
-  }
-  const orca = new CliOrca({
-    cwd: gatePath,
-    reviewerModel: stringFlag(parsed.flags, 'reviewer-model'),
-    fixerModel: stringFlag(parsed.flags, 'fixer-model'),
-    fixerEffort: stringFlag(parsed.flags, 'fixer-effort'),
-    notifyHandle: stringFlag(parsed.flags, 'notify')
-  })
+  const gate = await createGateWorktree(repoState.root, repoState.root, gateName())
   const result = await runPipeline(
     {
       intent,
       maxFixRounds,
-      deliveryBranch,
-      gate: { branch: gateBranch, worktreeId: gateWorktreeId }
+      deliveryBranch: repoState.branch,
+      gate: { branch: gate.branch, worktreeId: gate.id }
     },
-    orca,
-    pipelineGit
+    new CliOrca({ cwd: gate.path, ...orcaOptions }),
+    new GitShell({
+      repo: gate.path,
+      base: stringFlag(parsed.flags, 'base'),
+      expectedHead: expectedHead ?? repoState.head
+    })
   )
   console.log(JSON.stringify(result))
 }

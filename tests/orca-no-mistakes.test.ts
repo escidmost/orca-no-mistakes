@@ -663,6 +663,8 @@ console.log(JSON.stringify({ result }))
     assert.ok(commandText.includes(`'--repo' '${gateWt}'`))
     assert.ok(commandText.includes("NO_MISTAKES_DELIVERY_BRANCH='feature'"))
     assert.ok(commandText.includes("NO_MISTAKES_GATE_WORKTREE_ID='wt-gate-1'"))
+    const gateBranch = worktreeCreate[worktreeCreate.indexOf('--name') + 1]
+    assert.ok(commandText.includes(`NO_MISTAKES_GATE_BRANCH='${gateBranch}'`))
     assert.ok(commandText.includes(`'--head' '${git(repo, 'rev-parse', 'HEAD')}'`))
     assert.ok(commandText.includes("'--notify' 'originating-opencode'"))
     assert.ok(commandText.includes("'--intent' 'Validate detached coordination.'"))
@@ -672,6 +674,86 @@ console.log(JSON.stringify({ result }))
     else process.env.ORCA_CLI_COMMAND = previousCommand
     if (previousHandle === undefined) delete process.env.ORCA_TERMINAL_HANDLE
     else process.env.ORCA_TERMINAL_HANDLE = previousHandle
+    await rm(temp, { recursive: true, force: true })
+  }
+})
+
+test('an attached run removes the gate when its own pre-flight check fails', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'orca-gate-preflight-'))
+  const origin = path.join(temp, 'origin.git')
+  const repo = path.join(temp, 'repo')
+  const gateWt = path.join(temp, 'gate-wt')
+  const fakeOrca = path.join(temp, 'orca')
+  const callsPath = path.join(temp, 'calls.jsonl')
+  const previous = {
+    command: process.env.ORCA_CLI_COMMAND,
+    branch: process.env.NO_MISTAKES_GATE_BRANCH,
+    delivery: process.env.NO_MISTAKES_DELIVERY_BRANCH,
+    worktree: process.env.NO_MISTAKES_GATE_WORKTREE_ID
+  }
+  try {
+    git(temp, 'init', '--bare', origin)
+    git(temp, 'clone', origin, repo)
+    git(repo, 'config', 'user.email', 'test@example.com')
+    git(repo, 'config', 'user.name', 'Test User')
+    git(repo, 'checkout', '-b', 'main')
+    await writeFile(path.join(repo, 'README.md'), 'main\n')
+    git(repo, 'add', 'README.md')
+    git(repo, 'commit', '-m', 'main')
+    git(repo, 'push', '-u', 'origin', 'main')
+    git(temp, `--git-dir=${origin}`, 'symbolic-ref', 'HEAD', 'refs/heads/main')
+    git(repo, 'checkout', '-b', 'feature')
+    git(repo, 'worktree', 'add', gateWt, '-b', 'no-mistakes-gate-preflight', 'feature')
+    await writeFile(path.join(gateWt, 'leftover.txt'), 'dirty\n')
+    git(gateWt, 'add', 'leftover.txt')
+
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+import { execFileSync } from 'node:child_process'
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+if (args[0] === 'worktree' && args[1] === 'rm') {
+  execFileSync('git', ['worktree', 'remove', '--force', ${JSON.stringify(gateWt)}], { cwd: ${JSON.stringify(repo)} })
+}
+console.log(JSON.stringify({ result: { accepted: true } }))
+`
+    )
+    await chmod(fakeOrca, 0o755)
+    process.env.ORCA_CLI_COMMAND = fakeOrca
+    process.env.NO_MISTAKES_GATE_BRANCH = 'no-mistakes-gate-preflight'
+    process.env.NO_MISTAKES_DELIVERY_BRANCH = 'feature'
+    process.env.NO_MISTAKES_GATE_WORKTREE_ID = 'wt-gate-1'
+
+    await assert.rejects(
+      main(['run', '--attached', `--repo=${gateWt}`, '--intent=Validate gate cleanup.'])
+    )
+
+    const calls = (await readFile(callsPath, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as string[])
+    assert.ok(
+      calls.some(
+        (args) => args[0] === 'worktree' && args[1] === 'rm' && args.includes('id:wt-gate-1')
+      ),
+      'the gate worktree is removed'
+    )
+    assert.throws(
+      () => git(repo, 'rev-parse', '--verify', 'no-mistakes-gate-preflight'),
+      'the gate branch is deleted'
+    )
+  } finally {
+    for (const [name, value] of [
+      ['ORCA_CLI_COMMAND', previous.command],
+      ['NO_MISTAKES_GATE_BRANCH', previous.branch],
+      ['NO_MISTAKES_DELIVERY_BRANCH', previous.delivery],
+      ['NO_MISTAKES_GATE_WORKTREE_ID', previous.worktree]
+    ] as const) {
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
     await rm(temp, { recursive: true, force: true })
   }
 })
@@ -1385,6 +1467,28 @@ test('a reviewer-only pass launches no fixers and opens no gates', async () => {
   for (const stage of workerStages) {
     assert.equal(orca.launches.filter((launch) => launch.stage === stage).length, 1, stage)
   }
+})
+
+test('reviewer worktrees are removed even when releasing the worker fails', async () => {
+  const git = new FakeGit()
+  const orca = new FakeOrca(git)
+  orca.finishWorker = async (worker) => {
+    orca.calls.push(`release-failed:${worker.dispatchId}`)
+    throw new Error('terminal release failed')
+  }
+
+  const result = await runPipeline(
+    {
+      intent: 'Everything passes.',
+      gate: { branch: 'no-mistakes-gate-release', worktreeId: 'wt-gate' }
+    },
+    orca,
+    git
+  )
+
+  assert.equal(result.steps.length, PIPELINE_STEPS.length)
+  assert.ok(orca.launches.length > 0)
+  assert.equal(orca.removedWorktrees.length, orca.launches.length + 1)
 })
 
 test('worker cancellation cleans up the gate worktree and branch', async () => {
