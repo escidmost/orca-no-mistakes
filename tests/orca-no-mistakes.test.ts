@@ -471,7 +471,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
 } else if (args[0] === 'terminal' && args[1] === 'send') {
   out({ accepted: true })
 } else if (args[0] === 'terminal' && args[1] === 'show') {
-  out({ terminal: { connected: true, title: 'OC | OpenCode Discussion', preview: 'ready' } })
+  out({ terminal: { connected: true, title: 'OpenCode', preview: 'ready' } })
 } else if (args[0] === 'orchestration' && args[1] === 'worker-start') {
   const count = fs.existsSync(${JSON.stringify(startCountPath)}) ? Number(fs.readFileSync(${JSON.stringify(startCountPath)}, 'utf8')) : 0
   fs.writeFileSync(${JSON.stringify(startCountPath)}, String(count + 1))

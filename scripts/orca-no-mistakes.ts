@@ -657,11 +657,13 @@ export class CliOrca implements OrcaOperations {
     try {
       const branch = (await command('git', ['branch', '--show-current'], this.#cwd)).stdout.trim()
       if (!branch) throw new Error('no-mistakes requires a named branch for a worker worktree')
+      const commonGitDir = (await command('git', ['rev-parse', '--git-common-dir'], this.#cwd)).stdout.trim()
+      const repoRoot = path.dirname(path.resolve(this.#cwd, commonGitDir))
       const created = await this.#json<{ worktree: { id: string; path: string } }>([
         'worktree',
         'create',
         '--repo',
-        `path:${this.#cwd}`,
+        `path:${repoRoot}`,
         '--name',
         launch.name,
         '--base-branch',
@@ -751,7 +753,7 @@ export class CliOrca implements OrcaOperations {
       if (terminal.connected === false) throw new Error('worker agent terminal disconnected during startup')
       const title = terminal.title ?? ''
       const preview = terminal.preview ?? ''
-      if (title.startsWith('OC |') && !preview.includes('esc interrupt')) return
+      if ((title === 'OpenCode' || title.startsWith('OC |')) && !preview.includes('esc interrupt')) return
       if (Date.now() >= deadline) throw new Error('opencode did not become ready before the timeout')
       await new Promise((resolve) => setTimeout(resolve, 250))
     }
