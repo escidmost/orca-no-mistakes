@@ -44,7 +44,7 @@ Fixers mutate the active worktree. There is no branch semantic lease, duplicate-
 
 ## Outcome
 
-An attached run prints `{"runId":...,"steps":[...]}` after every stage task completes. A detached run prints `{"detached":true,"terminalHandle":"..."}` immediately, and the stage result appears in the dedicated Orca terminal. The coordinator attempts to mark the Orca worktree completed; on failure it throws, sets a nonzero direct-run exit status, and attempts to mark the worktree in review. Worktree-status update failures are logged as warnings rather than changing the pipeline result.
+An attached run prints `{"runId":...,"steps":[...]}` after every stage task completes. A detached run prints `{"detached":true,"terminalHandle":"..."}` immediately, and the stage result appears in the dedicated Orca terminal. On direct pipeline success, the coordinator attempts to mark the Orca worktree completed. If a pipeline stage fails, the coordinator throws, sets a nonzero direct-run exit status, and attempts to mark the worktree in review. Worktree-status update failures are logged as warnings rather than changing the pipeline result.
 
 Current completion is not the domain `Passed` outcome. It does not prove that required commands ran deterministically, that policy came from a trusted base, that CI was complete on an exact commit, or that the delivered target-branch tree preserved the tested candidate.
 

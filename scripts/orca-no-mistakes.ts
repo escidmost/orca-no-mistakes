@@ -204,7 +204,7 @@ export async function runPipeline(
           git
         )
         if (retainedFixer) {
-          await orca.finishWorker(retainedFixer, 'release')
+          await orca.finishWorker(retainedFixer, 'retain')
         }
         retainedFixer = nextFixer
         if (stage === 'pr' || stage === 'ci') {
@@ -376,8 +376,16 @@ async function validateReport(
     ...report,
     findings: report.findings.map((finding, index) => {
       if (!finding || typeof finding !== 'object') return finding
+      const aliases = finding as Finding & { message?: unknown; title?: unknown }
+      const title = typeof aliases.title === 'string' ? aliases.title.trim() : ''
+      const message = typeof aliases.message === 'string' ? aliases.message.trim() : ''
+      const description =
+        typeof finding.description === 'string' && finding.description.trim()
+          ? finding.description
+          : [title, message].filter(Boolean).join(': ')
       return {
         ...finding,
+        description,
         id:
           typeof finding.id === 'string' && /^[A-Za-z0-9_-]+$/.test(finding.id.trim())
             ? finding.id.trim()
@@ -387,7 +395,7 @@ async function validateReport(
                     index,
                     finding.file,
                     finding.line,
-                    finding.description,
+                    description,
                     finding.action,
                     finding.severity
                   ])
@@ -731,21 +739,24 @@ export function parseGateResolution(resolution: string, availableFindings: Findi
         rawAction === 'fix'
           ? rawAction
           : 'unknown'
+      const guidance = typeof parsed.guidance === 'string' ? parsed.guidance : ''
       if (action !== 'fix') {
-        return { action, guidance: parsed.guidance ?? '', selectedFindings: [] }
+        return { action, guidance, selectedFindings: [] }
       }
       let selected = availableFindings
       if (Array.isArray(parsed.findingIds)) {
         const idSet = new Set(parsed.findingIds)
         selected = availableFindings.filter((f) => idSet.has(f.id))
       }
-      if (parsed.instructions) {
+      if (parsed.instructions && typeof parsed.instructions === 'object' && !Array.isArray(parsed.instructions)) {
         selected = selected.map((f) => {
           const inst = parsed.instructions?.[f.id]
-          return inst ? { ...f, description: `${f.description} (User instruction: ${inst})` } : f
+          return typeof inst === 'string' && inst.trim()
+            ? { ...f, description: `${f.description} (User instruction: ${inst.trim()})` }
+            : f
         })
       }
-      return { action: 'fix', guidance: parsed.guidance ?? '', selectedFindings: selected }
+      return { action: 'fix', guidance, selectedFindings: selected }
     } catch {
       return { action: 'unknown', guidance: trimmed, selectedFindings: [] }
     }

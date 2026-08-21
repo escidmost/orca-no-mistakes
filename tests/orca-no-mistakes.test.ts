@@ -207,8 +207,14 @@ test('runs the nine-stage adversarial pipeline with fixes, gates, and isolation'
   assert.equal(fixerLaunches[1].terminal, 'term-fixer')
   assert.equal(fixerLaunches[2].terminal, 'term-fixer')
   assert.ok(
-    orca.fixerDispatches.every((dispatchId) => orca.calls.includes(`release:${dispatchId}`)),
-    'every retained fixer dispatch is eventually released'
+    orca.fixerDispatches.every(
+      (dispatchId) => orca.calls.includes(`retain:${dispatchId}`) || orca.calls.includes(`release:${dispatchId}`)
+    ),
+    'every fixer dispatch is retained or eventually released'
+  )
+  assert.ok(
+    orca.calls.includes(`release:${orca.fixerDispatches[orca.fixerDispatches.length - 1]}`),
+    'the final retained fixer dispatch is released'
   )
   assert.ok(orca.calls.some((call) => call.startsWith('gate:') && call.includes('docs-1')))
   assert.equal(orca.removedWorktrees.length, orca.launches.filter((launch) => launch.worktree === 'new-child').length)
@@ -397,7 +403,7 @@ test('malformed reviewer findings fail closed and still clean up the worker', as
   assert.equal(orca.removedWorktrees.length, 1)
 })
 
-test('reviewer findings without IDs receive deterministic IDs', async () => {
+test('reviewer title/message findings receive canonical descriptions and IDs', async () => {
   const git = new FakeGit()
   const orca = new FakeOrca(git)
   orca.reports.set('review', [
@@ -406,7 +412,8 @@ test('reviewer findings without IDs receive deterministic IDs', async () => {
         {
           severity: 'error',
           action: 'auto-fix',
-          description: 'This valid finding omitted its ID.'
+          title: 'Missing canonical fields',
+          message: 'This valid finding used review aliases.'
         } as unknown as Finding
       ],
       summary: 'missing ID'
@@ -418,6 +425,10 @@ test('reviewer findings without IDs receive deterministic IDs', async () => {
 
   const fixer = orca.launches.find((launch) => launch.role === 'fixer')
   assert.match(fixer?.prompt ?? '', /"id":"review-[0-9a-f]{12}"/)
+  assert.match(
+    fixer?.prompt ?? '',
+    /"description":"Missing canonical fields: This valid finding used review aliases\."/
+  )
 })
 
 test('reviewer artifacts must exist under the run evidence directory', async () => {
@@ -640,10 +651,12 @@ test('CliOrca creates a fixer once and reuses its terminal without creation flag
   const evidence = path.join(homedir(), '.orca-no-mistakes', 'evidence', 'adapter-test')
   const reportOne = path.join(evidence, 'one.json')
   const reportTwo = path.join(evidence, 'two.json')
+  const reportThree = path.join(evidence, 'three.json')
   try {
     await mkdir(evidence, { recursive: true })
     await writeFile(reportOne, JSON.stringify(pass('first fix')))
     await writeFile(reportTwo, JSON.stringify(pass('second fix')))
+    await writeFile(reportThree, JSON.stringify(pass('third fix')))
     await writeFile(
       fakeOrca,
       `#!/usr/bin/env node
@@ -666,9 +679,9 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
 } else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
   const count = fs.existsSync(${JSON.stringify(countPath)}) ? Number(fs.readFileSync(${JSON.stringify(countPath)}, 'utf8')) : 0
   fs.writeFileSync(${JSON.stringify(countPath)}, String(count + 1))
-  const dispatchId = count === 0 ? 'dispatch-1' : 'dispatch-2'
-  const taskId = count === 0 ? 'task-1' : 'task-2'
-  const reportPath = count === 0 ? ${JSON.stringify(reportOne)} : ${JSON.stringify(reportTwo)}
+  const dispatchId = 'dispatch-' + (count + 1)
+  const taskId = 'task-' + (count + 1)
+  const reportPath = count === 0 ? ${JSON.stringify(reportOne)} : count === 1 ? ${JSON.stringify(reportTwo)} : ${JSON.stringify(reportThree)}
   out({ deliveryId: 'delivery-' + count, messages: [{ type: 'worker_done', body: 'Fixed the issue. Verified the change. Nothing remains.', payload: JSON.stringify({ taskId, dispatchId, outcome: 'succeeded', reportPath }) }] })
 } else {
   out({ ok: true })
@@ -700,28 +713,29 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       terminal: first.terminalHandle,
       worktree: 'current'
     })
-    await orca.finishWorker(second, 'release')
+    await orca.finishWorker(second, 'retain')
+    const third = await orca.startWorker('task-3', {
+      name: 'third-fixer',
+      prompt: 'third',
+      role: 'fixer',
+      stage: 'test',
+      terminal: second.terminalHandle,
+      worktree: 'current'
+    })
+    await orca.finishWorker(third, 'release')
 
     const calls = (await readFile(callsPath, 'utf8'))
       .trim()
       .split('\n')
       .map((line) => JSON.parse(line) as string[])
     const starts = calls.filter((args) => args[1] === 'dispatch')
-    assert.equal(starts.length, 2)
-    assert.ok(starts[0].includes('--to'))
-    assert.ok(starts[0].includes('--inject'))
-    assert.ok(starts[0].includes('--return-preamble'))
-    assert.ok(!starts[0].includes('--agent'))
-    assert.ok(!starts[0].includes('--model'))
-    assert.ok(!starts[0].includes('--effort'))
-    assert.ok(!starts[0].includes('--name'))
-    assert.ok(starts[1].includes('--to'))
-    assert.ok(starts[1].includes('--inject'))
-    assert.ok(starts[1].includes('--return-preamble'))
-    assert.ok(!starts[1].includes('--agent'))
-    assert.ok(!starts[1].includes('--model'))
-    assert.ok(!starts[1].includes('--effort'))
-    assert.ok(!starts[1].includes('--name'))
+    assert.equal(starts.length, 3)
+    assert.equal(first.terminalHandle, 'created-fixer')
+    assert.equal(second.terminalHandle, 'created-fixer')
+    assert.equal(third.terminalHandle, 'created-fixer')
+    const closes = calls.filter((args) => args[0] === 'terminal' && args[1] === 'close')
+    assert.equal(closes.length, 1)
+    assert.ok(closes[0].includes('created-fixer'))
   } finally {
     await rm(temp, { recursive: true, force: true })
     await rm(evidence, { recursive: true, force: true })

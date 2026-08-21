@@ -4,7 +4,7 @@
 - **Push through no-mistakes** When instructed to push, use `orca-no-mistakes push --intent "<intent for this exact commit set>"`. Do not push unless told to. The current CLI has no branch lease or duplicate-run guard, so inspect `orca orchestration run-list --json` and the Orca Runs view before starting; do not start another run for the same repository, branch, and HEAD.
 - **Post-merge cleanup** When the PR for a Linear issue is merged, remove any readiness and process labels present, such as `ready-for-*` and `wayfinder:*`. PR titles begin with the Linear issue identifier: `ONM-##: <title>`.
 
-When asking question, please use your elicitation tool instead of putting them in a chat response.
+When asking questions, please use your elicitation tool instead of putting them in a chat response.
 
 ## Agent skills
 
