@@ -1793,13 +1793,14 @@ function gateName(): string {
 }
 
 async function createGateWorktree(
-  repoRoot: string,
   parentWorktree: string,
   name: string
 ): Promise<{ branch: string; id: string; path: string }> {
   const orcaCommand = resolveOrcaCommand()
   const baseBranch = (await command('git', ['branch', '--show-current'], parentWorktree)).stdout.trim()
   if (!baseBranch) throw new Error('no-mistakes requires a named feature branch')
+  const commonGitDir = (await command('git', ['rev-parse', '--git-common-dir'], parentWorktree)).stdout.trim()
+  const repoRoot = path.dirname(path.resolve(parentWorktree, commonGitDir))
   const created = unwrapJson<{ worktree: { id: string; path: string } }>(
     (
       await command(
@@ -1835,7 +1836,7 @@ async function createGateWorktree(
 async function launchDetachedRun(repoState: RepoState, flags: RawCliFlags): Promise<string> {
   const root = repoState.root
   const orcaCommand = resolveOrcaCommand()
-  const gate = await createGateWorktree(root, root, gateName())
+  const gate = await createGateWorktree(root, gateName())
   let terminalHandle = ''
   try {
     const created = unwrapJson<{ terminal: { handle: string } }>(
@@ -1915,6 +1916,7 @@ async function launchDetachedRun(repoState: RepoState, flags: RawCliFlags): Prom
     await command(orcaCommand, ['worktree', 'rm', '--worktree', `id:${gate.id}`, '--force', '--json'], root, {
       allowFailure: true
     }).catch(() => {})
+    await command('git', ['branch', '-D', gate.branch], root, { allowFailure: true }).catch(() => {})
     throw error
   }
   return terminalHandle
@@ -2004,7 +2006,7 @@ Run options:
     console.log(JSON.stringify({ detached: true, terminalHandle }))
     return
   }
-  const gate = await createGateWorktree(repoState.root, repoState.root, gateName())
+  const gate = await createGateWorktree(repoState.root, gateName())
   const result = await runPipeline(
     {
       intent,

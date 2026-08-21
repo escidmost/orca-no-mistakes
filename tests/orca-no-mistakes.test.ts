@@ -759,6 +759,117 @@ console.log(JSON.stringify({ result: { accepted: true } }))
   }
 })
 
+async function seedOriginRepo(temp: string): Promise<string> {
+  const origin = path.join(temp, 'origin.git')
+  const repo = path.join(temp, 'repo')
+  git(temp, 'init', '--bare', origin)
+  git(temp, 'clone', origin, repo)
+  git(repo, 'config', 'user.email', 'test@example.com')
+  git(repo, 'config', 'user.name', 'Test User')
+  git(repo, 'checkout', '-b', 'main')
+  await writeFile(path.join(repo, 'README.md'), 'main\n')
+  git(repo, 'add', 'README.md')
+  git(repo, 'commit', '-m', 'main')
+  git(repo, 'push', '-u', 'origin', 'main')
+  git(temp, `--git-dir=${origin}`, 'symbolic-ref', 'HEAD', 'refs/heads/main')
+  return repo
+}
+
+async function writeGateOrca(
+  fakeOrca: string,
+  callsPath: string,
+  repo: string,
+  gateWt: string,
+  terminalCreateResult: string
+): Promise<void> {
+  await writeFile(
+    fakeOrca,
+    `#!/usr/bin/env node
+import fs from 'node:fs'
+import { execFileSync } from 'node:child_process'
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+const result = args[0] === 'worktree' && args[1] === 'create'
+  ? (() => {
+      const name = args[args.indexOf('--name') + 1]
+      const base = args[args.indexOf('--base-branch') + 1]
+      execFileSync('git', ['worktree', 'add', ${JSON.stringify(gateWt)}, '-b', name, base], { cwd: ${JSON.stringify(repo)} })
+      return { worktree: { id: 'wt-gate-1', path: ${JSON.stringify(gateWt)} } }
+    })()
+  : args[0] === 'worktree' && args[1] === 'rm'
+    ? (() => {
+        execFileSync('git', ['worktree', 'remove', '--force', ${JSON.stringify(gateWt)}], { cwd: ${JSON.stringify(repo)} })
+        return { accepted: true }
+      })()
+    : args[0] === 'terminal' && args[1] === 'create'
+      ? ${terminalCreateResult}
+      : args[0] === 'terminal' && args[1] === 'show'
+        ? { terminal: { connected: true, preview: 'ready shell prompt' } }
+        : { accepted: true }
+console.log(JSON.stringify({ result }))
+`
+  )
+  await chmod(fakeOrca, 0o755)
+}
+
+test('the gate worktree is created against the main repository root', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'orca-gate-root-'))
+  const linked = path.join(temp, 'linked')
+  const gateWt = path.join(temp, 'gate-wt')
+  const fakeOrca = path.join(temp, 'orca')
+  const callsPath = path.join(temp, 'calls.jsonl')
+  const previousCommand = process.env.ORCA_CLI_COMMAND
+  try {
+    const repo = await seedOriginRepo(temp)
+    git(repo, 'worktree', 'add', linked, '-b', 'linked-feature')
+    await writeGateOrca(fakeOrca, callsPath, repo, gateWt, "{ terminal: { handle: 'detached-coordinator' } }")
+    process.env.ORCA_CLI_COMMAND = fakeOrca
+
+    await main(['run', `--repo=${linked}`, '--intent=Validate gate creation from a linked worktree.'])
+
+    const calls = (await readFile(callsPath, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as string[])
+    const worktreeCreate = calls.find((args) => args[0] === 'worktree' && args[1] === 'create')
+    assert.ok(worktreeCreate)
+    const repoArg = worktreeCreate[worktreeCreate.indexOf('--repo') + 1].replace(/^path:/, '')
+    const parentArg = worktreeCreate[worktreeCreate.indexOf('--parent-worktree') + 1].replace(/^path:/, '')
+    assert.equal(await realpath(repoArg), await realpath(repo))
+    assert.equal(await realpath(parentArg), await realpath(linked))
+    assert.ok(worktreeCreate.includes('linked-feature'))
+  } finally {
+    if (previousCommand === undefined) delete process.env.ORCA_CLI_COMMAND
+    else process.env.ORCA_CLI_COMMAND = previousCommand
+    await rm(temp, { recursive: true, force: true })
+  }
+})
+
+test('a failed detached launch deletes the gate branch it created', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'orca-gate-launch-fail-'))
+  const gateWt = path.join(temp, 'gate-wt')
+  const fakeOrca = path.join(temp, 'orca')
+  const callsPath = path.join(temp, 'calls.jsonl')
+  const previousCommand = process.env.ORCA_CLI_COMMAND
+  try {
+    const repo = await seedOriginRepo(temp)
+    git(repo, 'checkout', '-b', 'feature')
+    await writeGateOrca(fakeOrca, callsPath, repo, gateWt, '{ terminal: {} }')
+    process.env.ORCA_CLI_COMMAND = fakeOrca
+
+    await assert.rejects(
+      main(['run', `--repo=${repo}`, '--intent=Validate launch failure cleanup.']),
+      /terminal create returned an invalid receipt/
+    )
+
+    assert.equal(git(repo, 'branch', '--list', 'no-mistakes-gate-*'), '')
+  } finally {
+    if (previousCommand === undefined) delete process.env.ORCA_CLI_COMMAND
+    else process.env.ORCA_CLI_COMMAND = previousCommand
+    await rm(temp, { recursive: true, force: true })
+  }
+})
+
 test('CliOrca notifies the originating terminal when a gate opens', async () => {
   const temp = await mkdtemp(path.join(tmpdir(), 'orca-gate-notify-'))
   const fakeOrca = path.join(temp, 'orca')
