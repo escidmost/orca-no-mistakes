@@ -45,7 +45,7 @@ Useful direct-run options:
 --max-fix-rounds <count>
 ```
 
-Workers launch with the `opencode` agent on model `opencode-go/ox-alpha-free` at max reasoning effort by default; the default maximum is three fix rounds. `ORCA_CLI_COMMAND` overrides the Orca executable.
+Workers launch with the `opencode` agent on model `openai/gpt-5.6-luna` at max reasoning effort by default; the default maximum is three fix rounds. `ORCA_CLI_COMMAND` overrides the Orca executable.
 
 ## Gates and outcomes
 

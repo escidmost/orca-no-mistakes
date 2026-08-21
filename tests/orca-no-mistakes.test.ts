@@ -449,6 +449,7 @@ test('CliOrca creates a fixer once and reuses its terminal without creation flag
   const fakeOrca = path.join(temp, 'orca')
   const callsPath = path.join(temp, 'calls.jsonl')
   const countPath = path.join(temp, 'count')
+  const startCountPath = path.join(temp, 'start-count')
   const evidence = path.join(homedir(), '.orca-no-mistakes', 'evidence', 'adapter-test')
   const reportOne = path.join(evidence, 'one.json')
   const reportTwo = path.join(evidence, 'two.json')
@@ -465,9 +466,16 @@ fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
 const out = (result) => console.log(JSON.stringify({ result }))
 if (args[0] === 'orchestration' && args[1] === 'run-create') {
   out({ run: { id: 'adapter-test' } })
+} else if (args[0] === 'terminal' && args[1] === 'create') {
+  out({ terminal: { handle: 'created-fixer' } })
+} else if (args[0] === 'terminal' && args[1] === 'send') {
+  out({ accepted: true })
+} else if (args[0] === 'terminal' && args[1] === 'show') {
+  out({ terminal: { connected: true, title: 'OC | OpenCode Discussion', preview: 'ready' } })
 } else if (args[0] === 'orchestration' && args[1] === 'worker-start') {
-  const reused = args.includes('--terminal')
-  out({ dispatchId: reused ? 'dispatch-2' : 'dispatch-1', state: 'ready', effects: [] })
+  const count = fs.existsSync(${JSON.stringify(startCountPath)}) ? Number(fs.readFileSync(${JSON.stringify(startCountPath)}, 'utf8')) : 0
+  fs.writeFileSync(${JSON.stringify(startCountPath)}, String(count + 1))
+  out({ dispatchId: 'dispatch-' + (count + 1), state: 'ready', effects: [] })
 } else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
   const count = fs.existsSync(${JSON.stringify(countPath)}) ? Number(fs.readFileSync(${JSON.stringify(countPath)}, 'utf8')) : 0
   fs.writeFileSync(${JSON.stringify(countPath)}, String(count + 1))
@@ -515,15 +523,94 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       .map((line) => JSON.parse(line) as string[])
     const starts = calls.filter((args) => args[1] === 'worker-start')
     assert.equal(starts.length, 2)
-    assert.ok(starts[0].includes('--agent'))
-    assert.ok(starts[0].includes('--model'))
-    assert.ok(starts[0].includes('--effort'))
+    assert.ok(starts[0].includes('--terminal'))
+    assert.ok(!starts[0].includes('--agent'))
+    assert.ok(!starts[0].includes('--model'))
+    assert.ok(!starts[0].includes('--effort'))
     assert.ok(!starts[0].includes('--name'))
     assert.ok(starts[1].includes('--terminal'))
     assert.ok(!starts[1].includes('--agent'))
     assert.ok(!starts[1].includes('--model'))
     assert.ok(!starts[1].includes('--effort'))
     assert.ok(!starts[1].includes('--name'))
+  } finally {
+    await rm(temp, { recursive: true, force: true })
+    await rm(evidence, { recursive: true, force: true })
+  }
+})
+
+test('CliOrca boots a fresh opencode terminal before worker-start', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'orca-cli-'))
+  const fakeOrca = path.join(temp, 'orca')
+  const callsPath = path.join(temp, 'calls.jsonl')
+  const evidence = path.join(homedir(), '.orca-no-mistakes', 'evidence', 'adapter-new-child')
+  const reportPath = path.join(evidence, 'review.json')
+  const worktreeId = 'repo-id::/tmp/worker'
+  try {
+    git(temp, 'init', '-b', 'feature')
+    await mkdir(evidence, { recursive: true })
+    await writeFile(reportPath, JSON.stringify(pass('reviewed')))
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+const out = (result) => console.log(JSON.stringify({ result }))
+if (args[0] === 'orchestration' && args[1] === 'run-create') {
+  out({ run: { id: 'adapter-new-child' } })
+} else if (args[0] === 'worktree' && args[1] === 'create') {
+  out({ worktree: { id: ${JSON.stringify(worktreeId)}, path: '/tmp/worker' } })
+} else if (args[0] === 'terminal' && args[1] === 'list') {
+  out({ terminals: [{ handle: 'worker-shell', connected: true, writable: true }] })
+} else if (args[0] === 'terminal' && args[1] === 'send') {
+  out({ accepted: true })
+} else if (args[0] === 'terminal' && args[1] === 'show') {
+  out({ terminal: { connected: true, title: 'OC | OpenCode Discussion', preview: 'ready' } })
+} else if (args[0] === 'orchestration' && args[1] === 'worker-start') {
+  out({ dispatchId: 'dispatch-review', state: 'ready', effects: [] })
+} else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
+  out({ deliveryId: 'delivery-review', messages: [{ type: 'worker_done', body: 'Reviewed. Verified. Nothing remains.', payload: JSON.stringify({ taskId: 'task-review', dispatchId: 'dispatch-review', outcome: 'succeeded', reportPath: ${JSON.stringify(reportPath)} }) }] })
+} else if (args[0] === 'orchestration' && args[1] === 'worker-show') {
+  out({ worker: { agent_terminal_handle: 'worker-shell' } })
+} else {
+  out({ ok: true })
+}
+`
+    )
+    await chmod(fakeOrca, 0o755)
+    const orca = new CliOrca({ command: fakeOrca, cwd: temp })
+    await orca.createRun('adapter test')
+
+    const worker = await orca.startWorker('task-review', {
+      name: 'fresh-reviewer',
+      prompt: 'contains ) and shell syntax',
+      role: 'reviewer',
+      stage: 'review',
+      worktree: 'new-child'
+    })
+
+    assert.equal(worker.worktreeId, worktreeId)
+    const calls = (await readFile(callsPath, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as string[])
+    const worktreeCreate = calls.find((args) => args[0] === 'worktree' && args[1] === 'create')
+    const terminalSend = calls.find((args) => args[0] === 'terminal' && args[1] === 'send')
+    const workerStart = calls.find((args) => args[0] === 'orchestration' && args[1] === 'worker-start')
+    assert.ok(worktreeCreate?.includes('--base-branch'))
+    assert.ok(worktreeCreate?.includes('feature'))
+    assert.deepEqual(terminalSend?.slice(0, 6), [
+      'terminal',
+      'send',
+      '--terminal',
+      'worker-shell',
+      '--text',
+      "'opencode'"
+    ])
+    assert.ok(workerStart?.includes('--terminal'))
+    assert.ok(!workerStart?.includes('--agent'))
+    assert.ok(!workerStart?.includes('--name'))
   } finally {
     await rm(temp, { recursive: true, force: true })
     await rm(evidence, { recursive: true, force: true })

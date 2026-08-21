@@ -20,7 +20,7 @@ The coordinator creates one Orca Run and an ordered nine-task DAG:
 
 `intent` records the supplied objective. `rebase` and `push` are coordinator-run Git operations. The other stages are worker evaluations that return structured reports.
 
-Reviewers run as fresh opencode workers in disposable child worktrees. Fixes run through one retained opencode terminal on the operator's current worktree. Every fixer round must leave a clean worktree and create a new commit. Workers default to model `opencode-go/ox-alpha-free` at max reasoning effort; `--reviewer-model`, `--fixer-model`, and `--fixer-effort` override per role.
+Reviewers run as fresh opencode workers in disposable child worktrees. Fixes run through one retained opencode terminal on the operator's current worktree. Every fixer round must leave a clean worktree and create a new commit. Workers default to model `openai/gpt-5.6-luna` at max reasoning effort; `--reviewer-model`, `--fixer-model`, and `--fixer-effort` override per role.
 
 ## Findings and gates
 

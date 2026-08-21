@@ -46,7 +46,7 @@ orca-no-mistakes push --repo /path/to/repo --intent "<user objective and constra
 
 Direct `run` supplies a meaningful exit status. The Git gate runs synchronously, but Git may still report a successful push when the hook's pipeline fails; inspect the Orca Run after `push`.
 
-Available direct-run controls are `--base`, `--head`, `--reviewer-model`, `--fixer-model`, `--fixer-effort`, and `--max-fix-rounds`. Workers launch with the `opencode` agent on model `opencode-go/ox-alpha-free` at max reasoning effort by default; the default maximum is three fix rounds.
+Available direct-run controls are `--base`, `--head`, `--reviewer-model`, `--fixer-model`, `--fixer-effort`, and `--max-fix-rounds`. Workers launch with the `opencode` agent on model `openai/gpt-5.6-luna` at max reasoning effort by default; the default maximum is three fix rounds.
 
 ## Gates
 

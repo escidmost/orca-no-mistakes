@@ -530,8 +530,13 @@ function unwrapJson<T>(stdout: string): T {
 }
 
 const DEFAULT_WORKER_AGENT = 'opencode'
-const DEFAULT_WORKER_MODEL = 'opencode-go/ox-alpha-free'
-const DEFAULT_WORKER_EFFORT = 'max'
+const WORKER_AGENT_READY_TIMEOUT_MS = 60_000
+
+type PreparedWorker = {
+  terminalHandle: string
+  worktreeId?: string
+  worktreePath: string
+}
 
 type CliOrcaOptions = {
   command?: string
@@ -544,18 +549,18 @@ type CliOrcaOptions = {
 export class CliOrca implements OrcaOperations {
   readonly #command: string
   readonly #cwd: string
-  readonly #fixerEffort: string
-  readonly #fixerModel: string
-  readonly #reviewerModel: string
+  readonly #fixerEffort?: string
+  readonly #fixerModel?: string
+  readonly #reviewerModel?: string
   #runId?: string
 
   constructor(options: CliOrcaOptions) {
     this.#command =
       options.command ?? process.env.ORCA_CLI_COMMAND ?? (process.platform === 'linux' ? 'orca-ide' : 'orca')
     this.#cwd = options.cwd
-    this.#fixerEffort = options.fixerEffort ?? DEFAULT_WORKER_EFFORT
-    this.#fixerModel = options.fixerModel ?? DEFAULT_WORKER_MODEL
-    this.#reviewerModel = options.reviewerModel ?? DEFAULT_WORKER_MODEL
+    this.#fixerEffort = options.fixerEffort
+    this.#fixerModel = options.fixerModel
+    this.#reviewerModel = options.reviewerModel
   }
 
   async createRun(objective: string): Promise<string> {
@@ -581,28 +586,45 @@ export class CliOrca implements OrcaOperations {
   }
 
   async startWorker(taskId: string, launch: WorkerLaunch): Promise<WorkerResult> {
+    // Start opencode before worker-start can deliver its preamble to a shell.
+    const prepared =
+      !launch.terminal
+        ? launch.worktree === 'new-child'
+          ? await this.#prepareNewChildWorker(launch)
+          : await this.#prepareCurrentWorker(launch)
+        : undefined
     const args = ['orchestration', 'worker-start', '--task', taskId]
     if (this.#runId) args.push('--run', this.#runId)
-    if (launch.terminal) {
+    if (prepared) {
+      args.push('--worktree', `path:${prepared.worktreePath}`, '--terminal', prepared.terminalHandle)
+    } else if (launch.terminal) {
       args.push('--terminal', launch.terminal)
     } else {
-      args.push('--worktree', launch.worktree, '--agent', DEFAULT_WORKER_AGENT)
-      if (launch.worktree === 'new-child') args.push('--name', launch.name, '--setup', 'run')
-      args.push('--model', launch.role === 'reviewer' ? this.#reviewerModel : this.#fixerModel)
-      args.push('--effort', launch.role === 'reviewer' ? DEFAULT_WORKER_EFFORT : this.#fixerEffort)
+      throw new Error('fresh workers must be prepared with an existing terminal')
     }
     args.push('--json')
-    const receipt = await this.#json<{
+    let receipt: {
       dispatchId: string
       effects?: { action?: string; id?: string; kind?: string }[]
       state: string
-    }>(args, true)
+    }
+    try {
+      receipt = await this.#json<{
+        dispatchId: string
+        effects?: { action?: string; id?: string; kind?: string }[]
+        state: string
+      }>(args, true)
+    } catch (error) {
+      if (prepared) await this.#cleanupPreparedWorker(prepared)
+      throw error
+    }
     if (!receipt || typeof receipt.dispatchId !== 'string' || typeof receipt.state !== 'string') {
+      if (prepared) await this.#cleanupPreparedWorker(prepared)
       throw new Error('worker-start returned an invalid receipt')
     }
-    const worktreeId = receipt.effects?.find(
-      (effect) => effect.kind === 'worktree' && effect.action === 'created'
-    )?.id
+    const worktreeId =
+      prepared?.worktreeId ??
+      receipt.effects?.find((effect) => effect.kind === 'worktree' && effect.action === 'created')?.id
     if (receipt.state !== 'ready') {
       await this.#cleanupFailedWorker(receipt.dispatchId, worktreeId)
       throw new Error(`worker ${receipt.dispatchId} did not start: ${receipt.state}`)
@@ -626,6 +648,127 @@ export class CliOrca implements OrcaOperations {
     } catch (error) {
       await this.#cleanupFailedWorker(receipt.dispatchId, worktreeId, deliveryId)
       throw error
+    }
+  }
+
+  async #prepareNewChildWorker(launch: WorkerLaunch): Promise<PreparedWorker> {
+    let worktree: { id: string; path: string } | undefined
+    let terminalHandle = ''
+    try {
+      const branch = (await command('git', ['branch', '--show-current'], this.#cwd)).stdout.trim()
+      if (!branch) throw new Error('no-mistakes requires a named branch for a worker worktree')
+      const created = await this.#json<{ worktree: { id: string; path: string } }>([
+        'worktree',
+        'create',
+        '--repo',
+        `path:${this.#cwd}`,
+        '--name',
+        launch.name,
+        '--base-branch',
+        branch,
+        '--parent-worktree',
+        `path:${this.#cwd}`,
+        '--setup',
+        'run',
+        '--json'
+      ])
+      worktree = created.worktree
+      if (!worktree?.id || !worktree.path) throw new Error('worktree create returned an invalid receipt')
+
+      const listed = await this.#json<{
+        terminals: { connected?: boolean; handle: string; writable?: boolean }[]
+      }>(['terminal', 'list', '--worktree', `path:${worktree.path}`, '--json'])
+      terminalHandle =
+        listed.terminals.find((terminal) => terminal.connected !== false && terminal.writable !== false)?.handle ?? ''
+      if (!terminalHandle) {
+        const createdTerminal = await this.#json<{ terminal: { handle: string } }>([
+          'terminal',
+          'create',
+          '--worktree',
+          `path:${worktree.path}`,
+          '--json'
+        ])
+        terminalHandle = createdTerminal.terminal.handle
+      }
+      if (!terminalHandle) throw new Error('terminal create returned an invalid receipt')
+
+      const model = launch.role === 'reviewer' ? this.#reviewerModel : this.#fixerModel
+      const variant = launch.role === 'fixer' ? this.#fixerEffort : undefined
+      await this.#launchWorkerAgent(terminalHandle, model, variant)
+      return { terminalHandle, worktreeId: worktree.id, worktreePath: worktree.path }
+    } catch (error) {
+      if (worktree) await this.#cleanupPreparedWorker({ terminalHandle, worktreeId: worktree.id, worktreePath: worktree.path })
+      throw error
+    }
+  }
+
+  async #prepareCurrentWorker(launch: WorkerLaunch): Promise<PreparedWorker> {
+    const prepared: PreparedWorker = { terminalHandle: '', worktreePath: this.#cwd }
+    try {
+      const created = await this.#json<{ terminal: { handle: string } }>([
+        'terminal',
+        'create',
+        '--worktree',
+        `path:${this.#cwd}`,
+        '--json'
+      ])
+      prepared.terminalHandle = created.terminal.handle
+      if (!prepared.terminalHandle) throw new Error('terminal create returned an invalid receipt')
+      const model = launch.role === 'reviewer' ? this.#reviewerModel : this.#fixerModel
+      const variant = launch.role === 'fixer' ? this.#fixerEffort : undefined
+      await this.#launchWorkerAgent(prepared.terminalHandle, model, variant)
+      return prepared
+    } catch (error) {
+      await this.#cleanupPreparedWorker(prepared)
+      throw error
+    }
+  }
+
+  async #launchWorkerAgent(terminalHandle: string, model?: string, variant?: string): Promise<void> {
+    const commandArgs = [DEFAULT_WORKER_AGENT]
+    if (model) commandArgs.push('--model', model)
+    if (model && variant) commandArgs.push('--variant', variant)
+    await this.#json([
+      'terminal',
+      'send',
+      '--terminal',
+      terminalHandle,
+      '--text',
+      commandArgs.map(shellQuote).join(' '),
+      '--enter',
+      '--json'
+    ])
+    await this.#waitForWorkerAgent(terminalHandle)
+  }
+
+  async #waitForWorkerAgent(terminalHandle: string): Promise<void> {
+    const deadline = Date.now() + WORKER_AGENT_READY_TIMEOUT_MS
+    for (;;) {
+      const shown = await this.#json<{
+        terminal: { connected?: boolean; preview?: string | null; title?: string | null }
+      }>(['terminal', 'show', '--terminal', terminalHandle, '--json'])
+      const terminal = shown.terminal
+      if (terminal.connected === false) throw new Error('worker agent terminal disconnected during startup')
+      const title = terminal.title ?? ''
+      const preview = terminal.preview ?? ''
+      if (title.startsWith('OC |') && !preview.includes('esc interrupt')) return
+      if (Date.now() >= deadline) throw new Error('opencode did not become ready before the timeout')
+      await new Promise((resolve) => setTimeout(resolve, 250))
+    }
+  }
+
+  async #cleanupPreparedWorker(prepared: PreparedWorker): Promise<void> {
+    if (prepared.terminalHandle) {
+      await this.#json(
+        ['terminal', 'close', '--terminal', prepared.terminalHandle, '--tab', '--json'],
+        true
+      ).catch(() => {})
+    }
+    if (prepared.worktreeId) {
+      await this.#json(
+        ['worktree', 'rm', '--worktree', `id:${prepared.worktreeId}`, '--force', '--json'],
+        true
+      ).catch(() => {})
     }
   }
 
