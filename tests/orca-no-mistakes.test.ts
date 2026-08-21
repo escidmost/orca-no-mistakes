@@ -27,12 +27,13 @@ const pass = (summary = 'passed'): StageReport => ({ findings: [], summary })
 class FakeGit implements GitOperations {
   readonly calls: string[] = []
   readonly pushReports: StageReport[] = []
+  branch = 'feature'
   #head = 'head-1'
   #pendingApplyFailures: StageReport[] = []
 
   async assertReady(): Promise<{ base: string; branch: string; head: string; root: string }> {
     this.calls.push('assert-ready')
-    return { base: 'main', branch: 'feature', head: this.#head, root: '/repo' }
+    return { base: 'main', branch: this.branch, head: this.#head, root: '/repo' }
   }
 
   async assertClean(): Promise<void> {
@@ -1448,6 +1449,29 @@ test('runs sequential fixer rounds from fresh child worktrees before re-review',
     assert.ok(applyCalls.some((call) => call.endsWith(`:/wt/${dispatchId}`)))
     assert.ok(orca.calls.includes(`release:${dispatchId}`))
     assert.ok(orca.removedWorktrees.includes(`repo::/${dispatchId}`))
+  }
+})
+
+test('reviewer prompts name the delivery branch, not the gate branch', async () => {
+  const git = new FakeGit()
+  git.branch = 'no-mistakes-gate-prompt'
+  const orca = new FakeOrca(git)
+
+  await runPipeline(
+    {
+      intent: 'Everything passes.',
+      deliveryBranch: 'feature',
+      gate: { branch: 'no-mistakes-gate-prompt', worktreeId: 'wt-gate' }
+    },
+    orca,
+    git
+  )
+
+  const reviewers = orca.launches.filter((launch) => launch.role === 'reviewer')
+  assert.ok(reviewers.length > 0)
+  for (const launch of reviewers) {
+    assert.match(launch.prompt, /^Branch: feature$/m)
+    assert.ok(!launch.prompt.includes('no-mistakes-gate-prompt'), launch.name)
   }
 })
 

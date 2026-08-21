@@ -248,7 +248,7 @@ async function executeStage(
   if (stage === 'push') {
     return await git.push(deliveryBranch)
   }
-  return await runReviewer(stage, attempt, taskId, intent, evidenceDir, repo, orca)
+  return await runReviewer(stage, attempt, taskId, intent, evidenceDir, repo, deliveryBranch, orca)
 }
 
 async function runReviewer(
@@ -258,12 +258,14 @@ async function runReviewer(
   intent: string,
   evidenceDir: string,
   repo: RepoState,
+  deliveryBranch: string,
   orca: OrcaOperations
 ): Promise<StageReport> {
   const prompt = checkerPrompt(
     stage,
     intent,
     repo,
+    deliveryBranch,
     path.join(evidenceDir, `${stage}-${attempt + 1}.json`)
   )
   const childTask = await orca.createTask(`[${stage} check ${attempt + 1}]\n${prompt}`, {
@@ -576,12 +578,13 @@ function checkerPrompt(
   stage: StageName,
   intent: string,
   repo: RepoState,
+  deliveryBranch: string,
   reportPath: string
 ): string {
   return `You are the independent read-only ${stage} worker in an active no-mistakes run.
 
 Repository: ${repo.root}
-Branch: ${repo.branch}
+Branch: ${deliveryBranch}
 Base: ${repo.base}
 User intent: ${intent}
 Assignment: ${checkerBrief(stage)}
