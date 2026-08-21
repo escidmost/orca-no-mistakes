@@ -2,7 +2,7 @@
 status: accepted
 date: 2026-08-21
 scope: target architecture
-implementation: not implemented
+implementation: partially implemented
 ---
 
 # Hierarchical Configuration Schema and Precedence Hierarchy
@@ -39,3 +39,5 @@ The runner requires a deterministic, hierarchical configuration system allowing 
 ## Consequences
 
 This unblocks ONM-30 (unified agent launch adapter) and ONM-31 (trusted base ref config extraction and merging engine). Runtime evidence captures the effective-policy hash derived from the merged configuration.
+
+The schema and the precedence resolver are implemented in `scripts/config.ts`. Configuration-file discovery, trusted base ref extraction, runner wiring, and effective-policy hashing are not implemented, so the runner still takes its per-role settings from CLI flags and built-in defaults; see [`docs/current-architecture.md`](../current-architecture.md).
