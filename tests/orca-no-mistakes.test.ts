@@ -218,8 +218,44 @@ test('runs the nine-stage adversarial pipeline with fixes, gates, and isolation'
     /report exactly once with worker_done/i
   )
   assert.match(
+    orca.tasks.find((task) => task.spec.startsWith('[review check 1]'))?.spec ?? '',
+    /Do NOT run tests during review/
+  )
+  assert.match(
+    orca.tasks.find((task) => task.spec.startsWith('[test check 1]'))?.spec ?? '',
+    /Do NOT run the complete repository test suite/
+  )
+  assert.match(
+    orca.tasks.find((task) => task.spec.startsWith('[document check 1]'))?.spec ?? '',
+    /Find what this change made stale/
+  )
+  assert.match(
+    orca.tasks.find((task) => task.spec.startsWith('[lint check 1]'))?.spec ?? '',
+    /Discover configured linters/
+  )
+  assert.match(
+    orca.tasks.find((task) => task.spec.startsWith('[pr check 1]'))?.spec ?? '',
+    /conventional commit format/
+  )
+  assert.match(
+    orca.tasks.find((task) => task.spec.startsWith('[ci check 1]'))?.spec ?? '',
+    /Wait for all required CI checks/
+  )
+  assert.match(
     orca.tasks.find((task) => task.spec.startsWith('[review fix 1]'))?.spec ?? '',
     /Null input crashes the command/
+  )
+  assert.match(
+    orca.tasks.find((task) => task.spec.startsWith('[review fix 1]'))?.spec ?? '',
+    /Apply all the fixes you intend to make first/
+  )
+  assert.match(
+    orca.tasks.find((task) => task.spec.startsWith('[lint fix 1]'))?.spec ?? '',
+    /Re-run the relevant lint or format commands/
+  )
+  assert.match(
+    orca.tasks.find((task) => task.spec.startsWith('[ci fix 1]'))?.spec ?? '',
+    /fix the test to be cross-platform/
   )
   assert.equal(
     orca.calls.at(-1),

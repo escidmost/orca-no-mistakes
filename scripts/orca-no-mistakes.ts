@@ -414,13 +414,121 @@ function stageTaskSpec(stage: StageName, intent: string): string {
 function checkerBrief(stage: StageName): string {
   const briefs: Record<Exclude<StageName, 'intent' | 'push' | 'rebase'>, string> = {
     review: 'Adversarially review the committed change.',
-    test: 'Run the smallest relevant behavioral checks.',
+    test: 'Run the smallest relevant behavioral checks and gather evidence for user intent.',
     document: 'Check whether the change made owned documentation stale.',
-    lint: 'Run the repository lint and formatting checks.',
-    pr: 'Create or update the pull request without merging it.',
+    lint: 'Run repository linting, formatting, and static-analysis checks.',
+    pr: 'Create or update the pull request for the full branch delta without merging it.',
     ci: 'Wait for the pull request checks and report their terminal state.'
   }
   return briefs[stage as keyof typeof briefs]
+}
+
+function checkerInstructions(stage: StageName): string {
+  switch (stage) {
+    case 'review':
+      return `Task:
+- Read the relevant history and diff yourself.
+- Focus findings on risks introduced by changed code, but inspect surrounding code, call sites, shared helpers, tests, and invariants when needed to understand root cause.
+- Determine from the stated intent and relevant evidence whether a bug-fix change claims a durable fix or explicitly authorized short-term containment.
+- For a claimed durable fix, reconstruct the concrete failing sequence and required invariant, inspect relevant sibling paths and shared state transitions, and verify whether the failure remains reachable.
+- For new or changed logic, construct at least one concrete input or state and trace it through the code, looking for a case that produces a wrong result without erroring.
+- When source evidence proves the failure remains reachable, report the concrete path and recommend the earliest supported shared boundary that would make the invariant hold, rather than duplicating another symptom patch.
+- Do not infer a systemic flaw from code shape, duplication, or architectural preference alone. Do not demand a shared abstraction or broad redesign without a concrete reachable path, violated invariant, or immediately competing semantic owner.
+- Do not block explicitly authorized honest containment merely because a later durable fix is possible. Do not expand user scope or turn optional broader improvements into blockers.
+- Do NOT run tests during review. The pipeline has a dedicated test step after review.
+- Analyze for bugs, security issues, performance regressions, breaking changes, insufficient error handling, computations returning wrong values/labels/sets without failing, and code simplification opportunities.
+- "Simplification" means reducing code complexity through non-functional refactoring (e.g. deduplication, clearer control flow). It does NOT mean removing features, changing product behavior, or stripping intentional user-facing output.
+- Do a full review pass before returning. Do not stop after the first valid finding. Continue inspecting the rest of the changed code until you have enumerated all material issues you can substantiate.
+
+Rules:
+- Anchor every finding to a specific file and one-indexed line number in the changed code when possible.
+- Use severity "error" for problems that should absolutely not get merged, "warning" for things that are worth addressing but can be done in a follow-up, and "info" for things that are nice to have.
+- Be concise and actionable. No generic advice like "add more tests".
+- Only comment on things that genuinely matter.
+- Do NOT report styling, formatting, linting, compilation, or type-checking issues.
+- If the change is clean, return an empty findings array.
+- For each finding, set the action field to:
+  - "ask-user": functional requirements, product behavior, or challenging the author's deliberate intent (e.g. "this feature seems unnecessary", "this hardcoded value should be configurable", "this deletion looks wrong"). When in doubt, default to "ask-user".
+  - "auto-fix": non-functional, non-user-visible issues (correctness, error handling, security, performance, mechanical code quality) that can be safely fixed without discussion about intent.
+  - "no-op": informational notes or acknowledged tradeoffs.`
+
+    case 'test':
+      return `Task:
+- Understand the user intent before testing. Use declared intent as the primary criteria for what success means.
+- Decide what evidence or artifacts would clearly demonstrate the user intent is satisfied. Unit tests passing is not sufficient evidence by itself.
+- Demonstrate the user intent working end-to-end in a way consistent with how an end user would actually experience it.
+- Prefer product-level artifacts: screenshots, GIFs, videos, rendered UI, CLI transcripts, API responses, persisted database state, generated PR markdown, logs, or other outputs that directly show intended behavior working.
+- For UI, HTML, CSS, Electron renderer, browser, visual layout, or copy-placement changes, attempt to capture reviewer-visible visual evidence (screenshots, videos, rendered HTML). If not possible, state why in summary.
+- Look for existing tests that would generate sufficient evidence. If they exist, run the smallest relevant set that proves the requested intent.
+- Do NOT run the complete repository test suite. Local Test is targeted validation of the requested intent; remote CI owns broad regression.
+- Never treat "do not run everything" as permission to run nothing: if no targeted automated test can establish the intent, write or improve a focused test, perform manual verification with evidence, or report a warning finding.
+- If automated testing cannot produce the needed evidence, execute manual verification steps and record the evidence-producing steps you performed.
+- If sufficient evidence is not possible, report a warning finding with action "ask-user" explaining what evidence is missing.
+
+Rules:
+- Do NOT run linters, formatters, or static analysis tools. Focus on testing and test-related validation only.
+- Before finishing, remove any transient artifacts your testing created in the working tree (downloaded models, caches, build outputs, large binaries, or generated scratch directories) so they are not committed, leaving evidence in the dedicated evidence directory.
+- Include a concise "summary" describing what you exercised and the overall result.
+- Record the exact tests, manual checks, and evidence-producing steps you ran in a "tested" array (prefer concrete commands or test selectors wrapped in backticks).
+- Always include an "artifacts" array with paths to captured evidence under the evidence directory.
+- Report only actionable findings: test failures, unfixable setup issues, flaky tests, or missing evidence that prevents demonstrating user intent.
+- Do NOT report passing tests, test counts, or coverage summaries as findings.
+- If all tests pass and there are no issues, return an empty findings array.`
+
+    case 'document':
+      return `Task:
+1. Understand the change: read the diff and changed files to understand what was added, modified, or removed, and the intent of the change.
+2. Find what this change made stale: for each fact or contract the change altered, locate its one authoritative owner document (README, docs/, doc comments, config examples, etc.).
+3. Locate existing duplicates of those facts that are now stale.
+4. Check that changed user-facing behavior leaves its authoritative documentation accurate, and that stale duplicates are removed or reduced to short pointers to the owner.
+5. Report only unresolved documentation gaps, judgment calls (ambiguous intent or conflicting docs), or an out-of-scope consolidation worth a follow-up.
+
+Rules:
+- Focus on documentation accuracy and completeness. Do NOT change executable behavior or tests.
+- Do NOT report documentation gaps that are already accurate.
+- If the project documentation is accurate and clean, return an empty findings array.
+- Use action "ask-user" for ambiguous intent, product decisions, or conflicting documentation; use "auto-fix" for mechanical documentation updates; use "no-op" for informational notes.`
+
+    case 'lint':
+      return `Task:
+- Discover configured linters, formatters, and static-analysis tools for this project.
+- Only lint or format the relevant changed files when possible.
+- Run relevant checks yourself and report only unresolved lint, format, or static-analysis issues.
+- If everything is clean or passes, return an empty findings array.
+
+Rules:
+- Do NOT run tests or broader behavioral validation.
+- Focus on lint, format, and static-analysis issues only.
+- If the change is clean or passes all checks, return an empty findings array.
+- Use action "auto-fix" for mechanical lint/formatting issues; use "ask-user" for rule configurations requiring user decisions; use "no-op" for informational notes.`
+
+    case 'pr':
+      return `Task:
+- Create or update the pull request for the full branch delta without merging it.
+- Title must use conventional commit format: "type(scope): description" or "type: description". Valid types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert. Scope is optional. Do not capitalize the type.
+- When including a scope, it MUST be a real package/module name that exists in the codebase, identified by inspecting changed paths. Keep scope at a coarse level (e.g. "cli", "pipeline", "daemon").
+- Body: a "## What Changed" section in GitHub-flavored markdown with 1-3 concise bullet points describing concrete changes from the final diff, not user motivation. Do not include Intent, Risk Assessment, Testing, or Pipeline sections - those are handled separately.
+- Derive every claim from the final diff. Do not invent tests or behavior.
+
+Rules:
+- Report the pull request URL and status in the summary.
+- Report any authentication blockers, forge errors, or missing metadata as actionable findings.
+- If the PR is cleanly created or updated, return an empty findings array.`
+
+    case 'ci':
+      return `Task:
+- Inspect the pull request CI check runs and report their terminal state.
+- Check mergeability against the target base branch.
+- Wait for all required CI checks to complete on the candidate commit.
+
+Rules:
+- If all checks pass and the PR is mergeable, return an empty findings array and summarize the passing checks.
+- If any CI checks fail or merge conflicts exist, report actionable findings with failing check names, failure logs, and details.
+- Set action to "auto-fix" for objective test/build failures or merge conflicts; set action to "ask-user" for infrastructure/permission failures or ambiguous breakages.`
+
+    default:
+      return `Assignment: ${checkerBrief(stage)}`
+  }
 }
 
 function checkerPrompt(
@@ -437,12 +545,89 @@ Base: ${repo.base}
 User intent: ${intent}
 Assignment: ${checkerBrief(stage)}
 
+${checkerInstructions(stage)}
+
 Do not edit or commit files. Do not invoke no-mistakes or Orca pipeline controls. Inspect the actual diff and execute only focused checks needed for this phase. Evidence belongs outside the repository at ${reportPath}.
 
 Write one JSON object to ${reportPath} with this shape:
 {"findings":[{"id":"stable-id","severity":"error|warning|info","file":"optional/path","line":1,"description":"full finding","action":"auto-fix|ask-user|no-op"}],"summary":"concise result","tested":["optional command"],"artifacts":["optional path"]}
 
 Create the parent directory if needed. Then report exactly once with worker_done: keep --body to the required three-sentence executive summary and pass --report-path ${reportPath}. Use auto-fix only for a concrete mechanical repair. Use ask-user for product choices, intent conflicts, destructive actions, credentials, or uncertain delivery state. An empty findings array means this phase passed.`
+}
+
+function fixerInstructions(stage: StageName): string {
+  switch (stage) {
+    case 'review':
+      return `Rules:
+- Always start by double-checking whether each finding is legitimate.
+- Before changing code, identify whether each finding is a local defect or a symptom of a deeper design, abstraction, validation, ownership, or test-coverage flaw. Prefer the smallest correct root-cause fix within the changed area over patching only the reported line.
+- If a narrow fix would leave the same class of bug likely elsewhere, fix the deepest practical cause instead.
+- Avoid resolving a finding by removing or reverting the author's intentional code in their original commit. If the original change introduced something on purpose, fix it forward (e.g. add validation, handle edge cases, tighten logic) rather than deleting it. Similarly, if the original change intentionally deleted or simplified code, do not restore or re-add the removed code unless the finding is a legitimate correctness, reliability, or security issue and the smallest reasonable fix happens to reintroduce a small amount of previously deleted logic.
+- Do not add code comments explaining your fixes.
+- Apply all the fixes you intend to make first; do not run any verification in between individual fixes.
+- After all fixes are applied, run one focused verification limited to the changed area (the specific package, file, or test you touched) at the end of the fix round to confirm the fixes hold.
+- Do NOT run the complete repository test suite or lint suite during this fix round.
+- Commit only your fixes on the current feature branch. Do not push, create a PR, or invoke no-mistakes/Orca pipeline controls.
+- The summary must be one concise sentence fragment suitable for a git commit subject under 10 words.`
+
+    case 'test':
+      return `Rules:
+- Reproduce the specific failing case first (the exact test, package, script, or check named in the findings), then re-run only that focused verification after the fix.
+- Make the smallest correct root-cause fix.
+- Do not refactor beyond what is needed for that root-cause fix.
+- If tests fail, determine whether the problem is a real product/code failure, a setup/environment problem you can fix, or a flaky/infrastructure issue.
+- Do NOT run linters, formatters, or static analysis tools.
+- Do NOT run the complete repository test suite. Local Test is targeted validation of the failure and the requested intent; remote CI owns broad regression.
+- Before finishing, remove any transient artifacts your testing created in the working tree (downloaded models, caches, build outputs, large binaries, or generated data directories) so they are not committed and pushed.
+- Commit only your fixes on the current feature branch. Do not push, create a PR, or invoke no-mistakes/Orca pipeline controls.
+- The summary must be one concise sentence fragment suitable for a git commit subject under 10 words.`
+
+    case 'document':
+      return `Rules:
+- Update each altered fact in its one authoritative owner document (README, docs/, doc comments, config examples, etc.). Changed user-facing behavior must leave its authoritative user documentation accurate.
+- Remove stale duplicates or reduce them to a short pointer to the owner; do not synchronize full copies.
+- Only edit documentation files or doc comments. Do not change executable behavior or tests.
+- Re-read what you changed to verify it now reflects the code.
+- Commit only your fixes on the current feature branch. Do not push, create a PR, or invoke no-mistakes/Orca pipeline controls.
+- The summary must be one concise sentence fragment suitable for a git commit subject under 10 words.`
+
+    case 'lint':
+      return `Rules:
+- Make the smallest correct root-cause fix.
+- Do not refactor beyond what is needed for that root-cause fix.
+- Do not run tests or broader behavioral validation.
+- Re-run the relevant lint or format commands before finishing to verify they pass.
+- Commit only your fixes on the current feature branch. Do not push, create a PR, or invoke no-mistakes/Orca pipeline controls.
+- The summary must be one concise sentence fragment suitable for a git commit subject under 10 words.`
+
+    case 'rebase':
+      return `Rules:
+- Find all conflicting files and resolve the conflict markers (<<<<<<< ======= >>>>>>>).
+- After resolving each file, stage it with: git add <file>
+- Preserve the intent of both the current branch changes and the upstream changes.
+- Do not modify any files that don't have conflicts.
+- Verify the rebase resolution completes cleanly.
+- Commit only your fixes on the current feature branch. Do not push, create a PR, or invoke no-mistakes/Orca pipeline controls.
+- The summary must be one concise sentence fragment suitable for a git commit subject under 10 words.`
+
+    case 'ci':
+      return `Rules:
+- You MUST produce file changes that fix the failing checks. Do not conclude that nothing needs to change.
+- If a test fails only on a specific OS (e.g. Windows CRLF, path separators), fix the test to be cross-platform.
+- If a test is flaky, make it deterministic.
+- Make the smallest correct root-cause fix without unnecessary refactoring.
+- If merge conflicts exist with the base branch, resolve them cleanly preserving both sides' intent.
+- Verify the fix by running the most relevant commands locally before finishing.
+- Commit only your fixes on the current feature branch. Do not push, create a PR, or invoke no-mistakes/Orca pipeline controls (repush is handled by the coordinator).
+- The summary must be one concise sentence fragment suitable for a git commit subject under 10 words.`
+
+    default:
+      return `Rules:
+- Fix all listed findings without changing unrelated behavior.
+- Run one focused verification after all edits.
+- Commit only your fixes on the current feature branch. Do not push, create a PR, run the whole repository suite, or invoke no-mistakes/Orca pipeline controls.
+- The summary must be one concise sentence fragment suitable for a git commit subject under 10 words.`
+  }
 }
 
 function fixerPrompt(
@@ -457,7 +642,7 @@ function fixerPrompt(
 User intent: ${intent}
 Findings: ${JSON.stringify(actionableFindings(report))}
 ${guidance ? `User guidance: ${guidance}\n` : ''}
-Fix all listed findings without changing unrelated behavior. Run one focused verification after all edits. Commit only your fixes on the current feature branch. Do not push, create a PR, run the whole repository suite, or invoke no-mistakes/Orca pipeline controls.
+${fixerInstructions(stage)}
 
 Write {"findings":[],"summary":"what was fixed and committed","tested":["focused command"]} to ${reportPath}, creating its parent directory if needed. Then report exactly once with worker_done: keep --body to the required three-sentence executive summary and pass --report-path ${reportPath}.`
 }
