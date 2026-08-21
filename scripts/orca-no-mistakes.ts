@@ -148,12 +148,17 @@ export async function runPipeline(
     runId,
     submissionCommitOid: repo.head
   })
-  ledger.acquireLease({
-    branch: repo.branch,
-    force: options.forceLease === true,
-    repoRoot: repo.root,
-    runId
-  })
+  try {
+    ledger.acquireLease({
+      branch: repo.branch,
+      force: options.forceLease === true,
+      repoRoot: repo.root,
+      runId
+    })
+  } catch (error) {
+    ledger.finishRun(runId, 'failed')
+    throw error
+  }
 
   const submissionCommitOid = repo.head
   ledger.recordCheckpoint({
@@ -813,7 +818,7 @@ function gateDecision(resolution: string): string {
 }
 
 export type GateDecision = {
-  action: 'approve' | 'fix' | 'retry' | 'skip' | 'stop' | 'unknown'
+  action: 'approve' | 'fix' | 'skip' | 'stop' | 'unknown'
   guidance: string
   selectedFindings: Finding[]
 }
@@ -840,7 +845,6 @@ export function parseGateResolution(resolution: string, availableFindings: Findi
         rawAction === 'approve' ||
         rawAction === 'skip' ||
         rawAction === 'stop' ||
-        rawAction === 'retry' ||
         rawAction === 'fix'
           ? rawAction
           : 'unknown'
@@ -872,7 +876,7 @@ export function parseGateResolution(resolution: string, availableFindings: Findi
   }
 
   const rawAction = gateDecision(trimmed)
-  if (rawAction === 'approve' || rawAction === 'skip' || rawAction === 'stop' || rawAction === 'retry') {
+  if (rawAction === 'approve' || rawAction === 'skip' || rawAction === 'stop') {
     return { action: rawAction, guidance: '', selectedFindings: [] }
   }
   if (rawAction !== 'fix') {
@@ -2016,7 +2020,7 @@ async function runAttestationCommand(positionals: string[], flags: RawCliFlags):
     verifyManifest(manifest)
     let stored: PassedAttestationManifest | undefined
     try {
-      stored = await ledger.getAttestation(manifest.runId ?? '')
+      stored = await ledger.getAttestation(manifest.candidateCommitOid)
     } catch {
       stored = undefined
     }
@@ -2031,9 +2035,6 @@ async function runAttestationCommand(positionals: string[], flags: RawCliFlags):
   }
 }
 
-async function loadManifest(ref: string, ledger: DomainLedger): Promise<PassedAttestationManifest> {
-  return ledger.getAttestation(ref)
-}
 
 const invokedPath = process.argv[1] ? pathToFileURL(path.resolve(process.argv[1])).href : ''
 if (import.meta.url === invokedPath) {

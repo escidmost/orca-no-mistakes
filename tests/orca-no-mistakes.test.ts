@@ -11,6 +11,7 @@ import {
   DomainLedger,
   GitShell,
   PIPELINE_STEPS,
+  buildAttestation,
   capLog,
   main,
   parseGateResolution,
@@ -1326,6 +1327,40 @@ test('prune removes completed runs with their evidence while retaining in-progre
 
   const future = ledger.prune({ before: new Date(Date.now() + 60_000) })
   assert.deepEqual(future, [])
+
+  assert.deepEqual(ledger.prune({ repoSubstring: 'live' }), [])
+  assert.deepEqual(ledger.prune({}), [])
+  assert.equal(ledger.runStatus('run-live'), 'in-progress')
+})
+
+test('re-attesting an unchanged commit replaces the stored manifest instead of failing', async () => {
+  const ledger = new DomainLedger(':memory:')
+  const candidate = 'b'.repeat(40)
+  for (const runId of ['run-first', 'run-second']) {
+    ledger.startRun({
+      baseBranch: 'main',
+      branch: 'feature',
+      intent: `pass ${runId}`,
+      policySha256: 'f'.repeat(64),
+      repoRoot: '/repo/rerun',
+      runId,
+      submissionCommitOid: candidate
+    })
+    ledger.recordAttestation(
+      buildAttestation([], {
+        baseCommitOid: 'a'.repeat(40),
+        candidateCommitOid: candidate,
+        intent: `pass ${runId}`,
+        policySha256: 'f'.repeat(64),
+        runId
+      })
+    )
+  }
+
+  const stored = ledger.getAttestation(candidate)
+  assert.equal(stored.runId, 'run-second')
+  verifyManifest(stored)
+  assert.equal(ledger.getAttestation('run-second').runId, 'run-second')
 })
 
 test('CLI exports, verifies, and prunes attestations through the domain ledger', async () => {

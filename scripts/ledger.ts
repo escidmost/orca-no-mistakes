@@ -208,6 +208,11 @@ CREATE TABLE IF NOT EXISTS branch_leases (
   PRIMARY KEY (repo_root, branch)
 );
 
+CREATE TABLE IF NOT EXISTS lease_generations (
+  repo_root TEXT PRIMARY KEY,
+  next_token INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS stage_checkpoints (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
@@ -330,7 +335,7 @@ export class DomainLedger {
           `branch ${options.branch} is already leased by run ${existing.run_id}; pass --force-lease to reclaim it`
         )
       }
-      const nextToken = Number(existing.generation_token) + 1
+      const nextToken = this.#nextGenerationToken(options.repoRoot)
       this.#db
         .prepare(
           'UPDATE branch_leases SET run_id = ?, generation_token = ?, acquired_at = ?, heartbeat_at = ? WHERE repo_root = ? AND branch = ?'
@@ -344,15 +349,25 @@ export class DomainLedger {
         .run(now, options.repoRoot, options.branch)
       return Number(existing.generation_token)
     }
-    const row = this.#db
-      .prepare('SELECT COALESCE(MAX(generation_token), 0) + 1 AS token FROM branch_leases WHERE repo_root = ?')
-      .get(options.repoRoot) as { token: number | bigint }
-    const token = Number(row.token)
+    const token = this.#nextGenerationToken(options.repoRoot)
     this.#db
       .prepare(
         'INSERT INTO branch_leases (repo_root, branch, run_id, generation_token, acquired_at, heartbeat_at) VALUES (?, ?, ?, ?, ?, ?)'
       )
       .run(options.repoRoot, options.branch, options.runId, token, now, now)
+    return token
+  }
+
+  #nextGenerationToken(repoRoot: string): number {
+    const row = this.#db
+      .prepare('SELECT next_token FROM lease_generations WHERE repo_root = ?')
+      .get(repoRoot) as { next_token: number | bigint } | undefined
+    const token = row ? Number(row.next_token) : 1
+    this.#db
+      .prepare(
+        'INSERT INTO lease_generations (repo_root, next_token) VALUES (?, ?) ON CONFLICT(repo_root) DO UPDATE SET next_token = excluded.next_token'
+      )
+      .run(repoRoot, token + 1)
     return token
   }
 
@@ -483,7 +498,17 @@ export class DomainLedger {
         `INSERT INTO passed_attestations (
            candidate_commit_oid, run_id, base_commit_oid, policy_sha256, intent, intent_hash,
            merkle_root, manifest_json, coordinator_version, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(candidate_commit_oid) DO UPDATE SET
+           run_id = excluded.run_id,
+           base_commit_oid = excluded.base_commit_oid,
+           policy_sha256 = excluded.policy_sha256,
+           intent = excluded.intent,
+           intent_hash = excluded.intent_hash,
+           merkle_root = excluded.merkle_root,
+           manifest_json = excluded.manifest_json,
+           coordinator_version = excluded.coordinator_version,
+           created_at = excluded.created_at`
       )
       .run(
         manifest.candidateCommitOid,
@@ -516,7 +541,9 @@ export class DomainLedger {
     const rows = this.#db
       .prepare(
         `SELECT run_id FROM runs
-         WHERE (? IS NULL OR (completed_at IS NOT NULL AND completed_at < ?))
+         WHERE status <> 'in-progress'
+           AND completed_at IS NOT NULL
+           AND (? IS NULL OR completed_at < ?)
            AND (? IS NULL OR instr(repo_root, ?) > 0)`
       )
       .all(before, before, options.repoSubstring ?? null, options.repoSubstring ?? null) as {
