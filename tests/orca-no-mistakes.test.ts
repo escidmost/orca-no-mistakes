@@ -340,6 +340,9 @@ test('exhaustion gate allows user to authorize another fix round', async () => {
   const result = await runPipeline({ intent: 'Exhaustion fix test', maxFixRounds: 1 }, orca, git)
   assert.equal(result.steps.length, PIPELINE_STEPS.length)
   assert.ok(orca.calls.some((call) => call.includes('reached the limit of 1 fix rounds')))
+  const postGateFixer = orca.tasks.find((task) => task.spec.startsWith('[review fix 2]'))
+  assert.ok(postGateFixer, 'the gate authorized a second fix round')
+  assert.match(postGateFixer.spec, /try alternative fix/)
 })
 
 test('unknown gate decisions stop the pipeline and update worktree status', async () => {
@@ -604,6 +607,8 @@ test('CliOrca notifies the originating terminal when a gate opens', async () => 
   const temp = await mkdtemp(path.join(tmpdir(), 'orca-gate-notify-'))
   const fakeOrca = path.join(temp, 'orca')
   const callsPath = path.join(temp, 'calls.jsonl')
+  const previousHandle = process.env.ORCA_TERMINAL_HANDLE
+  delete process.env.ORCA_TERMINAL_HANDLE
   try {
     await writeFile(
       fakeOrca,
@@ -638,6 +643,8 @@ console.log(JSON.stringify({ result }))
     assert.ok(sent?.includes('question'))
     assert.ok(sent?.includes('Choose a review action.\nGate: gate-review'))
   } finally {
+    if (previousHandle === undefined) delete process.env.ORCA_TERMINAL_HANDLE
+    else process.env.ORCA_TERMINAL_HANDLE = previousHandle
     await rm(temp, { recursive: true, force: true })
   }
 })
@@ -964,6 +971,10 @@ test('parseGateResolution parses actions, finding IDs, guidance, and JSON overri
     guidance: 'some text',
     selectedFindings: []
   })
+  assert.deepEqual(
+    parseGateResolution(JSON.stringify({ action: 'fix', findingIds: 'f-1' }), findings),
+    { action: 'fix', guidance: '', selectedFindings: [] }
+  )
   assert.deepEqual(parseGateResolution('fix: f-9: some text', findings), {
     action: 'fix',
     guidance: 'f-9: some text',

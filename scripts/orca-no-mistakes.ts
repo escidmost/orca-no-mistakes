@@ -744,8 +744,12 @@ export function parseGateResolution(resolution: string, availableFindings: Findi
         return { action, guidance, selectedFindings: [] }
       }
       let selected = availableFindings
-      if (Array.isArray(parsed.findingIds)) {
-        const idSet = new Set(parsed.findingIds)
+      if (parsed.findingIds !== undefined) {
+        const idSet = new Set(
+          Array.isArray(parsed.findingIds)
+            ? parsed.findingIds.filter((id): id is string => typeof id === 'string')
+            : []
+        )
         selected = availableFindings.filter((f) => idSet.has(f.id))
       }
       if (parsed.instructions && typeof parsed.instructions === 'object' && !Array.isArray(parsed.instructions)) {
@@ -800,7 +804,8 @@ export function parseGateResolution(resolution: string, availableFindings: Findi
     const selected = availableFindings.filter((f) => selectedIds.has(f.id))
     let guidance = remainder
     for (const id of matchedTokens) {
-      guidance = guidance.replace(new RegExp(`\\b${id}\\b`, 'g'), '')
+      const escaped = id.replace(/[.*+?^${}()|[\]\\-]/g, '\\$&')
+      guidance = guidance.replace(new RegExp(`(^|[^A-Za-z0-9_-])${escaped}(?![A-Za-z0-9_-])`, 'g'), '$1')
     }
     guidance = guidance.replace(/^[\s,;:[\]|=-]+/, '').trim()
     return { action: 'fix', guidance, selectedFindings: selected }
@@ -949,7 +954,7 @@ export class CliOrca implements OrcaOperations {
           : await this.#prepareCurrentWorker(launch)
         : undefined
     const terminalHandle = prepared?.terminalHandle ?? launch.terminal
-    if (!terminalHandle) throw new Error('fresh workers must be prepared with an existing terminal')
+    if (!terminalHandle) throw new Error('worker preparation returned no terminal handle')
     const args = [
       'orchestration',
       'dispatch',
@@ -1732,15 +1737,14 @@ Run options:
     base: stringFlag(parsed.flags, 'base'),
     expectedHead: stringFlag(parsed.flags, 'head')
   })
-  const root = (await command('git', ['-C', repo, 'rev-parse', '--show-toplevel'], repo)).stdout.trim()
+  const repoState = await git.assertReady()
   if (parsed.flags.attached !== true) {
-    await git.assertReady()
-    const terminalHandle = await launchDetachedRun(root, parsed.flags)
+    const terminalHandle = await launchDetachedRun(repoState.root, parsed.flags)
     console.log(JSON.stringify({ detached: true, terminalHandle }))
     return
   }
   const orca = new CliOrca({
-    cwd: root,
+    cwd: repoState.root,
     reviewerModel: stringFlag(parsed.flags, 'reviewer-model'),
     fixerModel: stringFlag(parsed.flags, 'fixer-model'),
     fixerEffort: stringFlag(parsed.flags, 'fixer-effort'),
