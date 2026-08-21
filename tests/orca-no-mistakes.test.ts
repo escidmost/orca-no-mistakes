@@ -35,12 +35,13 @@ class FakeGit implements GitOperations {
   }
   #counter = 1
   #head = FakeGit.#oid(1)
+  #baseOid = FakeGit.#oid(0)
   divergeAfterAnchor = false
   #operatorDiverged = false
 
   async assertReady(): Promise<{ base: string; baseOid: string; branch: string; head: string; root: string }> {
     this.calls.push('assert-ready')
-    return { base: 'main', baseOid: FakeGit.#oid(0), branch: 'feature', head: this.#head, root: '/repo' }
+    return { base: 'main', baseOid: this.#baseOid, branch: 'feature', head: this.#head, root: '/repo' }
   }
 
   async assertClean(): Promise<void> {
@@ -53,12 +54,18 @@ class FakeGit implements GitOperations {
 
   async rebase(base: string): Promise<StageReport> {
     this.calls.push(`rebase:${base}`)
+    this.#baseOid = 'b'.repeat(40)
     this.#head = FakeGit.#oid(++this.#counter)
     return pass('rebased')
   }
 
   async policySha256(): Promise<string> {
     return 'f'.repeat(64)
+  }
+
+  async resolveBaseOid(): Promise<string> {
+    this.calls.push('resolve-base')
+    return this.#baseOid
   }
 
   async advanceIfUnchanged(fromOid: string, toOid: string): Promise<boolean> {
@@ -1399,4 +1406,25 @@ test('CLI exports, verifies, and prunes attestations through the domain ledger',
     else process.env.ORCA_NO_MISTAKES_HOME = previousHome
     await rm(temp, { recursive: true, force: true })
   }
+})
+
+test('the attestation binds the base commit fetched by the rebase stage', async () => {
+  const git = new FakeGit()
+  const orca = new FakeOrca(git)
+  const result = await runPipeline({ intent: 'Bind the fetched base.' }, orca, git)
+
+  assert.ok(result.attestation)
+  assert.equal(result.attestation.baseCommitOid, 'b'.repeat(40))
+  const byStage = (stage: string) =>
+    result.attestation!.stageEvidence.filter((entry) => entry.stage === stage)
+  assert.deepEqual(
+    byStage('intent').map((entry) => entry.baseCommitOid),
+    ['0'.repeat(40)]
+  )
+  for (const stage of ['review', 'test', 'document', 'lint']) {
+    for (const entry of byStage(stage)) {
+      assert.equal(entry.baseCommitOid, 'b'.repeat(40))
+    }
+  }
+  verifyManifest(result.attestation)
 })

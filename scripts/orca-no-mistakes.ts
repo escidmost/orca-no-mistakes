@@ -80,6 +80,7 @@ export interface GitOperations {
   head(): Promise<string>
   rebase(base: string): Promise<StageReport>
   policySha256(base: string): Promise<string>
+  resolveBaseOid(base: string): Promise<string>
   advanceIfUnchanged(fromOid: string, toOid: string): Promise<boolean>
   anchorRecoveryRef(runId: string, oid: string): Promise<void>
 }
@@ -138,7 +139,8 @@ export async function runPipeline(
     throw new Error('Orca returned an unsafe Run ID')
   }
 
-  const policySha256Value = await git.policySha256(repo.base)
+  let baseCommitOid = repo.baseOid
+  let policySha256Value = await git.policySha256(repo.base)
   ledger.startRun({
     baseBranch: repo.base,
     branch: repo.branch,
@@ -192,11 +194,11 @@ export async function runPipeline(
       stage,
       round,
       candidateCommitOid: candidate,
-      baseCommitOid: repo.baseOid,
+      baseCommitOid,
       workerIdentity,
       exitCode,
       evidenceSha256: evidenceSha256({
-        baseCommitOid: repo.baseOid,
+        baseCommitOid,
         candidateCommitOid: candidate,
         exitCode,
         round,
@@ -208,7 +210,7 @@ export async function runPipeline(
     }
     ledger.recordEvidence({
       artifactPath,
-      baseCommitOid: repo.baseOid,
+      baseCommitOid,
       candidateCommitOid: candidate,
       evidenceSha256: entry.evidenceSha256,
       exitCode,
@@ -336,6 +338,11 @@ export async function runPipeline(
       }
 
       await orca.completeTask(taskId, report)
+      if (stage === 'rebase') {
+        baseCommitOid = await git.resolveBaseOid(repo.base)
+        policySha256Value = await git.policySha256(repo.base)
+        ledger.updateRunPolicy(runId, policySha256Value)
+      }
     }
 
     if (retainedFixer) {
@@ -362,7 +369,7 @@ export async function runPipeline(
     }
 
     const attestation = buildAttestation(stageEntries, {
-      baseCommitOid: repo.baseOid,
+      baseCommitOid,
       candidateCommitOid: terminalCommitOid,
       intent,
       policySha256: policySha256Value,
@@ -1668,14 +1675,19 @@ export class GitShell implements GitOperations {
     const base = this.#requestedBase ?? (await this.#detectBase())
     if (branch === base) throw new Error(`no-mistakes refuses to run on the default branch ${base}`)
     await this.#git(['remote', 'get-url', 'origin'])
-    const resolvedBase =
+    const resolvedBase = await this.resolveBaseOid(base)
+    this.#state = { base, baseOid: resolvedBase, branch, head, root }
+    return this.#state
+  }
+
+  async resolveBaseOid(base: string): Promise<string> {
+    const resolved =
       (
         await this.#git(['rev-parse', '--verify', `refs/remotes/origin/${base}^{commit}`], true)
       ).stdout.trim() ||
       (await this.#git(['rev-parse', '--verify', `${base}^{commit}`], true)).stdout.trim()
-    if (!resolvedBase) throw new Error(`could not resolve the base branch ${base}`)
-    this.#state = { base, baseOid: resolvedBase, branch, head, root }
-    return this.#state
+    if (!resolved) throw new Error(`could not resolve the base branch ${base}`)
+    return resolved
   }
 
   async assertClean(): Promise<void> {

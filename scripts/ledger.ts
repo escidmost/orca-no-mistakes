@@ -313,6 +313,10 @@ export class DomainLedger {
       )
   }
 
+  updateRunPolicy(runId: string, policySha256: string): void {
+    this.#db.prepare('UPDATE runs SET policy_sha256 = ? WHERE run_id = ?').run(policySha256, runId)
+  }
+
   finishRun(runId: string, status: Exclude<RunStatus, 'in-progress'>, terminalCommitOid?: string): void {
     this.#db
       .prepare('UPDATE runs SET status = ?, completed_at = ?, terminal_commit_oid = COALESCE(?, terminal_commit_oid) WHERE run_id = ?')
@@ -526,8 +530,13 @@ export class DomainLedger {
 
   getAttestation(ref: string): PassedAttestationManifest {
     const row = this.#db
-      .prepare('SELECT manifest_json, merkle_root FROM passed_attestations WHERE run_id = ? OR candidate_commit_oid = ?')
-      .get(ref, ref) as { manifest_json: string; merkle_root: string } | undefined
+      .prepare(
+        `SELECT manifest_json, merkle_root FROM passed_attestations
+           WHERE candidate_commit_oid = ? OR run_id = ?
+           ORDER BY (candidate_commit_oid = ?) DESC, created_at DESC
+           LIMIT 1`
+      )
+      .get(ref, ref, ref) as { manifest_json: string; merkle_root: string } | undefined
     if (!row) throw new Error(`no passed attestation found for ${ref}`)
     const manifest = JSON.parse(row.manifest_json) as PassedAttestationManifest
     if (manifest.merkleRoot !== row.merkle_root) {
