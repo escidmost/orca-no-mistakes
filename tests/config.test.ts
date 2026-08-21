@@ -181,6 +181,19 @@ test('deepMerge prevents prototype pollution from __proto__ and constructor payl
   assert.equal(({} as { polluted?: string }).polluted, undefined)
 })
 
+test('deepMerge strips unsafe keys on the clone path regardless of layer order', () => {
+  const payload = JSON.parse('{"agent_args_override":{"__proto__":{"polluted":"yes"}}}')
+
+  const fresh = deepMerge<Record<string, Record<string, unknown>>>({}, payload)
+  assert.equal(Object.hasOwn(fresh.agent_args_override, '__proto__'), false)
+
+  const layered = deepMerge<Record<string, Record<string, unknown>>>(
+    { agent_args_override: { existing: [] } },
+    payload
+  )
+  assert.equal(Object.hasOwn(layered.agent_args_override, '__proto__'), false)
+})
+
 test('allow_review_autofix: true overrides baseline in resolveRoleConfig and resolvePipelineConfig', () => {
   const repoGlobalConfig: OrcaNoMistakesConfig = {
     defaults: {

@@ -96,6 +96,12 @@ export const BASELINE_AUTO_FIX = {
   allow_review_autofix: false
 } as const
 
+export interface ResolvedAutoFixConfig {
+  enabled: boolean
+  max_rounds: number
+  allow_review_autofix: boolean
+}
+
 export function formatZodError(error: z.ZodError): string {
   const issues = error.issues.map((issue) => {
     const path = issue.path.join('.')
@@ -126,8 +132,21 @@ export function parseConfigYaml(yamlStr: string): OrcaNoMistakesConfig {
   }
 }
 
+const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
+
+function cloneSafe<T = unknown>(value: unknown): T {
+  if (Array.isArray(value)) return value.map((item) => cloneSafe(item)) as T
+  if (value === null || typeof value !== 'object') return structuredClone(value) as T
+  const out: Record<string, unknown> = {}
+  for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+    if (UNSAFE_KEYS.has(key)) continue
+    out[key] = cloneSafe(val)
+  }
+  return out as T
+}
+
 export function deepMerge<T = unknown>(target: unknown, source: unknown): T {
-  if (source === undefined) return target !== undefined ? (structuredClone(target) as T) : (undefined as T)
+  if (source === undefined) return target !== undefined ? cloneSafe<T>(target) : (undefined as T)
   if (
     target === undefined ||
     typeof target !== 'object' ||
@@ -137,14 +156,14 @@ export function deepMerge<T = unknown>(target: unknown, source: unknown): T {
     source === null ||
     Array.isArray(source)
   ) {
-    return structuredClone(source) as T
+    return cloneSafe<T>(source)
   }
 
-  const result: Record<string, unknown> = structuredClone(target) as Record<string, unknown>
+  const result: Record<string, unknown> = cloneSafe<Record<string, unknown>>(target)
   for (const [key, val] of Object.entries(source as Record<string, unknown>)) {
-    if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue
+    if (UNSAFE_KEYS.has(key)) continue
     if (val !== undefined) {
-      result[key] = Object.hasOwn(result, key) && result[key] !== undefined ? deepMerge(result[key], val) : structuredClone(val)
+      result[key] = Object.hasOwn(result, key) && result[key] !== undefined ? deepMerge(result[key], val) : cloneSafe(val)
     }
   }
   return result as T
@@ -154,6 +173,14 @@ function extractBase(config: StageConfig | DefaultsConfig | undefined): RoleConf
   if (!config) return undefined
   const { reviewer, fixer, ...base } = config
   return base
+}
+
+function withAutoFixDefaults(partial: AutoFixConfig | undefined): ResolvedAutoFixConfig {
+  return {
+    enabled: partial?.enabled ?? BASELINE_AUTO_FIX.enabled,
+    max_rounds: partial?.max_rounds ?? BASELINE_AUTO_FIX.max_rounds,
+    allow_review_autofix: partial?.allow_review_autofix ?? BASELINE_AUTO_FIX.allow_review_autofix
+  }
 }
 
 export interface ResolverOptions {
@@ -169,11 +196,7 @@ export interface ResolvedRoleConfig {
   variant?: string
   timeout_ms?: number
   agent_args_override?: AgentArgsOverride
-  auto_fix: {
-    enabled: boolean
-    max_rounds: number
-    allow_review_autofix: boolean
-  }
+  auto_fix: ResolvedAutoFixConfig
 }
 
 export function resolveRoleConfig(
@@ -218,21 +241,13 @@ export function resolveRoleConfig(
     variant: merged.variant,
     timeout_ms: merged.timeout_ms,
     agent_args_override: merged.agent_args_override,
-    auto_fix: {
-      enabled: merged.auto_fix?.enabled ?? BASELINE_AUTO_FIX.enabled,
-      max_rounds: merged.auto_fix?.max_rounds ?? BASELINE_AUTO_FIX.max_rounds,
-      allow_review_autofix: merged.auto_fix?.allow_review_autofix ?? BASELINE_AUTO_FIX.allow_review_autofix
-    }
+    auto_fix: withAutoFixDefaults(merged.auto_fix)
   }
 }
 
 export interface ResolvedPipelineConfig {
   intent?: string
-  auto_fix: {
-    enabled: boolean
-    max_rounds: number
-    allow_review_autofix: boolean
-  }
+  auto_fix: ResolvedAutoFixConfig
   agent_args_override: AgentArgsOverride
   stages: Record<StageName, {
     reviewer: ResolvedRoleConfig
@@ -245,19 +260,18 @@ export function resolvePipelineConfig(options: ResolverOptions = {}): ResolvedPi
   const autoFix = [
     { ...BASELINE_AUTO_FIX },
     u?.auto_fix,
-    extractBase(u?.defaults)?.auto_fix,
+    u?.defaults?.auto_fix,
     r?.auto_fix,
-    extractBase(r?.defaults)?.auto_fix,
+    r?.defaults?.auto_fix,
     c?.auto_fix,
     c?.max_fix_rounds !== undefined ? { max_rounds: c.max_fix_rounds } : undefined
   ].reduce<AutoFixConfig>((acc, item) => (item ? deepMerge(acc, item) : acc), {})
 
   const agentArgs = [
-    {},
     u?.agent_args_override,
-    extractBase(u?.defaults)?.agent_args_override,
+    u?.defaults?.agent_args_override,
     r?.agent_args_override,
-    extractBase(r?.defaults)?.agent_args_override,
+    r?.defaults?.agent_args_override,
     c?.agent_args_override
   ].reduce<AgentArgsOverride>((acc, item) => (item ? deepMerge(acc, item) : acc), {})
 
@@ -273,11 +287,7 @@ export function resolvePipelineConfig(options: ResolverOptions = {}): ResolvedPi
 
   return {
     intent: c?.intent ?? r?.intent ?? u?.intent,
-    auto_fix: {
-      enabled: autoFix.enabled ?? BASELINE_AUTO_FIX.enabled,
-      max_rounds: autoFix.max_rounds ?? BASELINE_AUTO_FIX.max_rounds,
-      allow_review_autofix: autoFix.allow_review_autofix ?? BASELINE_AUTO_FIX.allow_review_autofix
-    },
+    auto_fix: withAutoFixDefaults(autoFix),
     agent_args_override: agentArgs,
     stages
   }
