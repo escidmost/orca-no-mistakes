@@ -1670,7 +1670,9 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`
 }
 
-type CliFlags = Record<string, string | boolean>
+export * from './config.ts'
+
+type RawCliFlags = Record<string, string | boolean>
 
 const BOOLEAN_FLAGS = new Set(['attached', 'force'])
 const VALUE_FLAGS = new Set([
@@ -1701,11 +1703,11 @@ const COMMAND_FLAGS: Record<string, Set<string>> = {
   ])
 }
 
-function parseCli(argv: string[]): { command: string; flags: CliFlags } {
+function parseCli(argv: string[]): { command: string; flags: RawCliFlags } {
   const [subcommand = 'run', ...rest] = argv
   const allowedFlags = COMMAND_FLAGS[subcommand]
   if (!allowedFlags) throw new Error(`unknown command: ${subcommand}`)
-  const flags: CliFlags = {}
+  const flags: RawCliFlags = {}
   for (let index = 0; index < rest.length; index += 1) {
     const arg = rest[index]
     if (!arg.startsWith('--')) throw new Error(`unexpected argument: ${arg}`)
@@ -1727,12 +1729,12 @@ function parseCli(argv: string[]): { command: string; flags: CliFlags } {
   return { command: subcommand, flags }
 }
 
-function stringFlag(flags: CliFlags, name: string): string | undefined {
+function stringFlag(flags: RawCliFlags, name: string): string | undefined {
   const value = flags[name]
   return typeof value === 'string' ? value : undefined
 }
 
-async function launchDetachedRun(root: string, flags: CliFlags): Promise<string> {
+async function launchDetachedRun(root: string, flags: RawCliFlags): Promise<string> {
   const orcaCommand = resolveOrcaCommand()
   const created = unwrapJson<{ terminal: { handle: string } }>(
     (
