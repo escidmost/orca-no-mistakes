@@ -1,8 +1,21 @@
 ## Standards
 
-- **Code reviews** Skip a separate `/code-review`. Run `/ponytail-review` before committing when that external skill is installed; otherwise perform the same minimality review over the diff and report the missing prerequisite.
-- **Push through no-mistakes** When instructed to push, use `orca-no-mistakes push --intent "<intent for this exact commit set>"`. Do not push unless told to. The current CLI has no branch lease or duplicate-run guard, so inspect `orca orchestration run-list --json` and the Orca Runs view before starting; do not start another run for the same repository, branch, and HEAD.
-- **Post-merge cleanup** When the PR for a Linear issue is merged, remove any readiness and process labels present, such as `ready-for-*` and `wayfinder:*`. PR titles begin with the Linear issue identifier: `ONM-##: <title>`.
+- **Code reviews** Skip a separate `/code-review` but run `/ponytail-review` before making commits
+- **Push through no-mistakes.* When it's time to push, push through no-mistakes unless otherwise instructed. Don't push unless told to. If there's a current no-mistakes run, you can attach to it with `no-mistakes axi run`, with or without the original `--intent`. Do not poll with status/sleep loops or start another run. When starting a new run, use --intent like normal to start new runs.
+- **Post-merge cleanup** When the PR for a Linear issue is merged, remove any labels from the issue that indicate readiness or process (ready-for-\*, wayfinder:\*). Make sure that the PR begins with the Linear issue number ($TeamSlug-##: $title).
+
+
+## No-mistakes findings 
+
+For each finding, verify the claim against the code at the cited location before judging it. Trace the concrete sequence it describes; do not accept it because it sounds plausible or reject it because it sounds pedantic. Some findings will be wrong or overstated.
+
+Per finding, state your judgment in 1-3 sentences — one of:
+- confirmed, should change -> fix
+- confirmed, but acceptable as-is / deliberate design (say why) -> approve
+- not confirmed in the code (cite what disproves it) -> approve
+- design question rather than a bug: decide it on the merits as the author would, then fix or approve accordingly
+
+Respond to no-mistakes with your verdict
 
 When asking questions, please use your elicitation tool instead of putting them in a chat response.
 
