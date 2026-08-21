@@ -7,10 +7,10 @@ This document describes implemented behavior in version `0.1.0`. The ADRs under 
 `orca-no-mistakes` supports three commands:
 
 - `install` creates a bare local gate under the repository's Git directory and configures the `orca-no-mistakes` remote.
-- `run` launches the coordinator detached in a dedicated Orca terminal tab and returns `{"detached":true,"terminalHandle":"..."}`. If `--notify <handle>` is passed or `ORCA_TERMINAL_HANDLE` is set, the coordinator also notifies that terminal when a decision gate opens. Pass `--attached` to run synchronously in the foreground.
+- `run` validates the initiating worktree, creates a dedicated per-run gate worktree under the same repository and Orca project, launches the coordinator inside that gate worktree in a dedicated Orca terminal tab nested under the initiating session, and returns `{"detached":true,"terminalHandle":"..."}`. If `--notify <handle>` is passed or `ORCA_TERMINAL_HANDLE` is set, the coordinator also notifies that terminal when a decision gate opens. Pass `--attached` to run synchronously in the foreground; attached mode also orchestrates inside a freshly created gate worktree.
 - `push` sends one single-line intent as a Git push option to the installed gate.
 
-The runner requires a clean, committed, named feature branch, rejects the detected default branch, verifies an `origin` remote, and optionally checks an expected `--head` SHA. It fetches and rebases onto the selected base before validation continues.
+The runner requires a clean, committed, named feature branch, rejects the detected default branch, verifies an `origin` remote, and optionally checks an expected `--head` SHA. The initiating worktree is only read; all pipeline work happens in the gate worktree, which fetches and rebases its temporary gate branch onto the selected base before validation continues.
 
 ## Orchestration
 
@@ -20,7 +20,7 @@ The coordinator creates one Orca Run and an ordered nine-task DAG:
 
 `intent` records the supplied objective. `rebase` and `push` are coordinator-run Git operations. The other stages are worker evaluations that return structured reports.
 
-Reviewers run as fresh opencode workers in disposable child worktrees. Fixes run through one retained opencode terminal on the operator's current worktree. Every fixer round must leave a clean worktree and create a new commit. Workers default to model `openai/gpt-5.6-luna` at max reasoning effort; `--reviewer-model`, `--fixer-model`, and `--fixer-effort` override per role.
+Reviewers and fixers run as fresh opencode workers in disposable child worktrees of the gate worktree. Every fixer round must leave a clean gate branch and create a new commit; the coordinator applies the fixer's commits to the gate branch with `git cherry-pick` before re-review. Workers default to model `openai/gpt-5.6-luna` at max reasoning effort; `--reviewer-model`, `--fixer-model`, and `--fixer-effort` override per role.
 
 ## Findings and gates
 
@@ -38,9 +38,9 @@ The current store has no SQLite ledger, content hashes, Merkle manifest, signatu
 
 ## Git delivery and custody
 
-Delivery to `origin` uses `git push --force-with-lease --set-upstream origin HEAD:refs/heads/<branch>`. If a PR or CI fixer creates a commit, the coordinator pushes again before rechecking that stage.
+The initiating worktree stays untouched after submitting its committed HEAD. The coordinator orchestrates inside a temporary gate worktree on a temporary gate branch created from that HEAD; reviewer and fixer child worktrees branch from the gate state, and accepted fixer commits are cherry-picked back onto the gate branch. Delivery to `origin` uses `git push --force-with-lease --set-upstream origin HEAD:refs/heads/<original-branch>` from the gate worktree. After success, failure, or cancellation the coordinator removes the gate worktree and deletes the gate branch; worker reports and artifacts survive in `~/.orca-no-mistakes/evidence/`. If a PR or CI fixer creates a commit, the coordinator applies it to the gate branch and pushes again before rechecking that stage.
 
-Fixers mutate the active worktree. There is no branch semantic lease, duplicate-run rejection, internal submission ref, crash-safe checkpoint, preserved recovery ref, custody synchronization command, or coordinator restart recovery. Operators must avoid concurrent runs for the same repository, branch, and HEAD.
+There is no branch semantic lease, duplicate-run rejection, internal submission ref, crash-safe checkpoint, preserved recovery ref, custody synchronization command, or coordinator restart recovery. Operators must avoid concurrent runs for the same repository, branch, and HEAD.
 
 ## Outcome
 

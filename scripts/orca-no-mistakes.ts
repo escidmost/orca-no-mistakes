@@ -31,8 +31,6 @@ export type WorkerLaunch = {
   prompt: string
   role: 'fixer' | 'reviewer'
   stage: StageName
-  terminal?: string
-  worktree: 'current' | 'new-child'
 }
 
 export type WorkerResult = {
@@ -42,13 +40,14 @@ export type WorkerResult = {
   taskId: string
   terminalHandle?: string
   worktreeId?: string
+  worktreePath?: string
 }
 
 export interface OrcaOperations {
   createRun(objective: string): Promise<string>
   createTask(spec: string, options?: { deps?: string[]; parent?: string }): Promise<string>
   startWorker(taskId: string, launch: WorkerLaunch): Promise<WorkerResult>
-  finishWorker(worker: WorkerResult, disposition: 'release' | 'retain'): Promise<void>
+  finishWorker(worker: WorkerResult): Promise<void>
   removeWorktree(worktreeId: string): Promise<void>
   completeTask(taskId: string, report: StageReport): Promise<void>
   createGate(taskId: string, question: string, options?: string[]): Promise<string>
@@ -62,9 +61,13 @@ export interface GitOperations {
   head(): Promise<string>
   rebase(base: string): Promise<StageReport>
   push(branch: string): Promise<StageReport>
+  applyWorktreeCommits(sourcePath: string, base: string): Promise<StageReport>
+  deleteBranch(name: string): Promise<void>
 }
 
 export type PipelineOptions = {
+  deliveryBranch?: string
+  gate?: { branch: string; worktreeId?: string }
   intent: string
   maxFixRounds?: number
 }
@@ -93,6 +96,7 @@ export async function runPipeline(
   }
 
   const repo = await git.assertReady()
+  const deliveryBranch = options.deliveryBranch ?? repo.branch
   const runId = await orca.createRun(`no-mistakes: ${intent}`)
   const evidenceBase = path.join(homedir(), '.orca-no-mistakes', 'evidence')
   const evidenceDir = path.resolve(evidenceBase, runId)
@@ -110,7 +114,6 @@ export async function runPipeline(
   }
   const stageTasks = new Map<StageName, string>()
   let previousTask: string | undefined
-  let retainedFixer: WorkerResult | undefined
 
   for (const stage of PIPELINE_STEPS) {
     const task = await orca.createTask(stageTaskSpec(stage, intent), {
@@ -132,7 +135,7 @@ export async function runPipeline(
       let round = 0
       let attempt = 0
       const runStage = async () =>
-        await executeStage(stage, attempt++, taskId, intent, evidenceDir, repo, orca, git)
+        await executeStage(stage, attempt++, taskId, intent, evidenceDir, repo, deliveryBranch, orca, git)
       let report = await runStage()
 
       while (actionableFindings(report).length > 0) {
@@ -179,7 +182,7 @@ export async function runPipeline(
         }
 
         round += 1
-        const nextFixer = await runFixer(
+        await runFixer(
           stage,
           round,
           taskId,
@@ -187,16 +190,11 @@ export async function runPipeline(
           targetFindings,
           guidance,
           path.join(evidenceDir, `fixer-${stage}-${round}.json`),
-          retainedFixer,
           orca,
           git
         )
-        if (retainedFixer) {
-          await orca.finishWorker(retainedFixer, 'retain')
-        }
-        retainedFixer = nextFixer
         if (stage === 'pr' || stage === 'ci') {
-          await repushAfterDeliveryFix(stage, taskId, repo.branch, orca, git)
+          await repushAfterDeliveryFix(stage, taskId, deliveryBranch, orca, git)
         }
         report = await runStage()
       }
@@ -204,19 +202,19 @@ export async function runPipeline(
       await orca.completeTask(taskId, report)
     }
 
-    if (retainedFixer) {
-      await orca.finishWorker(retainedFixer, 'release')
-      retainedFixer = undefined
-    }
     await orca.setWorktreeStatus(`no-mistakes passed all ${PIPELINE_STEPS.length} stages`, 'completed')
     return { runId, steps: PIPELINE_STEPS }
   } catch (error) {
-    if (retainedFixer) {
-      await orca.finishWorker(retainedFixer, 'release').catch(() => {})
-    }
     const message = error instanceof Error ? error.message : String(error)
     await orca.setWorktreeStatus(`no-mistakes stopped: ${message}`, 'in-review').catch(() => {})
     throw error
+  } finally {
+    if (options.gate?.worktreeId) {
+      await orca.removeWorktree(options.gate.worktreeId).catch(() => {})
+    }
+    if (options.gate?.branch) {
+      await git.deleteBranch(options.gate.branch).catch(() => {})
+    }
   }
 }
 
@@ -227,6 +225,7 @@ async function executeStage(
   intent: string,
   evidenceDir: string,
   repo: RepoState,
+  deliveryBranch: string,
   orca: OrcaOperations,
   git: GitOperations
 ): Promise<StageReport> {
@@ -237,7 +236,7 @@ async function executeStage(
     return await git.rebase(repo.base)
   }
   if (stage === 'push') {
-    return await git.push(repo.branch)
+    return await git.push(deliveryBranch)
   }
   return await runReviewer(stage, attempt, taskId, intent, evidenceDir, repo, orca)
 }
@@ -264,13 +263,12 @@ async function runReviewer(
     name: `no-mistakes-${stage}-${attempt + 1}`,
     prompt,
     role: 'reviewer',
-    stage,
-    worktree: 'new-child'
+    stage
   })
   try {
     return await validateReport(worker.report, stage, evidenceDir)
   } finally {
-    await orca.finishWorker(worker, 'release')
+    await orca.finishWorker(worker)
     if (worker.worktreeId) {
       await orca.removeWorktree(worker.worktreeId)
     }
@@ -285,10 +283,9 @@ async function runFixer(
   findings: Finding[],
   guidance: string,
   reportPath: string,
-  retainedFixer: WorkerResult | undefined,
   orca: OrcaOperations,
   git: GitOperations
-): Promise<WorkerResult> {
+): Promise<void> {
   await git.assertClean()
   const before = await git.head()
   const prompt = fixerPrompt(stage, intent, findings, guidance, reportPath)
@@ -299,22 +296,25 @@ async function runFixer(
     name: `no-mistakes-fixer-${stage}-${round}`,
     prompt,
     role: 'fixer',
-    stage,
-    terminal: retainedFixer?.terminalHandle,
-    worktree: 'current'
+    stage
   })
   try {
     await validateReport(worker.report, stage, path.dirname(reportPath))
-    await git.assertClean()
+    if (!worker.worktreePath) throw new Error(`${stage} fixer did not expose its worktree`)
+    const applied = await git.applyWorktreeCommits(worker.worktreePath, before)
+    const failed = applied.findings.find((finding) => finding.id === 'fix-apply-failed')
+    if (failed) {
+      throw new Error(`${stage} fixer commits could not be applied to the gate branch: ${failed.description}`)
+    }
     const after = await git.head()
     if (before === after) {
       throw new Error(`${stage} fixer did not commit a change`)
     }
-    await orca.finishWorker(worker, 'retain')
-    return worker
-  } catch (error) {
-    await orca.finishWorker(worker, 'release').catch(() => {})
-    throw error
+  } finally {
+    await orca.finishWorker(worker).catch(() => {})
+    if (worker.worktreeId) {
+      await orca.removeWorktree(worker.worktreeId).catch(() => {})
+    }
   }
 }
 
@@ -598,7 +598,7 @@ function fixerInstructions(stage: StageName): string {
 - Apply all the fixes you intend to make first; do not run any verification in between individual fixes.
 - After all fixes are applied, run one focused verification limited to the changed area (the specific package, file, or test you touched) at the end of the fix round to confirm the fixes hold.
 - Do NOT run the complete repository test suite or lint suite during this fix round.
-- Commit only your fixes on the current feature branch. Do not push, create a PR, or invoke no-mistakes/Orca pipeline controls.
+- Commit only your fixes on your worktree's own branch. Do not push, create a PR, or invoke no-mistakes/Orca pipeline controls.
 - The summary must be one concise sentence fragment suitable for a git commit subject under 10 words.`
 
     case 'test':
@@ -610,7 +610,7 @@ function fixerInstructions(stage: StageName): string {
 - Do NOT run linters, formatters, or static analysis tools.
 - Do NOT run the complete repository test suite. Local Test is targeted validation of the failure and the requested intent; remote CI owns broad regression.
 - Before finishing, remove any transient artifacts your testing created in the working tree (downloaded models, caches, build outputs, large binaries, or generated data directories) so they are not committed and pushed.
-- Commit only your fixes on the current feature branch. Do not push, create a PR, or invoke no-mistakes/Orca pipeline controls.
+- Commit only your fixes on your worktree's own branch. Do not push, create a PR, or invoke no-mistakes/Orca pipeline controls.
 - The summary must be one concise sentence fragment suitable for a git commit subject under 10 words.`
 
     case 'document':
@@ -619,7 +619,7 @@ function fixerInstructions(stage: StageName): string {
 - Remove stale duplicates or reduce them to a short pointer to the owner; do not synchronize full copies.
 - Only edit documentation files or doc comments. Do not change executable behavior or tests.
 - Re-read what you changed to verify it now reflects the code.
-- Commit only your fixes on the current feature branch. Do not push, create a PR, or invoke no-mistakes/Orca pipeline controls.
+- Commit only your fixes on your worktree's own branch. Do not push, create a PR, or invoke no-mistakes/Orca pipeline controls.
 - The summary must be one concise sentence fragment suitable for a git commit subject under 10 words.`
 
     case 'lint':
@@ -628,7 +628,7 @@ function fixerInstructions(stage: StageName): string {
 - Do not refactor beyond what is needed for that root-cause fix.
 - Do not run tests or broader behavioral validation.
 - Re-run the relevant lint or format commands before finishing to verify they pass.
-- Commit only your fixes on the current feature branch. Do not push, create a PR, or invoke no-mistakes/Orca pipeline controls.
+- Commit only your fixes on your worktree's own branch. Do not push, create a PR, or invoke no-mistakes/Orca pipeline controls.
 - The summary must be one concise sentence fragment suitable for a git commit subject under 10 words.`
 
     case 'rebase':
@@ -638,7 +638,7 @@ function fixerInstructions(stage: StageName): string {
 - Preserve the intent of both the current branch changes and the upstream changes.
 - Do not modify any files that don't have conflicts.
 - Verify the rebase resolution completes cleanly.
-- Commit only your fixes on the current feature branch. Do not push, create a PR, or invoke no-mistakes/Orca pipeline controls.
+- Commit only your fixes on your worktree's own branch. Do not push, create a PR, or invoke no-mistakes/Orca pipeline controls.
 - The summary must be one concise sentence fragment suitable for a git commit subject under 10 words.`
 
     case 'ci':
@@ -649,14 +649,14 @@ function fixerInstructions(stage: StageName): string {
 - Make the smallest correct root-cause fix without unnecessary refactoring.
 - If merge conflicts exist with the base branch, resolve them cleanly preserving both sides' intent.
 - Verify the fix by running the most relevant commands locally before finishing.
-- Commit only your fixes on the current feature branch. Do not push, create a PR, or invoke no-mistakes/Orca pipeline controls (repush is handled by the coordinator).
+- Commit only your fixes on your worktree's own branch. Do not push, create a PR, or invoke no-mistakes/Orca pipeline controls (repush is handled by the coordinator).
 - The summary must be one concise sentence fragment suitable for a git commit subject under 10 words.`
 
     default:
       return `Rules:
 - Fix all listed findings without changing unrelated behavior.
 - Run one focused verification after all edits.
-- Commit only your fixes on the current feature branch. Do not push, create a PR, run the whole repository suite, or invoke no-mistakes/Orca pipeline controls.
+- Commit only your fixes on your worktree's own branch. Do not push, create a PR, run the whole repository suite, or invoke no-mistakes/Orca pipeline controls.
 - The summary must be one concise sentence fragment suitable for a git commit subject under 10 words.`
   }
 }
@@ -937,14 +937,8 @@ export class CliOrca implements OrcaOperations {
 
   async startWorker(taskId: string, launch: WorkerLaunch): Promise<WorkerResult> {
     // Start opencode first, then use dispatch injection so the preamble carries its capability.
-    const prepared =
-      !launch.terminal
-        ? launch.worktree === 'new-child'
-          ? await this.#prepareNewChildWorker(launch)
-          : await this.#prepareCurrentWorker(launch)
-        : undefined
-    const terminalHandle = prepared?.terminalHandle ?? launch.terminal
-    if (!terminalHandle) throw new Error('worker preparation returned no terminal handle')
+    const prepared = await this.#prepareNewChildWorker(launch)
+    const terminalHandle = prepared.terminalHandle
     const args = [
       'orchestration',
       'dispatch',
@@ -969,19 +963,19 @@ export class CliOrca implements OrcaOperations {
         preamble?: string
       }>(args, true)
     } catch (error) {
-      if (prepared) await this.#cleanupPreparedWorker(prepared)
+      await this.#cleanupPreparedWorker(prepared)
       throw error
     }
     const dispatchId = receipt?.dispatch?.id
     if (!dispatchId || receipt.injected !== true || !receipt.preamble?.trim()) {
       if (dispatchId) {
-        await this.#cleanupFailedWorker(dispatchId, terminalHandle, prepared?.worktreeId)
-      } else if (prepared) {
+        await this.#cleanupFailedWorker(dispatchId, terminalHandle, prepared.worktreeId)
+      } else {
         await this.#cleanupPreparedWorker(prepared)
       }
       throw new Error('dispatch returned an invalid receipt')
     }
-    const worktreeId = prepared?.worktreeId
+    const worktreeId = prepared.worktreeId
     let deliveryId: string | undefined
     try {
       const result = await this.#waitForWorker(taskId, dispatchId, terminalHandle)
@@ -993,7 +987,8 @@ export class CliOrca implements OrcaOperations {
         taskId,
         dispatchId,
         terminalHandle,
-        worktreeId
+        worktreeId,
+        worktreePath: prepared.worktreePath
       }
     } catch (error) {
       await this.#cleanupFailedWorker(dispatchId, terminalHandle, worktreeId, deliveryId)
@@ -1054,28 +1049,6 @@ export class CliOrca implements OrcaOperations {
     }
   }
 
-  async #prepareCurrentWorker(launch: WorkerLaunch): Promise<PreparedWorker> {
-    const prepared: PreparedWorker = { terminalHandle: '', worktreePath: this.#cwd }
-    try {
-      const created = await this.#json<{ terminal: { handle: string } }>([
-        'terminal',
-        'create',
-        '--worktree',
-        `path:${this.#cwd}`,
-        '--json'
-      ])
-      prepared.terminalHandle = created?.terminal?.handle ?? ''
-      if (!prepared.terminalHandle) throw new Error('terminal create returned an invalid receipt')
-      const model = launch.role === 'reviewer' ? this.#reviewerModel : this.#fixerModel
-      const variant = launch.role === 'fixer' ? this.#fixerEffort : undefined
-      await this.#launchWorkerAgent(prepared.terminalHandle, model, variant)
-      return prepared
-    } catch (error) {
-      await this.#cleanupPreparedWorker(prepared)
-      throw error
-    }
-  }
-
   async #launchWorkerAgent(terminalHandle: string, model?: string, variant?: string): Promise<void> {
     const commandArgs = [DEFAULT_WORKER_AGENT]
     if (model) commandArgs.push('--model', model)
@@ -1124,8 +1097,8 @@ export class CliOrca implements OrcaOperations {
     }
   }
 
-  async finishWorker(worker: WorkerResult, disposition: 'release' | 'retain'): Promise<void> {
-    if (disposition === 'release' && worker.terminalHandle) {
+  async finishWorker(worker: WorkerResult): Promise<void> {
+    if (worker.terminalHandle) {
       await this.#json(
         ['terminal', 'close', '--terminal', worker.terminalHandle, '--tab', '--json'],
         true
@@ -1582,6 +1555,27 @@ export class GitShell implements GitOperations {
       : { findings: [], summary: `pushed ${branch} with force-with-lease` }
   }
 
+  async applyWorktreeCommits(sourcePath: string, base: string): Promise<StageReport> {
+    const sourceHead = (
+      await command('git', ['-C', path.resolve(sourcePath), 'rev-parse', 'HEAD'], this.#repo, {
+        allowFailure: true
+      })
+    ).stdout.trim()
+    if (!sourceHead) {
+      return failureReport('fix-apply-failed', 'ask-user', `could not read HEAD in ${sourcePath}`)
+    }
+    const pick = await this.#git(['cherry-pick', `${base}..${sourceHead}`], true)
+    if (!pick.failed) {
+      return { findings: [], summary: `applied ${sourceHead.slice(0, 12)} onto the gate branch` }
+    }
+    await this.#git(['cherry-pick', '--abort'], true)
+    return failureReport('fix-apply-failed', 'ask-user', pick.output)
+  }
+
+  async deleteBranch(name: string): Promise<void> {
+    await this.#git(['branch', '-D', name])
+  }
+
   async #detectBase(): Promise<string> {
     const symbolic = await this.#git(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], true)
     if (!symbolic.failed) return symbolic.output.trim().replace(/^origin\//, '')
@@ -1766,36 +1760,86 @@ function stringFlag(flags: RawCliFlags, name: string): string | undefined {
   return typeof value === 'string' ? value : undefined
 }
 
-async function launchDetachedRun(root: string, flags: RawCliFlags): Promise<string> {
+function gateName(): string {
+  return `no-mistakes-gate-${Date.now().toString(36)}-${process.pid}`
+}
+
+async function createGateWorktree(
+  repoRoot: string,
+  parentWorktree: string,
+  name: string
+): Promise<{ branch: string; id: string; path: string }> {
   const orcaCommand = resolveOrcaCommand()
-  const created = unwrapJson<{ terminal: { handle: string } }>(
+  const baseBranch = (await command('git', ['branch', '--show-current'], parentWorktree)).stdout.trim()
+  if (!baseBranch) throw new Error('no-mistakes requires a named feature branch')
+  const created = unwrapJson<{ worktree: { id: string; path: string } }>(
     (
       await command(
         orcaCommand,
-        ['terminal', 'create', '--worktree', `path:${root}`, '--title', 'no-mistakes', '--json'],
-        root
+        [
+          'worktree',
+          'create',
+          '--repo',
+          `path:${repoRoot}`,
+          '--name',
+          name,
+          '--base-branch',
+          baseBranch,
+          '--parent-worktree',
+          `path:${parentWorktree}`,
+          '--setup',
+          'run',
+          '--json'
+        ],
+        parentWorktree
       )
     ).stdout
   )
-  const terminalHandle = created?.terminal?.handle
-  if (!terminalHandle) throw new Error('terminal create returned an invalid receipt')
-
-  const attachedArgs = ['run', '--attached', '--repo', root]
-  for (const name of COMMAND_FLAGS.run) {
-    if (name === 'attached' || name === 'notify' || name === 'repo') continue
-    const value = stringFlag(flags, name)
-    if (value !== undefined) attachedArgs.push(`--${name}`, value)
+  const worktree = created?.worktree
+  if (!worktree?.id || !worktree.path) {
+    throw new Error('gate worktree create returned an invalid receipt')
   }
-  const notifyHandle = stringFlag(flags, 'notify') ?? process.env.ORCA_TERMINAL_HANDLE
-  if (notifyHandle) attachedArgs.push('--notify', notifyHandle)
-  const quotedCommand = [process.execPath, fileURLToPath(import.meta.url), ...attachedArgs]
-    .map(shellQuote)
-    .join(' ')
-  const coordinatorCommand = process.env.ORCA_CLI_COMMAND
-    ? `ORCA_CLI_COMMAND=${shellQuote(process.env.ORCA_CLI_COMMAND)} ${quotedCommand}`
-    : quotedCommand
+  const branch = (await command('git', ['branch', '--show-current'], worktree.path)).stdout.trim()
+  if (!branch) throw new Error('gate worktree did not check out a named gate branch')
+  return { branch, id: worktree.id, path: worktree.path }
+}
 
+async function launchDetachedRun(repoState: RepoState, flags: RawCliFlags): Promise<string> {
+  const root = repoState.root
+  const orcaCommand = resolveOrcaCommand()
+  const gate = await createGateWorktree(root, root, gateName())
+  let terminalHandle = ''
   try {
+    const created = unwrapJson<{ terminal: { handle: string } }>(
+      (
+        await command(
+          orcaCommand,
+          ['terminal', 'create', '--worktree', `path:${gate.path}`, '--title', 'no-mistakes', '--json'],
+          gate.path
+        )
+      ).stdout
+    )
+    terminalHandle = created?.terminal?.handle ?? ''
+    if (!terminalHandle) throw new Error('terminal create returned an invalid receipt')
+
+    const attachedArgs = ['run', '--attached', '--repo', gate.path]
+    for (const name of COMMAND_FLAGS.run) {
+      if (name === 'attached' || name === 'notify' || name === 'repo') continue
+      const value = stringFlag(flags, name)
+      if (value !== undefined) attachedArgs.push(`--${name}`, value)
+    }
+    const notifyHandle = stringFlag(flags, 'notify') ?? process.env.ORCA_TERMINAL_HANDLE
+    if (notifyHandle) attachedArgs.push('--notify', notifyHandle)
+    const quotedCommand = [process.execPath, fileURLToPath(import.meta.url), ...attachedArgs]
+      .map(shellQuote)
+      .join(' ')
+    const coordinatorCommand = [
+      `NO_MISTAKES_DELIVERY_BRANCH=${shellQuote(repoState.branch)}`,
+      `NO_MISTAKES_GATE_WORKTREE_ID=${shellQuote(gate.id)}`,
+      ...(process.env.ORCA_CLI_COMMAND ? [`ORCA_CLI_COMMAND=${shellQuote(process.env.ORCA_CLI_COMMAND)}`] : []),
+      quotedCommand
+    ].join(' ')
+
     const deadline = Date.now() + 10_000
     for (;;) {
       const shown = unwrapJson<{
@@ -1805,7 +1849,7 @@ async function launchDetachedRun(root: string, flags: RawCliFlags): Promise<stri
           await command(
             orcaCommand,
             ['terminal', 'show', '--terminal', terminalHandle, '--json'],
-            root
+            gate.path
           )
         ).stdout
       )
@@ -1828,15 +1872,20 @@ async function launchDetachedRun(root: string, flags: RawCliFlags): Promise<stri
         '--enter',
         '--json'
       ],
-      root
+      gate.path
     )
   } catch (error) {
-    await command(
-      orcaCommand,
-      ['terminal', 'close', '--terminal', terminalHandle, '--tab', '--json'],
-      root,
-      { allowFailure: true }
-    )
+    if (terminalHandle) {
+      await command(
+        orcaCommand,
+        ['terminal', 'close', '--terminal', terminalHandle, '--tab', '--json'],
+        root,
+        { allowFailure: true }
+      ).catch(() => {})
+    }
+    await command(orcaCommand, ['worktree', 'rm', '--worktree', `id:${gate.id}`, '--force', '--json'], root, {
+      allowFailure: true
+    }).catch(() => {})
     throw error
   }
   return terminalHandle
@@ -1882,25 +1931,55 @@ Run options:
   if (maxFixRounds !== undefined && (!Number.isInteger(maxFixRounds) || maxFixRounds < 0)) {
     throw new Error('maxFixRounds must be a non-negative integer')
   }
+  const expectedHead = stringFlag(parsed.flags, 'head')
   const git = new GitShell({
     repo,
     base: stringFlag(parsed.flags, 'base'),
-    expectedHead: stringFlag(parsed.flags, 'head')
+    expectedHead
   })
   const repoState = await git.assertReady()
   if (parsed.flags.attached !== true) {
-    const terminalHandle = await launchDetachedRun(repoState.root, parsed.flags)
+    const terminalHandle = await launchDetachedRun(repoState, parsed.flags)
     console.log(JSON.stringify({ detached: true, terminalHandle }))
     return
   }
+  // Attached mode always orchestrates inside a per-run gate worktree. When the
+  // detached launcher pre-created one, this process was started inside it.
+  let gatePath = repoState.root
+  let deliveryBranch = repoState.branch
+  let pipelineGit: GitShell = git
+  let gateBranch = repoState.branch
+  let gateWorktreeId: string | undefined
+  if (
+    process.env.NO_MISTAKES_DELIVERY_BRANCH &&
+    process.env.NO_MISTAKES_GATE_WORKTREE_ID
+  ) {
+    deliveryBranch = process.env.NO_MISTAKES_DELIVERY_BRANCH
+    gateWorktreeId = process.env.NO_MISTAKES_GATE_WORKTREE_ID
+  } else {
+    const gate = await createGateWorktree(repoState.root, repoState.root, gateName())
+    gatePath = gate.path
+    gateBranch = gate.branch
+    gateWorktreeId = gate.id
+    pipelineGit = new GitShell({ repo: gate.path, expectedHead: expectedHead ?? repoState.head })
+  }
   const orca = new CliOrca({
-    cwd: repoState.root,
+    cwd: gatePath,
     reviewerModel: stringFlag(parsed.flags, 'reviewer-model'),
     fixerModel: stringFlag(parsed.flags, 'fixer-model'),
     fixerEffort: stringFlag(parsed.flags, 'fixer-effort'),
     notifyHandle: stringFlag(parsed.flags, 'notify')
   })
-  const result = await runPipeline({ intent, maxFixRounds }, orca, git)
+  const result = await runPipeline(
+    {
+      intent,
+      maxFixRounds,
+      deliveryBranch,
+      gate: { branch: gateBranch, worktreeId: gateWorktreeId }
+    },
+    orca,
+    pipelineGit
+  )
   console.log(JSON.stringify(result))
 }
 

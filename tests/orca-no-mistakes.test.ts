@@ -28,6 +28,7 @@ class FakeGit implements GitOperations {
   readonly calls: string[] = []
   readonly pushReports: StageReport[] = []
   #head = 'head-1'
+  #pendingApplyFailures: StageReport[] = []
 
   async assertReady(): Promise<{ base: string; branch: string; head: string; root: string }> {
     this.calls.push('assert-ready')
@@ -53,8 +54,24 @@ class FakeGit implements GitOperations {
     return this.pushReports.shift() ?? pass('pushed')
   }
 
+  async applyWorktreeCommits(sourcePath: string, base: string): Promise<StageReport> {
+    this.calls.push(`apply:${base}:${sourcePath}`)
+    const failure = this.#pendingApplyFailures.shift()
+    if (failure) return failure
+    this.advanceHead()
+    return pass('applied fixer commits to the gate branch')
+  }
+
+  async deleteBranch(name: string): Promise<void> {
+    this.calls.push(`delete-branch:${name}`)
+  }
+
   advanceHead(): void {
     this.#head = `head-${Number(this.#head.split('-')[1]) + 1}`
+  }
+
+  failApplyOnce(report: StageReport): void {
+    this.#pendingApplyFailures.push(report)
   }
 }
 
@@ -68,13 +85,12 @@ class FakeOrca implements OrcaOperations {
   readonly removedWorktrees: string[] = []
   readonly reports = new Map<string, StageReport[]>()
   gateResolution = 'approve'
+  failWorkerFor?: string
   #taskNumber = 0
   #dispatchNumber = 0
-  #git: FakeGit
   #runId: string
 
-  constructor(git: FakeGit, runId = `test-run-${randomUUID()}`) {
-    this.#git = git
+  constructor(_git: FakeGit, runId = `test-run-${randomUUID()}`) {
     this.#runId = runId
   }
 
@@ -92,26 +108,29 @@ class FakeOrca implements OrcaOperations {
   async startWorker(taskId: string, launch: WorkerLaunch): Promise<WorkerResult> {
     this.launches.push(launch)
     const dispatchId = `dispatch-${++this.#dispatchNumber}`
+    if (this.failWorkerFor === launch.stage) {
+      throw new Error(`${launch.stage} worker was cancelled`)
+    }
     const stage = launch.stage
     const reports = this.reports.get(stage) ?? [pass(stage)]
     const report = reports.shift() ?? pass(stage)
     this.reports.set(stage, reports)
     if (launch.role === 'fixer') {
       this.fixerDispatches.push(dispatchId)
-      this.#git.advanceHead()
     }
     return {
       deliveryId: `delivery-${dispatchId}`,
       dispatchId,
       report,
       taskId,
-      terminalHandle: launch.role === 'fixer' ? 'term-fixer' : `term-${dispatchId}`,
-      worktreeId: launch.worktree === 'new-child' ? `repo::/${dispatchId}` : undefined
+      terminalHandle: `term-${dispatchId}`,
+      worktreeId: `repo::/${dispatchId}`,
+      worktreePath: `/wt/${dispatchId}`
     }
   }
 
-  async finishWorker(worker: WorkerResult, disposition: 'release' | 'retain'): Promise<void> {
-    this.calls.push(`${disposition}:${worker.dispatchId}`)
+  async finishWorker(worker: WorkerResult): Promise<void> {
+    this.calls.push(`release:${worker.dispatchId}`)
   }
 
   async removeWorktree(worktreeId: string): Promise<void> {
@@ -177,7 +196,10 @@ test('runs the nine-stage adversarial pipeline with fixes, gates, and isolation'
   ])
 
   const result = await runPipeline(
-    { intent: 'Add the requested command without changing existing behavior.' },
+    {
+      intent: 'Add the requested command without changing existing behavior.',
+      gate: { branch: 'no-mistakes-gate-test', worktreeId: 'wt-gate' }
+    },
     orca,
     git
   )
@@ -198,26 +220,26 @@ test('runs the nine-stage adversarial pipeline with fixes, gates, and isolation'
   )
   assert.equal(reviewLaunches.length, 2)
   assert.ok(reviewLaunches.every((launch) => launch.role === 'reviewer'))
-  assert.ok(reviewLaunches.every((launch) => launch.worktree === 'new-child'))
   assert.notEqual(reviewLaunches[0].name, reviewLaunches[1].name)
 
   const fixerLaunches = orca.launches.filter((launch) => launch.role === 'fixer')
   assert.equal(fixerLaunches.length, 3)
-  assert.equal(fixerLaunches[0].worktree, 'current')
-  assert.equal(fixerLaunches[1].terminal, 'term-fixer')
-  assert.equal(fixerLaunches[2].terminal, 'term-fixer')
   assert.ok(
-    orca.fixerDispatches.every(
-      (dispatchId) => orca.calls.includes(`retain:${dispatchId}`) || orca.calls.includes(`release:${dispatchId}`)
-    ),
-    'every fixer dispatch is retained or eventually released'
+    orca.fixerDispatches.every((dispatchId) => orca.calls.includes(`release:${dispatchId}`)),
+    'every fixer dispatch is released after its round'
   )
+  const applyCalls = git.calls.filter((call) => call.startsWith('apply:'))
+  assert.equal(applyCalls.length, 3)
   assert.ok(
-    orca.calls.includes(`release:${orca.fixerDispatches[orca.fixerDispatches.length - 1]}`),
-    'the final retained fixer dispatch is released'
+    orca.fixerDispatches.every((dispatchId) =>
+      applyCalls.some((call) => call.endsWith(`:/wt/${dispatchId}`))
+    ),
+    'every fixer round applies its commits to the gate branch'
   )
   assert.ok(orca.calls.some((call) => call.startsWith('gate:') && call.includes('docs-1')))
-  assert.equal(orca.removedWorktrees.length, orca.launches.filter((launch) => launch.worktree === 'new-child').length)
+  assert.equal(orca.removedWorktrees.length, orca.launches.length + 1)
+  assert.ok(orca.removedWorktrees.includes('wt-gate'), 'the gate worktree is removed')
+  assert.ok(git.calls.includes('delete-branch:no-mistakes-gate-test'), 'the gate branch is deleted')
   assert.ok(git.calls.indexOf('rebase:main') < git.calls.indexOf('push:feature'))
   assert.equal(git.calls.filter((call) => call === 'push:feature').length, 2)
   assert.match(
@@ -566,10 +588,11 @@ test('CLI accepts equals syntax and preserves negative numeric values', async ()
   }
 })
 
-test('run starts an attached coordinator in a dedicated Orca terminal', async () => {
+test('run launches the detached coordinator inside a fresh gate worktree', async () => {
   const temp = await mkdtemp(path.join(tmpdir(), 'orca-detached-run-'))
   const origin = path.join(temp, 'origin.git')
   const repo = path.join(temp, 'repo')
+  const gateWt = path.join(temp, 'gate-wt')
   const fakeOrca = path.join(temp, 'orca')
   const callsPath = path.join(temp, 'calls.jsonl')
   const previousCommand = process.env.ORCA_CLI_COMMAND
@@ -591,13 +614,21 @@ test('run starts an attached coordinator in a dedicated Orca terminal', async ()
       fakeOrca,
       `#!/usr/bin/env node
 import fs from 'node:fs'
+import { execFileSync } from 'node:child_process'
 const args = process.argv.slice(2)
 fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
-const result = args[0] === 'terminal' && args[1] === 'create'
-  ? { terminal: { handle: 'detached-coordinator' } }
-  : args[0] === 'terminal' && args[1] === 'show'
-    ? { terminal: { connected: true, preview: 'ready shell prompt' } }
-    : { accepted: true }
+const result = args[0] === 'worktree' && args[1] === 'create'
+  ? (() => {
+      const name = args[args.indexOf('--name') + 1]
+      const base = args[args.indexOf('--base-branch') + 1]
+      execFileSync('git', ['worktree', 'add', ${JSON.stringify(gateWt)}, '-b', name, base], { cwd: ${JSON.stringify(repo)} })
+      return { worktree: { id: 'wt-gate-1', path: ${JSON.stringify(gateWt)} } }
+    })()
+  : args[0] === 'terminal' && args[1] === 'create'
+    ? { terminal: { handle: 'detached-coordinator' } }
+    : args[0] === 'terminal' && args[1] === 'show'
+      ? { terminal: { connected: true, preview: 'ready shell prompt' } }
+      : { accepted: true }
 console.log(JSON.stringify({ result }))
 `
     )
@@ -605,18 +636,34 @@ console.log(JSON.stringify({ result }))
     process.env.ORCA_CLI_COMMAND = fakeOrca
     process.env.ORCA_TERMINAL_HANDLE = 'originating-opencode'
 
-    await main(['run', `--repo=${repo}`, '--intent=Validate detached coordination.'])
+    const head = git(repo, 'rev-parse', 'HEAD')
+    await main(['run', `--repo=${repo}`, `--head=${head}`, '--intent=Validate detached coordination.'])
 
     const calls = (await readFile(callsPath, 'utf8'))
       .trim()
       .split('\n')
       .map((line) => JSON.parse(line) as string[])
+    const worktreeCreate = calls.find((args) => args[0] === 'worktree' && args[1] === 'create')
     const terminalCreate = calls.find((args) => args[0] === 'terminal' && args[1] === 'create')
     const terminalSend = calls.find((args) => args[0] === 'terminal' && args[1] === 'send')
+    assert.ok(worktreeCreate, 'the launcher creates the gate worktree first')
+    assert.ok(terminalCreate, 'the launcher creates a coordinator terminal')
+    assert.ok(calls.indexOf(worktreeCreate) < calls.indexOf(terminalCreate))
+    assert.ok(worktreeCreate.includes('--base-branch'))
+    assert.ok(worktreeCreate.includes('feature'))
+    const parentWorktree =
+      worktreeCreate[worktreeCreate.indexOf('--parent-worktree') + 1]?.replace(/^path:/, '') ?? ''
+    assert.equal(await realpath(parentWorktree), await realpath(repo))
+    const commandWorktree =
+      terminalCreate?.[terminalCreate.indexOf('--worktree') + 1]?.replace(/^path:/, '') ?? ''
+    assert.equal(await realpath(commandWorktree), await realpath(gateWt))
+    assert.notEqual(await realpath(commandWorktree), await realpath(repo))
     const commandText = terminalSend?.[terminalSend.indexOf('--text') + 1] ?? ''
-    const worktree = terminalCreate?.[terminalCreate.indexOf('--worktree') + 1]?.replace(/^path:/, '')
-    assert.equal(worktree ? await realpath(worktree) : '', await realpath(repo))
     assert.ok(commandText.includes("'--attached'"))
+    assert.ok(commandText.includes(`'--repo' '${gateWt}'`))
+    assert.ok(commandText.includes("NO_MISTAKES_DELIVERY_BRANCH='feature'"))
+    assert.ok(commandText.includes("NO_MISTAKES_GATE_WORKTREE_ID='wt-gate-1'"))
+    assert.ok(commandText.includes(`'--head' '${git(repo, 'rev-parse', 'HEAD')}'`))
     assert.ok(commandText.includes("'--notify' 'originating-opencode'"))
     assert.ok(commandText.includes("'--intent' 'Validate detached coordination.'"))
     assert.ok(!calls.some((args) => args[0] === 'orchestration'))
@@ -731,17 +778,19 @@ if (args[1] === 'run-create') {
   }
 })
 
-test('CliOrca creates a fixer once and reuses its terminal without creation flags', async () => {
+test('CliOrca gives every fixer its own child worktree and terminal', async () => {
   const temp = await mkdtemp(path.join(tmpdir(), 'orca-cli-'))
   const fakeOrca = path.join(temp, 'orca')
   const callsPath = path.join(temp, 'calls.jsonl')
   const countPath = path.join(temp, 'count')
-  const startCountPath = path.join(temp, 'start-count')
+  const startCountPath = path.join(temp, 'wt-count')
+  const dispatchCountPath = path.join(temp, 'dispatch-count')
   const evidence = path.join(homedir(), '.orca-no-mistakes', 'evidence', 'adapter-test')
   const reportOne = path.join(evidence, 'one.json')
   const reportTwo = path.join(evidence, 'two.json')
   const reportThree = path.join(evidence, 'three.json')
   try {
+    git(temp, 'init', '-b', 'feature')
     await mkdir(evidence, { recursive: true })
     await writeFile(reportOne, JSON.stringify(pass('first fix')))
     await writeFile(reportTwo, JSON.stringify(pass('second fix')))
@@ -753,24 +802,31 @@ import fs from 'node:fs'
 const args = process.argv.slice(2)
 fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
 const out = (result) => console.log(JSON.stringify({ result }))
+const nextCount = (file) => {
+  const count = fs.existsSync(file) ? Number(fs.readFileSync(file, 'utf8')) : 0
+  fs.writeFileSync(file, String(count + 1))
+  return count + 1
+}
 if (args[0] === 'orchestration' && args[1] === 'run-create') {
   out({ run: { id: 'adapter-test' } })
-} else if (args[0] === 'terminal' && args[1] === 'create') {
-  out({ terminal: { handle: 'created-fixer' } })
+} else if (args[0] === 'worktree' && args[1] === 'create') {
+  const n = nextCount(${JSON.stringify(startCountPath)})
+  out({ worktree: { id: 'wt-' + n, path: '/wt-' + n } })
+} else if (args[0] === 'terminal' && args[1] === 'list') {
+  const n = Number(fs.readFileSync(${JSON.stringify(startCountPath)}, 'utf8'))
+  out({ terminals: [{ handle: 'worker-shell-' + n, connected: true, writable: true }] })
 } else if (args[0] === 'terminal' && args[1] === 'send') {
   out({ accepted: true })
 } else if (args[0] === 'terminal' && args[1] === 'show') {
-  out({ terminal: { connected: true, title: 'OpenCode', preview: 'ready' } })
+  out({ terminal: { connected: true, lastOutputAt: 1, title: 'OpenCode', preview: 'ready' } })
 } else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
-  const count = fs.existsSync(${JSON.stringify(startCountPath)}) ? Number(fs.readFileSync(${JSON.stringify(startCountPath)}, 'utf8')) : 0
-  fs.writeFileSync(${JSON.stringify(startCountPath)}, String(count + 1))
-  out({ dispatch: { id: 'dispatch-' + (count + 1), status: 'dispatched' }, injected: true, preamble: 'authenticated' })
+  const count = nextCount(${JSON.stringify(dispatchCountPath)})
+  out({ dispatch: { id: 'dispatch-' + count, status: 'dispatched' }, injected: true, preamble: 'authenticated' })
 } else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
-  const count = fs.existsSync(${JSON.stringify(countPath)}) ? Number(fs.readFileSync(${JSON.stringify(countPath)}, 'utf8')) : 0
-  fs.writeFileSync(${JSON.stringify(countPath)}, String(count + 1))
-  const dispatchId = 'dispatch-' + (count + 1)
-  const taskId = 'task-' + (count + 1)
-  const reportPath = count === 0 ? ${JSON.stringify(reportOne)} : count === 1 ? ${JSON.stringify(reportTwo)} : ${JSON.stringify(reportThree)}
+  const count = nextCount(${JSON.stringify(countPath)})
+  const dispatchId = 'dispatch-' + count
+  const taskId = 'task-' + count
+  const reportPath = count === 1 ? ${JSON.stringify(reportOne)} : count === 2 ? ${JSON.stringify(reportTwo)} : ${JSON.stringify(reportThree)}
   out({ deliveryId: 'delivery-' + count, messages: [{ type: 'worker_done', body: 'Fixed the issue. Verified the change. Nothing remains.', payload: JSON.stringify({ taskId, dispatchId, outcome: 'succeeded', reportPath }) }] })
 } else {
   out({ ok: true })
@@ -790,41 +846,50 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       name: 'first-fixer',
       prompt: 'first',
       role: 'fixer',
-      stage: 'review',
-      worktree: 'current'
+      stage: 'review'
     })
-    await orca.finishWorker(first, 'retain')
+    await orca.finishWorker(first)
     const second = await orca.startWorker('task-2', {
       name: 'second-fixer',
       prompt: 'second',
       role: 'fixer',
-      stage: 'lint',
-      terminal: first.terminalHandle,
-      worktree: 'current'
+      stage: 'lint'
     })
-    await orca.finishWorker(second, 'retain')
+    await orca.finishWorker(second)
     const third = await orca.startWorker('task-3', {
       name: 'third-fixer',
       prompt: 'third',
       role: 'fixer',
-      stage: 'test',
-      terminal: second.terminalHandle,
-      worktree: 'current'
+      stage: 'test'
     })
-    await orca.finishWorker(third, 'release')
+    await orca.finishWorker(third)
 
+    assert.equal(first.worktreeId, 'wt-1')
+    assert.equal(first.worktreePath, '/wt-1')
+    assert.equal(first.terminalHandle, 'worker-shell-1')
+    assert.equal(second.worktreeId, 'wt-2')
+    assert.equal(second.terminalHandle, 'worker-shell-2')
+    assert.equal(third.worktreeId, 'wt-3')
+    assert.equal(third.terminalHandle, 'worker-shell-3')
     const calls = (await readFile(callsPath, 'utf8'))
       .trim()
       .split('\n')
       .map((line) => JSON.parse(line) as string[])
     const starts = calls.filter((args) => args[1] === 'dispatch')
     assert.equal(starts.length, 3)
-    assert.equal(first.terminalHandle, 'created-fixer')
-    assert.equal(second.terminalHandle, 'created-fixer')
-    assert.equal(third.terminalHandle, 'created-fixer')
+    const worktreeCreates = calls.filter((args) => args[0] === 'worktree' && args[1] === 'create')
+    assert.equal(worktreeCreates.length, 3)
+    for (const created of worktreeCreates) {
+      assert.ok(created.includes('--base-branch'))
+      assert.ok(created.includes('feature'))
+      assert.ok(created.includes('--parent-worktree'))
+    }
     const closes = calls.filter((args) => args[0] === 'terminal' && args[1] === 'close')
-    assert.equal(closes.length, 1)
-    assert.ok(closes[0].includes('created-fixer'))
+    assert.equal(closes.length, 3)
+    assert.deepEqual(
+      closes.map((close) => close[close.indexOf('--terminal') + 1]),
+      ['worker-shell-1', 'worker-shell-2', 'worker-shell-3']
+    )
   } finally {
     await rm(temp, { recursive: true, force: true })
     await rm(evidence, { recursive: true, force: true })
@@ -887,11 +952,11 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       name: 'fresh-reviewer',
       prompt: 'contains ) and shell syntax',
       role: 'reviewer',
-      stage: 'review',
-      worktree: 'new-child'
+      stage: 'review'
     })
 
     assert.equal(worker.worktreeId, worktreeId)
+    assert.equal(worker.worktreePath, '/tmp/worker')
     const calls = (await readFile(callsPath, 'utf8'))
       .trim()
       .split('\n')
@@ -968,6 +1033,52 @@ test('GitShell rebases a clean feature branch and delivers it to origin', async 
       git(temp, `--git-dir=${origin}`, 'rev-parse', 'refs/heads/feature'),
       git(repo, 'rev-parse', 'HEAD')
     )
+
+    const gatePath = path.join(temp, 'gate')
+    git(repo, 'worktree', 'add', gatePath, '-b', 'no-mistakes-gate-x', 'HEAD')
+    const gateShell = new GitShell({ repo: gatePath })
+    const gateState = await gateShell.assertReady()
+    assert.equal(gateState.branch, 'no-mistakes-gate-x')
+    assert.equal(gateState.base, 'main')
+
+    const workerPath = path.join(temp, 'worker')
+    git(gatePath, 'worktree', 'add', workerPath, '-b', 'no-mistakes-fixer-y', 'HEAD')
+    const baseSha = git(gatePath, 'rev-parse', 'HEAD')
+    await writeFile(path.join(workerPath, 'fix.txt'), 'fixed\n')
+    git(workerPath, 'add', 'fix.txt')
+    git(workerPath, 'commit', '-m', 'fix it')
+
+    const applied = await gateShell.applyWorktreeCommits(workerPath, baseSha)
+    assert.deepEqual(applied.findings, [])
+    assert.equal(
+      git(gatePath, 'rev-parse', 'HEAD^{tree}'),
+      git(workerPath, 'rev-parse', 'HEAD^{tree}')
+    )
+
+    const divergedBase = git(workerPath, 'rev-parse', 'HEAD')
+    await writeFile(path.join(gatePath, 'conflict.txt'), 'gate\n')
+    git(gatePath, 'add', 'conflict.txt')
+    git(gatePath, 'commit', '-m', 'gate change')
+    const conflictedGateHead = git(gatePath, 'rev-parse', 'HEAD')
+    await writeFile(path.join(workerPath, 'conflict.txt'), 'worker\n')
+    git(workerPath, 'add', 'conflict.txt')
+    git(workerPath, 'commit', '-m', 'worker change')
+
+    const failedApply = await gateShell.applyWorktreeCommits(workerPath, divergedBase)
+    assert.equal(failedApply.findings[0].id, 'fix-apply-failed')
+    assert.equal(failedApply.findings[0].action, 'ask-user')
+    assert.equal(git(gatePath, 'rev-parse', 'HEAD'), conflictedGateHead)
+    await gateShell.assertClean()
+
+    await gateShell.push(state.branch)
+    assert.equal(
+      git(temp, `--git-dir=${origin}`, 'rev-parse', 'refs/heads/feature'),
+      git(gatePath, 'rev-parse', 'HEAD')
+    )
+
+    git(gatePath, 'worktree', 'remove', workerPath)
+    await gateShell.deleteBranch('no-mistakes-fixer-y')
+    assert.throws(() => git(gatePath, 'rev-parse', '--verify', 'no-mistakes-fixer-y'))
   } finally {
     await rm(temp, { recursive: true, force: true })
   }
@@ -1192,4 +1303,127 @@ if (args[1] === 'run-create') {
   } finally {
     await rm(temp, { recursive: true, force: true })
   }
+})
+
+test('runs sequential fixer rounds from fresh child worktrees before re-review', async () => {
+  const git = new FakeGit()
+  const orca = new FakeOrca(git)
+  orca.reports.set('review', [
+    {
+      findings: [
+        { id: 'review-a', severity: 'error', action: 'auto-fix', description: 'First defect remains.' }
+      ],
+      summary: 'first failure'
+    },
+    pass('first fix committed'),
+    {
+      findings: [
+        { id: 'review-b', severity: 'error', action: 'auto-fix', description: 'Second defect remains.' }
+      ],
+      summary: 'second failure'
+    },
+    pass('second fix committed'),
+    pass('clean rereview after two rounds')
+  ])
+
+  const result = await runPipeline(
+    { intent: 'Multiple fixer rounds.', gate: { branch: 'no-mistakes-gate-mr', worktreeId: 'wt-gate-mr' } },
+    orca,
+    git
+  )
+
+  assert.equal(result.steps.length, PIPELINE_STEPS.length)
+  const fixerLaunches = orca.launches.filter((launch) => launch.role === 'fixer')
+  assert.deepEqual(
+    fixerLaunches.map((launch) => launch.name),
+    ['no-mistakes-fixer-review-1', 'no-mistakes-fixer-review-2']
+  )
+  const firstFixTask = orca.tasks.find((task) => task.spec.startsWith('[review fix 1]'))
+  const secondFixTask = orca.tasks.find((task) => task.spec.startsWith('[review fix 2]'))
+  assert.match(firstFixTask?.spec ?? '', /First defect remains\./)
+  assert.ok(!firstFixTask?.spec.includes('Second defect'))
+  assert.match(secondFixTask?.spec ?? '', /Second defect remains\./)
+  const applyCalls = git.calls.filter((call) => call.startsWith('apply:'))
+  assert.equal(applyCalls.length, 2)
+  for (const dispatchId of orca.fixerDispatches) {
+    assert.ok(applyCalls.some((call) => call.endsWith(`:/wt/${dispatchId}`)))
+    assert.ok(orca.calls.includes(`release:${dispatchId}`))
+    assert.ok(orca.removedWorktrees.includes(`repo::/${dispatchId}`))
+  }
+})
+
+test('a reviewer-only pass launches no fixers and opens no gates', async () => {
+  const git = new FakeGit()
+  const orca = new FakeOrca(git)
+
+  const result = await runPipeline({ intent: 'Everything passes.' }, orca, git)
+
+  assert.equal(result.steps.length, PIPELINE_STEPS.length)
+  assert.equal(orca.launches.filter((launch) => launch.role === 'fixer').length, 0)
+  assert.equal(git.calls.filter((call) => call.startsWith('apply:')).length, 0)
+  assert.equal(orca.gates.length, 0)
+  const workerStages = PIPELINE_STEPS.filter(
+    (stage) => stage !== 'intent' && stage !== 'rebase' && stage !== 'push'
+  )
+  for (const stage of workerStages) {
+    assert.equal(orca.launches.filter((launch) => launch.stage === stage).length, 1, stage)
+  }
+})
+
+test('worker cancellation cleans up the gate worktree and branch', async () => {
+  const git = new FakeGit()
+  const orca = new FakeOrca(git)
+  orca.failWorkerFor = 'review'
+
+  await assert.rejects(
+    runPipeline(
+      { intent: 'Cancelled mid-flight.', gate: { branch: 'no-mistakes-gate-cx', worktreeId: 'wt-gate-cx' } },
+      orca,
+      git
+    ),
+    /review worker was cancelled/
+  )
+  assert.ok(orca.removedWorktrees.includes('wt-gate-cx'))
+  assert.ok(git.calls.includes('delete-branch:no-mistakes-gate-cx'))
+  assert.ok(orca.calls.some((call) => call.includes('status:in-review:no-mistakes stopped:')))
+})
+
+test('failed commit application stops the pipeline and cleans up the fixer', async () => {
+  const git = new FakeGit()
+  const orca = new FakeOrca(git)
+  git.failApplyOnce({
+    findings: [
+      {
+        id: 'fix-apply-failed',
+        severity: 'error',
+        action: 'ask-user',
+        description: 'CONFLICT content conflict in fix.txt'
+      }
+    ],
+    summary: 'cherry-pick failed'
+  })
+  orca.reports.set('review', [
+    {
+      findings: [
+        { id: 'review-c', severity: 'error', action: 'auto-fix', description: 'Needs a fix.' }
+      ],
+      summary: 'failure'
+    },
+    pass('never reached')
+  ])
+
+  await assert.rejects(
+    runPipeline(
+      { intent: 'Apply conflict.', gate: { branch: 'no-mistakes-gate-ca', worktreeId: 'wt-gate-ca' } },
+      orca,
+      git
+    ),
+    /review fixer commits could not be applied to the gate branch/
+  )
+  const [fixerDispatch] = orca.fixerDispatches
+  assert.ok(fixerDispatch)
+  assert.ok(orca.calls.includes(`release:${fixerDispatch}`))
+  assert.ok(orca.removedWorktrees.includes(`repo::/${fixerDispatch}`))
+  assert.ok(orca.removedWorktrees.includes('wt-gate-ca'))
+  assert.ok(git.calls.includes('delete-branch:no-mistakes-gate-ca'))
 })
