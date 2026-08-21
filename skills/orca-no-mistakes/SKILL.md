@@ -65,6 +65,7 @@ A `fix` resolution supports targeted finding selection, per-finding instructions
 - Resolving with `fix` without IDs targets all actionable findings. Unselected findings are evaluated in subsequent re-review passes.
 - Copy IDs exactly from the gate question. If none of the supplied IDs match a reported finding, the run stops with `<stage> fix gate resolved with no matching findings`.
 - IDs that do not match a reported finding are dropped without a warning. If at least one ID matches, the run proceeds with the matched subset only.
+- Single-word guidance following `fix` without brackets (e.g. `--resolution "fix urgently"`) is parsed as a finding ID candidate and can fail closed if no such finding exists. For global guidance across all findings, use bracket syntax (e.g. `--resolution "fix [] - urgently"`), multi-word text (e.g. `--resolution "fix please handle urgently"`), or JSON.
 
 Escalate every `ask-user` finding to the user before resolving it. Relay its ID, file and line when present, and full description. Do not choose `approve` or `skip` on the user's behalf.
 

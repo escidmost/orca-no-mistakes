@@ -779,7 +779,7 @@ export function parseGateResolution(resolution: string, availableFindings: Findi
     return { action: 'fix', guidance: '', selectedFindings: availableFindings }
   }
 
-  const bracketMatch = remainder.match(/^\[([^\]]+)\](.*)$/)
+  const bracketMatch = remainder.match(/^\[([^\]]*)\](.*)$/)
   if (bracketMatch) {
     const rawIds = bracketMatch[1].split(/[\s,]+/).filter(Boolean)
     const availableIds = new Set(availableFindings.map((f) => f.id))
@@ -984,7 +984,11 @@ export class CliOrca implements OrcaOperations {
     }
     const dispatchId = receipt?.dispatch?.id
     if (!dispatchId || receipt.injected !== true || !receipt.preamble?.trim()) {
-      if (prepared) await this.#cleanupPreparedWorker(prepared)
+      if (dispatchId) {
+        await this.#cleanupFailedWorker(dispatchId, terminalHandle, prepared?.worktreeId)
+      } else if (prepared) {
+        await this.#cleanupPreparedWorker(prepared)
+      }
       throw new Error('dispatch returned an invalid receipt')
     }
     const worktreeId = prepared?.worktreeId
@@ -1240,6 +1244,7 @@ export class CliOrca implements OrcaOperations {
     taskId: string,
     dispatchId: string
   ): Promise<{ deliveryId?: string; error?: string; report?: StageReport }> {
+    const deadline = Date.now() + 1800000
     for (;;) {
       const result = await this.#json<{
         _heartbeat?: boolean
@@ -1268,7 +1273,16 @@ export class CliOrca implements OrcaOperations {
         ],
         true
       )
-      if (result._keepalive || result._heartbeat || result.timedOut) continue
+      if (result._keepalive || result._heartbeat || result.timedOut) {
+        if (Date.now() >= deadline) {
+          return {
+            deliveryId: result.deliveryId,
+            error: `worker ${dispatchId} timed out waiting for orchestration check`
+          }
+        }
+        await new Promise((resolve) => setTimeout(resolve, 250))
+        continue
+      }
       if (result.cancelled || result.connectionLost) {
         return {
           deliveryId: result.deliveryId,

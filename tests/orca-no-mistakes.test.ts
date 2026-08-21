@@ -989,6 +989,16 @@ test('parseGateResolution parses actions, finding IDs, guidance, and JSON overri
     guidance: 'f-9: some text',
     selectedFindings: []
   })
+  assert.deepEqual(parseGateResolution('fix urgently', findings), {
+    action: 'fix',
+    guidance: 'urgently',
+    selectedFindings: []
+  })
+  assert.deepEqual(parseGateResolution('fix [] - urgently', findings), {
+    action: 'fix',
+    guidance: 'urgently',
+    selectedFindings: []
+  })
 
   // Free-text guidance with no ID list targets every available finding
   const guidedFix = parseGateResolution('fix please handle the null case first', findings)
