@@ -529,6 +529,10 @@ function unwrapJson<T>(stdout: string): T {
     : (parsed as T)
 }
 
+const DEFAULT_WORKER_AGENT = 'opencode'
+const DEFAULT_WORKER_MODEL = 'opencode-go/ox-alpha-free'
+const DEFAULT_WORKER_EFFORT = 'max'
+
 type CliOrcaOptions = {
   command?: string
   cwd: string
@@ -540,8 +544,8 @@ type CliOrcaOptions = {
 export class CliOrca implements OrcaOperations {
   readonly #command: string
   readonly #cwd: string
-  readonly #fixerEffort?: string
-  readonly #fixerModel?: string
+  readonly #fixerEffort: string
+  readonly #fixerModel: string
   readonly #reviewerModel: string
   #runId?: string
 
@@ -549,12 +553,9 @@ export class CliOrca implements OrcaOperations {
     this.#command =
       options.command ?? process.env.ORCA_CLI_COMMAND ?? (process.platform === 'linux' ? 'orca-ide' : 'orca')
     this.#cwd = options.cwd
-    this.#fixerEffort = options.fixerEffort
-    this.#fixerModel = options.fixerModel
-    this.#reviewerModel = options.reviewerModel ?? 'sonnet'
-    if (this.#fixerEffort && !this.#fixerModel) {
-      throw new Error('--fixer-effort requires --fixer-model')
-    }
+    this.#fixerEffort = options.fixerEffort ?? DEFAULT_WORKER_EFFORT
+    this.#fixerModel = options.fixerModel ?? DEFAULT_WORKER_MODEL
+    this.#reviewerModel = options.reviewerModel ?? DEFAULT_WORKER_MODEL
   }
 
   async createRun(objective: string): Promise<string> {
@@ -585,11 +586,10 @@ export class CliOrca implements OrcaOperations {
     if (launch.terminal) {
       args.push('--terminal', launch.terminal)
     } else {
-      args.push('--worktree', launch.worktree, '--agent', launch.role === 'reviewer' ? 'claude' : 'codex')
+      args.push('--worktree', launch.worktree, '--agent', DEFAULT_WORKER_AGENT)
       if (launch.worktree === 'new-child') args.push('--name', launch.name, '--setup', 'run')
-      if (launch.role === 'reviewer') args.push('--model', this.#reviewerModel)
-      if (launch.role === 'fixer' && this.#fixerModel) args.push('--model', this.#fixerModel)
-      if (launch.role === 'fixer' && this.#fixerEffort) args.push('--effort', this.#fixerEffort)
+      args.push('--model', launch.role === 'reviewer' ? this.#reviewerModel : this.#fixerModel)
+      args.push('--effort', launch.role === 'reviewer' ? DEFAULT_WORKER_EFFORT : this.#fixerEffort)
     }
     args.push('--json')
     const receipt = await this.#json<{

@@ -1,15 +1,22 @@
-# 1. Coordinator Recovery Model
+---
+status: accepted
+date: 2026-08-20
+scope: target architecture
+implementation: not implemented
+---
 
-We persist pipeline state and Git custody in a dedicated SQLite domain ledger while delegating durable worker, task, and gate lifecycle to Orca orchestration. On coordinator restart, the coordinator rebinds the Orca Run with generation fencing, opportunistically adopts healthy in-flight workers (falling back to checkpoint restarts for failed or interrupted fixers), reattaches to durable Orca decision gates, and preserves unpublished pipeline commits under recovery refs with three-way containment proof for custody return. This achieves safety-semantic parity with original no-mistakes without duplicating generic orchestration infrastructure.
+# Coordinator Recovery Model
 
-## Considered Options
+The target coordinator persists domain state separately from Orca's orchestration state so a restarted coordinator can resume without duplicating workers or losing Git custody. Current behavior is documented in [`docs/current-architecture.md`](../current-architecture.md).
 
-- **Stateless Adapter / Reconstruct on demand**: Querying Orca DB and Git refs without a local ledger proved insufficient to guarantee atomic branch leases and commit-bound stage verification checkpoints.
-- **Fenced Invalidate-and-Rerun on all workers**: Discarding all in-flight workers on restart was simpler, but opportunistic adoption leverages Orca's native worker durability to survive coordinator updates and CLI detachments without interrupting long-running test suites.
-- **Unconditional branch reset on recovery**: Overwriting working branches on failure or cancellation risks silent data loss; three-way containment proof guarantees operator edits are never dropped.
+## Decision
+
+- Resolve the repository's common Git directory and store the domain ledger at `<git-common-dir>/orca-no-mistakes/ledger.sqlite`.
+- Use the ledger for proposed-change identity, branch semantic leases, commit-bound stage checkpoints, and custody state. Orca remains authoritative for Runs, Tasks, Dispatches, and decision-gate lifecycle under ADR-0008.
+- Fence each coordinator generation before it may advance domain state. A restarted coordinator may adopt an Orca worker only when Orca identifies it as the same live Dispatch for the same task and generation; otherwise it restarts from the last committed checkpoint.
+- Preserve unpublished pipeline heads under `refs/no-mistakes/recover/<run-id>` before releasing or changing custody.
+- Return custody only through a three-way containment check over the submitted head, operator head, and terminal pipeline head. Ambiguous divergence requires an operator decision and never triggers an automatic reset.
 
 ## Consequences
 
-- The adapter requires a lightweight SQLite domain ledger at `~/.orca-no-mistakes/ledger.db` tracking branch leases, proposed change metadata, stage commit checkpoints, and custody states.
-- Orca native `bindRun` generation fencing prevents split-brain execution across multiple coordinator invocations.
-- Stranded pipeline commits are anchored to `refs/no-mistakes/recover/<run_id>`, enabling safe recovery via `orca-no-mistakes axi sync --recover`.
+Recovery is a Release 4 capability under ADR-0010. Earlier releases may run and deliver changes, but they are not crash-safe and cannot claim the full target Passed guarantee.

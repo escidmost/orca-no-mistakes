@@ -1,27 +1,21 @@
-# 0008: Orca Native Guarantee Boundary
+---
+status: accepted
+date: 2026-08-20
+scope: target architecture
+implementation: partially implemented
+---
 
-## Status
+# Orca Native Guarantee Boundary
 
-Accepted
-
-## Context
-
-Orca provides durable orchestration without understanding Git custody, repository policy, or the evidence required for Passed. Reimplementing Orca's scheduler and worker lifecycle would create a duplicate, weaker authority, while relying on Orca alone would leave the domain guarantees unowned.
+Orca owns generic orchestration lifecycle; Orca No-Mistakes owns Git, policy, and proof semantics. Neither component may fabricate facts owned by the other.
 
 ## Decision
 
-Orca is authoritative for Runs, Tasks, Dispatches, mailbox delivery, worker questions and replies, decision gates, lifecycle stops, terminal release, and worker recovery. `orca-no-mistakes` owns the domain ledger for the exact proposed change, repository and branch semantic leases, exact-commit worktree custody, trusted policy execution, Git reconciliation after failure or cancellation, delivery evidence, and the final commit-bound Passed attestation.
-
-## Considered Options
-
-- **Custom standalone daemon**: rejected because Orca already provides durable orchestration and worker lifecycle management.
-- **Rely on Orca for Git custody and Passed proof**: rejected because Orca is intentionally unaware of Git and forge policy.
-- **Block on upstream Orca enhancements**: rejected; generic enhancements may land asynchronously, while the adapter must provide its safety guarantees immediately.
-- **Adapter domain ledger over Orca**: accepted.
+- Orca is authoritative for Runs, Tasks, Dispatches, worker lifecycle, mailbox delivery, decision-gate status, resolution, resolver identity when available, and terminal release.
+- Orca No-Mistakes owns proposed-change identity, the repository ledger, branch semantic leases, exact-commit custody, effective-policy execution, Git and forge reconciliation, and Passed evaluation.
+- The domain ledger records Orca identifiers and copies authoritative gate facts for evidence. It does not invent resolver provenance or replace Orca's scheduler.
+- If Orca cannot supply an authoritative fact required by effective policy, the adapter may ship a narrower workflow but must withhold Passed rather than substitute an unverifiable local assertion.
 
 ## Consequences
 
-- The adapter does not implement its own task scheduler, worker daemon, or terminal supervisor.
-- Concurrent validation runs on the same repository branch are rejected through adapter-owned semantic leases.
-- Gate provenance, finding history, commit checkpoints, and Passed evidence are recorded in the adapter's SQLite domain ledger.
-- Unmerged pipeline commits from failed or cancelled runs are anchored under recovery refs for deterministic custody recovery.
+The adapter has no standalone task scheduler, worker daemon, or terminal supervisor. Generic missing capabilities should be improved upstream; domain-specific invariants remain in this project.

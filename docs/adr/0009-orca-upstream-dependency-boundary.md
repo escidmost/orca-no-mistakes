@@ -1,19 +1,22 @@
-# 0009: Orca Upstream Dependency Boundary
+---
+status: accepted
+date: 2026-08-20
+scope: target architecture
+implementation: not implemented
+---
 
-Status: accepted
+# Orca Upstream Dependency Boundary
 
-Context:
-To restore safety-semantic parity across shippable releases, we need a defined boundary between Orca core enhancements and adapter responsibilities, ensuring parity milestones do not stall on upstream release cycles or carry weaker local substitutes.
+Useful releases should not wait for every desirable Orca enhancement, but an absent authoritative capability cannot be replaced with a weaker assertion while retaining the same guarantee.
 
-Decision:
-Shippable parity releases of `orca-no-mistakes` will not hard-block on new upstream Orca engine releases; all required safety invariants (branch semantic leases, gate resolver provenance, findings overrides, and commit-bound Passed attestations) are owned authoritatively by an adapter-managed SQLite validation ledger. Five generic upstream enhancements (atomic worktree occupancy leases, canonical external worktree path resolution, gate resolver principal tracking, durable audit export, and headless SSH control plane) will be authored directly as upstream Orca PRs and opportunistically adopted.
+## Decision
 
-Considered Options:
-- Hard-blocking parity releases on new Orca upstream releases: rejected because it delays shipping independently valuable parity milestones without improving safety semantics.
-- Deferring safety guarantees (e.g. unverified gate resolutions or unleased branch runs) until upstream Orca support lands: rejected because it violates the non-negotiable definition of Passed.
-- Rebuilding a standalone daemon/supervisor inside the adapter: rejected because Orca already provides durable orchestration and worker lifecycle management.
+- Target releases require Orca CLI `>= 1.4.185` and fail closed when the minimum version is not met.
+- Adapter-owned state uses `<git-common-dir>/orca-no-mistakes/ledger.sqlite`, consistent with ADR-0001 and ADR-0006.
+- The adapter may implement domain-specific leases, checkpoints, custody, and attestation metadata without waiting for upstream support.
+- Generic capabilities such as atomic worktree occupancy, canonical external-worktree paths, resolver-principal export, durable audit export, and headless control should be proposed upstream and adopted when available.
+- When a target guarantee depends on an authoritative Orca fact that the installed version cannot provide, the release reports the limitation and withholds Passed. It does not synthesize the fact locally.
 
-Consequences:
-- `orca-no-mistakes` requires a minimum Orca CLI version fence (`>= 1.4.185`) and fails closed on incompatible environments.
-- The adapter implements a repository-scoped SQLite ledger (`.git/orca-no-mistakes/ledger.sqlite`) for lease coordination and attestation provenance.
-- Upstream Orca PRs for atomic occupancy, resolver principals, and audit export can land asynchronously without breaking adapter safety guarantees.
+## Consequences
+
+The roadmap can ship independently useful stages without overstating parity. Version enforcement and capability checks must exist before a release claims the guarantees that depend on them.

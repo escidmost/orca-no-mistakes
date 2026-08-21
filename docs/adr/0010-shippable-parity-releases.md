@@ -1,22 +1,21 @@
-# 0010: Four Shippable Parity Releases
+---
+status: accepted
+date: 2026-08-20
+scope: target roadmap
+implementation: partially implemented
+---
 
-To restore the original meaning of Passed without compromising safety or blocking on unresolved remote proofs, we divide the delivery of Orca No-Mistakes into four independently shippable parity releases: Local Validation Core, Guarded Push Delivery, Authoritative CI Proof & Merge, and Resilient Recovery & Custody Synchronization.
+# Four Shippable Parity Releases
 
-## Status
-
-Accepted
-
-## Context
-
-Orca No-Mistakes replaces a standalone daemon with an Orca-native validation pipeline. Releasing a single massive migration creates high delivery risk and risks shipping weakened guarantees. Conversely, releasing an early version that writes to remote remotes before branch leasing or CI reconciliation exist would produce misleading Passed outcomes.
+The target architecture is delivered in four independently useful releases. Each release states its limitations; only Release 4 may emit the full Passed outcome defined by ADR-0005.
 
 ## Decision
 
-We partition the roadmap into four distinct, independently shippable releases:
+1. **Local Adversarial Validation Core** runs trusted-policy `intent`, `rebase`, `review`, `test`, `document`, and `lint` stages in isolated worktrees and emits a tamper-evident local evidence manifest. It has no remote side effects and reports local completion, not Passed.
+2. **Guarded Remote Delivery and Branch Leasing** adds the local Git gate, repository-scoped semantic leases, exact-head `--force-with-lease` delivery, and pull-request creation. Crash recovery is deliberately deferred: a coordinator crash may strand pipeline-created commits, this limitation must be displayed, and Passed remains unavailable.
+3. **Authoritative PR, CI, and Delivery Proof** adds complete GitHub reconciliation, trusted check-set completeness, expected-head non-bypass delivery, and delivered-tree verification. It may report `checks-passed` and verified delivery facts, but still withholds full Passed because custody recovery is absent.
+4. **Resilient Recovery and Custody Synchronization** adds coordinator restart recovery, parked-gate reattachment, preserved recovery refs, three-way custody reconciliation, and safe return of pipeline-created commits. Once every ADR-0005 invariant is implemented and accepted, this release may emit Passed.
 
-1. **Release 1 (Local Adversarial Validation Core)**: Executes trusted-policy validation DAG (`intent`, `rebase`, `review`, `test`, `document`, `lint`) across isolated child worktrees with Claude reviewers and durable Codex fixers, persisting an unforgeable commit-bound Attestation JSON without remote push side-effects.
-2. **Release 2 (Guarded Remote Delivery & Branch Custody)**: Introduces the bare gate push option entrypoint (`git push no-mistakes -o intent="..."`), exclusive branch semantic leases in `~/.orca-no-mistakes/leases/`, `--force-with-lease` exact-commit push, and PR creation.
-3. **Release 3 (Authoritative PR/CI Proof & Guarded Merge)**: Enforces fully paginated reconciliation of GitHub Checks API and Commit Statuses against exact commit SHAs, pre-declared trusted check-set completeness with fail-closed `no_ci: true` fallback, and non-bypass expected-head merge or merge queue transitions.
-4. **Release 4 (Resilient Coordinator Recovery & Custody Sync)**: Implements coordinator crash resumption, parked gate recovery, fail-closed branch custody reconciliation via `no-mistakes axi sync --recover` with anchored refs under `refs/no-mistakes/recover-local/<runId>`, and forward compatibility for upstream Orca atomic worktree occupancy leases.
+## Consequences
 
-Each release must be accompanied by an automated live scenario rig demonstrating real Git and Orca execution under fault and adversarial injection.
+Before a release is marked complete, an automated end-to-end scenario must exercise its claimed Git, Orca, gate, failure, and recovery behavior. The current implementation contains pieces from several releases but does not complete any target release; see [`docs/current-architecture.md`](../current-architecture.md).

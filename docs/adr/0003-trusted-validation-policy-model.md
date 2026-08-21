@@ -1,21 +1,22 @@
+---
+status: accepted
+date: 2026-08-20
+scope: target architecture
+implementation: not implemented
+---
+
 # Trusted Validation Policy Model
 
-To prevent untrusted proposed changes from silently weakening or subverting validation while enabling routine project evolution, the pipeline enforces a guarded policy evolution model. Reviewer prompts, agent execution constraints, and CI check requirements are immutably compiled from the trusted base commit and coordinator engine with untrusted data framing, while branch modifications to test assertions, linter configurations, and documentation are reconciled against the user's declared intent and gated on any unexplained relaxation.
+The proposed branch is untrusted input, but legitimate changes may need to add tests or alter validation configuration. The target pipeline therefore derives an effective policy from the trusted base plus an explicitly approved policy delta.
 
-## Status
+## Decision
 
-Accepted
-
-## Considered Options
-
-- **Strict Base-Only Policy Locking**: Sourcing all test files, linter scripts, and configs exclusively from the base commit was rejected because feature branches frequently need to add new tests, bump dependencies, update linters, and evolve documentation.
-- **Unchecked Branch-Owned Policy**: Allowing proposed changes to freely define and alter test suites, linter scripts, and review prompts was rejected because untrusted branches or compromised agents could disable checks, weaken assertions, or inject prompt overrides.
-- **Zero Agent Discretion vs Full Agent Discretion**: Giving agents zero discretion slowed diagnostic triage, while full discretion allowed hallucinated or unchecked pass summaries; bounded diagnostic discretion with deterministic coordinator invariant execution at stage boundaries was chosen instead.
-- **Silent Fallback on Malformed Policy**: Silently falling back to base defaults on unparseable configs was rejected because it masks configuration errors; failing closed at an explicit decision gate ensures full auditability.
+- Coordinator-owned prompts, execution constraints, and required check definitions come from the trusted base and coordinator engine. Branch diffs, repository instructions, and task text are framed as untrusted data.
+- Changes that add, remove, or weaken existing tests, lint rules, documentation rules, reviewer prompts, or required checks form a policy delta.
+- The coordinator reconciles that delta against declared intent. Unexplained relaxations fail closed at an `ask-user` gate.
+- Approval records a precise policy delta. The coordinator computes a new effective-policy hash and reruns every affected validation stage against that policy before `checks-passed` is available.
+- Fixers may alter an existing policy artifact only when the approved delta specifically authorizes that change. Malformed policy never silently falls back to base defaults.
 
 ## Consequences
 
-- The coordinator constructs reviewer and checker prompts from trusted engine definitions, treating the branch diff, `AGENTS.md`, and instructions strictly as untrusted data payloads.
-- Automated fixer agents are constrained to modifying implementation source code and adding new regression tests; they are forbidden from mutating existing test assertions, lint configs, or coordinator prompts.
-- Any deletion or weakening of existing test assertions or linter rules must align with declared user intent; unexplained relaxations surface as `ask-user` findings (`severity: error`).
-- The local validation ledger records the trusted base SHA, verified test execution commands, intent string, policy diff summary, and audit records of any approved policy gates.
+Evidence records the trusted base SHA, approved delta, effective-policy hash, intent, and commands executed. This resolves policy evolution without treating either the base or proposed branch as the sole authority.

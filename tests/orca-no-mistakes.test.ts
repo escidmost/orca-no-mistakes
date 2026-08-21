@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -569,3 +569,9 @@ test('GitShell rebases a clean feature branch and delivers it to origin', async 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
 }
+
+test('bundled skill never collides with the no-mistakes skill name', async () => {
+  const skills = await readdir(new URL('../skills', import.meta.url), 'utf8')
+  assert.ok(skills.includes('orca-no-mistakes'))
+  assert.ok(!skills.includes('no-mistakes'))
+})

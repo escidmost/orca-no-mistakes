@@ -1,20 +1,22 @@
+---
+status: accepted
+date: 2026-08-20
+scope: target architecture
+implementation: not implemented
+---
+
 # PR and CI Proof Architecture
 
-To restore safety-semantic parity for the Passed outcome on GitHub, the pipeline separates deterministic proof evaluation from adversarial agent analysis through a typed GitHub provider seam (`PrProofProvider`). The deterministic coordinator executes exact OID reconciliation queries, proves check completeness via dual-anchored manifests and forge rulesets, executes guarded delivery transitions with non-bypass credentials, and verifies delivered tree integrity, while adversarial agent tasks are restricted to diagnosing failures and generating fixes.
+The target pipeline separates deterministic GitHub and Git object proof from adversarial agent diagnosis. Agents may explain failures or propose fixes; they do not decide that required CI or delivery policy passed.
 
-## Status
+## Decision
 
-Accepted
-
-## Considered Options
-
-- **CLI Wrapper (`gh`) vs Direct Typed GraphQL/REST Client**: Wrapping the `gh` CLI was rejected because CLI commands lack atomic commit-bound checks and merge proofs, discarding essential provenance.
-- **Agent-Assisted Verdicts vs Strict Deterministic Coordinator**: Delegating check evaluation or policy waiver decisions to agents was rejected to ensure adversarial separation; agents remain diagnostic and generative.
-- **Open-World Observation vs Dual-Anchored Check Completeness**: Trusting dynamic check registrations without a trusted manifest was rejected because unobserved or delayed checks could silently pass.
-- **Admin Bypass Merge vs Non-Bypass Guarded Transition**: Using bypass credentials was rejected because it avoids GitHub's server-side branch protection rules, defeating the auditability of the merge transition.
+- A typed provider queries pull-request state, check runs, commit statuses, branch rules, and merge results against exact object IDs with complete pagination.
+- Required checks must finish successfully. `neutral`, `skipped`, or absent checks satisfy Passed only when the effective trusted policy explicitly marks them optional; a generic empty check list never passes.
+- Check completeness is evaluated against both the effective trusted manifest and applicable forge branch rules.
+- Delivery uses a non-bypass expected-head transition that fails closed if the candidate or target base changed after reconciliation.
+- GitHub merge fields are a delivery receipt, not delivered-tree proof. After delivery, the coordinator fetches the resulting Git objects and verifies candidate ancestry for merge commits or exact tree equality for squash/rebase delivery.
 
 ## Consequences
 
-- The coordinator requires direct GitHub API access with scoped non-bypass credentials (GitHub App or fine-grained PAT).
-- Check suites and legacy commit statuses are tracked by full lifecycle tuples (`check_run_id`, `completed_at`, `status`, `conclusion`) against exact candidate commit OIDs.
-- Post-merge verification must confirm parent ancestry (for merge commits) or tree SHA equality (for squash/rebase) before issuing a Passed outcome.
+The coordinator needs scoped non-bypass GitHub credentials and records full check lifecycle identifiers and timestamps. Agent summaries and PR state alone cannot produce `checks-passed` or `Passed`.

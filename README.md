@@ -4,11 +4,13 @@ An Orca-native, nine-stage adversarial validation pipeline:
 
 `intent -> rebase -> review -> test -> document -> lint -> push -> pr -> ci`
 
-The coordinator creates an Orca Run and ordered Task DAG. Fresh Claude workers review disposable child worktrees; one retained Codex terminal fixes the current worktree and commits each repair. Human decisions use Orca gates. Structured evidence stays under `~/.orca-no-mistakes/evidence/`, outside the branch.
+The current runner creates an Orca Run and ordered Task DAG. Fresh Claude workers inspect disposable child worktrees; one retained Codex terminal fixes the current worktree and commits each repair. Human decisions use Orca gates. Structured worker reports stay under `~/.orca-no-mistakes/evidence/`, outside the branch.
+
+Successful completion currently means that all nine stages completed under the worker-report model. It does not yet provide the target architecture's commit-bound `Passed` proof, branch leases, crash recovery, trusted-policy execution, or authoritative GitHub delivery verification. See [Current Architecture](docs/current-architecture.md) for implemented behavior and [the ADRs](docs/adr/) for accepted target decisions.
 
 ## Install
 
-Requires Node.js 24+, Git, a running Orca app, and authenticated `claude`, `codex`, and repository-host tooling.
+Requires Node.js 24+, Git, a running Orca app, and authenticated `opencode` and repository-host tooling.
 
 ```bash
 npm install
@@ -20,21 +22,36 @@ The installer creates a local bare gate under the repository's Git directory and
 
 ## Run
 
-Direct invocation:
+Direct invocation returns a meaningful process exit status:
 
 ```bash
 orca-no-mistakes run --repo /path/to/repo --intent "Add X without changing Y"
 ```
 
-Git entry point:
+The Git entry point submits through the installed local gate:
 
 ```bash
 orca-no-mistakes push --repo /path/to/repo --intent "Add X without changing Y"
 ```
 
-The push command sends the intent as a native Git push option. Intent is never stored in repository config or passed through the shell environment, and a plain `git push no-mistakes` is rejected. Git waits for the gate's `post-receive` pipeline, but it does not turn a pipeline failure into a nonzero push exit; check the Orca Run for the outcome. Use `/no-mistakes` or direct `run` when the caller needs the pipeline's exit status. Orca automations can invoke the same `run` command. The bundled `skills/no-mistakes/SKILL.md` provides `/no-mistakes` instructions for skill hosts.
+The runner requires a clean, committed, named feature branch and a configured `origin`. It rebases onto the detected default branch unless `--base` is supplied and delivers rewritten history with `--force-with-lease`.
 
-The runner requires a clean, committed feature branch and a configured `origin`. Rewrites are delivered with `--force-with-lease`. A failed push, PR, or CI delivery stage can only be retried or stopped; it cannot be approved as successful.
+Useful direct-run options:
+
+```text
+--base <branch>
+--reviewer-model <model>
+--fixer-model <model> --fixer-effort <level>
+--max-fix-rounds <count>
+```
+
+Workers launch with the `opencode` agent on model `opencode-go/ox-alpha-free` at max reasoning effort by default; the default maximum is three fix rounds. `ORCA_CLI_COMMAND` overrides the Orca executable.
+
+## Gates and outcomes
+
+Validation gates offer `approve`, `fix`, `skip`, or `stop`. Delivery gates (`push`, `pr`, and `ci`) offer only `retry` or `stop`. Resolve pending gates through Orca's native gate interface; the bundled [`/orca-no-mistakes` skill](skills/orca-no-mistakes/SKILL.md) contains the commands.
+
+Direct `run` blocks until completion or failure and prints JSON containing the Orca Run ID and completed stage names. `push` sends the intent as a native Git push option; a plain `git push no-mistakes` is rejected. Git waits for the gate's `post-receive` hook, but hook failure may not become a nonzero push exit, so inspect the Orca Run for the authoritative current-run status.
 
 ## Development
 
