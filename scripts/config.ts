@@ -1,17 +1,7 @@
 import { z } from 'zod'
 import YAML from 'yaml'
 
-export const PIPELINE_STEPS = [
-  'intent',
-  'rebase',
-  'review',
-  'test',
-  'document',
-  'lint',
-  'push',
-  'pr',
-  'ci'
-] as const
+export const PIPELINE_STEPS = ['intent', 'rebase', 'review', 'test', 'document', 'lint'] as const
 export type StageName = (typeof PIPELINE_STEPS)[number]
 
 export const ROLES = ['reviewer', 'fixer'] as const
