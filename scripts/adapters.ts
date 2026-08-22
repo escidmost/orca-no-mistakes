@@ -86,6 +86,12 @@ const EFFORT_KNOBS: Record<string, { flag: string; requiresModel?: boolean }> = 
 const MODEL_PIN_FLAGS = ['-m', '--model']
 const EFFORT_PIN_FLAGS = ['--effort', '--reasoning-effort', '--thinking']
 
+// A reserved flag stays reserved when joined to its value as --flag=value.
+function flagName(arg: string): string {
+  const equals = arg.indexOf('=')
+  return equals < 0 ? arg : arg.slice(0, equals)
+}
+
 function pinsAnyFlag(args: string[], flags: string[]): boolean {
   return args.some((arg) => flags.some((flag) => arg === flag || arg.startsWith(`${flag}=`)))
 }
@@ -145,7 +151,7 @@ export function buildCliCommand(harness: string, options: CliAgentCommandOptions
   const reserved = RESERVED_HARNESS_ARGS[harness]
   if (reserved) {
     for (const arg of raw) {
-      if (reserved.has(arg)) {
+      if (reserved.has(flagName(arg))) {
         throw new Error(`agent ${harness}: reserved argument '${arg}' cannot be overridden`)
       }
     }
@@ -171,8 +177,12 @@ export function readinessMatcher(
     return ({ preview, title }) =>
       /\b(?:agy|antigravity)\b/i.test(title ?? '') && !(preview ?? '').includes(INTERRUPT_MARKER)
   }
-  const pattern = new RegExp(`\\b${harness.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i')
+  const pattern = new RegExp(`\\b${escapeRegExp(harness)}\\b`, 'i')
   return ({ preview, title }) => pattern.test(title ?? '') && !(preview ?? '').includes(INTERRUPT_MARKER)
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 export function workerAgentReadyTimeoutMs(): number {
@@ -241,9 +251,15 @@ export class PreflightError extends Error {
 const BINARY_MISSING_PATTERN = /\bENOENT\b|command not found/i
 
 // Startup readiness observers see shell/terminal text, so a missing harness
-// binary surfaces as printed output rather than a spawn error.
-export function isBinaryMissingOutput(text: string): boolean {
-  return BINARY_MISSING_PATTERN.test(text)
+// binary surfaces as printed output rather than a spawn error. Only a line that
+// names the harness itself counts: shell rc noise and agent banners routinely
+// report other missing binaries, and treating those as a failed launch would
+// abort a healthy harness under the wrong failure class.
+export function isBinaryMissingOutput(text: string, harness: string): boolean {
+  const named = new RegExp(`\\b${escapeRegExp(harness)}\\b`, 'i')
+  return text
+    .split('\n')
+    .some((line) => BINARY_MISSING_PATTERN.test(line) && named.test(line))
 }
 
 const PREFLIGHT_PATTERNS: [RegExp, PreflightFailureClass][] = [

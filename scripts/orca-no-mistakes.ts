@@ -2508,7 +2508,7 @@ export class CliOrca implements OrcaOperations {
             "worker agent terminal disconnected during startup",
           );
         const startupOutput = `${terminal.title ?? ""}\n${terminal.preview ?? ""}`;
-        if (isBinaryMissingOutput(startupOutput))
+        if (isBinaryMissingOutput(startupOutput, harness))
           throw new PreflightError(
             "binary-missing",
             `worker agent ${harness} is not installed: ${startupOutput.trim().slice(-200)}`,

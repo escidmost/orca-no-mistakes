@@ -307,7 +307,13 @@ test('buildCliCommand always sends the agy reserved flag and rejects reserved ov
     model: 'm'
   })
   assert.match(envOverride, /^AGY_EFFORT='high' 'agy'/)
-  for (const flag of ['--dangerously-skip-permissions', '--prompt-interactive', '-i']) {
+  for (const flag of [
+    '--dangerously-skip-permissions',
+    '--prompt-interactive',
+    '-i',
+    '--prompt-interactive=/tmp/x',
+    '--dangerously-skip-permissions=false'
+  ]) {
     assert.throws(
       () => buildCliCommand('agy', { agentArgsOverride: { agy: [flag] } } as never),
       (error: unknown) =>
@@ -322,11 +328,18 @@ test('buildCliCommand always sends the agy reserved flag and rejects reserved ov
   )
 })
 
-test('isBinaryMissingOutput spots shell binary failures in startup output', () => {
-  assert.equal(isBinaryMissingOutput('zsh: command not found: agy'), true)
-  assert.equal(isBinaryMissingOutput('spawn agy ENOENT'), true)
-  assert.equal(isBinaryMissingOutput('Antigravity ready'), false)
-  assert.equal(isBinaryMissingOutput(''), false)
+test('isBinaryMissingOutput spots shell binary failures naming the harness', () => {
+  assert.equal(isBinaryMissingOutput('zsh: command not found: agy', 'agy'), true)
+  assert.equal(isBinaryMissingOutput('spawn agy ENOENT', 'agy'), true)
+  assert.equal(isBinaryMissingOutput('agy: command not found', 'agy'), true)
+  assert.equal(isBinaryMissingOutput('Antigravity ready', 'agy'), false)
+  assert.equal(isBinaryMissingOutput('', 'agy'), false)
+  // Unrelated startup noise must not abort a healthy harness.
+  assert.equal(
+    isBinaryMissingOutput('nvm: command not found\nOpenCode\nagy is elsewhere', 'opencode'),
+    false
+  )
+  assert.equal(isBinaryMissingOutput('spawn ripgrep ENOENT', 'opencode'), false)
 })
 
 test('parseAgyStream maps deltas, thinking usage, responses, and structured output', () => {
