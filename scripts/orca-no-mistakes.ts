@@ -25,6 +25,7 @@ import {
   classifyPreflightFailure,
   collectResidualResources,
   extractStructuredJson,
+  harnessTitleMatcher,
   isBinaryMissingOutput,
   nativeWorkerStartArgs,
   parseAcpTarget,
@@ -2472,6 +2473,7 @@ export class CliOrca implements OrcaOperations {
   ): Promise<void> {
     const waitsForPrompt = harness.toLowerCase() === "agy" && !promptSubmitted;
     const ready = readinessMatcher(harness);
+    const harnessTookOver = harnessTitleMatcher(harness);
     const deadline = Date.now() + workerAgentReadyTimeoutMs();
     let consecutiveMatches = 0;
     for (;;) {
@@ -2508,7 +2510,10 @@ export class CliOrca implements OrcaOperations {
             "worker agent terminal disconnected during startup",
           );
         const startupOutput = `${terminal.title ?? ""}\n${terminal.preview ?? ""}`;
-        if (isBinaryMissingOutput(startupOutput, harness))
+        if (
+          !harnessTookOver(terminal.title) &&
+          isBinaryMissingOutput(startupOutput, harness)
+        )
           throw new PreflightError(
             "binary-missing",
             `worker agent ${harness} is not installed: ${startupOutput.trim().slice(-200)}`,

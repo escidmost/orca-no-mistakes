@@ -164,21 +164,23 @@ export function buildCliCommand(harness: string, options: CliAgentCommandOptions
 
 export type TerminalView = { preview?: string | null; title?: string | null }
 
+export function harnessTitleMatcher(harness: string): (title?: string | null) => boolean {
+  const normalizedHarness = harness.toLowerCase()
+  if (normalizedHarness === 'opencode') {
+    return (title) => title === 'OpenCode' || title?.startsWith('OC |') === true
+  }
+  if (normalizedHarness === 'agy') {
+    return (title) => /\b(?:agy|antigravity)\b/i.test(title ?? '')
+  }
+  const pattern = new RegExp(`\\b${escapeRegExp(harness)}\\b`, 'i')
+  return (title) => pattern.test(title ?? '')
+}
+
 export function readinessMatcher(
   harness: string
 ): (terminal: TerminalView) => boolean {
-  const normalizedHarness = harness.toLowerCase()
-  if (normalizedHarness === 'opencode') {
-    return ({ preview, title }) =>
-      (title === 'OpenCode' || title?.startsWith('OC |') === true) &&
-      !(preview ?? '').includes(INTERRUPT_MARKER)
-  }
-  if (normalizedHarness === 'agy') {
-    return ({ preview, title }) =>
-      /\b(?:agy|antigravity)\b/i.test(title ?? '') && !(preview ?? '').includes(INTERRUPT_MARKER)
-  }
-  const pattern = new RegExp(`\\b${escapeRegExp(harness)}\\b`, 'i')
-  return ({ preview, title }) => pattern.test(title ?? '') && !(preview ?? '').includes(INTERRUPT_MARKER)
+  const titleTaken = harnessTitleMatcher(harness)
+  return ({ preview, title }) => titleTaken(title) && !(preview ?? '').includes(INTERRUPT_MARKER)
 }
 
 function escapeRegExp(value: string): string {

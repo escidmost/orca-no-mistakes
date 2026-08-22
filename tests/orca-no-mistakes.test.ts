@@ -3216,6 +3216,55 @@ if (args[0] === 'terminal' && args[1] === 'create') {
   }
 });
 
+test("a started harness rendering missing-binary text is not misdiagnosed", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-binary-rendered-"));
+  const fakeOrca = path.join(temp, "orca");
+  const evidence = path.join(
+    homedir(),
+    ".orca-no-mistakes",
+    "artifacts",
+    "rendered-test",
+  );
+  const report = path.join(evidence, "rendered.json");
+  try {
+    await mkdir(evidence, { recursive: true });
+    await writeFile(report, JSON.stringify(pass("rendered done")));
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+const args = process.argv.slice(2)
+const out = (result) => console.log(JSON.stringify({ result }))
+if (args[0] === 'orchestration' && args[1] === 'run-create') {
+  out({ run: { id: 'rendered-test' } })
+} else if (args[0] === 'terminal' && args[1] === 'create') {
+  out({ terminal: { handle: 'rendered-terminal' } })
+} else if (args[0] === 'terminal' && args[1] === 'show') {
+  out({ terminal: { connected: true, title: 'OpenCode', preview: 'reviewing diff\\n+  isBinaryMissingOutput("zsh: command not found: opencode", "opencode")' } })
+} else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
+  out({ dispatch: { id: 'dispatch-1', status: 'dispatched' }, injected: true, preamble: 'authenticated' })
+} else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
+  out({ deliveryId: 'delivery-1', messages: [{ type: 'worker_done', body: 'done', payload: JSON.stringify({ taskId: 'task-rendered', dispatchId: 'dispatch-1', outcome: 'succeeded', reportPath: ${JSON.stringify(report)} }) }] })
+} else {
+  out({ ok: true })
+}
+`,
+    );
+    await chmod(fakeOrca, 0o755);
+    const orca = new CliOrca({ command: fakeOrca, cwd: temp });
+    await orca.createRun("rendered test");
+    const worker = await orca.startWorker("task-rendered", {
+      name: "rendered-agent",
+      prompt: "instructions",
+      role: "reviewer",
+      stage: "lint",
+      worktree: "current",
+    });
+    assert.equal(worker.terminalHandle, "rendered-terminal");
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test("CliOrca extracts acp reports wrapped in closed JSON fences", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-acp-fence-"));
   const fakeAcpx = path.join(temp, "acpx");
