@@ -31,6 +31,7 @@ class FakeGit implements GitOperations {
   branch = 'feature'
   #head = 'head-1'
   #pendingApplyFailures: StageReport[] = []
+  #pendingApplyNoops = 0
 
   async assertReady(): Promise<{ base: string; branch: string; head: string; root: string }> {
     this.calls.push('assert-ready')
@@ -60,6 +61,10 @@ class FakeGit implements GitOperations {
     this.calls.push(`apply:${base}:${sourcePath}`)
     const failure = this.#pendingApplyFailures.shift()
     if (failure) return failure
+    if (this.#pendingApplyNoops > 0) {
+      this.#pendingApplyNoops -= 1
+      return pass('nothing to apply')
+    }
     this.advanceHead()
     return pass('applied fixer commits to the gate branch')
   }
@@ -74,6 +79,10 @@ class FakeGit implements GitOperations {
 
   failApplyOnce(report: StageReport): void {
     this.#pendingApplyFailures.push(report)
+  }
+
+  noopApplyOnce(): void {
+    this.#pendingApplyNoops += 1
   }
 }
 
@@ -121,6 +130,7 @@ class FakeOrca implements OrcaOperations {
       this.fixerDispatches.push(dispatchId)
     }
     return {
+      branchName: launch.name,
       deliveryId: `delivery-${dispatchId}`,
       dispatchId,
       report,
@@ -682,8 +692,6 @@ console.log(JSON.stringify({ result }))
 
 test('an attached run removes the gate when its own pre-flight check fails', async () => {
   const temp = await mkdtemp(path.join(tmpdir(), 'orca-gate-preflight-'))
-  const origin = path.join(temp, 'origin.git')
-  const repo = path.join(temp, 'repo')
   const gateWt = path.join(temp, 'gate-wt')
   const fakeOrca = path.join(temp, 'orca')
   const callsPath = path.join(temp, 'calls.jsonl')
@@ -694,16 +702,7 @@ test('an attached run removes the gate when its own pre-flight check fails', asy
     worktree: process.env.NO_MISTAKES_GATE_WORKTREE_ID
   }
   try {
-    git(temp, 'init', '--bare', origin)
-    git(temp, 'clone', origin, repo)
-    git(repo, 'config', 'user.email', 'test@example.com')
-    git(repo, 'config', 'user.name', 'Test User')
-    git(repo, 'checkout', '-b', 'main')
-    await writeFile(path.join(repo, 'README.md'), 'main\n')
-    git(repo, 'add', 'README.md')
-    git(repo, 'commit', '-m', 'main')
-    git(repo, 'push', '-u', 'origin', 'main')
-    git(temp, `--git-dir=${origin}`, 'symbolic-ref', 'HEAD', 'refs/heads/main')
+    const repo = await seedOriginRepo(temp)
     git(repo, 'checkout', '-b', 'feature')
     git(repo, 'worktree', 'add', gateWt, '-b', 'no-mistakes-gate-preflight', 'feature')
     await writeFile(path.join(gateWt, 'leftover.txt'), 'dirty\n')
@@ -742,8 +741,9 @@ console.log(JSON.stringify({ result: { accepted: true } }))
       ),
       'the gate worktree is removed'
     )
-    assert.throws(
-      () => git(repo, 'rev-parse', '--verify', 'no-mistakes-gate-preflight'),
+    assert.equal(
+      git(repo, 'branch', '--list', 'no-mistakes-gate-preflight').trim(),
+      '',
       'the gate branch is deleted'
     )
   } finally {
@@ -1585,6 +1585,8 @@ test('reviewer prompts name the delivery branch, not the gate branch', async () 
     assert.match(launch.prompt, /^Branch: feature$/m)
     assert.ok(!launch.prompt.includes('no-mistakes-gate-prompt'), launch.name)
   }
+  assert.ok(git.calls.includes('push:feature'), 'delivery pushes target the original branch')
+  assert.ok(!git.calls.includes('push:no-mistakes-gate-prompt'), 'the pipeline never pushes the gate branch')
 })
 
 test('a reviewer-only pass launches no fixers and opens no gates', async () => {
@@ -1869,4 +1871,35 @@ if (args[0] === 'worktree' && args[1] === 'create') {
   } finally {
     await rm(temp, { recursive: true, force: true })
   }
+})
+
+test('a fixer that leaves the gate HEAD unchanged stops the pipeline', async () => {
+  const git = new FakeGit()
+  git.noopApplyOnce()
+  const orca = new FakeOrca(git)
+  orca.reports.set('review', [
+    {
+      findings: [
+        { id: 'review-1', severity: 'error', action: 'auto-fix', description: 'Null input crashes.' }
+      ],
+      summary: 'one defect'
+    }
+  ])
+
+  await assert.rejects(
+    runPipeline(
+      { intent: 'No-op fix.', gate: { branch: 'no-mistakes-gate-noop', worktreeId: 'wt-gate-noop' } },
+      orca,
+      git
+    ),
+    /review fixer did not commit a change/
+  )
+
+  const [fixer] = orca.fixerDispatches
+  assert.ok(fixer)
+  assert.ok(orca.calls.includes(`release:${fixer}`), 'the no-op fixer is released')
+  assert.ok(orca.removedWorktrees.includes(`repo::/${fixer}`), 'the no-op fixer worktree is removed')
+  assert.ok(git.calls.includes('delete-branch:no-mistakes-fixer-review-1'), 'the fixer branch is deleted')
+  assert.ok(orca.removedWorktrees.includes('wt-gate-noop'), 'the gate worktree is removed')
+  assert.ok(git.calls.includes('delete-branch:no-mistakes-gate-noop'), 'the gate branch is deleted')
 })

@@ -34,6 +34,7 @@ export type WorkerLaunch = {
 }
 
 export type WorkerResult = {
+  branchName?: string
   deliveryId?: string
   dispatchId: string
   report: StageReport
@@ -248,7 +249,7 @@ async function executeStage(
   if (stage === 'push') {
     return await git.push(deliveryBranch)
   }
-  return await runReviewer(stage, attempt, taskId, intent, evidenceDir, repo, deliveryBranch, orca)
+  return await runReviewer(stage, attempt, taskId, intent, evidenceDir, repo, deliveryBranch, orca, git)
 }
 
 async function runReviewer(
@@ -259,7 +260,8 @@ async function runReviewer(
   evidenceDir: string,
   repo: RepoState,
   deliveryBranch: string,
-  orca: OrcaOperations
+  orca: OrcaOperations,
+  git: GitOperations
 ): Promise<StageReport> {
   const prompt = checkerPrompt(
     stage,
@@ -283,6 +285,9 @@ async function runReviewer(
     await orca.finishWorker(worker).catch(() => {})
     if (worker.worktreeId) {
       await orca.removeWorktree(worker.worktreeId).catch(() => {})
+    }
+    if (worker.branchName) {
+      await git.deleteBranch(worker.branchName).catch(() => {})
     }
   }
 }
@@ -326,6 +331,9 @@ async function runFixer(
     await orca.finishWorker(worker).catch(() => {})
     if (worker.worktreeId) {
       await orca.removeWorktree(worker.worktreeId).catch(() => {})
+    }
+    if (worker.branchName) {
+      await git.deleteBranch(worker.branchName).catch(() => {})
     }
   }
 }
@@ -891,6 +899,7 @@ const WORKER_AGENT_READY_TIMEOUT_MS = 60_000
 const WORKER_IDLE_TIMEOUT_MS = 1_800_000
 
 type PreparedWorker = {
+  branchName?: string
   terminalHandle: string
   worktreeId?: string
   worktreePath: string
@@ -986,7 +995,7 @@ export class CliOrca implements OrcaOperations {
     const dispatchId = receipt?.dispatch?.id
     if (!dispatchId || receipt.injected !== true || !receipt.preamble?.trim()) {
       if (dispatchId) {
-        await this.#cleanupFailedWorker(dispatchId, terminalHandle, prepared.worktreeId)
+        await this.#cleanupFailedWorker(dispatchId, terminalHandle, prepared.worktreeId, undefined, prepared.branchName)
       } else {
         await this.#cleanupPreparedWorker(prepared)
       }
@@ -999,6 +1008,7 @@ export class CliOrca implements OrcaOperations {
       deliveryId = result.deliveryId
       if (result.error) throw new Error(result.error)
       return {
+        branchName: prepared.branchName,
         deliveryId,
         report: result.report!,
         taskId,
@@ -1008,13 +1018,14 @@ export class CliOrca implements OrcaOperations {
         worktreePath: prepared.worktreePath
       }
     } catch (error) {
-      await this.#cleanupFailedWorker(dispatchId, terminalHandle, worktreeId, deliveryId)
+      await this.#cleanupFailedWorker(dispatchId, terminalHandle, worktreeId, deliveryId, prepared.branchName)
       throw error
     }
   }
 
   async #prepareNewChildWorker(launch: WorkerLaunch): Promise<PreparedWorker> {
     let worktree: { id: string; path: string } | undefined
+    let branchName: string | undefined
     let terminalHandle = ''
     try {
       const branch = (await command('git', ['branch', '--show-current'], this.#cwd)).stdout.trim()
@@ -1038,6 +1049,12 @@ export class CliOrca implements OrcaOperations {
       ])
       worktree = created.worktree
       if (!worktree?.id || !worktree.path) throw new Error('worktree create returned an invalid receipt')
+      const workerBranch = (
+        await command('git', ['-C', worktree.path, 'branch', '--show-current'], this.#cwd, {
+          allowFailure: true
+        })
+      ).stdout.trim()
+      if (workerBranch) branchName = workerBranch
 
       const listed = await this.#json<{
         terminals: { connected?: boolean; handle: string; writable?: boolean }[]
@@ -1059,9 +1076,11 @@ export class CliOrca implements OrcaOperations {
       const model = launch.role === 'reviewer' ? this.#reviewerModel : this.#fixerModel
       const variant = launch.role === 'fixer' ? this.#fixerEffort : undefined
       await this.#launchWorkerAgent(terminalHandle, model, variant)
-      return { terminalHandle, worktreeId: worktree.id, worktreePath: worktree.path }
+      return { branchName, terminalHandle, worktreeId: worktree.id, worktreePath: worktree.path }
     } catch (error) {
-      if (worktree) await this.#cleanupPreparedWorker({ terminalHandle, worktreeId: worktree.id, worktreePath: worktree.path })
+      if (worktree) {
+        await this.#cleanupPreparedWorker({ branchName, terminalHandle, worktreeId: worktree.id, worktreePath: worktree.path })
+      }
       throw error
     }
   }
@@ -1111,6 +1130,9 @@ export class CliOrca implements OrcaOperations {
         ['worktree', 'rm', '--worktree', `id:${prepared.worktreeId}`, '--force', '--json'],
         true
       ).catch(() => {})
+    }
+    if (prepared.branchName) {
+      await command('git', ['branch', '-D', prepared.branchName], this.#cwd, { allowFailure: true }).catch(() => {})
     }
   }
 
@@ -1461,7 +1483,8 @@ export class CliOrca implements OrcaOperations {
     dispatchId: string,
     terminalHandle: string,
     worktreeId?: string,
-    deliveryId?: string
+    deliveryId?: string,
+    branchName?: string
   ): Promise<void> {
     await this.#json(
       ['orchestration', 'worker-abandon', '--dispatch', dispatchId, '--json'],
@@ -1475,6 +1498,9 @@ export class CliOrca implements OrcaOperations {
       await this.#json(['worktree', 'rm', '--worktree', `id:${worktreeId}`, '--force', '--json'], true).catch(
         () => {}
       )
+    }
+    if (branchName) {
+      await command('git', ['branch', '-D', branchName], this.#cwd, { allowFailure: true }).catch(() => {})
     }
     if (deliveryId) {
       await this.#json(
@@ -1579,37 +1605,60 @@ export class GitShell implements GitOperations {
 
   async applyWorktreeCommits(sourcePath: string, base: string): Promise<StageReport> {
     const source = path.resolve(sourcePath)
-    const sourceGit = async (args: string[]): Promise<string> =>
-      (await command('git', ['-C', source, ...args], this.#repo, { allowFailure: true })).stdout.trim()
-    const sourceHead = await sourceGit(['rev-parse', 'HEAD'])
-    if (!sourceHead) {
-      return failureReport('fix-apply-failed', 'ask-user', `could not read HEAD in ${sourcePath}`)
+    const sourceGit = async (args: string[]): Promise<{ failed: boolean; output: string }> => {
+      const result = await command('git', ['-C', source, ...args], this.#repo, { allowFailure: true })
+      return { failed: result.code !== 0, output: `${result.stdout}${result.stderr}`.trim() }
     }
-    const dirty = await sourceGit(['status', '--porcelain'])
-    if (dirty) {
+    const head = await sourceGit(['rev-parse', 'HEAD'])
+    if (head.failed || !head.output) {
+      return failureReport('fix-apply-failed', 'ask-user', `could not read HEAD in ${sourcePath}: ${head.output}`)
+    }
+    const sourceHead = head.output
+    const status = await sourceGit(['status', '--porcelain'])
+    if (status.failed) {
       return failureReport(
         'fix-apply-failed',
         'ask-user',
-        `uncommitted changes left in ${sourcePath}:\n${dirty}`
+        `could not read status in ${sourcePath}: ${status.output}`
+      )
+    }
+    if (status.output) {
+      return failureReport(
+        'fix-apply-failed',
+        'ask-user',
+        `uncommitted changes left in ${sourcePath}:\n${status.output}`
       )
     }
     if (sourceHead === base) {
       return { findings: [], summary: `no commits in ${base.slice(0, 12)}..${sourceHead.slice(0, 12)}` }
     }
     const appendOnly = await this.#git(['merge-base', '--is-ancestor', base, sourceHead], true)
-    if (appendOnly.failed) {
-      const discarded = await this.#git(['merge-base', '--is-ancestor', sourceHead, base], true)
-      if (!discarded.failed) {
+    let advance: CommandResult & { failed: boolean; output: string }
+    if (!appendOnly.failed) {
+      advance = await this.#git(['merge', '--ff-only', sourceHead], true)
+    } else {
+      const behind = await this.#git(['merge-base', '--is-ancestor', sourceHead, 'HEAD'], true)
+      if (!behind.failed) {
         return failureReport(
           'fix-apply-failed',
           'ask-user',
           `${sourcePath} discarded commits: ${sourceHead.slice(0, 12)} is behind ${base.slice(0, 12)}`
         )
       }
+      // The fixer rewrote history. Resetting is destructive, so only accept it
+      // while the gate branch still points at the commit the fixer branched
+      // from; anything else could discard gate-side commits.
+      const live = await this.#git(['rev-parse', 'HEAD'], true)
+      const liveHead = live.output.trim()
+      if (live.failed || liveHead !== base) {
+        return failureReport(
+          'fix-apply-failed',
+          'ask-user',
+          `the gate branch advanced to ${liveHead.slice(0, 12)} since fixing started; refusing to reset onto ${sourceHead.slice(0, 12)}`
+        )
+      }
+      advance = await this.#git(['reset', '--hard', sourceHead], true)
     }
-    const advance = appendOnly.failed
-      ? await this.#git(['reset', '--hard', sourceHead], true)
-      : await this.#git(['merge', '--ff-only', sourceHead], true)
     if (advance.failed) {
       return failureReport('fix-apply-failed', 'ask-user', advance.output)
     }
@@ -1856,6 +1905,7 @@ export async function createGateWorktree(
       parentWorktree,
       { allowFailure: true }
     ).catch(() => {})
+    await command('git', ['branch', '-D', name], parentWorktree, { allowFailure: true }).catch(() => {})
     throw error
   }
 }
