@@ -249,21 +249,24 @@ export class PreflightError extends Error {
 }
 
 const BINARY_MISSING_PATTERN = /\bENOENT\b|command not found/i
-// fish spells it `fish: Unknown command: <name>`. Only safe alongside the
-// harness-name anchoring below: unanchored it would swallow a CLI's own
-// "unknown command '<subcommand>'" usage errors.
-const SHELL_BINARY_MISSING_PATTERN = /\bENOENT\b|command not found|unknown command/i
 
 // Startup readiness observers see shell/terminal text, so a missing harness
 // binary surfaces as printed output rather than a spawn error. Only a line that
 // names the harness itself counts: shell rc noise and agent banners routinely
 // report other missing binaries, and treating those as a failed launch would
-// abort a healthy harness under the wrong failure class.
+// abort a healthy harness under the wrong failure class. fish spells it
+// `fish: Unknown command: <name>`, so that wording requires the harness name
+// immediately after the phrase — a CLI's own `<name>: unknown command '<sub>'`
+// usage error names itself first and must not read as a missing binary.
 export function isBinaryMissingOutput(text: string, harness: string): boolean {
-  const named = new RegExp(`\\b${escapeRegExp(harness)}\\b`, 'i')
+  const name = escapeRegExp(harness)
+  const named = new RegExp(`\\b${name}\\b`, 'i')
+  const unknownCommand = new RegExp(`unknown command:?\\s*['"\`]?${name}\\b`, 'i')
   return text
     .split('\n')
-    .some((line) => SHELL_BINARY_MISSING_PATTERN.test(line) && named.test(line))
+    .some(
+      (line) => unknownCommand.test(line) || (BINARY_MISSING_PATTERN.test(line) && named.test(line))
+    )
 }
 
 const PREFLIGHT_PATTERNS: [RegExp, PreflightFailureClass][] = [
@@ -489,14 +492,15 @@ export function extractStructuredJson(text: string): unknown | undefined {
   } catch {}
   const { closed, open } = fencedJsonCandidates(text)
   for (const candidates of [closed, open]) {
-    const parsed: unknown[] = []
+    const distinct = new Map<string, unknown>()
     for (const candidate of candidates) {
       try {
-        parsed.push(JSON.parse(candidate.trim()))
+        const value: unknown = JSON.parse(candidate.trim())
+        distinct.set(JSON.stringify(value), value)
       } catch {}
     }
-    if (parsed.length > 1) return undefined
-    if (parsed.length === 1) return parsed[0]
+    if (distinct.size > 1) return undefined
+    if (distinct.size === 1) return [...distinct.values()][0]
   }
   return lastBareJsonObject(text)
 }

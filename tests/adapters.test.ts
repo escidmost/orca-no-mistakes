@@ -341,6 +341,7 @@ test('isBinaryMissingOutput spots shell binary failures naming the harness', () 
     false
   )
   assert.equal(isBinaryMissingOutput('spawn ripgrep ENOENT', 'opencode'), false)
+  assert.equal(isBinaryMissingOutput("opencode: unknown command '--nope'", 'opencode'), false)
 })
 
 test('parseAgyStream maps deltas, thinking usage, responses, and structured output', () => {
@@ -459,6 +460,11 @@ test('extractStructuredJson prefers closed fences over unclosed tails and prose 
     extractStructuredJson('```json\n{"a":1}\n```\n```json\n{"a":2}\n```'),
     undefined,
     'multiple valid closed fences are ambiguous'
+  )
+  assert.deepEqual(
+    extractStructuredJson('```json\n{"a":1}\n```\ntext\n```json\n{"a":1}\n```'),
+    { a: 1 },
+    'closed fences repeating the same value do not disagree'
   )
   assert.equal(extractStructuredJson('no json here'), undefined)
   assert.equal(
