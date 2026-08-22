@@ -112,10 +112,6 @@ class FakeGit implements GitOperations {
     this.calls.push("assert-clean");
   }
 
-  async isClean(): Promise<boolean> {
-    return !this.dirtyDelivery;
-  }
-
   async head(): Promise<string> {
     return this.#currentHead();
   }
@@ -209,7 +205,8 @@ class FakeGit implements GitOperations {
   ): Promise<boolean> {
     this.calls.push(`apply:${sourcePath}:${expectedHead}`);
     if (this.throwOnApply)
-      throw new Error("no-mistakes requires a clean committed worktree");
+      throw new Error("worker worktree must be clean before applying commits");
+    if (this.dirtyDelivery) return false;
     if (this.#head !== expectedHead) return false;
     this.advanceHead();
     return true;
@@ -1835,6 +1832,17 @@ test("three-way containment advances clean checkouts and preserves diverged ones
     assert.equal(
       git(repo, "rev-parse", "refs/no-mistakes/recover/run-containment"),
       terminal,
+    );
+
+    // Dirty checkout: reported as a refusal, not an error; HEAD and the
+    // operator's uncommitted work are left untouched.
+    git(repo, "reset", "--hard", submission);
+    await writeFile(path.join(repo, "feature.txt"), "operator edit\n");
+    assert.equal(await shell.applyWorktreeCommits(gate, submission), false);
+    assert.equal(git(repo, "rev-parse", "HEAD"), submission);
+    assert.equal(
+      await readFile(path.join(repo, "feature.txt"), "utf8"),
+      "operator edit\n",
     );
 
     // Clean checkout (C_op == C_sub): custody returns via fast-forward.
@@ -3705,12 +3713,12 @@ test("a dirty delivery checkout preserves custody behind a recovery ref instead 
   assert.match(result.custodyNote ?? "", /refs\/no-mistakes\/recover\//);
   assert.match(result.custodyNote ?? "", /uncommitted changes/);
   assert.match(result.custodyNote ?? "", /stash/);
-  assert.ok(!deliveryGit.calls.some((call) => call.startsWith("apply:")));
+  assert.ok(deliveryGit.calls.some((call) => call.startsWith("apply:")));
   assert.ok(deliveryGit.calls.some((call) => call.startsWith("recover:")));
   assert.equal(ledger.runStatus(result.runId), "passed");
 });
 
-test("a checkout dirtied after the clean check preserves custody instead of failing the run", async () => {
+test("a pipeline-side transfer failure is reported as such, not as operator divergence", async () => {
   const gateGit = new FakeGit("/gate", "no-mistakes-gate-test");
   const deliveryGit = new FakeGit("/origin", "feature");
   deliveryGit.throwOnApply = true;
@@ -3720,7 +3728,7 @@ test("a checkout dirtied after the clean check preserves custody instead of fail
   const result = await runPipeline(
     {
       deliveryGit,
-      intent: "Delivery dirtied mid-transfer.",
+      intent: "Pipeline worktree dirtied mid-transfer.",
     },
     orca,
     gateGit,
@@ -3728,13 +3736,58 @@ test("a checkout dirtied after the clean check preserves custody instead of fail
   );
 
   assert.match(result.custodyNote ?? "", /refs\/no-mistakes\/recover\//);
-  assert.match(result.custodyNote ?? "", /diverged/);
+  assert.match(result.custodyNote ?? "", /custody transfer failed/);
+  assert.match(
+    result.custodyNote ?? "",
+    /worker worktree must be clean before applying commits/,
+  );
+  assert.ok(!/diverged/.test(result.custodyNote ?? ""));
   assert.ok(deliveryGit.calls.some((call) => call.startsWith("apply:")));
   assert.ok(deliveryGit.calls.some((call) => call.startsWith("recover:")));
   assert.equal(ledger.runStatus(result.runId), "passed");
 });
 
 test("failed terminations tag the anchored recovery ref for the terminal notification", async () => {
+  const git = new FakeGit("/gate", "no-mistakes-gate-test");
+  const deliveryGit = new FakeGit("/origin", "feature");
+  const orca = new FakeOrca(git);
+  const ledger = new DomainLedger(":memory:");
+  orca.gateResolution = "later";
+  orca.reports.set("document", [
+    {
+      findings: [
+        {
+          id: "docs-choice",
+          severity: "warning",
+          action: "ask-user",
+          description: "Documentation ownership is unclear.",
+        },
+      ],
+      summary: "decision needed",
+    },
+  ]);
+
+  let failure: unknown;
+  try {
+    await runPipeline(
+      { deliveryGit, intent: "Surface recovery on failure." },
+      orca,
+      git,
+      ledger,
+    );
+  } catch (error) {
+    failure = error;
+  }
+
+  assert.ok(failure instanceof Error);
+  const { recoverRef } = failure as Error & { recoverRef?: string };
+
+  assert.match(recoverRef ?? "", /^refs\/no-mistakes\/recover\/test-run-/);
+  assert.ok(deliveryGit.calls.some((call) => call.startsWith("recover:")));
+  assert.equal(ledger.leaseFor("/origin", "feature"), undefined);
+});
+
+test("a failed run that produced no commits omits the recovery instructions", async () => {
   const git = new FakeGit();
   const orca = new FakeOrca(git);
   const ledger = new DomainLedger(":memory:");
@@ -3756,7 +3809,7 @@ test("failed terminations tag the anchored recovery ref for the terminal notific
   let failure: unknown;
   try {
     await runPipeline(
-      { intent: "Surface recovery on failure." },
+      { intent: "Fail without producing commits." },
       orca,
       git,
       ledger,
@@ -3766,11 +3819,11 @@ test("failed terminations tag the anchored recovery ref for the terminal notific
   }
 
   assert.ok(failure instanceof Error);
-  const { recoverRef } = failure as Error & { recoverRef?: string };
-
-  assert.match(recoverRef ?? "", /^refs\/no-mistakes\/recover\/test-run-/);
+  assert.equal(
+    (failure as Error & { recoverRef?: string }).recoverRef,
+    undefined,
+  );
   assert.ok(git.calls.some((call) => call.startsWith("recover:")));
-  assert.equal(ledger.leaseFor("/repo", "feature"), undefined);
 });
 
 test("capLog preserves head and tail of oversized logs", () => {

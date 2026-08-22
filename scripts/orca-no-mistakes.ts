@@ -158,7 +158,6 @@ export type RepoSnapshot = {
 export interface GitOperations {
   assertReady(): Promise<RepoSnapshot>;
   assertClean(): Promise<void>;
-  isClean(): Promise<boolean>;
   head(): Promise<string>;
   /** Diff between the resolved trusted base and the captured HEAD snapshot
    *  (merge-base three-dot form). Must throw on failure so a missing diff
@@ -623,24 +622,35 @@ export async function runPipeline(
         operatorHead === submissionCommitOid
           ? `branch ${deliveryRepo.branch} already at submission commit ${submissionCommitOid}`
           : `branch ${deliveryRepo.branch} carries the terminal commit ${terminalCommitOid}`;
-    } else if (
-      operatorHead === submissionCommitOid &&
-      (deliveryGit === git
-        ? await deliveryGit.advanceIfUnchanged(
-            submissionCommitOid,
-            terminalCommitOid,
-          )
-        : (await deliveryGit.isClean()) &&
-          (await deliveryGit
-            .applyWorktreeCommits(repo.root, submissionCommitOid)
-            .catch(() => false)))
-    ) {
-      custodyNote = `advanced branch ${deliveryRepo.branch} from submission to terminal commit ${terminalCommitOid}`;
     } else {
       const recoverRef = `refs/no-mistakes/recover/${runId}`;
-      custodyNote =
-        "operator checkout diverged or carries uncommitted changes; " +
-        recoveryInstructions(recoverRef);
+      let advanced = false;
+      let transferFailure: string | undefined;
+      if (operatorHead === submissionCommitOid) {
+        if (deliveryGit === git) {
+          advanced = await deliveryGit.advanceIfUnchanged(
+            submissionCommitOid,
+            terminalCommitOid,
+          );
+        } else {
+          try {
+            advanced = await deliveryGit.applyWorktreeCommits(
+              repo.root,
+              submissionCommitOid,
+            );
+          } catch (error) {
+            transferFailure =
+              error instanceof Error ? error.message : String(error);
+          }
+        }
+      }
+      custodyNote = advanced
+        ? `advanced branch ${deliveryRepo.branch} from submission to terminal commit ${terminalCommitOid}`
+        : transferFailure
+          ? `custody transfer failed on the pipeline side (${transferFailure}); ` +
+            recoveryInstructions(recoverRef)
+          : "operator checkout diverged or carries uncommitted changes; " +
+            recoveryInstructions(recoverRef);
     }
 
     const attestation = buildAttestation(stageEntries, {
@@ -670,8 +680,12 @@ export async function runPipeline(
     const outcome = error instanceof GateStopError ? "cancelled" : "failed";
     let anchorError: unknown;
     try {
-      await deliveryGit.anchorRecoveryRef(runId, await git.head());
-      if (error instanceof Error) {
+      const terminalOid = await git.head();
+      await deliveryGit.anchorRecoveryRef(runId, terminalOid);
+      if (
+        error instanceof Error &&
+        terminalOid !== (await deliveryGit.head())
+      ) {
         (error as CustodyTaggedError).recoverRef =
           `refs/no-mistakes/recover/${runId}`;
       }
@@ -3189,7 +3203,7 @@ export class GitShell implements GitOperations {
     sourcePath: string,
     expectedHead: string,
   ): Promise<boolean> {
-    await this.assertClean();
+    if (!(await this.isClean())) return false;
     if ((await this.head()) !== expectedHead) return false;
     const sourceStatus = await this.#git(
       ["-C", sourcePath, "status", "--porcelain"],
