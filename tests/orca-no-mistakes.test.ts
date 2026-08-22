@@ -3700,6 +3700,8 @@ test("a dirty delivery checkout preserves custody behind a recovery ref instead 
   );
 
   assert.match(result.custodyNote ?? "", /refs\/no-mistakes\/recover\//);
+  assert.match(result.custodyNote ?? "", /uncommitted changes/);
+  assert.match(result.custodyNote ?? "", /stash/);
   assert.ok(!deliveryGit.calls.some((call) => call.startsWith("apply:")));
   assert.ok(deliveryGit.calls.some((call) => call.startsWith("recover:")));
   assert.equal(ledger.runStatus(result.runId), "passed");

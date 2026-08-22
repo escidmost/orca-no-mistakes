@@ -631,8 +631,8 @@ export async function runPipeline(
     } else {
       const recoverRef = `refs/no-mistakes/recover/${runId}`;
       custodyNote =
-        `operator checkout diverged from the pipeline head; pipeline commits preserved at ${recoverRef} — ` +
-        `inspect with \`git log ${recoverRef}\`, then integrate with e.g. \`git rebase ${recoverRef}\``;
+        `operator checkout diverged or carries uncommitted changes; pipeline commits preserved at ${recoverRef} — ` +
+        `inspect with \`git log ${recoverRef}\`, then commit or stash local changes before integrating with e.g. \`git rebase ${recoverRef}\``;
     }
 
     const attestation = buildAttestation(stageEntries, {
