@@ -1,3 +1,6 @@
+import fs from 'node:fs'
+import path from 'node:path'
+import { tmpdir } from 'node:os'
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { PIPELINE_STEPS } from '../scripts/orca-no-mistakes.ts'
@@ -8,13 +11,17 @@ import {
   AutoFixConfigSchema,
   BASELINE_AUTO_FIX,
   CliFlagsSchema,
+  DEFAULT_CONFIG_TEMPLATE,
   DefaultsConfigSchema,
   OrcaNoMistakesConfigSchema,
   RoleConfigSchema,
   StageConfigSchema,
   StagesConfigSchema,
   deepMerge,
+  defaultUserConfigDir,
+  defaultUserConfigPath,
   formatZodError,
+  installDefaultUserConfig,
   normalizeAgentSpec,
   parseConfig,
   parseConfigYaml,
@@ -22,6 +29,7 @@ import {
   resolveRoleConfig,
   type OrcaNoMistakesConfig
 } from '../scripts/config.ts'
+
 
 test('validates strict schema and parses valid configurations', () => {
   const valid = {
@@ -492,3 +500,85 @@ test('resolvePipelineConfig builds resolved configurations for all pipeline step
   assert.equal(pipeline.stages.review.reviewer.effort, 'high')
   assert.equal(pipeline.stages.review.fixer.effort, undefined)
 })
+
+test('DEFAULT_CONFIG_TEMPLATE parses cleanly into valid OrcaNoMistakesConfig', () => {
+  const parsed = parseConfigYaml(DEFAULT_CONFIG_TEMPLATE)
+  assert.ok(parsed)
+  assert.equal(parsed.defaults?.agent, 'claude')
+  assert.equal(parsed.auto_fix?.enabled, true)
+  assert.equal(parsed.auto_fix?.max_rounds, 3)
+  assert.equal(parsed.auto_fix?.allow_review_autofix, false)
+})
+
+test('templates/config.yaml matches DEFAULT_CONFIG_TEMPLATE and parses validly', () => {
+  const templatePath = path.join(import.meta.dirname, '..', 'templates', 'config.yaml')
+  assert.ok(fs.existsSync(templatePath))
+  const content = fs.readFileSync(templatePath, 'utf8')
+  assert.equal(content, DEFAULT_CONFIG_TEMPLATE)
+  const parsed = parseConfigYaml(content)
+  assert.ok(parsed)
+})
+
+test('defaultUserConfigDir and defaultUserConfigPath respect environment overrides', () => {
+  const origXdg = process.env.XDG_CONFIG_HOME
+  const origCustomDir = process.env.ORCA_NO_MISTAKES_CONFIG_DIR
+  const origCustomFile = process.env.ORCA_NO_MISTAKES_USER_CONFIG
+
+  try {
+    delete process.env.XDG_CONFIG_HOME
+    delete process.env.ORCA_NO_MISTAKES_CONFIG_DIR
+    delete process.env.ORCA_NO_MISTAKES_USER_CONFIG
+
+    assert.match(defaultUserConfigDir(), /\.config\/orca-no-mistakes$/)
+    assert.match(defaultUserConfigPath(), /\.config\/orca-no-mistakes\/config\.yaml$/)
+
+    process.env.XDG_CONFIG_HOME = '/tmp/custom-xdg'
+    assert.equal(defaultUserConfigDir(), '/tmp/custom-xdg/orca-no-mistakes')
+    assert.equal(defaultUserConfigPath(), '/tmp/custom-xdg/orca-no-mistakes/config.yaml')
+
+    process.env.ORCA_NO_MISTAKES_CONFIG_DIR = '/tmp/direct-dir'
+    assert.equal(defaultUserConfigDir(), '/tmp/direct-dir')
+    assert.equal(defaultUserConfigPath(), '/tmp/direct-dir/config.yaml')
+
+    process.env.ORCA_NO_MISTAKES_USER_CONFIG = '/tmp/direct-file/custom.yaml'
+    assert.equal(defaultUserConfigPath(), '/tmp/direct-file/custom.yaml')
+  } finally {
+    if (origXdg !== undefined) process.env.XDG_CONFIG_HOME = origXdg
+    else delete process.env.XDG_CONFIG_HOME
+    if (origCustomDir !== undefined) process.env.ORCA_NO_MISTAKES_CONFIG_DIR = origCustomDir
+    else delete process.env.ORCA_NO_MISTAKES_CONFIG_DIR
+    if (origCustomFile !== undefined) process.env.ORCA_NO_MISTAKES_USER_CONFIG = origCustomFile
+    else delete process.env.ORCA_NO_MISTAKES_USER_CONFIG
+  }
+})
+
+test('installDefaultUserConfig writes default template and does not overwrite without force', () => {
+  const testDir = fs.mkdtempSync(path.join(tmpdir(), 'onm-config-test-'))
+  const targetPath = path.join(testDir, 'subdir', 'config.yaml')
+
+  try {
+    const firstResult = installDefaultUserConfig({ destinationPath: targetPath })
+    assert.equal(firstResult.installed, true)
+    assert.equal(firstResult.reason, 'created')
+    assert.equal(firstResult.path, targetPath)
+    assert.ok(fs.existsSync(targetPath))
+    assert.equal(fs.readFileSync(targetPath, 'utf8'), DEFAULT_CONFIG_TEMPLATE)
+
+    // Modify file to ensure it is not overwritten on second install
+    fs.writeFileSync(targetPath, 'defaults:\n  agent: custom-agent\n', 'utf8')
+
+    const secondResult = installDefaultUserConfig({ destinationPath: targetPath })
+    assert.equal(secondResult.installed, false)
+    assert.equal(secondResult.reason, 'already_exists')
+    assert.equal(fs.readFileSync(targetPath, 'utf8'), 'defaults:\n  agent: custom-agent\n')
+
+    // Force overwrite
+    const forcedResult = installDefaultUserConfig({ destinationPath: targetPath, force: true })
+    assert.equal(forcedResult.installed, true)
+    assert.equal(forcedResult.reason, 'overwritten')
+    assert.equal(fs.readFileSync(targetPath, 'utf8'), DEFAULT_CONFIG_TEMPLATE)
+  } finally {
+    fs.rmSync(testDir, { recursive: true, force: true })
+  }
+})
+

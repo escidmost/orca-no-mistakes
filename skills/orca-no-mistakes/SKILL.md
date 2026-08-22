@@ -32,13 +32,13 @@ Pass the user's objective and constraints as an explicit single-line intent, not
 orca-no-mistakes run --repo /path/to/repo --intent "<user objective and constraints>"
 ```
 
-The coordinator launches detached in a dedicated Orca terminal and returns immediately with `{"detached":true,"terminalHandle":"..."}`. This avoids blocking the caller and allows the originating session to receive and resolve decision gates via `orca orchestration gate-resolve`. (Pass `--attached` to run synchronously in the foreground).
+The coordinator launches detached in a dedicated Orca terminal and returns immediately with `{"detached":true,"terminalHandle":"..."}`. This avoids blocking the caller and allows the originating session to receive and resolve decision gates via `orca orchestration gate-resolve`.
 
-Available direct-run controls are `--attached`, `--base`, `--head`, `--force-lease`, `--notify`, `--reviewer-model`, `--fixer-model`, `--fixer-effort`, `--max-fix-rounds`, `--allow-local-config`, and `--config <path>`. Agent configuration is otherwise read from `.orca/no-mistakes.yaml` on the trusted base ref; the two local-config flags mark the run uncertified. Workers launch with the `opencode` agent on the agent's own default model by default; the default maximum is 3 automated fix rounds, after which an exhaustion gate opens.
+Available direct-run controls are `--base`, `--head`, `--force-lease`, `--notify`, `--reviewer-model`, `--fixer-model`, `--fixer-effort`, and `--max-fix-rounds`. Workers launch with the `opencode` agent on model `openai/gpt-5.6-luna` at max reasoning effort by default; the default maximum is 3 automated fix rounds, after which an exhaustion gate opens.
 
 ## Gates
 
-A detached run returns before any gate opens; an `--attached` run waits while an Orca gate is pending. Inspect and resolve the gate from the Orca app or a separate terminal:
+The detached run returns immediately. When an Orca gate is pending, inspect and resolve the gate from the Orca app or a separate terminal:
 
 ```bash
 orca orchestration gate-list --run <run-id> --status pending --json

@@ -6,7 +6,7 @@ This document describes implemented behavior for Release 1 (Local Adversarial Va
 
 `orca-no-mistakes` supports three commands:
 
-- `run` launches the coordinator detached in a dedicated Orca terminal tab and returns `{"detached":true,"terminalHandle":"..."}`. If `--notify <handle>` is passed or `ORCA_TERMINAL_HANDLE` is set, the coordinator also notifies that terminal when a decision gate opens. Pass `--attached` to run synchronously in the foreground.
+- `run` launches the coordinator detached in a dedicated Orca terminal tab and returns `{"detached":true,"terminalHandle":"..."}`. If `--notify <handle>` is passed or `ORCA_TERMINAL_HANDLE` is set, the coordinator also notifies that terminal when a decision gate opens. (The internal `--attached` flag runs synchronously inside the spawned terminal tab).
 - `attestation export|verify` reads or checks Passed Attestation manifests against the domain ledger and retained evidence.
 - `prune [--before <date>] [--repo <substring>]` deletes completed runs (cascading checkpoints, evidence, gate audit rows, attestations) plus their artifact directories.
 

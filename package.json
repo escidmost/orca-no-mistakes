@@ -10,6 +10,7 @@
     "orca-no-mistakes": "bin/orca-no-mistakes"
   },
   "scripts": {
+    "postinstall": "node scripts/postinstall.ts",
     "test": "node --test tests/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
