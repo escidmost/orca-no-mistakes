@@ -282,13 +282,7 @@ async function runReviewer(
   try {
     return await validateReport(worker.report, stage, evidenceDir)
   } finally {
-    await orca.finishWorker(worker).catch(() => {})
-    if (worker.worktreeId) {
-      await orca.removeWorktree(worker.worktreeId).catch(() => {})
-    }
-    if (worker.branchName) {
-      await git.deleteBranch(worker.branchName).catch(() => {})
-    }
+    await cleanupWorker(worker, orca, git)
   }
 }
 
@@ -328,13 +322,17 @@ async function runFixer(
       throw new Error(`${stage} fixer did not commit a change`)
     }
   } finally {
-    await orca.finishWorker(worker).catch(() => {})
-    if (worker.worktreeId) {
-      await orca.removeWorktree(worker.worktreeId).catch(() => {})
-    }
-    if (worker.branchName) {
-      await git.deleteBranch(worker.branchName).catch(() => {})
-    }
+    await cleanupWorker(worker, orca, git)
+  }
+}
+
+async function cleanupWorker(worker: WorkerResult, orca: OrcaOperations, git: GitOperations): Promise<void> {
+  await orca.finishWorker(worker).catch(() => {})
+  if (worker.worktreeId) {
+    await orca.removeWorktree(worker.worktreeId).catch(() => {})
+  }
+  if (worker.branchName) {
+    await git.deleteBranch(worker.branchName).catch(() => {})
   }
 }
 
@@ -894,6 +892,31 @@ function unwrapJson<T>(stdout: string): T {
     : (parsed as T)
 }
 
+async function orcaJson<T>(orcaCommand: string, args: string[], cwd: string): Promise<T> {
+  return unwrapJson<T>((await command(orcaCommand, args, cwd)).stdout)
+}
+
+async function removeOrcaWorktreeQuiet(orcaCommand: string, cwd: string, worktreeId: string): Promise<void> {
+  await command(orcaCommand, ['worktree', 'rm', '--worktree', `id:${worktreeId}`, '--force', '--json'], cwd, {
+    allowFailure: true
+  }).catch(() => {})
+}
+
+async function deleteBranchQuiet(cwd: string, branchName: string): Promise<void> {
+  await command('git', ['branch', '-D', branchName], cwd, { allowFailure: true }).catch(() => {})
+}
+
+async function currentBranchAndRepoRoot(
+  worktreePath: string,
+  missingBranchMessage: string
+): Promise<{ branch: string; repoRoot: string }> {
+  const branch = (await command('git', ['branch', '--show-current'], worktreePath)).stdout.trim()
+  if (!branch) throw new Error(missingBranchMessage)
+  const commonGitDir = (await command('git', ['rev-parse', '--git-common-dir'], worktreePath)).stdout.trim()
+  const repoRoot = path.dirname(path.resolve(worktreePath, commonGitDir))
+  return { branch, repoRoot }
+}
+
 const DEFAULT_WORKER_AGENT = 'opencode'
 const WORKER_AGENT_READY_TIMEOUT_MS = 60_000
 const WORKER_IDLE_TIMEOUT_MS = 1_800_000
@@ -1028,10 +1051,10 @@ export class CliOrca implements OrcaOperations {
     let branchName: string | undefined
     let terminalHandle = ''
     try {
-      const branch = (await command('git', ['branch', '--show-current'], this.#cwd)).stdout.trim()
-      if (!branch) throw new Error('no-mistakes requires a named branch for a worker worktree')
-      const commonGitDir = (await command('git', ['rev-parse', '--git-common-dir'], this.#cwd)).stdout.trim()
-      const repoRoot = path.dirname(path.resolve(this.#cwd, commonGitDir))
+      const { branch, repoRoot } = await currentBranchAndRepoRoot(
+        this.#cwd,
+        'no-mistakes requires a named branch for a worker worktree'
+      )
       const created = await this.#json<{ worktree: { id: string; path: string } }>([
         'worktree',
         'create',
@@ -1118,31 +1141,18 @@ export class CliOrca implements OrcaOperations {
     }
   }
 
+  async #closeTerminal(terminalHandle: string): Promise<void> {
+    await this.#json(['terminal', 'close', '--terminal', terminalHandle, '--tab', '--json'], true).catch(() => {})
+  }
+
   async #cleanupPreparedWorker(prepared: PreparedWorker): Promise<void> {
-    if (prepared.terminalHandle) {
-      await this.#json(
-        ['terminal', 'close', '--terminal', prepared.terminalHandle, '--tab', '--json'],
-        true
-      ).catch(() => {})
-    }
-    if (prepared.worktreeId) {
-      await this.#json(
-        ['worktree', 'rm', '--worktree', `id:${prepared.worktreeId}`, '--force', '--json'],
-        true
-      ).catch(() => {})
-    }
-    if (prepared.branchName) {
-      await command('git', ['branch', '-D', prepared.branchName], this.#cwd, { allowFailure: true }).catch(() => {})
-    }
+    if (prepared.terminalHandle) await this.#closeTerminal(prepared.terminalHandle)
+    if (prepared.worktreeId) await removeOrcaWorktreeQuiet(this.#command, this.#cwd, prepared.worktreeId)
+    if (prepared.branchName) await deleteBranchQuiet(this.#cwd, prepared.branchName)
   }
 
   async finishWorker(worker: WorkerResult): Promise<void> {
-    if (worker.terminalHandle) {
-      await this.#json(
-        ['terminal', 'close', '--terminal', worker.terminalHandle, '--tab', '--json'],
-        true
-      ).catch(() => {})
-    }
+    if (worker.terminalHandle) await this.#closeTerminal(worker.terminalHandle)
     if (worker.deliveryId) {
       await this.#json([
         'orchestration',
@@ -1490,18 +1500,9 @@ export class CliOrca implements OrcaOperations {
       ['orchestration', 'worker-abandon', '--dispatch', dispatchId, '--json'],
       true
     ).catch(() => {})
-    await this.#json(
-      ['terminal', 'close', '--terminal', terminalHandle, '--tab', '--json'],
-      true
-    ).catch(() => {})
-    if (worktreeId) {
-      await this.#json(['worktree', 'rm', '--worktree', `id:${worktreeId}`, '--force', '--json'], true).catch(
-        () => {}
-      )
-    }
-    if (branchName) {
-      await command('git', ['branch', '-D', branchName], this.#cwd, { allowFailure: true }).catch(() => {})
-    }
+    await this.#closeTerminal(terminalHandle)
+    if (worktreeId) await removeOrcaWorktreeQuiet(this.#command, this.#cwd, worktreeId)
+    if (branchName) await deleteBranchQuiet(this.#cwd, branchName)
     if (deliveryId) {
       await this.#json(
         [
@@ -1863,32 +1864,28 @@ export async function createGateWorktree(
   name: string
 ): Promise<{ branch: string; id: string; path: string }> {
   const orcaCommand = resolveOrcaCommand()
-  const baseBranch = (await command('git', ['branch', '--show-current'], parentWorktree)).stdout.trim()
-  if (!baseBranch) throw new Error('no-mistakes requires a named feature branch')
-  const commonGitDir = (await command('git', ['rev-parse', '--git-common-dir'], parentWorktree)).stdout.trim()
-  const repoRoot = path.dirname(path.resolve(parentWorktree, commonGitDir))
-  const created = unwrapJson<{ worktree: { id: string; path: string } }>(
-    (
-      await command(
-        orcaCommand,
-        [
-          'worktree',
-          'create',
-          '--repo',
-          `path:${repoRoot}`,
-          '--name',
-          name,
-          '--base-branch',
-          baseBranch,
-          '--parent-worktree',
-          `path:${parentWorktree}`,
-          '--setup',
-          'run',
-          '--json'
-        ],
-        parentWorktree
-      )
-    ).stdout
+  const { branch: baseBranch, repoRoot } = await currentBranchAndRepoRoot(
+    parentWorktree,
+    'no-mistakes requires a named feature branch'
+  )
+  const created = await orcaJson<{ worktree: { id: string; path: string } }>(
+    orcaCommand,
+    [
+      'worktree',
+      'create',
+      '--repo',
+      `path:${repoRoot}`,
+      '--name',
+      name,
+      '--base-branch',
+      baseBranch,
+      '--parent-worktree',
+      `path:${parentWorktree}`,
+      '--setup',
+      'run',
+      '--json'
+    ],
+    parentWorktree
   )
   const worktree = created?.worktree
   if (!worktree?.id || !worktree.path) {
@@ -1899,13 +1896,8 @@ export async function createGateWorktree(
     if (!branch) throw new Error('gate worktree did not check out a named gate branch')
     return { branch, id: worktree.id, path: worktree.path }
   } catch (error) {
-    await command(
-      orcaCommand,
-      ['worktree', 'rm', '--worktree', `id:${worktree.id}`, '--force', '--json'],
-      parentWorktree,
-      { allowFailure: true }
-    ).catch(() => {})
-    await command('git', ['branch', '-D', name], parentWorktree, { allowFailure: true }).catch(() => {})
+    await removeOrcaWorktreeQuiet(orcaCommand, parentWorktree, worktree.id)
+    await deleteBranchQuiet(parentWorktree, name)
     throw error
   }
 }
@@ -1916,14 +1908,10 @@ async function launchDetachedRun(repoState: RepoState, flags: RawCliFlags): Prom
   const gate = await createGateWorktree(root, gateName())
   let terminalHandle = ''
   try {
-    const created = unwrapJson<{ terminal: { handle: string } }>(
-      (
-        await command(
-          orcaCommand,
-          ['terminal', 'create', '--worktree', `path:${gate.path}`, '--title', 'no-mistakes', '--json'],
-          gate.path
-        )
-      ).stdout
+    const created = await orcaJson<{ terminal: { handle: string } }>(
+      orcaCommand,
+      ['terminal', 'create', '--worktree', `path:${gate.path}`, '--title', 'no-mistakes', '--json'],
+      gate.path
     )
     terminalHandle = created?.terminal?.handle ?? ''
     if (!terminalHandle) throw new Error('terminal create returned an invalid receipt')
@@ -1950,17 +1938,9 @@ async function launchDetachedRun(repoState: RepoState, flags: RawCliFlags): Prom
 
     const deadline = Date.now() + 10_000
     for (;;) {
-      const shown = unwrapJson<{
+      const shown = await orcaJson<{
         terminal: { connected?: boolean; preview?: string | null }
-      }>(
-        (
-          await command(
-            orcaCommand,
-            ['terminal', 'show', '--terminal', terminalHandle, '--json'],
-            gate.path
-          )
-        ).stdout
-      )
+      }>(orcaCommand, ['terminal', 'show', '--terminal', terminalHandle, '--json'], gate.path)
       if (shown.terminal.connected === false) {
         throw new Error('detached coordinator terminal disconnected during startup')
       }
@@ -1991,10 +1971,8 @@ async function launchDetachedRun(repoState: RepoState, flags: RawCliFlags): Prom
         { allowFailure: true }
       ).catch(() => {})
     }
-    await command(orcaCommand, ['worktree', 'rm', '--worktree', `id:${gate.id}`, '--force', '--json'], root, {
-      allowFailure: true
-    }).catch(() => {})
-    await command('git', ['branch', '-D', gate.branch], root, { allowFailure: true }).catch(() => {})
+    await removeOrcaWorktreeQuiet(orcaCommand, root, gate.id)
+    await deleteBranchQuiet(root, gate.branch)
     throw error
   }
   return terminalHandle
