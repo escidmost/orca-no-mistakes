@@ -93,7 +93,17 @@ function flagName(arg: string): string {
 }
 
 function pinsAnyFlag(args: string[], flags: string[]): boolean {
-  return args.some((arg) => flags.some((flag) => arg === flag || arg.startsWith(`${flag}=`)))
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]
+    for (const flag of flags) {
+      if (arg.startsWith(`${flag}=`)) {
+        if (arg.length > flag.length + 1) return true
+      } else if (arg === flag) {
+        if (i + 1 < args.length && args[i + 1] !== '') return true
+      }
+    }
+  }
+  return false
 }
 
 // Flags no-mistakes manages itself for a harness. agent_args_override entries

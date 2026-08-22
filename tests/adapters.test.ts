@@ -129,13 +129,32 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
     () => buildCliCommand('opencode', { effort: 'high' }),
     /cannot express effort without a model/
   )
-  assert.equal(
-    buildCliCommand('opencode', {
-      agentArgsOverride: { opencode: ['--model', 'custom-model'] } as never,
-      effort: 'high'
-    }),
-    `'opencode' '--variant' 'high' '--model' 'custom-model'`
-  )
+  // Accepted raw model-pin forms for opencode effort validation:
+  for (const rawArgs of [
+    ['--model', 'custom-model'],
+    ['--model=custom-model'],
+    ['-m', 'custom-model'],
+    ['-m=custom-model']
+  ]) {
+    assert.equal(
+      buildCliCommand('opencode', {
+        agentArgsOverride: { opencode: rawArgs } as never,
+        effort: 'high'
+      }),
+      `'opencode' '--variant' 'high' ${rawArgs.map((a) => `'${a}'`).join(' ')}`
+    )
+  }
+  // Empty or invalid raw model pins do not satisfy the model requirement:
+  for (const rawArgs of [['--model'], ['--model='], ['--model', ''], ['-m'], ['-m='], ['-m', '']]) {
+    assert.throws(
+      () =>
+        buildCliCommand('opencode', {
+          agentArgsOverride: { opencode: rawArgs } as never,
+          effort: 'high'
+        }),
+      /cannot express effort without a model/
+    )
+  }
   assert.equal(
     buildCliCommand('opencode', { effort: 'medium', variant: 'high' }),
     `'opencode' '--variant' 'high'`
