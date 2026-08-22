@@ -912,6 +912,67 @@ console.log(JSON.stringify({ result }))
   }
 });
 
+test("CliOrca reports terminal run outcomes to the originating session", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-run-notify-"));
+  const fakeOrca = path.join(temp, "orca");
+  const callsPath = path.join(temp, "calls.jsonl");
+  const previousHandle = process.env.ORCA_TERMINAL_HANDLE;
+  process.env.ORCA_TERMINAL_HANDLE = "coordinator-opencode";
+  try {
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+const result = args[1] === 'run-create'
+  ? { run: { id: 'completed-run' } }
+  : { message: { id: 'run-notification' } }
+console.log(JSON.stringify({ result }))
+`,
+    );
+    await chmod(fakeOrca, 0o755);
+    const orca = new CliOrca({
+      command: fakeOrca,
+      cwd: temp,
+      notifyHandle: "originating-opencode",
+    });
+    await orca.createRun("completion notification");
+    await orca.notifyRunResult(
+      "passed",
+      "Run completed-run passed all 6 stages. Candidate commit: abc123.",
+    );
+
+    const calls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    const sent = calls.find(
+      (args) => args[0] === "orchestration" && args[1] === "send",
+    );
+    const wake = calls.find(
+      (args) => args[0] === "terminal" && args[1] === "send",
+    );
+    assert.ok(sent?.includes("originating-opencode"));
+    assert.ok(sent?.includes("completed-run"));
+    assert.ok(sent?.includes("no-mistakes run passed"));
+    assert.ok(
+      sent?.includes(
+        "Run completed-run passed all 6 stages. Candidate commit: abc123.",
+      ),
+    );
+    assert.ok(wake?.includes("originating-opencode"));
+    assert.ok(wake?.includes("--enter"));
+    assert.ok(
+      wake?.some((value) => value.includes("Report this result to the user")),
+    );
+  } finally {
+    if (previousHandle === undefined) delete process.env.ORCA_TERMINAL_HANDLE;
+    else process.env.ORCA_TERMINAL_HANDLE = previousHandle;
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test("CliOrca applies gate responses through the bound coordinator", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-gate-response-"));
   const fakeOrca = path.join(temp, "orca");

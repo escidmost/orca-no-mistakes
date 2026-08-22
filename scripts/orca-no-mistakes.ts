@@ -1438,6 +1438,57 @@ export class CliOrca implements OrcaOperations {
     return result.run.id;
   }
 
+  async notifyRunResult(
+    outcome: "passed" | "failed" | "cancelled",
+    summary: string,
+  ): Promise<void> {
+    if (
+      !this.#notifyHandle ||
+      this.#notifyHandle === process.env.ORCA_TERMINAL_HANDLE
+    ) {
+      return;
+    }
+    const subject = `no-mistakes run ${outcome}`;
+    await this.#json([
+      "orchestration",
+      "send",
+      "--to",
+      this.#notifyHandle,
+      ...(this.#runId ? ["--run", this.#runId] : []),
+      "--subject",
+      subject,
+      "--body",
+      summary,
+      "--type",
+      "status",
+      "--priority",
+      outcome === "passed" ? "normal" : "high",
+      "--json",
+    ]).catch((error) => {
+      console.error(
+        `warning: could not notify terminal ${this.#notifyHandle}: ${String(error)}`,
+      );
+    });
+    await this.#json([
+      "terminal",
+      "send",
+      "--terminal",
+      this.#notifyHandle,
+      "--text",
+      [
+        `A detached no-mistakes run ${outcome}.`,
+        summary,
+        "Report this result to the user and take any requested follow-up action.",
+      ].join("\n\n"),
+      "--enter",
+      "--json",
+    ]).catch((error) => {
+      console.error(
+        `warning: could not wake terminal ${this.#notifyHandle}: ${String(error)}`,
+      );
+    });
+  }
+
   async createTask(
     spec: string,
     options: { deps?: string[]; parent?: string } = {},
@@ -3175,7 +3226,22 @@ Run options:
       git,
       ledger,
     );
+    await orca.notifyRunResult(
+      "passed",
+      [
+        `Run ${result.runId} passed all ${result.steps.length} stages.`,
+        ...(result.attestation
+          ? [`Candidate commit: ${result.attestation.candidateCommitOid}.`]
+          : []),
+        ...(result.custodyNote ? [result.custodyNote] : []),
+      ].join("\n"),
+    );
     console.log(JSON.stringify(result));
+  } catch (error) {
+    const outcome = error instanceof GateStopError ? "cancelled" : "failed";
+    const message = error instanceof Error ? error.message : String(error);
+    await orca.notifyRunResult(outcome, `No-mistakes ${outcome}: ${message}`);
+    throw error;
   } finally {
     try {
       ledger.close();
