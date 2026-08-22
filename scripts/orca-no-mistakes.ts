@@ -24,6 +24,8 @@ import {
   classifyHarness,
   classifyPreflightFailure,
   collectResidualResources,
+  extractStructuredJson,
+  isBinaryMissingOutput,
   nativeWorkerStartArgs,
   parseAcpTarget,
   readinessMatcher,
@@ -2505,6 +2507,12 @@ export class CliOrca implements OrcaOperations {
             "readiness-timeout",
             "worker agent terminal disconnected during startup",
           );
+        const startupOutput = `${terminal.title ?? ""}\n${terminal.preview ?? ""}`;
+        if (isBinaryMissingOutput(startupOutput))
+          throw new PreflightError(
+            "binary-missing",
+            `worker agent ${harness} is not installed: ${startupOutput.trim().slice(-200)}`,
+          );
         if (
           ready({
             preview: terminal.preview ?? null,
@@ -2621,6 +2629,10 @@ export class CliOrca implements OrcaOperations {
         report = acpReportFrom(unwrapJson<unknown>(result.stdout));
       } catch {
         report = undefined;
+      }
+      if (!report) {
+        const extracted = extractStructuredJson(result.stdout);
+        report = extracted === undefined ? undefined : acpReportFrom(extracted);
       }
       if (!report)
         throw new Error(`acp target ${target} returned an invalid report`);
@@ -3057,10 +3069,19 @@ export class CliOrca implements OrcaOperations {
               error: `worker ${dispatchId} used an unsafe report path`,
             };
           }
-          const report = JSON.parse(
-            await readFile(reportPath, "utf8"),
-          ) as StageReport;
-          return { deliveryId: result.deliveryId, report };
+          const rawReport = await readFile(reportPath, "utf8");
+          let parsedReport: unknown;
+          try {
+            parsedReport = JSON.parse(rawReport);
+          } catch {
+            parsedReport = extractStructuredJson(rawReport);
+          }
+          if (parsedReport === undefined || parsedReport === null)
+            throw new Error("report file contained no JSON value");
+          return {
+            deliveryId: result.deliveryId,
+            report: parsedReport as StageReport,
+          };
         } catch (error) {
           return {
             deliveryId: result.deliveryId,

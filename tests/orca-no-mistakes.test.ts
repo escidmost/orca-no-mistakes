@@ -1601,7 +1601,10 @@ test("CliOrca delivers agy preambles and preserves concurrent trust updates", as
       settingsPath,
       JSON.stringify({ trustAllWorkspaces: true, trustedWorkspaces: [] }),
     );
-    await writeFile(reportPath, JSON.stringify(pass("reviewed")));
+    await writeFile(
+      reportPath,
+      `\`\`\`json\n${JSON.stringify(pass("reviewed"))}\n\`\`\``,
+    );
     await writeFile(
       fakeOrca,
       `#!/usr/bin/env node
@@ -1691,7 +1694,10 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     );
     const launchCommand = sends[0][sends[0].indexOf("--text") + 1];
     assert.equal(sends.length, 1);
-    assert.match(launchCommand, /'agy' --prompt-interactive/);
+    assert.match(
+      launchCommand,
+      /^'agy' '--dangerously-skip-permissions' --prompt-interactive "\$\(cat -- /,
+    );
     assert.ok(!launchCommand.includes("authenticated"));
     assert.deepEqual(
       calls.find((args) => args[0] === "prompt-content"),
@@ -3150,6 +3156,112 @@ if (args[0] === 'terminal' && args[1] === 'create') {
     if (previousTimeout === undefined)
       delete process.env.WORKER_AGENT_READY_TIMEOUT_MS;
     else process.env.WORKER_AGENT_READY_TIMEOUT_MS = previousTimeout;
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("a missing CLI harness binary fails startup immediately as binary-missing", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-binary-missing-"));
+  const fakeOrca = path.join(temp, "orca");
+  const callsPath = path.join(temp, "calls.jsonl");
+  try {
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+const out = (result) => console.log(JSON.stringify({ result }))
+if (args[0] === 'terminal' && args[1] === 'create') {
+  out({ terminal: { handle: 'missing-terminal' } })
+} else if (args[0] === 'terminal' && args[1] === 'show') {
+  out({ terminal: { connected: true, title: 'zsh', preview: 'zsh: command not found: opencode' } })
+} else {
+  out({ ok: true })
+}
+`,
+    );
+    await chmod(fakeOrca, 0o755);
+    const orca = new CliOrca({ command: fakeOrca, cwd: temp });
+    await assert.rejects(
+      orca.startWorker("task-missing-binary", {
+        name: "missing-agent",
+        prompt: "instructions",
+        role: "reviewer",
+        stage: "lint",
+        worktree: "current",
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof PreflightError);
+        assert.equal(error.failureClass, "binary-missing");
+        assert.match(error.message, /worker agent opencode is not installed/);
+        return true;
+      },
+    );
+    const calls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    assert.ok(
+      calls.some(
+        (args) =>
+          args[0] === "terminal" &&
+          args[1] === "close" &&
+          args.includes("missing-terminal"),
+      ),
+      "a binary-missing launch still closes its terminal",
+    );
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("CliOrca extracts acp reports wrapped in closed JSON fences", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-acp-fence-"));
+  const fakeAcpx = path.join(temp, "acpx");
+  const fakeOrca = path.join(temp, "orca");
+  const worktreePath = path.join(temp, "acp-fence-wt");
+  try {
+    git(temp, "init", "-b", "feature");
+    await mkdir(worktreePath);
+    await writeFile(
+      fakeAcpx,
+      `#!/usr/bin/env node
+const fence = ${JSON.stringify("```")}
+console.log('Review notes:\\n' + fence + 'json\\n' + JSON.stringify({ findings: [], summary: 'fenced done' }) + '\\n' + fence)
+`,
+    );
+    await chmod(fakeAcpx, 0o755);
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+const out = (result) => console.log(JSON.stringify({ result }))
+if (args[0] === 'worktree' && args[1] === 'create') {
+  out({ worktree: { id: 'wt-acp-fence', path: ${JSON.stringify(worktreePath)} } })
+} else {
+  out({ ok: true })
+}
+`,
+    );
+    await chmod(fakeOrca, 0o755);
+    const orca = new CliOrca({
+      acpxCommand: fakeAcpx,
+      command: fakeOrca,
+      cwd: temp,
+    });
+    const worker = await orca.startWorker("task-acp-fence", {
+      agent: { harness: "acp:gemini-dev" },
+      name: "acp-worker",
+      prompt: "Review now.",
+      role: "reviewer",
+      stage: "review",
+      worktree: "new-child",
+    });
+    assert.equal(worker.report.summary, "fenced done");
+    await orca.finishWorker(worker, "release");
+  } finally {
     await rm(temp, { recursive: true, force: true });
   }
 });

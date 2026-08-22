@@ -75,11 +75,11 @@ export type AgentProfile = {
 // this table: Orca worker-start owns their per-harness flags; acp:<target>
 // rides acpx's own --model and exposes no effort surface.
 const EFFORT_KNOBS: Record<string, { flag: string; requiresModel?: boolean }> = {
+  agy: { flag: '--effort' },
   grok: { flag: '--reasoning-effort' },
   opencode: { flag: '--variant', requiresModel: true },
   pi: { flag: '--thinking' },
 }
-const UNMAPPABLE_HARNESSES = new Set(['agy'])
 
 // A knob already pinned through a raw agent_args_override flag wins, so the
 // mapped value is not emitted and no harness receives one knob twice.
@@ -88,6 +88,16 @@ const EFFORT_PIN_FLAGS = ['--effort', '--reasoning-effort', '--thinking']
 
 function pinsAnyFlag(args: string[], flags: string[]): boolean {
   return args.some((arg) => flags.some((flag) => arg === flag || arg.startsWith(`${flag}=`)))
+}
+
+// Flags no-mistakes manages itself for a harness. agent_args_override entries
+// may not supply them; always-present flags are appended after override args so
+// they cannot be dropped or reordered away.
+const RESERVED_HARNESS_ARGS: Record<string, ReadonlySet<string>> = {
+  agy: new Set(['--dangerously-skip-permissions', '--prompt-interactive', '-i']),
+}
+const REQUIRED_HARNESS_ARGS: Record<string, readonly string[]> = {
+  agy: ['--dangerously-skip-permissions'],
 }
 
 const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
@@ -112,14 +122,8 @@ export function buildCliCommand(harness: string, options: CliAgentCommandOptions
     }
   }
   const raw = Array.isArray(override) ? override : []
-  const unmappable = UNMAPPABLE_HARNESSES.has(harness)
   const effortKnob = EFFORT_KNOBS[harness]
-  if ((options.model || options.effort || options.variant) && unmappable) {
-    throw new Error(
-      `agent ${harness}: cannot express model or effort; no verified mechanism exists for it (use agent_args_override.${harness} if your build accepts a flag)`
-    )
-  }
-  if (options.effort && !effortKnob && !unmappable) {
+  if (options.effort && !effortKnob) {
     throw new Error(
       `agent ${harness}: cannot express effort; no verified reasoning-effort flag exists for it (use agent_args_override.${harness} if your build accepts one)`
     )
@@ -138,7 +142,16 @@ export function buildCliCommand(harness: string, options: CliAgentCommandOptions
   } else if (effortKnob && options.effort && !pinsAnyFlag(raw, EFFORT_PIN_FLAGS)) {
     parts.push(effortKnob.flag, options.effort)
   }
+  const reserved = RESERVED_HARNESS_ARGS[harness]
+  if (reserved) {
+    for (const arg of raw) {
+      if (reserved.has(arg)) {
+        throw new Error(`agent ${harness}: reserved argument '${arg}' cannot be overridden`)
+      }
+    }
+  }
   parts.push(...raw)
+  parts.push(...(REQUIRED_HARNESS_ARGS[harness] ?? []))
   // Environment assignments stay unquoted as a prefix; arguments are shell-quoted individually.
   return [...env, ...parts.map(shellQuote)].join(' ')
 }
@@ -225,8 +238,16 @@ export class PreflightError extends Error {
   }
 }
 
+const BINARY_MISSING_PATTERN = /\bENOENT\b|command not found/i
+
+// Startup readiness observers see shell/terminal text, so a missing harness
+// binary surfaces as printed output rather than a spawn error.
+export function isBinaryMissingOutput(text: string): boolean {
+  return BINARY_MISSING_PATTERN.test(text)
+}
+
 const PREFLIGHT_PATTERNS: [RegExp, PreflightFailureClass][] = [
-  [/\bENOENT\b|command not found/i, 'binary-missing'],
+  [BINARY_MISSING_PATTERN, 'binary-missing'],
   [/\b429\b|rate.?limit|quota|resource.?exhausted/i, 'quota'],
   [/unauthorized|authentication|credential|not logged in|api key|login required|permission denied/i, 'auth'],
 ]
@@ -277,4 +298,182 @@ export function collectResidualResources(value: unknown): ResidualResources {
   }
   visit(value)
   return { terminalHandles: [...terminalHandles], worktreeIds: [...worktreeIds] }
+}
+
+export type AgyStreamUsage = {
+  cacheCreationReported?: boolean
+  cacheCreationTokens?: number
+  cacheReadTokens?: number
+  inputTokens?: number
+  outputTokens?: number
+  reasoningReported?: boolean
+  reasoningTokens?: number
+}
+
+export type AgyStreamResult = { error?: string; text: string; usage: AgyStreamUsage }
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined
+}
+
+function applyAgyUsagePatch(usage: AgyStreamUsage, patch: Record<string, unknown>): void {
+  const numeric = (key: string): number | undefined => {
+    const value = patch[key]
+    return typeof value === 'number' ? value : undefined
+  }
+  const inputTokens = numeric('input_tokens')
+  if (inputTokens !== undefined) usage.inputTokens = inputTokens
+  const outputTokens = numeric('output_tokens')
+  if (outputTokens !== undefined) usage.outputTokens = outputTokens
+  const cacheReadTokens = numeric('cache_read_tokens')
+  if (cacheReadTokens !== undefined) usage.cacheReadTokens = cacheReadTokens
+  const cacheCreationTokens = numeric('cache_creation_tokens')
+  if (cacheCreationTokens !== undefined) {
+    usage.cacheCreationTokens = cacheCreationTokens
+    usage.cacheCreationReported = true
+  }
+  // Presence, not the value, marks reasoning as reported so a genuine zero
+  // stays distinguishable from a harness that never exposes the field.
+  if ('thinking_tokens' in patch) {
+    usage.reasoningReported = true
+    const thinkingTokens = numeric('thinking_tokens')
+    if (thinkingTokens !== undefined) usage.reasoningTokens = thinkingTokens
+  }
+}
+
+// Parses the NDJSON emitted by `agy --output-format stream-json`. Each line is
+// an event record dispatched on its top-level `event` field: `step_update`
+// streams text deltas and per-step usage; `result` carries the terminal status,
+// authoritative usage, optional `response`, and optional `structured_output`.
+// Malformed or unrecognized lines are skipped. Final text precedence is
+// structured_output > response > accumulated deltas.
+export function parseAgyStream(jsonl: string): AgyStreamResult {
+  let streamText = ''
+  let response = ''
+  let structured = ''
+  let error: string | undefined
+  const usage: AgyStreamUsage = {}
+  for (const line of jsonl.split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    let event: Record<string, unknown> | undefined
+    try {
+      event = asRecord(JSON.parse(trimmed))
+    } catch {
+      continue
+    }
+    if (!event) continue
+    if (event.event === 'step_update') {
+      const payload = asRecord(event.step_update)
+      if (!payload) continue
+      if (typeof payload.text_delta === 'string') streamText += payload.text_delta
+      const stepUsage = asRecord(payload.usage)
+      if (stepUsage) applyAgyUsagePatch(usage, stepUsage)
+    } else if (event.event === 'result') {
+      const payload = asRecord(event.result)
+      if (!payload) continue
+      if (payload.status === 'ERROR') {
+        error =
+          typeof payload.error === 'string' && payload.error.trim()
+            ? payload.error
+            : 'unknown error'
+      }
+      if (typeof payload.response === 'string' && payload.response) response = payload.response
+      const resultUsage = asRecord(payload.usage)
+      if (resultUsage) applyAgyUsagePatch(usage, resultUsage)
+      if (payload.structured_output !== undefined && payload.structured_output !== null) {
+        structured = JSON.stringify(payload.structured_output)
+      }
+    }
+  }
+  const text = [structured, response, streamText].find((value) => value !== '') ?? ''
+  return { error, text: text.trim(), usage }
+}
+
+type FenceCandidates = { closed: string[]; open: string[] }
+
+// Scans ```json fences anywhere in the text, including glued to preceding
+// content on the same line. Closed-fence bodies are collected separately from
+// unclosed tails running to end-of-text, and the scan never stops at an
+// opener whose span turns out to be unusable.
+function fencedJsonCandidates(text: string): FenceCandidates {
+  const closed: string[] = []
+  const open: string[] = []
+  let rest = text
+  for (;;) {
+    const marker = rest.indexOf('```')
+    if (marker < 0) return { closed, open }
+    const infoMatch = /^[A-Za-z0-9_-]*/.exec(rest.slice(marker + 3))
+    const info = (infoMatch?.[0] ?? '').toLowerCase()
+    if (info !== 'json') {
+      rest = rest.slice(marker + 3)
+      continue
+    }
+    const contentStart = marker + 3 + info.length
+    const closeIndex = rest.indexOf('```', contentStart)
+    if (closeIndex < 0) {
+      open.push(rest.slice(contentStart))
+      return { closed, open }
+    }
+    closed.push(rest.slice(contentStart, closeIndex))
+    rest = rest.slice(closeIndex + 3)
+  }
+}
+
+function lastBareJsonObject(text: string): unknown | undefined {
+  let best: unknown
+  let depth = 0
+  let start = -1
+  let inString = false
+  let escaped = false
+  for (let index = 0; index < text.length; index++) {
+    const char = text[index]
+    if (inString) {
+      if (escaped) escaped = false
+      else if (char === '\\') escaped = true
+      else if (char === '"') inString = false
+      continue
+    }
+    if (char === '"') {
+      inString = true
+    } else if (char === '{') {
+      if (depth === 0) start = index
+      depth += 1
+    } else if (char === '}') {
+      if (depth > 0) {
+        depth -= 1
+        if (depth === 0 && start >= 0) {
+          try {
+            const parsed: unknown = JSON.parse(text.slice(start, index + 1))
+            if (parsed && typeof parsed === 'object') best = parsed
+          } catch {}
+          start = -1
+        }
+      }
+    }
+  }
+  return best
+}
+
+// Extracts a structured result from agent text: direct JSON first, then closed
+// JSON fences, then unclosed tails, then the last bare JSON object. More than
+// one valid closed fence is ambiguous and yields undefined rather than a guess.
+export function extractStructuredJson(text: string): unknown | undefined {
+  try {
+    return JSON.parse(text.trim())
+  } catch {}
+  const { closed, open } = fencedJsonCandidates(text)
+  for (const candidates of [closed, open]) {
+    const parsed: unknown[] = []
+    for (const candidate of candidates) {
+      try {
+        parsed.push(JSON.parse(candidate.trim()))
+      } catch {}
+    }
+    if (parsed.length > 1) return undefined
+    if (parsed.length === 1) return parsed[0]
+  }
+  return lastBareJsonObject(text)
 }

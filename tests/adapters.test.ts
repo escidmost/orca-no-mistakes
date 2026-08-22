@@ -6,8 +6,11 @@ import {
   buildCliCommand,
   classifyHarness,
   collectResidualResources,
+  extractStructuredJson,
+  isBinaryMissingOutput,
   nativeWorkerStartArgs,
   parseAcpTarget,
+  parseAgyStream,
   readinessMatcher,
   shellQuote,
   workerAgentReadyTimeoutMs
@@ -129,10 +132,6 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
   assert.equal(
     buildCliCommand('opencode', { effort: 'medium', variant: 'high' }),
     `'opencode' '--variant' 'high'`
-  )
-  assert.throws(
-    () => buildCliCommand('agy', { effort: 'high', model: 'm' }),
-    /cannot express model or effort/
   )
   // A raw override flag that already pins a knob wins over the profile value.
   const pinned = buildCliCommand('grok', {
@@ -284,4 +283,161 @@ test('collectResidualResources reclaims terminals and worktrees from failure rec
 
 test('shellQuote escapes embedded single quotes', () => {
   assert.equal(shellQuote("it's"), `'it'"'"'s'`)
+})
+
+test('buildCliCommand always sends the agy reserved flag and rejects reserved overrides', () => {
+  assert.equal(buildCliCommand('agy'), `'agy' '--dangerously-skip-permissions'`)
+  assert.equal(
+    buildCliCommand('agy', { model: 'gemini-3-pro', effort: 'high' }),
+    `'agy' '--model' 'gemini-3-pro' '--effort' 'high' '--dangerously-skip-permissions'`
+  )
+  assert.equal(
+    buildCliCommand('agy', { effort: 'low' }),
+    `'agy' '--effort' 'low' '--dangerously-skip-permissions'`
+  )
+  const overridden = buildCliCommand('agy', {
+    agentArgsOverride: { agy: ['--mode', 'accept-edits'] } as never
+  })
+  assert.equal(
+    overridden,
+    `'agy' '--mode' 'accept-edits' '--dangerously-skip-permissions'`
+  )
+  const envOverride = buildCliCommand('agy', {
+    agentArgsOverride: { agy: { AGY_EFFORT: 'high' } } as never,
+    model: 'm'
+  })
+  assert.match(envOverride, /^AGY_EFFORT='high' 'agy'/)
+  for (const flag of ['--dangerously-skip-permissions', '--prompt-interactive', '-i']) {
+    assert.throws(
+      () => buildCliCommand('agy', { agentArgsOverride: { agy: [flag] } } as never),
+      (error: unknown) =>
+        error instanceof Error &&
+        error.message === `agent agy: reserved argument '${flag}' cannot be overridden`
+    )
+  }
+  // Other harnesses keep plain passthrough overrides.
+  assert.equal(
+    buildCliCommand('grok', { agentArgsOverride: { grok: ['-q'] } as never }),
+    `'grok' '-q'`
+  )
+})
+
+test('isBinaryMissingOutput spots shell binary failures in startup output', () => {
+  assert.equal(isBinaryMissingOutput('zsh: command not found: agy'), true)
+  assert.equal(isBinaryMissingOutput('spawn agy ENOENT'), true)
+  assert.equal(isBinaryMissingOutput('Antigravity ready'), false)
+  assert.equal(isBinaryMissingOutput(''), false)
+})
+
+test('parseAgyStream maps deltas, thinking usage, responses, and structured output', () => {
+  const stream = [
+    JSON.stringify({ event: 'step_update', step_update: { text_delta: 'Hel' } }),
+    JSON.stringify({
+      event: 'step_update',
+      step_update: {
+        text_delta: 'lo',
+        usage: { input_tokens: 10, output_tokens: 5, thinking_tokens: 42 }
+      }
+    }),
+    '',
+    'not json at all',
+    JSON.stringify({
+      event: 'result',
+      result: {
+        status: 'SUCCESS',
+        response: 'final answer',
+        usage: { input_tokens: 12, output_tokens: 7, thinking_tokens: 50, cache_read_tokens: 3 }
+      }
+    })
+  ].join('\n')
+  const parsed = parseAgyStream(stream)
+  assert.equal(parsed.error, undefined)
+  assert.equal(parsed.text, 'final answer', 'the terminal result response outranks stream deltas')
+  assert.equal(parsed.usage.inputTokens, 12)
+  assert.equal(parsed.usage.outputTokens, 7)
+  assert.equal(parsed.usage.cacheReadTokens, 3)
+  assert.equal(parsed.usage.reasoningTokens, 50)
+  assert.equal(parsed.usage.reasoningReported, true)
+
+  const structured = parseAgyStream([
+    JSON.stringify({ event: 'step_update', step_update: { text_delta: '{"partial":true}' } }),
+    JSON.stringify({
+      event: 'result',
+      result: { status: 'SUCCESS', response: 'prose wrapper', structured_output: { success: true } }
+    })
+  ].join('\n'))
+  assert.equal(structured.text, '{"success":true}', 'structured_output outranks response and deltas')
+
+  const deltasOnly = parseAgyStream([
+    JSON.stringify({ event: 'step_update', step_update: { text_delta: 'stream only' } }),
+    JSON.stringify({ event: 'result', result: { status: 'SUCCESS' } })
+  ].join('\n'))
+  assert.equal(deltasOnly.text, 'stream only')
+
+  assert.equal(
+    parseAgyStream(JSON.stringify({ event: 'result', result: { status: 'ERROR' } })).error,
+    'unknown error'
+  )
+  assert.equal(
+    parseAgyStream(
+      JSON.stringify({ event: 'result', result: { status: 'ERROR', error: 'quota exceeded' } })
+    ).error,
+    'quota exceeded'
+  )
+})
+
+test('parseAgyStream distinguishes a genuine zero of thinking tokens from absence', () => {
+  const zero = parseAgyStream(
+    JSON.stringify({ event: 'step_update', step_update: { usage: { thinking_tokens: 0 } } })
+  )
+  assert.equal(zero.usage.reasoningReported, true)
+  assert.equal(zero.usage.reasoningTokens, 0)
+
+  const absent = parseAgyStream(
+    JSON.stringify({ event: 'step_update', step_update: { usage: { output_tokens: 2 } } })
+  )
+  assert.equal(absent.usage.reasoningReported, undefined)
+  assert.equal(absent.usage.reasoningTokens, undefined)
+
+  const malformed = parseAgyStream(
+    JSON.stringify({ event: 'step_update', step_update: { usage: { thinking_tokens: 'lots' } } })
+  )
+  assert.equal(malformed.usage.reasoningReported, true)
+  assert.equal(malformed.usage.reasoningTokens, undefined)
+
+  const junk = [
+    'null',
+    '[1,2]',
+    '"quoted string"',
+    '42',
+    'not json at all',
+    JSON.stringify({ event: null }),
+    JSON.stringify({ other: true })
+  ].join('\n')
+  const junkResult = parseAgyStream(junk)
+  assert.equal(junkResult.text, '')
+  assert.equal(junkResult.error, undefined)
+  assert.deepEqual(junkResult.usage, {})
+})
+
+test('extractStructuredJson prefers closed fences over unclosed tails and prose quotes', () => {
+  assert.deepEqual(extractStructuredJson('{"a":1}'), { a: 1 })
+  assert.deepEqual(extractStructuredJson('noise\n```json\n{"a":1}\n```\ntail'), { a: 1 })
+  assert.deepEqual(extractStructuredJson('```json{"glued":true}```'), { glued: true })
+  assert.deepEqual(
+    extractStructuredJson(
+      'example:\n```json as an inline quote\nthen real data\n```json\n{"a":1}\n```\n'
+    ),
+    { a: 1 },
+    'prose quoting a fence must not shadow a trailing closed block'
+  )
+  assert.deepEqual(extractStructuredJson('```json\n{"open":1}'), { open: 1 })
+  assert.deepEqual(extractStructuredJson('prefix {"bare":true} suffix'), { bare: true })
+  assert.deepEqual(extractStructuredJson('```json\n{"nested":{"deep":2}}\n```'), { nested: { deep: 2 } })
+  assert.equal(
+    extractStructuredJson('```json\n{"a":1}\n```\n```json\n{"a":2}\n```'),
+    undefined,
+    'multiple valid closed fences are ambiguous'
+  )
+  assert.equal(extractStructuredJson('no json here'), undefined)
 })
