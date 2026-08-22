@@ -1,0 +1,103 @@
+# ==============================================================================
+# orca-no-mistakes Configuration Template
+# ==============================================================================
+# Location: ~/.config/orca-no-mistakes/config.yaml (User Global)
+#           .orca/no-mistakes.yaml (Repository Global)
+#
+# Note: The configuration uses strict schema validation (Zod). Any unrecognized
+# keys will cause the runner to fail closed.
+# ==============================================================================
+
+# Optional default task intent or objective statement
+# intent: "Ensure zero regressions and complete test coverage"
+
+# ------------------------------------------------------------------------------
+# Global Auto-Fix Settings
+# ------------------------------------------------------------------------------
+auto_fix:
+  # Master toggle for automatic repair attempts across stages (default: true)
+  enabled: true
+
+  # Maximum number of fix/retry rounds before requiring human intervention (default: 3)
+  max_rounds: 3
+
+  # Whether to allow auto-fixing during the review stage (default: false)
+  # Keeping this false prevents circular automated reviewer-fixer churn (ADR-0007).
+  allow_review_autofix: false
+
+# ------------------------------------------------------------------------------
+# Agent CLI Arguments & Environment Overrides
+# ------------------------------------------------------------------------------
+# Custom flags or environment variables passed to specific agent harnesses.
+# agent_args_override:
+#   opencode:
+#     - "--agent"
+#     - "custom-reviewer"
+#   gemini:
+#     TEMPERATURE: "0.2"
+
+# ------------------------------------------------------------------------------
+# Global Defaults
+# ------------------------------------------------------------------------------
+# These settings apply to all pipeline stages unless overridden.
+defaults:
+  # Default agent harness. Can be:
+  # 1. Shorthand string: "claude", "opencode", "gemini"
+  # 2. Structured object: { harness: "claude", model: "claude-3-7-sonnet", effort: "high" }
+  # 3. Fallback chain array: ["claude", { harness: "opencode", model: "sonnet" }]
+  agent: "claude"
+
+  # Optional model override
+  # model: "claude-3-7-sonnet"
+
+  # Reasoning effort (e.g. "low", "medium", "high")
+  # effort: "high"
+
+  # Harness variant (optional)
+  # variant: "default"
+
+  # Execution timeout in milliseconds per stage (e.g. 120000 = 2 minutes)
+  # timeout_ms: 120000
+
+  # Role-specific default overrides across all stages
+  # reviewer:
+  #   agent: { harness: "opencode", model: "claude-3-7-sonnet" }
+  #   effort: "high"
+  #   timeout_ms: 180000
+
+  # fixer:
+  #   agent: "claude"
+  #   effort: "medium"
+  #   timeout_ms: 120000
+
+# ------------------------------------------------------------------------------
+# Stage-Specific Overrides
+# ------------------------------------------------------------------------------
+# Supported stages: intent, rebase, review, test, document, lint
+# stages:
+#   intent:
+#     agent: "claude"
+#     timeout_ms: 60000
+#
+#   rebase:
+#     timeout_ms: 60000
+#
+#   review:
+#     reviewer:
+#       effort: "high"
+#       timeout_ms: 240000
+#     fixer:
+#       effort: "high"
+#
+#   test:
+#     reviewer:
+#       timeout_ms: 300000
+#     fixer:
+#       timeout_ms: 180000
+#
+#   document:
+#     agent: "claude"
+#     effort: "medium"
+#
+#   lint:
+#     timeout_ms: 60000

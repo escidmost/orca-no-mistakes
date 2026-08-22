@@ -3,7 +3,7 @@
 - **Code reviews** Skip a separate `/code-review` but run `/ponytail-review` before making commits
 - **Push through no-mistakes.* When it's time to push, push through no-mistakes unless otherwise instructed. Don't push unless told to. If there's a current no-mistakes run, you can attach to it with `no-mistakes axi run`, with or without the original `--intent`. Do not poll with status/sleep loops or start another run. When starting a new run, use --intent like normal to start new runs.
 - **Post-merge cleanup** When the PR for a Linear issue is merged, remove any labels from the issue that indicate readiness or process (ready-for-\*, wayfinder:\*). Make sure that the PR begins with the Linear issue number ($TeamSlug-##: $title).
-
+- **Keep example config updated.** When new features are added that have config options, be sure to add them and their default values to templates/config.yaml
 
 ## No-mistakes findings 
 
