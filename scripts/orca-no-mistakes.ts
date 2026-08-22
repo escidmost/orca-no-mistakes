@@ -256,117 +256,117 @@ export async function runPipeline(
     throw error;
   }
 
-  await writeFile(
-    path.join(artifactsDir, "manifest.json"),
-    JSON.stringify(
-      {
-        base_ref: provenance.baseRef,
-        base_ref_sha: provenance.baseRefSha,
-        effective_policy_hash: provenance.effectivePolicyHash,
-        local_bypass: provenance.localBypass,
-        effective_config: repoPolicyConfig,
-        cli_overrides: options.cliFlags ?? {},
-        resolved_config: pipelineConfig,
-      },
-      null,
-      2,
-    ),
-  );
-
-  const submissionCommitOid = repo.head;
-  ledger.recordCheckpoint({
-    inputCommitOid: submissionCommitOid,
-    outputCommitOid: submissionCommitOid,
-    roundIndex: 0,
-    runId,
-    stageId: "intent",
-  });
   let retainedFixer: WorkerResult | undefined;
-  let attemptCounter = 0;
-  const stageEntries: StageEvidenceManifestEntry[] = [];
-  const latestEntryByStage = new Map<StageName, StageEvidenceManifestEntry>();
-
-  const recordStageEvidence = async (
-    stage: StageName,
-    round: number,
-    workerIdentity: string,
-    exitCode: number,
-    report: StageReport,
-  ): Promise<void> => {
-    const candidate = await git.head();
-    const logsDir = path.join(artifactsDir, "logs");
-    await mkdir(logsDir, { recursive: true });
-    const artifactPath = path.join(
-      logsDir,
-      `${stage}-r${round}-${attemptCounter++}.json`,
-    );
-    const logContent = capLog(
+  try {
+    await writeFile(
+      path.join(artifactsDir, "manifest.json"),
       JSON.stringify(
         {
-          exitCode,
-          findings: report.findings,
-          summary: report.summary,
-          tested: report.tested,
+          base_ref: provenance.baseRef,
+          base_ref_sha: provenance.baseRefSha,
+          effective_policy_hash: provenance.effectivePolicyHash,
+          local_bypass: provenance.localBypass,
+          effective_config: repoPolicyConfig,
+          cli_overrides: options.cliFlags ?? {},
+          resolved_config: pipelineConfig,
         },
         null,
         2,
       ),
     );
-    await writeFile(artifactPath, logContent);
-    const artifactSha256 = sha256(logContent);
-    const entry: StageEvidenceManifestEntry = {
-      stage,
-      round,
-      candidateCommitOid: candidate,
-      baseCommitOid,
-      workerIdentity,
-      exitCode,
-      artifactSha256,
-      evidenceSha256: evidenceSha256({
+
+    const submissionCommitOid = repo.head;
+    ledger.recordCheckpoint({
+      inputCommitOid: submissionCommitOid,
+      outputCommitOid: submissionCommitOid,
+      roundIndex: 0,
+      runId,
+      stageId: "intent",
+    });
+    let attemptCounter = 0;
+    const stageEntries: StageEvidenceManifestEntry[] = [];
+    const latestEntryByStage = new Map<StageName, StageEvidenceManifestEntry>();
+
+    const recordStageEvidence = async (
+      stage: StageName,
+      round: number,
+      workerIdentity: string,
+      exitCode: number,
+      report: StageReport,
+    ): Promise<void> => {
+      const candidate = await git.head();
+      const logsDir = path.join(artifactsDir, "logs");
+      await mkdir(logsDir, { recursive: true });
+      const artifactPath = path.join(
+        logsDir,
+        `${stage}-r${round}-${attemptCounter++}.json`,
+      );
+      const logContent = capLog(
+        JSON.stringify(
+          {
+            exitCode,
+            findings: report.findings,
+            summary: report.summary,
+            tested: report.tested,
+          },
+          null,
+          2,
+        ),
+      );
+      await writeFile(artifactPath, logContent);
+      const artifactSha256 = sha256(logContent);
+      const entry: StageEvidenceManifestEntry = {
+        stage,
+        round,
+        candidateCommitOid: candidate,
+        baseCommitOid,
+        workerIdentity,
+        exitCode,
         artifactSha256,
+        evidenceSha256: evidenceSha256({
+          artifactSha256,
+          baseCommitOid,
+          candidateCommitOid: candidate,
+          exitCode,
+          round,
+          stage,
+          summary: report.summary,
+          workerIdentity,
+        }),
+        summary: report.summary,
+      };
+      ledger.recordEvidence({
+        artifactPath,
         baseCommitOid,
         candidateCommitOid: candidate,
+        evidenceSha256: entry.evidenceSha256,
         exitCode,
-        round,
-        stage,
+        roundIndex: round,
+        runId,
+        stageId: stage,
         summary: report.summary,
         workerIdentity,
-      }),
-      summary: report.summary,
+      });
+      stageEntries.push(entry);
+      latestEntryByStage.set(stage, entry);
     };
-    ledger.recordEvidence({
-      artifactPath,
-      baseCommitOid,
-      candidateCommitOid: candidate,
-      evidenceSha256: entry.evidenceSha256,
-      exitCode,
-      roundIndex: round,
-      runId,
-      stageId: stage,
-      summary: report.summary,
-      workerIdentity,
-    });
-    stageEntries.push(entry);
-    latestEntryByStage.set(stage, entry);
-  };
 
-  const stageTasks = new Map<StageName, string>();
-  let previousTask: string | undefined;
+    const stageTasks = new Map<StageName, string>();
+    let previousTask: string | undefined;
 
-  for (const stage of PIPELINE_STEPS) {
-    const task = await orca.createTask(stageTaskSpec(stage, intent), {
-      deps: previousTask ? [previousTask] : [],
-    });
-    stageTasks.set(stage, task);
-    previousTask = task;
-  }
+    for (const stage of PIPELINE_STEPS) {
+      const task = await orca.createTask(stageTaskSpec(stage, intent), {
+        deps: previousTask ? [previousTask] : [],
+      });
+      stageTasks.set(stage, task);
+      previousTask = task;
+    }
 
-  await orca.setWorktreeStatus(
-    `${statusPrefix}no-mistakes started: intent`,
-    "in-progress",
-  );
+    await orca.setWorktreeStatus(
+      `${statusPrefix}no-mistakes started: intent`,
+      "in-progress",
+    );
 
-  try {
     for (const stage of PIPELINE_STEPS) {
       const taskId = stageTasks.get(stage)!;
       ledger.heartbeatLease(repo.root, repo.branch, runId);
@@ -1332,7 +1332,12 @@ async function command(
 }
 
 function unwrapJson<T>(stdout: string): T {
-  const parsed = JSON.parse(stdout) as { result?: T } | T;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch (error) {
+    throw new Error("command output was not valid JSON", { cause: error });
+  }
   return typeof parsed === "object" && parsed !== null && "result" in parsed
     ? (parsed as { result: T }).result
     : (parsed as T);
