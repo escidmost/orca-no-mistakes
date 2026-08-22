@@ -1808,30 +1808,48 @@ export class CliOrca implements OrcaOperations {
     terminalHandle: string,
     harness: string,
   ): Promise<void> {
+    const waitsForPrompt = harness.toLowerCase() === "agy";
     const ready = readinessMatcher(harness);
     const deadline = Date.now() + workerAgentReadyTimeoutMs();
     let consecutiveMatches = 0;
     for (;;) {
-      const shown = await this.#json<{
-        terminal: {
-          connected?: boolean;
-          preview?: string | null;
-          title?: string | null;
-        };
-      }>(["terminal", "show", "--terminal", terminalHandle, "--json"]);
-      const terminal = shown.terminal;
-      if (terminal.connected === false)
-        throw new Error("worker agent terminal disconnected during startup");
-      if (
-        ready({
-          preview: terminal.preview ?? null,
-          title: terminal.title ?? null,
-        })
-      ) {
-        consecutiveMatches += 1;
-        if (consecutiveMatches >= 2) return;
+      if (waitsForPrompt) {
+        const screen = await this.#json<{
+          terminal: { status?: string; tail?: string[] };
+        }>([
+          "terminal",
+          "read",
+          "--terminal",
+          terminalHandle,
+          "--screen",
+          "--json",
+        ]);
+        if (screen.terminal.status === "exited") {
+          throw new Error("worker agent terminal exited during startup");
+        }
+        if (screen.terminal.tail?.some((line) => line.trim() === ">")) return;
       } else {
-        consecutiveMatches = 0;
+        const shown = await this.#json<{
+          terminal: {
+            connected?: boolean;
+            preview?: string | null;
+            title?: string | null;
+          };
+        }>(["terminal", "show", "--terminal", terminalHandle, "--json"]);
+        const terminal = shown.terminal;
+        if (terminal.connected === false)
+          throw new Error("worker agent terminal disconnected during startup");
+        if (
+          ready({
+            preview: terminal.preview ?? null,
+            title: terminal.title ?? null,
+          })
+        ) {
+          consecutiveMatches += 1;
+          if (consecutiveMatches >= 2) return;
+        } else {
+          consecutiveMatches = 0;
+        }
       }
       if (Date.now() >= deadline) {
         throw new Error(`${harness} did not become ready before the timeout`);

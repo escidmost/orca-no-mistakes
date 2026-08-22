@@ -1223,6 +1223,9 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
   out({ accepted: true })
 } else if (args[0] === 'terminal' && args[1] === 'show') {
   out({ terminal: { connected: true, title: 'Antigravity', preview: 'ready' } })
+} else if (args[0] === 'terminal' && args[1] === 'read') {
+  const reads = fs.readFileSync(${JSON.stringify(callsPath)}, 'utf8').split('\\n').filter((line) => line.includes('"read"')).length
+  out({ terminal: { status: 'running', tail: reads >= 2 ? ['Antigravity CLI', '>'] : ['starting'] } })
 } else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
   out({ dispatch: { id: 'dispatch-agy', status: 'dispatched' }, injected: false, preamble: 'authenticated' })
 } else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
@@ -1258,6 +1261,11 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     );
     assert.equal(sends[0][sends[0].indexOf("--text") + 1], "'agy'");
     assert.equal(sends[1][sends[1].indexOf("--text") + 1], "authenticated");
+    assert.ok(
+      calls.filter(
+        (args) => args[0] === "terminal" && args[1] === "read",
+      ).length >= 2,
+    );
     assert.ok(!dispatch?.includes("--inject"));
     assert.ok(dispatch?.includes("--return-preamble"));
   } finally {
