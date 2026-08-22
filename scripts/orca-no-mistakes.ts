@@ -1285,7 +1285,7 @@ function fixerInstructions(stage: StageName): string {
 - Apply all the fixes you intend to make first; do not run any verification in between individual fixes.
 - After all fixes are applied, run one focused verification limited to the changed area (the specific package, file, or test you touched) at the end of the fix round to confirm the fixes hold.
 - Do NOT run the complete repository test suite or lint suite during this fix round.
-- Commit only your fixes on the current feature branch. Do not push, create a PR, or invoke no-mistakes/Orca pipeline controls.
+- Commit only your fixes in this worktree while staying detached at your pinned commit; never checkout or switch branches. Do not push, create a PR, or invoke no-mistakes/Orca pipeline controls.
 - The summary must be one concise sentence fragment suitable for a git commit subject under 10 words.`;
 
     case "test":
@@ -1297,7 +1297,7 @@ function fixerInstructions(stage: StageName): string {
 - Do NOT run linters, formatters, or static analysis tools.
 - Do NOT run the complete repository test suite. Local Test is targeted validation of the failure and the requested intent; remote CI owns broad regression.
 - Before finishing, remove any transient artifacts your testing created in the working tree (downloaded models, caches, build outputs, large binaries, or generated data directories) so they are not committed and pushed.
-- Commit only your fixes on the current feature branch. Do not push, create a PR, or invoke no-mistakes/Orca pipeline controls.
+- Commit only your fixes in this worktree while staying detached at your pinned commit; never checkout or switch branches. Do not push, create a PR, or invoke no-mistakes/Orca pipeline controls.
 - The summary must be one concise sentence fragment suitable for a git commit subject under 10 words.`;
 
     case "document":
@@ -1306,7 +1306,7 @@ function fixerInstructions(stage: StageName): string {
 - Remove stale duplicates or reduce them to a short pointer to the owner; do not synchronize full copies.
 - Only edit documentation files or doc comments. Do not change executable behavior or tests.
 - Re-read what you changed to verify it now reflects the code.
-- Commit only your fixes on the current feature branch. Do not push, create a PR, or invoke no-mistakes/Orca pipeline controls.
+- Commit only your fixes in this worktree while staying detached at your pinned commit; never checkout or switch branches. Do not push, create a PR, or invoke no-mistakes/Orca pipeline controls.
 - The summary must be one concise sentence fragment suitable for a git commit subject under 10 words.`;
 
     case "lint":
@@ -1315,7 +1315,7 @@ function fixerInstructions(stage: StageName): string {
 - Do not refactor beyond what is needed for that root-cause fix.
 - Do not run tests or broader behavioral validation.
 - Re-run the relevant lint or format commands before finishing to verify they pass.
-- Commit only your fixes on the current feature branch. Do not push, create a PR, or invoke no-mistakes/Orca pipeline controls.
+- Commit only your fixes in this worktree while staying detached at your pinned commit; never checkout or switch branches. Do not push, create a PR, or invoke no-mistakes/Orca pipeline controls.
 - The summary must be one concise sentence fragment suitable for a git commit subject under 10 words.`;
 
     case "rebase":
@@ -1326,14 +1326,14 @@ function fixerInstructions(stage: StageName): string {
 - Preserve the intent of both the current branch changes and the upstream changes.
 - Do not modify any files that don't have conflicts.
 - Verify the rebase resolution completes cleanly.
-- Commit only your fixes on the current feature branch. Do not push, create a PR, or invoke no-mistakes/Orca pipeline controls.
+- Commit only your fixes in this worktree while staying detached at your pinned commit; never checkout or switch branches. Do not push, create a PR, or invoke no-mistakes/Orca pipeline controls.
 - The summary must be one concise sentence fragment suitable for a git commit subject under 10 words.`;
 
     default:
       return `Rules:
 - Fix all listed findings without changing unrelated behavior.
 - Run one focused verification after all edits.
-- Commit only your fixes on the current feature branch. Do not push, create a PR, run the whole repository suite, or invoke no-mistakes/Orca pipeline controls.
+- Commit only your fixes in this worktree while staying detached at your pinned commit; never checkout or switch branches. Do not push, create a PR, run the whole repository suite, or invoke no-mistakes/Orca pipeline controls.
 - The summary must be one concise sentence fragment suitable for a git commit subject under 10 words.`;
   }
 }
@@ -3106,7 +3106,7 @@ export class GitShell implements GitOperations {
     );
     if (result.failed) {
       throw new Error(
-        `could not compute the branch diff against ${base}: ${result.output}`,
+        `could not compute the branch diff against ${base} (exit ${result.code}): ${result.output}`,
       );
     }
     return result.stdout;

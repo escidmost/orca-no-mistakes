@@ -115,9 +115,8 @@ class FakeGit implements GitOperations {
   }
 
   async showFile(ref: string, filePath: string): Promise<string | undefined> {
-    const stored = this.baseFiles.get(`${ref}:${filePath}`);
-    if (stored !== undefined || this.baseFiles.has(`${ref}:${filePath}`)) {
-      return stored;
+    if (this.baseFiles.has(`${ref}:${filePath}`)) {
+      return this.baseFiles.get(`${ref}:${filePath}`);
     }
     if (
       filePath === "AGENTS.md" &&
@@ -1417,14 +1416,13 @@ test("CliOrca detaches new-child reviewer worktrees at the pinned commit", async
   const workerPath = path.join(temp, "worker-wt");
   const fakeOrca = path.join(temp, "orca");
   const callsPath = path.join(temp, "calls.jsonl");
-  const evidence = path.join(
-    homedir(),
-    ".orca-no-mistakes",
-    "artifacts",
-    "adapter-detach-child",
-  );
+  const runId = `adapter-detach-${randomUUID().slice(0, 8)}`;
+  const noMistakesHome = path.join(temp, "home");
+  const evidence = path.join(noMistakesHome, "artifacts", runId);
   const reportPath = path.join(evidence, "review.json");
+  const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
   try {
+    process.env.ORCA_NO_MISTAKES_HOME = noMistakesHome;
     git(temp, "init", "-b", "feature");
     git(temp, "config", "user.email", "test@example.com");
     git(temp, "config", "user.name", "test");
@@ -1446,7 +1444,7 @@ const args = process.argv.slice(2)
 fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
 const out = (result) => console.log(JSON.stringify({ result }))
 if (args[0] === 'orchestration' && args[1] === 'run-create') {
-  out({ run: { id: 'adapter-detach-child' } })
+  out({ run: { id: ${JSON.stringify(runId)} } })
 } else if (args[0] === 'worktree' && args[1] === 'create') {
   const workerPath = ${JSON.stringify(workerPath)}
   fs.mkdirSync(workerPath, { recursive: true })
@@ -1493,7 +1491,17 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       detached = true;
     }
     assert.ok(detached, "worker worktree HEAD must not track a branch");
+    assert.equal(
+      await readFile(path.join(workerPath, "file.txt"), "utf8"),
+      "one\n",
+      "worker worktree contents must match the pinned commit",
+    );
   } finally {
+    if (previousHome === undefined) {
+      delete process.env.ORCA_NO_MISTAKES_HOME;
+    } else {
+      process.env.ORCA_NO_MISTAKES_HOME = previousHome;
+    }
     await rm(temp, { recursive: true, force: true });
     await rm(evidence, { recursive: true, force: true });
   }
@@ -3214,6 +3222,11 @@ test("reviewer fallback attempts are recorded in stage evidence with resolved_ag
   assert.equal(
     reviewLog.fallbackAttempts?.[0].failureClass,
     "readiness-timeout",
+||||||| parent of 2ede919 (ONM-18: review follow-ups for untrusted branch framing)
+  assert.throws(
+    () =>
+      launchAgent({ auto_fix: autoFix, agent: ["opencode", "grok"] as never }),
+    /agent fallback chains arrive in ONM-39/,
   );
 });
 
@@ -3224,7 +3237,7 @@ test("acp reviewers receive a prompt that replaces the worker_done delivery cont
   await runPipeline(
     {
       intent: "Adapt delivery for acp targets.",
-      cliFlags: { reviewer: { agent: "acp:gemini-dev" } } as never,
+      cliFlags: { reviewer: { agent: "acp:gemini-dev" } },
     },
     orca,
     git,
