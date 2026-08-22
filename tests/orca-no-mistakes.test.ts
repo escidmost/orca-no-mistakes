@@ -40,6 +40,7 @@ import {
   type WorkerResult,
 } from "../scripts/orca-no-mistakes.ts";
 import { buildCliCommand } from "../scripts/adapters.ts";
+import { loadUserConfig } from "../scripts/config.ts";
 import { effectivePolicyHash } from "../scripts/policy.ts";
 
 const pass = (summary = "passed"): StageReport => ({ findings: [], summary });
@@ -56,6 +57,13 @@ class FakeGit implements GitOperations {
   divergeAfterAnchor = false;
   rebaseConflict = false;
   #operatorDiverged = false;
+  readonly #branch: string;
+  readonly #root: string;
+
+  constructor(root = "/repo", branch = "feature") {
+    this.#root = root;
+    this.#branch = branch;
+  }
 
   async assertReady(): Promise<{
     base: string;
@@ -68,9 +76,9 @@ class FakeGit implements GitOperations {
     return {
       base: "main",
       baseOid: this.#baseOid,
-      branch: "feature",
+      branch: this.#branch,
       head: this.#head,
-      root: "/repo",
+      root: this.#root,
     };
   }
 
@@ -131,6 +139,16 @@ class FakeGit implements GitOperations {
     if ((this.#operatorDiverged ? FakeGit.#oid(9_999) : this.#head) !== fromOid)
       return false;
     this.#head = toOid;
+    return true;
+  }
+
+  async applyWorktreeCommits(
+    sourcePath: string,
+    expectedHead: string,
+  ): Promise<boolean> {
+    this.calls.push(`apply:${sourcePath}:${expectedHead}`);
+    if (this.#head !== expectedHead) return false;
+    this.advanceHead();
     return true;
   }
 
@@ -198,10 +216,7 @@ class FakeOrca implements OrcaOperations {
     const reports = this.reports.get(stage) ?? [pass(stage)];
     const report = reports.shift() ?? pass(stage);
     this.reports.set(stage, reports);
-    if (launch.role === "fixer") {
-      this.fixerDispatches.push(dispatchId);
-      this.#git.advanceHead();
-    }
+    if (launch.role === "fixer") this.fixerDispatches.push(dispatchId);
     return {
       deliveryId: `delivery-${dispatchId}`,
       dispatchId,
@@ -211,6 +226,8 @@ class FakeOrca implements OrcaOperations {
         launch.role === "fixer" ? "term-fixer" : `term-${dispatchId}`,
       worktreeId:
         launch.worktree === "new-child" ? `repo::/${dispatchId}` : undefined,
+      worktreePath:
+        launch.worktree === "new-child" ? `/worktrees/${dispatchId}` : undefined,
     };
   }
 
@@ -320,21 +337,17 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
     (launch) => launch.role === "fixer",
   );
   assert.equal(fixerLaunches.length, 2);
-  assert.equal(fixerLaunches[0].worktree, "current");
-  assert.equal(fixerLaunches[1].terminal, "term-fixer");
+  assert.ok(fixerLaunches.every((launch) => launch.worktree === "new-child"));
+  assert.ok(fixerLaunches.every((launch) => launch.terminal === undefined));
   assert.ok(
-    orca.fixerDispatches.every(
-      (dispatchId) =>
-        orca.calls.includes(`retain:${dispatchId}`) ||
-        orca.calls.includes(`release:${dispatchId}`),
+    orca.fixerDispatches.every((dispatchId) =>
+      orca.calls.includes(`release:${dispatchId}`),
     ),
-    "every fixer dispatch is retained or eventually released",
+    "every fixer dispatch is released",
   );
-  assert.ok(
-    orca.calls.includes(
-      `release:${orca.fixerDispatches[orca.fixerDispatches.length - 1]}`,
-    ),
-    "the final retained fixer dispatch is released",
+  assert.equal(
+    git.calls.filter((call) => call.startsWith("apply:/worktrees/")).length,
+    2,
   );
   assert.ok(
     orca.calls.some(
@@ -433,6 +446,30 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
     orca.calls.at(-1),
     `status:completed:no-mistakes passed all ${PIPELINE_STEPS.length} stages`,
   );
+});
+
+test("a passing gate transfers final custody to the unchanged initiating worktree", async () => {
+  const gateGit = new FakeGit("/gate", "no-mistakes-gate-test");
+  const deliveryGit = new FakeGit("/origin", "feature");
+  const orca = new FakeOrca(gateGit);
+  const ledger = new DomainLedger(":memory:");
+
+  const result = await runPipeline(
+    {
+      deliveryGit,
+      intent: "Validate in an isolated gate before updating the feature branch.",
+    },
+    orca,
+    gateGit,
+    ledger,
+  );
+
+  assert.ok(
+    deliveryGit.calls.some((call) => call.startsWith("apply:/gate:")),
+  );
+  assert.ok(deliveryGit.calls.some((call) => call.startsWith("recover:")));
+  assert.ok(!gateGit.calls.some((call) => call.startsWith("recover:")));
+  assert.match(result.custodyNote ?? "", /advanced branch feature/);
 });
 
 test("opens an exhaustion gate when automatic fix limit is reached and stops on stop decision", async () => {
@@ -705,10 +742,11 @@ test("CLI accepts equals syntax and preserves negative numeric values", async ()
   }
 });
 
-test("run starts an attached coordinator in a dedicated Orca terminal", async () => {
+test("run starts its coordinator in a child gate worktree", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-detached-run-"));
   const origin = path.join(temp, "origin.git");
   const repo = path.join(temp, "repo");
+  const gate = path.join(temp, "gate");
   const fakeOrca = path.join(temp, "orca");
   const callsPath = path.join(temp, "calls.jsonl");
   const previousCommand = process.env.ORCA_CLI_COMMAND;
@@ -725,6 +763,7 @@ test("run starts an attached coordinator in a dedicated Orca terminal", async ()
     git(repo, "push", "-u", "origin", "main");
     git(temp, `--git-dir=${origin}`, "symbolic-ref", "HEAD", "refs/heads/main");
     git(repo, "checkout", "-b", "feature");
+    await mkdir(gate);
 
     await writeFile(
       fakeOrca,
@@ -732,11 +771,13 @@ test("run starts an attached coordinator in a dedicated Orca terminal", async ()
 import fs from 'node:fs'
 const args = process.argv.slice(2)
 fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
-const result = args[0] === 'terminal' && args[1] === 'create'
-  ? { terminal: { handle: 'detached-coordinator' } }
-  : args[0] === 'terminal' && args[1] === 'show'
-    ? { terminal: { connected: true, preview: 'ready shell prompt' } }
-    : { accepted: true }
+const result = args[0] === 'worktree' && args[1] === 'create'
+  ? { worktree: { id: 'gate-id', path: ${JSON.stringify(gate)}, branch: 'refs/heads/no-mistakes-gate-test' } }
+  : args[0] === 'terminal' && args[1] === 'create'
+    ? { terminal: { handle: 'detached-coordinator' } }
+    : args[0] === 'terminal' && args[1] === 'show'
+      ? { terminal: { connected: true, preview: 'ready shell prompt' } }
+      : { accepted: true }
 console.log(JSON.stringify({ result }))
 `,
     );
@@ -758,19 +799,36 @@ console.log(JSON.stringify({ result }))
     const terminalCreate = calls.find(
       (args) => args[0] === "terminal" && args[1] === "create",
     );
+    const worktreeCreate = calls.find(
+      (args) => args[0] === "worktree" && args[1] === "create",
+    );
     const terminalSend = calls.find(
       (args) => args[0] === "terminal" && args[1] === "send",
     );
     const commandText =
       terminalSend?.[terminalSend.indexOf("--text") + 1] ?? "";
-    const worktree = terminalCreate?.[
+    const canonicalRepo = await realpath(repo);
+    const coordinatorWorktree = terminalCreate?.[
       terminalCreate.indexOf("--worktree") + 1
     ]?.replace(/^path:/, "");
+    assert.equal(coordinatorWorktree, gate);
     assert.equal(
-      worktree ? await realpath(worktree) : "",
-      await realpath(repo),
+      worktreeCreate?.[worktreeCreate.indexOf("--parent-worktree") + 1],
+      `path:${canonicalRepo}`,
     );
+    assert.equal(
+      worktreeCreate?.[worktreeCreate.indexOf("--base-branch") + 1],
+      "feature",
+    );
+    assert.ok(!worktreeCreate?.includes("--repo"));
     assert.ok(commandText.includes("'--attached'"));
+    assert.ok(commandText.includes(`'--repo' '${gate}'`));
+    assert.ok(
+      commandText.includes(`NO_MISTAKES_ORIGIN_WORKTREE='${canonicalRepo}'`),
+    );
+    assert.ok(
+      commandText.includes("NO_MISTAKES_DELIVERY_BRANCH='feature'"),
+    );
     assert.ok(commandText.includes("'--notify' 'originating-opencode'"));
     assert.ok(
       commandText.includes("'--intent' 'Validate detached coordination.'"),
@@ -1135,6 +1193,79 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
   }
 });
 
+test("CliOrca delivers agy preambles directly after dispatch", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-agy-cli-"));
+  const fakeOrca = path.join(temp, "orca");
+  const callsPath = path.join(temp, "calls.jsonl");
+  const evidence = path.join(
+    homedir(),
+    ".orca-no-mistakes",
+    "artifacts",
+    "adapter-agy",
+  );
+  const reportPath = path.join(evidence, "review.json");
+  try {
+    git(temp, "init", "-b", "feature");
+    await mkdir(evidence, { recursive: true });
+    await writeFile(reportPath, JSON.stringify(pass("reviewed")));
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+const out = (result) => console.log(JSON.stringify({ result }))
+if (args[0] === 'orchestration' && args[1] === 'run-create') {
+  out({ run: { id: 'adapter-agy' } })
+} else if (args[0] === 'terminal' && args[1] === 'create') {
+  out({ terminal: { handle: 'agy-shell' } })
+} else if (args[0] === 'terminal' && args[1] === 'send') {
+  out({ accepted: true })
+} else if (args[0] === 'terminal' && args[1] === 'show') {
+  out({ terminal: { connected: true, title: 'Antigravity', preview: 'ready' } })
+} else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
+  out({ dispatch: { id: 'dispatch-agy', status: 'dispatched' }, injected: false, preamble: 'authenticated' })
+} else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
+  out({ deliveryId: 'delivery-agy', messages: [{ type: 'worker_done', body: 'Reviewed.', payload: JSON.stringify({ taskId: 'task-review', dispatchId: 'dispatch-agy', outcome: 'succeeded', reportPath: ${JSON.stringify(reportPath)} }) }] })
+} else {
+  out({ ok: true })
+}
+`,
+    );
+    await chmod(fakeOrca, 0o755);
+    const orca = new CliOrca({ command: fakeOrca, cwd: temp });
+    await orca.createRun("agy adapter test");
+
+    const worker = await orca.startWorker("task-review", {
+      agent: { harness: "agy" },
+      name: "agy-reviewer",
+      prompt: "review",
+      role: "reviewer",
+      stage: "review",
+      worktree: "current",
+    });
+    await orca.finishWorker(worker, "release");
+
+    const calls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    const sends = calls.filter(
+      (args) => args[0] === "terminal" && args[1] === "send",
+    );
+    const dispatch = calls.find(
+      (args) => args[0] === "orchestration" && args[1] === "dispatch",
+    );
+    assert.equal(sends[0][sends[0].indexOf("--text") + 1], "'agy'");
+    assert.equal(sends[1][sends[1].indexOf("--text") + 1], "authenticated");
+    assert.ok(!dispatch?.includes("--inject"));
+    assert.ok(dispatch?.includes("--return-preamble"));
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+    await rm(evidence, { recursive: true, force: true });
+  }
+});
+
 test("GitShell rebases a clean feature branch, hashes trusted policy, and returns custody", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-git-"));
   const origin = path.join(temp, "origin.git");
@@ -1177,6 +1308,34 @@ test("GitShell rebases a clean feature branch, hashes trusted policy, and return
       git(repo, "rev-parse", "refs/no-mistakes/recover/run-custody"),
       head,
     );
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("GitShell safely transfers rewritten gate history to an unchanged checkout", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-git-custody-"));
+  const repo = path.join(temp, "repo");
+  const gate = path.join(temp, "gate");
+  try {
+    git(temp, "init", repo);
+    git(repo, "config", "user.email", "test@example.com");
+    git(repo, "config", "user.name", "Test User");
+    git(repo, "checkout", "-b", "feature");
+    await writeFile(path.join(repo, "feature.txt"), "before\n");
+    git(repo, "add", "feature.txt");
+    git(repo, "commit", "-m", "feature");
+    const submission = git(repo, "rev-parse", "HEAD");
+    git(repo, "worktree", "add", "-b", "gate", gate, "feature");
+    await writeFile(path.join(gate, "feature.txt"), "after\n");
+    git(gate, "add", "feature.txt");
+    git(gate, "commit", "--amend", "--no-edit");
+    const terminal = git(gate, "rev-parse", "HEAD");
+
+    const shell = new GitShell({ repo });
+    assert.equal(await shell.applyWorktreeCommits(gate, submission), true);
+    assert.equal(git(repo, "rev-parse", "HEAD"), terminal);
+    assert.equal(await readFile(path.join(repo, "feature.txt"), "utf8"), "after\n");
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
@@ -1567,6 +1726,41 @@ test("runPipeline extracts the trusted base policy and binds it into run evidenc
   );
 });
 
+test("runPipeline applies the user-global default agent", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "user-config-run-"));
+  const configPath = path.join(temp, "config.yaml");
+  const previousConfig = process.env.ORCA_NO_MISTAKES_USER_CONFIG;
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  try {
+    await writeFile(configPath, "defaults:\n  agent: agy\n");
+    process.env.ORCA_NO_MISTAKES_USER_CONFIG = configPath;
+
+    const result = await runPipeline(
+      {
+        intent: "Use the configured worker harness.",
+        userGlobalConfig: loadUserConfig(),
+      },
+      orca,
+      git,
+    );
+
+    assert.ok(orca.launches.length > 0);
+    assert.ok(
+      orca.launches.every((launch) => launch.agent?.harness === "agy"),
+    );
+    await rm(
+      path.join(homedir(), ".orca-no-mistakes", "artifacts", result.runId),
+      { recursive: true, force: true },
+    );
+  } finally {
+    if (previousConfig === undefined)
+      delete process.env.ORCA_NO_MISTAKES_USER_CONFIG;
+    else process.env.ORCA_NO_MISTAKES_USER_CONFIG = previousConfig;
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test("local config bypass taints the run as uncertified", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "policy-bypass-run-"));
   const git = new FakeGit();
@@ -1650,7 +1844,7 @@ const out = (result) => console.log(JSON.stringify({ result }))
 if (args[0] === 'orchestration' && args[1] === 'run-create') {
   out({ run: { id: 'native-run' } })
 } else if (args[0] === 'orchestration' && args[1] === 'worker-start') {
-  out({ terminal: { handle: 'native-worker' }, worktree: { id: 'wt-native' } })
+  out({ terminal: { handle: 'native-worker' }, worktree: { id: 'wt-native', path: '/worktrees/native' } })
 } else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
   out({ dispatch: { id: 'dispatch-nat', status: 'dispatched' }, injected: true, preamble: 'authenticated' })
 } else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
@@ -1675,6 +1869,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
 
     assert.equal(worker.terminalHandle, "native-worker");
     assert.equal(worker.worktreeId, "wt-native");
+    assert.equal(worker.worktreePath, "/worktrees/native");
     const calls = (await readFile(callsPath, "utf8"))
       .trim()
       .split("\n")

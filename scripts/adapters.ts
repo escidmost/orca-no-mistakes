@@ -106,6 +106,10 @@ export function readinessMatcher(
       (title === 'OpenCode' || title?.startsWith('OC |') === true) &&
       !(preview ?? '').includes(INTERRUPT_MARKER)
   }
+  if (harness === 'agy') {
+    return ({ preview, title }) =>
+      /agy|antigravity/i.test(title ?? '') && !(preview ?? '').includes(INTERRUPT_MARKER)
+  }
   const pattern = new RegExp(`\\b${harness.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i')
   return ({ preview, title }) => pattern.test(title ?? '') && !(preview ?? '').includes(INTERRUPT_MARKER)
 }

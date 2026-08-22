@@ -422,6 +422,11 @@ export function defaultUserConfigPath(): string {
   return path.join(defaultUserConfigDir(), 'config.yaml')
 }
 
+export function loadUserConfig(configPath = defaultUserConfigPath()): OrcaNoMistakesConfig {
+  if (!fs.existsSync(configPath)) return {}
+  return parseConfigYaml(fs.readFileSync(configPath, 'utf8'))
+}
+
 export interface InstallConfigOptions {
   destinationPath?: string
   force?: boolean
@@ -459,4 +464,3 @@ export function installDefaultUserConfig(options: InstallConfigOptions = {}): In
     reason: exists ? 'overwritten' : 'created'
   }
 }
-

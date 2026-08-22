@@ -30,10 +30,12 @@ import {
 } from "./adapters.ts";
 import {
   PIPELINE_STEPS,
+  loadUserConfig,
   normalizeAgentSpec,
   resolvePipelineConfig,
   type AgentArgsOverride,
   type CliFlags,
+  type OrcaNoMistakesConfig,
   type ResolvedRoleConfig,
   type StageName,
 } from "./config.ts";
@@ -105,6 +107,7 @@ export type WorkerResult = {
   taskId: string;
   terminalHandle?: string;
   worktreeId?: string;
+  worktreePath?: string;
 };
 
 export interface OrcaOperations {
@@ -148,6 +151,10 @@ export interface GitOperations {
   policySha256(base: string): Promise<string>;
   resolveBaseOid(base: string): Promise<string>;
   advanceIfUnchanged(fromOid: string, toOid: string): Promise<boolean>;
+  applyWorktreeCommits(
+    sourcePath: string,
+    expectedHead: string,
+  ): Promise<boolean>;
   anchorRecoveryRef(runId: string, oid: string): Promise<void>;
 }
 
@@ -155,9 +162,12 @@ export type PipelineOptions = {
   allowLocalConfig?: boolean;
   cliFlags?: CliFlags;
   configPath?: string;
+  deliveryBranch?: string;
+  deliveryGit?: GitOperations;
   forceLease?: boolean;
   intent: string;
   maxFixRounds?: number;
+  userGlobalConfig?: OrcaNoMistakesConfig;
 };
 
 export type PipelineResult = {
@@ -201,6 +211,18 @@ export async function runPipeline(
   }
 
   const repo = await git.assertReady();
+  const deliveryGit = options.deliveryGit ?? git;
+  const deliveryRepo =
+    deliveryGit === git ? repo : await deliveryGit.assertReady();
+  if (deliveryGit !== git && deliveryRepo.head !== repo.head) {
+    throw new Error("gate worktree is not based on the initiating checkout");
+  }
+  if (
+    options.deliveryBranch &&
+    deliveryRepo.branch !== options.deliveryBranch
+  ) {
+    throw new Error("initiating checkout changed branches during gate startup");
+  }
   // Resolve policy and pipeline config before creating the Orca Run: a failure
   // here must not leave an open run behind.
   const { config: repoPolicyConfig, provenance } = await resolveRunPolicy({
@@ -213,6 +235,7 @@ export async function runPipeline(
   const pipelineConfig = resolvePipelineConfig({
     cliFlags: options.cliFlags,
     repoGlobalConfig: repoPolicyConfig,
+    userGlobalConfig: options.userGlobalConfig,
   });
   const statusPrefix = provenance.localBypass
     ? "[uncertified: local config bypass] "
@@ -236,19 +259,19 @@ export async function runPipeline(
 
   let baseCommitOid = repo.baseOid;
   ledger.startRun({
-    baseBranch: repo.base,
-    branch: repo.branch,
+    baseBranch: deliveryRepo.base,
+    branch: deliveryRepo.branch,
     intent,
     policySha256: policySha256Value,
-    repoRoot: repo.root,
+    repoRoot: deliveryRepo.root,
     runId,
-    submissionCommitOid: repo.head,
+    submissionCommitOid: deliveryRepo.head,
   });
   try {
     ledger.acquireLease({
-      branch: repo.branch,
+      branch: deliveryRepo.branch,
       force: options.forceLease === true,
-      repoRoot: repo.root,
+      repoRoot: deliveryRepo.root,
       runId,
     });
   } catch (error) {
@@ -256,7 +279,6 @@ export async function runPipeline(
     throw error;
   }
 
-  let retainedFixer: WorkerResult | undefined;
   try {
     await writeFile(
       path.join(artifactsDir, "manifest.json"),
@@ -275,7 +297,7 @@ export async function runPipeline(
       ),
     );
 
-    const submissionCommitOid = repo.head;
+    const submissionCommitOid = deliveryRepo.head;
     ledger.recordCheckpoint({
       inputCommitOid: submissionCommitOid,
       outputCommitOid: submissionCommitOid,
@@ -369,7 +391,11 @@ export async function runPipeline(
 
     for (const stage of PIPELINE_STEPS) {
       const taskId = stageTasks.get(stage)!;
-      ledger.heartbeatLease(repo.root, repo.branch, runId);
+      ledger.heartbeatLease(
+        deliveryRepo.root,
+        deliveryRepo.branch,
+        runId,
+      );
       await orca.setWorktreeStatus(
         `${statusPrefix}no-mistakes ${stage} (${stageIndex(stage)}/${PIPELINE_STEPS.length})`,
         "in-progress",
@@ -475,7 +501,11 @@ export async function runPipeline(
         }
 
         round += 1;
-        ledger.heartbeatLease(repo.root, repo.branch, runId);
+        ledger.heartbeatLease(
+          deliveryRepo.root,
+          deliveryRepo.branch,
+          runId,
+        );
         const nextFixer = await runFixer(
           stage,
           round,
@@ -484,15 +514,10 @@ export async function runPipeline(
           targetFindings,
           guidance,
           path.join(artifactsDir, `fixer-${stage}-${round}.json`),
-          retainedFixer,
           pipelineConfig.stages[stage].fixer,
           orca,
           git,
         );
-        if (retainedFixer) {
-          await orca.finishWorker(retainedFixer, "retain");
-        }
-        retainedFixer = nextFixer.worker;
         ledger.recordCheckpoint({
           inputCommitOid: nextFixer.before,
           outputCommitOid: nextFixer.after,
@@ -506,24 +531,28 @@ export async function runPipeline(
       await orca.completeTask(taskId, report);
     }
 
-    if (retainedFixer) {
-      await orca.finishWorker(retainedFixer, "release");
-      retainedFixer = undefined;
-    }
     const terminalCommitOid = await git.head();
-    await git.anchorRecoveryRef(runId, terminalCommitOid);
-    const operatorHead = await git.head();
+    await deliveryGit.anchorRecoveryRef(runId, terminalCommitOid);
+    const operatorHead = await deliveryGit.head();
     let custodyNote: string;
-    if (operatorHead === terminalCommitOid) {
+    if (deliveryGit === git && operatorHead === terminalCommitOid) {
       custodyNote =
         operatorHead === submissionCommitOid
-          ? `branch ${repo.branch} already at submission commit ${submissionCommitOid}`
-          : `branch ${repo.branch} carries the terminal commit ${terminalCommitOid}`;
+          ? `branch ${deliveryRepo.branch} already at submission commit ${submissionCommitOid}`
+          : `branch ${deliveryRepo.branch} carries the terminal commit ${terminalCommitOid}`;
     } else if (
       operatorHead === submissionCommitOid &&
-      (await git.advanceIfUnchanged(submissionCommitOid, terminalCommitOid))
+      (deliveryGit === git
+        ? await deliveryGit.advanceIfUnchanged(
+            submissionCommitOid,
+            terminalCommitOid,
+          )
+        : await deliveryGit.applyWorktreeCommits(
+            repo.root,
+            submissionCommitOid,
+          ))
     ) {
-      custodyNote = `advanced branch ${repo.branch} from submission to terminal commit ${terminalCommitOid}`;
+      custodyNote = `advanced branch ${deliveryRepo.branch} from submission to terminal commit ${terminalCommitOid}`;
     } else {
       custodyNote = `operator checkout diverged from the pipeline head; terminal commit preserved at refs/no-mistakes/recover/${runId}`;
     }
@@ -552,9 +581,6 @@ export async function runPipeline(
       steps: PIPELINE_STEPS,
     };
   } catch (error) {
-    if (retainedFixer) {
-      await orca.finishWorker(retainedFixer, "release").catch(() => {});
-    }
     ledger.releaseLease(runId);
     ledger.finishRun(
       runId,
@@ -717,11 +743,10 @@ async function runFixer(
   findings: Finding[],
   guidance: string,
   reportPath: string,
-  retainedFixer: WorkerResult | undefined,
   role: ResolvedRoleConfig,
   orca: OrcaOperations,
   git: GitOperations,
-): Promise<{ after: string; before: string; worker: WorkerResult }> {
+): Promise<{ after: string; before: string }> {
   await git.assertClean();
   const before = await git.head();
   const agent = launchAgent(role);
@@ -745,21 +770,27 @@ async function runFixer(
     prompt,
     role: "fixer",
     stage,
-    terminal: retainedFixer?.terminalHandle,
-    worktree: "current",
+    worktree: "new-child",
   });
   try {
     await validateReport(worker.report, stage, path.dirname(reportPath));
+    if (!worker.worktreePath) {
+      throw new Error(`${stage} fixer did not return a worktree path`);
+    }
+    if (!(await git.applyWorktreeCommits(worker.worktreePath, before))) {
+      throw new Error(`${stage} fixer could not apply its committed change`);
+    }
     await git.assertClean();
     const after = await git.head();
     if (before === after) {
       throw new Error(`${stage} fixer did not commit a change`);
     }
-    await orca.finishWorker(worker, "retain");
-    return { after, before, worker };
-  } catch (error) {
+    return { after, before };
+  } finally {
     await orca.finishWorker(worker, "release").catch(() => {});
-    throw error;
+    if (worker.worktreeId) {
+      await orca.removeWorktree(worker.worktreeId).catch(() => {});
+    }
   }
 }
 
@@ -1362,6 +1393,7 @@ const NATIVE_WORKER_CREATE_SLACK_MS = 120_000;
 type PreparedWorker = {
   terminalHandle: string;
   worktreeId?: string;
+  worktreePath?: string;
 };
 
 type CliOrcaOptions = {
@@ -1425,13 +1457,14 @@ export class CliOrca implements OrcaOperations {
     if (launch.agent && classifyHarness(launch.agent.harness) === "acp") {
       return await this.#startAcpWorker(taskId, launch);
     }
-    // Start the agent first, then use dispatch injection so the preamble carries its capability.
+    // Start the agent first, then deliver the authenticated dispatch preamble.
     const prepared = launch.terminal
       ? undefined
       : await this.#prepareWorker(taskId, launch);
     const terminalHandle = prepared?.terminalHandle ?? launch.terminal;
     if (!terminalHandle)
       throw new Error("worker preparation returned no terminal handle");
+    const directPreamble = launch.agent?.harness.toLowerCase() === "agy";
     const args = [
       "orchestration",
       "dispatch",
@@ -1439,9 +1472,9 @@ export class CliOrca implements OrcaOperations {
       taskId,
       "--to",
       terminalHandle,
-      "--inject",
       "--return-preamble",
     ];
+    if (!directPreamble) args.push("--inject");
     if (this.#runId) args.push("--run", this.#runId);
     args.push("--json");
     let receipt: {
@@ -1460,7 +1493,12 @@ export class CliOrca implements OrcaOperations {
       throw error;
     }
     const dispatchId = receipt?.dispatch?.id;
-    if (!dispatchId || receipt.injected !== true || !receipt.preamble?.trim()) {
+    const preamble = receipt.preamble?.trim();
+    if (
+      !dispatchId ||
+      !preamble ||
+      (!directPreamble && receipt.injected !== true)
+    ) {
       if (dispatchId) {
         await this.#cleanupFailedWorker(
           dispatchId,
@@ -1472,7 +1510,29 @@ export class CliOrca implements OrcaOperations {
       }
       throw new Error("dispatch returned an invalid receipt");
     }
+    if (directPreamble) {
+      try {
+        await this.#json([
+          "terminal",
+          "send",
+          "--terminal",
+          terminalHandle,
+          "--text",
+          preamble,
+          "--enter",
+          "--json",
+        ]);
+      } catch (error) {
+        await this.#cleanupFailedWorker(
+          dispatchId,
+          terminalHandle,
+          prepared?.worktreeId,
+        );
+        throw error;
+      }
+    }
     const worktreeId = prepared?.worktreeId;
+    const worktreePath = prepared?.worktreePath;
     let deliveryId: string | undefined;
     try {
       const result = await this.#waitForWorker(
@@ -1489,6 +1549,7 @@ export class CliOrca implements OrcaOperations {
         dispatchId,
         terminalHandle,
         worktreeId,
+        worktreePath,
       };
     } catch (error) {
       await this.#cleanupFailedWorker(
@@ -1565,8 +1626,12 @@ export class CliOrca implements OrcaOperations {
         dispatch?: { terminalHandle?: string };
         residualResources?: unknown;
         terminal?: { handle?: string };
-        worktree?: { id?: string };
-        worker?: { terminalHandle?: string; worktreeId?: string };
+        worktree?: { id?: string; path?: string };
+        worker?: {
+          terminalHandle?: string;
+          worktreeId?: string;
+          worktreePath?: string;
+        };
       } = {};
       try {
         receipt = unwrapJson(started.stdout);
@@ -1579,6 +1644,8 @@ export class CliOrca implements OrcaOperations {
         receipt.dispatch?.terminalHandle ??
         "";
       worktreeId = receipt.worktree?.id ?? receipt.worker?.worktreeId;
+      const worktreePath =
+        receipt.worktree?.path ?? receipt.worker?.worktreePath;
       const reported = collectResidualResources(receipt.residualResources);
       residual.terminalHandles.push(...reported.terminalHandles);
       residual.worktreeIds.push(...reported.worktreeIds);
@@ -1594,7 +1661,7 @@ export class CliOrca implements OrcaOperations {
           `worker-start did not produce a ready ${agent.harness} worker: ${JSON.stringify(receipt).slice(0, 400)}`,
         );
       }
-      return { terminalHandle, worktreeId };
+      return { terminalHandle, worktreeId, worktreePath };
     } catch (error) {
       for (const handle of new Set(
         [terminalHandle, ...residual.terminalHandles].filter(Boolean),
@@ -1678,7 +1745,11 @@ export class CliOrca implements OrcaOperations {
         throw new Error("terminal create returned an invalid receipt");
 
       await this.#launchWorkerAgent(terminalHandle, launch);
-      return { terminalHandle, worktreeId: worktree.id };
+      return {
+        terminalHandle,
+        worktreeId: worktree.id,
+        worktreePath: worktree.path,
+      };
     } catch (error) {
       if (worktree)
         await this.#cleanupPreparedWorker({
@@ -1837,7 +1908,13 @@ export class CliOrca implements OrcaOperations {
       }
       if (!report)
         throw new Error(`acp target ${target} returned an invalid report`);
-      return { dispatchId: `acp-${randomUUID()}`, report, taskId, worktreeId };
+      return {
+        dispatchId: `acp-${randomUUID()}`,
+        report,
+        taskId,
+        worktreeId,
+        worktreePath: worktreeId ? cwd : undefined,
+      };
     } catch (error) {
       if (worktreeId)
         await this.#cleanupPreparedWorker({ terminalHandle: "", worktreeId });
@@ -2464,6 +2541,32 @@ export class GitShell implements GitOperations {
     return !merge.failed;
   }
 
+  async applyWorktreeCommits(
+    sourcePath: string,
+    expectedHead: string,
+  ): Promise<boolean> {
+    await this.assertClean();
+    if ((await this.head()) !== expectedHead) return false;
+    const sourceStatus = await this.#git(
+      ["-C", sourcePath, "status", "--porcelain"],
+      true,
+    );
+    if (sourceStatus.failed || sourceStatus.stdout.trim()) {
+      throw new Error("worker worktree must be clean before applying commits");
+    }
+    const sourceHead = (
+      await this.#git(["-C", sourcePath, "rev-parse", "HEAD"])
+    ).stdout.trim();
+    const appendOnly = await this.#git(
+      ["merge-base", "--is-ancestor", expectedHead, sourceHead],
+      true,
+    );
+    const applied = appendOnly.failed
+      ? await this.#git(["reset", "--keep", sourceHead], true)
+      : await this.#git(["merge", "--ff-only", sourceHead], true);
+    return !applied.failed;
+  }
+
   async anchorRecoveryRef(runId: string, oid: string): Promise<void> {
     if (!RUN_ID_PATTERN.test(runId)) {
       throw new Error("Orca returned an unsafe Run ID");
@@ -2642,33 +2745,89 @@ function stringFlag(flags: RawCliFlags, name: string): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
+type GateWorktree = { branch: string; id: string; path: string };
+
+async function removeGateWorktree(
+  gate: GateWorktree,
+  originWorktree: string,
+  orcaCommand: string,
+): Promise<void> {
+  await command(
+    orcaCommand,
+    ["worktree", "rm", "--worktree", `id:${gate.id}`, "--force", "--json"],
+    originWorktree,
+    { allowFailure: true },
+  );
+  await command(
+    "git",
+    ["-C", originWorktree, "branch", "-D", gate.branch],
+    originWorktree,
+    { allowFailure: true },
+  );
+}
+
 async function launchDetachedRun(
-  root: string,
+  repo: RepoSnapshot,
   flags: RawCliFlags,
 ): Promise<string> {
   const orcaCommand = resolveOrcaCommand();
-  const created = unwrapJson<{ terminal: { handle: string } }>(
+  const gateName = `no-mistakes-gate-${randomUUID().slice(0, 8)}`;
+  const gateReceipt = unwrapJson<{ worktree: GateWorktree }>(
     (
       await command(
         orcaCommand,
         [
-          "terminal",
+          "worktree",
           "create",
-          "--worktree",
-          `path:${root}`,
-          "--title",
-          "no-mistakes",
+          "--name",
+          gateName,
+          "--base-branch",
+          repo.branch,
+          "--parent-worktree",
+          `path:${repo.root}`,
+          "--setup",
+          "run",
           "--json",
         ],
-        root,
+        repo.root,
       )
     ).stdout,
   );
+  const gate = gateReceipt.worktree;
+  if (!gate?.id || !gate.path || !gate.branch) {
+    throw new Error("worktree create returned an invalid receipt");
+  }
+  gate.branch = gate.branch.replace(/^refs\/heads\//, "");
+  let created: { terminal: { handle: string } };
+  try {
+    created = unwrapJson(
+      (
+        await command(
+          orcaCommand,
+          [
+            "terminal",
+            "create",
+            "--worktree",
+            `path:${gate.path}`,
+            "--title",
+            "no-mistakes",
+            "--json",
+          ],
+          repo.root,
+        )
+      ).stdout,
+    );
+  } catch (error) {
+    await removeGateWorktree(gate, repo.root, orcaCommand);
+    throw error;
+  }
   const terminalHandle = created?.terminal?.handle;
-  if (!terminalHandle)
+  if (!terminalHandle) {
+    await removeGateWorktree(gate, repo.root, orcaCommand);
     throw new Error("terminal create returned an invalid receipt");
+  }
 
-  const attachedArgs = ["run", "--attached", "--repo", root];
+  const attachedArgs = ["run", "--attached", "--repo", gate.path];
   for (const name of COMMAND_FLAGS.run) {
     if (name === "attached" || name === "notify" || name === "repo") continue;
     if (BOOLEAN_FLAGS.has(name)) {
@@ -2688,9 +2847,18 @@ async function launchDetachedRun(
   ]
     .map(shellQuote)
     .join(" ");
-  const coordinatorCommand = process.env.ORCA_CLI_COMMAND
-    ? `ORCA_CLI_COMMAND=${shellQuote(process.env.ORCA_CLI_COMMAND)} ${quotedCommand}`
-    : quotedCommand;
+  const environment = [
+    `NO_MISTAKES_DELIVERY_BRANCH=${shellQuote(repo.branch)}`,
+    `NO_MISTAKES_GATE_BRANCH=${shellQuote(gate.branch)}`,
+    `NO_MISTAKES_GATE_WORKTREE_ID=${shellQuote(gate.id)}`,
+    `NO_MISTAKES_ORIGIN_WORKTREE=${shellQuote(repo.root)}`,
+  ];
+  if (process.env.ORCA_CLI_COMMAND) {
+    environment.push(
+      `ORCA_CLI_COMMAND=${shellQuote(process.env.ORCA_CLI_COMMAND)}`,
+    );
+  }
+  const coordinatorCommand = `${environment.join(" ")} ${quotedCommand}`;
 
   try {
     const deadline = Date.now() + 60_000;
@@ -2702,7 +2870,7 @@ async function launchDetachedRun(
           await command(
             orcaCommand,
             ["terminal", "show", "--terminal", terminalHandle, "--json"],
-            root,
+            repo.root,
           )
         ).stdout,
       );
@@ -2728,15 +2896,16 @@ async function launchDetachedRun(
         "--enter",
         "--json",
       ],
-      root,
+      repo.root,
     );
   } catch (error) {
     await command(
       orcaCommand,
       ["terminal", "close", "--terminal", terminalHandle, "--tab", "--json"],
-      root,
+      repo.root,
       { allowFailure: true },
     );
+    await removeGateWorktree(gate, repo.root, orcaCommand);
     throw error;
   }
   return terminalHandle;
@@ -2823,10 +2992,7 @@ Run options:
   });
   const repoState = await git.assertReady();
   if (parsed.flags.attached !== true) {
-    const terminalHandle = await launchDetachedRun(
-      repoState.root,
-      parsed.flags,
-    );
+    const terminalHandle = await launchDetachedRun(repoState, parsed.flags);
     console.log(JSON.stringify({ detached: true, terminalHandle }));
     return;
   }
@@ -2846,15 +3012,35 @@ Run options:
     notifyHandle: stringFlag(parsed.flags, "notify"),
   });
   const ledger = new DomainLedger();
+  const gate =
+    process.env.NO_MISTAKES_GATE_WORKTREE_ID &&
+    process.env.NO_MISTAKES_GATE_BRANCH &&
+    process.env.NO_MISTAKES_ORIGIN_WORKTREE
+      ? {
+          branch: process.env.NO_MISTAKES_GATE_BRANCH,
+          id: process.env.NO_MISTAKES_GATE_WORKTREE_ID,
+          path: repoState.root,
+        }
+      : undefined;
+  const deliveryGit = gate
+    ? new GitShell({
+        base: stringFlag(parsed.flags, "base"),
+        expectedHead: stringFlag(parsed.flags, "head"),
+        repo: process.env.NO_MISTAKES_ORIGIN_WORKTREE!,
+      })
+    : undefined;
   try {
     const result = await runPipeline(
       {
         allowLocalConfig: parsed.flags["allow-local-config"] === true,
         cliFlags,
         configPath: stringFlag(parsed.flags, "config"),
+        deliveryBranch: process.env.NO_MISTAKES_DELIVERY_BRANCH,
+        deliveryGit,
         forceLease: parsed.flags["force-lease"] === true,
         intent,
         maxFixRounds,
+        userGlobalConfig: loadUserConfig(),
       },
       orca,
       git,
@@ -2862,7 +3048,17 @@ Run options:
     );
     console.log(JSON.stringify(result));
   } finally {
-    ledger.close();
+    try {
+      ledger.close();
+    } finally {
+      if (gate) {
+        await removeGateWorktree(
+          gate,
+          process.env.NO_MISTAKES_ORIGIN_WORKTREE!,
+          resolveOrcaCommand(),
+        );
+      }
+    }
   }
 }
 
