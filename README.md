@@ -4,15 +4,13 @@ An Orca-native, six-stage local adversarial validation pipeline:
 
 `intent -> rebase -> review -> test -> document -> lint`
 
-Release 1 is deliberately local-only: it excludes remote `push`, `pr`, and `ci` stages and terminates with a signed-off **Passed Attestation** instead of a push.
-
-The runner creates an Orca Run, acquires an exclusive semantic lease on the branch in a SQLite domain ledger (`~/.orca-no-mistakes/ledger.db`), compiles its validation policy from the trusted base commit, and drives fresh reviewer workers over disposable child worktrees while one retained fixer terminal repairs the current worktree. Human decisions use Orca gates; every approval or skip is recorded as an audit row and bound into the final attestation. Stage evidence (reports, logs, exit codes, content hashes) lands under `~/.orca-no-mistakes/artifacts/<run-id>/`, outside the branch.
+The current runner creates an Orca Run, acquires an exclusive semantic lease on the branch in a SQLite domain ledger (`~/.orca-no-mistakes/ledger.db`), compiles its validation policy from the trusted base commit, and drives fresh reviewer workers over disposable child worktrees while one retained fixer terminal repairs the current worktree. The worker agent for each stage and role comes from the resolved validation policy configuration. Human decisions use Orca gates; every approval or skip is recorded as an audit row and bound into the final attestation. Stage evidence (reports, logs, exit codes, content hashes) lands under `~/.orca-no-mistakes/artifacts/<run-id>/`, outside the branch. Release 1 is deliberately local-only: it excludes remote `push`, `pr`, and `ci` stages and terminates with a signed-off **Passed Attestation** instead of a push.
 
 Successful completion means all six stages completed with a tamper-evident Merkle attestation binding stage evidence to the exact candidate commit, base commit, policy hash, and declared intent. Remote delivery verification, crash resumption, and forge adapters remain future releases. See [Current Architecture](docs/current-architecture.md) for implemented behavior and [the ADRs](docs/adr/) for accepted target decisions.
 
 ## Install
 
-Requires Node.js 24+, Git, a running Orca app, and authenticated `opencode` tooling.
+Requires Node.js 24+, Git, a running Orca app, and authenticated CLI tooling for the configured worker agents (`opencode` by default).
 
 ```bash
 npm install
@@ -41,9 +39,13 @@ Useful direct-run options:
 --reviewer-model <model>
 --fixer-model <model> --fixer-effort <level>
 --max-fix-rounds <count>
+--allow-local-config
+--config <path>
 ```
 
-Workers launch with the `opencode` agent on model `openai/gpt-5.6-luna` at max reasoning effort by default; the default maximum is three fix rounds. `ORCA_CLI_COMMAND` overrides the Orca executable.
+Validation policy comes from `.orca/no-mistakes.yaml` on the trusted base ref, not from the proposed branch; an absent file means built-in defaults. It selects the worker agent per stage and role across native (`claude`, `codex`, `cursor`), terminal (`opencode`, `grok`, `gemini`), and `acp:<target>` harnesses. `--allow-local-config` and `--config <path>` read policy locally instead and mark the run uncertified.
+
+Workers launch with the `opencode` agent on the agent's own default model by default; the default maximum is three fix rounds. `ORCA_CLI_COMMAND` overrides the Orca executable, and `WORKER_AGENT_READY_TIMEOUT_MS` overrides the 60-second agent-startup deadline.
 
 ## Attestations and retention
 
@@ -67,3 +69,5 @@ A direct `run` blocks until completion or failure and prints JSON containing the
 npm test
 npm run typecheck
 ```
+
+GitHub Actions runs both on every pull request and on pushes to `main`.

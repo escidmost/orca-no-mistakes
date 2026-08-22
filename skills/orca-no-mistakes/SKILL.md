@@ -19,7 +19,7 @@ If your assigned task explicitly says you are already a no-mistakes stage worker
 - Work is committed on a clean, named feature branch.
 - The branch is not the detected default branch.
 - The repository has an `origin` remote.
-- Orca is running and `opencode` tooling is authenticated.
+- Orca is running and CLI tooling for the configured worker agents (`opencode` by default) is authenticated.
 - No other run holds the branch semantic lease. A conflicting run fails closed with `branch <name> is already leased by run <id>`; reclaim it with `--force-lease` only after confirming the other run is dead.
 
 ## Invocation
@@ -48,6 +48,7 @@ orca orchestration gate-resolve --id <gate-id> --resolution <decision> --json
 Decisions are `approve`, `fix`, `skip`, and `stop`; anything else fails closed.
 
 A `fix` resolution supports targeted finding selection, per-finding instructions, and global guidance:
+
 - Plain text syntax: `--resolution "fix: id1, id2: guidance"` or `--resolution "fix [id1, id2] - guidance"`.
 - JSON syntax: `--resolution '{"action":"fix","findingIds":["id1"],"instructions":{"id1":"instruction"},"guidance":"global guidance"}'`.
 - Resolving with `fix` without IDs targets all actionable findings. Unselected findings are evaluated in subsequent re-review passes.
