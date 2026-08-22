@@ -124,6 +124,10 @@ export interface OrcaOperations {
     spec: string,
     options?: { deps?: string[]; parent?: string },
   ): Promise<string>;
+  // Implementations must synchronously settle every resource a failed launch
+  // created (close terminals, remove created worktrees, abandon dispatches)
+  // before rejecting, so the fallback chain can start the next candidate
+  // immediately after the rejection.
   startWorker(taskId: string, launch: WorkerLaunch): Promise<WorkerResult>;
   finishWorker(
     worker: WorkerResult,
@@ -2355,7 +2359,8 @@ export class CliOrca implements OrcaOperations {
         if (
           failureClass === "quota" ||
           failureClass === "auth" ||
-          failureClass === "binary-missing"
+          failureClass === "binary-missing" ||
+          failureClass === "readiness-timeout"
         ) {
           throw new PreflightError(failureClass, message);
         }

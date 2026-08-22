@@ -2412,6 +2412,34 @@ if (args[0] === 'worktree' && args[1] === 'create') {
       ),
       "a failed ACP run removes its child worktree",
     );
+
+    const stallingAcpx = path.join(temp, "acpx-readiness");
+    await writeFile(
+      stallingAcpx,
+      '#!/usr/bin/env node\nconsole.error("gemini did not become ready before the timeout")\nprocess.exit(7)\n',
+    );
+    await chmod(stallingAcpx, 0o755);
+    const stalling = new CliOrca({
+      acpxCommand: stallingAcpx,
+      command: fakeOrca,
+      cwd: temp,
+    });
+    await assert.rejects(
+      stalling.startWorker("task-acp", {
+        agent: { harness: "acp:gemini-dev" },
+        name: "acp-worker",
+        prompt: "Review now.",
+        role: "reviewer",
+        stage: "review",
+        worktree: "new-child",
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof PreflightError);
+        assert.equal(error.failureClass, "readiness-timeout");
+        assert.match(error.message, /acp target gemini-dev failed \(exit 7\)/);
+        return true;
+      },
+    );
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
@@ -2542,6 +2570,110 @@ if (args[0] === 'terminal' && args[1] === 'create') {
     if (previousTimeout === undefined)
       delete process.env.WORKER_AGENT_READY_TIMEOUT_MS;
     else process.env.WORKER_AGENT_READY_TIMEOUT_MS = previousTimeout;
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("fallback chains settle each failed candidate before the next launch", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-fallback-settle-"));
+  const fakeOrca = path.join(temp, "orca");
+  const callsPath = path.join(temp, "calls.jsonl");
+  const evidence = path.join(
+    homedir(),
+    ".orca-no-mistakes",
+    "artifacts",
+    "run-chain",
+  );
+  const reportPath = path.join(evidence, "review.json");
+  const previousTimeout = process.env.WORKER_AGENT_READY_TIMEOUT_MS;
+  process.env.WORKER_AGENT_READY_TIMEOUT_MS = "600";
+  try {
+    await mkdir(evidence, { recursive: true });
+    await writeFile(
+      reportPath,
+      JSON.stringify({ findings: [], summary: "second candidate done", tested: true }),
+    );
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+const out = (result) => console.log(JSON.stringify({ result }))
+if (args[0] === 'orchestration' && args[1] === 'run-create') {
+  out({ run: { id: 'run-chain' } })
+} else if (args[0] === 'terminal' && args[1] === 'create') {
+  const creates = fs.readFileSync(${JSON.stringify(callsPath)}, 'utf8').trim().split('\\n')
+    .filter((line) => { const a = JSON.parse(line); return a[0] === 'terminal' && a[1] === 'create' })
+  out({ terminal: { handle: creates.length === 1 ? 'stuck-terminal' : 'fresh-terminal' } })
+} else if (args[0] === 'orchestration' && args[1] === 'worker-start') {
+  out({ terminal: { handle: 'fresh-terminal' } })
+} else if (args[0] === 'terminal' && args[1] === 'show') {
+  if (args.includes('stuck-terminal')) {
+    out({ terminal: { connected: true, title: 'bash', preview: '' } })
+  } else {
+    out({ terminal: { connected: true, title: 'Claude CLI', preview: 'ready' } })
+  }
+} else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
+  out({ dispatch: { id: 'dispatch-claude', status: 'dispatched' }, injected: true, preamble: 'ok' })
+} else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
+  out({ deliveryId: 'delivery-claude', messages: [{ type: 'worker_done', body: 'Reviewed. Verified. Clear.', payload: JSON.stringify({ taskId: 'task-chain', dispatchId: 'dispatch-claude', outcome: 'succeeded', reportPath: ${JSON.stringify(reportPath)} }) }] })
+} else {
+  out({ ok: true })
+}
+`,
+    );
+    await chmod(fakeOrca, 0o755);
+    const roleConfig = { enabled: false, max_rounds: 0, allow_review_autofix: false };
+    const [grok, claude] = ["grok", "claude"].map(
+      (harness) => launchAgent({ auto_fix: roleConfig, agent: harness })![0],
+    );
+    const launches: WorkerLaunch[] = [
+      { agent: grok, name: "first", prompt: "instructions", role: "reviewer", stage: "lint", worktree: "current" },
+      { agent: claude, name: "second", prompt: "instructions", role: "reviewer", stage: "lint", worktree: "current" },
+    ];
+
+    const orca = new CliOrca({ command: fakeOrca, cwd: temp });
+    await orca.createRun("fallback chain settlement");
+    const outcome = await startWorkerWithFallback(orca, "task-chain", launches);
+
+    assert.equal(outcome.resolvedAgent, "claude");
+    assert.deepEqual(
+      outcome.attempts.map((attempt) => [attempt.agent, attempt.failureClass]),
+      [["grok", "readiness-timeout"]],
+    );
+
+    const calls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    const closeIndex = calls.findIndex(
+      (args) =>
+        args[0] === "terminal" &&
+        args[1] === "close" &&
+        args.includes("stuck-terminal"),
+    );
+    const createIndexes = calls
+      .map((args, index) =>
+        args[0] === "terminal" && args[1] === "create" ? index : -1,
+      )
+      .filter((index) => index >= 0);
+    assert.equal(createIndexes.length, 1);
+    const nextLaunchIndex = calls.findIndex(
+      (args) =>
+        args[0] === "orchestration" && args[1] === "worker-start",
+    );
+    assert.ok(nextLaunchIndex !== -1);
+    assert.ok(closeIndex !== -1);
+    assert.ok(
+      closeIndex < nextLaunchIndex,
+      "the failed candidate's terminal closes before the next candidate starts",
+    );
+  } finally {
+    if (previousTimeout === undefined)
+      delete process.env.WORKER_AGENT_READY_TIMEOUT_MS;
+    else process.env.WORKER_AGENT_READY_TIMEOUT_MS = previousTimeout;
+    await rm(evidence, { recursive: true, force: true });
     await rm(temp, { recursive: true, force: true });
   }
 });
