@@ -24,6 +24,7 @@ import {
   PIPELINE_STEPS,
   RecoveryAnchorError,
   launchAgent,
+  startWorkerWithFallback,
   buildAttestation,
   capLog,
   main,
@@ -41,7 +42,12 @@ import {
   type WorkerLaunch,
   type WorkerResult,
 } from "../scripts/orca-no-mistakes.ts";
-import { buildCliCommand } from "../scripts/adapters.ts";
+import {
+  PreflightError,
+  buildCliCommand,
+  classifyPreflightFailure,
+} from "../scripts/adapters.ts";
+import { artifactsRoot } from "../scripts/ledger.ts";
 import { loadUserConfig } from "../scripts/config.ts";
 import { effectivePolicyHash } from "../scripts/policy.ts";
 
@@ -180,6 +186,7 @@ class FakeOrca implements OrcaOperations {
   readonly completedStages: string[] = [];
   readonly removedWorktrees: string[] = [];
   readonly reports = new Map<string, StageReport[]>();
+  readonly launchFailures: Error[] = [];
   gateResolution = "approve";
   #taskNumber = 0;
   #dispatchNumber = 0;
@@ -215,6 +222,8 @@ class FakeOrca implements OrcaOperations {
     launch: WorkerLaunch,
   ): Promise<WorkerResult> {
     this.launches.push(launch);
+    const failure = this.launchFailures.shift();
+    if (failure) throw failure;
     const dispatchId = `dispatch-${++this.#dispatchNumber}`;
     const stage = launch.stage;
     const reports = this.reports.get(stage) ?? [pass(stage)];
@@ -2403,6 +2412,34 @@ if (args[0] === 'worktree' && args[1] === 'create') {
       ),
       "a failed ACP run removes its child worktree",
     );
+
+    const stallingAcpx = path.join(temp, "acpx-readiness");
+    await writeFile(
+      stallingAcpx,
+      '#!/usr/bin/env node\nconsole.error("gemini did not become ready before the timeout")\nprocess.exit(7)\n',
+    );
+    await chmod(stallingAcpx, 0o755);
+    const stalling = new CliOrca({
+      acpxCommand: stallingAcpx,
+      command: fakeOrca,
+      cwd: temp,
+    });
+    await assert.rejects(
+      stalling.startWorker("task-acp", {
+        agent: { harness: "acp:gemini-dev" },
+        name: "acp-worker",
+        prompt: "Review now.",
+        role: "reviewer",
+        stage: "review",
+        worktree: "new-child",
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof PreflightError);
+        assert.equal(error.failureClass, "readiness-timeout");
+        assert.match(error.message, /acp target gemini-dev failed \(exit 7\)/);
+        return true;
+      },
+    );
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
@@ -2510,7 +2547,12 @@ if (args[0] === 'terminal' && args[1] === 'create') {
         stage: "lint",
         worktree: "current",
       }),
-      /opencode did not become ready before the timeout/,
+      (error: unknown) => {
+        assert.ok(error instanceof PreflightError);
+        assert.equal(error.failureClass, "readiness-timeout");
+        assert.match(error.message, /did not become ready before the timeout/);
+        return true;
+      },
     );
     const calls = (await readFile(callsPath, "utf8"))
       .trim()
@@ -2532,36 +2574,372 @@ if (args[0] === 'terminal' && args[1] === 'create') {
   }
 });
 
+test("fallback chains settle each failed candidate before the next launch", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-fallback-settle-"));
+  const fakeOrca = path.join(temp, "orca");
+  const callsPath = path.join(temp, "calls.jsonl");
+  const evidence = path.join(
+    homedir(),
+    ".orca-no-mistakes",
+    "artifacts",
+    "run-chain",
+  );
+  const reportPath = path.join(evidence, "review.json");
+  const previousTimeout = process.env.WORKER_AGENT_READY_TIMEOUT_MS;
+  process.env.WORKER_AGENT_READY_TIMEOUT_MS = "600";
+  try {
+    await mkdir(evidence, { recursive: true });
+    await writeFile(
+      reportPath,
+      JSON.stringify({ findings: [], summary: "second candidate done", tested: [] }),
+    );
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+const out = (result) => console.log(JSON.stringify({ result }))
+if (args[0] === 'orchestration' && args[1] === 'run-create') {
+  out({ run: { id: 'run-chain' } })
+} else if (args[0] === 'terminal' && args[1] === 'create') {
+  const creates = fs.readFileSync(${JSON.stringify(callsPath)}, 'utf8').trim().split('\\n')
+    .filter((line) => { const a = JSON.parse(line); return a[0] === 'terminal' && a[1] === 'create' })
+  out({ terminal: { handle: creates.length === 1 ? 'stuck-terminal' : 'fresh-terminal' } })
+} else if (args[0] === 'orchestration' && args[1] === 'worker-start') {
+  out({ terminal: { handle: 'fresh-terminal' } })
+} else if (args[0] === 'terminal' && args[1] === 'show') {
+  if (args.includes('stuck-terminal')) {
+    out({ terminal: { connected: true, title: 'bash', preview: '' } })
+  } else {
+    out({ terminal: { connected: true, title: 'Claude CLI', preview: 'ready' } })
+  }
+} else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
+  out({ dispatch: { id: 'dispatch-claude', status: 'dispatched' }, injected: true, preamble: 'ok' })
+} else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
+  out({ deliveryId: 'delivery-claude', messages: [{ type: 'worker_done', body: 'Reviewed. Verified. Clear.', payload: JSON.stringify({ taskId: 'task-chain', dispatchId: 'dispatch-claude', outcome: 'succeeded', reportPath: ${JSON.stringify(reportPath)} }) }] })
+} else {
+  out({ ok: true })
+}
+`,
+    );
+    await chmod(fakeOrca, 0o755);
+    const roleConfig = { enabled: false, max_rounds: 0, allow_review_autofix: false };
+    const [grok, claude] = ["grok", "claude"].map(
+      (harness) => launchAgent({ auto_fix: roleConfig, agent: harness })![0],
+    );
+    const launches: WorkerLaunch[] = [
+      { agent: grok, name: "first", prompt: "instructions", role: "reviewer", stage: "lint", worktree: "current" },
+      { agent: claude, name: "second", prompt: "instructions", role: "reviewer", stage: "lint", worktree: "current" },
+    ];
+
+    const orca = new CliOrca({ command: fakeOrca, cwd: temp });
+    await orca.createRun("fallback chain settlement");
+    const outcome = await startWorkerWithFallback(orca, () => Promise.resolve("task-chain"), launches);
+
+    assert.equal(outcome.resolvedAgent, "claude");
+    assert.deepEqual(
+      outcome.attempts.map((attempt) => [attempt.agent, attempt.failureClass]),
+      [["grok", "readiness-timeout"]],
+    );
+
+    const calls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    const closeIndex = calls.findIndex(
+      (args) =>
+        args[0] === "terminal" &&
+        args[1] === "close" &&
+        args.includes("stuck-terminal"),
+    );
+    const createIndexes = calls
+      .map((args, index) =>
+        args[0] === "terminal" && args[1] === "create" ? index : -1,
+      )
+      .filter((index) => index >= 0);
+    assert.equal(createIndexes.length, 1);
+    const nextLaunchIndex = calls.findIndex(
+      (args) =>
+        args[0] === "orchestration" && args[1] === "worker-start",
+    );
+    assert.ok(nextLaunchIndex !== -1);
+    assert.ok(closeIndex !== -1);
+    assert.ok(
+      closeIndex < nextLaunchIndex,
+      "the failed candidate's terminal closes before the next candidate starts",
+    );
+  } finally {
+    if (previousTimeout === undefined)
+      delete process.env.WORKER_AGENT_READY_TIMEOUT_MS;
+    else process.env.WORKER_AGENT_READY_TIMEOUT_MS = previousTimeout;
+    await rm(evidence, { recursive: true, force: true });
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test("launchAgent carries role settings even when no agent harness is configured", () => {
   const autoFix = { enabled: true, max_rounds: 3, allow_review_autofix: false };
-  assert.equal(launchAgent({ auto_fix: autoFix }), undefined);
+  assert.deepEqual(launchAgent({ auto_fix: autoFix }), []);
   assert.deepEqual(
     launchAgent({ auto_fix: autoFix, model: "gpt-5.6", effort: "high" }),
-    {
-      agentArgsOverride: undefined,
-      effort: "high",
-      harness: "opencode",
-      model: "gpt-5.6",
-      timeoutMs: undefined,
-      variant: undefined,
-    },
+    [
+      {
+        agentArgsOverride: undefined,
+        effort: "high",
+        harness: "opencode",
+        model: "gpt-5.6",
+        timeoutMs: undefined,
+        variant: undefined,
+      },
+    ],
   );
   assert.equal(
-    launchAgent({ auto_fix: autoFix, agent: "claude", model: "x" })?.harness,
+    launchAgent({ auto_fix: autoFix, agent: "claude", model: "x" })?.[0]
+      .harness,
     "claude",
   );
   assert.equal(
     buildCliCommand(
       "opencode",
-      launchAgent({ auto_fix: autoFix, model: "gpt-5.6", effort: "high" }) ??
+      launchAgent({ auto_fix: autoFix, model: "gpt-5.6", effort: "high" })?.[0] ??
         {},
     ),
     `'opencode' '--model' 'gpt-5.6' '--variant' 'high'`,
   );
-  assert.throws(
-    () =>
-      launchAgent({ auto_fix: autoFix, agent: ["opencode", "grok"] as never }),
-    /agent fallback chains arrive in ONM-39/,
+  assert.deepEqual(
+    launchAgent({
+      auto_fix: autoFix,
+      agent: ["opencode", { harness: "claude", model: "claude-3-7-sonnet" }],
+    }).map((agent) => [agent.harness, agent.model]),
+    [
+      ["opencode", undefined],
+      ["claude", "claude-3-7-sonnet"],
+    ],
+  );
+});
+
+test("fallback chains advance only on preflight failures and settle between candidates", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  const roleConfig = { enabled: false, max_rounds: 0, allow_review_autofix: false };
+  const launches = (
+    ["claude", "grok", "acp:gemini"] as const
+  ).map((harness, index): WorkerLaunch => ({
+    agent: launchAgent({ auto_fix: roleConfig, agent: harness })![0],
+    name: `no-mistakes-lint-1-${index}`,
+    prompt: `prompt for ${harness}`,
+    role: "reviewer",
+    stage: "lint",
+    worktree: "new-child",
+  }));
+
+  orca.launchFailures.push(
+    new PreflightError("readiness-timeout", "claude did not become ready"),
+    new PreflightError("quota", "429 quota exhausted for grok"),
+  );
+  const outcome = await startWorkerWithFallback(orca, () => Promise.resolve("task-fb"), launches);
+  assert.equal(outcome.resolvedAgent, "acp:gemini");
+  assert.equal(outcome.worker.dispatchId, "dispatch-1");
+  assert.deepEqual(
+    outcome.attempts.map((attempt) => [attempt.agent, attempt.failureClass]),
+    [
+      ["claude", "readiness-timeout"],
+      ["grok", "quota"],
+    ],
+  );
+  assert.deepEqual(
+    outcome.attempts.map((attempt) => attempt.role),
+    ["reviewer", "reviewer"],
+  );
+  assert.equal(orca.launches.length, 3);
+  assert.match(orca.launches[2].prompt, /prompt for acp:gemini/);
+});
+
+test("execution-phase errors do not advance the fallback chain", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  const roleConfig = { enabled: false, max_rounds: 0, allow_review_autofix: false };
+  const launches = (
+    ["claude", "grok"] as const
+  ).map((harness): WorkerLaunch => ({
+    agent: launchAgent({
+      auto_fix: roleConfig,
+      agent: harness,
+    })![0],
+    name: "no-mistakes-test-1",
+    prompt: "instructions",
+    role: "reviewer",
+    stage: "test",
+    worktree: "new-child",
+  }));
+  orca.launchFailures.push(new Error(`test stage failed: 3 failing tests`));
+
+  await assert.rejects(
+    startWorkerWithFallback(orca, () => Promise.resolve("task-exec"), launches),
+    /test stage failed: 3 failing tests/,
+  );
+  assert.equal(orca.launches.length, 1);
+});
+
+test("exhausted chains fail closed with aggregated candidate diagnostics", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  const launches = (
+    ["claude", "grok", "codex"] as const
+  ).map((harness): WorkerLaunch => ({
+    agent: launchAgent({
+      auto_fix: { enabled: false, max_rounds: 0, allow_review_autofix: false },
+      agent: harness,
+    })![0],
+    name: "no-mistakes-review-1",
+    prompt: "instructions",
+    role: "reviewer",
+    stage: "review",
+    worktree: "new-child",
+  }));
+  orca.launchFailures.push(
+    new PreflightError("binary-missing", "spawn claude ENOENT"),
+    new PreflightError("auth", "grok: not logged in"),
+    new PreflightError("unclassified", "terminal create returned an invalid receipt"),
+  );
+
+  await assert.rejects(
+    startWorkerWithFallback(orca, () => Promise.resolve("task-exh"), launches),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /exhausted all 3 fallback candidates/);
+      assert.match(error.message, /claude \[binary-missing\]/);
+      assert.match(error.message, /grok \[auth\]/);
+      assert.match(error.message, /codex \[unclassified\]/);
+      return true;
+    },
+  );
+  assert.equal(orca.launches.length, 3);
+});
+
+test("preflight failure classification maps known launch failures", () => {
+  assert.equal(classifyPreflightFailure("worker-start failed: spawn codex ENOENT"), "binary-missing");
+  assert.equal(classifyPreflightFailure("HTTP 429 rate limit exceeded"), "quota");
+  assert.equal(classifyPreflightFailure("monthly quota exhausted"), "quota");
+  assert.equal(classifyPreflightFailure("gemini: not logged in; run auth login"), "auth");
+  assert.equal(classifyPreflightFailure("claude did not become ready before the timeout"), "readiness-timeout");
+  assert.equal(classifyPreflightFailure("worker agent terminal exited during startup"), "readiness-timeout");
+  assert.equal(classifyPreflightFailure("something else went wrong"), "unclassified");
+});
+
+test("each fallback candidate is dispatched with its own task spec", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  orca.launchFailures.push(
+    new PreflightError("readiness-timeout", "acp:gemini-dev did not become ready"),
+  );
+  await runPipeline(
+    {
+      intent: "Dispatch per-candidate fallback instructions.",
+      cliFlags: { reviewer: { agent: ["acp:gemini-dev", "grok"] } } as never,
+    },
+    orca,
+    git,
+  );
+  const checkTasks = orca.tasks.filter((task) => /^\[\w+ check /.test(task.spec));
+  assert.match(
+    checkTasks[0].spec,
+    /Do not write a report file and do not call worker_done/,
+  );
+  assert.match(checkTasks[1].spec, /report exactly once with worker_done/);
+  assert.doesNotMatch(checkTasks[1].spec, /Do not write a report file/);
+});
+
+test("acp runner timeouts stay execution-phase failures", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-acp-timeout-"));
+  const fakeAcpx = path.join(temp, "acpx");
+  const fakeOrca = path.join(temp, "orca");
+  const worktreePath = path.join(temp, "acp-wt");
+  try {
+    git(temp, "init", "-b", "feature");
+    await mkdir(worktreePath);
+    await writeFile(fakeAcpx, "#!/usr/bin/env node\nsetTimeout(() => {}, 60000)\n");
+    await chmod(fakeAcpx, 0o755);
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+const out = (result) => console.log(JSON.stringify({ result }))
+out({ worktree: { id: 'wt-timeout', path: ${JSON.stringify(worktreePath)} } })
+`,
+    );
+    await chmod(fakeOrca, 0o755);
+    const orca = new CliOrca({
+      acpxCommand: fakeAcpx,
+      command: fakeOrca,
+      cwd: temp,
+    });
+    await assert.rejects(
+      orca.startWorker("task-acp", {
+        agent: { harness: "acp:gemini-dev", timeoutMs: 100 },
+        name: "acp-worker",
+        prompt: "Review now.",
+        role: "reviewer",
+        stage: "review",
+        worktree: "new-child",
+      }),
+      (error: unknown) => {
+        assert.ok(!(error instanceof PreflightError));
+        assert.match((error as Error).message, /exit 124/);
+        return true;
+      },
+    );
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("reviewer fallback attempts are recorded in stage evidence with resolved_agent", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  orca.launchFailures.push(
+    new PreflightError("readiness-timeout", "claude did not become ready"),
+  );
+
+  const result = await runPipeline(
+    {
+      intent: "Record fallback provenance for reviewers.",
+      cliFlags: { reviewer: { agent: ["claude", "grok"] } } as never,
+    },
+    orca,
+    git,
+  );
+
+  const reviewLaunches = orca.launches.filter(
+    (launch) => launch.role === "reviewer",
+  );
+  assert.equal(reviewLaunches.length >= 2, true);
+  assert.equal(reviewLaunches[0].agent?.harness, "claude");
+  assert.equal(reviewLaunches[1].agent?.harness, "grok");
+
+  const logsDir = path.join(artifactsRoot(), result.runId, "logs");
+  const logFiles = await readdir(logsDir);
+  const reviewLogName = logFiles.find((name) =>
+    name.startsWith("review-r0-"),
+  );
+  assert.ok(reviewLogName);
+  const reviewLog = JSON.parse(
+    await readFile(path.join(logsDir, reviewLogName), "utf8"),
+  ) as {
+    resolvedAgent?: string;
+    fallbackAttempts?: {
+      agent: string;
+      durationMs: number;
+      failureClass: string;
+      message: string;
+    }[];
+  };
+  assert.equal(reviewLog.resolvedAgent, "grok");
+  assert.equal(reviewLog.fallbackAttempts?.length, 1);
+  assert.equal(reviewLog.fallbackAttempts?.[0].agent, "claude");
+  assert.equal(
+    reviewLog.fallbackAttempts?.[0].failureClass,
+    "readiness-timeout",
   );
 });
 

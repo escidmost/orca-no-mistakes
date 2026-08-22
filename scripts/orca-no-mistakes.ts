@@ -18,15 +18,18 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
+  PreflightError,
   acpRunnerInvocation,
   buildCliCommand,
   classifyHarness,
+  classifyPreflightFailure,
   collectResidualResources,
   nativeWorkerStartArgs,
   parseAcpTarget,
   readinessMatcher,
   shellQuote,
   workerAgentReadyTimeoutMs,
+  type PreflightFailureClass,
   type ResidualResources,
 } from "./adapters.ts";
 import {
@@ -121,6 +124,10 @@ export interface OrcaOperations {
     spec: string,
     options?: { deps?: string[]; parent?: string },
   ): Promise<string>;
+  // Implementations must synchronously settle every resource a failed launch
+  // created (close terminals, remove created worktrees, abandon dispatches)
+  // before rejecting, so the fallback chain can start the next candidate
+  // immediately after the rejection.
   startWorker(taskId: string, launch: WorkerLaunch): Promise<WorkerResult>;
   finishWorker(
     worker: WorkerResult,
@@ -344,6 +351,7 @@ export async function runPipeline(
       workerIdentity: string,
       exitCode: number,
       report: StageReport,
+      fallback: { attempts: FallbackAttempt[]; resolvedAgent: string },
     ): Promise<void> => {
       const candidate = await git.head();
       const logsDir = path.join(artifactsDir, "logs");
@@ -359,6 +367,10 @@ export async function runPipeline(
             findings: report.findings,
             summary: report.summary,
             tested: report.tested,
+            resolvedAgent: fallback.resolvedAgent,
+            ...(fallback.attempts.length > 0
+              ? { fallbackAttempts: fallback.attempts }
+              : {}),
           },
           null,
           2,
@@ -431,6 +443,9 @@ export async function runPipeline(
       );
       let round = 0;
       let attempt = 0;
+      let inheritedFallback:
+        | { attempts: FallbackAttempt[]; resolvedAgent: string }
+        | undefined;
       const runStage = async () => {
         const execution = await executeStage(
           stage,
@@ -443,16 +458,24 @@ export async function runPipeline(
           git,
           pipelineConfig.stages[stage],
         );
+        if (inheritedFallback) {
+          // Merge so a fixer's fallback history is never dropped or silently
+          // replaced by the next reviewer run; roles on each attempt keep the
+          // provenance explicit.
+          execution.fallbackAttempts = [
+            ...inheritedFallback.attempts,
+            ...(execution.fallbackAttempts ?? []),
+          ];
+          execution.resolvedAgent ??= inheritedFallback.resolvedAgent;
+        }
+        inheritedFallback = undefined;
         if (stage === "rebase" && execution.report.findings.length === 0) {
           baseCommitOid = await git.resolveBaseOid(repo.base);
         }
-        await recordStageEvidence(
-          stage,
-          round,
-          execution.workerIdentity,
-          execution.exitCode,
-          execution.report,
-        );
+        await recordStageEvidence(stage, round, execution.workerIdentity, execution.exitCode, execution.report, {
+          attempts: execution.fallbackAttempts ?? [],
+          resolvedAgent: execution.resolvedAgent,
+        });
         return execution.report;
       };
       let report = await runStage();
@@ -547,6 +570,12 @@ export async function runPipeline(
           orca,
           git,
         );
+        if (nextFixer.fallbackAttempts && nextFixer.resolvedAgent) {
+          inheritedFallback = {
+            attempts: nextFixer.fallbackAttempts,
+            resolvedAgent: nextFixer.resolvedAgent,
+          };
+        }
         ledger.recordCheckpoint({
           inputCommitOid: nextFixer.before,
           outputCommitOid: nextFixer.after,
@@ -637,7 +666,7 @@ type StageRoles = { fixer: ResolvedRoleConfig; reviewer: ResolvedRoleConfig };
 
 export function launchAgent(
   config: ResolvedRoleConfig,
-): WorkerAgent | undefined {
+): WorkerAgent[] {
   const fallbacks = {
     effort: config.effort,
     model: config.model,
@@ -647,31 +676,104 @@ export function launchAgent(
   const carriesSettings =
     config.agent_args_override !== undefined ||
     Object.values(fallbacks).some((value) => value !== undefined);
-  const specs = normalizeAgentSpec(
+  return normalizeAgentSpec(
     config.agent ?? (carriesSettings ? DEFAULT_WORKER_AGENT : undefined),
     fallbacks,
-  );
-  if (specs.length > 1) {
-    throw new Error(
-      "a role accepts a single agent; agent fallback chains arrive in ONM-39",
-    );
-  }
-  const [spec] = specs;
-  if (!spec) return undefined;
-  return {
+  ).map((spec) => ({
     agentArgsOverride: config.agent_args_override,
     effort: spec.effort,
     harness: spec.harness,
     model: spec.model,
     timeoutMs: spec.timeout_ms,
     variant: spec.variant,
-  };
+  }));
+}
+
+// An unconfigured role still launches once with the orchestrator's default
+// delivery, so a missing chain is one candidate, not zero.
+function launchCandidates(
+  config: ResolvedRoleConfig,
+): (WorkerAgent | undefined)[] {
+  const agents = launchAgent(config);
+  return agents.length > 0 ? agents : [undefined];
+}
+
+export type FallbackAttempt = {
+  agent: string;
+  durationMs: number;
+  failureClass: PreflightFailureClass;
+  message: string;
+  role: "fixer" | "reviewer";
+};
+
+export type WorkerLaunchOutcome = {
+  attempts: FallbackAttempt[];
+  resolvedAgent: string;
+  worker: WorkerResult;
+};
+
+// Iterates an ordered fallback chain. Only PreflightError (launch/readiness/
+// dispatch failures before a candidate accepts the task) advances to the next
+// candidate; execution-phase errors propagate immediately. Each candidate gets
+// its own child task so the injected spec always carries that candidate's
+// delivery instructions.
+export async function startWorkerWithFallback(
+  orca: OrcaOperations,
+  createTask: (launch: WorkerLaunch) => Promise<string>,
+  launches: WorkerLaunch[],
+): Promise<WorkerLaunchOutcome> {
+  if (launches.length === 0)
+    throw new Error("no agent configured for this role");
+  const attempts: FallbackAttempt[] = [];
+  for (const [index, launch] of launches.entries()) {
+    const startedAt = Date.now();
+    const taskId = await createTask(launch);
+    try {
+      const worker = await orca.startWorker(taskId, launch);
+      return {
+        attempts,
+        resolvedAgent: launch.agent?.harness ?? DEFAULT_WORKER_AGENT,
+        worker,
+      };
+    } catch (error) {
+      if (!(error instanceof PreflightError)) throw error;
+      await orca
+        .completeTask(taskId, {
+          findings: [],
+          summary: `skipped: ${error.failureClass} — fallback advanced to the next candidate`,
+          tested: [],
+        })
+        .catch(() => {});
+      attempts.push({
+        agent: launch.agent?.harness ?? DEFAULT_WORKER_AGENT,
+        durationMs: Date.now() - startedAt,
+        failureClass: error.failureClass,
+        message: error.message,
+        role: launch.role,
+      });
+      if (index === launches.length - 1) {
+        const digest = attempts
+          .map(
+            (attempt) =>
+              `- ${attempt.agent} [${attempt.failureClass}] after ${attempt.durationMs}ms: ${attempt.message}`,
+          )
+          .join("\n");
+        throw new Error(
+          `${launch.stage} exhausted all ${launches.length} fallback candidates:\n${digest}`,
+          { cause: error },
+        );
+      }
+    }
+  }
+  throw new Error("unreachable: fallback loop exited without a result");
 }
 
 type StageExecution = {
   exitCode: number;
   report: StageReport;
   workerIdentity: string;
+  fallbackAttempts?: FallbackAttempt[];
+  resolvedAgent: string;
 };
 
 async function executeStage(
@@ -694,6 +796,7 @@ async function executeStage(
       exitCode: exitCodeFor(report),
       report,
       workerIdentity: "coordinator",
+      resolvedAgent: "coordinator",
     };
   }
   if (stage === "rebase") {
@@ -702,6 +805,7 @@ async function executeStage(
       exitCode: exitCodeFor(report),
       report,
       workerIdentity: "coordinator",
+      resolvedAgent: "coordinator",
     };
   }
   return await runReviewer(
@@ -730,28 +834,33 @@ async function runReviewer(
   orca: OrcaOperations,
   role: ResolvedRoleConfig,
 ): Promise<StageExecution> {
-  const agent = launchAgent(role);
-  const prompt = checkerPrompt(
-    stage,
-    intent,
-    repo,
-    path.join(evidenceDir, `${stage}-${attempt + 1}.json`),
-    deliveryChannel(agent),
-  );
-  const childTask = await orca.createTask(
-    `[${stage} check ${attempt + 1}]\n${prompt}`,
-    {
-      parent: parentTask,
-    },
-  );
-  const worker = await orca.startWorker(childTask, {
-    agent,
-    name: `no-mistakes-${stage}-${attempt + 1}`,
-    prompt,
-    role: "reviewer",
-    stage,
-    worktree: "new-child",
+  const reportPath = path.join(evidenceDir, `${stage}-${attempt + 1}.json`);
+  const launches = launchCandidates(role).map((agent): WorkerLaunch => {
+    const prompt = checkerPrompt(
+      stage,
+      intent,
+      repo,
+      reportPath,
+      deliveryChannel(agent),
+    );
+    return {
+      agent,
+      name: `no-mistakes-${stage}-${attempt + 1}`,
+      prompt,
+      role: "reviewer",
+      stage,
+      worktree: "new-child",
+    };
   });
+  const outcome = await startWorkerWithFallback(
+    orca,
+    (launch) =>
+      orca.createTask(`[${stage} check ${attempt + 1}]\n${launch.prompt}`, {
+        parent: parentTask,
+      }),
+    launches,
+  );
+  const worker = outcome.worker;
   try {
     const validatedReport = await validateReport(
       worker.report,
@@ -762,6 +871,10 @@ async function runReviewer(
       exitCode: exitCodeFor(validatedReport),
       report: validatedReport,
       workerIdentity: `reviewer:${worker.dispatchId}`,
+      resolvedAgent: outcome.resolvedAgent,
+      ...(outcome.attempts.length > 0
+        ? { fallbackAttempts: outcome.attempts }
+        : {}),
     };
   } finally {
     await orca.finishWorker(worker, "release");
@@ -782,32 +895,41 @@ async function runFixer(
   role: ResolvedRoleConfig,
   orca: OrcaOperations,
   git: GitOperations,
-): Promise<{ after: string; before: string }> {
+): Promise<{
+  after: string;
+  before: string;
+  fallbackAttempts?: FallbackAttempt[];
+  resolvedAgent: string;
+}> {
   await git.assertClean();
   const before = await git.head();
-  const agent = launchAgent(role);
-  const prompt = fixerPrompt(
-    stage,
-    intent,
-    findings,
-    guidance,
-    reportPath,
-    deliveryChannel(agent),
-  );
-  const childTask = await orca.createTask(
-    `[${stage} fix ${round}]\n${prompt}`,
-    {
-      parent: parentTask,
-    },
-  );
-  const worker = await orca.startWorker(childTask, {
-    agent,
-    name: `no-mistakes-fixer-${stage}-${round}`,
-    prompt,
-    role: "fixer",
-    stage,
-    worktree: "new-child",
+  const launches = launchCandidates(role).map((agent): WorkerLaunch => {
+    const prompt = fixerPrompt(
+      stage,
+      intent,
+      findings,
+      guidance,
+      reportPath,
+      deliveryChannel(agent),
+    );
+    return {
+      agent,
+      name: `no-mistakes-fixer-${stage}-${round}`,
+      prompt,
+      role: "fixer",
+      stage,
+      worktree: "new-child",
+    };
   });
+  const outcome = await startWorkerWithFallback(
+    orca,
+    (launch) =>
+      orca.createTask(`[${stage} fix ${round}]\n${launch.prompt}`, {
+        parent: parentTask,
+      }),
+    launches,
+  );
+  const worker = outcome.worker;
   try {
     await validateReport(worker.report, stage, path.dirname(reportPath));
     if (!worker.worktreePath) {
@@ -821,7 +943,14 @@ async function runFixer(
     if (before === after) {
       throw new Error(`${stage} fixer did not commit a change`);
     }
-    return { after, before };
+    return {
+      after,
+      before,
+      resolvedAgent: outcome.resolvedAgent,
+      ...(outcome.attempts.length > 0
+        ? { fallbackAttempts: outcome.attempts }
+        : {}),
+    };
   } finally {
     await orca.finishWorker(worker, "release").catch(() => {});
     if (worker.worktreeId) {
@@ -1551,13 +1680,18 @@ export class CliOrca implements OrcaOperations {
       : await this.#prepareWorker(taskId, launch);
     const terminalHandle = prepared?.terminalHandle ?? launch.terminal;
     if (!terminalHandle)
-      throw new Error("worker preparation returned no terminal handle");
+      throw new PreflightError(
+        "unclassified",
+        "worker preparation returned no terminal handle",
+      );
     if (directPreamble) {
       try {
         await this.#trustAgyWorkspace(prepared?.worktreePath ?? this.#cwd);
       } catch (error) {
         if (prepared) await this.#cleanupPreparedWorker(prepared);
-        throw error;
+        throw new PreflightError("unclassified", "agy workspace trust failed", {
+          cause: error,
+        });
       }
     }
     const args = [
@@ -1585,7 +1719,11 @@ export class CliOrca implements OrcaOperations {
       }>(args, true);
     } catch (error) {
       if (prepared) await this.#cleanupPreparedWorker(prepared);
-      throw error;
+      throw new PreflightError(
+        classifyPreflightFailure(String(error)),
+        `initial dispatch failed: ${String(error)}`,
+        { cause: error },
+      );
     }
     const dispatchId = receipt?.dispatch?.id;
     const preamble = receipt.preamble?.trim();
@@ -1603,7 +1741,10 @@ export class CliOrca implements OrcaOperations {
       } else if (prepared) {
         await this.#cleanupPreparedWorker(prepared);
       }
-      throw new Error("dispatch returned an invalid receipt");
+      throw new PreflightError(
+        "unclassified",
+        "dispatch returned an invalid receipt",
+      );
     }
     let promptPath: string | undefined;
     if (directPreamble) {
@@ -1756,14 +1897,16 @@ export class CliOrca implements OrcaOperations {
       residual.terminalHandles.push(...reported.terminalHandles);
       residual.worktreeIds.push(...reported.worktreeIds);
       if (started.code !== 0) {
-        throw new Error(
-          `worker-start failed for ${agent.harness} (exit ${started.code}): ${
-            started.stdout.trim() || started.stderr.trim() || "no output"
-          }`,
+        const detail =
+          started.stdout.trim() || started.stderr.trim() || "no output";
+        throw new PreflightError(
+          classifyPreflightFailure(detail),
+          `worker-start failed for ${agent.harness} (exit ${started.code}): ${detail}`,
         );
       }
       if (!terminalHandle) {
-        throw new Error(
+        throw new PreflightError(
+          "readiness-timeout",
           `worker-start did not produce a ready ${agent.harness} worker: ${JSON.stringify(receipt).slice(0, 400)}`,
         );
       }
@@ -1821,7 +1964,10 @@ export class CliOrca implements OrcaOperations {
       ]);
       worktree = created.worktree;
       if (!worktree?.id || !worktree.path)
-        throw new Error("worktree create returned an invalid receipt");
+        throw new PreflightError(
+          "unclassified",
+          "worktree create returned an invalid receipt",
+        );
 
       const listed = await this.#json<{
         terminals: {
@@ -1848,7 +1994,10 @@ export class CliOrca implements OrcaOperations {
         terminalHandle = createdTerminal?.terminal?.handle ?? "";
       }
       if (!terminalHandle)
-        throw new Error("terminal create returned an invalid receipt");
+        throw new PreflightError(
+          "unclassified",
+          "terminal create returned an invalid receipt",
+        );
 
       if (launch.agent?.harness.toLowerCase() !== "agy")
         await this.#launchWorkerAgent(terminalHandle, launch);
@@ -1879,7 +2028,10 @@ export class CliOrca implements OrcaOperations {
       ]);
       prepared.terminalHandle = created?.terminal?.handle ?? "";
       if (!prepared.terminalHandle)
-        throw new Error("terminal create returned an invalid receipt");
+        throw new PreflightError(
+          "unclassified",
+          "terminal create returned an invalid receipt",
+        );
       if (launch.agent?.harness.toLowerCase() !== "agy")
         await this.#launchWorkerAgent(prepared.terminalHandle, launch);
       return prepared;
@@ -2100,7 +2252,10 @@ export class CliOrca implements OrcaOperations {
           "--json",
         ]);
         if (screen.terminal.status === "exited") {
-          throw new Error("worker agent terminal exited during startup");
+          throw new PreflightError(
+            "readiness-timeout",
+            "worker agent terminal exited during startup",
+          );
         }
         if (screen.terminal.tail?.some((line) => line.trim() === ">")) return;
       } else {
@@ -2113,7 +2268,10 @@ export class CliOrca implements OrcaOperations {
         }>(["terminal", "show", "--terminal", terminalHandle, "--json"]);
         const terminal = shown.terminal;
         if (terminal.connected === false)
-          throw new Error("worker agent terminal disconnected during startup");
+          throw new PreflightError(
+            "readiness-timeout",
+            "worker agent terminal disconnected during startup",
+          );
         if (
           ready({
             preview: terminal.preview ?? null,
@@ -2127,7 +2285,10 @@ export class CliOrca implements OrcaOperations {
         }
       }
       if (Date.now() >= deadline) {
-        throw new Error(`${harness} did not become ready before the timeout`);
+        throw new PreflightError(
+          "readiness-timeout",
+          `${harness} did not become ready before the timeout`,
+        );
       }
       await new Promise((resolve) => setTimeout(resolve, 250));
     }
@@ -2172,7 +2333,10 @@ export class CliOrca implements OrcaOperations {
           "--json",
         ]);
         if (!created.worktree?.id || !created.worktree.path) {
-          throw new Error("worktree create returned an invalid receipt");
+          throw new PreflightError(
+            "unclassified",
+            "worktree create returned an invalid receipt",
+          );
         }
         worktreeId = created.worktree.id;
         cwd = created.worktree.path;
@@ -2183,15 +2347,37 @@ export class CliOrca implements OrcaOperations {
         target,
         timeoutMs: agent.timeoutMs,
       });
-      const result = await command(this.#acpxCommand, invocation.args, cwd, {
-        allowFailure: true,
-        timeoutMs: agent.timeoutMs ?? WORKER_IDLE_TIMEOUT_MS,
-      });
+      let result: { code: number; stderr: string; stdout: string };
+      try {
+        result = await command(this.#acpxCommand, invocation.args, cwd, {
+          allowFailure: true,
+          timeoutMs: agent.timeoutMs ?? WORKER_IDLE_TIMEOUT_MS,
+        });
+      } catch (error) {
+        // The one-shot runner never accepted the task: a missing binary or
+        // rejected session is preflight and may advance the fallback chain.
+        throw new PreflightError(
+          classifyPreflightFailure(String(error)),
+          `acp target ${target} could not start: ${String(error)}`,
+          { cause: error },
+        );
+      }
       if (result.code !== 0) {
         const detail = `${result.stderr}\n${result.stdout}`.trim();
-        throw new Error(
-          `acp target ${target} failed (exit ${result.code}): ${detail.slice(-400)}`,
-        );
+        // Our own runner timeout (exit 124) stays an execution-phase error:
+        // by then the target may have accepted the task, and captured
+        // stdout/stderr give no acceptance marker to tell the phases apart.
+        const failureClass = classifyPreflightFailure(detail);
+        const message = `acp target ${target} failed (exit ${result.code}): ${detail.slice(-400)}`;
+        if (
+          failureClass === "quota" ||
+          failureClass === "auth" ||
+          failureClass === "binary-missing" ||
+          failureClass === "readiness-timeout"
+        ) {
+          throw new PreflightError(failureClass, message);
+        }
+        throw new Error(message);
       }
       let report: StageReport | undefined;
       try {
