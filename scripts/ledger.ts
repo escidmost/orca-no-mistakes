@@ -151,6 +151,9 @@ export function verifyManifest(manifest: PassedAttestationManifest): void {
     if (!HEX_64.test(entry.evidenceSha256)) {
       throw new Error(`stage ${entry.stage} evidence hash is not a SHA-256`)
     }
+    if (evidenceSha256(entry) !== entry.evidenceSha256) {
+      throw new Error(`stage ${entry.stage} evidence hash does not match its recorded fields`)
+    }
   }
   const root = merkleRoot(manifest.stageEvidence.map((entry) => sha256(canonicalEntry(entry))))
   if (root !== manifest.merkleRoot) {

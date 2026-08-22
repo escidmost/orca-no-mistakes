@@ -16,6 +16,7 @@ import {
   main,
   parseGateResolution,
   runPipeline,
+  merkleRoot,
   sha256,
   verifyManifest,
   type Finding,
@@ -37,6 +38,7 @@ class FakeGit implements GitOperations {
   #head = FakeGit.#oid(1)
   #baseOid = FakeGit.#oid(0)
   divergeAfterAnchor = false
+  rebaseConflict = false
   #operatorDiverged = false
 
   async assertReady(): Promise<{ base: string; baseOid: string; branch: string; head: string; root: string }> {
@@ -55,6 +57,19 @@ class FakeGit implements GitOperations {
   async rebase(base: string): Promise<StageReport> {
     this.calls.push(`rebase:${base}`)
     this.#baseOid = 'b'.repeat(40)
+    if (this.rebaseConflict) {
+      return {
+        findings: [
+          {
+            id: 'rebase-conflict',
+            severity: 'error',
+            action: 'ask-user',
+            description: 'conflict; rebase aborted'
+          }
+        ],
+        summary: 'rebase aborted'
+      }
+    }
     this.#head = FakeGit.#oid(++this.#counter)
     return pass('rebased')
   }
@@ -1421,10 +1436,54 @@ test('the attestation binds the base commit fetched by the rebase stage', async 
     byStage('intent').map((entry) => entry.baseCommitOid),
     ['0'.repeat(40)]
   )
-  for (const stage of ['review', 'test', 'document', 'lint']) {
+  for (const stage of ['rebase', 'review', 'test', 'document', 'lint']) {
     for (const entry of byStage(stage)) {
       assert.equal(entry.baseCommitOid, 'b'.repeat(40))
     }
   }
   verifyManifest(result.attestation)
+})
+
+test('an aborted rebase keeps the pre-fetch base in evidence and the attestation', async () => {
+  const git = new FakeGit()
+  git.rebaseConflict = true
+  const orca = new FakeOrca(git)
+  orca.gateResolution = 'approve'
+
+  const result = await runPipeline({ intent: 'Approve past a rebase conflict.' }, orca, git)
+
+  assert.ok(result.attestation)
+  assert.equal(result.attestation.baseCommitOid, '0'.repeat(40))
+  for (const entry of result.attestation.stageEvidence) {
+    assert.equal(entry.baseCommitOid, '0'.repeat(40))
+  }
+  verifyManifest(result.attestation)
+})
+
+test('verifyManifest recomputes each stage evidence hash', async () => {
+  const git = new FakeGit()
+  const orca = new FakeOrca(git)
+  const result = await runPipeline({ intent: 'Recompute evidence hashes.' }, orca, git)
+
+  assert.ok(result.attestation)
+  const forged = structuredClone(result.attestation)
+  forged.stageEvidence[3].summary = 'rewritten after the fact'
+  forged.merkleRoot = merkleRoot(
+    forged.stageEvidence.map((entry) =>
+      sha256(
+        JSON.stringify({
+          baseCommitOid: entry.baseCommitOid,
+          candidateCommitOid: entry.candidateCommitOid,
+          evidenceSha256: entry.evidenceSha256,
+          exitCode: entry.exitCode,
+          round: entry.round,
+          stage: entry.stage,
+          summary: entry.summary,
+          ...(entry.waiverOrApproval ? { waiverOrApproval: entry.waiverOrApproval } : {}),
+          workerIdentity: entry.workerIdentity
+        })
+      )
+    )
+  )
+  assert.throws(() => verifyManifest(forged), /evidence hash does not match/)
 })

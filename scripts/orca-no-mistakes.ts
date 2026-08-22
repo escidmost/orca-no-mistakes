@@ -249,6 +249,11 @@ export async function runPipeline(
       let attempt = 0
       const runStage = async () => {
         const execution = await executeStage(stage, attempt++, taskId, intent, artifactsDir, repo, orca, git)
+        if (stage === 'rebase' && execution.report.findings.length === 0) {
+          baseCommitOid = await git.resolveBaseOid(repo.base)
+          policySha256Value = await git.policySha256(repo.base)
+          ledger.updateRunPolicy(runId, policySha256Value)
+        }
         await recordStageEvidence(stage, round, execution.workerIdentity, execution.exitCode, execution.report)
         return execution.report
       }
@@ -338,11 +343,6 @@ export async function runPipeline(
       }
 
       await orca.completeTask(taskId, report)
-      if (stage === 'rebase') {
-        baseCommitOid = await git.resolveBaseOid(repo.base)
-        policySha256Value = await git.policySha256(repo.base)
-        ledger.updateRunPolicy(runId, policySha256Value)
-      }
     }
 
     if (retainedFixer) {
