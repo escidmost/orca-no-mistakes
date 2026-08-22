@@ -1809,7 +1809,7 @@ function gateName(): string {
   return `no-mistakes-gate-${Date.now().toString(36)}-${process.pid}`
 }
 
-async function createGateWorktree(
+export async function createGateWorktree(
   parentWorktree: string,
   name: string
 ): Promise<{ branch: string; id: string; path: string }> {
@@ -1845,9 +1845,19 @@ async function createGateWorktree(
   if (!worktree?.id || !worktree.path) {
     throw new Error('gate worktree create returned an invalid receipt')
   }
-  const branch = (await command('git', ['branch', '--show-current'], worktree.path)).stdout.trim()
-  if (!branch) throw new Error('gate worktree did not check out a named gate branch')
-  return { branch, id: worktree.id, path: worktree.path }
+  try {
+    const branch = (await command('git', ['branch', '--show-current'], worktree.path)).stdout.trim()
+    if (!branch) throw new Error('gate worktree did not check out a named gate branch')
+    return { branch, id: worktree.id, path: worktree.path }
+  } catch (error) {
+    await command(
+      orcaCommand,
+      ['worktree', 'rm', '--worktree', `id:${worktree.id}`, '--force', '--json'],
+      parentWorktree,
+      { allowFailure: true }
+    ).catch(() => {})
+    throw error
+  }
 }
 
 async function launchDetachedRun(repoState: RepoState, flags: RawCliFlags): Promise<string> {

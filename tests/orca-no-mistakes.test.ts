@@ -10,6 +10,7 @@ import {
   CliOrca,
   GitShell,
   PIPELINE_STEPS,
+  createGateWorktree,
   installGitGate,
   main,
   parseGateResolution,
@@ -1805,6 +1806,66 @@ test('a fixer that discards gate commits is rejected instead of rewinding the ga
     assert.equal(applied.findings[0]?.id, 'fix-apply-failed')
     assert.equal(git(gatePath, 'rev-parse', 'HEAD'), base)
     await gateShell.assertClean()
+  } finally {
+    await rm(temp, { recursive: true, force: true })
+  }
+})
+
+test('createGateWorktree removes a created gate worktree when validation fails', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'orca-gate-leak-'))
+  const repo = path.join(temp, 'repo')
+  const callsPath = path.join(temp, 'calls.jsonl')
+  const fakeOrca = path.join(temp, 'fake-orca')
+  const notARepo = path.join(temp, 'not-a-repo')
+  try {
+    await mkdir(repo, { recursive: true })
+    await mkdir(notARepo, { recursive: true })
+    git(repo, 'init', '-b', 'feature')
+    git(repo, 'config', 'user.email', 'test@example.com')
+    git(repo, 'config', 'user.name', 'Test User')
+    await writeFile(path.join(repo, 'README.md'), '# repo\n')
+    git(repo, 'add', 'README.md')
+    git(repo, 'commit', '-m', 'initial')
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+if (args[0] === 'worktree' && args[1] === 'create') {
+  console.log(JSON.stringify({ worktree: { id: 'wt-leak', path: ${JSON.stringify(notARepo)} } }))
+} else {
+  console.log(JSON.stringify({ accepted: true }))
+}
+`
+    )
+    await chmod(fakeOrca, 0o755)
+    const previousOrcaCommand = process.env.ORCA_CLI_COMMAND
+    process.env.ORCA_CLI_COMMAND = fakeOrca
+    try {
+      await assert.rejects(
+        createGateWorktree(repo, 'no-mistakes-gate-leak-test'),
+        (error: Error) => /not a git repository|did not check out/.test(error.message)
+      )
+    } finally {
+      if (previousOrcaCommand === undefined) delete process.env.ORCA_CLI_COMMAND
+      else process.env.ORCA_CLI_COMMAND = previousOrcaCommand
+    }
+    const calls = (await readFile(callsPath, 'utf8'))
+      .split('\n')
+      .filter((line) => line.trim())
+      .map((line) => JSON.parse(line) as string[])
+    assert.ok(
+      calls.some(
+        (args) =>
+          args[0] === 'worktree' &&
+          args[1] === 'rm' &&
+          args.includes('--worktree') &&
+          args.includes('id:wt-leak') &&
+          args.includes('--force')
+      ),
+      'the leaked gate worktree is removed when branch validation fails'
+    )
   } finally {
     await rm(temp, { recursive: true, force: true })
   }
