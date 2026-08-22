@@ -22,6 +22,7 @@ import {
   DomainLedger,
   GitShell,
   PIPELINE_STEPS,
+  PostMutationCustodyError,
   RecoveryAnchorError,
   launchAgent,
   startWorkerWithFallback,
@@ -63,7 +64,10 @@ class FakeGit implements GitOperations {
   #head = FakeGit.#oid(1);
   #baseOid = FakeGit.#oid(0);
   divergeAfterAnchor = false;
+  dirtyDelivery = false;
   failRecoveryAnchor = false;
+  failHeadAfterAnchor = false;
+  failRebase = false;
   rebaseConflict = false;
   diffOutput = "";
   #agentsMdAtHead?: string;
@@ -76,7 +80,10 @@ class FakeGit implements GitOperations {
     this.#agentsMdAtHead = content;
     if (content !== undefined) this.#agentsMdOids.add(this.#currentHead());
   }
+  throwOnApply = false;
+  postMutationThrowOnApply = false;
   #operatorDiverged = false;
+  #headReadBroken = false;
   readonly #branch: string;
   readonly #root: string;
 
@@ -111,6 +118,8 @@ class FakeGit implements GitOperations {
   }
 
   async head(): Promise<string> {
+    if (this.#headReadBroken)
+      throw new Error(`could not read HEAD in ${this.#root}`);
     return this.#currentHead();
   }
 
@@ -139,9 +148,9 @@ class FakeGit implements GitOperations {
     }
     if (
       filePath === "AGENTS.md" &&
-      (filePath === "AGENTS.md" &&
-        this.#agentsMdAtHead !== undefined &&
-        (this.#agentsMdOids.has(ref) || ref === this.#currentHead()))
+      filePath === "AGENTS.md" &&
+      this.#agentsMdAtHead !== undefined &&
+      (this.#agentsMdOids.has(ref) || ref === this.#currentHead())
     ) {
       return this.#agentsMdAtHead;
     }
@@ -159,6 +168,7 @@ class FakeGit implements GitOperations {
 
   async rebase(base: string): Promise<StageReport> {
     this.calls.push(`rebase:${base}`);
+    if (this.failRebase) throw new Error("rebase stage could not run");
     this.#baseOid = "b".repeat(40);
     if (this.rebaseConflict) {
       // one-shot: the next rebase models the fixer having resolved the conflict
@@ -189,14 +199,6 @@ class FakeGit implements GitOperations {
     return this.#baseOid;
   }
 
-  async advanceIfUnchanged(fromOid: string, toOid: string): Promise<boolean> {
-    this.calls.push(`ff:${fromOid}->${toOid}`);
-    if ((this.#operatorDiverged ? FakeGit.#oid(9_999) : this.#head) !== fromOid)
-      return false;
-    this.#head = toOid;
-    return true;
-  }
-
   async applyWorktreeCommits(
     sourcePath: string,
     expectedHead: string,
@@ -205,6 +207,13 @@ class FakeGit implements GitOperations {
     this.calls.push(
       `apply:${sourcePath}:${expectedHead}:${fence?.aborted ? "fenced" : "open"}`,
     );
+    if (this.throwOnApply)
+      throw new Error("worker worktree must be clean before applying commits");
+    if (this.postMutationThrowOnApply)
+      throw new PostMutationCustodyError(
+        "custody transfer failed after advancing the operator branch: simulated reset failure",
+      );
+    if (this.dirtyDelivery) return false;
     if (this.#head !== expectedHead || fence?.aborted) return false;
     this.advanceHead();
     return true;
@@ -214,6 +223,7 @@ class FakeGit implements GitOperations {
     this.calls.push(`recover:${runId}:${oid}`);
     if (this.failRecoveryAnchor) throw new Error("recovery ref rejected");
     if (this.divergeAfterAnchor) this.#operatorDiverged = true;
+    if (this.failHeadAfterAnchor) this.#headReadBroken = true;
   }
 
   advanceHead(): void {
@@ -239,11 +249,9 @@ class FakeOrca implements OrcaOperations {
   gateResolution = "approve";
   #taskNumber = 0;
   #dispatchNumber = 0;
-  #git: FakeGit;
   #runId: string;
 
-  constructor(git: FakeGit, runId = `test-run-${randomUUID()}`) {
-    this.#git = git;
+  constructor(_git: FakeGit, runId = `test-run-${randomUUID()}`) {
     this.#runId = runId;
   }
 
@@ -289,7 +297,9 @@ class FakeOrca implements OrcaOperations {
       worktreeId:
         launch.worktree === "new-child" ? `repo::/${dispatchId}` : undefined,
       worktreePath:
-        launch.worktree === "new-child" ? `/worktrees/${dispatchId}` : undefined,
+        launch.worktree === "new-child"
+          ? `/worktrees/${dispatchId}`
+          : undefined,
     };
   }
 
@@ -442,7 +452,10 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
     2,
     "only the intent and AGENTS block closers may appear raw",
   );
-  assert.doesNotMatch(reviewSpec, /\(no textual changes relative to the base\)/);
+  assert.doesNotMatch(
+    reviewSpec,
+    /\(no textual changes relative to the base\)/,
+  );
   for (const launch of orca.launches.filter(
     (launch) => launch.worktree === "new-child",
   )) {
@@ -574,16 +587,15 @@ test("a passing gate transfers final custody to the unchanged initiating worktre
   const result = await runPipeline(
     {
       deliveryGit,
-      intent: "Validate in an isolated gate before updating the feature branch.",
+      intent:
+        "Validate in an isolated gate before updating the feature branch.",
     },
     orca,
     gateGit,
     ledger,
   );
 
-  assert.ok(
-    deliveryGit.calls.some((call) => call.startsWith("apply:/gate:")),
-  );
+  assert.ok(deliveryGit.calls.some((call) => call.startsWith("apply:/gate:")));
   assert.ok(deliveryGit.calls.some((call) => call.startsWith("recover:")));
   assert.ok(!gateGit.calls.some((call) => call.startsWith("recover:")));
   assert.match(result.custodyNote ?? "", /advanced branch feature/);
@@ -1010,9 +1022,7 @@ console.log(JSON.stringify({ result }))
       `path:${gate}`,
     );
     assert.ok(
-      !calls.some(
-        (args) => args[0] === "terminal" && args[1] === "create",
-      ),
+      !calls.some((args) => args[0] === "terminal" && args[1] === "create"),
     );
     assert.equal(
       terminalSend?.[terminalSend.indexOf("--terminal") + 1],
@@ -1032,9 +1042,7 @@ console.log(JSON.stringify({ result }))
     assert.ok(
       commandText.includes(`NO_MISTAKES_ORIGIN_WORKTREE='${canonicalRepo}'`),
     );
-    assert.ok(
-      commandText.includes("NO_MISTAKES_DELIVERY_BRANCH='feature'"),
-    );
+    assert.ok(commandText.includes("NO_MISTAKES_DELIVERY_BRANCH='feature'"));
     assert.ok(commandText.includes("'--notify' 'originating-opencode'"));
     assert.ok(
       commandText.includes("'--intent' 'Validate detached coordination.'"),
@@ -1653,7 +1661,8 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     for (;;) {
       const calls = await readFile(callsPath, "utf8");
       if (calls.includes('["terminal","list"')) break;
-      if (Date.now() >= deadline) throw new Error("worker did not reach trust setup");
+      if (Date.now() >= deadline)
+        throw new Error("worker did not reach trust setup");
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     await new Promise((resolve) => setTimeout(resolve, 50));
@@ -1754,11 +1763,6 @@ test("GitShell rebases a clean feature branch, hashes trusted policy, and return
     assert.match(policyBefore, /^[0-9a-f]{64}$/);
     const head = await shell.head();
 
-    assert.equal(
-      await shell.advanceIfUnchanged("deadbeef".repeat(5).slice(0, 40), head),
-      false,
-    );
-    assert.equal(await shell.advanceIfUnchanged(head, head), true);
     await shell.anchorRecoveryRef("run-custody", head);
     assert.equal(
       git(repo, "rev-parse", "refs/no-mistakes/recover/run-custody"),
@@ -1791,7 +1795,10 @@ test("GitShell applies append-only commits and adopts rewritten history behind a
     const shell = new GitShell({ repo });
     assert.equal(await shell.applyWorktreeCommits(gate, submission), true);
     assert.equal(git(repo, "rev-parse", "HEAD"), terminal);
-    assert.equal(await readFile(path.join(repo, "feature.txt"), "utf8"), "after\n");
+    assert.equal(
+      await readFile(path.join(repo, "feature.txt"), "utf8"),
+      "after\n",
+    );
 
     await writeFile(path.join(gate, "feature.txt"), "rewritten\n");
     git(gate, "add", "feature.txt");
@@ -1820,6 +1827,64 @@ test("GitShell applies append-only commits and adopts rewritten history behind a
       false,
     );
     assert.equal(git(repo, "rev-parse", "HEAD"), rewritten);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("three-way containment advances clean checkouts and preserves diverged ones behind a recovery ref", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-containment-"));
+  const repo = path.join(temp, "repo");
+  const gate = path.join(temp, "gate");
+  try {
+    git(temp, "init", repo);
+    git(repo, "config", "user.email", "test@example.com");
+    git(repo, "config", "user.name", "Test User");
+    git(repo, "checkout", "-b", "feature");
+    await writeFile(path.join(repo, "feature.txt"), "before\n");
+    git(repo, "add", "feature.txt");
+    git(repo, "commit", "-m", "submission");
+    const submission = git(repo, "rev-parse", "HEAD");
+    git(repo, "worktree", "add", "-b", "gate", gate, "feature");
+    await writeFile(path.join(gate, "feature.txt"), "after\n");
+    git(gate, "add", "feature.txt");
+    git(gate, "commit", "-m", "terminal");
+    const terminal = git(gate, "rev-parse", "HEAD");
+    const shell = new GitShell({ repo });
+
+    // Diverged checkout (C_op != C_sub): HEAD untouched, terminal behind ref.
+    await writeFile(path.join(repo, "author.txt"), "author edit\n");
+    git(repo, "add", "author.txt");
+    git(repo, "commit", "-m", "author edit");
+    const divergedHead = git(repo, "rev-parse", "HEAD");
+    assert.notEqual(divergedHead, submission);
+    assert.equal(await shell.applyWorktreeCommits(gate, submission), false);
+    assert.equal(git(repo, "rev-parse", "HEAD"), divergedHead);
+    await shell.anchorRecoveryRef("run-containment", terminal);
+    assert.equal(
+      git(repo, "rev-parse", "refs/no-mistakes/recover/run-containment"),
+      terminal,
+    );
+
+    // Dirty checkout: reported as a refusal, not an error; HEAD and the
+    // operator's uncommitted work are left untouched.
+    git(repo, "reset", "--hard", submission);
+    await writeFile(path.join(repo, "feature.txt"), "operator edit\n");
+    assert.equal(await shell.applyWorktreeCommits(gate, submission), false);
+    assert.equal(git(repo, "rev-parse", "HEAD"), submission);
+    assert.equal(
+      await readFile(path.join(repo, "feature.txt"), "utf8"),
+      "operator edit\n",
+    );
+
+    // Clean checkout (C_op == C_sub): custody returns via fast-forward.
+    git(repo, "reset", "--hard", submission);
+    assert.equal(await shell.applyWorktreeCommits(gate, submission), true);
+    assert.equal(git(repo, "rev-parse", "HEAD"), terminal);
+    assert.equal(
+      await readFile(path.join(repo, "feature.txt"), "utf8"),
+      "after\n",
+    );
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
@@ -1931,9 +1996,17 @@ test("GitShell.applyWorktreeCommits adopts rewritten rebase history behind a bac
 
     const shell = new GitShell({ repo: operator });
     assert.equal(await shell.applyWorktreeCommits(worker, pinnedHead), true);
-    assert.equal(git(operator, "rev-parse", "HEAD"), git(worker, "rev-parse", "HEAD"));
     assert.equal(
-      git(operator, "rev-parse", "--verify", `refs/no-mistakes/backup/${pinnedHead}`),
+      git(operator, "rev-parse", "HEAD"),
+      git(worker, "rev-parse", "HEAD"),
+    );
+    assert.equal(
+      git(
+        operator,
+        "rev-parse",
+        "--verify",
+        `refs/no-mistakes/backup/${pinnedHead}`,
+      ),
       pinnedHead,
     );
   } finally {
@@ -2426,9 +2499,7 @@ test("runPipeline applies the user-global default agent", async () => {
     );
 
     assert.ok(orca.launches.length > 0);
-    assert.ok(
-      orca.launches.every((launch) => launch.agent?.harness === "agy"),
-    );
+    assert.ok(orca.launches.every((launch) => launch.agent?.harness === "agy"));
     const manifestPath = path.join(
       homedir(),
       ".orca-no-mistakes",
@@ -2438,10 +2509,7 @@ test("runPipeline applies the user-global default agent", async () => {
     );
     const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
     assert.deepEqual(manifest.effective_config, manifest.resolved_config);
-    assert.equal(
-      manifest.effective_config.stages.review.reviewer.agent,
-      "agy",
-    );
+    assert.equal(manifest.effective_config.stages.review.reviewer.agent, "agy");
     assert.equal(
       manifest.effective_policy_hash,
       effectivePolicyHash(manifest.effective_config),
@@ -3103,7 +3171,11 @@ test("fallback chains settle each failed candidate before the next launch", asyn
     await mkdir(evidence, { recursive: true });
     await writeFile(
       reportPath,
-      JSON.stringify({ findings: [], summary: "second candidate done", tested: [] }),
+      JSON.stringify({
+        findings: [],
+        summary: "second candidate done",
+        tested: [],
+      }),
     );
     await writeFile(
       fakeOrca,
@@ -3136,18 +3208,40 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
 `,
     );
     await chmod(fakeOrca, 0o755);
-    const roleConfig = { enabled: false, max_rounds: 0, allow_review_autofix: false };
+    const roleConfig = {
+      enabled: false,
+      max_rounds: 0,
+      allow_review_autofix: false,
+    };
     const [grok, claude] = ["grok", "claude"].map(
       (harness) => launchAgent({ auto_fix: roleConfig, agent: harness })![0],
     );
     const launches: WorkerLaunch[] = [
-      { agent: grok, name: "first", prompt: "instructions", role: "reviewer", stage: "lint", worktree: "current" },
-      { agent: claude, name: "second", prompt: "instructions", role: "reviewer", stage: "lint", worktree: "current" },
+      {
+        agent: grok,
+        name: "first",
+        prompt: "instructions",
+        role: "reviewer",
+        stage: "lint",
+        worktree: "current",
+      },
+      {
+        agent: claude,
+        name: "second",
+        prompt: "instructions",
+        role: "reviewer",
+        stage: "lint",
+        worktree: "current",
+      },
     ];
 
     const orca = new CliOrca({ command: fakeOrca, cwd: temp });
     await orca.createRun("fallback chain settlement");
-    const outcome = await startWorkerWithFallback(orca, () => Promise.resolve("task-chain"), launches);
+    const outcome = await startWorkerWithFallback(
+      orca,
+      () => Promise.resolve("task-chain"),
+      launches,
+    );
 
     assert.equal(outcome.resolvedAgent, "claude");
     assert.deepEqual(
@@ -3172,8 +3266,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       .filter((index) => index >= 0);
     assert.equal(createIndexes.length, 1);
     const nextLaunchIndex = calls.findIndex(
-      (args) =>
-        args[0] === "orchestration" && args[1] === "worker-start",
+      (args) => args[0] === "orchestration" && args[1] === "worker-start",
     );
     assert.ok(nextLaunchIndex !== -1);
     assert.ok(closeIndex !== -1);
@@ -3214,8 +3307,11 @@ test("launchAgent carries role settings even when no agent harness is configured
   assert.equal(
     buildCliCommand(
       "opencode",
-      launchAgent({ auto_fix: autoFix, model: "gpt-5.6", effort: "high" })?.[0] ??
-        {},
+      launchAgent({
+        auto_fix: autoFix,
+        model: "gpt-5.6",
+        effort: "high",
+      })?.[0] ?? {},
     ),
     `'opencode' '--model' 'gpt-5.6' '--variant' 'high'`,
   );
@@ -3234,23 +3330,31 @@ test("launchAgent carries role settings even when no agent harness is configured
 test("fallback chains advance only on preflight failures and settle between candidates", async () => {
   const git = new FakeGit();
   const orca = new FakeOrca(git);
-  const roleConfig = { enabled: false, max_rounds: 0, allow_review_autofix: false };
-  const launches = (
-    ["claude", "grok", "acp:gemini"] as const
-  ).map((harness, index): WorkerLaunch => ({
-    agent: launchAgent({ auto_fix: roleConfig, agent: harness })![0],
-    name: `no-mistakes-lint-1-${index}`,
-    prompt: `prompt for ${harness}`,
-    role: "reviewer",
-    stage: "lint",
-    worktree: "new-child",
-  }));
+  const roleConfig = {
+    enabled: false,
+    max_rounds: 0,
+    allow_review_autofix: false,
+  };
+  const launches = (["claude", "grok", "acp:gemini"] as const).map(
+    (harness, index): WorkerLaunch => ({
+      agent: launchAgent({ auto_fix: roleConfig, agent: harness })![0],
+      name: `no-mistakes-lint-1-${index}`,
+      prompt: `prompt for ${harness}`,
+      role: "reviewer",
+      stage: "lint",
+      worktree: "new-child",
+    }),
+  );
 
   orca.launchFailures.push(
     new PreflightError("readiness-timeout", "claude did not become ready"),
     new PreflightError("quota", "429 quota exhausted for grok"),
   );
-  const outcome = await startWorkerWithFallback(orca, () => Promise.resolve("task-fb"), launches);
+  const outcome = await startWorkerWithFallback(
+    orca,
+    () => Promise.resolve("task-fb"),
+    launches,
+  );
   assert.equal(outcome.resolvedAgent, "acp:gemini");
   assert.equal(outcome.worker.dispatchId, "dispatch-1");
   assert.deepEqual(
@@ -3271,20 +3375,24 @@ test("fallback chains advance only on preflight failures and settle between cand
 test("execution-phase errors do not advance the fallback chain", async () => {
   const git = new FakeGit();
   const orca = new FakeOrca(git);
-  const roleConfig = { enabled: false, max_rounds: 0, allow_review_autofix: false };
-  const launches = (
-    ["claude", "grok"] as const
-  ).map((harness): WorkerLaunch => ({
-    agent: launchAgent({
-      auto_fix: roleConfig,
-      agent: harness,
-    })![0],
-    name: "no-mistakes-test-1",
-    prompt: "instructions",
-    role: "reviewer",
-    stage: "test",
-    worktree: "new-child",
-  }));
+  const roleConfig = {
+    enabled: false,
+    max_rounds: 0,
+    allow_review_autofix: false,
+  };
+  const launches = (["claude", "grok"] as const).map(
+    (harness): WorkerLaunch => ({
+      agent: launchAgent({
+        auto_fix: roleConfig,
+        agent: harness,
+      })![0],
+      name: "no-mistakes-test-1",
+      prompt: "instructions",
+      role: "reviewer",
+      stage: "test",
+      worktree: "new-child",
+    }),
+  );
   orca.launchFailures.push(new Error(`test stage failed: 3 failing tests`));
 
   await assert.rejects(
@@ -3297,23 +3405,30 @@ test("execution-phase errors do not advance the fallback chain", async () => {
 test("exhausted chains fail closed with aggregated candidate diagnostics", async () => {
   const git = new FakeGit();
   const orca = new FakeOrca(git);
-  const launches = (
-    ["claude", "grok", "codex"] as const
-  ).map((harness): WorkerLaunch => ({
-    agent: launchAgent({
-      auto_fix: { enabled: false, max_rounds: 0, allow_review_autofix: false },
-      agent: harness,
-    })![0],
-    name: "no-mistakes-review-1",
-    prompt: "instructions",
-    role: "reviewer",
-    stage: "review",
-    worktree: "new-child",
-  }));
+  const launches = (["claude", "grok", "codex"] as const).map(
+    (harness): WorkerLaunch => ({
+      agent: launchAgent({
+        auto_fix: {
+          enabled: false,
+          max_rounds: 0,
+          allow_review_autofix: false,
+        },
+        agent: harness,
+      })![0],
+      name: "no-mistakes-review-1",
+      prompt: "instructions",
+      role: "reviewer",
+      stage: "review",
+      worktree: "new-child",
+    }),
+  );
   orca.launchFailures.push(
     new PreflightError("binary-missing", "spawn claude ENOENT"),
     new PreflightError("auth", "grok: not logged in"),
-    new PreflightError("unclassified", "terminal create returned an invalid receipt"),
+    new PreflightError(
+      "unclassified",
+      "terminal create returned an invalid receipt",
+    ),
   );
 
   await assert.rejects(
@@ -3331,20 +3446,41 @@ test("exhausted chains fail closed with aggregated candidate diagnostics", async
 });
 
 test("preflight failure classification maps known launch failures", () => {
-  assert.equal(classifyPreflightFailure("worker-start failed: spawn codex ENOENT"), "binary-missing");
-  assert.equal(classifyPreflightFailure("HTTP 429 rate limit exceeded"), "quota");
+  assert.equal(
+    classifyPreflightFailure("worker-start failed: spawn codex ENOENT"),
+    "binary-missing",
+  );
+  assert.equal(
+    classifyPreflightFailure("HTTP 429 rate limit exceeded"),
+    "quota",
+  );
   assert.equal(classifyPreflightFailure("monthly quota exhausted"), "quota");
-  assert.equal(classifyPreflightFailure("gemini: not logged in; run auth login"), "auth");
-  assert.equal(classifyPreflightFailure("claude did not become ready before the timeout"), "readiness-timeout");
-  assert.equal(classifyPreflightFailure("worker agent terminal exited during startup"), "readiness-timeout");
-  assert.equal(classifyPreflightFailure("something else went wrong"), "unclassified");
+  assert.equal(
+    classifyPreflightFailure("gemini: not logged in; run auth login"),
+    "auth",
+  );
+  assert.equal(
+    classifyPreflightFailure("claude did not become ready before the timeout"),
+    "readiness-timeout",
+  );
+  assert.equal(
+    classifyPreflightFailure("worker agent terminal exited during startup"),
+    "readiness-timeout",
+  );
+  assert.equal(
+    classifyPreflightFailure("something else went wrong"),
+    "unclassified",
+  );
 });
 
 test("each fallback candidate is dispatched with its own task spec", async () => {
   const git = new FakeGit();
   const orca = new FakeOrca(git);
   orca.launchFailures.push(
-    new PreflightError("readiness-timeout", "acp:gemini-dev did not become ready"),
+    new PreflightError(
+      "readiness-timeout",
+      "acp:gemini-dev did not become ready",
+    ),
   );
   await runPipeline(
     {
@@ -3354,7 +3490,9 @@ test("each fallback candidate is dispatched with its own task spec", async () =>
     orca,
     git,
   );
-  const checkTasks = orca.tasks.filter((task) => /^\[\w+ check /.test(task.spec));
+  const checkTasks = orca.tasks.filter((task) =>
+    /^\[\w+ check /.test(task.spec),
+  );
   assert.match(
     checkTasks[0].spec,
     /Do not write a report file and do not call worker_done/,
@@ -3371,7 +3509,10 @@ test("acp runner timeouts stay execution-phase failures", async () => {
   try {
     git(temp, "init", "-b", "feature");
     await mkdir(worktreePath);
-    await writeFile(fakeAcpx, "#!/usr/bin/env node\nsetTimeout(() => {}, 60000)\n");
+    await writeFile(
+      fakeAcpx,
+      "#!/usr/bin/env node\nsetTimeout(() => {}, 60000)\n",
+    );
     await chmod(fakeAcpx, 0o755);
     await writeFile(
       fakeOrca,
@@ -3431,9 +3572,7 @@ test("reviewer fallback attempts are recorded in stage evidence with resolved_ag
 
   const logsDir = path.join(artifactsRoot(), result.runId, "logs");
   const logFiles = await readdir(logsDir);
-  const reviewLogName = logFiles.find((name) =>
-    name.startsWith("review-r0-"),
-  );
+  const reviewLogName = logFiles.find((name) => name.startsWith("review-r0-"));
   assert.ok(reviewLogName);
   const reviewLog = JSON.parse(
     await readFile(path.join(logsDir, reviewLogName), "utf8"),
@@ -3653,9 +3792,211 @@ test("custody return preserves diverged operator checkouts behind a recovery ref
     result.custodyNote ?? "",
     /diverged.*refs\/no-mistakes\/recover\//,
   );
-  assert.ok(!git.calls.some((call) => call.startsWith("ff:")));
+  assert.match(
+    result.custodyNote ?? "",
+    /git log refs\/no-mistakes\/recover\//,
+  );
+  assert.match(
+    result.custodyNote ?? "",
+    /git rebase refs\/no-mistakes\/recover\//,
+  );
+  assert.ok(!git.calls.some((call) => call.startsWith("apply:")));
   assert.ok(git.calls.some((call) => call.startsWith("recover:")));
   assert.equal(ledger.runStatus(result.runId), "passed");
+});
+
+test("a dirty delivery checkout preserves custody behind a recovery ref instead of failing the run", async () => {
+  const gateGit = new FakeGit("/gate", "no-mistakes-gate-test");
+  const deliveryGit = new FakeGit("/origin", "feature");
+  deliveryGit.dirtyDelivery = true;
+  const orca = new FakeOrca(gateGit);
+  const ledger = new DomainLedger(":memory:");
+
+  const result = await runPipeline(
+    {
+      deliveryGit,
+      intent: "Dirty operator checkout.",
+    },
+    orca,
+    gateGit,
+    ledger,
+  );
+
+  assert.match(result.custodyNote ?? "", /refs\/no-mistakes\/recover\//);
+  assert.match(result.custodyNote ?? "", /uncommitted changes/);
+  assert.match(result.custodyNote ?? "", /stash/);
+  assert.ok(deliveryGit.calls.some((call) => call.startsWith("apply:")));
+  assert.ok(deliveryGit.calls.some((call) => call.startsWith("recover:")));
+  assert.equal(ledger.runStatus(result.runId), "passed");
+});
+
+test("a pipeline-side transfer failure is reported as such, not as operator divergence", async () => {
+  const gateGit = new FakeGit("/gate", "no-mistakes-gate-test");
+  const deliveryGit = new FakeGit("/origin", "feature");
+  deliveryGit.throwOnApply = true;
+  const orca = new FakeOrca(gateGit);
+  const ledger = new DomainLedger(":memory:");
+
+  const result = await runPipeline(
+    {
+      deliveryGit,
+      intent: "Pipeline worktree dirtied mid-transfer.",
+    },
+    orca,
+    gateGit,
+    ledger,
+  );
+
+  assert.match(result.custodyNote ?? "", /refs\/no-mistakes\/recover\//);
+  assert.match(result.custodyNote ?? "", /custody transfer failed/);
+  assert.match(
+    result.custodyNote ?? "",
+    /worker worktree must be clean before applying commits/,
+  );
+  assert.ok(!/diverged/.test(result.custodyNote ?? ""));
+  assert.ok(deliveryGit.calls.some((call) => call.startsWith("apply:")));
+  assert.ok(deliveryGit.calls.some((call) => call.startsWith("recover:")));
+  assert.equal(ledger.runStatus(result.runId), "passed");
+});
+
+test("a post-mutation transfer failure fails the run instead of certifying it passed", async () => {
+  const gateGit = new FakeGit("/gate", "no-mistakes-gate-test");
+  const deliveryGit = new FakeGit("/origin", "feature");
+  deliveryGit.postMutationThrowOnApply = true;
+  const orca = new FakeOrca(gateGit);
+  const ledger = new DomainLedger(":memory:");
+
+  let failure: unknown;
+  try {
+    await runPipeline(
+      { deliveryGit, intent: "Transfer broke after mutating the branch." },
+      orca,
+      gateGit,
+      ledger,
+    );
+  } catch (error) {
+    failure = error;
+  }
+
+  assert.ok(failure instanceof PostMutationCustodyError);
+  assert.match(
+    (failure as Error).message,
+    /custody transfer failed after advancing the operator branch/,
+  );
+  const { recoverRef } = failure as Error & { recoverRef?: string };
+  assert.match(recoverRef ?? "", /^refs\/no-mistakes\/recover\//);
+  assert.ok(deliveryGit.calls.some((call) => call.startsWith("recover:")));
+});
+
+test("failed terminations tag the anchored recovery ref for the terminal notification", async () => {
+  const git = new FakeGit("/gate", "no-mistakes-gate-test");
+  const deliveryGit = new FakeGit("/origin", "feature");
+  const orca = new FakeOrca(git);
+  const ledger = new DomainLedger(":memory:");
+  orca.gateResolution = "later";
+  orca.reports.set("document", [
+    {
+      findings: [
+        {
+          id: "docs-choice",
+          severity: "warning",
+          action: "ask-user",
+          description: "Documentation ownership is unclear.",
+        },
+      ],
+      summary: "decision needed",
+    },
+  ]);
+
+  let failure: unknown;
+  try {
+    await runPipeline(
+      { deliveryGit, intent: "Surface recovery on failure." },
+      orca,
+      git,
+      ledger,
+    );
+  } catch (error) {
+    failure = error;
+  }
+
+  assert.ok(failure instanceof Error);
+  const { recoverRef } = failure as Error & { recoverRef?: string };
+
+  assert.match(recoverRef ?? "", /^refs\/no-mistakes\/recover\/test-run-/);
+  assert.ok(deliveryGit.calls.some((call) => call.startsWith("recover:")));
+  assert.equal(ledger.leaseFor("/origin", "feature"), undefined);
+});
+
+test("a failed run that produced no commits omits the recovery instructions", async () => {
+  const git = new FakeGit("/gate", "no-mistakes-gate-test");
+  const deliveryGit = new FakeGit("/origin", "feature");
+  git.failRebase = true;
+  const orca = new FakeOrca(git);
+  const ledger = new DomainLedger(":memory:");
+
+  let failure: unknown;
+  try {
+    await runPipeline(
+      { deliveryGit, intent: "Fail without producing commits." },
+      orca,
+      git,
+      ledger,
+    );
+  } catch (error) {
+    failure = error;
+  }
+
+  assert.ok(failure instanceof Error);
+  assert.equal(await git.head(), await deliveryGit.head());
+  assert.equal(
+    (failure as Error & { recoverRef?: string }).recoverRef,
+    undefined,
+  );
+  assert.ok(deliveryGit.calls.some((call) => call.startsWith("recover:")));
+});
+
+test("a failed run whose delivery head cannot be read still anchors custody", async () => {
+  const git = new FakeGit("/gate", "no-mistakes-gate-test");
+  const deliveryGit = new FakeGit("/origin", "feature");
+  deliveryGit.failHeadAfterAnchor = true;
+  const orca = new FakeOrca(git);
+  const ledger = new DomainLedger(":memory:");
+  orca.gateResolution = "later";
+  orca.reports.set("document", [
+    {
+      findings: [
+        {
+          id: "docs-choice",
+          severity: "warning",
+          action: "ask-user",
+          description: "Documentation ownership is unclear.",
+        },
+      ],
+      summary: "decision needed",
+    },
+  ]);
+
+  let failure: unknown;
+  try {
+    await runPipeline(
+      { deliveryGit, intent: "Operator checkout vanished mid-run." },
+      orca,
+      git,
+      ledger,
+    );
+  } catch (error) {
+    failure = error;
+  }
+
+  assert.ok(failure instanceof Error);
+  assert.ok(!(failure instanceof RecoveryAnchorError));
+  assert.match(
+    (failure as Error & { recoverRef?: string }).recoverRef ?? "",
+    /^refs\/no-mistakes\/recover\/test-run-/,
+  );
+  assert.ok(deliveryGit.calls.some((call) => call.startsWith("recover:")));
+  assert.equal(ledger.leaseFor("/origin", "feature"), undefined);
 });
 
 test("capLog preserves head and tail of oversized logs", () => {
@@ -3781,16 +4122,19 @@ test("the domain ledger auto-initializes at the default path and records submiss
            FROM runs WHERE run_id = ?`,
         )
         .get(result.runId) as Record<string, string>;
-      assert.deepEqual({ ...run }, {
-        base_branch: "main",
-        branch: "feature",
-        intent: "Record submission metadata.",
-        intent_hash: sha256("Record submission metadata."),
-        policy_sha256: "f".repeat(64),
-        repo_root: "/repo",
-        status: "passed",
-        submission_commit_oid: "1".padStart(40, "0"),
-      });
+      assert.deepEqual(
+        { ...run },
+        {
+          base_branch: "main",
+          branch: "feature",
+          intent: "Record submission metadata.",
+          intent_hash: sha256("Record submission metadata."),
+          policy_sha256: "f".repeat(64),
+          repo_root: "/repo",
+          status: "passed",
+          submission_commit_oid: "1".padStart(40, "0"),
+        },
+      );
     } finally {
       db.close();
     }
@@ -4412,16 +4756,17 @@ test("stage evidence binds effective policy provenance into artifacts and the le
 
   const logsDir = path.join(artifactsRoot(), result.runId, "logs");
   const logFiles = await readdir(logsDir);
-  const reviewLogName = logFiles.find((name) =>
-    name.startsWith("review-r0-"),
-  );
+  const reviewLogName = logFiles.find((name) => name.startsWith("review-r0-"));
   assert.ok(reviewLogName);
   const raw = await readFile(path.join(logsDir, reviewLogName!), "utf8");
   const reviewLog = JSON.parse(raw) as {
     effective_policy_hash?: string;
     base_ref_sha?: string;
   };
-  assert.equal(reviewLog.effective_policy_hash, result.policy.effectivePolicyHash);
+  assert.equal(
+    reviewLog.effective_policy_hash,
+    result.policy.effectivePolicyHash,
+  );
   assert.equal(reviewLog.base_ref_sha, result.policy.baseRefSha);
   assert.equal(
     sha256(raw),

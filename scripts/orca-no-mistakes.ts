@@ -168,7 +168,6 @@ export interface GitOperations {
   pathExists(ref: string, filePath: string): Promise<boolean>;
   policySha256(base: string): Promise<string>;
   resolveBaseOid(base: string): Promise<string>;
-  advanceIfUnchanged(fromOid: string, toOid: string): Promise<boolean>;
   applyWorktreeCommits(
     sourcePath: string,
     expectedHead: string,
@@ -201,7 +200,25 @@ export type PipelineResult = {
 
 type RepoState = Awaited<ReturnType<GitOperations["assertReady"]>>;
 
+type CustodyTaggedError = Error & { recoverRef?: string };
+
+function recoveryRefFor(runId: string): string {
+  return `refs/no-mistakes/recover/${runId}`;
+}
+
+function recoveryInstructions(recoverRef: string): string {
+  return (
+    `pipeline commits preserved at ${recoverRef} — inspect with \`git log ${recoverRef}\`, ` +
+    `then commit or stash local changes before integrating with e.g. \`git rebase ${recoverRef}\``
+  );
+}
+
 export class GateStopError extends Error {}
+
+// Thrown when a rewritten-history custody transfer failed after the operator's
+// branch ref was already advanced: the run must fail instead of degrading to a
+// custody note, so the operator is told something went wrong.
+export class PostMutationCustodyError extends Error {}
 
 export class RecoveryAnchorError extends Error {
   readonly outcome: "cancelled" | "failed";
@@ -451,11 +468,7 @@ export async function runPipeline(
 
     for (const stage of PIPELINE_STEPS) {
       const taskId = stageTasks.get(stage)!;
-      ledger.heartbeatLease(
-        deliveryRepo.root,
-        deliveryRepo.branch,
-        runId,
-      );
+      ledger.heartbeatLease(deliveryRepo.root, deliveryRepo.branch, runId);
       await orca.setWorktreeStatus(
         `${statusPrefix}no-mistakes ${stage} (${stageIndex(stage)}/${PIPELINE_STEPS.length})`,
         "in-progress",
@@ -463,8 +476,7 @@ export async function runPipeline(
       let round = 0;
       let attempt = 0;
       let inheritedFallback:
-        | { attempts: FallbackAttempt[]; resolvedAgent: string }
-        | undefined;
+        { attempts: FallbackAttempt[]; resolvedAgent: string } | undefined;
       const runStage = async () => {
         const execution = await executeStage(
           stage,
@@ -588,11 +600,7 @@ export async function runPipeline(
         }
 
         round += 1;
-        ledger.heartbeatLease(
-          deliveryRepo.root,
-          deliveryRepo.branch,
-          runId,
-        );
+        ledger.heartbeatLease(deliveryRepo.root, deliveryRepo.branch, runId);
         const fixerRoles = pipelineConfig.stages[stage].fixer;
         const nextFixer = await withTimeout(
           fixerRoles.timeout_ms,
@@ -633,6 +641,10 @@ export async function runPipeline(
     }
 
     const terminalCommitOid = await git.head();
+    // Anchor custody before the containment decision: in gate mode the gate
+    // worktree is removed after the run, so the terminal commit must be
+    // referenced in the delivery repo before any HEAD-advancing merge is
+    // attempted. On clean runs the ref is a harmless bookmark.
     await deliveryGit.anchorRecoveryRef(runId, terminalCommitOid);
     const operatorHead = await deliveryGit.head();
     let custodyNote: string;
@@ -641,21 +653,31 @@ export async function runPipeline(
         operatorHead === submissionCommitOid
           ? `branch ${deliveryRepo.branch} already at submission commit ${submissionCommitOid}`
           : `branch ${deliveryRepo.branch} carries the terminal commit ${terminalCommitOid}`;
-    } else if (
-      operatorHead === submissionCommitOid &&
-      (deliveryGit === git
-        ? await deliveryGit.advanceIfUnchanged(
-            submissionCommitOid,
-            terminalCommitOid,
-          )
-        : await deliveryGit.applyWorktreeCommits(
+    } else {
+      const recoverRef = recoveryRefFor(runId);
+      let advanced = false;
+      let transferFailure: string | undefined;
+      if (deliveryGit !== git && operatorHead === submissionCommitOid) {
+        try {
+          advanced = await deliveryGit.applyWorktreeCommits(
             repo.root,
             submissionCommitOid,
-          ))
-    ) {
-      custodyNote = `advanced branch ${deliveryRepo.branch} from submission to terminal commit ${terminalCommitOid}`;
-    } else {
-      custodyNote = `operator checkout diverged from the pipeline head; terminal commit preserved at refs/no-mistakes/recover/${runId}`;
+          );
+        } catch (error) {
+          if (error instanceof PostMutationCustodyError) {
+            throw error;
+          }
+          transferFailure =
+            error instanceof Error ? error.message : String(error);
+        }
+      }
+      custodyNote = advanced
+        ? `advanced branch ${deliveryRepo.branch} from submission to terminal commit ${terminalCommitOid}`
+        : transferFailure
+          ? `custody transfer failed on the pipeline side (${transferFailure}); ` +
+            recoveryInstructions(recoverRef)
+          : "operator checkout diverged or carries uncommitted changes; " +
+            recoveryInstructions(recoverRef);
     }
 
     const attestation = buildAttestation(stageEntries, {
@@ -684,10 +706,19 @@ export async function runPipeline(
   } catch (error) {
     const outcome = error instanceof GateStopError ? "cancelled" : "failed";
     let anchorError: unknown;
+    let anchoredOid: string | undefined;
     try {
-      await deliveryGit.anchorRecoveryRef(runId, await git.head());
+      anchoredOid = await git.head();
+      await deliveryGit.anchorRecoveryRef(runId, anchoredOid);
     } catch (recoveryError) {
       anchorError = recoveryError;
+      anchoredOid = undefined;
+    }
+    if (anchoredOid !== undefined && error instanceof Error) {
+      const operatorHead = await deliveryGit.head().catch(() => undefined);
+      if (operatorHead !== anchoredOid) {
+        (error as CustodyTaggedError).recoverRef = recoveryRefFor(runId);
+      }
     }
     if (!anchorError) ledger.releaseLease(runId);
     ledger.finishRun(runId, outcome);
@@ -707,9 +738,7 @@ export async function runPipeline(
 
 type StageRoles = { fixer: ResolvedRoleConfig; reviewer: ResolvedRoleConfig };
 
-export function launchAgent(
-  config: ResolvedRoleConfig,
-): WorkerAgent[] {
+export function launchAgent(config: ResolvedRoleConfig): WorkerAgent[] {
   const fallbacks = {
     effort: config.effort,
     model: config.model,
@@ -757,7 +786,9 @@ async function withTimeout<T>(
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
           fence.aborted = true;
-          reject(new Error(`${label} exceeded its ${timeoutMs}ms execution timeout`));
+          reject(
+            new Error(`${label} exceeded its ${timeoutMs}ms execution timeout`),
+          );
         }, timeoutMs);
       }),
     ]);
@@ -878,21 +909,18 @@ async function executeStage(
       resolvedAgent: "coordinator",
     };
   }
-  return await withTimeout(
-    roles.reviewer.timeout_ms,
-    `${stage} reviewer`,
-    () =>
-      runReviewer(
-        stage,
-        attempt,
-        taskId,
-        intent,
-        evidenceDir,
-        repo,
-        orca,
-        git,
-        roles.reviewer,
-      ),
+  return await withTimeout(roles.reviewer.timeout_ms, `${stage} reviewer`, () =>
+    runReviewer(
+      stage,
+      attempt,
+      taskId,
+      intent,
+      evidenceDir,
+      repo,
+      orca,
+      git,
+      roles.reviewer,
+    ),
   );
 }
 
@@ -1027,7 +1055,6 @@ async function runFixer(
     if (!(await git.applyWorktreeCommits(worker.worktreePath, before, fence))) {
       throw new Error(`${stage} fixer could not apply its committed change`);
     }
-    await git.assertClean();
     const after = await git.head();
     if (before === after) {
       throw new Error(`${stage} fixer did not commit a change`);
@@ -2265,10 +2292,7 @@ export class CliOrca implements OrcaOperations {
         variant: launch.agent?.variant,
       });
       if (initialPrompt !== undefined) {
-        const promptDir = path.join(
-          artifactsRoot(),
-          this.#runId ?? "unbound",
-        );
+        const promptDir = path.join(artifactsRoot(), this.#runId ?? "unbound");
         await mkdir(promptDir, { recursive: true });
         promptPath = path.join(promptDir, `prompt-${randomUUID()}.txt`);
         await writeFile(promptPath, initialPrompt, { mode: 0o600 });
@@ -2324,7 +2348,8 @@ export class CliOrca implements OrcaOperations {
           return parsed as { pid: number; token: string };
         }
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined;
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT")
+          return undefined;
       }
       return undefined;
     };
@@ -2443,8 +2468,7 @@ export class CliOrca implements OrcaOperations {
     harness: string,
     promptSubmitted = false,
   ): Promise<void> {
-    const waitsForPrompt =
-      harness.toLowerCase() === "agy" && !promptSubmitted;
+    const waitsForPrompt = harness.toLowerCase() === "agy" && !promptSubmitted;
     const ready = readinessMatcher(harness);
     const deadline = Date.now() + workerAgentReadyTimeoutMs();
     let consecutiveMatches = 0;
@@ -3197,9 +3221,12 @@ export class GitShell implements GitOperations {
     return resolved;
   }
 
+  async isClean(): Promise<boolean> {
+    return !(await this.#git(["status", "--porcelain"])).stdout.trim();
+  }
+
   async assertClean(): Promise<void> {
-    const status = (await this.#git(["status", "--porcelain"])).stdout.trim();
-    if (status)
+    if (!(await this.isClean()))
       throw new Error("no-mistakes requires a clean committed worktree");
   }
 
@@ -3240,20 +3267,13 @@ export class GitShell implements GitOperations {
     return digest.digest("hex");
   }
 
-  async advanceIfUnchanged(fromOid: string, toOid: string): Promise<boolean> {
-    const current = await this.head();
-    if (current !== fromOid) return false;
-    const merge = await this.#git(["merge", "--ff-only", toOid], true);
-    return !merge.failed;
-  }
-
   async applyWorktreeCommits(
     sourcePath: string,
     expectedHead: string,
     fence?: { readonly aborted: boolean },
   ): Promise<boolean> {
     if (fence?.aborted) return false;
-    await this.assertClean();
+    if (!(await this.isClean())) return false;
     if ((await this.head()) !== expectedHead) return false;
     const sourceStatus = await this.#git(
       ["-C", sourcePath, "status", "--porcelain"],
@@ -3298,11 +3318,7 @@ export class GitShell implements GitOperations {
     if (!casSucceeded) return false;
     try {
       const backup = await this.#git(
-        [
-          "update-ref",
-          `refs/no-mistakes/backup/${expectedHead}`,
-          expectedHead,
-        ],
+        ["update-ref", `refs/no-mistakes/backup/${expectedHead}`, expectedHead],
         true,
         fence,
       );
@@ -3317,16 +3333,15 @@ export class GitShell implements GitOperations {
     } catch (error) {
       if (branch && branch !== "HEAD") {
         await this.#git(
-          [
-            "update-ref",
-            `refs/heads/${branch}`,
-            expectedHead,
-            sourceHead,
-          ],
+          ["update-ref", `refs/heads/${branch}`, expectedHead, sourceHead],
           true,
         ).catch(() => {});
       }
-      throw error;
+      throw new PostMutationCustodyError(
+        `custody transfer failed after advancing the operator branch: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
     }
   }
 
@@ -3347,7 +3362,7 @@ export class GitShell implements GitOperations {
     if (!RUN_ID_PATTERN.test(runId)) {
       throw new Error("Orca returned an unsafe Run ID");
     }
-    await this.#git(["update-ref", `refs/no-mistakes/recover/${runId}`, oid]);
+    await this.#git(["update-ref", recoveryRefFor(runId), oid]);
   }
 
   async rebase(base: string): Promise<StageReport> {
@@ -3599,13 +3614,7 @@ async function launchDetachedRun(
       (
         await command(
           orcaCommand,
-          [
-            "terminal",
-            "list",
-            "--worktree",
-            `path:${gate.path}`,
-            "--json",
-          ],
+          ["terminal", "list", "--worktree", `path:${gate.path}`, "--json"],
           repo.root,
         )
       ).stdout,
@@ -3883,7 +3892,13 @@ Run options:
         ? "cancelled"
         : "failed";
     const message = error instanceof Error ? error.message : String(error);
-    await orca.notifyRunResult(outcome, `No-mistakes ${outcome}: ${message}`);
+    const recoverRef = (error as CustodyTaggedError).recoverRef;
+    await orca.notifyRunResult(
+      outcome,
+      recoverRef
+        ? `No-mistakes ${outcome}: ${message}\n${recoveryInstructions(recoverRef)}`
+        : `No-mistakes ${outcome}: ${message}`,
+    );
     throw error;
   } finally {
     try {
