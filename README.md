@@ -10,7 +10,7 @@ Successful completion means all six stages completed with a tamper-evident Merkl
 
 ## Install
 
-Requires Node.js 24+, Git, a running Orca app, and authenticated `opencode` tooling.
+Requires Node.js 24+, Git, a running Orca app, and authenticated CLI tooling for the configured worker agents (`opencode` by default).
 
 ```bash
 npm install
