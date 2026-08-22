@@ -2,7 +2,7 @@
 status: accepted
 date: 2026-08-21
 scope: target architecture
-implementation: not implemented
+implementation: partially implemented
 ---
 
 # Trusted Base Config Extraction and Merging Engine

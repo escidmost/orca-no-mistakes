@@ -33,9 +33,21 @@ The coordinator creates one Orca Run and an ordered six-task DAG:
 
 `intent` records the supplied objective behind `<untrusted_instruction>` framing. `rebase` is a coordinator-run Git operation; the other stages are worker evaluations returning structured reports. Release 1 executes no remote push, PR creation, or CI reconciliation.
 
-The validation policy (reviewer/fixer prompt templates) is compiled from the trusted base commit: the coordinator hashes its own script files as they exist at `origin/<base>` and records that digest in the ledger and attestation. Reviewer prompts frame repository content, diffs, and instructions as untrusted data; policy changes may only come from the coordinator prompt itself.
+Reviewers run as fresh workers in disposable child worktrees. Fixes run through one retained worker terminal on the operator's current worktree. Every fixer round must leave a clean worktree and create a new commit; review-stage fixers are forbidden from weakening existing test assertions or linter configurations.
 
-Reviewers run as fresh opencode workers in disposable child worktrees. Fixes run through one retained opencode terminal on the operator's current worktree. Every fixer round must leave a clean worktree and create a new commit; review-stage fixers are forbidden from weakening existing test assertions or linter configurations. Workers default to model `openai/gpt-5.6-luna` at max reasoning effort; `--reviewer-model`, `--fixer-model`, and `--fixer-effort` override per role.
+Each stage and role resolves its own agent from the configuration tiers, and the launch adapter dispatches on the resolved harness:
+
+- `claude`, `codex`, and `cursor` launch through native `orca orchestration worker-start`, which receives the resolved model, effort, and timeout as flags.
+- `opencode`, `grok`, and `gemini` launch in a spawned terminal by sending a shell-quoted startup command carrying the resolved model, variant, and any `agent_args_override` entries, then dispatching instructions by injection.
+- `acp:<target>` harnesses run through the `acpx` runner (`acpx --format quiet --approve-all <target> exec "<prompt>"`) and must return a JSON stage report.
+
+Terminal-launched harnesses use per-harness readiness matchers; startup waits up to `WORKER_AGENT_READY_TIMEOUT_MS` milliseconds (default 60000) before the terminal and any allocated worktree are torn down. With no configuration the default remains one `opencode` worker per role on the agent's own default model; `--reviewer-model`, `--fixer-model`, and `--fixer-effort` override per role at the highest precedence.
+
+## Validation policy
+
+Two provenance rules bind every run. First, repository agent configuration is read from `.orca/no-mistakes.yaml` on the trusted base ref (`git show origin/<base>:.orca/no-mistakes.yaml`); an absent file resolves to an empty policy, and an unresolvable base ref fails the run. Second, the coordinator hashes its own script files as they exist at `origin/<base>` and records that digest in the ledger and attestation. Reviewer prompts frame repository content, diffs, and instructions as untrusted data; policy changes may only come from the coordinator prompt itself.
+
+The extracted configuration supplies per-stage and per-role agent selection and is merged under the CLI flags. `--allow-local-config` reads the same path from the working tree instead, and `--config <path>` reads an explicit file that must exist. Either bypass marks the run uncertified: the Orca worktree status is prefixed `[uncertified: local config bypass]` and the artifacts manifest records `local_bypass`.
 
 ## Findings and gates
 
@@ -47,7 +59,7 @@ An `ask-user` finding or fix exhaustion opens an Orca decision gate offering `ap
 
 Worker JSON reports, coordinator stage logs, and declared artifacts are confined to `~/.orca-no-mistakes/artifacts/<run-id>/`. The coordinator validates report shape and prevents report or artifact paths from escaping that directory. Coordinator-written logs larger than 50 MB are capped to head + tail with an explicit truncation marker.
 
-Each stage execution produces a `stage_evidence` row whose SHA-256 digest covers stage, round, candidate commit OID, base commit OID, worker identity, exit code, and summary.
+Each stage execution produces a `stage_evidence` row whose SHA-256 digest covers stage, round, candidate commit OID, base commit OID, worker identity, exit code, and summary. Each run also writes `manifest.json` beside its reports, recording `base_ref`, `base_ref_sha`, `local_bypass`, the effective policy configuration snapshot with resolved CLI overrides, and its `effective_policy_hash` (SHA-256 over key-sorted canonical JSON).
 
 ## Custody return
 

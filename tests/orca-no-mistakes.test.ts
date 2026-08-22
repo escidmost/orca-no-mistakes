@@ -11,6 +11,7 @@ import {
   DomainLedger,
   GitShell,
   PIPELINE_STEPS,
+  launchAgent,
   buildAttestation,
   capLog,
   main,
@@ -27,11 +28,14 @@ import {
   type WorkerLaunch,
   type WorkerResult
 } from '../scripts/orca-no-mistakes.ts'
+import { buildCliCommand } from '../scripts/adapters.ts'
+import { effectivePolicyHash } from '../scripts/policy.ts'
 
 const pass = (summary = 'passed'): StageReport => ({ findings: [], summary })
 
 class FakeGit implements GitOperations {
   readonly calls: string[] = []
+  readonly baseFiles = new Map<string, string>()
   static #oid(counter: number): string {
     return counter.toString(16).padStart(40, '0')
   }
@@ -53,6 +57,18 @@ class FakeGit implements GitOperations {
 
   async head(): Promise<string> {
     return this.#operatorDiverged ? FakeGit.#oid(9_999) : this.#head
+  }
+
+  async resolveRefSha(ref: string): Promise<string | undefined> {
+    return `sha-${ref.replaceAll('/', '-')}`
+  }
+
+  async showFile(ref: string, filePath: string): Promise<string | undefined> {
+    return this.baseFiles.get(`${ref}:${filePath}`)
+  }
+
+  async pathExists(ref: string, filePath: string): Promise<boolean> {
+    return this.baseFiles.has(`${ref}:${filePath}`)
   }
 
   async rebase(base: string): Promise<StageReport> {
@@ -583,7 +599,12 @@ console.log(JSON.stringify({ result }))
     process.env.ORCA_CLI_COMMAND = fakeOrca
     process.env.ORCA_TERMINAL_HANDLE = 'originating-opencode'
 
-    await main(['run', `--repo=${repo}`, '--intent=Validate detached coordination.'])
+    await main([
+      'run',
+      `--repo=${repo}`,
+      '--intent=Validate detached coordination.',
+      '--allow-local-config'
+    ])
 
     const calls = (await readFile(callsPath, 'utf8'))
       .trim()
@@ -597,6 +618,7 @@ console.log(JSON.stringify({ result }))
     assert.ok(commandText.includes("'--attached'"))
     assert.ok(commandText.includes("'--notify' 'originating-opencode'"))
     assert.ok(commandText.includes("'--intent' 'Validate detached coordination.'"))
+    assert.ok(commandText.includes("'--allow-local-config'"))
     assert.ok(!calls.some((args) => args[0] === 'orchestration'))
   } finally {
     if (previousCommand === undefined) delete process.env.ORCA_CLI_COMMAND
@@ -758,13 +780,12 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     await chmod(fakeOrca, 0o755)
     const orca = new CliOrca({
       command: fakeOrca,
-      cwd: temp,
-      fixerModel: 'gpt-5.6',
-      fixerEffort: 'high'
+      cwd: temp
     })
     await orca.createRun('adapter test')
 
     const first = await orca.startWorker('task-1', {
+      agent: { harness: 'opencode', model: 'gpt-5.6', variant: 'high' },
       name: 'first-fixer',
       prompt: 'first',
       role: 'fixer',
@@ -1175,6 +1196,525 @@ if (args[1] === 'run-create') {
   } finally {
     await rm(temp, { recursive: true, force: true })
   }
+})
+
+test('runPipeline extracts the trusted base policy and binds it into run evidence', async () => {
+  const git = new FakeGit()
+  git.baseFiles.set(
+    'origin/main:.orca/no-mistakes.yaml',
+    'stages:\n  review:\n    reviewer:\n      agent: claude\n      model: claude-opus-4\n      timeout_ms: 45000\n'
+  )
+  const orca = new FakeOrca(git)
+
+  const result = await runPipeline({ intent: 'Route reviewers through native dispatch.' }, orca, git)
+
+  assert.equal(result.policy.localBypass, false)
+  assert.equal(result.policy.baseRef, 'origin/main')
+  assert.equal(result.policy.baseRefSha, 'sha-origin-main')
+
+  const reviewReviewer = orca.launches.find((launch) => launch.stage === 'review' && launch.role === 'reviewer')
+  assert.equal(reviewReviewer?.agent?.harness, 'claude')
+  assert.equal(reviewReviewer?.agent?.model, 'claude-opus-4')
+  assert.equal(reviewReviewer?.agent?.timeoutMs, 45000)
+  // Stages without configuration keep the default CLI harness.
+  const lintReviewer = orca.launches.find((launch) => launch.stage === 'lint' && launch.role === 'reviewer')
+  assert.equal(lintReviewer?.agent, undefined)
+
+  const manifestPath = path.join(homedir(), '.orca-no-mistakes', 'artifacts', result.runId, 'manifest.json')
+  const manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
+  assert.equal(manifest.base_ref, 'origin/main')
+  assert.equal(manifest.base_ref_sha, 'sha-origin-main')
+  assert.equal(manifest.local_bypass, false)
+  assert.deepEqual(manifest.effective_config, {
+    stages: { review: { reviewer: { agent: 'claude', model: 'claude-opus-4', timeout_ms: 45000 } } }
+  })
+  assert.equal(manifest.effective_policy_hash, effectivePolicyHash(manifest.effective_config))
+  await rm(path.join(homedir(), '.orca-no-mistakes', 'artifacts', result.runId), { recursive: true, force: true })
+})
+
+test('local config bypass taints the run as uncertified', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'policy-bypass-run-'))
+  const git = new FakeGit()
+  const orca = new FakeOrca(git)
+  try {
+    const configFile = path.join(temp, 'local.yaml')
+    await writeFile(configFile, 'stages:\n  test:\n    reviewer:\n      agent: grok\n')
+
+    const result = await runPipeline(
+      { allowLocalConfig: true, configPath: configFile, intent: 'Iterate locally.' },
+      orca,
+      git
+    )
+
+    assert.equal(result.policy.localBypass, true)
+    assert.equal(result.policy.baseRefSha, undefined)
+    const testReviewer = orca.launches.find((launch) => launch.stage === 'test' && launch.role === 'reviewer')
+    assert.equal(testReviewer?.agent?.harness, 'grok')
+    assert.ok(orca.calls.some((call) => call.startsWith('status:') && call.includes('[uncertified')))
+    assert.ok(orca.calls.some((call) => call.includes('status:completed:') && call.includes('[uncertified')))
+
+    const manifestPath = path.join(homedir(), '.orca-no-mistakes', 'artifacts', result.runId, 'manifest.json')
+    const manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
+    assert.equal(manifest.local_bypass, true)
+    assert.equal('base_ref_sha' in manifest, false)
+    await rm(path.join(homedir(), '.orca-no-mistakes', 'artifacts', result.runId), { recursive: true, force: true })
+  } finally {
+    await rm(temp, { recursive: true, force: true })
+  }
+})
+
+test('CliOrca starts native workers through orchestration worker-start', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'orca-native-'))
+  const fakeOrca = path.join(temp, 'orca')
+  const callsPath = path.join(temp, 'calls.jsonl')
+  const evidence = path.join(homedir(), '.orca-no-mistakes', 'artifacts', 'native-run')
+  const reportPath = path.join(evidence, 'review.json')
+  try {
+    git(temp, 'init', '-b', 'feature')
+    await mkdir(evidence, { recursive: true })
+    await writeFile(reportPath, JSON.stringify(pass('native reviewed')))
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+const out = (result) => console.log(JSON.stringify({ result }))
+if (args[0] === 'orchestration' && args[1] === 'run-create') {
+  out({ run: { id: 'native-run' } })
+} else if (args[0] === 'orchestration' && args[1] === 'worker-start') {
+  out({ terminal: { handle: 'native-worker' }, worktree: { id: 'wt-native' } })
+} else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
+  out({ dispatch: { id: 'dispatch-nat', status: 'dispatched' }, injected: true, preamble: 'authenticated' })
+} else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
+  out({ deliveryId: 'delivery-nat', messages: [{ type: 'worker_done', body: 'Reviewed. Verified. Clear.', payload: JSON.stringify({ taskId: 'task-nat', dispatchId: 'dispatch-nat', outcome: 'succeeded', reportPath: ${JSON.stringify(reportPath)} }) }] })
+} else {
+  out({ ok: true })
+}
+`
+    )
+    await chmod(fakeOrca, 0o755)
+    const orca = new CliOrca({ command: fakeOrca, cwd: temp })
+    await orca.createRun('native test')
+
+    const worker = await orca.startWorker('task-nat', {
+      agent: { effort: 'high', harness: 'claude', model: 'claude-opus-4' },
+      name: 'nm-review',
+      prompt: 'review instructions',
+      role: 'reviewer',
+      stage: 'review',
+      worktree: 'new-child'
+    })
+
+    assert.equal(worker.terminalHandle, 'native-worker')
+    assert.equal(worker.worktreeId, 'wt-native')
+    const calls = (await readFile(callsPath, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as string[])
+    const workerStart = calls.find((args) => args[1] === 'worker-start')
+    assert.ok(workerStart?.includes('--agent'))
+    assert.ok(workerStart?.includes('claude'))
+    assert.ok(workerStart?.includes('--model'))
+    assert.ok(workerStart?.includes('claude-opus-4'))
+    assert.ok(workerStart?.includes('--effort'))
+    assert.ok(workerStart?.includes('--worktree'))
+    assert.ok(workerStart?.includes('new-child'))
+    assert.ok(workerStart?.includes('--name'))
+    assert.ok(workerStart?.includes('nm-review'))
+    assert.ok(workerStart?.includes('--base-branch'))
+    assert.ok(workerStart?.includes('feature'))
+    assert.ok(workerStart?.includes('--run'))
+    const dispatch = calls.find((args) => args[1] === 'dispatch')
+    assert.ok(dispatch?.includes('native-worker'))
+    assert.equal(reportPath && worker.report.summary, 'native reviewed')
+
+    await orca.finishWorker(worker, 'release')
+    const postReleaseCalls = (await readFile(callsPath, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as string[])
+    assert.ok(
+      postReleaseCalls.some(
+        (args) => args[0] === 'terminal' && args[1] === 'close' && args.includes('native-worker')
+      ),
+      'release closes the native worker terminal'
+    )
+  } finally {
+    await rm(temp, { recursive: true, force: true })
+    await rm(evidence, { recursive: true, force: true })
+  }
+})
+
+test('CliOrca reclaims residualResources reported by a failed native worker-start', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'orca-native-residual-'))
+  const fakeOrca = path.join(temp, 'orca')
+  const callsPath = path.join(temp, 'calls.jsonl')
+  try {
+    git(temp, 'init', '-b', 'feature')
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+const out = (result) => console.log(JSON.stringify({ result }))
+if (args[0] === 'orchestration' && args[1] === 'worker-start') {
+  out({
+    status: 'failed',
+    failedStage: 'agent-ready',
+    residualResources: [
+      { kind: 'worktree', id: 'wt-residual' },
+      { kind: 'terminal', handle: 'term-residual' }
+    ]
+  })
+  process.exit(1)
+} else {
+  out({ ok: true })
+}
+`
+    )
+    await chmod(fakeOrca, 0o755)
+    const orca = new CliOrca({ command: fakeOrca, cwd: temp })
+
+    await assert.rejects(
+      orca.startWorker('task-residual', {
+        agent: { harness: 'claude' },
+        name: 'nm-review',
+        prompt: 'review instructions',
+        role: 'reviewer',
+        stage: 'review',
+        worktree: 'current'
+      }),
+      /worker-start failed/
+    )
+    const calls = (await readFile(callsPath, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as string[])
+    assert.ok(
+      calls.some(
+        (args) => args[0] === 'terminal' && args[1] === 'close' && args.includes('term-residual')
+      ),
+      'the residual terminal is closed'
+    )
+    assert.ok(
+      calls.some(
+        (args) => args[0] === 'worktree' && args[1] === 'rm' && args.includes('id:wt-residual')
+      ),
+      'the residual worktree is removed'
+    )
+  } finally {
+    await rm(temp, { recursive: true, force: true })
+  }
+})
+
+test('CliOrca rejects a native worker-start that exits non-zero', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'orca-native-fail-'))
+  const fakeOrca = path.join(temp, 'orca')
+  const callsPath = path.join(temp, 'calls.jsonl')
+  try {
+    git(temp, 'init', '-b', 'feature')
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+const out = (result) => console.log(JSON.stringify({ result }))
+if (args[0] === 'orchestration' && args[1] === 'run-create') {
+  out({ run: { id: 'native-fail-run' } })
+} else if (args[0] === 'orchestration' && args[1] === 'worker-start') {
+  out({ status: 'outcome_unknown', failedStage: 'agent-ready', terminal: { handle: 'half-started' }, worktree: { id: 'wt-orphan' }, recovery: ['orca terminal close --terminal half-started'] })
+  process.exit(1)
+} else {
+  out({ ok: true })
+}
+`
+    )
+    await chmod(fakeOrca, 0o755)
+    const orca = new CliOrca({ command: fakeOrca, cwd: temp })
+    await orca.createRun('native failure test')
+
+    await assert.rejects(
+      orca.startWorker('task-fail', {
+        agent: { harness: 'claude', model: 'claude-opus-4' },
+        name: 'nm-review',
+        prompt: 'review instructions',
+        role: 'reviewer',
+        stage: 'review',
+        worktree: 'current'
+      }),
+      /outcome_unknown/
+    )
+    const calls = (await readFile(callsPath, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as string[])
+    assert.equal(
+      calls.find((args) => args[1] === 'dispatch'),
+      undefined,
+      'a failed worker-start must not be dispatched into'
+    )
+    assert.ok(
+      calls.some(
+        (args) => args[0] === 'terminal' && args[1] === 'close' && args.includes('half-started')
+      ),
+      'the half-started terminal is closed'
+    )
+    assert.ok(
+      calls.some((args) => args[0] === 'worktree' && args[1] === 'rm' && args.includes('id:wt-orphan')),
+      'the orphaned worktree is removed'
+    )
+  } finally {
+    await rm(temp, { recursive: true, force: true })
+  }
+})
+
+test('CliOrca runs acp targets through the acpx runner', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'orca-acp-'))
+  const fakeAcpx = path.join(temp, 'acpx')
+  const failingAcpx = path.join(temp, 'acpx-fail')
+  const fakeOrca = path.join(temp, 'orca')
+  const callsPath = path.join(temp, 'acp-calls.jsonl')
+  const orcaCallsPath = path.join(temp, 'orca-calls.jsonl')
+  const worktreePath = path.join(temp, 'acp-wt')
+  try {
+    git(temp, 'init', '-b', 'feature')
+    await mkdir(worktreePath)
+    await writeFile(
+      fakeAcpx,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+if (args.at(-2) !== 'exec') {
+  console.error('No acpx session found (searched up to /). Create one: acpx <agent> sessions new')
+  process.exit(1)
+}
+// --format quiet emits the agent's final assistant message on stdout.
+console.log(JSON.stringify({ findings: [], summary: 'acp done' }))
+`
+    )
+    await chmod(fakeAcpx, 0o755)
+    await writeFile(failingAcpx, '#!/usr/bin/env node\nconsole.error("target offline")\nprocess.exit(3)\n')
+    await chmod(failingAcpx, 0o755)
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(orcaCallsPath)}, JSON.stringify(args) + '\\n')
+const out = (result) => console.log(JSON.stringify({ result }))
+if (args[0] === 'worktree' && args[1] === 'create') {
+  out({ worktree: { id: 'wt-acp', path: ${JSON.stringify(worktreePath)} } })
+} else {
+  out({ ok: true })
+}
+`
+    )
+    await chmod(fakeOrca, 0o755)
+
+    const orca = new CliOrca({ acpxCommand: fakeAcpx, command: fakeOrca, cwd: temp })
+    const worker = await orca.startWorker('task-acp', {
+      agent: { harness: 'acp:gemini-dev', model: 'glm-5' },
+      name: 'acp-worker',
+      prompt: 'Review now.',
+      role: 'reviewer',
+      stage: 'review',
+      worktree: 'new-child'
+    })
+    assert.equal(worker.report.summary, 'acp done')
+    assert.match(worker.dispatchId, /^acp-/)
+    assert.equal(worker.terminalHandle, undefined)
+    assert.equal(worker.worktreeId, 'wt-acp')
+    await orca.finishWorker(worker, 'release')
+
+    const invocation = (await readFile(callsPath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as string[])[0]
+    assert.equal(invocation.at(-3), 'gemini-dev')
+    assert.equal(invocation.at(-2), 'exec')
+    assert.equal(invocation.at(-1), 'Review now.')
+    assert.deepEqual(invocation.slice(0, -3), [
+      '--format',
+      'quiet',
+      '--approve-all',
+      '--model',
+      'glm-5'
+    ])
+    const orcaCalls = (await readFile(orcaCallsPath, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as string[])
+    assert.ok(orcaCalls.some((args) => args[0] === 'worktree' && args[1] === 'create'))
+
+    const failing = new CliOrca({ acpxCommand: failingAcpx, command: fakeOrca, cwd: temp })
+    await assert.rejects(
+      failing.startWorker('task-acp', {
+        agent: { harness: 'acp:gemini-dev' },
+        name: 'acp-worker',
+        prompt: 'Review now.',
+        role: 'reviewer',
+        stage: 'review',
+        worktree: 'new-child'
+      }),
+      /acp target gemini-dev failed \(exit 3\)/
+    )
+    const failingCalls = (await readFile(orcaCallsPath, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as string[])
+    assert.ok(
+      failingCalls.some(
+        (args) => args[0] === 'worktree' && args[1] === 'rm' && args.includes('id:wt-acp') && args.includes('--force')
+      ),
+      'a failed ACP run removes its child worktree'
+    )
+  } finally {
+    await rm(temp, { recursive: true, force: true })
+  }
+})
+
+test('CliOrca formats CLI harness startup lines with per-harness readiness', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'orca-grok-'))
+  const fakeOrca = path.join(temp, 'orca')
+  const callsPath = path.join(temp, 'calls.jsonl')
+  const evidence = path.join(homedir(), '.orca-no-mistakes', 'artifacts', 'grok-run')
+  const reportPath = path.join(evidence, 'review.json')
+  try {
+    await mkdir(evidence, { recursive: true })
+    await writeFile(reportPath, JSON.stringify(pass('grok reviewed')))
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+const out = (result) => console.log(JSON.stringify({ result }))
+if (args[0] === 'orchestration' && args[1] === 'run-create') {
+  out({ run: { id: 'grok-run' } })
+} else if (args[0] === 'terminal' && args[1] === 'create') {
+  out({ terminal: { handle: 'grok-terminal' } })
+} else if (args[0] === 'terminal' && args[1] === 'send') {
+  out({ accepted: true })
+} else if (args[0] === 'terminal' && args[1] === 'show') {
+  out({ terminal: { connected: true, title: 'Grok CLI', preview: 'ready' } })
+} else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
+  out({ dispatch: { id: 'dispatch-grok', status: 'dispatched' }, injected: true, preamble: 'authenticated' })
+} else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
+  out({ deliveryId: 'delivery-grok', messages: [{ type: 'worker_done', body: 'Reviewed. Verified. Clear.', payload: JSON.stringify({ taskId: 'task-grok', dispatchId: 'dispatch-grok', outcome: 'succeeded', reportPath: ${JSON.stringify(reportPath)} }) }] })
+} else {
+  out({ ok: true })
+}
+`
+    )
+    await chmod(fakeOrca, 0o755)
+    const orca = new CliOrca({ command: fakeOrca, cwd: temp })
+    await orca.createRun('grok test')
+
+    const worker = await orca.startWorker('task-grok', {
+      agent: { harness: 'grok', model: 'grok-4' },
+      name: 'grok-reviewer',
+      prompt: 'instructions',
+      role: 'reviewer',
+      stage: 'review',
+      worktree: 'current'
+    })
+
+    assert.equal(worker.terminalHandle, 'grok-terminal')
+    const calls = (await readFile(callsPath, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as string[])
+    const send = calls.find((args) => args[0] === 'terminal' && args[1] === 'send')
+    assert.equal(send?.[send.indexOf('--text') + 1], `'grok' '--model' 'grok-4'`)
+  } finally {
+    await rm(temp, { recursive: true, force: true })
+    await rm(evidence, { recursive: true, force: true })
+  }
+})
+
+test('WORKER_AGENT_READY_TIMEOUT_MS tears down an unready CLI agent terminal', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'orca-ready-timeout-'))
+  const fakeOrca = path.join(temp, 'orca')
+  const callsPath = path.join(temp, 'calls.jsonl')
+  const previousTimeout = process.env.WORKER_AGENT_READY_TIMEOUT_MS
+  process.env.WORKER_AGENT_READY_TIMEOUT_MS = '100'
+  try {
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+const out = (result) => console.log(JSON.stringify({ result }))
+if (args[0] === 'terminal' && args[1] === 'create') {
+  out({ terminal: { handle: 'stuck-terminal' } })
+} else if (args[0] === 'terminal' && args[1] === 'show') {
+  out({ terminal: { connected: true, title: 'bash', preview: '' } })
+} else {
+  out({ ok: true })
+}
+`
+    )
+    await chmod(fakeOrca, 0o755)
+    const orca = new CliOrca({ command: fakeOrca, cwd: temp })
+    await assert.rejects(
+      orca.startWorker('task-timeout', {
+        name: 'slow-agent',
+        prompt: 'instructions',
+        role: 'reviewer',
+        stage: 'lint',
+        worktree: 'current'
+      }),
+      /opencode did not become ready before the timeout/
+    )
+    const calls = (await readFile(callsPath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as string[])
+    assert.ok(calls.some((args) => args[0] === 'terminal' && args[1] === 'close' && args.includes('stuck-terminal')))
+  } finally {
+    if (previousTimeout === undefined) delete process.env.WORKER_AGENT_READY_TIMEOUT_MS
+    else process.env.WORKER_AGENT_READY_TIMEOUT_MS = previousTimeout
+    await rm(temp, { recursive: true, force: true })
+  }
+})
+
+test('launchAgent carries role settings even when no agent harness is configured', () => {
+  const autoFix = { enabled: true, max_rounds: 3, allow_review_autofix: false }
+  assert.equal(launchAgent({ auto_fix: autoFix }), undefined)
+  assert.deepEqual(launchAgent({ auto_fix: autoFix, model: 'gpt-5.6', effort: 'high' }), {
+    agentArgsOverride: undefined,
+    effort: 'high',
+    harness: 'opencode',
+    model: 'gpt-5.6',
+    timeoutMs: undefined,
+    variant: undefined
+  })
+  assert.equal(launchAgent({ auto_fix: autoFix, agent: 'claude', model: 'x' })?.harness, 'claude')
+  assert.equal(
+    buildCliCommand('opencode', launchAgent({ auto_fix: autoFix, model: 'gpt-5.6', effort: 'high' }) ?? {}),
+    `'opencode' '--model' 'gpt-5.6' '--variant' 'high'`
+  )
+  assert.throws(
+    () => launchAgent({ auto_fix: autoFix, agent: ['opencode', 'grok'] as never }),
+    /agent fallback chains arrive in ONM-39/
+  )
+})
+
+test('acp reviewers receive a prompt that replaces the worker_done delivery contract', async () => {
+  const git = new FakeGit()
+  const orca = new FakeOrca(git)
+
+  await runPipeline(
+    { intent: 'Adapt delivery for acp targets.', cliFlags: { reviewer: { agent: 'acp:gemini-dev' } } as never },
+    orca,
+    git
+  )
+
+  const acpLaunch = orca.launches.find((launch) => launch.role === 'reviewer')
+  assert.equal(acpLaunch?.agent?.harness, 'acp:gemini-dev')
+  assert.match(acpLaunch?.prompt ?? '', /Reply with exactly one JSON object as your final message/)
+  assert.ok(!(acpLaunch?.prompt ?? '').includes('--report-path'))
+  assert.match(acpLaunch?.prompt ?? '', /do not call worker_done/)
+
 })
 
 test('a held branch semantic lease fails closed and --force-lease reclaims it', async () => {

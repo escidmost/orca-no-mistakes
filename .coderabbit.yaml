@@ -1,0 +1,5 @@
+# Docstrings are deliberately not used in this repository: the codebase follows
+# a no-comments style where types, names, and tests carry intent.
+tools:
+  docstrings:
+    enabled: false
