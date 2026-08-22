@@ -148,9 +148,9 @@ class FakeGit implements GitOperations {
     }
     if (
       filePath === "AGENTS.md" &&
-      (filePath === "AGENTS.md" &&
-        this.#agentsMdAtHead !== undefined &&
-        (this.#agentsMdOids.has(ref) || ref === this.#currentHead()))
+      filePath === "AGENTS.md" &&
+      this.#agentsMdAtHead !== undefined &&
+      (this.#agentsMdOids.has(ref) || ref === this.#currentHead())
     ) {
       return this.#agentsMdAtHead;
     }
@@ -202,8 +202,11 @@ class FakeGit implements GitOperations {
   async applyWorktreeCommits(
     sourcePath: string,
     expectedHead: string,
+    fence?: { readonly aborted: boolean },
   ): Promise<boolean> {
-    this.calls.push(`apply:${sourcePath}:${expectedHead}`);
+    this.calls.push(
+      `apply:${sourcePath}:${expectedHead}:${fence?.aborted ? "fenced" : "open"}`,
+    );
     if (this.throwOnApply)
       throw new Error("worker worktree must be clean before applying commits");
     if (this.postMutationThrowOnApply)
@@ -211,7 +214,7 @@ class FakeGit implements GitOperations {
         "custody transfer failed after advancing the operator branch: simulated reset failure",
       );
     if (this.dirtyDelivery) return false;
-    if (this.#head !== expectedHead) return false;
+    if (this.#head !== expectedHead || fence?.aborted) return false;
     this.advanceHead();
     return true;
   }
@@ -343,8 +346,18 @@ class FakeOrca implements OrcaOperations {
   }
 }
 
+// Seeds a trusted-base policy that explicitly authorizes review auto-fix,
+// opting these scenarios out of the ADR-0007 default gate.
+const allowReviewAutoFix = (git: FakeGit) => {
+  git.baseFiles.set(
+    "origin/main:.orca/no-mistakes.yaml",
+    "auto_fix:\n  allow_review_autofix: true\n",
+  );
+};
+
 test("runs the six-stage local adversarial pipeline with fixes, gates, and isolation", async () => {
   const git = new FakeGit();
+  allowReviewAutoFix(git);
   const orca = new FakeOrca(git);
   const ledger = new DomainLedger(":memory:");
   const autoFix: Finding = {
@@ -439,7 +452,10 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
     2,
     "only the intent and AGENTS block closers may appear raw",
   );
-  assert.doesNotMatch(reviewSpec, /\(no textual changes relative to the base\)/);
+  assert.doesNotMatch(
+    reviewSpec,
+    /\(no textual changes relative to the base\)/,
+  );
   for (const launch of orca.launches.filter(
     (launch) => launch.worktree === "new-child",
   )) {
@@ -587,6 +603,7 @@ test("a passing gate transfers final custody to the unchanged initiating worktre
 
 test("opens an exhaustion gate when automatic fix limit is reached and stops on stop decision", async () => {
   const git = new FakeGit();
+  allowReviewAutoFix(git);
   const orca = new FakeOrca(git);
   orca.gateResolution = "stop";
   const finding: Finding = {
@@ -804,6 +821,7 @@ test("malformed reviewer findings fail closed and still clean up the worker", as
 
 test("reviewer title/message findings receive canonical descriptions and IDs", async () => {
   const git = new FakeGit();
+  allowReviewAutoFix(git);
   const orca = new FakeOrca(git);
   orca.reports.set("review", [
     {
@@ -862,6 +880,7 @@ test("reviewer artifacts must exist under the run evidence directory", async () 
 
 test("reviewer URL references are not treated as local artifacts", async () => {
   const git = new FakeGit();
+  allowReviewAutoFix(git);
   const orca = new FakeOrca(git);
   orca.reports.set("review", [
     {
@@ -1795,6 +1814,19 @@ test("GitShell applies append-only commits and adopts rewritten history behind a
       git(repo, "rev-parse", "--verify", `refs/no-mistakes/backup/${terminal}`),
       terminal,
     );
+
+    // A flipped timeout fence refuses to move the branch even when the
+    // worktree history would fast-forward cleanly.
+    const fencedWt = path.join(temp, "fenced");
+    git(repo, "worktree", "add", fencedWt);
+    await writeFile(path.join(fencedWt, "feature.txt"), "fenced\n");
+    git(fencedWt, "add", "feature.txt");
+    git(fencedWt, "commit", "-m", "fenced change");
+    assert.equal(
+      await shell.applyWorktreeCommits(fencedWt, terminal, { aborted: true }),
+      false,
+    );
+    assert.equal(git(repo, "rev-parse", "HEAD"), rewritten);
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
@@ -1964,9 +1996,17 @@ test("GitShell.applyWorktreeCommits adopts rewritten rebase history behind a bac
 
     const shell = new GitShell({ repo: operator });
     assert.equal(await shell.applyWorktreeCommits(worker, pinnedHead), true);
-    assert.equal(git(operator, "rev-parse", "HEAD"), git(worker, "rev-parse", "HEAD"));
     assert.equal(
-      git(operator, "rev-parse", "--verify", `refs/no-mistakes/backup/${pinnedHead}`),
+      git(operator, "rev-parse", "HEAD"),
+      git(worker, "rev-parse", "HEAD"),
+    );
+    assert.equal(
+      git(
+        operator,
+        "rev-parse",
+        "--verify",
+        `refs/no-mistakes/backup/${pinnedHead}`,
+      ),
       pinnedHead,
     );
   } finally {
@@ -1976,6 +2016,7 @@ test("GitShell.applyWorktreeCommits adopts rewritten rebase history behind a bac
 
 test("a failed fixer leaves its worktree commits anchored for recovery", async () => {
   const git = new FakeGit();
+  allowReviewAutoFix(git);
   const orca = new FakeOrca(git);
   const ledger = new DomainLedger(":memory:");
   orca.reports.set("review", [
@@ -3130,7 +3171,11 @@ test("fallback chains settle each failed candidate before the next launch", asyn
     await mkdir(evidence, { recursive: true });
     await writeFile(
       reportPath,
-      JSON.stringify({ findings: [], summary: "second candidate done", tested: [] }),
+      JSON.stringify({
+        findings: [],
+        summary: "second candidate done",
+        tested: [],
+      }),
     );
     await writeFile(
       fakeOrca,
@@ -3163,18 +3208,40 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
 `,
     );
     await chmod(fakeOrca, 0o755);
-    const roleConfig = { enabled: false, max_rounds: 0, allow_review_autofix: false };
+    const roleConfig = {
+      enabled: false,
+      max_rounds: 0,
+      allow_review_autofix: false,
+    };
     const [grok, claude] = ["grok", "claude"].map(
       (harness) => launchAgent({ auto_fix: roleConfig, agent: harness })![0],
     );
     const launches: WorkerLaunch[] = [
-      { agent: grok, name: "first", prompt: "instructions", role: "reviewer", stage: "lint", worktree: "current" },
-      { agent: claude, name: "second", prompt: "instructions", role: "reviewer", stage: "lint", worktree: "current" },
+      {
+        agent: grok,
+        name: "first",
+        prompt: "instructions",
+        role: "reviewer",
+        stage: "lint",
+        worktree: "current",
+      },
+      {
+        agent: claude,
+        name: "second",
+        prompt: "instructions",
+        role: "reviewer",
+        stage: "lint",
+        worktree: "current",
+      },
     ];
 
     const orca = new CliOrca({ command: fakeOrca, cwd: temp });
     await orca.createRun("fallback chain settlement");
-    const outcome = await startWorkerWithFallback(orca, () => Promise.resolve("task-chain"), launches);
+    const outcome = await startWorkerWithFallback(
+      orca,
+      () => Promise.resolve("task-chain"),
+      launches,
+    );
 
     assert.equal(outcome.resolvedAgent, "claude");
     assert.deepEqual(
@@ -3199,8 +3266,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       .filter((index) => index >= 0);
     assert.equal(createIndexes.length, 1);
     const nextLaunchIndex = calls.findIndex(
-      (args) =>
-        args[0] === "orchestration" && args[1] === "worker-start",
+      (args) => args[0] === "orchestration" && args[1] === "worker-start",
     );
     assert.ok(nextLaunchIndex !== -1);
     assert.ok(closeIndex !== -1);
@@ -3241,8 +3307,11 @@ test("launchAgent carries role settings even when no agent harness is configured
   assert.equal(
     buildCliCommand(
       "opencode",
-      launchAgent({ auto_fix: autoFix, model: "gpt-5.6", effort: "high" })?.[0] ??
-        {},
+      launchAgent({
+        auto_fix: autoFix,
+        model: "gpt-5.6",
+        effort: "high",
+      })?.[0] ?? {},
     ),
     `'opencode' '--model' 'gpt-5.6' '--variant' 'high'`,
   );
@@ -3261,23 +3330,31 @@ test("launchAgent carries role settings even when no agent harness is configured
 test("fallback chains advance only on preflight failures and settle between candidates", async () => {
   const git = new FakeGit();
   const orca = new FakeOrca(git);
-  const roleConfig = { enabled: false, max_rounds: 0, allow_review_autofix: false };
-  const launches = (
-    ["claude", "grok", "acp:gemini"] as const
-  ).map((harness, index): WorkerLaunch => ({
-    agent: launchAgent({ auto_fix: roleConfig, agent: harness })![0],
-    name: `no-mistakes-lint-1-${index}`,
-    prompt: `prompt for ${harness}`,
-    role: "reviewer",
-    stage: "lint",
-    worktree: "new-child",
-  }));
+  const roleConfig = {
+    enabled: false,
+    max_rounds: 0,
+    allow_review_autofix: false,
+  };
+  const launches = (["claude", "grok", "acp:gemini"] as const).map(
+    (harness, index): WorkerLaunch => ({
+      agent: launchAgent({ auto_fix: roleConfig, agent: harness })![0],
+      name: `no-mistakes-lint-1-${index}`,
+      prompt: `prompt for ${harness}`,
+      role: "reviewer",
+      stage: "lint",
+      worktree: "new-child",
+    }),
+  );
 
   orca.launchFailures.push(
     new PreflightError("readiness-timeout", "claude did not become ready"),
     new PreflightError("quota", "429 quota exhausted for grok"),
   );
-  const outcome = await startWorkerWithFallback(orca, () => Promise.resolve("task-fb"), launches);
+  const outcome = await startWorkerWithFallback(
+    orca,
+    () => Promise.resolve("task-fb"),
+    launches,
+  );
   assert.equal(outcome.resolvedAgent, "acp:gemini");
   assert.equal(outcome.worker.dispatchId, "dispatch-1");
   assert.deepEqual(
@@ -3298,20 +3375,24 @@ test("fallback chains advance only on preflight failures and settle between cand
 test("execution-phase errors do not advance the fallback chain", async () => {
   const git = new FakeGit();
   const orca = new FakeOrca(git);
-  const roleConfig = { enabled: false, max_rounds: 0, allow_review_autofix: false };
-  const launches = (
-    ["claude", "grok"] as const
-  ).map((harness): WorkerLaunch => ({
-    agent: launchAgent({
-      auto_fix: roleConfig,
-      agent: harness,
-    })![0],
-    name: "no-mistakes-test-1",
-    prompt: "instructions",
-    role: "reviewer",
-    stage: "test",
-    worktree: "new-child",
-  }));
+  const roleConfig = {
+    enabled: false,
+    max_rounds: 0,
+    allow_review_autofix: false,
+  };
+  const launches = (["claude", "grok"] as const).map(
+    (harness): WorkerLaunch => ({
+      agent: launchAgent({
+        auto_fix: roleConfig,
+        agent: harness,
+      })![0],
+      name: "no-mistakes-test-1",
+      prompt: "instructions",
+      role: "reviewer",
+      stage: "test",
+      worktree: "new-child",
+    }),
+  );
   orca.launchFailures.push(new Error(`test stage failed: 3 failing tests`));
 
   await assert.rejects(
@@ -3324,23 +3405,30 @@ test("execution-phase errors do not advance the fallback chain", async () => {
 test("exhausted chains fail closed with aggregated candidate diagnostics", async () => {
   const git = new FakeGit();
   const orca = new FakeOrca(git);
-  const launches = (
-    ["claude", "grok", "codex"] as const
-  ).map((harness): WorkerLaunch => ({
-    agent: launchAgent({
-      auto_fix: { enabled: false, max_rounds: 0, allow_review_autofix: false },
-      agent: harness,
-    })![0],
-    name: "no-mistakes-review-1",
-    prompt: "instructions",
-    role: "reviewer",
-    stage: "review",
-    worktree: "new-child",
-  }));
+  const launches = (["claude", "grok", "codex"] as const).map(
+    (harness): WorkerLaunch => ({
+      agent: launchAgent({
+        auto_fix: {
+          enabled: false,
+          max_rounds: 0,
+          allow_review_autofix: false,
+        },
+        agent: harness,
+      })![0],
+      name: "no-mistakes-review-1",
+      prompt: "instructions",
+      role: "reviewer",
+      stage: "review",
+      worktree: "new-child",
+    }),
+  );
   orca.launchFailures.push(
     new PreflightError("binary-missing", "spawn claude ENOENT"),
     new PreflightError("auth", "grok: not logged in"),
-    new PreflightError("unclassified", "terminal create returned an invalid receipt"),
+    new PreflightError(
+      "unclassified",
+      "terminal create returned an invalid receipt",
+    ),
   );
 
   await assert.rejects(
@@ -3358,20 +3446,41 @@ test("exhausted chains fail closed with aggregated candidate diagnostics", async
 });
 
 test("preflight failure classification maps known launch failures", () => {
-  assert.equal(classifyPreflightFailure("worker-start failed: spawn codex ENOENT"), "binary-missing");
-  assert.equal(classifyPreflightFailure("HTTP 429 rate limit exceeded"), "quota");
+  assert.equal(
+    classifyPreflightFailure("worker-start failed: spawn codex ENOENT"),
+    "binary-missing",
+  );
+  assert.equal(
+    classifyPreflightFailure("HTTP 429 rate limit exceeded"),
+    "quota",
+  );
   assert.equal(classifyPreflightFailure("monthly quota exhausted"), "quota");
-  assert.equal(classifyPreflightFailure("gemini: not logged in; run auth login"), "auth");
-  assert.equal(classifyPreflightFailure("claude did not become ready before the timeout"), "readiness-timeout");
-  assert.equal(classifyPreflightFailure("worker agent terminal exited during startup"), "readiness-timeout");
-  assert.equal(classifyPreflightFailure("something else went wrong"), "unclassified");
+  assert.equal(
+    classifyPreflightFailure("gemini: not logged in; run auth login"),
+    "auth",
+  );
+  assert.equal(
+    classifyPreflightFailure("claude did not become ready before the timeout"),
+    "readiness-timeout",
+  );
+  assert.equal(
+    classifyPreflightFailure("worker agent terminal exited during startup"),
+    "readiness-timeout",
+  );
+  assert.equal(
+    classifyPreflightFailure("something else went wrong"),
+    "unclassified",
+  );
 });
 
 test("each fallback candidate is dispatched with its own task spec", async () => {
   const git = new FakeGit();
   const orca = new FakeOrca(git);
   orca.launchFailures.push(
-    new PreflightError("readiness-timeout", "acp:gemini-dev did not become ready"),
+    new PreflightError(
+      "readiness-timeout",
+      "acp:gemini-dev did not become ready",
+    ),
   );
   await runPipeline(
     {
@@ -3381,7 +3490,9 @@ test("each fallback candidate is dispatched with its own task spec", async () =>
     orca,
     git,
   );
-  const checkTasks = orca.tasks.filter((task) => /^\[\w+ check /.test(task.spec));
+  const checkTasks = orca.tasks.filter((task) =>
+    /^\[\w+ check /.test(task.spec),
+  );
   assert.match(
     checkTasks[0].spec,
     /Do not write a report file and do not call worker_done/,
@@ -3398,7 +3509,10 @@ test("acp runner timeouts stay execution-phase failures", async () => {
   try {
     git(temp, "init", "-b", "feature");
     await mkdir(worktreePath);
-    await writeFile(fakeAcpx, "#!/usr/bin/env node\nsetTimeout(() => {}, 60000)\n");
+    await writeFile(
+      fakeAcpx,
+      "#!/usr/bin/env node\nsetTimeout(() => {}, 60000)\n",
+    );
     await chmod(fakeAcpx, 0o755);
     await writeFile(
       fakeOrca,
@@ -3458,9 +3572,7 @@ test("reviewer fallback attempts are recorded in stage evidence with resolved_ag
 
   const logsDir = path.join(artifactsRoot(), result.runId, "logs");
   const logFiles = await readdir(logsDir);
-  const reviewLogName = logFiles.find((name) =>
-    name.startsWith("review-r0-"),
-  );
+  const reviewLogName = logFiles.find((name) => name.startsWith("review-r0-"));
   assert.ok(reviewLogName);
   const reviewLog = JSON.parse(
     await readFile(path.join(logsDir, reviewLogName), "utf8"),
@@ -4350,4 +4462,319 @@ test("legacy attestation ledgers are rebuilt onto the per-run key", async () => 
     reopened.close();
     await rm(temp, { recursive: true, force: true });
   }
+});
+
+test("review auto-fix findings raise a human gate under the default policy", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  const ledger = new DomainLedger(":memory:");
+  orca.gateResolution = "approve";
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Null input crashes the command",
+        },
+      ],
+      summary: "one defect",
+    },
+  ]);
+
+  const result = await runPipeline(
+    { intent: "Gate unapproved review repairs." },
+    orca,
+    git,
+    ledger,
+  );
+
+  assert.equal(
+    orca.launches.some((launch) => launch.role === "fixer"),
+    false,
+    "no repair runs before a human authorizes it",
+  );
+  assert.equal(orca.gates.length, 1);
+  assert.doesNotMatch(orca.gates[0].question, /limit of \d+ fix rounds/);
+  const waived = result.attestation?.stageEvidence.find(
+    (entry) => entry.waiverOrApproval,
+  );
+  assert.equal(waived?.waiverOrApproval?.decision, "approve");
+  assert.equal(ledger.runStatus(result.runId), "passed");
+});
+
+test("trusted policy can authorize review auto-fix explicitly", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  const orca = new FakeOrca(git);
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Null input crashes the command",
+        },
+      ],
+      summary: "one defect",
+    },
+    pass("clean rereview"),
+  ]);
+
+  await runPipeline({ intent: "Authorized review repairs." }, orca, git);
+
+  assert.ok(orca.launches.some((launch) => launch.role === "fixer"));
+  assert.equal(orca.gates.length, 0);
+});
+
+test("per-stage auto_fix.max_rounds budgets gate before any automatic round", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  orca.gateResolution = "stop";
+  git.baseFiles.set(
+    "origin/main:.orca/no-mistakes.yaml",
+    "auto_fix:\n  allow_review_autofix: true\nstages:\n  review:\n    fixer:\n      auto_fix:\n        max_rounds: 0\n",
+  );
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "persistent",
+          severity: "error",
+          action: "auto-fix",
+          description: "The same defect remains.",
+        },
+      ],
+      summary: "first failure",
+    },
+  ]);
+
+  await assert.rejects(
+    runPipeline({ intent: "Zero-budget review stage." }, orca, git),
+    /review gate stopped the pipeline: stop/,
+  );
+  assert.match(
+    orca.gates[0]?.question ?? "",
+    /reached the limit of 0 fix rounds/,
+  );
+  assert.equal(
+    orca.launches.some((launch) => launch.role === "fixer"),
+    false,
+  );
+});
+
+test("a fixer timeout during commit application leaves the branch unchanged", async () => {
+  class SlowApplyGit extends FakeGit {
+    headAtApply = "";
+    async applyWorktreeCommits(
+      sourcePath: string,
+      expectedHead: string,
+      fence?: { readonly aborted: boolean },
+    ): Promise<boolean> {
+      this.headAtApply = await this.head();
+      await new Promise((resolve) => setTimeout(resolve, 75));
+      return super.applyWorktreeCommits(sourcePath, expectedHead, fence);
+    }
+  }
+  const git = new SlowApplyGit();
+  allowReviewAutoFix(git);
+  const orca = new FakeOrca(git);
+  const ledger = new DomainLedger(":memory:");
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Null input crashes the command",
+        },
+      ],
+      summary: "one defect",
+    },
+  ]);
+
+  await assert.rejects(
+    runPipeline(
+      {
+        intent: "Fence in-flight fixes.",
+        cliFlags: { fixer: { timeout_ms: 10 } } as never,
+      },
+      orca,
+      git,
+      ledger,
+    ),
+    /review fixer exceeded its 10ms execution timeout/,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 150));
+
+  assert.ok(
+    git.calls.some((call) => call.endsWith(":fenced")),
+    "the late application attempt was observed and fenced",
+  );
+  assert.equal(
+    await git.head(),
+    git.headAtApply,
+    "no commit landed after the stage timed out",
+  );
+});
+
+test("disabling auto_fix gates mechanical findings on every stage", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  const ledger = new DomainLedger(":memory:");
+  git.baseFiles.set(
+    "origin/main:.orca/no-mistakes.yaml",
+    "auto_fix:\n  enabled: false\n",
+  );
+  orca.reports.set("lint", [
+    {
+      findings: [
+        {
+          id: "lint-1",
+          severity: "warning",
+          action: "auto-fix",
+          description: "Formatting is stale",
+        },
+      ],
+      summary: "formatting defect",
+    },
+  ]);
+
+  const result = await runPipeline(
+    { intent: "No silent repairs anywhere." },
+    orca,
+    git,
+    ledger,
+  );
+
+  assert.equal(
+    orca.launches.some((launch) => launch.role === "fixer"),
+    false,
+  );
+  assert.equal(orca.gates.length, 1);
+  assert.equal(ledger.runStatus(result.runId), "passed");
+});
+
+test("resolved role timeout_ms bounds reviewer execution", async () => {
+  const git = new FakeGit();
+  class SlowReviewerOrca extends FakeOrca {
+    async startWorker(
+      taskId: string,
+      launch: WorkerLaunch,
+    ): Promise<WorkerResult> {
+      if (launch.role === "reviewer") {
+        await new Promise((resolve) => setTimeout(resolve, 75));
+      }
+      return super.startWorker(taskId, launch);
+    }
+  }
+  const orca = new SlowReviewerOrca(git);
+  const ledger = new DomainLedger(":memory:");
+
+  await assert.rejects(
+    runPipeline(
+      {
+        intent: "Bound reviewer wall clock.",
+        cliFlags: { reviewer: { timeout_ms: 10 } } as never,
+      },
+      orca,
+      git,
+      ledger,
+    ),
+    /review reviewer exceeded its 10ms execution timeout/,
+  );
+  assert.equal(ledger.listRuns().length, 1);
+  assert.equal(ledger.runStatus(ledger.listRuns()[0].run_id), "failed");
+});
+
+test("a timed-out fixer never applies commits after the run fails", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  class SlowFixerOrca extends FakeOrca {
+    async startWorker(
+      taskId: string,
+      launch: WorkerLaunch,
+    ): Promise<WorkerResult> {
+      if (launch.role === "fixer") {
+        await new Promise((resolve) => setTimeout(resolve, 75));
+      }
+      return super.startWorker(taskId, launch);
+    }
+  }
+  const orca = new SlowFixerOrca(git);
+  const ledger = new DomainLedger(":memory:");
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Null input crashes the command",
+        },
+      ],
+      summary: "one defect",
+    },
+  ]);
+
+  await assert.rejects(
+    runPipeline(
+      {
+        intent: "Fence late fixers.",
+        cliFlags: { fixer: { timeout_ms: 10 } } as never,
+      },
+      orca,
+      git,
+      ledger,
+    ),
+    /review fixer exceeded its 10ms execution timeout/,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(
+    git.calls.filter((call) => call.startsWith("apply:")).length,
+    0,
+    "no worktree commits may land after the timeout",
+  );
+  assert.equal(ledger.runStatus(ledger.listRuns()[0].run_id), "failed");
+});
+
+test("stage evidence binds effective policy provenance into artifacts and the ledger", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  const orca = new FakeOrca(git);
+  const ledger = new DomainLedger(":memory:");
+
+  const result = await runPipeline(
+    { intent: "Bind provenance." },
+    orca,
+    git,
+    ledger,
+  );
+
+  const logsDir = path.join(artifactsRoot(), result.runId, "logs");
+  const logFiles = await readdir(logsDir);
+  const reviewLogName = logFiles.find((name) => name.startsWith("review-r0-"));
+  assert.ok(reviewLogName);
+  const raw = await readFile(path.join(logsDir, reviewLogName!), "utf8");
+  const reviewLog = JSON.parse(raw) as {
+    effective_policy_hash?: string;
+    base_ref_sha?: string;
+  };
+  assert.equal(
+    reviewLog.effective_policy_hash,
+    result.policy.effectivePolicyHash,
+  );
+  assert.equal(reviewLog.base_ref_sha, result.policy.baseRefSha);
+  assert.equal(
+    sha256(raw),
+    result.attestation?.stageEvidence.find((entry) => entry.stage === "review")
+      ?.artifactSha256,
+    "the hashed evidence artifact carries the provenance",
+  );
+  const evidenceShape = ledger.tableDefinition("stage_evidence") ?? "";
+  assert.match(evidenceShape, /effective_policy_hash TEXT/);
+  assert.match(evidenceShape, /base_ref_sha TEXT/);
 });

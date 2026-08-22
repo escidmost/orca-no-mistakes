@@ -62,14 +62,38 @@ export function nativeWorkerStartArgs(options: NativeWorkerStartOptions): string
   return args
 }
 
-const VARIANT_FLAGS: Record<string, string> = { opencode: '--variant' }
+// Harness-neutral model/reasoning-effort selection: what an operator asked
+// for once, before it is mapped down to whatever mechanism a harness uses.
+export type AgentProfile = {
+  effort?: string
+  model?: string
+}
+
+// One table: how each terminal-launched harness expresses reasoning effort,
+// and which harnesses expose no mechanism at all. Model is uniformly --model
+// where a harness accepts it. Native harnesses (claude/codex/cursor) bypass
+// this table: Orca worker-start owns their per-harness flags; acp:<target>
+// rides acpx's own --model and exposes no effort surface.
+const EFFORT_KNOBS: Record<string, { flag: string; requiresModel?: boolean }> = {
+  grok: { flag: '--reasoning-effort' },
+  opencode: { flag: '--variant', requiresModel: true },
+  pi: { flag: '--thinking' },
+}
+const UNMAPPABLE_HARNESSES = new Set(['agy'])
+
+// A knob already pinned through a raw agent_args_override flag wins, so the
+// mapped value is not emitted and no harness receives one knob twice.
+const MODEL_PIN_FLAGS = ['-m', '--model']
+const EFFORT_PIN_FLAGS = ['--effort', '--reasoning-effort', '--thinking']
+
+function pinsAnyFlag(args: string[], flags: string[]): boolean {
+  return args.some((arg) => flags.some((flag) => arg === flag || arg.startsWith(`${flag}=`)))
+}
 
 const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
 
-export type CliAgentCommandOptions = {
+export type CliAgentCommandOptions = AgentProfile & {
   agentArgsOverride?: AgentArgsOverride
-  effort?: string
-  model?: string
   variant?: string
 }
 
@@ -87,11 +111,34 @@ export function buildCliCommand(harness: string, options: CliAgentCommandOptions
       env.push(`${key}=${shellQuote(value)}`)
     }
   }
-  if (options.model) parts.push('--model', options.model)
-  const variantFlag = VARIANT_FLAGS[harness]
-  const variant = options.variant ?? (options.model ? options.effort : undefined)
-  if (variant && variantFlag) parts.push(variantFlag, variant)
-  if (Array.isArray(override)) parts.push(...override)
+  const raw = Array.isArray(override) ? override : []
+  const unmappable = UNMAPPABLE_HARNESSES.has(harness)
+  const effortKnob = EFFORT_KNOBS[harness]
+  if ((options.model || options.effort || options.variant) && unmappable) {
+    throw new Error(
+      `agent ${harness}: cannot express model or effort; no verified mechanism exists for it (use agent_args_override.${harness} if your build accepts a flag)`
+    )
+  }
+  if (options.effort && !effortKnob && !unmappable) {
+    throw new Error(
+      `agent ${harness}: cannot express effort; no verified reasoning-effort flag exists for it (use agent_args_override.${harness} if your build accepts one)`
+    )
+  }
+  // Model-scoped effort carriers (--variant) need their model; an explicit
+  // variant option supersedes the effort knob by one declared precedence rule.
+  if (options.effort && effortKnob?.requiresModel && !options.model && !options.variant) {
+    throw new Error(
+      `agent ${harness}: cannot express effort without a model; ${effortKnob.flag} selects a model-scoped variant`
+    )
+  }
+  if (options.model && !pinsAnyFlag(raw, MODEL_PIN_FLAGS)) parts.push('--model', options.model)
+  if (effortKnob?.requiresModel) {
+    const variant = options.variant ?? options.effort
+    if (variant && !pinsAnyFlag(raw, [effortKnob.flag])) parts.push(effortKnob.flag, variant)
+  } else if (effortKnob && options.effort && !pinsAnyFlag(raw, EFFORT_PIN_FLAGS)) {
+    parts.push(effortKnob.flag, options.effort)
+  }
+  parts.push(...raw)
   // Environment assignments stay unquoted as a prefix; arguments are shell-quoted individually.
   return [...env, ...parts.map(shellQuote)].join(' ')
 }
@@ -129,11 +176,19 @@ export type AcpRunnerInvocation = { args: string[] }
 // event stream; `quiet` emits the final assistant message on stdout, which is the single JSON report
 // the worker prompt asks for.
 export function acpRunnerInvocation(options: {
+  effort?: string
   model?: string
   prompt: string
   target: string
   timeoutMs?: number
 }): AcpRunnerInvocation {
+  // acpx exposes --model but no reasoning-effort surface; refuse rather than
+  // silently drop the knob.
+  if (options.effort) {
+    throw new Error(
+      `agent acp:${options.target}: cannot express effort; acpx exposes a model surface but no reasoning-effort control`
+    )
+  }
   const args = ['--format', 'quiet', '--approve-all']
   if (options.model) args.push('--model', options.model)
   if (options.timeoutMs !== undefined) {
