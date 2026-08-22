@@ -189,6 +189,23 @@ export const DEFAULT_MAX_FIX_ROUNDS = 3;
 
 export class GateStopError extends Error {}
 
+export class RecoveryAnchorError extends Error {
+  readonly outcome: "cancelled" | "failed";
+
+  constructor(
+    runId: string,
+    outcome: "cancelled" | "failed",
+    originalError: unknown,
+    anchorError: unknown,
+  ) {
+    super(
+      `no-mistakes ${outcome}, but recovery ref for ${runId} could not be anchored; the gate was retained`,
+      { cause: new AggregateError([originalError, anchorError]) },
+    );
+    this.outcome = outcome;
+  }
+}
+
 export async function runPipeline(
   options: PipelineOptions,
   orca: OrcaOperations,
@@ -593,11 +610,15 @@ export async function runPipeline(
       steps: PIPELINE_STEPS,
     };
   } catch (error) {
-    ledger.releaseLease(runId);
-    ledger.finishRun(
-      runId,
-      error instanceof GateStopError ? "cancelled" : "failed",
-    );
+    const outcome = error instanceof GateStopError ? "cancelled" : "failed";
+    let anchorError: unknown;
+    try {
+      await deliveryGit.anchorRecoveryRef(runId, await git.head());
+    } catch (recoveryError) {
+      anchorError = recoveryError;
+    }
+    if (!anchorError) ledger.releaseLease(runId);
+    ledger.finishRun(runId, outcome);
     const message = error instanceof Error ? error.message : String(error);
     await orca
       .setWorktreeStatus(
@@ -605,6 +626,9 @@ export async function runPipeline(
         "in-review",
       )
       .catch(() => {});
+    if (anchorError) {
+      throw new RecoveryAnchorError(runId, outcome, error, anchorError);
+    }
     throw error;
   }
 }
@@ -1921,17 +1945,101 @@ export class CliOrca implements OrcaOperations {
     );
     await mkdir(path.dirname(settingsPath), { recursive: true });
     const lockPath = `${settingsPath}.lock`;
+    const ownerPath = path.join(lockPath, "owner.json");
+    const lockToken = randomUUID();
     const lockDeadline = Date.now() + 10_000;
+    const readOwner = async (): Promise<
+      { pid: number; token: string } | undefined
+    > => {
+      try {
+        const parsed: unknown = JSON.parse(await readFile(ownerPath, "utf8"));
+        if (
+          parsed &&
+          typeof parsed === "object" &&
+          Number.isInteger((parsed as { pid?: unknown }).pid) &&
+          (parsed as { pid: number }).pid > 0 &&
+          typeof (parsed as { token?: unknown }).token === "string"
+        ) {
+          return parsed as { pid: number; token: string };
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined;
+      }
+      return undefined;
+    };
+    const ownerIsAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === "EPERM";
+      }
+    };
     for (;;) {
       try {
-        await mkdir(lockPath);
+        await mkdir(lockPath, { mode: 0o700 });
+        await writeFile(
+          ownerPath,
+          `${JSON.stringify({ pid: process.pid, token: lockToken })}\n`,
+          { flag: "wx", mode: 0o600 },
+        );
         break;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        if (Date.now() >= lockDeadline)
-          throw new Error("timed out waiting for Antigravity settings lock");
-        await new Promise((resolve) => setTimeout(resolve, 25));
       }
+
+      const owner = await readOwner();
+      let stale = owner ? !ownerIsAlive(owner.pid) : false;
+      if (!owner) {
+        try {
+          stale = Date.now() - (await stat(lockPath)).mtimeMs >= 1_000;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+          throw error;
+        }
+      }
+      if (stale) {
+        const claimPath = path.join(lockPath, "reaper");
+        const claimToken = randomUUID();
+        let claimed = false;
+        try {
+          await writeFile(claimPath, claimToken, {
+            flag: "wx",
+            mode: 0o600,
+          });
+          claimed = true;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        }
+        if (claimed) {
+          let reclaimed = false;
+          try {
+            const currentOwner = await readOwner();
+            const sameStaleOwner = owner
+              ? currentOwner?.token === owner.token &&
+                !ownerIsAlive(currentOwner.pid)
+              : currentOwner === undefined &&
+                Date.now() - (await stat(lockPath)).mtimeMs >= 1_000;
+            if (sameStaleOwner) {
+              const stalePath = `${lockPath}.stale-${claimToken}`;
+              try {
+                await rename(lockPath, stalePath);
+                reclaimed = true;
+                await rm(stalePath, { recursive: true, force: true });
+              } catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== "ENOENT")
+                  throw error;
+              }
+            }
+          } finally {
+            if (!reclaimed) await rm(claimPath, { force: true });
+          }
+          if (reclaimed) continue;
+        }
+      }
+      if (Date.now() >= lockDeadline)
+        throw new Error("timed out waiting for Antigravity settings lock");
+      await new Promise((resolve) => setTimeout(resolve, 25));
     }
 
     try {
@@ -1963,7 +2071,9 @@ export class CliOrca implements OrcaOperations {
         await rm(tempPath, { force: true });
       }
     } finally {
-      await rm(lockPath, { recursive: true, force: true });
+      if ((await readOwner())?.token === lockToken) {
+        await rm(lockPath, { recursive: true, force: true });
+      }
     }
   }
 
@@ -2740,13 +2850,12 @@ export class GitShell implements GitOperations {
     const sourceHead = (
       await this.#git(["-C", sourcePath, "rev-parse", "HEAD"])
     ).stdout.trim();
-    const appendOnly = await this.#git(
+    const expectedIsAncestor = await this.#git(
       ["merge-base", "--is-ancestor", expectedHead, sourceHead],
       true,
     );
-    const applied = appendOnly.failed
-      ? await this.#git(["reset", "--keep", sourceHead], true)
-      : await this.#git(["merge", "--ff-only", sourceHead], true);
+    if (expectedIsAncestor.failed) return false;
+    const applied = await this.#git(["merge", "--ff-only", sourceHead], true);
     return !applied.failed;
   }
 
@@ -2935,18 +3044,30 @@ async function removeGateWorktree(
   originWorktree: string,
   orcaCommand: string,
 ): Promise<void> {
-  await command(
+  const removed = await command(
     orcaCommand,
     ["worktree", "rm", "--worktree", `id:${gate.id}`, "--force", "--json"],
     originWorktree,
     { allowFailure: true },
   );
-  await command(
+  if (removed.code !== 0) {
+    console.error(
+      `warning: could not remove gate worktree ${gate.id}: ${`${removed.stdout}${removed.stderr}`.trim()}`,
+    );
+    return;
+  }
+  const deleted = await command(
     "git",
     ["-C", originWorktree, "branch", "-D", gate.branch],
     originWorktree,
     { allowFailure: true },
   );
+  if (deleted.code !== 0) {
+    console.error(
+      `warning: removed gate worktree ${gate.id}, but could not delete branch ${gate.branch}: ${`${deleted.stdout}${deleted.stderr}`.trim()}`,
+    );
+    return;
+  }
 }
 
 async function launchDetachedRun(
@@ -3240,6 +3361,7 @@ Run options:
         repo: process.env.NO_MISTAKES_ORIGIN_WORKTREE!,
       })
     : undefined;
+  let retainGate = false;
   try {
     const result = await runPipeline(
       {
@@ -3269,7 +3391,12 @@ Run options:
     );
     console.log(JSON.stringify(result));
   } catch (error) {
-    const outcome = error instanceof GateStopError ? "cancelled" : "failed";
+    retainGate = error instanceof RecoveryAnchorError;
+    const outcome =
+      error instanceof GateStopError ||
+      (error instanceof RecoveryAnchorError && error.outcome === "cancelled")
+        ? "cancelled"
+        : "failed";
     const message = error instanceof Error ? error.message : String(error);
     await orca.notifyRunResult(outcome, `No-mistakes ${outcome}: ${message}`);
     throw error;
@@ -3277,7 +3404,7 @@ Run options:
     try {
       ledger.close();
     } finally {
-      if (gate) {
+      if (gate && !retainGate) {
         await removeGateWorktree(
           gate,
           process.env.NO_MISTAKES_ORIGIN_WORKTREE!,

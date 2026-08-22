@@ -101,14 +101,15 @@ export type TerminalView = { preview?: string | null; title?: string | null }
 export function readinessMatcher(
   harness: string
 ): (terminal: TerminalView) => boolean {
-  if (harness === 'opencode') {
+  const normalizedHarness = harness.toLowerCase()
+  if (normalizedHarness === 'opencode') {
     return ({ preview, title }) =>
       (title === 'OpenCode' || title?.startsWith('OC |') === true) &&
       !(preview ?? '').includes(INTERRUPT_MARKER)
   }
-  if (harness === 'agy') {
+  if (normalizedHarness === 'agy') {
     return ({ preview, title }) =>
-      /agy|antigravity/i.test(title ?? '') && !(preview ?? '').includes(INTERRUPT_MARKER)
+      /\b(?:agy|antigravity)\b/i.test(title ?? '') && !(preview ?? '').includes(INTERRUPT_MARKER)
   }
   const pattern = new RegExp(`\\b${harness.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i')
   return ({ preview, title }) => pattern.test(title ?? '') && !(preview ?? '').includes(INTERRUPT_MARKER)

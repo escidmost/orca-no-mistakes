@@ -241,8 +241,6 @@ version-matched schema or behavior test proves otherwise. In particular:
   are not documented settings keys.
 - `model` is used by the local file and appears in binary JSON metadata, but its
   accepted model-name values are not defined by the settings reference.
-- The local file contains an additional literal key `showFeedbackSurvey:`;
-  its presence is runtime evidence only and not a documented schema member.
 
 ## Sources and Confidence
 

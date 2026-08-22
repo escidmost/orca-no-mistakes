@@ -9,6 +9,7 @@ import {
   readFile,
   realpath,
   rm,
+  stat,
   writeFile,
 } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
@@ -21,6 +22,7 @@ import {
   DomainLedger,
   GitShell,
   PIPELINE_STEPS,
+  RecoveryAnchorError,
   launchAgent,
   buildAttestation,
   capLog,
@@ -55,6 +57,7 @@ class FakeGit implements GitOperations {
   #head = FakeGit.#oid(1);
   #baseOid = FakeGit.#oid(0);
   divergeAfterAnchor = false;
+  failRecoveryAnchor = false;
   rebaseConflict = false;
   #operatorDiverged = false;
   readonly #branch: string;
@@ -153,8 +156,9 @@ class FakeGit implements GitOperations {
   }
 
   async anchorRecoveryRef(runId: string, oid: string): Promise<void> {
-    if (this.divergeAfterAnchor) this.#operatorDiverged = true;
     this.calls.push(`recover:${runId}:${oid}`);
+    if (this.failRecoveryAnchor) throw new Error("recovery ref rejected");
+    if (this.divergeAfterAnchor) this.#operatorDiverged = true;
   }
 
   advanceHead(): void {
@@ -574,6 +578,39 @@ test("unknown gate decisions stop the pipeline and update worktree status", asyn
   const runs = ledger.listRuns();
   assert.equal(runs.length, 1);
   assert.equal(ledger.runStatus(runs[0].run_id), "failed");
+  assert.ok(git.calls.some((call) => call.startsWith("recover:")));
+});
+
+test("failed runs retain custody when their recovery ref cannot be anchored", async () => {
+  const git = new FakeGit();
+  git.failRecoveryAnchor = true;
+  const orca = new FakeOrca(git);
+  const ledger = new DomainLedger(":memory:");
+  orca.gateResolution = "later";
+  orca.reports.set("document", [
+    {
+      findings: [
+        {
+          id: "docs-choice",
+          severity: "warning",
+          action: "ask-user",
+          description: "Documentation ownership is unclear.",
+        },
+      ],
+      summary: "decision needed",
+    },
+  ]);
+
+  await assert.rejects(
+    runPipeline({ intent: "Retain an unpreserved gate." }, orca, git, ledger),
+    (error) =>
+      error instanceof RecoveryAnchorError && error.outcome === "failed",
+  );
+
+  const [run] = ledger.listRuns();
+  assert.equal(ledger.runStatus(run.run_id), "failed");
+  assert.ok(ledger.leaseFor("/repo", "feature"));
+  assert.ok(git.calls.some((call) => call.startsWith("recover:")));
 });
 
 test("unsafe Orca Run IDs cannot escape the evidence directory", async () => {
@@ -1343,6 +1380,10 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     const orca = new CliOrca({ command: fakeOrca, cwd: repo });
     await orca.createRun("agy adapter test");
     await mkdir(lockPath);
+    await writeFile(
+      path.join(lockPath, "owner.json"),
+      JSON.stringify({ pid: process.pid, token: "peer-update" }),
+    );
 
     const workerPromise = orca.startWorker("task-review", {
       agent: { harness: "agy" },
@@ -1401,6 +1442,22 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       trustAllWorkspaces: true,
       trustedWorkspaces: [peerPath, childPath],
     });
+
+    await mkdir(lockPath);
+    await writeFile(
+      path.join(lockPath, "owner.json"),
+      JSON.stringify({ pid: Number.MAX_SAFE_INTEGER, token: "abandoned" }),
+    );
+    const recoveredWorker = await orca.startWorker("task-review", {
+      agent: { harness: "agy" },
+      name: "agy-reviewer-recovered",
+      prompt: "review",
+      role: "reviewer",
+      stage: "review",
+      worktree: "new-child",
+    });
+    await orca.finishWorker(recoveredWorker, "release");
+    await assert.rejects(stat(lockPath), { code: "ENOENT" });
   } finally {
     if (previousHome === undefined) delete process.env.HOME;
     else process.env.HOME = previousHome;
@@ -1456,7 +1513,7 @@ test("GitShell rebases a clean feature branch, hashes trusted policy, and return
   }
 });
 
-test("GitShell safely transfers rewritten gate history to an unchanged checkout", async () => {
+test("GitShell applies append-only commits and rejects rewritten history", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-git-custody-"));
   const repo = path.join(temp, "repo");
   const gate = path.join(temp, "gate");
@@ -1472,11 +1529,18 @@ test("GitShell safely transfers rewritten gate history to an unchanged checkout"
     git(repo, "worktree", "add", "-b", "gate", gate, "feature");
     await writeFile(path.join(gate, "feature.txt"), "after\n");
     git(gate, "add", "feature.txt");
-    git(gate, "commit", "--amend", "--no-edit");
+    git(gate, "commit", "-m", "append-only change");
     const terminal = git(gate, "rev-parse", "HEAD");
 
     const shell = new GitShell({ repo });
     assert.equal(await shell.applyWorktreeCommits(gate, submission), true);
+    assert.equal(git(repo, "rev-parse", "HEAD"), terminal);
+    assert.equal(await readFile(path.join(repo, "feature.txt"), "utf8"), "after\n");
+
+    await writeFile(path.join(gate, "feature.txt"), "rewritten\n");
+    git(gate, "add", "feature.txt");
+    git(gate, "commit", "--amend", "--no-edit");
+    assert.equal(await shell.applyWorktreeCommits(gate, terminal), false);
     assert.equal(git(repo, "rev-parse", "HEAD"), terminal);
     assert.equal(await readFile(path.join(repo, "feature.txt"), "utf8"), "after\n");
   } finally {
@@ -1880,7 +1944,8 @@ test("runPipeline applies the user-global default agent", async () => {
   const configPath = path.join(temp, "config.yaml");
   const previousConfig = process.env.ORCA_NO_MISTAKES_USER_CONFIG;
   const git = new FakeGit();
-  const orca = new FakeOrca(git);
+  const runId = `user-config-run-${randomUUID()}`;
+  const orca = new FakeOrca(git, runId);
   try {
     await writeFile(configPath, "defaults:\n  agent: agy\n");
     process.env.ORCA_NO_MISTAKES_USER_CONFIG = configPath;
@@ -1919,14 +1984,14 @@ test("runPipeline applies the user-global default agent", async () => {
       result.policy.effectivePolicyHash,
       manifest.effective_policy_hash,
     );
-    await rm(
-      path.join(homedir(), ".orca-no-mistakes", "artifacts", result.runId),
-      { recursive: true, force: true },
-    );
   } finally {
     if (previousConfig === undefined)
       delete process.env.ORCA_NO_MISTAKES_USER_CONFIG;
     else process.env.ORCA_NO_MISTAKES_USER_CONFIG = previousConfig;
+    await rm(path.join(homedir(), ".orca-no-mistakes", "artifacts", runId), {
+      recursive: true,
+      force: true,
+    });
     await rm(temp, { recursive: true, force: true });
   }
 });
@@ -2677,6 +2742,7 @@ test("stop resolution cancels the run and records the audit decision", async () 
     ledger.listGateAudit(cancelledRunId).map((audit) => audit.decision),
     ["stop"],
   );
+  assert.ok(git.calls.some((call) => call.startsWith("recover:")));
   assert.equal(ledger.leaseFor("/repo", "feature"), undefined);
 });
 
