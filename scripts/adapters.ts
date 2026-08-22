@@ -442,6 +442,7 @@ function fencedJsonCandidates(text: string): FenceCandidates {
 
 function lastBareJsonObject(text: string): unknown | undefined {
   let best: unknown
+  const seen = new Set<string>()
   let depth = 0
   let start = -1
   let inString = false
@@ -465,19 +466,23 @@ function lastBareJsonObject(text: string): unknown | undefined {
         if (depth === 0 && start >= 0) {
           try {
             const parsed: unknown = JSON.parse(text.slice(start, index + 1))
-            if (parsed && typeof parsed === 'object') best = parsed
+            if (parsed && typeof parsed === 'object') {
+              seen.add(JSON.stringify(parsed))
+              best = parsed
+            }
           } catch {}
           start = -1
         }
       }
     }
   }
-  return best
+  return seen.size > 1 ? undefined : best
 }
 
 // Extracts a structured result from agent text: direct JSON first, then closed
-// JSON fences, then unclosed tails, then the last bare JSON object. More than
-// one valid closed fence is ambiguous and yields undefined rather than a guess.
+// JSON fences, then unclosed tails, then the last bare JSON object. Candidates
+// that disagree are ambiguous at every layer and yield undefined rather than a
+// guess; repeated identical values are not a disagreement.
 export function extractStructuredJson(text: string): unknown | undefined {
   try {
     return JSON.parse(text.trim())

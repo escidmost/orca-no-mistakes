@@ -461,4 +461,16 @@ test('extractStructuredJson prefers closed fences over unclosed tails and prose 
     'multiple valid closed fences are ambiguous'
   )
   assert.equal(extractStructuredJson('no json here'), undefined)
+  assert.equal(
+    extractStructuredJson(
+      'I reviewed the diff and found nothing.\n\n{"findings":[],"summary":"clean"}\n\nThe report shape is {"findings":[{"id":"stable-id","severity":"error|warning|info","file":"optional/path","line":1,"description":"full finding","action":"auto-fix|ask-user|no-op"}],"summary":"concise result","tested":["optional command"],"artifacts":["optional path"]}\n'
+    ),
+    undefined,
+    'a narrative file with disagreeing bare objects must not yield the echoed prompt template'
+  )
+  assert.deepEqual(
+    extractStructuredJson('{"a":1} restated as {"a":1}'),
+    { a: 1 },
+    'repeated identical bare objects are not ambiguous'
+  )
 })
