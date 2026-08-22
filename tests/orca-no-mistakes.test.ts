@@ -8,13 +8,18 @@ import test from 'node:test'
 
 import {
   CliOrca,
+  DomainLedger,
   GitShell,
   PIPELINE_STEPS,
-  createGateWorktree,
-  installGitGate,
+  buildAttestation,
+  capLog,
   main,
   parseGateResolution,
   runPipeline,
+  merkleRoot,
+  canonicalEntry,
+  sha256,
+  verifyManifest,
   type Finding,
   type GitOperations,
   type OrcaOperations,
@@ -27,15 +32,19 @@ const pass = (summary = 'passed'): StageReport => ({ findings: [], summary })
 
 class FakeGit implements GitOperations {
   readonly calls: string[] = []
-  readonly pushReports: StageReport[] = []
-  branch = 'feature'
-  #head = 'head-1'
-  #pendingApplyFailures: StageReport[] = []
-  #pendingApplyNoops = 0
+  static #oid(counter: number): string {
+    return counter.toString(16).padStart(40, '0')
+  }
+  #counter = 1
+  #head = FakeGit.#oid(1)
+  #baseOid = FakeGit.#oid(0)
+  divergeAfterAnchor = false
+  rebaseConflict = false
+  #operatorDiverged = false
 
-  async assertReady(): Promise<{ base: string; branch: string; head: string; root: string }> {
+  async assertReady(): Promise<{ base: string; baseOid: string; branch: string; head: string; root: string }> {
     this.calls.push('assert-ready')
-    return { base: 'main', branch: this.branch, head: this.#head, root: '/repo' }
+    return { base: 'main', baseOid: this.#baseOid, branch: 'feature', head: this.#head, root: '/repo' }
   }
 
   async assertClean(): Promise<void> {
@@ -43,46 +52,55 @@ class FakeGit implements GitOperations {
   }
 
   async head(): Promise<string> {
-    return this.#head
+    return this.#operatorDiverged ? FakeGit.#oid(9_999) : this.#head
   }
 
   async rebase(base: string): Promise<StageReport> {
     this.calls.push(`rebase:${base}`)
-    this.#head = 'head-2'
+    this.#baseOid = 'b'.repeat(40)
+    if (this.rebaseConflict) {
+      // one-shot: the next rebase models the fixer having resolved the conflict
+      this.rebaseConflict = false
+      return {
+        findings: [
+          {
+            id: 'rebase-conflict',
+            severity: 'error',
+            action: 'auto-fix',
+            description: 'conflict; rebase aborted'
+          }
+        ],
+        summary: 'rebase aborted'
+      }
+    }
+    this.#head = FakeGit.#oid(++this.#counter)
     return pass('rebased')
   }
 
-  async push(branch: string): Promise<StageReport> {
-    this.calls.push(`push:${branch}`)
-    return this.pushReports.shift() ?? pass('pushed')
+  async policySha256(): Promise<string> {
+    this.calls.push('policy')
+    return this.#baseOid === 'b'.repeat(40) ? 'e'.repeat(64) : 'f'.repeat(64)
   }
 
-  async applyWorktreeCommits(sourcePath: string, base: string): Promise<StageReport> {
-    this.calls.push(`apply:${base}:${sourcePath}`)
-    const failure = this.#pendingApplyFailures.shift()
-    if (failure) return failure
-    if (this.#pendingApplyNoops > 0) {
-      this.#pendingApplyNoops -= 1
-      return pass('nothing to apply')
-    }
-    this.advanceHead()
-    return pass('applied fixer commits to the gate branch')
+  async resolveBaseOid(): Promise<string> {
+    this.calls.push('resolve-base')
+    return this.#baseOid
   }
 
-  async deleteBranch(name: string): Promise<void> {
-    this.calls.push(`delete-branch:${name}`)
+  async advanceIfUnchanged(fromOid: string, toOid: string): Promise<boolean> {
+    this.calls.push(`ff:${fromOid}->${toOid}`)
+    if ((this.#operatorDiverged ? FakeGit.#oid(9_999) : this.#head) !== fromOid) return false
+    this.#head = toOid
+    return true
+  }
+
+  async anchorRecoveryRef(runId: string, oid: string): Promise<void> {
+    if (this.divergeAfterAnchor) this.#operatorDiverged = true
+    this.calls.push(`recover:${runId}:${oid}`)
   }
 
   advanceHead(): void {
-    this.#head = `head-${Number(this.#head.split('-')[1]) + 1}`
-  }
-
-  failApplyOnce(report: StageReport): void {
-    this.#pendingApplyFailures.push(report)
-  }
-
-  noopApplyOnce(): void {
-    this.#pendingApplyNoops += 1
+    this.#head = FakeGit.#oid(++this.#counter)
   }
 }
 
@@ -96,12 +114,13 @@ class FakeOrca implements OrcaOperations {
   readonly removedWorktrees: string[] = []
   readonly reports = new Map<string, StageReport[]>()
   gateResolution = 'approve'
-  failWorkerFor?: string
   #taskNumber = 0
   #dispatchNumber = 0
+  #git: FakeGit
   #runId: string
 
-  constructor(_git: FakeGit, runId = `test-run-${randomUUID()}`) {
+  constructor(git: FakeGit, runId = `test-run-${randomUUID()}`) {
+    this.#git = git
     this.#runId = runId
   }
 
@@ -119,30 +138,26 @@ class FakeOrca implements OrcaOperations {
   async startWorker(taskId: string, launch: WorkerLaunch): Promise<WorkerResult> {
     this.launches.push(launch)
     const dispatchId = `dispatch-${++this.#dispatchNumber}`
-    if (this.failWorkerFor === launch.stage) {
-      throw new Error(`${launch.stage} worker was cancelled`)
-    }
     const stage = launch.stage
     const reports = this.reports.get(stage) ?? [pass(stage)]
     const report = reports.shift() ?? pass(stage)
     this.reports.set(stage, reports)
     if (launch.role === 'fixer') {
       this.fixerDispatches.push(dispatchId)
+      this.#git.advanceHead()
     }
     return {
-      branchName: launch.name,
       deliveryId: `delivery-${dispatchId}`,
       dispatchId,
       report,
       taskId,
-      terminalHandle: `term-${dispatchId}`,
-      worktreeId: `repo::/${dispatchId}`,
-      worktreePath: `/wt/${dispatchId}`
+      terminalHandle: launch.role === 'fixer' ? 'term-fixer' : `term-${dispatchId}`,
+      worktreeId: launch.worktree === 'new-child' ? `repo::/${dispatchId}` : undefined
     }
   }
 
-  async finishWorker(worker: WorkerResult): Promise<void> {
-    this.calls.push(`release:${worker.dispatchId}`)
+  async finishWorker(worker: WorkerResult, disposition: 'release' | 'retain'): Promise<void> {
+    this.calls.push(`${disposition}:${worker.dispatchId}`)
   }
 
   async removeWorktree(worktreeId: string): Promise<void> {
@@ -175,9 +190,10 @@ class FakeOrca implements OrcaOperations {
   }
 }
 
-test('runs the nine-stage adversarial pipeline with fixes, gates, and isolation', async () => {
+test('runs the six-stage local adversarial pipeline with fixes, gates, and isolation', async () => {
   const git = new FakeGit()
   const orca = new FakeOrca(git)
+  const ledger = new DomainLedger(':memory:')
   const autoFix: Finding = {
     id: 'review-1',
     severity: 'error',
@@ -199,21 +215,12 @@ test('runs the nine-stage adversarial pipeline with fixes, gates, and isolation'
     },
     pass('lint clean')
   ])
-  orca.reports.set('ci', [
-    {
-      findings: [{ ...autoFix, id: 'ci-1', description: 'The new behavior fails in CI' }],
-      summary: 'CI defect'
-    },
-    pass('CI clean')
-  ])
 
   const result = await runPipeline(
-    {
-      intent: 'Add the requested command without changing existing behavior.',
-      gate: { branch: 'no-mistakes-gate-test', worktreeId: 'wt-gate' }
-    },
+    { intent: 'Add the requested command without changing existing behavior.' },
     orca,
-    git
+    git,
+    ledger
   )
 
   assert.match(result.runId, /^test-run-/)
@@ -232,28 +239,25 @@ test('runs the nine-stage adversarial pipeline with fixes, gates, and isolation'
   )
   assert.equal(reviewLaunches.length, 2)
   assert.ok(reviewLaunches.every((launch) => launch.role === 'reviewer'))
+  assert.ok(reviewLaunches.every((launch) => launch.worktree === 'new-child'))
   assert.notEqual(reviewLaunches[0].name, reviewLaunches[1].name)
 
   const fixerLaunches = orca.launches.filter((launch) => launch.role === 'fixer')
-  assert.equal(fixerLaunches.length, 3)
+  assert.equal(fixerLaunches.length, 2)
+  assert.equal(fixerLaunches[0].worktree, 'current')
+  assert.equal(fixerLaunches[1].terminal, 'term-fixer')
   assert.ok(
-    orca.fixerDispatches.every((dispatchId) => orca.calls.includes(`release:${dispatchId}`)),
-    'every fixer dispatch is released after its round'
-  )
-  const applyCalls = git.calls.filter((call) => call.startsWith('apply:'))
-  assert.equal(applyCalls.length, 3)
-  assert.ok(
-    orca.fixerDispatches.every((dispatchId) =>
-      applyCalls.some((call) => call.endsWith(`:/wt/${dispatchId}`))
+    orca.fixerDispatches.every(
+      (dispatchId) => orca.calls.includes(`retain:${dispatchId}`) || orca.calls.includes(`release:${dispatchId}`)
     ),
-    'every fixer round applies its commits to the gate branch'
+    'every fixer dispatch is retained or eventually released'
+  )
+  assert.ok(
+    orca.calls.includes(`release:${orca.fixerDispatches[orca.fixerDispatches.length - 1]}`),
+    'the final retained fixer dispatch is released'
   )
   assert.ok(orca.calls.some((call) => call.startsWith('gate:') && call.includes('docs-1')))
-  assert.equal(orca.removedWorktrees.length, orca.launches.length + 1)
-  assert.ok(orca.removedWorktrees.includes('wt-gate'), 'the gate worktree is removed')
-  assert.ok(git.calls.includes('delete-branch:no-mistakes-gate-test'), 'the gate branch is deleted')
-  assert.ok(git.calls.indexOf('rebase:main') < git.calls.indexOf('push:feature'))
-  assert.equal(git.calls.filter((call) => call === 'push:feature').length, 2)
+  assert.equal(orca.removedWorktrees.length, orca.launches.filter((launch) => launch.worktree === 'new-child').length)
   assert.match(
     orca.tasks.find((task) => task.spec.startsWith('[review check 1]'))?.spec ?? '',
     /report exactly once with worker_done/i
@@ -261,6 +265,18 @@ test('runs the nine-stage adversarial pipeline with fixes, gates, and isolation'
   assert.match(
     orca.tasks.find((task) => task.spec.startsWith('[review check 1]'))?.spec ?? '',
     /Do NOT run tests during review/
+  )
+  assert.match(
+    orca.tasks.find((task) => task.spec.startsWith('[review check 1]'))?.spec ?? '',
+    /unexplained relaxation of validation policy is a blocking finding/
+  )
+  assert.match(
+    orca.tasks.find((task) => task.spec.startsWith('[review check 1]'))?.spec ?? '',
+    /<untrusted_instruction>/
+  )
+  assert.match(
+    orca.tasks.find((task) => task.spec.startsWith('[review check 1]'))?.spec ?? '',
+    /untrusted data/
   )
   assert.match(
     orca.tasks.find((task) => task.spec.startsWith('[test check 1]'))?.spec ?? '',
@@ -275,14 +291,6 @@ test('runs the nine-stage adversarial pipeline with fixes, gates, and isolation'
     /Discover configured linters/
   )
   assert.match(
-    orca.tasks.find((task) => task.spec.startsWith('[pr check 1]'))?.spec ?? '',
-    /conventional commit format/
-  )
-  assert.match(
-    orca.tasks.find((task) => task.spec.startsWith('[ci check 1]'))?.spec ?? '',
-    /Wait for all required CI checks/
-  )
-  assert.match(
     orca.tasks.find((task) => task.spec.startsWith('[review fix 1]'))?.spec ?? '',
     /Null input crashes the command/
   )
@@ -291,43 +299,36 @@ test('runs the nine-stage adversarial pipeline with fixes, gates, and isolation'
     /Apply all the fixes you intend to make first/
   )
   assert.match(
+    orca.tasks.find((task) => task.spec.startsWith('[review fix 1]'))?.spec ?? '',
+    /Do NOT modify existing test assertions/
+  )
+  assert.match(
     orca.tasks.find((task) => task.spec.startsWith('[lint fix 1]'))?.spec ?? '',
     /Re-run the relevant lint or format commands/
   )
-  assert.match(
-    orca.tasks.find((task) => task.spec.startsWith('[ci fix 1]'))?.spec ?? '',
-    /fix the test to be cross-platform/
+
+  const checkpoints = ledger.listCheckpoints(result.runId)
+  assert.deepEqual(
+    checkpoints.map((checkpoint) => [checkpoint.stage_id, checkpoint.round_index]),
+    [
+      ['intent', 0],
+      ['review', 1],
+      ['lint', 1]
+    ]
   )
+  assert.equal(checkpoints[0].input_commit_oid, checkpoints[0].output_commit_oid)
+  for (const checkpoint of checkpoints.slice(1)) {
+    assert.notEqual(checkpoint.input_commit_oid, checkpoint.output_commit_oid)
+  }
+  assert.ok(result.attestation)
+  verifyManifest(result.attestation)
+  assert.equal(result.attestation.stageEvidence.length, 8)
+  assert.ok(git.calls.some((call) => call.startsWith('recover:')))
+  assert.match(result.custodyNote ?? '', /carries the terminal commit/)
   assert.equal(
     orca.calls.at(-1),
     `status:completed:no-mistakes passed all ${PIPELINE_STEPS.length} stages`
   )
-})
-
-test('delivery failures require a successful retry instead of approval', async () => {
-  const git = new FakeGit()
-  const orca = new FakeOrca(git)
-  const pushFailure: StageReport = {
-    findings: [
-      {
-        id: 'push-failed',
-        severity: 'error',
-        action: 'ask-user',
-        description: 'Authentication failed'
-      }
-    ],
-    summary: 'push failed'
-  }
-  git.pushReports.push(pushFailure, pass('retry pushed'))
-  orca.gateResolution = 'retry'
-
-  await runPipeline({ intent: 'Deliver the committed change.' }, orca, git)
-
-  assert.equal(git.calls.filter((call) => call === 'push:feature').length, 2)
-  assert.equal(orca.launches.filter((launch) => launch.role === 'fixer').length, 0)
-  assert.ok(orca.calls.some((call) => call.startsWith('gate:') && call.includes('push-failed')))
-  assert.deepEqual(orca.gates[0].options, ['retry', 'stop'])
-  assert.doesNotMatch(orca.gates[0].question, /approve|skip|fix/)
 })
 
 test('opens an exhaustion gate when automatic fix limit is reached and stops on stop decision', async () => {
@@ -382,6 +383,7 @@ test('exhaustion gate allows user to authorize another fix round', async () => {
 test('unknown gate decisions stop the pipeline and update worktree status', async () => {
   const git = new FakeGit()
   const orca = new FakeOrca(git)
+  const ledger = new DomainLedger(':memory:')
   orca.gateResolution = 'later'
   orca.reports.set('document', [
     {
@@ -398,10 +400,13 @@ test('unknown gate decisions stop the pipeline and update worktree status', asyn
   ])
 
   await assert.rejects(
-    runPipeline({ intent: 'Reject unknown decisions.' }, orca, git),
-    /document gate stopped the pipeline: later/
+    runPipeline({ intent: 'Reject unknown decisions.' }, orca, git, ledger),
+    /document gate could not be resolved from: later/
   )
   assert.ok(orca.calls.some((call) => call.includes('status:in-review:no-mistakes stopped:')))
+  const runs = ledger.listRuns()
+  assert.equal(runs.length, 1)
+  assert.equal(ledger.runStatus(runs[0].run_id), 'failed')
 })
 
 test('unsafe Orca Run IDs cannot escape the evidence directory', async () => {
@@ -518,71 +523,6 @@ test('reviewer URL references are not treated as local artifacts', async () => {
   assert.ok(orca.launches.some((launch) => launch.role === 'fixer'))
 })
 
-test('install requires per-push intent without persisting a fallback', async () => {
-  const temp = await mkdtemp(path.join(tmpdir(), 'orca-no-mistakes-'))
-  const repo = path.join(temp, 'repo')
-  try {
-    await mkdir(repo)
-    git(repo, 'init', '-b', 'feature')
-    git(repo, 'config', 'user.email', 'test@example.com')
-    git(repo, 'config', 'user.name', 'Test User')
-    await writeFile(path.join(repo, 'README.md'), 'test\n')
-    git(repo, 'add', 'README.md')
-    git(repo, 'commit', '-m', 'initial')
-    git(repo, 'config', 'orca-no-mistakes.intent', 'stale intent')
-
-    const gate = await installGitGate({ repo })
-    const hooks = path.join(gate, 'hooks')
-    const preReceive = path.join(hooks, 'pre-receive')
-    const postReceive = path.join(hooks, 'post-receive')
-    const hookSource = await readFile(postReceive, 'utf8')
-    assert.match(hookSource, /GIT_PUSH_OPTION_COUNT/)
-    assert.doesNotMatch(hookSource, /ORCA_NO_MISTAKES_INTENT|orca-no-mistakes\.intent/)
-    assert.match(await readFile(preReceive, 'utf8'), /per-push intent is required/)
-    assert.equal(git(repo, `--git-dir=${gate}`, 'config', '--get', 'core.hooksPath'), hooks)
-    assert.equal(git(repo, `--git-dir=${gate}`, 'config', '--get', 'receive.advertisePushOptions'), 'true')
-    assert.throws(() => git(repo, 'config', '--get', 'orca-no-mistakes.intent'))
-    await writeFile(postReceive, '#!/bin/sh\nexit 0\n')
-    await chmod(postReceive, 0o755)
-
-    assert.throws(() => git(repo, 'push', 'orca-no-mistakes'))
-    git(repo, 'push', '--push-option=no-mistakes.intent=Test this commit set.', 'orca-no-mistakes')
-
-    assert.equal(
-      git(repo, `--git-dir=${gate}`, 'rev-parse', 'refs/heads/feature'),
-      git(repo, 'rev-parse', 'HEAD')
-    )
-  } finally {
-    await rm(temp, { recursive: true, force: true })
-  }
-})
-
-test('push sends intent through Git push options', async () => {
-  const temp = await mkdtemp(path.join(tmpdir(), 'orca-push-intent-'))
-  const repo = path.join(temp, 'repo')
-  const receivedIntent = path.join(temp, 'received-intent')
-  try {
-    await mkdir(repo)
-    git(repo, 'init', '-b', 'feature')
-    git(repo, 'config', 'user.email', 'test@example.com')
-    git(repo, 'config', 'user.name', 'Test User')
-    await writeFile(path.join(repo, 'README.md'), 'test\n')
-    git(repo, 'add', 'README.md')
-    git(repo, 'commit', '-m', 'initial')
-
-    const gate = await installGitGate({ repo })
-    const hook = path.join(gate, 'hooks', 'post-receive')
-    await writeFile(hook, `#!/bin/sh\nprintf '%s' "$GIT_PUSH_OPTION_0" > '${receivedIntent}'\n`)
-    await chmod(hook, 0o755)
-
-    await main(['push', `--repo=${repo}`, '--intent=Explain this exact commit set.'])
-
-    assert.equal(await readFile(receivedIntent, 'utf8'), 'no-mistakes.intent=Explain this exact commit set.')
-  } finally {
-    await rm(temp, { recursive: true, force: true })
-  }
-})
-
 test('CLI accepts equals syntax and preserves negative numeric values', async () => {
   const temp = await mkdtemp(path.join(tmpdir(), 'orca-cli-'))
   try {
@@ -591,20 +531,23 @@ test('CLI accepts equals syntax and preserves negative numeric values', async ()
       main(['run', `--repo=${temp}`, '--intent=Validate parsing.', '--max-fix-rounds=-1']),
       /maxFixRounds must be a non-negative integer/
     )
-    await assert.rejects(main(['install', '--repo']), /--repo requires a value/)
-    await assert.rejects(main(['install', '--intent=x']), /--intent is not valid for install/)
+    await assert.rejects(main(['install', '--repo=x']), /unknown command: install/)
+    await assert.rejects(main(['push', '--intent=x']), /unknown command: push/)
     await assert.rejects(main(['run', '--force', '--intent=x']), /--force is not valid for run/)
-    await assert.rejects(main(['install', '--base=main']), /--base is not valid for install/)
+    await assert.rejects(main(['run', '--force-lease=true', '--intent=x']), /--force-lease does not take a value/)
+    await assert.rejects(main(['attestation']), /attestation requires export or verify/)
+    await assert.rejects(main(['attestation', 'export']), /requires a run ID/)
+  await assert.rejects(main(['run', '--intent=x', 'stray-arg']), /run does not accept positional arguments/)
+  await assert.rejects(main(['prune', 'stray-arg']), /prune does not accept positional arguments/)
   } finally {
     await rm(temp, { recursive: true, force: true })
   }
 })
 
-test('run launches the detached coordinator inside a fresh gate worktree', async () => {
+test('run starts an attached coordinator in a dedicated Orca terminal', async () => {
   const temp = await mkdtemp(path.join(tmpdir(), 'orca-detached-run-'))
   const origin = path.join(temp, 'origin.git')
   const repo = path.join(temp, 'repo')
-  const gateWt = path.join(temp, 'gate-wt')
   const fakeOrca = path.join(temp, 'orca')
   const callsPath = path.join(temp, 'calls.jsonl')
   const previousCommand = process.env.ORCA_CLI_COMMAND
@@ -626,21 +569,13 @@ test('run launches the detached coordinator inside a fresh gate worktree', async
       fakeOrca,
       `#!/usr/bin/env node
 import fs from 'node:fs'
-import { execFileSync } from 'node:child_process'
 const args = process.argv.slice(2)
 fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
-const result = args[0] === 'worktree' && args[1] === 'create'
-  ? (() => {
-      const name = args[args.indexOf('--name') + 1]
-      const base = args[args.indexOf('--base-branch') + 1]
-      execFileSync('git', ['worktree', 'add', ${JSON.stringify(gateWt)}, '-b', name, base], { cwd: ${JSON.stringify(repo)} })
-      return { worktree: { id: 'wt-gate-1', path: ${JSON.stringify(gateWt)} } }
-    })()
-  : args[0] === 'terminal' && args[1] === 'create'
-    ? { terminal: { handle: 'detached-coordinator' } }
-    : args[0] === 'terminal' && args[1] === 'show'
-      ? { terminal: { connected: true, preview: 'ready shell prompt' } }
-      : { accepted: true }
+const result = args[0] === 'terminal' && args[1] === 'create'
+  ? { terminal: { handle: 'detached-coordinator' } }
+  : args[0] === 'terminal' && args[1] === 'show'
+    ? { terminal: { connected: true, preview: 'ready shell prompt' } }
+    : { accepted: true }
 console.log(JSON.stringify({ result }))
 `
     )
@@ -648,36 +583,18 @@ console.log(JSON.stringify({ result }))
     process.env.ORCA_CLI_COMMAND = fakeOrca
     process.env.ORCA_TERMINAL_HANDLE = 'originating-opencode'
 
-    const head = git(repo, 'rev-parse', 'HEAD')
-    await main(['run', `--repo=${repo}`, `--head=${head}`, '--intent=Validate detached coordination.'])
+    await main(['run', `--repo=${repo}`, '--intent=Validate detached coordination.'])
 
     const calls = (await readFile(callsPath, 'utf8'))
       .trim()
       .split('\n')
       .map((line) => JSON.parse(line) as string[])
-    const worktreeCreate = calls.find((args) => args[0] === 'worktree' && args[1] === 'create')
     const terminalCreate = calls.find((args) => args[0] === 'terminal' && args[1] === 'create')
     const terminalSend = calls.find((args) => args[0] === 'terminal' && args[1] === 'send')
-    assert.ok(worktreeCreate, 'the launcher creates the gate worktree first')
-    assert.ok(terminalCreate, 'the launcher creates a coordinator terminal')
-    assert.ok(calls.indexOf(worktreeCreate) < calls.indexOf(terminalCreate))
-    assert.ok(worktreeCreate.includes('--base-branch'))
-    assert.ok(worktreeCreate.includes('feature'))
-    const parentWorktree =
-      worktreeCreate[worktreeCreate.indexOf('--parent-worktree') + 1]?.replace(/^path:/, '') ?? ''
-    assert.equal(await realpath(parentWorktree), await realpath(repo))
-    const commandWorktree =
-      terminalCreate?.[terminalCreate.indexOf('--worktree') + 1]?.replace(/^path:/, '') ?? ''
-    assert.equal(await realpath(commandWorktree), await realpath(gateWt))
-    assert.notEqual(await realpath(commandWorktree), await realpath(repo))
     const commandText = terminalSend?.[terminalSend.indexOf('--text') + 1] ?? ''
+    const worktree = terminalCreate?.[terminalCreate.indexOf('--worktree') + 1]?.replace(/^path:/, '')
+    assert.equal(worktree ? await realpath(worktree) : '', await realpath(repo))
     assert.ok(commandText.includes("'--attached'"))
-    assert.ok(commandText.includes(`'--repo' '${gateWt}'`))
-    assert.ok(commandText.includes("NO_MISTAKES_DELIVERY_BRANCH='feature'"))
-    assert.ok(commandText.includes("NO_MISTAKES_GATE_WORKTREE_ID='wt-gate-1'"))
-    const gateBranch = worktreeCreate[worktreeCreate.indexOf('--name') + 1]
-    assert.ok(commandText.includes(`NO_MISTAKES_GATE_BRANCH='${gateBranch}'`))
-    assert.ok(commandText.includes(`'--head' '${git(repo, 'rev-parse', 'HEAD')}'`))
     assert.ok(commandText.includes("'--notify' 'originating-opencode'"))
     assert.ok(commandText.includes("'--intent' 'Validate detached coordination.'"))
     assert.ok(!calls.some((args) => args[0] === 'orchestration'))
@@ -686,187 +603,6 @@ console.log(JSON.stringify({ result }))
     else process.env.ORCA_CLI_COMMAND = previousCommand
     if (previousHandle === undefined) delete process.env.ORCA_TERMINAL_HANDLE
     else process.env.ORCA_TERMINAL_HANDLE = previousHandle
-    await rm(temp, { recursive: true, force: true })
-  }
-})
-
-test('an attached run removes the gate when its own pre-flight check fails', async () => {
-  const temp = await mkdtemp(path.join(tmpdir(), 'orca-gate-preflight-'))
-  const gateWt = path.join(temp, 'gate-wt')
-  const fakeOrca = path.join(temp, 'orca')
-  const callsPath = path.join(temp, 'calls.jsonl')
-  const previous = {
-    command: process.env.ORCA_CLI_COMMAND,
-    branch: process.env.NO_MISTAKES_GATE_BRANCH,
-    delivery: process.env.NO_MISTAKES_DELIVERY_BRANCH,
-    worktree: process.env.NO_MISTAKES_GATE_WORKTREE_ID
-  }
-  try {
-    const repo = await seedOriginRepo(temp)
-    git(repo, 'checkout', '-b', 'feature')
-    git(repo, 'worktree', 'add', gateWt, '-b', 'no-mistakes-gate-preflight', 'feature')
-    await writeFile(path.join(gateWt, 'leftover.txt'), 'dirty\n')
-    git(gateWt, 'add', 'leftover.txt')
-
-    await writeFile(
-      fakeOrca,
-      `#!/usr/bin/env node
-import fs from 'node:fs'
-import { execFileSync } from 'node:child_process'
-const args = process.argv.slice(2)
-fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
-if (args[0] === 'worktree' && args[1] === 'rm') {
-  execFileSync('git', ['worktree', 'remove', '--force', ${JSON.stringify(gateWt)}], { cwd: ${JSON.stringify(repo)} })
-}
-console.log(JSON.stringify({ result: { accepted: true } }))
-`
-    )
-    await chmod(fakeOrca, 0o755)
-    process.env.ORCA_CLI_COMMAND = fakeOrca
-    process.env.NO_MISTAKES_GATE_BRANCH = 'no-mistakes-gate-preflight'
-    process.env.NO_MISTAKES_DELIVERY_BRANCH = 'feature'
-    process.env.NO_MISTAKES_GATE_WORKTREE_ID = 'wt-gate-1'
-
-    await assert.rejects(
-      main(['run', '--attached', `--repo=${gateWt}`, '--intent=Validate gate cleanup.'])
-    )
-
-    const calls = (await readFile(callsPath, 'utf8'))
-      .trim()
-      .split('\n')
-      .map((line) => JSON.parse(line) as string[])
-    assert.ok(
-      calls.some(
-        (args) => args[0] === 'worktree' && args[1] === 'rm' && args.includes('id:wt-gate-1')
-      ),
-      'the gate worktree is removed'
-    )
-    assert.equal(
-      git(repo, 'branch', '--list', 'no-mistakes-gate-preflight').trim(),
-      '',
-      'the gate branch is deleted'
-    )
-  } finally {
-    for (const [name, value] of [
-      ['ORCA_CLI_COMMAND', previous.command],
-      ['NO_MISTAKES_GATE_BRANCH', previous.branch],
-      ['NO_MISTAKES_DELIVERY_BRANCH', previous.delivery],
-      ['NO_MISTAKES_GATE_WORKTREE_ID', previous.worktree]
-    ] as const) {
-      if (value === undefined) delete process.env[name]
-      else process.env[name] = value
-    }
-    await rm(temp, { recursive: true, force: true })
-  }
-})
-
-async function seedOriginRepo(temp: string): Promise<string> {
-  const origin = path.join(temp, 'origin.git')
-  const repo = path.join(temp, 'repo')
-  git(temp, 'init', '--bare', origin)
-  git(temp, 'clone', origin, repo)
-  git(repo, 'config', 'user.email', 'test@example.com')
-  git(repo, 'config', 'user.name', 'Test User')
-  git(repo, 'checkout', '-b', 'main')
-  await writeFile(path.join(repo, 'README.md'), 'main\n')
-  git(repo, 'add', 'README.md')
-  git(repo, 'commit', '-m', 'main')
-  git(repo, 'push', '-u', 'origin', 'main')
-  git(temp, `--git-dir=${origin}`, 'symbolic-ref', 'HEAD', 'refs/heads/main')
-  return repo
-}
-
-async function writeGateOrca(
-  fakeOrca: string,
-  callsPath: string,
-  repo: string,
-  gateWt: string,
-  terminalCreateResult: string
-): Promise<void> {
-  await writeFile(
-    fakeOrca,
-    `#!/usr/bin/env node
-import fs from 'node:fs'
-import { execFileSync } from 'node:child_process'
-const args = process.argv.slice(2)
-fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
-const result = args[0] === 'worktree' && args[1] === 'create'
-  ? (() => {
-      const name = args[args.indexOf('--name') + 1]
-      const base = args[args.indexOf('--base-branch') + 1]
-      execFileSync('git', ['worktree', 'add', ${JSON.stringify(gateWt)}, '-b', name, base], { cwd: ${JSON.stringify(repo)} })
-      return { worktree: { id: 'wt-gate-1', path: ${JSON.stringify(gateWt)} } }
-    })()
-  : args[0] === 'worktree' && args[1] === 'rm'
-    ? (() => {
-        execFileSync('git', ['worktree', 'remove', '--force', ${JSON.stringify(gateWt)}], { cwd: ${JSON.stringify(repo)} })
-        return { accepted: true }
-      })()
-    : args[0] === 'terminal' && args[1] === 'create'
-      ? ${terminalCreateResult}
-      : args[0] === 'terminal' && args[1] === 'show'
-        ? { terminal: { connected: true, preview: 'ready shell prompt' } }
-        : { accepted: true }
-console.log(JSON.stringify({ result }))
-`
-  )
-  await chmod(fakeOrca, 0o755)
-}
-
-test('the gate worktree is created against the main repository root', async () => {
-  const temp = await mkdtemp(path.join(tmpdir(), 'orca-gate-root-'))
-  const linked = path.join(temp, 'linked')
-  const gateWt = path.join(temp, 'gate-wt')
-  const fakeOrca = path.join(temp, 'orca')
-  const callsPath = path.join(temp, 'calls.jsonl')
-  const previousCommand = process.env.ORCA_CLI_COMMAND
-  try {
-    const repo = await seedOriginRepo(temp)
-    git(repo, 'worktree', 'add', linked, '-b', 'linked-feature')
-    await writeGateOrca(fakeOrca, callsPath, repo, gateWt, "{ terminal: { handle: 'detached-coordinator' } }")
-    process.env.ORCA_CLI_COMMAND = fakeOrca
-
-    await main(['run', `--repo=${linked}`, '--intent=Validate gate creation from a linked worktree.'])
-
-    const calls = (await readFile(callsPath, 'utf8'))
-      .trim()
-      .split('\n')
-      .map((line) => JSON.parse(line) as string[])
-    const worktreeCreate = calls.find((args) => args[0] === 'worktree' && args[1] === 'create')
-    assert.ok(worktreeCreate)
-    const repoArg = worktreeCreate[worktreeCreate.indexOf('--repo') + 1].replace(/^path:/, '')
-    const parentArg = worktreeCreate[worktreeCreate.indexOf('--parent-worktree') + 1].replace(/^path:/, '')
-    assert.equal(await realpath(repoArg), await realpath(repo))
-    assert.equal(await realpath(parentArg), await realpath(linked))
-    assert.ok(worktreeCreate.includes('linked-feature'))
-  } finally {
-    if (previousCommand === undefined) delete process.env.ORCA_CLI_COMMAND
-    else process.env.ORCA_CLI_COMMAND = previousCommand
-    await rm(temp, { recursive: true, force: true })
-  }
-})
-
-test('a failed detached launch deletes the gate branch it created', async () => {
-  const temp = await mkdtemp(path.join(tmpdir(), 'orca-gate-launch-fail-'))
-  const gateWt = path.join(temp, 'gate-wt')
-  const fakeOrca = path.join(temp, 'orca')
-  const callsPath = path.join(temp, 'calls.jsonl')
-  const previousCommand = process.env.ORCA_CLI_COMMAND
-  try {
-    const repo = await seedOriginRepo(temp)
-    git(repo, 'checkout', '-b', 'feature')
-    await writeGateOrca(fakeOrca, callsPath, repo, gateWt, '{ terminal: {} }')
-    process.env.ORCA_CLI_COMMAND = fakeOrca
-
-    await assert.rejects(
-      main(['run', `--repo=${repo}`, '--intent=Validate launch failure cleanup.']),
-      /terminal create returned an invalid receipt/
-    )
-
-    assert.equal(git(repo, 'branch', '--list', 'no-mistakes-gate-*'), '')
-  } finally {
-    if (previousCommand === undefined) delete process.env.ORCA_CLI_COMMAND
-    else process.env.ORCA_CLI_COMMAND = previousCommand
     await rm(temp, { recursive: true, force: true })
   }
 })
@@ -973,19 +709,17 @@ if (args[1] === 'run-create') {
   }
 })
 
-test('CliOrca gives every fixer its own child worktree and terminal', async () => {
+test('CliOrca creates a fixer once and reuses its terminal without creation flags', async () => {
   const temp = await mkdtemp(path.join(tmpdir(), 'orca-cli-'))
   const fakeOrca = path.join(temp, 'orca')
   const callsPath = path.join(temp, 'calls.jsonl')
   const countPath = path.join(temp, 'count')
-  const startCountPath = path.join(temp, 'wt-count')
-  const dispatchCountPath = path.join(temp, 'dispatch-count')
-  const evidence = path.join(homedir(), '.orca-no-mistakes', 'evidence', 'adapter-test')
+  const startCountPath = path.join(temp, 'start-count')
+  const evidence = path.join(homedir(), '.orca-no-mistakes', 'artifacts', 'adapter-test')
   const reportOne = path.join(evidence, 'one.json')
   const reportTwo = path.join(evidence, 'two.json')
   const reportThree = path.join(evidence, 'three.json')
   try {
-    git(temp, 'init', '-b', 'feature')
     await mkdir(evidence, { recursive: true })
     await writeFile(reportOne, JSON.stringify(pass('first fix')))
     await writeFile(reportTwo, JSON.stringify(pass('second fix')))
@@ -997,31 +731,24 @@ import fs from 'node:fs'
 const args = process.argv.slice(2)
 fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
 const out = (result) => console.log(JSON.stringify({ result }))
-const nextCount = (file) => {
-  const count = fs.existsSync(file) ? Number(fs.readFileSync(file, 'utf8')) : 0
-  fs.writeFileSync(file, String(count + 1))
-  return count + 1
-}
 if (args[0] === 'orchestration' && args[1] === 'run-create') {
   out({ run: { id: 'adapter-test' } })
-} else if (args[0] === 'worktree' && args[1] === 'create') {
-  const n = nextCount(${JSON.stringify(startCountPath)})
-  out({ worktree: { id: 'wt-' + n, path: '/wt-' + n } })
-} else if (args[0] === 'terminal' && args[1] === 'list') {
-  const n = Number(fs.readFileSync(${JSON.stringify(startCountPath)}, 'utf8'))
-  out({ terminals: [{ handle: 'worker-shell-' + n, connected: true, writable: true }] })
+} else if (args[0] === 'terminal' && args[1] === 'create') {
+  out({ terminal: { handle: 'created-fixer' } })
 } else if (args[0] === 'terminal' && args[1] === 'send') {
   out({ accepted: true })
 } else if (args[0] === 'terminal' && args[1] === 'show') {
-  out({ terminal: { connected: true, lastOutputAt: 1, title: 'OpenCode', preview: 'ready' } })
+  out({ terminal: { connected: true, title: 'OpenCode', preview: 'ready' } })
 } else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
-  const count = nextCount(${JSON.stringify(dispatchCountPath)})
-  out({ dispatch: { id: 'dispatch-' + count, status: 'dispatched' }, injected: true, preamble: 'authenticated' })
+  const count = fs.existsSync(${JSON.stringify(startCountPath)}) ? Number(fs.readFileSync(${JSON.stringify(startCountPath)}, 'utf8')) : 0
+  fs.writeFileSync(${JSON.stringify(startCountPath)}, String(count + 1))
+  out({ dispatch: { id: 'dispatch-' + (count + 1), status: 'dispatched' }, injected: true, preamble: 'authenticated' })
 } else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
-  const count = nextCount(${JSON.stringify(countPath)})
-  const dispatchId = 'dispatch-' + count
-  const taskId = 'task-' + count
-  const reportPath = count === 1 ? ${JSON.stringify(reportOne)} : count === 2 ? ${JSON.stringify(reportTwo)} : ${JSON.stringify(reportThree)}
+  const count = fs.existsSync(${JSON.stringify(countPath)}) ? Number(fs.readFileSync(${JSON.stringify(countPath)}, 'utf8')) : 0
+  fs.writeFileSync(${JSON.stringify(countPath)}, String(count + 1))
+  const dispatchId = 'dispatch-' + (count + 1)
+  const taskId = 'task-' + (count + 1)
+  const reportPath = count === 0 ? ${JSON.stringify(reportOne)} : count === 1 ? ${JSON.stringify(reportTwo)} : ${JSON.stringify(reportThree)}
   out({ deliveryId: 'delivery-' + count, messages: [{ type: 'worker_done', body: 'Fixed the issue. Verified the change. Nothing remains.', payload: JSON.stringify({ taskId, dispatchId, outcome: 'succeeded', reportPath }) }] })
 } else {
   out({ ok: true })
@@ -1041,50 +768,41 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       name: 'first-fixer',
       prompt: 'first',
       role: 'fixer',
-      stage: 'review'
+      stage: 'review',
+      worktree: 'current'
     })
-    await orca.finishWorker(first)
+    await orca.finishWorker(first, 'retain')
     const second = await orca.startWorker('task-2', {
       name: 'second-fixer',
       prompt: 'second',
       role: 'fixer',
-      stage: 'lint'
+      stage: 'lint',
+      terminal: first.terminalHandle,
+      worktree: 'current'
     })
-    await orca.finishWorker(second)
+    await orca.finishWorker(second, 'retain')
     const third = await orca.startWorker('task-3', {
       name: 'third-fixer',
       prompt: 'third',
       role: 'fixer',
-      stage: 'test'
+      stage: 'test',
+      terminal: second.terminalHandle,
+      worktree: 'current'
     })
-    await orca.finishWorker(third)
+    await orca.finishWorker(third, 'release')
 
-    assert.equal(first.worktreeId, 'wt-1')
-    assert.equal(first.worktreePath, '/wt-1')
-    assert.equal(first.terminalHandle, 'worker-shell-1')
-    assert.equal(second.worktreeId, 'wt-2')
-    assert.equal(second.terminalHandle, 'worker-shell-2')
-    assert.equal(third.worktreeId, 'wt-3')
-    assert.equal(third.terminalHandle, 'worker-shell-3')
     const calls = (await readFile(callsPath, 'utf8'))
       .trim()
       .split('\n')
       .map((line) => JSON.parse(line) as string[])
     const starts = calls.filter((args) => args[1] === 'dispatch')
     assert.equal(starts.length, 3)
-    const worktreeCreates = calls.filter((args) => args[0] === 'worktree' && args[1] === 'create')
-    assert.equal(worktreeCreates.length, 3)
-    for (const created of worktreeCreates) {
-      assert.ok(created.includes('--base-branch'))
-      assert.ok(created.includes('feature'))
-      assert.ok(created.includes('--parent-worktree'))
-    }
+    assert.equal(first.terminalHandle, 'created-fixer')
+    assert.equal(second.terminalHandle, 'created-fixer')
+    assert.equal(third.terminalHandle, 'created-fixer')
     const closes = calls.filter((args) => args[0] === 'terminal' && args[1] === 'close')
-    assert.equal(closes.length, 3)
-    assert.deepEqual(
-      closes.map((close) => close[close.indexOf('--terminal') + 1]),
-      ['worker-shell-1', 'worker-shell-2', 'worker-shell-3']
-    )
+    assert.equal(closes.length, 1)
+    assert.ok(closes[0].includes('created-fixer'))
   } finally {
     await rm(temp, { recursive: true, force: true })
     await rm(evidence, { recursive: true, force: true })
@@ -1096,7 +814,7 @@ test('CliOrca boots a fresh opencode terminal before authenticated dispatch', as
   const fakeOrca = path.join(temp, 'orca')
   const callsPath = path.join(temp, 'calls.jsonl')
   const checkCountPath = path.join(temp, 'check-count')
-  const evidence = path.join(homedir(), '.orca-no-mistakes', 'evidence', 'adapter-new-child')
+  const evidence = path.join(homedir(), '.orca-no-mistakes', 'artifacts', 'adapter-new-child')
   const reportPath = path.join(evidence, 'review.json')
   const worktreeId = 'repo-id::/tmp/worker'
   try {
@@ -1147,11 +865,11 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       name: 'fresh-reviewer',
       prompt: 'contains ) and shell syntax',
       role: 'reviewer',
-      stage: 'review'
+      stage: 'review',
+      worktree: 'new-child'
     })
 
     assert.equal(worker.worktreeId, worktreeId)
-    assert.equal(worker.worktreePath, '/tmp/worker')
     const calls = (await readFile(callsPath, 'utf8'))
       .trim()
       .split('\n')
@@ -1197,7 +915,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
   }
 })
 
-test('GitShell rebases a clean feature branch and delivers it to origin', async () => {
+test('GitShell rebases a clean feature branch, hashes trusted policy, and returns custody', async () => {
   const temp = await mkdtemp(path.join(tmpdir(), 'orca-git-'))
   const origin = path.join(temp, 'origin.git')
   const repo = path.join(temp, 'repo')
@@ -1222,75 +940,17 @@ test('GitShell rebases a clean feature branch and delivers it to origin', async 
     const state = await shell.assertReady()
     assert.equal(state.base, 'main')
     assert.equal(state.branch, 'feature')
+    assert.match(state.baseOid, /^[0-9a-f]{40}$/)
     assert.deepEqual((await shell.rebase(state.base)).findings, [])
-    assert.deepEqual((await shell.push(state.branch)).findings, [])
-    assert.equal(
-      git(temp, `--git-dir=${origin}`, 'rev-parse', 'refs/heads/feature'),
-      git(repo, 'rev-parse', 'HEAD')
-    )
 
-    const gatePath = path.join(temp, 'gate')
-    git(repo, 'worktree', 'add', gatePath, '-b', 'no-mistakes-gate-x', 'HEAD')
-    const gateShell = new GitShell({ repo: gatePath })
-    const gateState = await gateShell.assertReady()
-    assert.equal(gateState.branch, 'no-mistakes-gate-x')
-    assert.equal(gateState.base, 'main')
+    const policyBefore = await shell.policySha256(state.base)
+    assert.match(policyBefore, /^[0-9a-f]{64}$/)
+    const head = await shell.head()
 
-    const workerPath = path.join(temp, 'worker')
-    git(gatePath, 'worktree', 'add', workerPath, '-b', 'no-mistakes-fixer-y', 'HEAD')
-    const baseSha = git(gatePath, 'rev-parse', 'HEAD')
-    await writeFile(path.join(workerPath, 'fix.txt'), 'fixed\n')
-    git(workerPath, 'add', 'fix.txt')
-    git(workerPath, 'commit', '-m', 'fix it')
-
-    const applied = await gateShell.applyWorktreeCommits(workerPath, baseSha)
-    assert.deepEqual(applied.findings, [])
-    assert.equal(
-      git(gatePath, 'rev-parse', 'HEAD^{tree}'),
-      git(workerPath, 'rev-parse', 'HEAD^{tree}')
-    )
-
-    const divergedBase = git(workerPath, 'rev-parse', 'HEAD')
-    await writeFile(path.join(gatePath, 'conflict.txt'), 'gate\n')
-    git(gatePath, 'add', 'conflict.txt')
-    git(gatePath, 'commit', '-m', 'gate change')
-    const conflictedGateHead = git(gatePath, 'rev-parse', 'HEAD')
-    await writeFile(path.join(workerPath, 'conflict.txt'), 'worker\n')
-    git(workerPath, 'add', 'conflict.txt')
-    git(workerPath, 'commit', '-m', 'worker change')
-
-    const failedApply = await gateShell.applyWorktreeCommits(workerPath, divergedBase)
-    assert.equal(failedApply.findings[0].id, 'fix-apply-failed')
-    assert.equal(failedApply.findings[0].action, 'ask-user')
-    assert.equal(git(gatePath, 'rev-parse', 'HEAD'), conflictedGateHead)
-    await gateShell.assertClean()
-
-    await gateShell.push(state.branch)
-    assert.equal(
-      git(temp, `--git-dir=${origin}`, 'rev-parse', 'refs/heads/feature'),
-      git(gatePath, 'rev-parse', 'HEAD')
-    )
-
-    const workerHead = git(workerPath, 'rev-parse', 'HEAD')
-    await writeFile(path.join(workerPath, 'dirty.txt'), 'uncommitted\n')
-    git(workerPath, 'add', 'dirty.txt')
-    const dirtyApply = await gateShell.applyWorktreeCommits(workerPath, workerHead)
-    assert.equal(dirtyApply.findings[0].id, 'fix-apply-failed')
-    assert.match(dirtyApply.findings[0].description, /uncommitted changes/)
-    git(workerPath, 'reset', '--hard')
-
-    const gateHeadBefore = git(gatePath, 'rev-parse', 'HEAD')
-    const emptyApply = await gateShell.applyWorktreeCommits(workerPath, workerHead)
-    assert.deepEqual(emptyApply.findings, [])
-    assert.equal(git(gatePath, 'rev-parse', 'HEAD'), gateHeadBefore)
-
-    git(gatePath, 'worktree', 'remove', workerPath)
-    await gateShell.deleteBranch('no-mistakes-fixer-y')
-    assert.throws(() => git(repo, 'rev-parse', '--verify', 'no-mistakes-fixer-y'))
-
-    git(repo, 'worktree', 'remove', '--force', gatePath)
-    await gateShell.deleteBranch('no-mistakes-gate-x')
-    assert.throws(() => git(repo, 'rev-parse', '--verify', 'no-mistakes-gate-x'))
+    assert.equal(await shell.advanceIfUnchanged('deadbeef'.repeat(5).slice(0, 40), head), false)
+    assert.equal(await shell.advanceIfUnchanged(head, head), true)
+    await shell.anchorRecoveryRef('run-custody', head)
+    assert.equal(git(repo, 'rev-parse', 'refs/no-mistakes/recover/run-custody'), head)
   } finally {
     await rm(temp, { recursive: true, force: true })
   }
@@ -1517,389 +1177,472 @@ if (args[1] === 'run-create') {
   }
 })
 
-test('runs sequential fixer rounds from fresh child worktrees before re-review', async () => {
+test('a held branch semantic lease fails closed and --force-lease reclaims it', async () => {
   const git = new FakeGit()
   const orca = new FakeOrca(git)
-  orca.reports.set('review', [
-    {
-      findings: [
-        { id: 'review-a', severity: 'error', action: 'auto-fix', description: 'First defect remains.' }
-      ],
-      summary: 'first failure'
-    },
-    pass('first fix committed'),
-    {
-      findings: [
-        { id: 'review-b', severity: 'error', action: 'auto-fix', description: 'Second defect remains.' }
-      ],
-      summary: 'second failure'
-    },
-    pass('second fix committed'),
-    pass('clean rereview after two rounds')
-  ])
+  const ledger = new DomainLedger(':memory:')
+  ledger.startRun({
+    baseBranch: 'main',
+    branch: 'feature',
+    intent: 'holder run',
+    policySha256: 'f'.repeat(64),
+    repoRoot: '/repo',
+    runId: 'run-holder',
+    submissionCommitOid: 'head-1'
+  })
+  ledger.acquireLease({ branch: 'feature', repoRoot: '/repo', runId: 'run-holder' })
 
-  const result = await runPipeline(
-    { intent: 'Multiple fixer rounds.', gate: { branch: 'no-mistakes-gate-mr', worktreeId: 'wt-gate-mr' } },
-    orca,
-    git
+  await assert.rejects(
+    runPipeline({ intent: 'Second concurrent attempt.' }, orca, git, ledger),
+    /branch feature is already leased by run run-holder/
   )
-
-  assert.equal(result.steps.length, PIPELINE_STEPS.length)
-  const fixerLaunches = orca.launches.filter((launch) => launch.role === 'fixer')
-  assert.deepEqual(
-    fixerLaunches.map((launch) => launch.name),
-    ['no-mistakes-fixer-review-1', 'no-mistakes-fixer-review-2']
-  )
-  const firstFixTask = orca.tasks.find((task) => task.spec.startsWith('[review fix 1]'))
-  const secondFixTask = orca.tasks.find((task) => task.spec.startsWith('[review fix 2]'))
-  assert.match(firstFixTask?.spec ?? '', /First defect remains\./)
-  assert.ok(!firstFixTask?.spec.includes('Second defect'))
-  assert.match(secondFixTask?.spec ?? '', /Second defect remains\./)
-  const applyCalls = git.calls.filter((call) => call.startsWith('apply:'))
-  assert.equal(applyCalls.length, 2)
-  for (const dispatchId of orca.fixerDispatches) {
-    assert.ok(applyCalls.some((call) => call.endsWith(`:/wt/${dispatchId}`)))
-    assert.ok(orca.calls.includes(`release:${dispatchId}`))
-    assert.ok(orca.removedWorktrees.includes(`repo::/${dispatchId}`))
-  }
-})
-
-test('reviewer prompts name the delivery branch, not the gate branch', async () => {
-  const git = new FakeGit()
-  git.branch = 'no-mistakes-gate-prompt'
-  const orca = new FakeOrca(git)
+  assert.equal(ledger.leaseFor('/repo', 'feature')?.run_id, 'run-holder')
+  const loser = ledger.listRuns().find((run) => run.intent === 'Second concurrent attempt.')
+  assert.ok(loser)
+  assert.equal(ledger.runStatus(loser.run_id), 'failed')
 
   await runPipeline(
+    { forceLease: true, intent: 'Forceful reclaim.' },
+    new FakeOrca(git),
+    git,
+    ledger
+  )
+  assert.equal(ledger.leaseFor('/repo', 'feature'), undefined)
+})
+
+test('rejects multi-line intent before any side effects', async () => {
+  const git = new FakeGit()
+  const orca = new FakeOrca(git)
+  await assert.rejects(
+    runPipeline({ intent: 'line one\nline two' }, orca, git),
+    /--intent must be a single line/
+  )
+  assert.equal(orca.tasks.length, 0)
+})
+
+test('gate approvals are audited and bound into the attestation as a waiver', async () => {
+  const git = new FakeGit()
+  const orca = new FakeOrca(git)
+  orca.reports.set('review', [
     {
-      intent: 'Everything passes.',
-      deliveryBranch: 'feature',
-      gate: { branch: 'no-mistakes-gate-prompt', worktreeId: 'wt-gate' }
-    },
-    orca,
-    git
-  )
+      findings: [
+        { id: 'docs-1', severity: 'warning', action: 'ask-user', description: 'Needs a product decision' }
+      ],
+      summary: 'decision needed'
+    }
+  ])
+  orca.gateResolution = 'approve'
+  const ledger = new DomainLedger(':memory:')
 
-  const reviewers = orca.launches.filter((launch) => launch.role === 'reviewer')
-  assert.ok(reviewers.length > 0)
-  for (const launch of reviewers) {
-    assert.match(launch.prompt, /^Branch: feature$/m)
-    assert.ok(!launch.prompt.includes('no-mistakes-gate-prompt'), launch.name)
-  }
-  assert.ok(git.calls.includes('push:feature'), 'delivery pushes target the original branch')
-  assert.ok(!git.calls.includes('push:no-mistakes-gate-prompt'), 'the pipeline never pushes the gate branch')
+  const result = await runPipeline({ intent: 'Ship the approved change.' }, orca, git, ledger)
+
+  const audits = ledger.listGateAudit(result.runId)
+  assert.equal(audits.length, 1)
+  assert.equal(audits[0].decision, 'approve')
+  const waived = result.attestation?.stageEvidence.find((entry) => entry.waiverOrApproval)
+  assert.equal(waived?.waiverOrApproval?.decision, 'approve')
+  assert.equal(waived?.waiverOrApproval?.gateId, audits[0].gate_id)
+  assert.equal(ledger.runStatus(result.runId), 'passed')
+
+  verifyManifest(ledger.getAttestation(result.runId))
+  assert.throws(() => ledger.getAttestation('no-such-ref'), /no passed attestation/)
 })
 
-test('a reviewer-only pass launches no fixers and opens no gates', async () => {
+test('attestation verification detects tampering', async () => {
   const git = new FakeGit()
   const orca = new FakeOrca(git)
+  const result = await runPipeline({ intent: 'Produce an attestation.' }, orca, git)
 
-  const result = await runPipeline({ intent: 'Everything passes.' }, orca, git)
+  assert.ok(result.attestation)
+  const tamperedEntry = structuredClone(result.attestation)
+  tamperedEntry.stageEvidence[2].summary = 'tampered summary'
+  assert.throws(() => verifyManifest(tamperedEntry), /(mismatch|does not match)/i)
 
-  assert.equal(result.steps.length, PIPELINE_STEPS.length)
-  assert.equal(orca.launches.filter((launch) => launch.role === 'fixer').length, 0)
-  assert.equal(git.calls.filter((call) => call.startsWith('apply:')).length, 0)
-  assert.equal(orca.gates.length, 0)
-  const workerStages = PIPELINE_STEPS.filter(
-    (stage) => stage !== 'intent' && stage !== 'rebase' && stage !== 'push'
-  )
-  for (const stage of workerStages) {
-    assert.equal(orca.launches.filter((launch) => launch.stage === stage).length, 1, stage)
-  }
+  const tamperedIntent = structuredClone(result.attestation)
+  tamperedIntent.intent = 'Rewritten after the fact'
+  assert.throws(() => verifyManifest(tamperedIntent), /(intent hash|mismatch|does not match)/)
+
+  const tamperedRoot = structuredClone(result.attestation)
+  tamperedRoot.merkleRoot = '0'.repeat(64)
+  assert.throws(() => verifyManifest(tamperedRoot), /(mismatch|does not match)/i)
 })
 
-test('reviewer worktrees are removed even when releasing the worker fails', async () => {
+test('stop resolution cancels the run and records the audit decision', async () => {
   const git = new FakeGit()
   const orca = new FakeOrca(git)
-  orca.finishWorker = async (worker) => {
-    orca.calls.push(`release-failed:${worker.dispatchId}`)
-    throw new Error('terminal release failed')
+  const autoFix: Finding = {
+    id: 'persistent',
+    severity: 'error',
+    action: 'auto-fix',
+    description: 'still failing'
   }
-
-  const result = await runPipeline(
-    {
-      intent: 'Everything passes.',
-      gate: { branch: 'no-mistakes-gate-release', worktreeId: 'wt-gate' }
-    },
-    orca,
-    git
-  )
-
-  assert.equal(result.steps.length, PIPELINE_STEPS.length)
-  assert.ok(orca.launches.length > 0)
-  assert.equal(orca.removedWorktrees.length, orca.launches.length + 1)
-})
-
-test('worker cancellation cleans up the gate worktree and branch', async () => {
-  const git = new FakeGit()
-  const orca = new FakeOrca(git)
-  orca.failWorkerFor = 'review'
+  orca.reports.set('review', [
+    { findings: [autoFix], summary: 'one defect' },
+    pass('fix committed'),
+    { findings: [{ ...autoFix }], summary: 'still failing' }
+  ])
+  orca.gateResolution = 'stop'
+  const ledger = new DomainLedger(':memory:')
 
   await assert.rejects(
-    runPipeline(
-      { intent: 'Cancelled mid-flight.', gate: { branch: 'no-mistakes-gate-cx', worktreeId: 'wt-gate-cx' } },
-      orca,
-      git
-    ),
-    /review worker was cancelled/
+    runPipeline({ maxFixRounds: 1, intent: 'Stop early.' }, orca, git, ledger),
+    /review gate stopped the pipeline: stop/
   )
-  assert.ok(orca.removedWorktrees.includes('wt-gate-cx'))
-  assert.ok(git.calls.includes('delete-branch:no-mistakes-gate-cx'))
-  assert.ok(orca.calls.some((call) => call.includes('status:in-review:no-mistakes stopped:')))
+
+  const runs = ledger.listRuns()
+  assert.equal(runs.length, 1)
+  const cancelledRunId = runs[0].run_id
+  assert.equal(ledger.runStatus(cancelledRunId), 'cancelled')
+  assert.deepEqual(
+    ledger.listGateAudit(cancelledRunId).map((audit) => audit.decision),
+    ['stop']
+  )
+  assert.equal(ledger.leaseFor('/repo', 'feature'), undefined)
 })
 
-test('failed commit application stops the pipeline and cleans up the fixer', async () => {
+test('custody return preserves diverged operator checkouts behind a recovery ref', async () => {
   const git = new FakeGit()
+  git.divergeAfterAnchor = true
   const orca = new FakeOrca(git)
-  git.failApplyOnce({
-    findings: [
-      {
-        id: 'fix-apply-failed',
-        severity: 'error',
-        action: 'ask-user',
-        description: 'CONFLICT content conflict in fix.txt'
-      }
-    ],
-    summary: 'cherry-pick failed'
+  const ledger = new DomainLedger(':memory:')
+
+  const result = await runPipeline({ intent: 'Diverged operator checkout.' }, orca, git, ledger)
+
+  assert.match(result.custodyNote ?? '', /diverged.*refs\/no-mistakes\/recover\//)
+  assert.ok(!git.calls.some((call) => call.startsWith('ff:')))
+  assert.ok(git.calls.some((call) => call.startsWith('recover:')))
+  assert.equal(ledger.runStatus(result.runId), 'passed')
+})
+
+test('capLog preserves head and tail of oversized logs', () => {
+  assert.equal(capLog('tiny log'), 'tiny log')
+  const big = `${'a'.repeat(30_000_000)}MIDDLE${'b'.repeat(30_000_000)}`
+  const capped = capLog(big)
+  assert.ok(Buffer.byteLength(capped) <= 50 * 1024 * 1024 + 128)
+  assert.match(capped, /\[no-mistakes: log truncated/)
+  assert.ok(capped.startsWith('aaaa'))
+  assert.ok(capped.endsWith('bbbb'))
+  assert.ok(!capped.includes('MIDDLE'))
+})
+
+test('prune removes completed runs with their evidence while retaining in-progress runs', async () => {
+  const ledger = new DomainLedger(':memory:')
+  ledger.startRun({
+    baseBranch: 'main',
+    branch: 'feature',
+    intent: 'old run',
+    policySha256: 'f'.repeat(64),
+    repoRoot: '/repo/old',
+    runId: 'run-old',
+    submissionCommitOid: 'a'.repeat(40)
   })
-  orca.reports.set('review', [
-    {
-      findings: [
-        { id: 'review-c', severity: 'error', action: 'auto-fix', description: 'Needs a fix.' }
-      ],
-      summary: 'failure'
-    },
-    pass('never reached')
-  ])
+  ledger.recordCheckpoint({
+    inputCommitOid: 'a'.repeat(40),
+    outputCommitOid: 'b'.repeat(40),
+    roundIndex: 1,
+    runId: 'run-old',
+    stageId: 'review'
+  })
+  ledger.finishRun('run-old', 'passed', 'b'.repeat(40))
 
-  await assert.rejects(
-    runPipeline(
-      { intent: 'Apply conflict.', gate: { branch: 'no-mistakes-gate-ca', worktreeId: 'wt-gate-ca' } },
-      orca,
-      git
-    ),
-    /review fixer commits could not be applied to the gate branch/
-  )
-  const [fixerDispatch] = orca.fixerDispatches
-  assert.ok(fixerDispatch)
-  assert.ok(orca.calls.includes(`release:${fixerDispatch}`))
-  assert.ok(orca.removedWorktrees.includes(`repo::/${fixerDispatch}`))
-  assert.ok(orca.removedWorktrees.includes('wt-gate-ca'))
-  assert.ok(git.calls.includes('delete-branch:no-mistakes-gate-ca'))
+  ledger.startRun({
+    baseBranch: 'main',
+    branch: 'feature',
+    intent: 'live run',
+    policySha256: 'f'.repeat(64),
+    repoRoot: '/repo/live',
+    runId: 'run-live',
+    submissionCommitOid: 'c'.repeat(40)
+  })
+
+  const pruned = ledger.prune({ repoSubstring: 'old' })
+  assert.deepEqual(pruned, ['run-old'])
+  assert.deepEqual(ledger.listCheckpoints('run-old'), [])
+  assert.equal(ledger.runStatus('run-live'), 'in-progress')
+
+  const future = ledger.prune({ before: new Date(Date.now() + 60_000) })
+  assert.deepEqual(future, [])
+
+  assert.deepEqual(ledger.prune({ repoSubstring: 'live' }), [])
+  assert.deepEqual(ledger.prune({}), [])
+  assert.equal(ledger.runStatus('run-live'), 'in-progress')
 })
 
-test('a fixer that rewrites or merges history still lands on the gate branch', async () => {
-  const temp = await mkdtemp(path.join(tmpdir(), 'orca-rebase-harvest-'))
-  try {
-    const repo = await seedOriginRepo(temp)
-    git(repo, 'checkout', '-b', 'feature')
-    await writeFile(path.join(repo, 'feature.txt'), 'feature\n')
-    git(repo, 'add', 'feature.txt')
-    git(repo, 'commit', '-m', 'feature')
-
-    git(repo, 'checkout', 'main')
-    await writeFile(path.join(repo, 'upstream.txt'), 'upstream\n')
-    git(repo, 'add', 'upstream.txt')
-    git(repo, 'commit', '-m', 'upstream')
-    git(repo, 'push', 'origin', 'main')
-    git(repo, 'checkout', 'feature')
-
-    const gatePath = path.join(temp, 'gate')
-    git(repo, 'worktree', 'add', gatePath, '-b', 'no-mistakes-gate-harvest', 'feature')
-    const gateShell = new GitShell({ repo: gatePath })
-    await gateShell.assertReady()
-    const base = git(gatePath, 'rev-parse', 'HEAD')
-
-    const rebaseWorker = path.join(temp, 'worker-rebase')
-    git(gatePath, 'worktree', 'add', rebaseWorker, '-b', 'no-mistakes-fixer-rebase', base)
-    git(rebaseWorker, 'rebase', 'origin/main')
-    const rebasedHead = git(rebaseWorker, 'rev-parse', 'HEAD')
-    assert.notEqual(rebasedHead, base)
-
-    const rebaseApplied = await gateShell.applyWorktreeCommits(rebaseWorker, base)
-    assert.deepEqual(rebaseApplied.findings, [])
-    assert.equal(git(gatePath, 'rev-parse', 'HEAD'), rebasedHead)
-    assert.equal(git(gatePath, 'rev-list', '--count', 'origin/main..HEAD'), '1')
-    await gateShell.assertClean()
-
-    git(repo, 'checkout', 'main')
-    await writeFile(path.join(repo, 'upstream-2.txt'), 'upstream 2\n')
-    git(repo, 'add', 'upstream-2.txt')
-    git(repo, 'commit', '-m', 'upstream 2')
-    git(repo, 'push', 'origin', 'main')
-    git(repo, 'checkout', 'feature')
-
-    const mergeBase = git(gatePath, 'rev-parse', 'HEAD')
-    const mergeWorker = path.join(temp, 'worker-merge')
-    git(gatePath, 'worktree', 'add', mergeWorker, '-b', 'no-mistakes-fixer-ci', mergeBase)
-    git(mergeWorker, 'fetch', 'origin', 'main')
-    git(mergeWorker, 'merge', '--no-ff', '--no-edit', 'origin/main')
-    const mergedHead = git(mergeWorker, 'rev-parse', 'HEAD')
-    assert.equal(git(mergeWorker, 'rev-list', '--count', '--merges', `${mergeBase}..HEAD`), '1')
-
-    const mergeApplied = await gateShell.applyWorktreeCommits(mergeWorker, mergeBase)
-    assert.deepEqual(mergeApplied.findings, [])
-    assert.equal(git(gatePath, 'rev-parse', 'HEAD'), mergedHead)
-    await gateShell.assertClean()
-  } finally {
-    await rm(temp, { recursive: true, force: true })
-  }
-})
-
-test('run status is reported on the initiating worktree, not the gate', async () => {
-  const temp = await mkdtemp(path.join(tmpdir(), 'orca-status-target-'))
-  const fakeOrca = path.join(temp, 'orca')
-  const callsPath = path.join(temp, 'calls.jsonl')
-  const operatorWorktree = path.join(temp, 'operator')
-  try {
-    await writeFile(
-      fakeOrca,
-      `#!/usr/bin/env node
-import fs from 'node:fs'
-const args = process.argv.slice(2)
-fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
-console.log(JSON.stringify({ result: { worktree: { id: 'wt-operator' } } }))
-`
-    )
-    await chmod(fakeOrca, 0o755)
-    const orca = new CliOrca({
-      command: fakeOrca,
-      cwd: temp,
-      statusWorktree: operatorWorktree
+test('re-attesting an unchanged commit replaces the stored manifest instead of failing', async () => {
+  const ledger = new DomainLedger(':memory:')
+  const candidate = 'b'.repeat(40)
+  for (const runId of ['run-first', 'run-second']) {
+    ledger.startRun({
+      baseBranch: 'main',
+      branch: 'feature',
+      intent: `pass ${runId}`,
+      policySha256: 'f'.repeat(64),
+      repoRoot: '/repo/rerun',
+      runId,
+      submissionCommitOid: candidate
     })
-    await orca.setWorktreeStatus('no-mistakes review (1/9)', 'in-progress')
-
-    const calls = (await readFile(callsPath, 'utf8'))
-      .trim()
-      .split('\n')
-      .map((line) => JSON.parse(line) as string[])
-    const set = calls.find((args) => args[0] === 'worktree' && args[1] === 'set')
-    assert.ok(set)
-    assert.equal(set[set.indexOf('--worktree') + 1], `path:${operatorWorktree}`)
-    assert.ok(set.includes('no-mistakes review (1/9)'))
-    assert.ok(set.includes('in-progress'))
-  } finally {
-    await rm(temp, { recursive: true, force: true })
-  }
-})
-
-test('a fixer that discards gate commits is rejected instead of rewinding the gate', async () => {
-  const temp = await mkdtemp(path.join(tmpdir(), 'orca-discard-harvest-'))
-  try {
-    const repo = await seedOriginRepo(temp)
-    git(repo, 'checkout', '-b', 'feature')
-    await writeFile(path.join(repo, 'feature.txt'), 'feature\n')
-    git(repo, 'add', 'feature.txt')
-    git(repo, 'commit', '-m', 'feature')
-
-    const gatePath = path.join(temp, 'gate')
-    git(repo, 'worktree', 'add', gatePath, '-b', 'no-mistakes-gate-discard', 'feature')
-    const gateShell = new GitShell({ repo: gatePath })
-    await gateShell.assertReady()
-    const base = git(gatePath, 'rev-parse', 'HEAD')
-
-    const worker = path.join(temp, 'worker-discard')
-    git(gatePath, 'worktree', 'add', worker, '-b', 'no-mistakes-fixer-discard', base)
-    git(worker, 'reset', '--hard', 'HEAD~1')
-    const truncated = git(worker, 'rev-parse', 'HEAD')
-    assert.notEqual(truncated, base)
-
-    const applied = await gateShell.applyWorktreeCommits(worker, base)
-    assert.equal(applied.findings.length, 1)
-    assert.equal(applied.findings[0]?.id, 'fix-apply-failed')
-    assert.equal(git(gatePath, 'rev-parse', 'HEAD'), base)
-    await gateShell.assertClean()
-  } finally {
-    await rm(temp, { recursive: true, force: true })
-  }
-})
-
-test('createGateWorktree removes a created gate worktree when validation fails', async () => {
-  const temp = await mkdtemp(path.join(tmpdir(), 'orca-gate-leak-'))
-  const repo = path.join(temp, 'repo')
-  const callsPath = path.join(temp, 'calls.jsonl')
-  const fakeOrca = path.join(temp, 'fake-orca')
-  const notARepo = path.join(temp, 'not-a-repo')
-  try {
-    await mkdir(repo, { recursive: true })
-    await mkdir(notARepo, { recursive: true })
-    git(repo, 'init', '-b', 'feature')
-    git(repo, 'config', 'user.email', 'test@example.com')
-    git(repo, 'config', 'user.name', 'Test User')
-    await writeFile(path.join(repo, 'README.md'), '# repo\n')
-    git(repo, 'add', 'README.md')
-    git(repo, 'commit', '-m', 'initial')
-    await writeFile(
-      fakeOrca,
-      `#!/usr/bin/env node
-import fs from 'node:fs'
-const args = process.argv.slice(2)
-fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
-if (args[0] === 'worktree' && args[1] === 'create') {
-  console.log(JSON.stringify({ worktree: { id: 'wt-leak', path: ${JSON.stringify(notARepo)} } }))
-} else {
-  console.log(JSON.stringify({ accepted: true }))
-}
-`
+    ledger.recordAttestation(
+      buildAttestation([], {
+        baseCommitOid: 'a'.repeat(40),
+        candidateCommitOid: candidate,
+        intent: `pass ${runId}`,
+        policySha256: 'f'.repeat(64),
+        runId
+      })
     )
-    await chmod(fakeOrca, 0o755)
-    const previousOrcaCommand = process.env.ORCA_CLI_COMMAND
-    process.env.ORCA_CLI_COMMAND = fakeOrca
-    try {
-      await assert.rejects(
-        createGateWorktree(repo, 'no-mistakes-gate-leak-test'),
-        (error: Error) => /not a git repository|did not check out/.test(error.message)
-      )
-    } finally {
-      if (previousOrcaCommand === undefined) delete process.env.ORCA_CLI_COMMAND
-      else process.env.ORCA_CLI_COMMAND = previousOrcaCommand
-    }
-    const calls = (await readFile(callsPath, 'utf8'))
-      .split('\n')
-      .filter((line) => line.trim())
-      .map((line) => JSON.parse(line) as string[])
-    assert.ok(
-      calls.some(
-        (args) =>
-          args[0] === 'worktree' &&
-          args[1] === 'rm' &&
-          args.includes('--worktree') &&
-          args.includes('id:wt-leak') &&
-          args.includes('--force')
-      ),
-      'the leaked gate worktree is removed when branch validation fails'
+  }
+
+  const stored = ledger.getAttestation(candidate)
+  assert.equal(stored.runId, 'run-second')
+  verifyManifest(stored)
+  assert.equal(ledger.getAttestation('run-second').runId, 'run-second')
+})
+
+test('CLI exports, verifies, and prunes attestations through the domain ledger', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'onm-cli-attest-'))
+  const previousHome = process.env.ORCA_NO_MISTAKES_HOME
+  process.env.ORCA_NO_MISTAKES_HOME = temp
+  try {
+    const git = new FakeGit()
+    const orca = new FakeOrca(git)
+    const ledger = new DomainLedger()
+    const result = await runPipeline({ intent: 'Attest through the CLI.' }, orca, git, ledger)
+    ledger.close()
+
+    const manifestPath = path.join(temp, 'manifest.json')
+    await main(['attestation', 'export', result.runId, `--out=${manifestPath}`])
+    const exported = JSON.parse(await readFile(manifestPath, 'utf8'))
+    assert.equal(exported.merkleRoot, result.attestation?.merkleRoot)
+
+    await main(['attestation', 'verify', manifestPath])
+    await main(['attestation', 'verify', result.attestation!.candidateCommitOid])
+
+    await assert.rejects(
+      main(['attestation', 'verify', manifestPath.replace('manifest', 'missing')]),
+      /(ENOENT|no passed attestation)/
     )
+
+    await main(['prune', '--before=2999-01-01'])
+    const reopened = new DomainLedger()
+    assert.throws(() => reopened.getAttestation(result.runId), /no passed attestation/)
+    reopened.close()
   } finally {
+    if (previousHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME
+    else process.env.ORCA_NO_MISTAKES_HOME = previousHome
     await rm(temp, { recursive: true, force: true })
   }
 })
 
-test('a fixer that leaves the gate HEAD unchanged stops the pipeline', async () => {
+test('the attestation binds the base commit fetched by the rebase stage', async () => {
   const git = new FakeGit()
-  git.noopApplyOnce()
   const orca = new FakeOrca(git)
-  orca.reports.set('review', [
-    {
-      findings: [
-        { id: 'review-1', severity: 'error', action: 'auto-fix', description: 'Null input crashes.' }
-      ],
-      summary: 'one defect'
-    }
-  ])
+  const result = await runPipeline({ intent: 'Bind the fetched base.' }, orca, git)
 
-  await assert.rejects(
-    runPipeline(
-      { intent: 'No-op fix.', gate: { branch: 'no-mistakes-gate-noop', worktreeId: 'wt-gate-noop' } },
-      orca,
-      git
-    ),
-    /review fixer did not commit a change/
+  assert.ok(result.attestation)
+  assert.equal(result.attestation.baseCommitOid, 'b'.repeat(40))
+  const byStage = (stage: string) =>
+    result.attestation!.stageEvidence.filter((entry) => entry.stage === stage)
+  assert.deepEqual(
+    byStage('intent').map((entry) => entry.baseCommitOid),
+    ['0'.repeat(40)]
   )
+  for (const stage of ['rebase', 'review', 'test', 'document', 'lint']) {
+    for (const entry of byStage(stage)) {
+      assert.equal(entry.baseCommitOid, 'b'.repeat(40))
+    }
+  }
+  verifyManifest(result.attestation)
+})
 
-  const [fixer] = orca.fixerDispatches
-  assert.ok(fixer)
-  assert.ok(orca.calls.includes(`release:${fixer}`), 'the no-op fixer is released')
-  assert.ok(orca.removedWorktrees.includes(`repo::/${fixer}`), 'the no-op fixer worktree is removed')
-  assert.ok(git.calls.includes('delete-branch:no-mistakes-fixer-review-1'), 'the fixer branch is deleted')
-  assert.ok(orca.removedWorktrees.includes('wt-gate-noop'), 'the gate worktree is removed')
-  assert.ok(git.calls.includes('delete-branch:no-mistakes-gate-noop'), 'the gate branch is deleted')
+test('the attestation keeps the policy digest captured at run start', async () => {
+  const git = new FakeGit()
+  const orca = new FakeOrca(git)
+  const result = await runPipeline({ intent: 'Pin the policy digest.' }, orca, git)
+
+  assert.ok(result.attestation)
+  assert.equal(result.attestation.policySha256, 'f'.repeat(64))
+  assert.equal(git.calls.filter((call) => call === 'policy').length, 1)
+  verifyManifest(result.attestation)
+})
+
+test('a rebase conflict fixes forward and rebases evidence onto the resolved base', async () => {
+  const git = new FakeGit()
+  git.rebaseConflict = true
+  const orca = new FakeOrca(git)
+  orca.gateResolution = 'approve'
+
+  const result = await runPipeline({ intent: 'Fix past a rebase conflict.' }, orca, git)
+
+  assert.ok(result.attestation)
+  assert.ok(
+    orca.launches.some((launch) => launch.role === 'fixer' && launch.stage === 'rebase'),
+    'expected a rebase fixer to run'
+  )
+  const failedAttempt = result.attestation.stageEvidence.find((entry) => entry.summary === 'rebase aborted')
+  assert.ok(failedAttempt, 'expected the conflicted attempt in evidence')
+  assert.equal(failedAttempt.baseCommitOid, '0'.repeat(40))
+  const rebased = result.attestation.stageEvidence.filter(
+    (entry) => entry.stage !== 'intent' && entry.summary !== 'rebase aborted'
+  )
+  assert.ok(rebased.length > 0)
+  for (const entry of rebased) {
+    assert.equal(entry.baseCommitOid, 'b'.repeat(40))
+  }
+  assert.equal(result.attestation.baseCommitOid, 'b'.repeat(40))
+  verifyManifest(result.attestation)
+})
+
+test('verifyManifest recomputes each stage evidence hash', async () => {
+  const git = new FakeGit()
+  const orca = new FakeOrca(git)
+  const result = await runPipeline({ intent: 'Recompute evidence hashes.' }, orca, git)
+
+  assert.ok(result.attestation)
+  const forged = structuredClone(result.attestation)
+  forged.stageEvidence[3].summary = 'rewritten after the fact'
+  forged.merkleRoot = merkleRoot(
+    forged.stageEvidence.map((entry) => sha256(canonicalEntry(entry)))
+  )
+  assert.throws(() => verifyManifest(forged), /evidence hash does not match/)
+})
+
+test('forced lease takeovers are fenced by generation tokens', () => {
+  const ledger = new DomainLedger(':memory:')
+  try {
+    for (const runId of ['run-a', 'run-b', 'run-c']) {
+      ledger.startRun({
+        baseBranch: 'main',
+        branch: 'feature',
+        intent: `Intent ${runId}`,
+        policySha256: 'f'.repeat(64),
+        repoRoot: '/repo',
+        runId,
+        submissionCommitOid: 'a'.repeat(40)
+      })
+    }
+    const tokenA = ledger.acquireLease({ branch: 'feature', repoRoot: '/repo', runId: 'run-a' })
+    assert.equal(tokenA, 1)
+    const tokenB = ledger.acquireLease({ branch: 'feature', force: true, repoRoot: '/repo', runId: 'run-b' })
+    assert.equal(tokenB, 2)
+    assert.throws(() => ledger.heartbeatLease('/repo', 'feature', 'run-a'), /lost or reclaimed/)
+    const tokenC = ledger.acquireLease({ branch: 'feature', force: true, repoRoot: '/repo', runId: 'run-c' })
+    assert.equal(tokenC, 3)
+    assert.throws(() => ledger.heartbeatLease('/repo', 'feature', 'run-b'), /lost or reclaimed/)
+  } finally {
+    ledger.close()
+  }
+})
+
+test('concurrent coordinators on separate connections fail closed against one lease', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'onm-ledger-race-'))
+  const dbPath = path.join(temp, 'ledger.db')
+  const first = new DomainLedger(dbPath)
+  const second = new DomainLedger(dbPath)
+  try {
+    for (const ledger of [first, second]) {
+      ledger.startRun({
+        baseBranch: 'main',
+        branch: 'feature',
+        intent: `Intent ${ledger.path}`,
+        policySha256: 'f'.repeat(64),
+        repoRoot: '/repo',
+        runId: ledger === first ? 'run-one' : 'run-two',
+        submissionCommitOid: 'a'.repeat(40)
+      })
+    }
+    const token = first.acquireLease({ branch: 'feature', repoRoot: '/repo', runId: 'run-one' })
+    assert.equal(token, 1)
+    assert.throws(
+      () => second.acquireLease({ branch: 'feature', repoRoot: '/repo', runId: 'run-two' }),
+      /already leased by run run-one/
+    )
+  } finally {
+    first.close()
+    second.close()
+    await rm(temp, { recursive: true, force: true })
+  }
+})
+
+test('attestations stay resolvable per run when candidate commits repeat, and commit lookup returns the most recent', () => {
+  const ledger = new DomainLedger(':memory:')
+  try {
+    const candidate = 'c'.repeat(40)
+    for (const runId of ['run-one', 'run-two']) {
+      ledger.startRun({
+        baseBranch: 'main',
+        branch: 'feature',
+        intent: `Intent ${runId}`,
+        policySha256: 'f'.repeat(64),
+        repoRoot: '/repo',
+        runId,
+        submissionCommitOid: 'a'.repeat(40)
+      })
+      const manifest = {
+        version: '1.0.0' as const,
+        runId,
+        candidateCommitOid: candidate,
+        baseCommitOid: 'b'.repeat(40),
+        policySha256: 'f'.repeat(64),
+        intent: `Intent ${runId}`,
+        intentHash: sha256(`Intent ${runId}`),
+        stageEvidence: [],
+        merkleRoot: sha256(''),
+        coordinatorVersion: 'test',
+        createdAt: new Date().toISOString()
+      }
+      ledger.recordAttestation(manifest)
+      ledger.finishRun(runId, 'passed', candidate)
+    }
+    assert.equal(ledger.getAttestation('run-one').runId, 'run-one')
+    assert.equal(ledger.getAttestation('run-two').runId, 'run-two')
+    assert.equal(ledger.getAttestation(candidate).runId, 'run-two')
+  } finally {
+    ledger.close()
+  }
+})
+
+test('legacy attestation ledgers are rebuilt onto the per-run key', async () => {
+  const { DatabaseSync } = await import('node:sqlite')
+  const temp = await mkdtemp(path.join(tmpdir(), 'onm-ledger-legacy-'))
+  const dbPath = path.join(temp, 'ledger.db')
+  const legacy = new DatabaseSync(dbPath)
+  legacy.exec(`
+    CREATE TABLE runs (
+      run_id TEXT PRIMARY KEY, repo_root TEXT NOT NULL, branch TEXT NOT NULL,
+      base_branch TEXT NOT NULL, submission_commit_oid TEXT NOT NULL, terminal_commit_oid TEXT,
+      intent TEXT NOT NULL, intent_hash TEXT NOT NULL, policy_sha256 TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('in-progress','passed','failed','cancelled')),
+      created_at TEXT NOT NULL, completed_at TEXT
+    );
+    CREATE TABLE passed_attestations (
+      candidate_commit_oid TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+      base_commit_oid TEXT NOT NULL, policy_sha256 TEXT NOT NULL, intent TEXT NOT NULL,
+      intent_hash TEXT NOT NULL, merkle_root TEXT NOT NULL, manifest_json TEXT NOT NULL,
+      coordinator_version TEXT NOT NULL, created_at TEXT NOT NULL
+    );
+    INSERT INTO runs VALUES (
+      'run-legacy', '/repo', 'feature', 'main', '${'a'.repeat(40)}', '${'c'.repeat(40)}',
+      'Legacy intent', '${sha256('Legacy intent')}', '${'f'.repeat(64)}',
+      'passed', '2026-01-01T00:00:00.000Z', '2026-01-01T00:05:00.000Z'
+    );
+    INSERT INTO passed_attestations VALUES (
+      '${'c'.repeat(40)}', 'run-legacy', '${'a'.repeat(40)}', '${'f'.repeat(64)}',
+      'Legacy intent', '${sha256('Legacy intent')}', '${'d'.repeat(64)}',
+      '${JSON.stringify({ merkleRoot: 'd'.repeat(64), runId: 'run-legacy', version: '1.0.0', candidateCommitOid: 'c'.repeat(40), baseCommitOid: 'a'.repeat(40), policySha256: 'f'.repeat(64), intent: 'Legacy intent', intentHash: sha256('Legacy intent'), stageEvidence: [], coordinatorVersion: 'test', createdAt: '2026-01-01T00:00:00.000Z' })}',
+      '0.1.0', '2026-01-01T00:05:00.000Z'
+    );
+  `)
+  legacy.close()
+  const reopened = new DomainLedger(dbPath)
+  try {
+    const shape = reopened.tableDefinition('passed_attestations')
+    assert.match(shape ?? '', /run_id TEXT PRIMARY KEY/)
+    const manifest = reopened.getAttestation('run-legacy')
+    assert.equal(manifest.runId, 'run-legacy')
+    assert.equal(reopened.getAttestation('c'.repeat(40)).runId, 'run-legacy')
+  } finally {
+    reopened.close()
+    await rm(temp, { recursive: true, force: true })
+  }
 })
