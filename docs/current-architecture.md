@@ -53,7 +53,7 @@ The extracted configuration supplies per-stage and per-role agent selection and 
 
 Findings are `auto-fix`, `ask-user`, or `no-op`. Reports containing only actionable `auto-fix` findings enter the fix loop automatically. The default maximum is three automated fix rounds, configurable via `--max-fix-rounds`. When the fix-round limit is reached with actionable findings remaining, the coordinator opens an exhaustion decision gate.
 
-An `ask-user` finding or fix exhaustion opens an Orca decision gate offering `approve`, `fix [ids][: guidance]`, `skip`, and `stop`. Unknown resolutions fail closed. `approve` and `skip` complete the stage with unresolved findings and are recorded in `gate_audit` and bound into the attestation as a waiver on that stage's final evidence entry. The adversarial review stage reconciles the diff against the declared intent: unexplained relaxation of tests or linter policy surfaces as a blocking `ask-user` finding.
+An `ask-user` finding or fix exhaustion opens an Orca decision gate offering `approve`, `fix [ids][: guidance]`, `skip`, and `stop`. Unknown resolutions fail closed. `approve` and `skip` complete the stage with unresolved findings and are recorded in `gate_audit` and bound into the attestation as a waiver on that stage's final evidence entry. The adversarial review stage audits the diff for removed or weakened test assertions and relaxed linter/formatter/static-analysis rules, reconciling each against the declared intent. Relaxations the intent explicitly justifies are reported as informational `no-op` findings; anything else surfaces as a blocking `ask-user` finding with `id: unexplained-policy-relaxation` (`severity: error`) and opens a gate.
 
 ## Evidence
 
