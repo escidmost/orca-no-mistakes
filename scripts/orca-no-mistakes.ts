@@ -166,6 +166,7 @@ export interface GitOperations {
   applyWorktreeCommits(
     sourcePath: string,
     expectedHead: string,
+    fence?: { readonly aborted: boolean },
   ): Promise<boolean>;
   anchorRecoveryRef(runId: string, oid: string): Promise<void>;
 }
@@ -995,7 +996,7 @@ async function runFixer(
       // so a delayed worker cannot apply commits into a settled run.
       throw new Error(`${stage} fixer timed out; commits were not applied`);
     }
-    if (!(await git.applyWorktreeCommits(worker.worktreePath, before))) {
+    if (!(await git.applyWorktreeCommits(worker.worktreePath, before, fence))) {
       throw new Error(`${stage} fixer could not apply its committed change`);
     }
     await git.assertClean();
@@ -1529,7 +1530,11 @@ async function command(
   executable: string,
   args: string[],
   cwd: string,
-  options: { allowFailure?: boolean; timeoutMs?: number | null } = {},
+  options: {
+    allowFailure?: boolean;
+    timeoutMs?: number | null;
+    signal?: { readonly aborted: boolean };
+  } = {},
 ): Promise<CommandResult> {
   return await new Promise((resolve, reject) => {
     const child = spawn(executable, args, {
@@ -1537,6 +1542,14 @@ async function command(
       env: process.env,
       stdio: ["ignore", "pipe", "pipe"],
     });
+    // Kill in-flight work (e.g. a fenced ff-only merge) once the caller's
+    // abort fence flips, so nothing lands after its stage already failed.
+    const watchAbort =
+      options.signal == null
+        ? undefined
+        : setInterval(() => {
+            if (options.signal?.aborted) child.kill("SIGKILL");
+          }, 25);
     const timeoutMs =
       options.timeoutMs === undefined ? 120_000 : options.timeoutMs;
     let timedOut = false;
@@ -1556,10 +1569,12 @@ async function command(
       stderr += chunk;
     });
     child.on("error", (error) => {
+      if (watchAbort) clearInterval(watchAbort);
       if (timer) clearTimeout(timer);
       reject(error);
     });
     child.on("close", (code) => {
+      if (watchAbort) clearInterval(watchAbort);
       if (timer) clearTimeout(timer);
       if (timedOut) {
         const message = `${executable} ${args.slice(0, 2).join(" ")} timed out after ${timeoutMs}ms`;
@@ -3083,7 +3098,9 @@ export class GitShell implements GitOperations {
   async applyWorktreeCommits(
     sourcePath: string,
     expectedHead: string,
+    fence?: { readonly aborted: boolean },
   ): Promise<boolean> {
+    if (fence?.aborted) return false;
     await this.assertClean();
     if ((await this.head()) !== expectedHead) return false;
     const sourceStatus = await this.#git(
@@ -3101,7 +3118,11 @@ export class GitShell implements GitOperations {
       true,
     );
     if (expectedIsAncestor.failed) return false;
-    const applied = await this.#git(["merge", "--ff-only", sourceHead], true);
+    const applied = await this.#git(
+      ["merge", "--ff-only", sourceHead],
+      true,
+      fence,
+    );
     return !applied.failed;
   }
 
@@ -3172,12 +3193,13 @@ export class GitShell implements GitOperations {
   async #git(
     args: string[],
     allowFailure = false,
+    signal?: { readonly aborted: boolean },
   ): Promise<CommandResult & { failed: boolean; output: string }> {
     const result = await command(
       "git",
       ["-C", this.#repo, ...args],
       this.#repo,
-      { allowFailure },
+      { allowFailure, signal },
     );
     const output = `${result.stdout}${result.stderr}`.trim();
     return { ...result, failed: result.code !== 0, output };

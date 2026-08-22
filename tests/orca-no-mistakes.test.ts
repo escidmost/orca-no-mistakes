@@ -154,9 +154,12 @@ class FakeGit implements GitOperations {
   async applyWorktreeCommits(
     sourcePath: string,
     expectedHead: string,
+    fence?: { readonly aborted: boolean },
   ): Promise<boolean> {
-    this.calls.push(`apply:${sourcePath}:${expectedHead}`);
-    if (this.#head !== expectedHead) return false;
+    this.calls.push(
+      `apply:${sourcePath}:${expectedHead}:${fence?.aborted ? "fenced" : "open"}`,
+    );
+    if (this.#head !== expectedHead || fence?.aborted) return false;
     this.advanceHead();
     return true;
   }
@@ -1565,6 +1568,19 @@ test("GitShell applies append-only commits and rejects rewritten history", async
     assert.equal(await shell.applyWorktreeCommits(gate, terminal), false);
     assert.equal(git(repo, "rev-parse", "HEAD"), terminal);
     assert.equal(await readFile(path.join(repo, "feature.txt"), "utf8"), "after\n");
+
+    // A flipped timeout fence refuses to move the branch even when the
+    // worktree history would fast-forward cleanly.
+    const fencedWt = path.join(temp, "fenced");
+    git(repo, "worktree", "add", fencedWt);
+    await writeFile(path.join(fencedWt, "feature.txt"), "fenced\n");
+    git(fencedWt, "add", "feature.txt");
+    git(fencedWt, "commit", "-m", "fenced change");
+    assert.equal(
+      await shell.applyWorktreeCommits(fencedWt, terminal, { aborted: true }),
+      false,
+    );
+    assert.equal(git(repo, "rev-parse", "HEAD"), terminal);
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
@@ -3719,6 +3735,62 @@ test("per-stage auto_fix.max_rounds budgets gate before any automatic round", as
   assert.equal(
     orca.launches.some((launch) => launch.role === "fixer"),
     false,
+  );
+});
+
+test("a fixer timeout during commit application leaves the branch unchanged", async () => {
+  class SlowApplyGit extends FakeGit {
+    headAtApply = "";
+    async applyWorktreeCommits(
+      sourcePath: string,
+      expectedHead: string,
+      fence?: { readonly aborted: boolean },
+    ): Promise<boolean> {
+      this.headAtApply = await this.head();
+      await new Promise((resolve) => setTimeout(resolve, 75));
+      return super.applyWorktreeCommits(sourcePath, expectedHead, fence);
+    }
+  }
+  const git = new SlowApplyGit();
+  allowReviewAutoFix(git);
+  const orca = new FakeOrca(git);
+  const ledger = new DomainLedger(":memory:");
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Null input crashes the command",
+        },
+      ],
+      summary: "one defect",
+    },
+  ]);
+
+  await assert.rejects(
+    runPipeline(
+      {
+        intent: "Fence in-flight fixes.",
+        cliFlags: { fixer: { timeout_ms: 10 } } as never,
+      },
+      orca,
+      git,
+      ledger,
+    ),
+    /review fixer exceeded its 10ms execution timeout/,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 150));
+
+  assert.ok(
+    git.calls.some((call) => call.endsWith(":fenced")),
+    "the late application attempt was observed and fenced",
+  );
+  assert.equal(
+    await git.head(),
+    git.headAtApply,
+    "no commit landed after the stage timed out",
   );
 });
 
