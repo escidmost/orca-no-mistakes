@@ -22,6 +22,7 @@ import {
   defaultUserConfigPath,
   formatZodError,
   installDefaultUserConfig,
+  loadUserConfig,
   normalizeAgentSpec,
   parseConfig,
   parseConfigYaml,
@@ -552,6 +553,19 @@ test('defaultUserConfigDir and defaultUserConfigPath respect environment overrid
   }
 })
 
+test('loadUserConfig reads the optional user configuration', () => {
+  const testDir = fs.mkdtempSync(path.join(tmpdir(), 'onm-user-config-test-'))
+  const configPath = path.join(testDir, 'config.yaml')
+
+  try {
+    assert.deepEqual(loadUserConfig(configPath), {})
+    fs.writeFileSync(configPath, 'defaults:\n  agent: agy\n', 'utf8')
+    assert.equal(loadUserConfig(configPath).defaults?.agent, 'agy')
+  } finally {
+    fs.rmSync(testDir, { recursive: true, force: true })
+  }
+})
+
 test('installDefaultUserConfig writes default template and does not overwrite without force', () => {
   const testDir = fs.mkdtempSync(path.join(tmpdir(), 'onm-config-test-'))
   const targetPath = path.join(testDir, 'subdir', 'config.yaml')
@@ -581,4 +595,3 @@ test('installDefaultUserConfig writes default template and does not overwrite wi
     fs.rmSync(testDir, { recursive: true, force: true })
   }
 })
-

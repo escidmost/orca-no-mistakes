@@ -157,6 +157,11 @@ test('readinessMatcher matches per-harness terminal titles and rejects interrupt
   const gemini = readinessMatcher('gemini')
   assert.equal(gemini({ title: 'Gemini', preview: 'ok' }), true)
   assert.equal(gemini({ title: 'vim', preview: '' }), false)
+
+  const agy = readinessMatcher('AGY')
+  assert.equal(agy({ title: 'Antigravity', preview: 'ready' }), true)
+  assert.equal(agy({ title: 'agy', preview: 'esc interrupt' }), false)
+  assert.equal(agy({ title: 'notagy', preview: 'ready' }), false)
 })
 
 test('workerAgentReadyTimeoutMs honors the environment override with a safe default', () => {
