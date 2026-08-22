@@ -255,8 +255,8 @@ CREATE TABLE IF NOT EXISTS gate_audit (
 );
 
 CREATE TABLE IF NOT EXISTS passed_attestations (
-  candidate_commit_oid TEXT PRIMARY KEY,
-  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE CASCADE,
+  candidate_commit_oid TEXT NOT NULL,
   base_commit_oid TEXT NOT NULL,
   policy_sha256 TEXT NOT NULL,
   intent TEXT NOT NULL,
@@ -266,6 +266,9 @@ CREATE TABLE IF NOT EXISTS passed_attestations (
   coordinator_version TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_passed_attestations_candidate
+  ON passed_attestations(candidate_commit_oid, created_at);
 `
 
 export class DomainLedger {
@@ -280,7 +283,22 @@ export class DomainLedger {
     this.#db = new DatabaseSync(dbPath)
     this.#db.exec('PRAGMA journal_mode = WAL')
     this.#db.exec('PRAGMA foreign_keys = ON')
+    // ponytail: pre-release rebuild — legacy ledgers keyed attestations by candidate OID,
+    // which let a repeat attestation overwrite the original run's lookup.
+    const legacyAttestations = this.#db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'passed_attestations'")
+      .get() as { sql: string } | undefined
+    if (legacyAttestations && !legacyAttestations.sql.includes('run_id TEXT PRIMARY KEY')) {
+      this.#db.exec('DROP TABLE passed_attestations')
+    }
     this.#db.exec(SCHEMA)
+  }
+
+  tableDefinition(tableName: string): string | undefined {
+    const row = this.#db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
+      .get(tableName) as { sql: string } | undefined
+    return row?.sql
   }
 
   get path(): string {
@@ -338,12 +356,19 @@ export class DomainLedger {
           `branch ${options.branch} is already leased by run ${existing.run_id}; pass --force-lease to reclaim it`
         )
       }
-      const nextToken = this.#nextGenerationToken(options.repoRoot)
-      this.#db
+      // ponytail: fenced compare-and-swap on the observed generation; SQLite serializes
+      // writers, so a concurrent taker changes the token first and this update no-ops.
+      const nextToken = Number(existing.generation_token) + 1
+      const takeover = this.#db
         .prepare(
-          'UPDATE branch_leases SET run_id = ?, generation_token = ?, acquired_at = ?, heartbeat_at = ? WHERE repo_root = ? AND branch = ?'
+          'UPDATE branch_leases SET run_id = ?, generation_token = ?, acquired_at = ?, heartbeat_at = ? WHERE repo_root = ? AND branch = ? AND generation_token = ?'
         )
-        .run(options.runId, nextToken, now, now, options.repoRoot, options.branch)
+        .run(options.runId, nextToken, now, now, options.repoRoot, options.branch, existing.generation_token)
+      if (Number(takeover.changes) === 0) {
+        throw new Error(
+          `branch ${options.branch} was concurrently reclaimed by another coordinator; inspect its state before forcing again`
+        )
+      }
       return nextToken
     }
     if (existing) {
@@ -498,24 +523,14 @@ export class DomainLedger {
   recordAttestation(manifest: PassedAttestationManifest): void {
     this.#db
       .prepare(
-        `INSERT INTO passed_attestations (
-           candidate_commit_oid, run_id, base_commit_oid, policy_sha256, intent, intent_hash,
+        `INSERT OR REPLACE INTO passed_attestations (
+           run_id, candidate_commit_oid, base_commit_oid, policy_sha256, intent, intent_hash,
            merkle_root, manifest_json, coordinator_version, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(candidate_commit_oid) DO UPDATE SET
-           run_id = excluded.run_id,
-           base_commit_oid = excluded.base_commit_oid,
-           policy_sha256 = excluded.policy_sha256,
-           intent = excluded.intent,
-           intent_hash = excluded.intent_hash,
-           merkle_root = excluded.merkle_root,
-           manifest_json = excluded.manifest_json,
-           coordinator_version = excluded.coordinator_version,
-           created_at = excluded.created_at`
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
-        manifest.candidateCommitOid,
         manifest.runId,
+        manifest.candidateCommitOid,
         manifest.baseCommitOid,
         manifest.policySha256,
         manifest.intent,
@@ -528,14 +543,14 @@ export class DomainLedger {
   }
 
   getAttestation(ref: string): PassedAttestationManifest {
-    const row = this.#db
-      .prepare(
-        `SELECT manifest_json, merkle_root FROM passed_attestations
-           WHERE candidate_commit_oid = ? OR run_id = ?
-           ORDER BY (candidate_commit_oid = ?) DESC, created_at DESC
-           LIMIT 1`
-      )
-      .get(ref, ref, ref) as { manifest_json: string; merkle_root: string } | undefined
+    const row = (this.#db
+      .prepare('SELECT manifest_json, merkle_root FROM passed_attestations WHERE run_id = ?')
+      .get(ref)
+      ?? this.#db
+        .prepare(
+          'SELECT manifest_json, merkle_root FROM passed_attestations WHERE candidate_commit_oid = ? ORDER BY created_at DESC LIMIT 1'
+        )
+        .get(ref)) as { manifest_json: string; merkle_root: string } | undefined
     if (!row) throw new Error(`no passed attestation found for ${ref}`)
     const manifest = JSON.parse(row.manifest_json) as PassedAttestationManifest
     if (manifest.merkleRoot !== row.merkle_root) {

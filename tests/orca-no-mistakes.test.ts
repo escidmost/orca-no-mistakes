@@ -1499,3 +1499,100 @@ test('verifyManifest recomputes each stage evidence hash', async () => {
   )
   assert.throws(() => verifyManifest(forged), /evidence hash does not match/)
 })
+
+test('forced lease takeovers are fenced by generation tokens', () => {
+  const ledger = new DomainLedger(':memory:')
+  try {
+    for (const runId of ['run-a', 'run-b', 'run-c']) {
+      ledger.startRun({
+        baseBranch: 'main',
+        branch: 'feature',
+        intent: `Intent ${runId}`,
+        policySha256: 'f'.repeat(64),
+        repoRoot: '/repo',
+        runId,
+        submissionCommitOid: 'a'.repeat(40)
+      })
+    }
+    const tokenA = ledger.acquireLease({ branch: 'feature', repoRoot: '/repo', runId: 'run-a' })
+    assert.equal(tokenA, 1)
+    const tokenB = ledger.acquireLease({ branch: 'feature', force: true, repoRoot: '/repo', runId: 'run-b' })
+    assert.equal(tokenB, 2)
+    assert.throws(() => ledger.heartbeatLease('/repo', 'feature', 'run-a'), /lost or reclaimed/)
+    const tokenC = ledger.acquireLease({ branch: 'feature', force: true, repoRoot: '/repo', runId: 'run-c' })
+    assert.equal(tokenC, 3)
+    assert.throws(() => ledger.heartbeatLease('/repo', 'feature', 'run-b'), /lost or reclaimed/)
+  } finally {
+    ledger.close()
+  }
+})
+
+test('attestations stay resolvable per run when candidate commits repeat', () => {
+  const ledger = new DomainLedger(':memory:')
+  try {
+    const candidate = 'c'.repeat(40)
+    for (const runId of ['run-one', 'run-two']) {
+      ledger.startRun({
+        baseBranch: 'main',
+        branch: 'feature',
+        intent: `Intent ${runId}`,
+        policySha256: 'f'.repeat(64),
+        repoRoot: '/repo',
+        runId,
+        submissionCommitOid: 'a'.repeat(40)
+      })
+      const manifest = {
+        version: '1.0.0' as const,
+        runId,
+        candidateCommitOid: candidate,
+        baseCommitOid: 'b'.repeat(40),
+        policySha256: 'f'.repeat(64),
+        intent: `Intent ${runId}`,
+        intentHash: sha256(`Intent ${runId}`),
+        stageEvidence: [],
+        merkleRoot: sha256(''),
+        coordinatorVersion: 'test',
+        createdAt: new Date().toISOString()
+      }
+      ledger.recordAttestation(manifest)
+      ledger.finishRun(runId, 'passed', candidate)
+    }
+    assert.equal(ledger.getAttestation('run-one').runId, 'run-one')
+    assert.equal(ledger.getAttestation('run-two').runId, 'run-two')
+    assert.equal(ledger.getAttestation(candidate).runId, 'run-two')
+  } finally {
+    ledger.close()
+  }
+})
+
+test('legacy attestation ledgers are rebuilt onto the per-run key', async () => {
+  const { DatabaseSync } = await import('node:sqlite')
+  const temp = await mkdtemp(path.join(tmpdir(), 'onm-ledger-legacy-'))
+  const dbPath = path.join(temp, 'ledger.db')
+  const legacy = new DatabaseSync(dbPath)
+  legacy.exec(`
+    CREATE TABLE runs (
+      run_id TEXT PRIMARY KEY, repo_root TEXT NOT NULL, branch TEXT NOT NULL,
+      base_branch TEXT NOT NULL, submission_commit_oid TEXT NOT NULL, terminal_commit_oid TEXT,
+      intent TEXT NOT NULL, intent_hash TEXT NOT NULL, policy_sha256 TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('in-progress','passed','failed','cancelled')),
+      created_at TEXT NOT NULL, completed_at TEXT
+    );
+    CREATE TABLE passed_attestations (
+      candidate_commit_oid TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+      base_commit_oid TEXT NOT NULL, policy_sha256 TEXT NOT NULL, intent TEXT NOT NULL,
+      intent_hash TEXT NOT NULL, merkle_root TEXT NOT NULL, manifest_json TEXT NOT NULL,
+      coordinator_version TEXT NOT NULL, created_at TEXT NOT NULL
+    );
+  `)
+  legacy.close()
+  const reopened = new DomainLedger(dbPath)
+  try {
+    const shape = reopened.tableDefinition('passed_attestations')
+    assert.match(shape ?? '', /run_id TEXT PRIMARY KEY/)
+  } finally {
+    reopened.close()
+    await rm(temp, { recursive: true, force: true })
+  }
+})
