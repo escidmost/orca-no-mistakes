@@ -134,8 +134,9 @@ export function buildCliCommand(harness: string, options: CliAgentCommandOptions
       `agent ${harness}: cannot express effort; no verified reasoning-effort flag exists for it (use agent_args_override.${harness} if your build accepts one)`
     )
   }
-  // Model-scoped effort carriers (--variant) need their model; an explicit
-  // variant option supersedes the effort knob by one declared precedence rule.
+  // Model-scoped effort carriers (--variant) need their model, supplied either
+  // as an option or as a raw agent_args_override pin; an explicit variant
+  // option supersedes the effort knob by one declared precedence rule.
   if (
     options.effort &&
     effortKnob?.requiresModel &&
