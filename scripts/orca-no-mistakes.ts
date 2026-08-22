@@ -282,7 +282,7 @@ async function runReviewer(
   try {
     return await validateReport(worker.report, stage, evidenceDir)
   } finally {
-    await releaseWorker(worker, orca, git)
+    await cleanupWorker(worker, orca, git)
   }
 }
 
@@ -322,11 +322,11 @@ async function runFixer(
       throw new Error(`${stage} fixer did not commit a change`)
     }
   } finally {
-    await releaseWorker(worker, orca, git)
+    await cleanupWorker(worker, orca, git)
   }
 }
 
-async function releaseWorker(worker: WorkerResult, orca: OrcaOperations, git: GitOperations): Promise<void> {
+async function cleanupWorker(worker: WorkerResult, orca: OrcaOperations, git: GitOperations): Promise<void> {
   await orca.finishWorker(worker).catch(() => {})
   if (worker.worktreeId) {
     await orca.removeWorktree(worker.worktreeId).catch(() => {})
@@ -1145,18 +1145,10 @@ export class CliOrca implements OrcaOperations {
     await this.#json(['terminal', 'close', '--terminal', terminalHandle, '--tab', '--json'], true).catch(() => {})
   }
 
-  async #removeWorktreeQuiet(worktreeId: string): Promise<void> {
-    await removeOrcaWorktreeQuiet(this.#command, this.#cwd, worktreeId)
-  }
-
-  async #deleteBranchQuiet(branchName: string): Promise<void> {
-    await deleteBranchQuiet(this.#cwd, branchName)
-  }
-
   async #cleanupPreparedWorker(prepared: PreparedWorker): Promise<void> {
     if (prepared.terminalHandle) await this.#closeTerminal(prepared.terminalHandle)
-    if (prepared.worktreeId) await this.#removeWorktreeQuiet(prepared.worktreeId)
-    if (prepared.branchName) await this.#deleteBranchQuiet(prepared.branchName)
+    if (prepared.worktreeId) await removeOrcaWorktreeQuiet(this.#command, this.#cwd, prepared.worktreeId)
+    if (prepared.branchName) await deleteBranchQuiet(this.#cwd, prepared.branchName)
   }
 
   async finishWorker(worker: WorkerResult): Promise<void> {
@@ -1509,8 +1501,8 @@ export class CliOrca implements OrcaOperations {
       true
     ).catch(() => {})
     await this.#closeTerminal(terminalHandle)
-    if (worktreeId) await this.#removeWorktreeQuiet(worktreeId)
-    if (branchName) await this.#deleteBranchQuiet(branchName)
+    if (worktreeId) await removeOrcaWorktreeQuiet(this.#command, this.#cwd, worktreeId)
+    if (branchName) await deleteBranchQuiet(this.#cwd, branchName)
     if (deliveryId) {
       await this.#json(
         [
