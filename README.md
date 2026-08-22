@@ -4,7 +4,7 @@ An Orca-native, nine-stage adversarial validation pipeline:
 
 `intent -> rebase -> review -> test -> document -> lint -> push -> pr -> ci`
 
-The current runner creates an Orca Run and ordered Task DAG. Fresh Claude workers inspect disposable child worktrees; one retained Codex terminal fixes the current worktree and commits each repair. Human decisions use Orca gates. Structured worker reports stay under `~/.orca-no-mistakes/evidence/`, outside the branch.
+The current runner creates an Orca Run and ordered Task DAG. It orchestrates inside a temporary gate worktree created from your committed HEAD, so your own worktree is never modified. Fresh `opencode` reviewers and fixers work in disposable child worktrees of that gate worktree, and each fix round commits its repair. Human decisions use Orca gates. Structured worker reports stay under `~/.orca-no-mistakes/evidence/`, outside the branch.
 
 Successful completion currently means that all nine stages completed under the worker-report model. It does not yet provide the target architecture's commit-bound `Passed` proof, branch leases, crash recovery, trusted-policy execution, or authoritative GitHub delivery verification. See [Current Architecture](docs/current-architecture.md) for implemented behavior and [the ADRs](docs/adr/) for accepted target decisions.
 
@@ -34,7 +34,7 @@ The Git entry point submits through the installed local gate:
 orca-no-mistakes push --repo /path/to/repo --intent "Add X without changing Y"
 ```
 
-The runner requires a clean, committed, named feature branch and a configured `origin`. It rebases onto the detected default branch unless `--base` is supplied and delivers rewritten history with `--force-with-lease`.
+The runner requires a clean, committed, named feature branch and a configured `origin`. It reads that branch's HEAD and leaves the worktree untouched; the gate worktree rebases onto the detected default branch unless `--base` is supplied and delivers rewritten history to the original branch with `--force-with-lease`.
 
 Useful direct-run options:
 
