@@ -1903,7 +1903,7 @@ async function launchDetachedRun(root: string, flags: RawCliFlags): Promise<stri
     : quotedCommand
 
   try {
-    const deadline = Date.now() + 10_000
+    const deadline = Date.now() + 60_000
     for (;;) {
       const shown = unwrapJson<{
         terminal: { connected?: boolean; preview?: string | null }
