@@ -501,7 +501,12 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
   assert.match(
     orca.tasks.find((task) => task.spec.startsWith("[review check 1]"))?.spec ??
       "",
-    /unexplained relaxation of validation policy is a blocking finding/,
+    /id "unexplained-policy-relaxation", severity "error", action "ask-user"/,
+  );
+  assert.match(
+    orca.tasks.find((task) => task.spec.startsWith("[review check 1]"))?.spec ??
+      "",
+    /it is permitted: report it as one "no-op" finding/,
   );
   assert.match(
     orca.tasks.find((task) => task.spec.startsWith("[review check 1]"))?.spec ??
@@ -636,6 +641,70 @@ test("opens an exhaustion gate when automatic fix limit is reached and stops on 
       call.includes("status:in-review:no-mistakes stopped:"),
     ),
   );
+});
+
+test("unexplained policy relaxations pause the pipeline at a decision gate", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  const relaxation: Finding = {
+    id: "unexplained-policy-relaxation",
+    severity: "error",
+    action: "ask-user",
+    description:
+      "Deleted the null-input regression assertion without stated justification",
+    file: "tests/parse.test.ts",
+    line: 42,
+  };
+  orca.reports.set("review", [
+    { findings: [relaxation], summary: "policy relaxed without intent" },
+  ]);
+
+  const result = await runPipeline(
+    { intent: "Add the requested command without changing existing behavior." },
+    orca,
+    git,
+  );
+
+  assert.equal(orca.gates.length, 1);
+  assert.deepEqual(orca.gates[0].options, ["approve", "fix", "skip", "stop"]);
+  assert.ok(
+    orca.gates[0].question.includes("unexplained-policy-relaxation"),
+    "the gate question must surface the policy relaxation finding",
+  );
+  assert.deepEqual(orca.completedStages, PIPELINE_STEPS);
+  assert.ok(result.attestation);
+});
+
+test("assertion updates documented in intent stay informational and never open gates", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "intended-policy-update",
+          severity: "info",
+          action: "no-op",
+          description:
+            "Assertion updated from two to three parsed results as declared in the intent",
+        },
+      ],
+      summary: "relaxation matches the declared intent",
+    },
+  ]);
+
+  const result = await runPipeline(
+    {
+      intent:
+        "Update the parse contract to three results; adjust the affected assertion accordingly.",
+    },
+    orca,
+    git,
+  );
+
+  assert.equal(orca.gates.length, 0);
+  assert.deepEqual(orca.completedStages, PIPELINE_STEPS);
+  assert.ok(result.attestation);
 });
 
 test("exhaustion gate allows user to authorize another fix round", async () => {
