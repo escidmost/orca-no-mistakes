@@ -13,6 +13,7 @@ import {
 } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import {
@@ -33,6 +34,7 @@ import {
   type Finding,
   type GitOperations,
   type OrcaOperations,
+  type PipelineResult,
   type StageReport,
   type WorkerLaunch,
   type WorkerResult,
@@ -2417,6 +2419,65 @@ test("re-attesting an unchanged commit replaces the stored manifest instead of f
   assert.equal(stored.runId, "run-second");
   verifyManifest(stored);
   assert.equal(ledger.getAttestation("run-second").runId, "run-second");
+});
+
+test("the domain ledger auto-initializes at the default path and records submission metadata", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-ledger-init-"));
+  const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
+  process.env.ORCA_NO_MISTAKES_HOME = temp;
+  try {
+    const ledgerPath = path.join(temp, "ledger.db");
+    const ledger = new DomainLedger();
+    let result: PipelineResult;
+    try {
+      assert.equal(ledger.path, ledgerPath);
+      assert.ok(ledger.tableDefinition("runs"));
+      assert.ok(ledger.tableDefinition("stage_checkpoints"));
+
+      const git = new FakeGit();
+      const orca = new FakeOrca(git);
+      result = await runPipeline(
+        { intent: "Record submission metadata." },
+        orca,
+        git,
+        ledger,
+      );
+    } finally {
+      ledger.close();
+    }
+
+    const db = new DatabaseSync(ledgerPath);
+    try {
+      assert.equal(
+        (db.prepare("PRAGMA journal_mode").get() as { journal_mode: string })
+          .journal_mode,
+        "wal",
+      );
+      const run = db
+        .prepare(
+          `SELECT base_branch, branch, intent, intent_hash, policy_sha256, repo_root, status,
+                  submission_commit_oid
+           FROM runs WHERE run_id = ?`,
+        )
+        .get(result.runId) as Record<string, string>;
+      assert.deepEqual({ ...run }, {
+        base_branch: "main",
+        branch: "feature",
+        intent: "Record submission metadata.",
+        intent_hash: sha256("Record submission metadata."),
+        policy_sha256: "f".repeat(64),
+        repo_root: "/repo",
+        status: "passed",
+        submission_commit_oid: "1".padStart(40, "0"),
+      });
+    } finally {
+      db.close();
+    }
+  } finally {
+    if (previousHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME;
+    else process.env.ORCA_NO_MISTAKES_HOME = previousHome;
+    await rm(temp, { recursive: true, force: true });
+  }
 });
 
 test("CLI exports, verifies, and prunes attestations through the domain ledger", async () => {
