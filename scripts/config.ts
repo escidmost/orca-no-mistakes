@@ -357,7 +357,8 @@ defaults:
   # Reasoning effort (e.g. "low", "medium", "high"). Mapped per harness:
   # claude/codex/cursor -> Orca worker-start --model/--effort,
   # grok -> --reasoning-effort, pi -> --thinking,
-  # opencode -> --variant (model-scoped: needs a model unless variant is set),
+  # opencode -> --variant (model-scoped: needs a model, a raw model pin, or
+  # an explicit variant),
   # agy -> --effort, acp:<target> -> acpx --model (effort is refused).
   # A raw agent_args_override flag that already pins a knob wins over this
   # value; overrides reach terminal-spawned CLI launches only - Orca native

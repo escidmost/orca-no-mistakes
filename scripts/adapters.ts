@@ -93,7 +93,17 @@ function flagName(arg: string): string {
 }
 
 function pinsAnyFlag(args: string[], flags: string[]): boolean {
-  return args.some((arg) => flags.some((flag) => arg === flag || arg.startsWith(`${flag}=`)))
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]
+    for (const flag of flags) {
+      if (arg.startsWith(`${flag}=`)) {
+        if (arg.length > flag.length + 1) return true
+      } else if (arg === flag) {
+        if (i + 1 < args.length && args[i + 1] !== '') return true
+      }
+    }
+  }
+  return false
 }
 
 // Flags no-mistakes manages itself for a harness. agent_args_override entries
@@ -134,9 +144,16 @@ export function buildCliCommand(harness: string, options: CliAgentCommandOptions
       `agent ${harness}: cannot express effort; no verified reasoning-effort flag exists for it (use agent_args_override.${harness} if your build accepts one)`
     )
   }
-  // Model-scoped effort carriers (--variant) need their model; an explicit
-  // variant option supersedes the effort knob by one declared precedence rule.
-  if (options.effort && effortKnob?.requiresModel && !options.model && !options.variant) {
+  // Model-scoped effort carriers (--variant) need their model, supplied either
+  // as an option or as a raw agent_args_override pin; an explicit variant
+  // option supersedes the effort knob by one declared precedence rule.
+  if (
+    options.effort &&
+    effortKnob?.requiresModel &&
+    !options.model &&
+    !pinsAnyFlag(raw, MODEL_PIN_FLAGS) &&
+    !options.variant
+  ) {
     throw new Error(
       `agent ${harness}: cannot express effort without a model; ${effortKnob.flag} selects a model-scoped variant`
     )
