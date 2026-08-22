@@ -104,11 +104,51 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
     buildCliCommand('opencode', { effort: 'high', model: 'gpt-5.6' }),
     `'opencode' '--model' 'gpt-5.6' '--variant' 'high'`
   )
-  // Effort without a model carries no variant, matching the pre-adapter behavior.
-  assert.equal(buildCliCommand('opencode', { effort: 'high' }), `'opencode'`)
   // Variant is opencode-specific.
   assert.equal(buildCliCommand('grok', { model: 'grok-4', variant: 'high' }), `'grok' '--model' 'grok-4'`)
   assert.equal(buildCliCommand('gemini', { model: 'gemini-3-pro' }), `'gemini' '--model' 'gemini-3-pro'`)
+  // Effort maps per harness through one table.
+  assert.equal(
+    buildCliCommand('grok', { effort: 'high', model: 'grok-4' }),
+    `'grok' '--model' 'grok-4' '--reasoning-effort' 'high'`
+  )
+  assert.equal(buildCliCommand('pi', { effort: 'high' }), `'pi' '--thinking' 'high'`)
+  const pinnedPi = buildCliCommand('pi', {
+    agentArgsOverride: { pi: ['--thinking', 'low'] } as never,
+    effort: 'high'
+  })
+  assert.equal(pinnedPi, `'pi' '--thinking' 'low'`)
+  // Effort is refused rather than silently dropped where a harness has no mechanism.
+  assert.throws(() => buildCliCommand('gemini', { model: 'm', effort: 'high' }), /cannot express effort/)
+  // opencode variants are model-scoped: effort without a model is refused, but
+  // an explicit variant option supersedes the effort knob.
+  assert.throws(
+    () => buildCliCommand('opencode', { effort: 'high' }),
+    /cannot express effort without a model/
+  )
+  assert.equal(
+    buildCliCommand('opencode', { effort: 'medium', variant: 'high' }),
+    `'opencode' '--variant' 'high'`
+  )
+  assert.throws(
+    () => buildCliCommand('agy', { effort: 'high', model: 'm' }),
+    /cannot express model or effort/
+  )
+  // A raw override flag that already pins a knob wins over the profile value.
+  const pinned = buildCliCommand('grok', {
+    agentArgsOverride: { grok: ['--reasoning-effort', 'low', '-m', 'other'] } as never,
+    effort: 'high',
+    model: 'grok-4'
+  })
+  assert.equal(pinned, `'grok' '--reasoning-effort' 'low' '-m' 'other'`)
+  const pinnedVariant = buildCliCommand('opencode', {
+    agentArgsOverride: { opencode: ['--variant=low'] } as never,
+    effort: 'high',
+    model: 'gpt-5.6'
+  })
+  assert.equal(pinnedVariant, `'opencode' '--model' 'gpt-5.6' '--variant=low'`)
+  // Unknown harnesses keep the legacy --model passthrough.
+  assert.equal(buildCliCommand('mycli', { model: 'm1' }), `'mycli' '--model' 'm1'`)
 
   const overridden = buildCliCommand('opencode', {
     agentArgsOverride: { opencode: { OPENCODE_MODEL: 'custom' }, grok: ['--verbose'] } as never,
@@ -202,6 +242,13 @@ test('acpRunnerInvocation targets the acpx runner and forwards constraints', () 
   ])
   const minimal = acpRunnerInvocation({ prompt: 'go', target: 'x' })
   assert.deepEqual(minimal.args, ['--format', 'quiet', '--approve-all', 'x', 'exec', 'go'])
+})
+
+test('acpRunnerInvocation refuses effort instead of silently dropping it', () => {
+  assert.throws(
+    () => acpRunnerInvocation({ effort: 'high', prompt: 'go', target: 'gemini-dev' }),
+    /agent acp:gemini-dev: cannot express effort/
+  )
 })
 
 test('collectResidualResources reclaims terminals and worktrees from failure receipts', () => {
