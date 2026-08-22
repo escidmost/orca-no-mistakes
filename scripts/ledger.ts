@@ -243,6 +243,8 @@ CREATE TABLE IF NOT EXISTS stage_evidence (
   evidence_sha256 TEXT NOT NULL,
   artifact_path TEXT NOT NULL,
   summary TEXT NOT NULL,
+  effective_policy_hash TEXT,
+  base_ref_sha TEXT,
   created_at TEXT NOT NULL
 );
 
@@ -318,6 +320,15 @@ export class DomainLedger {
       }
     }
     this.#db.exec(SCHEMA)
+    // ponytail: nullable provenance columns added post-release; ALTER is the
+    // idempotent path for ledgers created before ONM-40.
+    for (const column of ['effective_policy_hash TEXT', 'base_ref_sha TEXT']) {
+      try {
+        this.#db.exec(`ALTER TABLE stage_evidence ADD COLUMN ${column}`)
+      } catch {
+        // Column already exists.
+      }
+    }
   }
 
   tableDefinition(tableName: string): string | undefined {
@@ -490,14 +501,17 @@ export class DomainLedger {
     stageId: string
     summary: string
     workerIdentity: string
+    effectivePolicyHash?: string
+    baseRefSha?: string
   }): string {
     const evidenceId = randomUUID()
     this.#db
       .prepare(
         `INSERT INTO stage_evidence (
            evidence_id, run_id, stage_id, round_index, candidate_commit_oid, base_commit_oid,
-           worker_identity, exit_code, evidence_sha256, artifact_path, summary, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           worker_identity, exit_code, evidence_sha256, artifact_path, summary,
+           effective_policy_hash, base_ref_sha, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         evidenceId,
@@ -511,6 +525,8 @@ export class DomainLedger {
         input.evidenceSha256,
         input.artifactPath,
         input.summary,
+        input.effectivePolicyHash ?? null,
+        input.baseRefSha ?? null,
         new Date().toISOString()
       )
     return evidenceId

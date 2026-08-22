@@ -192,8 +192,6 @@ export type PipelineResult = {
 
 type RepoState = Awaited<ReturnType<GitOperations["assertReady"]>>;
 
-export const DEFAULT_MAX_FIX_ROUNDS = 3;
-
 export class GateStopError extends Error {}
 
 export class RecoveryAnchorError extends Error {
@@ -234,8 +232,11 @@ export async function runPipeline(
   if (intent.includes("\n") || intent.includes("\0")) {
     throw new Error("--intent must be a single line");
   }
-  const maxFixRounds = options.maxFixRounds ?? DEFAULT_MAX_FIX_ROUNDS;
-  if (!Number.isInteger(maxFixRounds) || maxFixRounds < 0) {
+  const maxFixRounds = options.maxFixRounds;
+  if (
+    maxFixRounds !== undefined &&
+    (!Number.isInteger(maxFixRounds) || maxFixRounds < 0)
+  ) {
     throw new Error("maxFixRounds must be a non-negative integer");
   }
 
@@ -262,7 +263,9 @@ export async function runPipeline(
     repoRoot: repo.root,
   });
   const pipelineConfig = resolvePipelineConfig({
-    cliFlags: options.cliFlags,
+    // The explicit fix-round option rides the highest precedence tier so every
+    // stage budget derives from one resolved configuration.
+    cliFlags: { ...options.cliFlags, max_fix_rounds: maxFixRounds },
     repoGlobalConfig: repoPolicyConfig,
     userGlobalConfig: options.userGlobalConfig,
   });
@@ -368,6 +371,10 @@ export async function runPipeline(
             summary: report.summary,
             tested: report.tested,
             resolvedAgent: fallback.resolvedAgent,
+            effective_policy_hash: effectiveProvenance.effectivePolicyHash,
+            ...(effectiveProvenance.baseRefSha
+              ? { base_ref_sha: effectiveProvenance.baseRefSha }
+              : {}),
             ...(fallback.attempts.length > 0
               ? { fallbackAttempts: fallback.attempts }
               : {}),
@@ -409,6 +416,8 @@ export async function runPipeline(
         stageId: stage,
         summary: report.summary,
         workerIdentity,
+        effectivePolicyHash: effectiveProvenance.effectivePolicyHash,
+        baseRefSha: effectiveProvenance.baseRefSha,
       });
       stageEntries.push(entry);
       latestEntryByStage.set(stage, entry);
@@ -488,18 +497,26 @@ export async function runPipeline(
         const asksUser = actionable.some(
           (finding) => finding.action === "ask-user",
         );
-        const exhausted = round >= maxFixRounds;
+        const stageAutoFix = pipelineConfig.stages[stage].fixer.auto_fix;
+        // ADR-0007: review findings are never repaired without explicit
+        // trusted-policy authorization, and a disabled auto_fix blocks every
+        // stage's automatic repairs.
+        const reviewAutoFixAllowed =
+          stage !== "review" || stageAutoFix.allow_review_autofix;
+        const automationBlocked =
+          !stageAutoFix.enabled || !reviewAutoFixAllowed;
+        const exhausted = round >= stageAutoFix.max_rounds;
         let targetFindings: Finding[] = actionable;
-        let shouldFix = !asksUser && !exhausted;
+        let shouldFix = !asksUser && !exhausted && !automationBlocked;
         let guidance = "";
 
-        if (asksUser || exhausted) {
+        if (!shouldFix) {
           const gateOptions = ["approve", "fix", "skip", "stop"];
           const question = gateQuestion(
             stage,
             report,
             gateOptions,
-            exhausted ? maxFixRounds : undefined,
+            exhausted ? stageAutoFix.max_rounds : undefined,
           );
           const gateId = await orca.createGate(taskId, question, gateOptions);
           const resolution = (await orca.waitForGate(gateId)).trim();
@@ -558,17 +575,23 @@ export async function runPipeline(
           deliveryRepo.branch,
           runId,
         );
-        const nextFixer = await runFixer(
-          stage,
-          round,
-          taskId,
-          intent,
-          targetFindings,
-          guidance,
-          path.join(artifactsDir, `fixer-${stage}-${round}.json`),
-          pipelineConfig.stages[stage].fixer,
-          orca,
-          git,
+        const fixerRoles = pipelineConfig.stages[stage].fixer;
+        const nextFixer = await withTimeout(
+          fixerRoles.timeout_ms,
+          `${stage} fixer`,
+          () =>
+            runFixer(
+              stage,
+              round,
+              taskId,
+              intent,
+              targetFindings,
+              guidance,
+              path.join(artifactsDir, `fixer-${stage}-${round}.json`),
+              fixerRoles,
+              orca,
+              git,
+            ),
         );
         if (nextFixer.fallbackAttempts && nextFixer.resolvedAgent) {
           inheritedFallback = {
@@ -698,6 +721,29 @@ function launchCandidates(
   return agents.length > 0 ? agents : [undefined];
 }
 
+// ponytail: hard wall-clock boundary only; the abandoned worker's cleanup runs
+// whenever its underlying promise settles.
+async function withTimeout<T>(
+  timeoutMs: number | undefined,
+  label: string,
+  run: () => Promise<T>,
+): Promise<T> {
+  if (timeoutMs === undefined) return await run();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      run(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error(`${label} exceeded its ${timeoutMs}ms execution timeout`));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export type FallbackAttempt = {
   agent: string;
   durationMs: number;
@@ -808,15 +854,20 @@ async function executeStage(
       resolvedAgent: "coordinator",
     };
   }
-  return await runReviewer(
-    stage,
-    attempt,
-    taskId,
-    intent,
-    evidenceDir,
-    repo,
-    orca,
-    roles.reviewer,
+  return await withTimeout(
+    roles.reviewer.timeout_ms,
+    `${stage} reviewer`,
+    () =>
+      runReviewer(
+        stage,
+        attempt,
+        taskId,
+        intent,
+        evidenceDir,
+        repo,
+        orca,
+        roles.reviewer,
+      ),
   );
 }
 
