@@ -773,8 +773,8 @@ const args = process.argv.slice(2)
 fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
 const result = args[0] === 'worktree' && args[1] === 'create'
   ? { worktree: { id: 'gate-id', path: ${JSON.stringify(gate)}, branch: 'refs/heads/no-mistakes-gate-test' } }
-  : args[0] === 'terminal' && args[1] === 'create'
-    ? { terminal: { handle: 'detached-coordinator' } }
+  : args[0] === 'terminal' && args[1] === 'list'
+    ? { terminals: [{ handle: 'gate-shell', connected: true, writable: true }] }
     : args[0] === 'terminal' && args[1] === 'show'
       ? { terminal: { connected: true, preview: 'ready shell prompt' } }
       : { accepted: true }
@@ -796,9 +796,6 @@ console.log(JSON.stringify({ result }))
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line) as string[]);
-    const terminalCreate = calls.find(
-      (args) => args[0] === "terminal" && args[1] === "create",
-    );
     const worktreeCreate = calls.find(
       (args) => args[0] === "worktree" && args[1] === "create",
     );
@@ -808,10 +805,22 @@ console.log(JSON.stringify({ result }))
     const commandText =
       terminalSend?.[terminalSend.indexOf("--text") + 1] ?? "";
     const canonicalRepo = await realpath(repo);
-    const coordinatorWorktree = terminalCreate?.[
-      terminalCreate.indexOf("--worktree") + 1
-    ]?.replace(/^path:/, "");
-    assert.equal(coordinatorWorktree, gate);
+    const terminalList = calls.find(
+      (args) => args[0] === "terminal" && args[1] === "list",
+    );
+    assert.equal(
+      terminalList?.[terminalList.indexOf("--worktree") + 1],
+      `path:${gate}`,
+    );
+    assert.ok(
+      !calls.some(
+        (args) => args[0] === "terminal" && args[1] === "create",
+      ),
+    );
+    assert.equal(
+      terminalSend?.[terminalSend.indexOf("--terminal") + 1],
+      "gate-shell",
+    );
     assert.equal(
       worktreeCreate?.[worktreeCreate.indexOf("--parent-worktree") + 1],
       `path:${canonicalRepo}`,

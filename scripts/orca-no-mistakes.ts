@@ -2816,30 +2816,58 @@ async function launchDetachedRun(
     throw new Error("worktree create returned an invalid receipt");
   }
   gate.branch = gate.branch.replace(/^refs\/heads\//, "");
-  let created: { terminal: { handle: string } };
+  let terminalHandle = "";
   try {
-    created = unwrapJson(
+    const listed = unwrapJson<{
+      terminals: {
+        connected?: boolean;
+        handle: string;
+        writable?: boolean;
+      }[];
+    }>(
       (
         await command(
           orcaCommand,
           [
             "terminal",
-            "create",
+            "list",
             "--worktree",
             `path:${gate.path}`,
-            "--title",
-            "no-mistakes",
             "--json",
           ],
           repo.root,
         )
       ).stdout,
     );
+    terminalHandle =
+      listed.terminals.find(
+        (terminal) =>
+          terminal.connected !== false && terminal.writable !== false,
+      )?.handle ?? "";
+    if (!terminalHandle) {
+      const created = unwrapJson<{ terminal: { handle: string } }>(
+        (
+          await command(
+            orcaCommand,
+            [
+              "terminal",
+              "create",
+              "--worktree",
+              `path:${gate.path}`,
+              "--title",
+              "no-mistakes",
+              "--json",
+            ],
+            repo.root,
+          )
+        ).stdout,
+      );
+      terminalHandle = created?.terminal?.handle ?? "";
+    }
   } catch (error) {
     await removeGateWorktree(gate, repo.root, orcaCommand);
     throw error;
   }
-  const terminalHandle = created?.terminal?.handle;
   if (!terminalHandle) {
     await removeGateWorktree(gate, repo.root, orcaCommand);
     throw new Error("terminal create returned an invalid receipt");
