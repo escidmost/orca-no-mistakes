@@ -3100,12 +3100,30 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
   }
 });
 
+// Redirects homedir()-derived state (agy settings under ~/.gemini) and the
+// artifacts/ledger root away from the real user home for the duration of a
+// startup test; returns a restore function for use in finally blocks.
+function isolateHomes(temp: string): () => void {
+  const previousHome = process.env.HOME;
+  const previousRoot = process.env.ORCA_NO_MISTAKES_HOME;
+  const home = path.join(temp, "home");
+  process.env.HOME = home;
+  process.env.ORCA_NO_MISTAKES_HOME = home;
+  return () => {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousRoot === undefined) delete process.env.ORCA_NO_MISTAKES_HOME;
+    else process.env.ORCA_NO_MISTAKES_HOME = previousRoot;
+  };
+}
+
 test("WORKER_AGENT_READY_TIMEOUT_MS tears down an unready CLI agent terminal", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-ready-timeout-"));
   const fakeOrca = path.join(temp, "orca");
   const callsPath = path.join(temp, "calls.jsonl");
   const previousTimeout = process.env.WORKER_AGENT_READY_TIMEOUT_MS;
   process.env.WORKER_AGENT_READY_TIMEOUT_MS = "100";
+  const restoreHomes = isolateHomes(temp);
   try {
     await writeFile(
       fakeOrca,
@@ -3153,6 +3171,7 @@ if (args[0] === 'terminal' && args[1] === 'create') {
       ),
     );
   } finally {
+    restoreHomes();
     if (previousTimeout === undefined)
       delete process.env.WORKER_AGENT_READY_TIMEOUT_MS;
     else process.env.WORKER_AGENT_READY_TIMEOUT_MS = previousTimeout;
@@ -3164,6 +3183,7 @@ test("a missing CLI harness binary fails startup immediately as binary-missing",
   const temp = await mkdtemp(path.join(tmpdir(), "orca-binary-missing-"));
   const fakeOrca = path.join(temp, "orca");
   const callsPath = path.join(temp, "calls.jsonl");
+  const restoreHomes = isolateHomes(temp);
   try {
     await writeFile(
       fakeOrca,
@@ -3212,6 +3232,7 @@ if (args[0] === 'terminal' && args[1] === 'create') {
       "a binary-missing launch still closes its terminal",
     );
   } finally {
+    restoreHomes();
     await rm(temp, { recursive: true, force: true });
   }
 });
@@ -3219,6 +3240,7 @@ if (args[0] === 'terminal' && args[1] === 'create') {
 test("a shell reporting a missing agy binary in its title fails as binary-missing", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-agy-missing-"));
   const fakeOrca = path.join(temp, "orca");
+  const restoreHomes = isolateHomes(temp);
   try {
     await writeFile(
       fakeOrca,
@@ -3255,6 +3277,7 @@ if (args[0] === 'terminal' && args[1] === 'create') {
       },
     );
   } finally {
+    restoreHomes();
     await rm(temp, { recursive: true, force: true });
   }
 });
@@ -3262,9 +3285,10 @@ if (args[0] === 'terminal' && args[1] === 'create') {
 test("a started harness rendering missing-binary text is not misdiagnosed", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-binary-rendered-"));
   const fakeOrca = path.join(temp, "orca");
+  const restoreHomes = isolateHomes(temp);
   const evidence = path.join(
-    homedir(),
-    ".orca-no-mistakes",
+    temp,
+    "home",
     "artifacts",
     "rendered-test",
   );
@@ -3304,6 +3328,57 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     });
     assert.equal(worker.terminalHandle, "rendered-terminal");
   } finally {
+    restoreHomes();
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("a report file without a valid StageReport shape fails closed", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-report-shape-"));
+  const fakeOrca = path.join(temp, "orca");
+  const restoreHomes = isolateHomes(temp);
+  const evidence = path.join(temp, "home", "artifacts", "shape-run");
+  try {
+    await mkdir(evidence, { recursive: true });
+    const reportPath = path.join(evidence, "shape.json");
+    await writeFile(reportPath, JSON.stringify({ nope: true }));
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+const args = process.argv.slice(2)
+const out = (result) => console.log(JSON.stringify({ result }))
+if (args[0] === 'orchestration' && args[1] === 'run-create') {
+  out({ run: { id: 'shape-run' } })
+} else if (args[0] === 'terminal' && args[1] === 'create') {
+  out({ terminal: { handle: 'shape-terminal' } })
+} else if (args[0] === 'terminal' && args[1] === 'send') {
+  out({ accepted: true })
+} else if (args[0] === 'terminal' && args[1] === 'show') {
+  out({ terminal: { connected: true, title: 'OpenCode', preview: 'ready' } })
+} else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
+  out({ dispatch: { id: 'dispatch-shape', status: 'dispatched' }, injected: true, preamble: 'authenticated' })
+} else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
+  out({ deliveryId: 'delivery-shape', messages: [{ type: 'worker_done', body: 'done', payload: JSON.stringify({ taskId: 'task-shape', dispatchId: 'dispatch-shape', outcome: 'succeeded', reportPath: ${JSON.stringify(reportPath)} }) }] })
+} else {
+  out({ ok: true })
+}
+`,
+    );
+    await chmod(fakeOrca, 0o755);
+    const orca = new CliOrca({ command: fakeOrca, cwd: temp });
+    await orca.createRun("shape test");
+    await assert.rejects(
+      orca.startWorker("task-shape", {
+        name: "shape-agent",
+        prompt: "instructions",
+        role: "reviewer",
+        stage: "lint",
+        worktree: "current",
+      }),
+      /worker dispatch-shape returned an invalid report/,
+    );
+  } finally {
+    restoreHomes();
     await rm(temp, { recursive: true, force: true });
   }
 });

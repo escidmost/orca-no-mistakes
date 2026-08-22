@@ -361,7 +361,13 @@ test('parseAgyStream maps deltas, thinking usage, responses, and structured outp
       result: {
         status: 'SUCCESS',
         response: 'final answer',
-        usage: { input_tokens: 12, output_tokens: 7, thinking_tokens: 50, cache_read_tokens: 3 }
+        usage: {
+          input_tokens: 12,
+          output_tokens: 7,
+          thinking_tokens: 50,
+          cache_read_tokens: 3,
+          cache_creation_tokens: 9
+        }
       }
     })
   ].join('\n')
@@ -371,6 +377,8 @@ test('parseAgyStream maps deltas, thinking usage, responses, and structured outp
   assert.equal(parsed.usage.inputTokens, 12)
   assert.equal(parsed.usage.outputTokens, 7)
   assert.equal(parsed.usage.cacheReadTokens, 3)
+  assert.equal(parsed.usage.cacheCreationTokens, 9)
+  assert.equal(parsed.usage.cacheCreationReported, true)
   assert.equal(parsed.usage.reasoningTokens, 50)
   assert.equal(parsed.usage.reasoningReported, true)
 

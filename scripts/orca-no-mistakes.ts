@@ -3085,10 +3085,14 @@ export class CliOrca implements OrcaOperations {
           }
           if (parsedReport === undefined || parsedReport === null)
             throw new Error("report file contained no JSON value");
-          return {
-            deliveryId: result.deliveryId,
-            report: parsedReport as StageReport,
-          };
+          const report = acpReportFrom(parsedReport);
+          if (!report) {
+            return {
+              deliveryId: result.deliveryId,
+              error: `worker ${dispatchId} returned an invalid report`,
+            };
+          }
+          return { deliveryId: result.deliveryId, report };
         } catch (error) {
           return {
             deliveryId: result.deliveryId,
