@@ -3,6 +3,7 @@
 - **Code reviews** Skip a separate `/code-review` but run `/ponytail-review` before making commits
 - **Push through orca-no-mistakes.** When told to push, run the gate through the worktree-local `./bin/orca-no-mistakes`; this package executes its TypeScript directly, so that executable is the worktree build. Do not push unless told to.
 - **Dogfood repairs.** If `orca-no-mistakes` fails because of its own behavior, diagnose and fix the root cause in the current worktree, verify and commit the repair, then run every later attempt through `./bin/orca-no-mistakes` so it includes the repair. Continue through a passing gate rather than bypassing it or patching Orca.
+- **Detached gates.** After starting a detached `orca-no-mistakes` run, return to chat. Do not wait on, read, or poll its terminal; Orca delivers failures and questions here, and a blocking terminal prevents those messages from being handled.
 - **Post-merge cleanup** When the PR for a Linear issue is merged, remove any labels from the issue that indicate readiness or process (ready-for-\*, wayfinder:\*). Make sure that the PR begins with the Linear issue number ($TeamSlug-##: $title).
 - **Keep example config updated.** When new features are added that have config options, be sure to add them and their default values to templates/config.yaml
 
