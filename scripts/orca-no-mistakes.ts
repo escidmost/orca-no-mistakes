@@ -1519,6 +1519,13 @@ export class CliOrca implements OrcaOperations {
           terminalHandle,
           "--text",
           preamble,
+          "--json",
+        ]);
+        await this.#json([
+          "terminal",
+          "send",
+          "--terminal",
+          terminalHandle,
           "--enter",
           "--json",
         ]);

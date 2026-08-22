@@ -1270,6 +1270,9 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     );
     assert.equal(sends[0][sends[0].indexOf("--text") + 1], "'agy'");
     assert.equal(sends[1][sends[1].indexOf("--text") + 1], "authenticated");
+    assert.ok(!sends[1].includes("--enter"));
+    assert.ok(sends[2].includes("--enter"));
+    assert.ok(!sends[2].includes("--text"));
     assert.ok(
       calls.filter(
         (args) => args[0] === "terminal" && args[1] === "read",
