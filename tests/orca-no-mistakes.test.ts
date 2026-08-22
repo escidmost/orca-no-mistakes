@@ -2881,7 +2881,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
 } else if (args[0] === 'terminal' && args[1] === 'show') {
   out({ terminal: { connected: true, title: 'Claude CLI', preview: 'ready' } })
 } else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
-  out({ dispatch: { id: 'dispatch-claude', status: 'dispatched' }, injected: true, preamble: 'authenticated' })
+  out({ dispatch: { id: 'dispatch-claude', status: 'dispatched' }, injected: false, preamble: 'authenticated' })
 } else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
   out({ deliveryId: 'delivery-claude', messages: [{ type: 'worker_done', body: 'Reviewed. Verified. Clear.', payload: JSON.stringify({ taskId: 'task-claude', dispatchId: 'dispatch-claude', outcome: 'succeeded', reportPath: ${JSON.stringify(reportPath)} }) }] })
 } else {
@@ -2912,9 +2912,10 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     const created = calls.find(
       ({ args }) => args[0] === "terminal" && args[1] === "create",
     );
-    const sent = calls.find(
+    const sends = calls.filter(
       ({ args }) => args[0] === "terminal" && args[1] === "send",
     );
+    const sent = sends[0];
     assert.ok(created && sent);
     assert.ok(sent.at - created.at >= 70, "Claude starts after the shell delay");
     assert.equal(
@@ -2925,6 +2926,11 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       calls.find(({ args }) => args[1] === "worker-start"),
       undefined,
     );
+    const dispatch = calls.find(
+      ({ args }) => args[0] === "orchestration" && args[1] === "dispatch",
+    );
+    assert.ok(dispatch && !dispatch.args.includes("--inject"));
+    assert.equal(sends[1]?.args[sends[1].args.indexOf("--text") + 1], "authenticated");
     assert.equal(worker.report.summary, "claude reviewed");
   } finally {
     if (previousDelay === undefined)
@@ -2932,6 +2938,63 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     else process.env.CLAUDE_SHELL_STARTUP_DELAY_MS = previousDelay;
     await rm(temp, { recursive: true, force: true });
     await rm(evidence, { recursive: true, force: true });
+  }
+});
+
+test("CliOrca preserves initial dispatch failures and closes the terminal", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-dispatch-failure-"));
+  const fakeOrca = path.join(temp, "orca");
+  const callsPath = path.join(temp, "calls.jsonl");
+  try {
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+const out = (result) => console.log(JSON.stringify({ result }))
+if (args[0] === 'terminal' && args[1] === 'create') {
+  out({ terminal: { handle: 'dispatch-failure-terminal' } })
+} else if (args[0] === 'terminal' && args[1] === 'send') {
+  out({ accepted: true })
+} else if (args[0] === 'terminal' && args[1] === 'show') {
+  out({ terminal: { connected: true, title: 'OpenCode', preview: 'ready' } })
+} else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
+  console.log(JSON.stringify({ ok: false, error: { code: 'agent_prompt_stalled', message: 'agent_prompt_stalled' } }))
+  process.exitCode = 1
+} else {
+  out({ ok: true })
+}
+`,
+    );
+    await chmod(fakeOrca, 0o755);
+    const orca = new CliOrca({ command: fakeOrca, cwd: temp });
+
+    await assert.rejects(
+      orca.startWorker("task-dispatch-failure", {
+        name: "dispatch-failure-reviewer",
+        prompt: "review instructions",
+        role: "reviewer",
+        stage: "review",
+        worktree: "current",
+      }),
+      /initial dispatch failed: .*agent_prompt_stalled/,
+    );
+
+    const calls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    assert.ok(
+      calls.some(
+        (args) =>
+          args[0] === "terminal" &&
+          args[1] === "close" &&
+          args.includes("dispatch-failure-terminal"),
+      ),
+    );
+  } finally {
+    await rm(temp, { recursive: true, force: true });
   }
 });
 

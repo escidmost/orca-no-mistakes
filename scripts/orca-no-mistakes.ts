@@ -2007,7 +2007,9 @@ export class CliOrca implements OrcaOperations {
     if (launch.agent && classifyHarness(launch.agent.harness) === "acp") {
       return await this.#startAcpWorker(taskId, launch);
     }
-    const directPreamble = launch.agent?.harness.toLowerCase() === "agy";
+    const harness = launch.agent?.harness.toLowerCase();
+    const directPreamble = harness === "agy";
+    const manualDispatch = directPreamble || harness === "claude";
     const launchWithPreamble = directPreamble && !launch.terminal;
     const prepared = launch.terminal
       ? undefined
@@ -2037,7 +2039,7 @@ export class CliOrca implements OrcaOperations {
       terminalHandle,
       "--return-preamble",
     ];
-    if (!directPreamble) args.push("--inject");
+    if (!manualDispatch) args.push("--inject");
     if (this.#runId) args.push("--run", this.#runId);
     args.push("--json");
     let receipt: {
@@ -2050,7 +2052,7 @@ export class CliOrca implements OrcaOperations {
         dispatch: { id: string; status: string } | null;
         injected?: boolean;
         preamble?: string;
-      }>(args, true);
+      }>(args);
     } catch (error) {
       if (prepared) await this.#cleanupPreparedWorker(prepared);
       throw new PreflightError(
@@ -2064,7 +2066,7 @@ export class CliOrca implements OrcaOperations {
     if (
       !dispatchId ||
       !preamble ||
-      (!directPreamble && receipt.injected !== true)
+      (!manualDispatch && receipt.injected !== true)
     ) {
       if (dispatchId) {
         await this.#cleanupFailedWorker(
@@ -2081,9 +2083,9 @@ export class CliOrca implements OrcaOperations {
       );
     }
     let promptPath: string | undefined;
-    if (directPreamble) {
+    if (manualDispatch) {
       try {
-        if (launchWithPreamble) {
+        if (directPreamble && launchWithPreamble) {
           promptPath = await this.#launchWorkerAgent(
             terminalHandle,
             launch,
