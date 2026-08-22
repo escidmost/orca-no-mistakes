@@ -248,7 +248,11 @@ export class PreflightError extends Error {
   }
 }
 
-const BINARY_MISSING_PATTERN = /\bENOENT\b|command not found|unknown command/i
+const BINARY_MISSING_PATTERN = /\bENOENT\b|command not found/i
+// fish spells it `fish: Unknown command: <name>`. Only safe alongside the
+// harness-name anchoring below: unanchored it would swallow a CLI's own
+// "unknown command '<subcommand>'" usage errors.
+const SHELL_BINARY_MISSING_PATTERN = /\bENOENT\b|command not found|unknown command/i
 
 // Startup readiness observers see shell/terminal text, so a missing harness
 // binary surfaces as printed output rather than a spawn error. Only a line that
@@ -259,7 +263,7 @@ export function isBinaryMissingOutput(text: string, harness: string): boolean {
   const named = new RegExp(`\\b${escapeRegExp(harness)}\\b`, 'i')
   return text
     .split('\n')
-    .some((line) => BINARY_MISSING_PATTERN.test(line) && named.test(line))
+    .some((line) => SHELL_BINARY_MISSING_PATTERN.test(line) && named.test(line))
 }
 
 const PREFLIGHT_PATTERNS: [RegExp, PreflightFailureClass][] = [

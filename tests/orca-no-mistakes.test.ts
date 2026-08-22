@@ -3580,6 +3580,11 @@ test("preflight failure classification maps known launch failures", () => {
     "readiness-timeout",
   );
   assert.equal(
+    classifyPreflightFailure("acpx error: unknown command 'exec'"),
+    "unclassified",
+    "a runner rejecting a subcommand is not a missing binary",
+  );
+  assert.equal(
     classifyPreflightFailure("something else went wrong"),
     "unclassified",
   );
