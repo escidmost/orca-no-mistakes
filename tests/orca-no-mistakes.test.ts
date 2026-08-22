@@ -371,7 +371,10 @@ const allowReviewAutoFix = (git: FakeGit) => {
 
 test("runs the six-stage local adversarial pipeline with fixes, gates, and isolation", async () => {
   const git = new FakeGit();
-  allowReviewAutoFix(git);
+  git.baseFiles.set(
+    "origin/main:.orca/no-mistakes.yaml",
+    "auto_fix:\n  allow_review_autofix: true\nstages:\n  review:\n    fixer:\n      agent: [claude, grok]\n  lint:\n    fixer:\n      agent: [grok, claude]\n",
+  );
   const orca = new FakeOrca(git);
   const ledger = new DomainLedger(":memory:");
   const autoFix: Finding = {
@@ -483,8 +486,10 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
   assert.equal(fixerLaunches.length, 2);
   assert.equal(fixerLaunches[0].worktree, "new-child");
   assert.equal(fixerLaunches[0].terminal, undefined);
-  assert.equal(fixerLaunches[1].worktree, "current");
-  assert.equal(fixerLaunches[1].terminal, "term-fixer");
+  assert.equal(fixerLaunches[0].agent?.harness, "claude");
+  assert.equal(fixerLaunches[1].worktree, "new-child");
+  assert.equal(fixerLaunches[1].terminal, undefined);
+  assert.equal(fixerLaunches[1].agent?.harness, "grok");
   assert.ok(
     orca.fixerDispatches.every((dispatchId) =>
       orca.calls.includes(`retain:${dispatchId}`),
@@ -502,8 +507,8 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
         .filter((call) => call.startsWith("apply:/worktrees/"))
         .map((call) => call.split(":", 2)[1]),
     ).size,
-    1,
-    "fix rounds share one fixer worktree",
+    2,
+    "changing the primary fixer candidate starts a fresh session",
   );
   assert.ok(
     orca.calls.some(
@@ -2157,7 +2162,7 @@ test("GitShell.diffBase falls back to a local base branch when origin lacks it",
   }
 });
 
-test("GitShell rejects fixer changes to base tests but permits new test files", async () => {
+test("GitShell rejects protected fixer changes but permits new test files", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-git-fixer-guard-"));
   const repo = path.join(temp, "repo");
   const worker = path.join(temp, "worker");
@@ -2165,12 +2170,12 @@ test("GitShell rejects fixer changes to base tests but permits new test files", 
     git(temp, "init", "-b", "main", repo);
     git(repo, "config", "user.email", "test@example.com");
     git(repo, "config", "user.name", "Test User");
-    await mkdir(path.join(repo, "tests"));
+    await mkdir(path.join(repo, "Tests"));
     await writeFile(
-      path.join(repo, "tests/existing.test.ts"),
+      path.join(repo, "Tests/existing.ts"),
       'assert.equal(value, "expected");\n',
     );
-    git(repo, "add", "tests/existing.test.ts");
+    git(repo, "add", "Tests/existing.ts");
     git(repo, "commit", "-m", "base test");
     const baseOid = git(repo, "rev-parse", "HEAD");
     git(repo, "checkout", "-b", "feature");
@@ -2181,23 +2186,34 @@ test("GitShell rejects fixer changes to base tests but permits new test files", 
     git(repo, "worktree", "add", "--detach", worker, featureHead);
 
     await writeFile(
-      path.join(worker, "tests/existing.test.ts"),
+      path.join(worker, "Tests/existing.ts"),
       'assert.ok(value);\n',
     );
-    git(worker, "add", "tests/existing.test.ts");
+    git(worker, "add", "Tests/existing.ts");
     git(worker, "commit", "-m", "weaken test");
     const shell = new GitShell({ repo });
     await assert.rejects(
       shell.assertFixerChangesAllowed(worker, baseOid, featureHead),
-      /fixer modified pre-existing test files: tests\/existing\.test\.ts/,
+      /fixer modified pre-existing test files: Tests\/existing\.ts/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "eslint.config.js"), "export default [];\n");
+    await mkdir(path.join(worker, "prompts"));
+    await writeFile(path.join(worker, "prompts/fixer.md"), "weaken checks\n");
+    git(worker, "add", "eslint.config.js", "prompts/fixer.md");
+    git(worker, "commit", "-m", "weaken validation policy");
+    await assert.rejects(
+      shell.assertFixerChangesAllowed(worker, baseOid, featureHead),
+      /unexplained-policy-relaxation:.*eslint\.config\.js, prompts\/fixer\.md/,
     );
 
     git(worker, "reset", "--hard", featureHead);
     await writeFile(
-      path.join(worker, "tests/new-regression.test.ts"),
+      path.join(worker, "Tests/new-regression.ts"),
       'assert.equal(value, 1);\n',
     );
-    git(worker, "add", "tests/new-regression.test.ts");
+    git(worker, "add", "Tests/new-regression.ts");
     git(worker, "commit", "-m", "add regression test");
     await shell.assertFixerChangesAllowed(worker, baseOid, featureHead);
   } finally {
@@ -5090,14 +5106,19 @@ test("per-stage auto_fix.max_rounds budgets gate before any automatic round", as
 test("a fixer timeout during commit application leaves the branch unchanged", async () => {
   class SlowApplyGit extends FakeGit {
     headAtApply = "";
+    settled = false;
     async applyWorktreeCommits(
       sourcePath: string,
       expectedHead: string,
       fence?: { readonly aborted: boolean },
     ): Promise<boolean> {
       this.headAtApply = await this.head();
-      await new Promise((resolve) => setTimeout(resolve, 75));
-      return super.applyWorktreeCommits(sourcePath, expectedHead, fence);
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 75));
+        return super.applyWorktreeCommits(sourcePath, expectedHead, fence);
+      } finally {
+        this.settled = true;
+      }
     }
   }
   const git = new SlowApplyGit();
@@ -5130,8 +5151,8 @@ test("a fixer timeout during commit application leaves the branch unchanged", as
     ),
     /review fixer exceeded its 10ms execution timeout/,
   );
-  await new Promise((resolve) => setTimeout(resolve, 150));
 
+  assert.equal(git.settled, true, "timeout waits for fenced application cleanup");
   assert.ok(
     git.calls.some((call) => call.endsWith(":fenced")),
     "the late application attempt was observed and fenced",
@@ -5254,7 +5275,6 @@ test("a timed-out fixer never applies commits after the run fails", async () => 
     ),
     /review fixer exceeded its 10ms execution timeout/,
   );
-  await new Promise((resolve) => setTimeout(resolve, 150));
   assert.equal(
     git.calls.filter((call) => call.startsWith("apply:")).length,
     0,

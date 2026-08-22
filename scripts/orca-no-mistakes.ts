@@ -798,19 +798,23 @@ function launchCandidates(
   return agents.length > 0 ? agents : [undefined];
 }
 
-// ponytail: hard wall-clock boundary; the abandoned worker keeps running until
-// its promise settles, so `fence` lets it decline any further repo mutation.
+type TimeoutFence = {
+  aborted: boolean;
+  settlement?: Promise<unknown>;
+};
+
 async function withTimeout<T>(
   timeoutMs: number | undefined,
   label: string,
-  run: (fence: { aborted: boolean }) => Promise<T>,
+  run: (fence: TimeoutFence) => Promise<T>,
 ): Promise<T> {
   if (timeoutMs === undefined) return await run({ aborted: false });
-  const fence = { aborted: false };
+  const fence: TimeoutFence = { aborted: false };
   let timer: ReturnType<typeof setTimeout> | undefined;
+  const operation = run(fence);
   try {
     return await Promise.race([
-      run(fence),
+      operation,
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
           fence.aborted = true;
@@ -820,6 +824,17 @@ async function withTimeout<T>(
         }, timeoutMs);
       }),
     ]);
+  } catch (error) {
+    if (fence.aborted && fence.settlement) {
+      try {
+        await fence.settlement;
+      } catch (settledError) {
+        if (settledError instanceof PostMutationCustodyError) {
+          throw settledError;
+        }
+      }
+    }
+    throw error;
   } finally {
     clearTimeout(timer);
   }
@@ -1030,10 +1045,9 @@ function fixerSessionMatchesRole(
   session: FixerSession,
   role: ResolvedRoleConfig,
 ): boolean {
+  const [candidate] = launchCandidates(role);
   const retained = JSON.stringify(session.agent ?? null);
-  return launchCandidates(role).some(
-    (agent) => JSON.stringify(agent ?? null) === retained,
-  );
+  return JSON.stringify(candidate ?? null) === retained;
 }
 
 async function releaseFixerSession(
@@ -1063,7 +1077,7 @@ async function runFixer(
   orca: OrcaOperations,
   git: GitOperations,
   retainedSession: FixerSession | undefined,
-  fence: { readonly aborted: boolean },
+  fence: TimeoutFence,
 ): Promise<{
   after: string;
   before: string;
@@ -1125,7 +1139,9 @@ async function runFixer(
       // so a delayed worker cannot apply commits into a settled run.
       throw new Error(`${stage} fixer timed out; commits were not applied`);
     }
-    if (!(await git.applyWorktreeCommits(worktreePath, before, fence))) {
+    const transfer = git.applyWorktreeCommits(worktreePath, before, fence);
+    fence.settlement = transfer;
+    if (!(await transfer)) {
       throw new Error(`${stage} fixer could not apply its committed change`);
     }
     const after = await git.head();
@@ -3304,8 +3320,26 @@ function isTestPath(filePath: string): boolean {
   return (
     parts
       .slice(0, -1)
-      .some((part) => ["test", "tests", "spec", "specs", "__tests__"].includes(part)) ||
+      .some((part) =>
+        ["test", "tests", "spec", "specs", "__tests__"].includes(
+          part.toLowerCase(),
+        ),
+      ) ||
     /(?:^|[._-])(tests?|specs?)(?:[._-]|$)/i.test(fileName)
+  );
+}
+
+function isProtectedValidationPolicyPath(filePath: string): boolean {
+  const normalized = filePath.toLowerCase();
+  const parts = normalized.split("/");
+  const fileName = parts.at(-1) ?? "";
+  return (
+    normalized === ".orca/no-mistakes.yaml" ||
+    parts.slice(0, -1).includes("prompts") ||
+    /(?:^|[._-])prompts?(?:[._-]|$)/.test(fileName) ||
+    /^(?:eslint\.config\..+|\.eslintrc(?:\..+)?|prettier\.config\..+|\.prettierrc(?:\..+)?|biome\.jsonc?|deno\.jsonc?|\.editorconfig|\.flake8|\.?ruff\.toml|\.?mypy\.ini|\.pylintrc|pyrightconfig\.json|\.rubocop\.ya?ml|stylelint\.config\..+|\.stylelintrc(?:\..+)?|\.?markdownlint(?:-cli2)?(?:\..+)?|\.golangci\.(?:ya?ml|toml|json)|\.?rustfmt\.toml|\.?clippy\.toml|\.clang-tidy|analysis_options\.yaml|checkstyle\.xml|detekt\.ya?ml|phpcs\.xml(?:\.dist)?|phpstan(?:\.[^.]+)?\.neon(?:\.dist)?|sonar-project\.properties|tsconfig(?:\.[^.]+)*\.json)$/.test(
+      fileName,
+    )
   );
 }
 
@@ -3396,14 +3430,23 @@ export class GitShell implements GitOperations {
       throw new Error(`could not inspect fixer changes: ${changed.output}`);
     }
     const protectedTests: string[] = [];
+    const protectedPolicy: string[] = [];
     for (const filePath of changed.stdout.split("\0").filter(Boolean)) {
       if (isTestPath(filePath) && (await this.pathExists(baseOid, filePath))) {
         protectedTests.push(filePath);
+      }
+      if (isProtectedValidationPolicyPath(filePath)) {
+        protectedPolicy.push(filePath);
       }
     }
     if (protectedTests.length > 0) {
       throw new Error(
         `fixer modified pre-existing test files: ${protectedTests.sort().join(", ")}`,
+      );
+    }
+    if (protectedPolicy.length > 0) {
+      throw new Error(
+        `unexplained-policy-relaxation: fixer modified protected validation policy files: ${protectedPolicy.sort().join(", ")}`,
       );
     }
   }
@@ -3473,6 +3516,10 @@ export class GitShell implements GitOperations {
         true,
         fence,
       );
+      if (fence?.aborted) {
+        await this.#restoreExpectedHeadAfterAbort(expectedHead, sourceHead);
+        return false;
+      }
       return !applied.failed;
     }
     if (fence?.aborted) return false;
@@ -3483,29 +3530,39 @@ export class GitShell implements GitOperations {
     const branch = (
       await this.#git(["rev-parse", "--abbrev-ref", "HEAD"], true)
     ).stdout.trim();
-    const casSucceeded =
+    const cas =
       !branch || branch === "HEAD"
-        ? true
-        : (
-            await this.#git(
-              ["update-ref", `refs/heads/${branch}`, sourceHead, expectedHead],
-              true,
-              fence,
-            )
-          ).code === 0;
-    if (!casSucceeded) return false;
+        ? undefined
+        : await this.#git(
+            ["update-ref", `refs/heads/${branch}`, sourceHead, expectedHead],
+            true,
+            fence,
+          );
+    if (fence?.aborted) {
+      await this.#restoreExpectedHeadAfterAbort(expectedHead, sourceHead);
+      return false;
+    }
+    if (cas?.failed) return false;
     try {
       const backup = await this.#git(
         ["update-ref", `refs/no-mistakes/backup/${expectedHead}`, expectedHead],
         true,
         fence,
       );
+      if (fence?.aborted) {
+        await this.#restoreExpectedHeadAfterAbort(expectedHead, sourceHead);
+        return false;
+      }
       if (backup.failed) throw new Error(backup.output);
       const reset = await this.#git(
         ["reset", "--hard", sourceHead],
         true,
         fence,
       );
+      if (fence?.aborted) {
+        await this.#restoreExpectedHeadAfterAbort(expectedHead, sourceHead);
+        return false;
+      }
       if (reset.failed) throw new Error(reset.output);
       return true;
     } catch (error) {
@@ -3519,6 +3576,25 @@ export class GitShell implements GitOperations {
         `custody transfer failed after advancing the operator branch: ${
           error instanceof Error ? error.message : String(error)
         }`,
+      );
+    }
+  }
+
+  async #restoreExpectedHeadAfterAbort(
+    expectedHead: string,
+    sourceHead: string,
+  ): Promise<void> {
+    const currentHead = await this.head();
+    if (currentHead === expectedHead) return;
+    if (currentHead !== sourceHead) {
+      throw new PostMutationCustodyError(
+        `timed-out custody transfer left unexpected HEAD ${currentHead}`,
+      );
+    }
+    const rollback = await this.#git(["reset", "--hard", expectedHead], true);
+    if (rollback.failed) {
+      throw new PostMutationCustodyError(
+        `timed-out custody transfer could not restore ${expectedHead}: ${rollback.output}`,
       );
     }
   }
