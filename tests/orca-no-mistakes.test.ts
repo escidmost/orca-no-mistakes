@@ -2848,6 +2848,93 @@ test("local config bypass taints the run as uncertified", async () => {
   }
 });
 
+test("CliOrca waits for the shell before launching Claude", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-claude-shell-"));
+  const fakeOrca = path.join(temp, "orca");
+  const callsPath = path.join(temp, "calls.jsonl");
+  const evidence = path.join(
+    homedir(),
+    ".orca-no-mistakes",
+    "artifacts",
+    "claude-shell-run",
+  );
+  const reportPath = path.join(evidence, "review.json");
+  const previousDelay = process.env.CLAUDE_SHELL_STARTUP_DELAY_MS;
+  process.env.CLAUDE_SHELL_STARTUP_DELAY_MS = "80";
+  try {
+    git(temp, "init", "-b", "feature");
+    await mkdir(evidence, { recursive: true });
+    await writeFile(reportPath, JSON.stringify(pass("claude reviewed")));
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify({ args, at: Date.now() }) + '\\n')
+const out = (result) => console.log(JSON.stringify({ result }))
+if (args[0] === 'orchestration' && args[1] === 'run-create') {
+  out({ run: { id: 'claude-shell-run' } })
+} else if (args[0] === 'terminal' && args[1] === 'create') {
+  out({ terminal: { handle: 'claude-shell' } })
+} else if (args[0] === 'terminal' && args[1] === 'send') {
+  out({ accepted: true })
+} else if (args[0] === 'terminal' && args[1] === 'show') {
+  out({ terminal: { connected: true, title: 'Claude CLI', preview: 'ready' } })
+} else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
+  out({ dispatch: { id: 'dispatch-claude', status: 'dispatched' }, injected: true, preamble: 'authenticated' })
+} else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
+  out({ deliveryId: 'delivery-claude', messages: [{ type: 'worker_done', body: 'Reviewed. Verified. Clear.', payload: JSON.stringify({ taskId: 'task-claude', dispatchId: 'dispatch-claude', outcome: 'succeeded', reportPath: ${JSON.stringify(reportPath)} }) }] })
+} else {
+  out({ ok: true })
+}
+`,
+    );
+    await chmod(fakeOrca, 0o755);
+    const orca = new CliOrca({ command: fakeOrca, cwd: temp });
+    await orca.createRun("claude shell delay test");
+
+    const worker = await orca.startWorker("task-claude", {
+      agent: { effort: "high", harness: "claude", model: "opus[1m]" },
+      name: "claude-reviewer",
+      prompt: "review instructions",
+      role: "reviewer",
+      stage: "review",
+      worktree: "current",
+    });
+
+    const calls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map(
+        (line) =>
+          JSON.parse(line) as { args: string[]; at: number },
+      );
+    const created = calls.find(
+      ({ args }) => args[0] === "terminal" && args[1] === "create",
+    );
+    const sent = calls.find(
+      ({ args }) => args[0] === "terminal" && args[1] === "send",
+    );
+    assert.ok(created && sent);
+    assert.ok(sent.at - created.at >= 70, "Claude starts after the shell delay");
+    assert.equal(
+      sent.args[sent.args.indexOf("--text") + 1],
+      "'claude' '--model' 'opus[1m]' '--effort' 'high' '--dangerously-skip-permissions'",
+    );
+    assert.equal(
+      calls.find(({ args }) => args[1] === "worker-start"),
+      undefined,
+    );
+    assert.equal(worker.report.summary, "claude reviewed");
+  } finally {
+    if (previousDelay === undefined)
+      delete process.env.CLAUDE_SHELL_STARTUP_DELAY_MS;
+    else process.env.CLAUDE_SHELL_STARTUP_DELAY_MS = previousDelay;
+    await rm(temp, { recursive: true, force: true });
+    await rm(evidence, { recursive: true, force: true });
+  }
+});
+
 test("CliOrca starts native workers through orchestration worker-start", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-native-"));
   const fakeOrca = path.join(temp, "orca");
@@ -2888,7 +2975,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     await orca.createRun("native test");
 
     const worker = await orca.startWorker("task-nat", {
-      agent: { effort: "high", harness: "claude", model: "claude-opus-4" },
+      agent: { effort: "high", harness: "codex", model: "gpt-5.6" },
       name: "nm-review",
       prompt: "review instructions",
       role: "reviewer",
@@ -2905,9 +2992,9 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       .map((line) => JSON.parse(line) as string[]);
     const workerStart = calls.find((args) => args[1] === "worker-start");
     assert.ok(workerStart?.includes("--agent"));
-    assert.ok(workerStart?.includes("claude"));
+    assert.ok(workerStart?.includes("codex"));
     assert.ok(workerStart?.includes("--model"));
-    assert.ok(workerStart?.includes("claude-opus-4"));
+    assert.ok(workerStart?.includes("gpt-5.6"));
     assert.ok(workerStart?.includes("--effort"));
     assert.ok(workerStart?.includes("--worktree"));
     assert.ok(workerStart?.includes("new-child"));
@@ -2967,7 +3054,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     await orca.createRun("native pin test");
     await assert.rejects(
       orca.startWorker("task-nat", {
-        agent: { harness: "claude" },
+        agent: { harness: "codex" },
         commitOid: "a".repeat(40),
         name: "nm-review",
         prompt: "review instructions",
@@ -3028,7 +3115,7 @@ if (args[0] === 'orchestration' && args[1] === 'worker-start') {
 
     await assert.rejects(
       orca.startWorker("task-residual", {
-        agent: { harness: "claude" },
+        agent: { harness: "codex" },
         name: "nm-review",
         prompt: "review instructions",
         role: "reviewer",
@@ -3093,7 +3180,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
 
     await assert.rejects(
       orca.startWorker("task-fail", {
-        agent: { harness: "claude", model: "claude-opus-4" },
+        agent: { harness: "codex", model: "gpt-5.6" },
         name: "nm-review",
         prompt: "review instructions",
         role: "reviewer",
@@ -3746,7 +3833,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       max_rounds: 0,
       allow_review_autofix: false,
     };
-    const [grok, claude] = ["grok", "claude"].map(
+    const [grok, codex] = ["grok", "codex"].map(
       (harness) => launchAgent({ auto_fix: roleConfig, agent: harness })![0],
     );
     const launches: WorkerLaunch[] = [
@@ -3759,7 +3846,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
         worktree: "current",
       },
       {
-        agent: claude,
+        agent: codex,
         name: "second",
         prompt: "instructions",
         role: "reviewer",
@@ -3776,7 +3863,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       launches,
     );
 
-    assert.equal(outcome.resolvedAgent, "claude");
+    assert.equal(outcome.resolvedAgent, "codex");
     assert.deepEqual(
       outcome.attempts.map((attempt) => [attempt.agent, attempt.failureClass]),
       [["grok", "readiness-timeout"]],

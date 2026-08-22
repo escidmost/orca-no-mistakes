@@ -1880,6 +1880,14 @@ function acpReportFrom(parsed: unknown): StageReport | undefined {
 const DEFAULT_WORKER_AGENT = "opencode";
 const WORKER_IDLE_TIMEOUT_MS = 1_800_000;
 const NATIVE_WORKER_CREATE_SLACK_MS = 120_000;
+const CLAUDE_SHELL_STARTUP_DELAY_MS = 5_000;
+
+function claudeShellStartupDelayMs(): number {
+  const configured = Number(process.env.CLAUDE_SHELL_STARTUP_DELAY_MS);
+  return Number.isFinite(configured) && configured >= 0
+    ? configured
+    : CLAUDE_SHELL_STARTUP_DELAY_MS;
+}
 
 type PreparedWorker = {
   terminalHandle: string;
@@ -2416,6 +2424,11 @@ export class CliOrca implements OrcaOperations {
         promptPath = path.join(promptDir, `prompt-${randomUUID()}.txt`);
         await writeFile(promptPath, initialPrompt, { mode: 0o600 });
         launchCommand += ` --prompt-interactive "$(cat -- ${shellQuote(promptPath)})"`;
+      }
+      if (harness === "claude") {
+        await new Promise((resolve) =>
+          setTimeout(resolve, claudeShellStartupDelayMs()),
+        );
       }
       await this.#json([
         "terminal",

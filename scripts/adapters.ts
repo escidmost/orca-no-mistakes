@@ -2,8 +2,8 @@ import type { AgentArgsOverride } from './config.ts'
 
 export type LaunchMode = 'acp' | 'cli' | 'native'
 
-export const NATIVE_HARNESSES = ['claude', 'codex', 'cursor'] as const
-export const CLI_HARNESSES = ['gemini', 'grok', 'opencode'] as const
+export const NATIVE_HARNESSES = ['codex', 'cursor'] as const
+export const CLI_HARNESSES = ['claude', 'gemini', 'grok', 'opencode'] as const
 
 const INTERRUPT_MARKER = 'esc interrupt'
 const ACP_TARGET_PATTERN = /^acp:([a-zA-Z0-9_-]+)$/
@@ -71,11 +71,12 @@ export type AgentProfile = {
 
 // One table: how each terminal-launched harness expresses reasoning effort,
 // and which harnesses expose no mechanism at all. Model is uniformly --model
-// where a harness accepts it. Native harnesses (claude/codex/cursor) bypass
+// where a harness accepts it. Native harnesses (codex/cursor) bypass
 // this table: Orca worker-start owns their per-harness flags; acp:<target>
 // rides acpx's own --model and exposes no effort surface.
 const EFFORT_KNOBS: Record<string, { flag: string; requiresModel?: boolean }> = {
   agy: { flag: '--effort' },
+  claude: { flag: '--effort' },
   grok: { flag: '--reasoning-effort' },
   opencode: { flag: '--variant', requiresModel: true },
   pi: { flag: '--thinking' },
@@ -111,9 +112,11 @@ function pinsAnyFlag(args: string[], flags: string[]): boolean {
 // they cannot be dropped or reordered away.
 const RESERVED_HARNESS_ARGS: Record<string, ReadonlySet<string>> = {
   agy: new Set(['--dangerously-skip-permissions', '--prompt-interactive', '-i']),
+  claude: new Set(['--dangerously-skip-permissions']),
 }
 const REQUIRED_HARNESS_ARGS: Record<string, readonly string[]> = {
   agy: ['--dangerously-skip-permissions'],
+  claude: ['--dangerously-skip-permissions'],
 }
 
 const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/

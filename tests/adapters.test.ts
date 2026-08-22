@@ -17,7 +17,7 @@ import {
 } from '../scripts/adapters.ts'
 
 test('classifyHarness routes native, CLI, and ACP harnesses', () => {
-  assert.equal(classifyHarness('claude'), 'native')
+  assert.equal(classifyHarness('claude'), 'cli')
   assert.equal(classifyHarness('codex'), 'native')
   assert.equal(classifyHarness('cursor'), 'native')
   assert.equal(classifyHarness('opencode'), 'cli')
@@ -110,6 +110,10 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
   // Variant is opencode-specific.
   assert.equal(buildCliCommand('grok', { model: 'grok-4', variant: 'high' }), `'grok' '--model' 'grok-4'`)
   assert.equal(buildCliCommand('gemini', { model: 'gemini-3-pro' }), `'gemini' '--model' 'gemini-3-pro'`)
+  assert.equal(
+    buildCliCommand('claude', { effort: 'high', model: 'opus[1m]' }),
+    `'claude' '--model' 'opus[1m]' '--effort' 'high' '--dangerously-skip-permissions'`
+  )
   // Effort maps per harness through one table.
   assert.equal(
     buildCliCommand('grok', { effort: 'high', model: 'grok-4' }),

@@ -42,9 +42,9 @@ Useful direct-run options:
 --config <path>
 ```
 
-Validation policy comes from `.orca/no-mistakes.yaml` on the trusted base ref, not from the proposed branch; an absent file means built-in defaults. It selects the worker agent per stage and role across native (`claude`, `codex`, `cursor`), terminal (`opencode`, `grok`, `gemini`, `agy`), and `acp:<target>` harnesses. `--allow-local-config` and `--config <path>` read policy locally instead and mark the run uncertified.
+Validation policy comes from `.orca/no-mistakes.yaml` on the trusted base ref, not from the proposed branch; an absent file means built-in defaults. It selects the worker agent per stage and role across native (`codex`, `cursor`), terminal (`claude`, `opencode`, `grok`, `gemini`, `agy`), and `acp:<target>` harnesses. `--allow-local-config` and `--config <path>` read policy locally instead and mark the run uncertified.
 
-Workers launch with the `opencode` agent on the agent's own default model by default; the default maximum is three fix rounds. `ORCA_CLI_COMMAND` overrides the Orca executable, and `WORKER_AGENT_READY_TIMEOUT_MS` overrides the 60-second agent-startup deadline.
+Workers launch with the `opencode` agent on the agent's own default model by default; the default maximum is three fix rounds. `ORCA_CLI_COMMAND` overrides the Orca executable, `WORKER_AGENT_READY_TIMEOUT_MS` overrides the 60-second agent-startup deadline, and `CLAUDE_SHELL_STARTUP_DELAY_MS` overrides Claude's five-second shell-startup grace period.
 
 ## Attestations and retention
 
