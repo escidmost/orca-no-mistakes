@@ -492,3 +492,10 @@ test('resolvePipelineConfig builds resolved configurations for all pipeline step
   assert.equal(pipeline.stages.review.reviewer.effort, 'high')
   assert.equal(pipeline.stages.review.fixer.effort, undefined)
 })
+
+test('PIPELINE_STEPS is the six-stage sequence without delivery stages', () => {
+  assert.deepEqual(PIPELINE_STEPS, ['intent', 'rebase', 'review', 'test', 'document', 'lint'])
+  assert.equal(PIPELINE_STEPS.includes('push' as (typeof PIPELINE_STEPS)[number]), false)
+  assert.equal(PIPELINE_STEPS.includes('pr' as (typeof PIPELINE_STEPS)[number]), false)
+  assert.equal(PIPELINE_STEPS.includes('ci' as (typeof PIPELINE_STEPS)[number]), false)
+})
