@@ -150,6 +150,43 @@ export function shellQuote(value: string): string {
 
 export type ResidualResources = { terminalHandles: string[]; worktreeIds: string[] }
 
+export type PreflightFailureClass =
+  | 'auth'
+  | 'binary-missing'
+  | 'quota'
+  | 'readiness-timeout'
+  | 'unclassified'
+
+// Thrown only for failures that happen before a candidate accepts the task
+// (launch, startup readiness, initial dispatch). Execution-phase task errors
+// stay plain Errors so they never advance a fallback chain.
+export class PreflightError extends Error {
+  readonly failureClass: PreflightFailureClass
+
+  constructor(failureClass: PreflightFailureClass, message: string, options?: { cause?: unknown }) {
+    super(message, options)
+    this.name = 'PreflightError'
+    this.failureClass = failureClass
+  }
+}
+
+const PREFLIGHT_PATTERNS: [RegExp, PreflightFailureClass][] = [
+  [/\bENOENT\b|command not found/i, 'binary-missing'],
+  [/\b429\b|rate.?limit|quota|resource.?exhausted/i, 'quota'],
+  [/unauthorized|authentication|credential|not logged in|api key|login required|permission denied/i, 'auth'],
+]
+
+export function classifyPreflightFailure(message: string): PreflightFailureClass {
+  const normalized = message.toLowerCase()
+  if (/did not become ready|terminal exited during startup|terminal disconnected during startup|startup readiness/.test(normalized)) {
+    return 'readiness-timeout'
+  }
+  for (const [pattern, failureClass] of PREFLIGHT_PATTERNS) {
+    if (pattern.test(message)) return failureClass
+  }
+  return 'unclassified'
+}
+
 // worker-start failure receipts report leaked resources under `residualResources`; the shape is not
 // pinned by the CLI contract, so match both keyed fields and kind/type-tagged entries.
 export function collectResidualResources(value: unknown): ResidualResources {
