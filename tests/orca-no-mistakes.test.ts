@@ -65,6 +65,8 @@ class FakeGit implements GitOperations {
   divergeAfterAnchor = false;
   dirtyDelivery = false;
   failRecoveryAnchor = false;
+  failHeadAfterAnchor = false;
+  failRebase = false;
   rebaseConflict = false;
   diffOutput = "";
   #agentsMdAtHead?: string;
@@ -79,6 +81,7 @@ class FakeGit implements GitOperations {
   }
   throwOnApply = false;
   #operatorDiverged = false;
+  #headReadBroken = false;
   readonly #branch: string;
   readonly #root: string;
 
@@ -113,6 +116,8 @@ class FakeGit implements GitOperations {
   }
 
   async head(): Promise<string> {
+    if (this.#headReadBroken)
+      throw new Error(`could not read HEAD in ${this.#root}`);
     return this.#currentHead();
   }
 
@@ -161,6 +166,7 @@ class FakeGit implements GitOperations {
 
   async rebase(base: string): Promise<StageReport> {
     this.calls.push(`rebase:${base}`);
+    if (this.failRebase) throw new Error("rebase stage could not run");
     this.#baseOid = "b".repeat(40);
     if (this.rebaseConflict) {
       // one-shot: the next rebase models the fixer having resolved the conflict
@@ -216,6 +222,7 @@ class FakeGit implements GitOperations {
     this.calls.push(`recover:${runId}:${oid}`);
     if (this.failRecoveryAnchor) throw new Error("recovery ref rejected");
     if (this.divergeAfterAnchor) this.#operatorDiverged = true;
+    if (this.failHeadAfterAnchor) this.#headReadBroken = true;
   }
 
   advanceHead(): void {
@@ -3788,7 +3795,37 @@ test("failed terminations tag the anchored recovery ref for the terminal notific
 });
 
 test("a failed run that produced no commits omits the recovery instructions", async () => {
-  const git = new FakeGit();
+  const git = new FakeGit("/gate", "no-mistakes-gate-test");
+  const deliveryGit = new FakeGit("/origin", "feature");
+  git.failRebase = true;
+  const orca = new FakeOrca(git);
+  const ledger = new DomainLedger(":memory:");
+
+  let failure: unknown;
+  try {
+    await runPipeline(
+      { deliveryGit, intent: "Fail without producing commits." },
+      orca,
+      git,
+      ledger,
+    );
+  } catch (error) {
+    failure = error;
+  }
+
+  assert.ok(failure instanceof Error);
+  assert.equal(await git.head(), await deliveryGit.head());
+  assert.equal(
+    (failure as Error & { recoverRef?: string }).recoverRef,
+    undefined,
+  );
+  assert.ok(deliveryGit.calls.some((call) => call.startsWith("recover:")));
+});
+
+test("a failed run whose delivery head cannot be read still anchors custody", async () => {
+  const git = new FakeGit("/gate", "no-mistakes-gate-test");
+  const deliveryGit = new FakeGit("/origin", "feature");
+  deliveryGit.failHeadAfterAnchor = true;
   const orca = new FakeOrca(git);
   const ledger = new DomainLedger(":memory:");
   orca.gateResolution = "later";
@@ -3809,7 +3846,7 @@ test("a failed run that produced no commits omits the recovery instructions", as
   let failure: unknown;
   try {
     await runPipeline(
-      { intent: "Fail without producing commits." },
+      { deliveryGit, intent: "Operator checkout vanished mid-run." },
       orca,
       git,
       ledger,
@@ -3819,11 +3856,13 @@ test("a failed run that produced no commits omits the recovery instructions", as
   }
 
   assert.ok(failure instanceof Error);
-  assert.equal(
-    (failure as Error & { recoverRef?: string }).recoverRef,
-    undefined,
+  assert.ok(!(failure instanceof RecoveryAnchorError));
+  assert.match(
+    (failure as Error & { recoverRef?: string }).recoverRef ?? "",
+    /^refs\/no-mistakes\/recover\/test-run-/,
   );
-  assert.ok(git.calls.some((call) => call.startsWith("recover:")));
+  assert.ok(deliveryGit.calls.some((call) => call.startsWith("recover:")));
+  assert.equal(ledger.leaseFor("/origin", "feature"), undefined);
 });
 
 test("capLog preserves head and tail of oversized logs", () => {

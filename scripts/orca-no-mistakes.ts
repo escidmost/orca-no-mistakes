@@ -679,18 +679,20 @@ export async function runPipeline(
   } catch (error) {
     const outcome = error instanceof GateStopError ? "cancelled" : "failed";
     let anchorError: unknown;
+    let anchoredOid: string | undefined;
     try {
-      const terminalOid = await git.head();
-      await deliveryGit.anchorRecoveryRef(runId, terminalOid);
-      if (
-        error instanceof Error &&
-        terminalOid !== (await deliveryGit.head())
-      ) {
+      anchoredOid = await git.head();
+      await deliveryGit.anchorRecoveryRef(runId, anchoredOid);
+    } catch (recoveryError) {
+      anchorError = recoveryError;
+      anchoredOid = undefined;
+    }
+    if (anchoredOid !== undefined && error instanceof Error) {
+      const operatorHead = await deliveryGit.head().catch(() => undefined);
+      if (operatorHead !== anchoredOid) {
         (error as CustodyTaggedError).recoverRef =
           `refs/no-mistakes/recover/${runId}`;
       }
-    } catch (recoveryError) {
-      anchorError = recoveryError;
     }
     if (!anchorError) ledger.releaseLease(runId);
     ledger.finishRun(runId, outcome);
@@ -991,10 +993,10 @@ async function runFixer(
     if (!worker.worktreePath) {
       throw new Error(`${stage} fixer did not return a worktree path`);
     }
+    await git.assertClean();
     if (!(await git.applyWorktreeCommits(worker.worktreePath, before))) {
       throw new Error(`${stage} fixer could not apply its committed change`);
     }
-    await git.assertClean();
     const after = await git.head();
     if (before === after) {
       throw new Error(`${stage} fixer did not commit a change`);
