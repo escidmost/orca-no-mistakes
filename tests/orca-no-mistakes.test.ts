@@ -77,6 +77,7 @@ class FakeGit implements GitOperations {
     this.#agentsMdAtHead = content;
     if (content !== undefined) this.#agentsMdOids.add(this.#currentHead());
   }
+  throwOnApply = false;
   #operatorDiverged = false;
   readonly #branch: string;
   readonly #root: string;
@@ -207,6 +208,8 @@ class FakeGit implements GitOperations {
     expectedHead: string,
   ): Promise<boolean> {
     this.calls.push(`apply:${sourcePath}:${expectedHead}`);
+    if (this.throwOnApply)
+      throw new Error("no-mistakes requires a clean committed worktree");
     if (this.#head !== expectedHead) return false;
     this.advanceHead();
     return true;
@@ -3705,6 +3708,69 @@ test("a dirty delivery checkout preserves custody behind a recovery ref instead 
   assert.ok(!deliveryGit.calls.some((call) => call.startsWith("apply:")));
   assert.ok(deliveryGit.calls.some((call) => call.startsWith("recover:")));
   assert.equal(ledger.runStatus(result.runId), "passed");
+});
+
+test("a checkout dirtied after the clean check preserves custody instead of failing the run", async () => {
+  const gateGit = new FakeGit("/gate", "no-mistakes-gate-test");
+  const deliveryGit = new FakeGit("/origin", "feature");
+  deliveryGit.throwOnApply = true;
+  const orca = new FakeOrca(gateGit);
+  const ledger = new DomainLedger(":memory:");
+
+  const result = await runPipeline(
+    {
+      deliveryGit,
+      intent: "Delivery dirtied mid-transfer.",
+    },
+    orca,
+    gateGit,
+    ledger,
+  );
+
+  assert.match(result.custodyNote ?? "", /refs\/no-mistakes\/recover\//);
+  assert.match(result.custodyNote ?? "", /diverged/);
+  assert.ok(deliveryGit.calls.some((call) => call.startsWith("apply:")));
+  assert.ok(deliveryGit.calls.some((call) => call.startsWith("recover:")));
+  assert.equal(ledger.runStatus(result.runId), "passed");
+});
+
+test("failed terminations tag the anchored recovery ref for the terminal notification", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  const ledger = new DomainLedger(":memory:");
+  orca.gateResolution = "later";
+  orca.reports.set("document", [
+    {
+      findings: [
+        {
+          id: "docs-choice",
+          severity: "warning",
+          action: "ask-user",
+          description: "Documentation ownership is unclear.",
+        },
+      ],
+      summary: "decision needed",
+    },
+  ]);
+
+  let failure: unknown;
+  try {
+    await runPipeline(
+      { intent: "Surface recovery on failure." },
+      orca,
+      git,
+      ledger,
+    );
+  } catch (error) {
+    failure = error;
+  }
+
+  assert.ok(failure instanceof Error);
+  const { recoverRef } = failure as Error & { recoverRef?: string };
+
+  assert.match(recoverRef ?? "", /^refs\/no-mistakes\/recover\/test-run-/);
+  assert.ok(git.calls.some((call) => call.startsWith("recover:")));
+  assert.equal(ledger.leaseFor("/repo", "feature"), undefined);
 });
 
 test("capLog preserves head and tail of oversized logs", () => {

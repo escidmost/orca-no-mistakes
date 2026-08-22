@@ -202,6 +202,15 @@ export type PipelineResult = {
 
 type RepoState = Awaited<ReturnType<GitOperations["assertReady"]>>;
 
+type CustodyTaggedError = Error & { recoverRef?: string };
+
+function recoveryInstructions(recoverRef: string): string {
+  return (
+    `pipeline commits preserved at ${recoverRef} — inspect with \`git log ${recoverRef}\`, ` +
+    `then commit or stash local changes before integrating with e.g. \`git rebase ${recoverRef}\``
+  );
+}
+
 export const DEFAULT_MAX_FIX_ROUNDS = 3;
 
 export class GateStopError extends Error {}
@@ -622,17 +631,16 @@ export async function runPipeline(
             terminalCommitOid,
           )
         : (await deliveryGit.isClean()) &&
-          (await deliveryGit.applyWorktreeCommits(
-            repo.root,
-            submissionCommitOid,
-          )))
+          (await deliveryGit
+            .applyWorktreeCommits(repo.root, submissionCommitOid)
+            .catch(() => false)))
     ) {
       custodyNote = `advanced branch ${deliveryRepo.branch} from submission to terminal commit ${terminalCommitOid}`;
     } else {
       const recoverRef = `refs/no-mistakes/recover/${runId}`;
       custodyNote =
-        `operator checkout diverged or carries uncommitted changes; pipeline commits preserved at ${recoverRef} — ` +
-        `inspect with \`git log ${recoverRef}\`, then commit or stash local changes before integrating with e.g. \`git rebase ${recoverRef}\``;
+        "operator checkout diverged or carries uncommitted changes; " +
+        recoveryInstructions(recoverRef);
     }
 
     const attestation = buildAttestation(stageEntries, {
@@ -663,6 +671,10 @@ export async function runPipeline(
     let anchorError: unknown;
     try {
       await deliveryGit.anchorRecoveryRef(runId, await git.head());
+      if (error instanceof Error) {
+        (error as CustodyTaggedError).recoverRef =
+          `refs/no-mistakes/recover/${runId}`;
+      }
     } catch (recoveryError) {
       anchorError = recoveryError;
     }
@@ -3789,7 +3801,13 @@ Run options:
         ? "cancelled"
         : "failed";
     const message = error instanceof Error ? error.message : String(error);
-    await orca.notifyRunResult(outcome, `No-mistakes ${outcome}: ${message}`);
+    const recoverRef = (error as CustodyTaggedError).recoverRef;
+    await orca.notifyRunResult(
+      outcome,
+      recoverRef
+        ? `No-mistakes ${outcome}: ${message}\n${recoveryInstructions(recoverRef)}`
+        : `No-mistakes ${outcome}: ${message}`,
+    );
     throw error;
   } finally {
     try {
