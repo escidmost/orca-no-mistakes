@@ -286,7 +286,9 @@ class FakeOrca implements OrcaOperations {
       worktreeId:
         launch.worktree === "new-child" ? `repo::/${dispatchId}` : undefined,
       worktreePath:
-        launch.worktree === "new-child" ? `/worktrees/${dispatchId}` : undefined,
+        launch.worktree === "new-child"
+          ? `/worktrees/${dispatchId}`
+          : undefined,
     };
   }
 
@@ -561,16 +563,15 @@ test("a passing gate transfers final custody to the unchanged initiating worktre
   const result = await runPipeline(
     {
       deliveryGit,
-      intent: "Validate in an isolated gate before updating the feature branch.",
+      intent:
+        "Validate in an isolated gate before updating the feature branch.",
     },
     orca,
     gateGit,
     ledger,
   );
 
-  assert.ok(
-    deliveryGit.calls.some((call) => call.startsWith("apply:/gate:")),
-  );
+  assert.ok(deliveryGit.calls.some((call) => call.startsWith("apply:/gate:")));
   assert.ok(deliveryGit.calls.some((call) => call.startsWith("recover:")));
   assert.ok(!gateGit.calls.some((call) => call.startsWith("recover:")));
   assert.match(result.custodyNote ?? "", /advanced branch feature/);
@@ -994,9 +995,7 @@ console.log(JSON.stringify({ result }))
       `path:${gate}`,
     );
     assert.ok(
-      !calls.some(
-        (args) => args[0] === "terminal" && args[1] === "create",
-      ),
+      !calls.some((args) => args[0] === "terminal" && args[1] === "create"),
     );
     assert.equal(
       terminalSend?.[terminalSend.indexOf("--terminal") + 1],
@@ -1016,9 +1015,7 @@ console.log(JSON.stringify({ result }))
     assert.ok(
       commandText.includes(`NO_MISTAKES_ORIGIN_WORKTREE='${canonicalRepo}'`),
     );
-    assert.ok(
-      commandText.includes("NO_MISTAKES_DELIVERY_BRANCH='feature'"),
-    );
+    assert.ok(commandText.includes("NO_MISTAKES_DELIVERY_BRANCH='feature'"));
     assert.ok(commandText.includes("'--notify' 'originating-opencode'"));
     assert.ok(
       commandText.includes("'--intent' 'Validate detached coordination.'"),
@@ -1637,7 +1634,8 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     for (;;) {
       const calls = await readFile(callsPath, "utf8");
       if (calls.includes('["terminal","list"')) break;
-      if (Date.now() >= deadline) throw new Error("worker did not reach trust setup");
+      if (Date.now() >= deadline)
+        throw new Error("worker did not reach trust setup");
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     await new Promise((resolve) => setTimeout(resolve, 50));
@@ -1775,7 +1773,10 @@ test("GitShell applies append-only commits and adopts rewritten history behind a
     const shell = new GitShell({ repo });
     assert.equal(await shell.applyWorktreeCommits(gate, submission), true);
     assert.equal(git(repo, "rev-parse", "HEAD"), terminal);
-    assert.equal(await readFile(path.join(repo, "feature.txt"), "utf8"), "after\n");
+    assert.equal(
+      await readFile(path.join(repo, "feature.txt"), "utf8"),
+      "after\n",
+    );
 
     await writeFile(path.join(gate, "feature.txt"), "rewritten\n");
     git(gate, "add", "feature.txt");
@@ -2443,9 +2444,7 @@ test("runPipeline applies the user-global default agent", async () => {
     );
 
     assert.ok(orca.launches.length > 0);
-    assert.ok(
-      orca.launches.every((launch) => launch.agent?.harness === "agy"),
-    );
+    assert.ok(orca.launches.every((launch) => launch.agent?.harness === "agy"));
     const manifestPath = path.join(
       homedir(),
       ".orca-no-mistakes",
@@ -2455,10 +2454,7 @@ test("runPipeline applies the user-global default agent", async () => {
     );
     const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
     assert.deepEqual(manifest.effective_config, manifest.resolved_config);
-    assert.equal(
-      manifest.effective_config.stages.review.reviewer.agent,
-      "agy",
-    );
+    assert.equal(manifest.effective_config.stages.review.reviewer.agent, "agy");
     assert.equal(
       manifest.effective_policy_hash,
       effectivePolicyHash(manifest.effective_config),
@@ -3806,16 +3802,19 @@ test("the domain ledger auto-initializes at the default path and records submiss
            FROM runs WHERE run_id = ?`,
         )
         .get(result.runId) as Record<string, string>;
-      assert.deepEqual({ ...run }, {
-        base_branch: "main",
-        branch: "feature",
-        intent: "Record submission metadata.",
-        intent_hash: sha256("Record submission metadata."),
-        policy_sha256: "f".repeat(64),
-        repo_root: "/repo",
-        status: "passed",
-        submission_commit_oid: "1".padStart(40, "0"),
-      });
+      assert.deepEqual(
+        { ...run },
+        {
+          base_branch: "main",
+          branch: "feature",
+          intent: "Record submission metadata.",
+          intent_hash: sha256("Record submission metadata."),
+          policy_sha256: "f".repeat(64),
+          repo_root: "/repo",
+          status: "passed",
+          submission_commit_oid: "1".padStart(40, "0"),
+        },
+      );
     } finally {
       db.close();
     }

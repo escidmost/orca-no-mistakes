@@ -442,11 +442,7 @@ export async function runPipeline(
 
     for (const stage of PIPELINE_STEPS) {
       const taskId = stageTasks.get(stage)!;
-      ledger.heartbeatLease(
-        deliveryRepo.root,
-        deliveryRepo.branch,
-        runId,
-      );
+      ledger.heartbeatLease(deliveryRepo.root, deliveryRepo.branch, runId);
       await orca.setWorktreeStatus(
         `${statusPrefix}no-mistakes ${stage} (${stageIndex(stage)}/${PIPELINE_STEPS.length})`,
         "in-progress",
@@ -571,11 +567,7 @@ export async function runPipeline(
         }
 
         round += 1;
-        ledger.heartbeatLease(
-          deliveryRepo.root,
-          deliveryRepo.branch,
-          runId,
-        );
+        ledger.heartbeatLease(deliveryRepo.root, deliveryRepo.branch, runId);
         const nextFixer = await runFixer(
           stage,
           runId,
@@ -2198,10 +2190,7 @@ export class CliOrca implements OrcaOperations {
         variant: launch.agent?.variant,
       });
       if (initialPrompt !== undefined) {
-        const promptDir = path.join(
-          artifactsRoot(),
-          this.#runId ?? "unbound",
-        );
+        const promptDir = path.join(artifactsRoot(), this.#runId ?? "unbound");
         await mkdir(promptDir, { recursive: true });
         promptPath = path.join(promptDir, `prompt-${randomUUID()}.txt`);
         await writeFile(promptPath, initialPrompt, { mode: 0o600 });
@@ -2257,7 +2246,8 @@ export class CliOrca implements OrcaOperations {
           return parsed as { pid: number; token: string };
         }
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined;
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT")
+          return undefined;
       }
       return undefined;
     };
@@ -2376,8 +2366,7 @@ export class CliOrca implements OrcaOperations {
     harness: string,
     promptSubmitted = false,
   ): Promise<void> {
-    const waitsForPrompt =
-      harness.toLowerCase() === "agy" && !promptSubmitted;
+    const waitsForPrompt = harness.toLowerCase() === "agy" && !promptSubmitted;
     const ready = readinessMatcher(harness);
     const deadline = Date.now() + workerAgentReadyTimeoutMs();
     let consecutiveMatches = 0;
@@ -3517,13 +3506,7 @@ async function launchDetachedRun(
       (
         await command(
           orcaCommand,
-          [
-            "terminal",
-            "list",
-            "--worktree",
-            `path:${gate.path}`,
-            "--json",
-          ],
+          ["terminal", "list", "--worktree", `path:${gate.path}`, "--json"],
           repo.root,
         )
       ).stdout,
