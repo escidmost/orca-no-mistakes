@@ -29,6 +29,7 @@ import {
   readinessMatcher,
   shellQuote,
   workerAgentReadyTimeoutMs,
+  type AgentProfile,
   type PreflightFailureClass,
   type ResidualResources,
 } from "./adapters.ts";
@@ -89,11 +90,9 @@ export type StageReport = {
   tested?: string[];
 };
 
-export type WorkerAgent = {
+export type WorkerAgent = AgentProfile & {
   agentArgsOverride?: AgentArgsOverride;
-  effort?: string;
   harness: string;
-  model?: string;
   timeoutMs?: number;
   variant?: string;
 };
@@ -2480,6 +2479,7 @@ export class CliOrca implements OrcaOperations {
         await this.#detachWorkerWorktree(launch, cwd);
       }
       const invocation = acpRunnerInvocation({
+        effort: agent.effort,
         model: agent.model,
         prompt: launch.prompt,
         target,

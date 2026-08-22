@@ -352,7 +352,15 @@ defaults:
   # Optional model override
   # model: "claude-3-7-sonnet"
 
-  # Reasoning effort (e.g. "low", "medium", "high")
+  # Reasoning effort (e.g. "low", "medium", "high"). Mapped per harness:
+  # claude/codex/cursor -> Orca worker-start --model/--effort,
+  # grok -> --reasoning-effort, pi -> --thinking,
+  # opencode -> --variant (model-scoped: needs a model unless variant is set),
+  # acp:<target> -> acpx --model (effort is refused), agy -> no mechanism
+  # (model/effort are refused rather than dropped).
+  # A raw agent_args_override flag that already pins a knob wins over this
+  # value; overrides reach terminal-spawned CLI launches only - Orca native
+  # workers and acp targets do not take them.
   # effort: "high"
 
   # Harness variant (optional)
