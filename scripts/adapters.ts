@@ -248,7 +248,7 @@ export class PreflightError extends Error {
   }
 }
 
-const BINARY_MISSING_PATTERN = /\bENOENT\b|command not found/i
+const BINARY_MISSING_PATTERN = /\bENOENT\b|command not found|unknown command/i
 
 // Startup readiness observers see shell/terminal text, so a missing harness
 // binary surfaces as printed output rather than a spawn error. Only a line that
@@ -411,31 +411,29 @@ export function parseAgyStream(jsonl: string): AgyStreamResult {
 type FenceCandidates = { closed: string[]; open: string[] }
 
 // Scans ```json fences anywhere in the text, including glued to preceding
-// content on the same line. Closed-fence bodies are collected separately from
-// unclosed tails running to end-of-text, and the scan never stops at an
-// opener whose span turns out to be unusable.
+// content on the same line. Only a bare ``` closes a block; a marker carrying
+// an info string is an opener, so prose that quotes ```json cannot swallow the
+// real block that follows it — the later opener restarts the span instead.
+// Closed-fence bodies are collected separately from unclosed tails running to
+// end-of-text.
 function fencedJsonCandidates(text: string): FenceCandidates {
   const closed: string[] = []
   const open: string[] = []
-  let rest = text
-  for (;;) {
-    const marker = rest.indexOf('```')
-    if (marker < 0) return { closed, open }
-    const infoMatch = /^[A-Za-z0-9_-]*/.exec(rest.slice(marker + 3))
-    const info = (infoMatch?.[0] ?? '').toLowerCase()
-    if (info !== 'json') {
-      rest = rest.slice(marker + 3)
+  const marker = /```([A-Za-z0-9_-]*)/g
+  let contentStart = -1
+  for (let match = marker.exec(text); match; match = marker.exec(text)) {
+    const info = match[1].toLowerCase()
+    if (info) {
+      contentStart = info === 'json' ? match.index + match[0].length : -1
       continue
     }
-    const contentStart = marker + 3 + info.length
-    const closeIndex = rest.indexOf('```', contentStart)
-    if (closeIndex < 0) {
-      open.push(rest.slice(contentStart))
-      return { closed, open }
+    if (contentStart >= 0) {
+      closed.push(text.slice(contentStart, match.index))
+      contentStart = -1
     }
-    closed.push(rest.slice(contentStart, closeIndex))
-    rest = rest.slice(closeIndex + 3)
   }
+  if (contentStart >= 0) open.push(text.slice(contentStart))
+  return { closed, open }
 }
 
 function lastBareJsonObject(text: string): unknown | undefined {

@@ -332,6 +332,7 @@ test('isBinaryMissingOutput spots shell binary failures naming the harness', () 
   assert.equal(isBinaryMissingOutput('zsh: command not found: agy', 'agy'), true)
   assert.equal(isBinaryMissingOutput('spawn agy ENOENT', 'agy'), true)
   assert.equal(isBinaryMissingOutput('agy: command not found', 'agy'), true)
+  assert.equal(isBinaryMissingOutput('fish: Unknown command: agy', 'agy'), true)
   assert.equal(isBinaryMissingOutput('Antigravity ready', 'agy'), false)
   assert.equal(isBinaryMissingOutput('', 'agy'), false)
   // Unrelated startup noise must not abort a healthy harness.
@@ -443,6 +444,13 @@ test('extractStructuredJson prefers closed fences over unclosed tails and prose 
     ),
     { a: 1 },
     'prose quoting a fence must not shadow a trailing closed block'
+  )
+  assert.deepEqual(
+    extractStructuredJson(
+      'Wrap output in ```json fences.\n\n```json\n{"findings":[],"summary":"clean"}\n```\n\nAlso `{"strict":true}` matters.'
+    ),
+    { findings: [], summary: 'clean' },
+    'a quoted opener must not pair with the real opener and hide the report body'
   )
   assert.deepEqual(extractStructuredJson('```json\n{"open":1}'), { open: 1 })
   assert.deepEqual(extractStructuredJson('prefix {"bare":true} suffix'), { bare: true })
