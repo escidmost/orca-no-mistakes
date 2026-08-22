@@ -172,6 +172,7 @@ export interface GitOperations {
   applyWorktreeCommits(
     sourcePath: string,
     expectedHead: string,
+    fence?: { readonly aborted: boolean },
   ): Promise<boolean>;
   /** Resolves the current HEAD commit of a worker worktree. */
   headOf(worktreePath: string): Promise<string>;
@@ -199,8 +200,6 @@ export type PipelineResult = {
 };
 
 type RepoState = Awaited<ReturnType<GitOperations["assertReady"]>>;
-
-export const DEFAULT_MAX_FIX_ROUNDS = 3;
 
 export class GateStopError extends Error {}
 
@@ -242,8 +241,11 @@ export async function runPipeline(
   if (intent.includes("\n") || intent.includes("\0")) {
     throw new Error("--intent must be a single line");
   }
-  const maxFixRounds = options.maxFixRounds ?? DEFAULT_MAX_FIX_ROUNDS;
-  if (!Number.isInteger(maxFixRounds) || maxFixRounds < 0) {
+  const maxFixRounds = options.maxFixRounds;
+  if (
+    maxFixRounds !== undefined &&
+    (!Number.isInteger(maxFixRounds) || maxFixRounds < 0)
+  ) {
     throw new Error("maxFixRounds must be a non-negative integer");
   }
 
@@ -270,7 +272,9 @@ export async function runPipeline(
     repoRoot: repo.root,
   });
   const pipelineConfig = resolvePipelineConfig({
-    cliFlags: options.cliFlags,
+    // The explicit fix-round option rides the highest precedence tier so every
+    // stage budget derives from one resolved configuration.
+    cliFlags: { ...options.cliFlags, max_fix_rounds: maxFixRounds },
     repoGlobalConfig: repoPolicyConfig,
     userGlobalConfig: options.userGlobalConfig,
   });
@@ -377,6 +381,10 @@ export async function runPipeline(
             summary: report.summary,
             tested: report.tested,
             resolvedAgent: fallback.resolvedAgent,
+            effective_policy_hash: effectiveProvenance.effectivePolicyHash,
+            ...(effectiveProvenance.baseRefSha
+              ? { base_ref_sha: effectiveProvenance.baseRefSha }
+              : {}),
             ...(fallback.attempts.length > 0
               ? { fallbackAttempts: fallback.attempts }
               : {}),
@@ -418,6 +426,8 @@ export async function runPipeline(
         stageId: stage,
         summary: report.summary,
         workerIdentity,
+        effectivePolicyHash: effectiveProvenance.effectivePolicyHash,
+        baseRefSha: effectiveProvenance.baseRefSha,
       });
       stageEntries.push(entry);
       latestEntryByStage.set(stage, entry);
@@ -505,18 +515,26 @@ export async function runPipeline(
         const asksUser = actionable.some(
           (finding) => finding.action === "ask-user",
         );
-        const exhausted = round >= maxFixRounds;
+        const stageAutoFix = pipelineConfig.stages[stage].fixer.auto_fix;
+        // ADR-0007: review findings are never repaired without explicit
+        // trusted-policy authorization, and a disabled auto_fix blocks every
+        // stage's automatic repairs.
+        const reviewAutoFixAllowed =
+          stage !== "review" || stageAutoFix.allow_review_autofix;
+        const automationBlocked =
+          !stageAutoFix.enabled || !reviewAutoFixAllowed;
+        const exhausted = round >= stageAutoFix.max_rounds;
         let targetFindings: Finding[] = actionable;
-        let shouldFix = !asksUser && !exhausted;
+        let shouldFix = !asksUser && !exhausted && !automationBlocked;
         let guidance = "";
 
-        if (asksUser || exhausted) {
+        if (!shouldFix) {
           const gateOptions = ["approve", "fix", "skip", "stop"];
           const question = gateQuestion(
             stage,
             report,
             gateOptions,
-            exhausted ? maxFixRounds : undefined,
+            exhausted ? stageAutoFix.max_rounds : undefined,
           );
           const gateId = await orca.createGate(taskId, question, gateOptions);
           const resolution = (await orca.waitForGate(gateId)).trim();
@@ -575,18 +593,25 @@ export async function runPipeline(
           deliveryRepo.branch,
           runId,
         );
-        const nextFixer = await runFixer(
-          stage,
-          runId,
-          round,
-          taskId,
-          intent,
-          targetFindings,
-          guidance,
-          path.join(artifactsDir, `fixer-${stage}-${round}.json`),
-          pipelineConfig.stages[stage].fixer,
-          orca,
-          git,
+        const fixerRoles = pipelineConfig.stages[stage].fixer;
+        const nextFixer = await withTimeout(
+          fixerRoles.timeout_ms,
+          `${stage} fixer`,
+          async (fence) =>
+            runFixer(
+              stage,
+              runId,
+              round,
+              taskId,
+              intent,
+              targetFindings,
+              guidance,
+              path.join(artifactsDir, `fixer-${stage}-${round}.json`),
+              fixerRoles,
+              orca,
+              git,
+              fence,
+            ),
         );
         if (nextFixer.fallbackAttempts && nextFixer.resolvedAgent) {
           inheritedFallback = {
@@ -716,6 +741,31 @@ function launchCandidates(
   return agents.length > 0 ? agents : [undefined];
 }
 
+// ponytail: hard wall-clock boundary; the abandoned worker keeps running until
+// its promise settles, so `fence` lets it decline any further repo mutation.
+async function withTimeout<T>(
+  timeoutMs: number | undefined,
+  label: string,
+  run: (fence: { aborted: boolean }) => Promise<T>,
+): Promise<T> {
+  if (timeoutMs === undefined) return await run({ aborted: false });
+  const fence = { aborted: false };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      run(fence),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          fence.aborted = true;
+          reject(new Error(`${label} exceeded its ${timeoutMs}ms execution timeout`));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export type FallbackAttempt = {
   agent: string;
   durationMs: number;
@@ -828,16 +878,21 @@ async function executeStage(
       resolvedAgent: "coordinator",
     };
   }
-  return await runReviewer(
-    stage,
-    attempt,
-    taskId,
-    intent,
-    evidenceDir,
-    repo,
-    orca,
-    git,
-    roles.reviewer,
+  return await withTimeout(
+    roles.reviewer.timeout_ms,
+    `${stage} reviewer`,
+    () =>
+      runReviewer(
+        stage,
+        attempt,
+        taskId,
+        intent,
+        evidenceDir,
+        repo,
+        orca,
+        git,
+        roles.reviewer,
+      ),
   );
 }
 
@@ -922,6 +977,7 @@ async function runFixer(
   role: ResolvedRoleConfig,
   orca: OrcaOperations,
   git: GitOperations,
+  fence: { readonly aborted: boolean },
 ): Promise<{
   after: string;
   before: string;
@@ -963,7 +1019,12 @@ async function runFixer(
     if (!worker.worktreePath) {
       throw new Error(`${stage} fixer did not return a worktree path`);
     }
-    if (!(await git.applyWorktreeCommits(worker.worktreePath, before))) {
+    if (fence.aborted) {
+      // The execution timeout already failed this stage; refuse late mutations
+      // so a delayed worker cannot apply commits into a settled run.
+      throw new Error(`${stage} fixer timed out; commits were not applied`);
+    }
+    if (!(await git.applyWorktreeCommits(worker.worktreePath, before, fence))) {
       throw new Error(`${stage} fixer could not apply its committed change`);
     }
     await git.assertClean();
@@ -1574,7 +1635,11 @@ async function command(
   executable: string,
   args: string[],
   cwd: string,
-  options: { allowFailure?: boolean; timeoutMs?: number | null } = {},
+  options: {
+    allowFailure?: boolean;
+    timeoutMs?: number | null;
+    signal?: { readonly aborted: boolean };
+  } = {},
 ): Promise<CommandResult> {
   return await new Promise((resolve, reject) => {
     const child = spawn(executable, args, {
@@ -1582,6 +1647,14 @@ async function command(
       env: process.env,
       stdio: ["ignore", "pipe", "pipe"],
     });
+    // Kill in-flight work (e.g. a fenced ff-only merge) once the caller's
+    // abort fence flips, so nothing lands after its stage already failed.
+    const watchAbort =
+      options.signal == null
+        ? undefined
+        : setInterval(() => {
+            if (options.signal?.aborted) child.kill("SIGKILL");
+          }, 25);
     const timeoutMs =
       options.timeoutMs === undefined ? 120_000 : options.timeoutMs;
     let timedOut = false;
@@ -1601,10 +1674,12 @@ async function command(
       stderr += chunk;
     });
     child.on("error", (error) => {
+      if (watchAbort) clearInterval(watchAbort);
       if (timer) clearTimeout(timer);
       reject(error);
     });
     child.on("close", (code) => {
+      if (watchAbort) clearInterval(watchAbort);
       if (timer) clearTimeout(timer);
       if (timedOut) {
         const message = `${executable} ${args.slice(0, 2).join(" ")} timed out after ${timeoutMs}ms`;
@@ -3175,7 +3250,9 @@ export class GitShell implements GitOperations {
   async applyWorktreeCommits(
     sourcePath: string,
     expectedHead: string,
+    fence?: { readonly aborted: boolean },
   ): Promise<boolean> {
+    if (fence?.aborted) return false;
     await this.assertClean();
     if ((await this.head()) !== expectedHead) return false;
     const sourceStatus = await this.#git(
@@ -3193,9 +3270,14 @@ export class GitShell implements GitOperations {
       true,
     );
     if (!expectedIsAncestor.failed) {
-      const applied = await this.#git(["merge", "--ff-only", sourceHead], true);
+      const applied = await this.#git(
+        ["merge", "--ff-only", sourceHead],
+        true,
+        fence,
+      );
       return !applied.failed;
     }
+    if (fence?.aborted) return false;
     // The fixer rewrote history (e.g. completed an aborted rebase): adopt it
     // via an atomic compare-and-swap of the branch ref so a concurrent branch
     // update aborts before the worktree changes. Detached checkouts have no
@@ -3210,6 +3292,7 @@ export class GitShell implements GitOperations {
             await this.#git(
               ["update-ref", `refs/heads/${branch}`, sourceHead, expectedHead],
               true,
+              fence,
             )
           ).code === 0;
     if (!casSucceeded) return false;
@@ -3221,9 +3304,14 @@ export class GitShell implements GitOperations {
           expectedHead,
         ],
         true,
+        fence,
       );
       if (backup.failed) throw new Error(backup.output);
-      const reset = await this.#git(["reset", "--hard", sourceHead], true);
+      const reset = await this.#git(
+        ["reset", "--hard", sourceHead],
+        true,
+        fence,
+      );
       if (reset.failed) throw new Error(reset.output);
       return true;
     } catch (error) {
@@ -3322,12 +3410,13 @@ export class GitShell implements GitOperations {
   async #git(
     args: string[],
     allowFailure = false,
+    signal?: { readonly aborted: boolean },
   ): Promise<CommandResult & { failed: boolean; output: string }> {
     const result = await command(
       "git",
       ["-C", this.#repo, ...args],
       this.#repo,
-      { allowFailure },
+      { allowFailure, signal },
     );
     const output = `${result.stdout}${result.stderr}`.trim();
     return { ...result, failed: result.code !== 0, output };
