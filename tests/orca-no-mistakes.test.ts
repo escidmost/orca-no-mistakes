@@ -1778,3 +1778,34 @@ console.log(JSON.stringify({ result: { worktree: { id: 'wt-operator' } } }))
     await rm(temp, { recursive: true, force: true })
   }
 })
+
+test('a fixer that discards gate commits is rejected instead of rewinding the gate', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'orca-discard-harvest-'))
+  try {
+    const repo = await seedOriginRepo(temp)
+    git(repo, 'checkout', '-b', 'feature')
+    await writeFile(path.join(repo, 'feature.txt'), 'feature\n')
+    git(repo, 'add', 'feature.txt')
+    git(repo, 'commit', '-m', 'feature')
+
+    const gatePath = path.join(temp, 'gate')
+    git(repo, 'worktree', 'add', gatePath, '-b', 'no-mistakes-gate-discard', 'feature')
+    const gateShell = new GitShell({ repo: gatePath })
+    await gateShell.assertReady()
+    const base = git(gatePath, 'rev-parse', 'HEAD')
+
+    const worker = path.join(temp, 'worker-discard')
+    git(gatePath, 'worktree', 'add', worker, '-b', 'no-mistakes-fixer-discard', base)
+    git(worker, 'reset', '--hard', 'HEAD~1')
+    const truncated = git(worker, 'rev-parse', 'HEAD')
+    assert.notEqual(truncated, base)
+
+    const applied = await gateShell.applyWorktreeCommits(worker, base)
+    assert.equal(applied.findings.length, 1)
+    assert.equal(applied.findings[0]?.id, 'fix-apply-failed')
+    assert.equal(git(gatePath, 'rev-parse', 'HEAD'), base)
+    await gateShell.assertClean()
+  } finally {
+    await rm(temp, { recursive: true, force: true })
+  }
+})

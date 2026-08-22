@@ -646,6 +646,7 @@ function fixerInstructions(stage: StageName): string {
 
     case 'rebase':
       return `Rules:
+- The coordinator already aborted the conflicting rebase, so your worktree is clean; start by re-running the rebase onto the base branch in your own worktree to reproduce the conflicts.
 - Find all conflicting files and resolve the conflict markers (<<<<<<< ======= >>>>>>>).
 - After resolving each file, stage it with: git add <file>
 - Preserve the intent of both the current branch changes and the upstream changes.
@@ -1596,6 +1597,16 @@ export class GitShell implements GitOperations {
       return { findings: [], summary: `no commits in ${base.slice(0, 12)}..${sourceHead.slice(0, 12)}` }
     }
     const appendOnly = await this.#git(['merge-base', '--is-ancestor', base, sourceHead], true)
+    if (appendOnly.failed) {
+      const discarded = await this.#git(['merge-base', '--is-ancestor', sourceHead, base], true)
+      if (!discarded.failed) {
+        return failureReport(
+          'fix-apply-failed',
+          'ask-user',
+          `${sourcePath} discarded commits: ${sourceHead.slice(0, 12)} is behind ${base.slice(0, 12)}`
+        )
+      }
+    }
     const advance = appendOnly.failed
       ? await this.#git(['reset', '--hard', sourceHead], true)
       : await this.#git(['merge', '--ff-only', sourceHead], true)
