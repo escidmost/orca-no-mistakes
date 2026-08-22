@@ -52,6 +52,8 @@ import { artifactsRoot } from "../scripts/ledger.ts";
 import { loadUserConfig } from "../scripts/config.ts";
 import { effectivePolicyHash } from "../scripts/policy.ts";
 
+process.env.WORKER_SHELL_STARTUP_DELAY_MS ??= "0";
+
 const pass = (summary = "passed"): StageReport => ({ findings: [], summary });
 
 class FakeGit implements GitOperations {
@@ -2848,7 +2850,7 @@ test("local config bypass taints the run as uncertified", async () => {
   }
 });
 
-test("CliOrca waits for the shell before launching Claude", async () => {
+test("CliOrca waits for a hidden fish shell before launching Claude", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-claude-shell-"));
   const fakeOrca = path.join(temp, "orca");
   const callsPath = path.join(temp, "calls.jsonl");
@@ -2859,8 +2861,8 @@ test("CliOrca waits for the shell before launching Claude", async () => {
     "claude-shell-run",
   );
   const reportPath = path.join(evidence, "review.json");
-  const previousDelay = process.env.CLAUDE_SHELL_STARTUP_DELAY_MS;
-  process.env.CLAUDE_SHELL_STARTUP_DELAY_MS = "80";
+  const previousDelay = process.env.WORKER_SHELL_STARTUP_DELAY_MS;
+  process.env.WORKER_SHELL_STARTUP_DELAY_MS = "80";
   try {
     git(temp, "init", "-b", "feature");
     await mkdir(evidence, { recursive: true });
@@ -2917,7 +2919,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     );
     const sent = sends[0];
     assert.ok(created && sent);
-    assert.ok(sent.at - created.at >= 70, "Claude starts after the shell delay");
+    assert.ok(sent.at - created.at >= 70, "worker starts after the shell delay");
     assert.equal(
       sent.args[sent.args.indexOf("--text") + 1],
       "'claude' '--model' 'opus[1m]' '--effort' 'high' '--dangerously-skip-permissions'",
@@ -2934,8 +2936,8 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     assert.equal(worker.report.summary, "claude reviewed");
   } finally {
     if (previousDelay === undefined)
-      delete process.env.CLAUDE_SHELL_STARTUP_DELAY_MS;
-    else process.env.CLAUDE_SHELL_STARTUP_DELAY_MS = previousDelay;
+      delete process.env.WORKER_SHELL_STARTUP_DELAY_MS;
+    else process.env.WORKER_SHELL_STARTUP_DELAY_MS = previousDelay;
     await rm(temp, { recursive: true, force: true });
     await rm(evidence, { recursive: true, force: true });
   }

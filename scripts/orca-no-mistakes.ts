@@ -1880,13 +1880,14 @@ function acpReportFrom(parsed: unknown): StageReport | undefined {
 const DEFAULT_WORKER_AGENT = "opencode";
 const WORKER_IDLE_TIMEOUT_MS = 1_800_000;
 const NATIVE_WORKER_CREATE_SLACK_MS = 120_000;
-const CLAUDE_SHELL_STARTUP_DELAY_MS = 10_000;
+const FISH_SHELL_STARTUP_DELAY_MS = 12_000;
 
-function claudeShellStartupDelayMs(): number {
-  const configured = Number(process.env.CLAUDE_SHELL_STARTUP_DELAY_MS);
-  return Number.isFinite(configured) && configured >= 0
-    ? configured
-    : CLAUDE_SHELL_STARTUP_DELAY_MS;
+function workerShellStartupDelayMs(): number {
+  const configured = Number(process.env.WORKER_SHELL_STARTUP_DELAY_MS);
+  if (Number.isFinite(configured) && configured >= 0) return configured;
+  return path.basename(process.env.SHELL ?? "") === "fish"
+    ? FISH_SHELL_STARTUP_DELAY_MS
+    : 0;
 }
 
 type PreparedWorker = {
@@ -2427,9 +2428,10 @@ export class CliOrca implements OrcaOperations {
         await writeFile(promptPath, initialPrompt, { mode: 0o600 });
         launchCommand += ` --prompt-interactive "$(cat -- ${shellQuote(promptPath)})"`;
       }
-      if (harness === "claude") {
+      const shellStartupDelayMs = workerShellStartupDelayMs();
+      if (shellStartupDelayMs > 0) {
         await new Promise((resolve) =>
-          setTimeout(resolve, claudeShellStartupDelayMs()),
+          setTimeout(resolve, shellStartupDelayMs),
         );
       }
       await this.#json([
