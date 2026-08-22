@@ -3216,6 +3216,49 @@ if (args[0] === 'terminal' && args[1] === 'create') {
   }
 });
 
+test("a shell reporting a missing agy binary in its title fails as binary-missing", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-agy-missing-"));
+  const fakeOrca = path.join(temp, "orca");
+  try {
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+const args = process.argv.slice(2)
+const out = (result) => console.log(JSON.stringify({ result }))
+if (args[0] === 'terminal' && args[1] === 'create') {
+  out({ terminal: { handle: 'agy-missing-terminal' } })
+} else if (args[0] === 'terminal' && args[1] === 'show') {
+  out({ terminal: { connected: true, title: 'zsh: command not found: agy', preview: '' } })
+} else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
+  out({ dispatch: { id: 'dispatch-agy-missing', status: 'dispatched' }, injected: false, preamble: 'authenticated' })
+} else {
+  out({ ok: true })
+}
+`,
+    );
+    await chmod(fakeOrca, 0o755);
+    const orca = new CliOrca({ command: fakeOrca, cwd: temp });
+    await assert.rejects(
+      orca.startWorker("task-agy-missing", {
+        agent: { harness: "agy" },
+        name: "agy-missing-agent",
+        prompt: "instructions",
+        role: "reviewer",
+        stage: "review",
+        worktree: "current",
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof PreflightError);
+        assert.equal(error.failureClass, "binary-missing");
+        assert.match(error.message, /worker agent agy is not installed/);
+        return true;
+      },
+    );
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test("a started harness rendering missing-binary text is not misdiagnosed", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-binary-rendered-"));
   const fakeOrca = path.join(temp, "orca");
