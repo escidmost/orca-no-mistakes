@@ -1204,18 +1204,36 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
 
 test("CliOrca delivers agy preambles directly after dispatch", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-agy-cli-"));
+  const previousHome = process.env.HOME;
+  const home = path.join(temp, "home");
+  process.env.HOME = home;
   const fakeOrca = path.join(temp, "orca");
   const callsPath = path.join(temp, "calls.jsonl");
   const evidence = path.join(
-    homedir(),
+    home,
     ".orca-no-mistakes",
     "artifacts",
     "adapter-agy",
   );
+  const settingsPath = path.join(
+    home,
+    ".gemini",
+    "antigravity-cli",
+    "settings.json",
+  );
   const reportPath = path.join(evidence, "review.json");
+  const child = path.join(temp, "document-worktree");
   try {
     git(temp, "init", "-b", "feature");
+    const repo = await realpath(temp);
+    await mkdir(child);
+    const childPath = await realpath(child);
     await mkdir(evidence, { recursive: true });
+    await mkdir(path.dirname(settingsPath), { recursive: true });
+    await writeFile(
+      settingsPath,
+      JSON.stringify({ trustAllWorkspaces: true, trustedWorkspaces: [] }),
+    );
     await writeFile(reportPath, JSON.stringify(pass("reviewed")));
     await writeFile(
       fakeOrca,
@@ -1226,11 +1244,17 @@ fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
 const out = (result) => console.log(JSON.stringify({ result }))
 if (args[0] === 'orchestration' && args[1] === 'run-create') {
   out({ run: { id: 'adapter-agy' } })
+} else if (args[0] === 'worktree' && args[1] === 'create') {
+  out({ worktree: { id: 'wt-agy', path: ${JSON.stringify(child)} } })
+} else if (args[0] === 'terminal' && args[1] === 'list') {
+  out({ terminals: [{ handle: 'agy-shell', connected: true, writable: true }] })
 } else if (args[0] === 'terminal' && args[1] === 'create') {
   out({ terminal: { handle: 'agy-shell' } })
 } else if (args[0] === 'terminal' && args[1] === 'send') {
   const text = args[args.indexOf('--text') + 1]
   if (text?.includes('--prompt-interactive')) {
+    const settings = JSON.parse(fs.readFileSync(${JSON.stringify(settingsPath)}, 'utf8'))
+    if (!settings.trustedWorkspaces.includes(${JSON.stringify(childPath)})) process.exit(4)
     const promptFile = fs.readdirSync(${JSON.stringify(evidence)}).find((name) => name.startsWith('prompt-'))
     fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(['prompt-content', fs.readFileSync(${JSON.stringify(evidence)} + '/' + promptFile, 'utf8')]) + '\\n')
   }
@@ -1250,7 +1274,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
 `,
     );
     await chmod(fakeOrca, 0o755);
-    const orca = new CliOrca({ command: fakeOrca, cwd: temp });
+    const orca = new CliOrca({ command: fakeOrca, cwd: repo });
     await orca.createRun("agy adapter test");
 
     const worker = await orca.startWorker("task-review", {
@@ -1259,7 +1283,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       prompt: "review",
       role: "reviewer",
       stage: "review",
-      worktree: "current",
+      worktree: "new-child",
     });
     await orca.finishWorker(worker, "release");
 
@@ -1287,7 +1311,13 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     );
     assert.ok(!dispatch?.includes("--inject"));
     assert.ok(dispatch?.includes("--return-preamble"));
+    assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
+      trustAllWorkspaces: true,
+      trustedWorkspaces: [childPath],
+    });
   } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
     await rm(temp, { recursive: true, force: true });
     await rm(evidence, { recursive: true, force: true });
   }

@@ -8,6 +8,7 @@ import {
   mkdir,
   readFile,
   realpath,
+  rename,
   rm,
   stat,
   writeFile,
@@ -1465,6 +1466,14 @@ export class CliOrca implements OrcaOperations {
     const terminalHandle = prepared?.terminalHandle ?? launch.terminal;
     if (!terminalHandle)
       throw new Error("worker preparation returned no terminal handle");
+    if (directPreamble) {
+      try {
+        await this.#trustAgyWorkspace(prepared?.worktreePath ?? this.#cwd);
+      } catch (error) {
+        if (prepared) await this.#cleanupPreparedWorker(prepared);
+        throw error;
+      }
+    }
     const args = [
       "orchestration",
       "dispatch",
@@ -1837,6 +1846,42 @@ export class CliOrca implements OrcaOperations {
     } catch (error) {
       if (promptPath) await rm(promptPath, { force: true });
       throw error;
+    }
+  }
+
+  async #trustAgyWorkspace(worktreePath: string): Promise<void> {
+    const workspace = await realpath(worktreePath);
+    const settingsPath = path.join(
+      homedir(),
+      ".gemini",
+      "antigravity-cli",
+      "settings.json",
+    );
+    let settings: Record<string, unknown> = {};
+    try {
+      const parsed: unknown = JSON.parse(await readFile(settingsPath, "utf8"));
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+        throw new Error("Antigravity settings must be a JSON object");
+      settings = parsed as Record<string, unknown>;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+
+    const trusted = settings.trustedWorkspaces ?? [];
+    if (!Array.isArray(trusted))
+      throw new Error("Antigravity trustedWorkspaces must be an array");
+    if (trusted.includes(workspace)) return;
+
+    settings.trustedWorkspaces = [...trusted, workspace];
+    await mkdir(path.dirname(settingsPath), { recursive: true });
+    const tempPath = `${settingsPath}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      await writeFile(tempPath, `${JSON.stringify(settings, null, 2)}\n`, {
+        mode: 0o600,
+      });
+      await rename(tempPath, settingsPath);
+    } finally {
+      await rm(tempPath, { force: true });
     }
   }
 
