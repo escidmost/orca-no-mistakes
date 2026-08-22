@@ -159,10 +159,10 @@ export interface GitOperations {
   assertReady(): Promise<RepoSnapshot>;
   assertClean(): Promise<void>;
   head(): Promise<string>;
-  /** Diff of the branch against the resolved base commit (merge-base
-   *  three-dot form). Must throw on failure so a missing diff never
-   *  certifies an empty one. */
-  diffBase(base: string): Promise<string>;
+  /** Diff between the resolved trusted base and the captured HEAD snapshot
+   *  (merge-base three-dot form). Must throw on failure so a missing diff
+   *  never certifies an empty one. */
+  diffBase(base: string, headOid: string): Promise<string>;
   rebase(base: string): Promise<StageReport>;
   resolveRefSha(ref: string): Promise<string | undefined>;
   showFile(ref: string, filePath: string): Promise<string | undefined>;
@@ -1191,6 +1191,9 @@ function fenceUntrusted(content: string): string {
 }
 
 const UNTRUSTED_DIFF_LIMIT_CHARS = 200_000;
+// ponytail: diff and AGENTS.md are buffered whole before this cap; streamed
+// capped reads only pay off if hostile multi-GB blobs ever become realistic
+// (git and hosting providers already bound blob sizes).
 const AGENTS_MD_PATH = "AGENTS.md";
 
 type UntrustedBranchContext = {
@@ -1204,7 +1207,7 @@ async function untrustedBranchContext(
   base: string,
 ): Promise<UntrustedBranchContext> {
   const headOid = await git.head();
-  const rawDiff = await git.diffBase(base);
+  const rawDiff = await git.diffBase(base, headOid);
   const branchDiff =
     rawDiff.length > UNTRUSTED_DIFF_LIMIT_CHARS
       ? `${rawDiff.slice(0, UNTRUSTED_DIFF_LIMIT_CHARS)}\n[branch diff truncated by the no-mistakes coordinator]`
@@ -1216,6 +1219,12 @@ async function untrustedBranchContext(
   ) {
     throw new Error(
       `could not read ${AGENTS_MD_PATH} at the reviewed commit ${headOid}`,
+    );
+  }
+  const currentHead = await git.head();
+  if (currentHead !== headOid) {
+    throw new Error(
+      `HEAD moved to ${currentHead} while collecting the branch context for ${headOid}`,
     );
   }
   return {
@@ -3089,10 +3098,10 @@ export class GitShell implements GitOperations {
     return (await this.#git(["rev-parse", "HEAD"])).stdout.trim();
   }
 
-  async diffBase(base: string): Promise<string> {
+  async diffBase(base: string, headOid: string): Promise<string> {
     const baseOid = await this.resolveBaseOid(base);
     const result = await this.#git(
-      ["diff", "--no-color", `${baseOid}...HEAD`],
+      ["diff", "--no-color", `${baseOid}...${headOid}`],
       true,
     );
     if (result.failed) {

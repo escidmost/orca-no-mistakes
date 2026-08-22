@@ -105,7 +105,7 @@ class FakeGit implements GitOperations {
     return this.#currentHead();
   }
 
-  async diffBase(base: string): Promise<string> {
+  async diffBase(base: string, _headOid: string): Promise<string> {
     this.calls.push(`diff:${base}`);
     return this.diffOutput;
   }
@@ -712,6 +712,26 @@ test("an unreadable AGENTS.md at the reviewed commit fails closed", async () => 
   await assert.rejects(
     runPipeline({ intent: "Fix the parser." }, orca, git, ledger),
     /could not read AGENTS\.md/,
+  );
+});
+
+test("reviewer context fails closed when the branch moves during collection", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  const ledger = new DomainLedger(":memory:");
+  let drifted = false;
+  const boundDiff = git.diffBase.bind(git);
+  git.diffBase = async (base: string, headOid: string) => {
+    const output = await boundDiff(base, headOid);
+    if (!drifted) {
+      drifted = true;
+      git.advanceHead();
+    }
+    return output;
+  };
+  await assert.rejects(
+    runPipeline({ intent: "Fix the parser." }, orca, git, ledger),
+    /HEAD moved to [0-9a-f]{40} while collecting/,
   );
 });
 
@@ -1781,10 +1801,14 @@ test("GitShell.diffBase falls back to a local base branch when origin lacks it",
     git(repo, "commit", "-m", "feature");
 
     const shell = new GitShell({ repo });
-    const diff = await shell.diffBase("main");
+    const featureHead = git(repo, "rev-parse", "HEAD");
+    const diff = await shell.diffBase("main", featureHead);
     assert.match(diff, /diff --git a\/feature\.txt b\/feature\.txt/);
     assert.match(diff, /\+feature\n/);
-    await assert.rejects(shell.diffBase("missing-base"), /could not resolve/);
+    await assert.rejects(
+      shell.diffBase("missing-base", featureHead),
+      /could not resolve/,
+    );
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
