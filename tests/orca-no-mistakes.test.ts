@@ -1263,7 +1263,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
   }
 });
 
-test("CliOrca delivers agy preambles directly after dispatch", async () => {
+test("CliOrca delivers agy preambles and preserves concurrent trust updates", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-agy-cli-"));
   const previousHome = process.env.HOME;
   const home = path.join(temp, "home");
@@ -1284,11 +1284,16 @@ test("CliOrca delivers agy preambles directly after dispatch", async () => {
   );
   const reportPath = path.join(evidence, "review.json");
   const child = path.join(temp, "document-worktree");
+  const peer = path.join(temp, "peer-worktree");
+  const lockPath = `${settingsPath}.lock`;
   try {
     git(temp, "init", "-b", "feature");
     const repo = await realpath(temp);
-    await mkdir(child);
-    const childPath = await realpath(child);
+    await Promise.all([mkdir(child), mkdir(peer)]);
+    const [childPath, peerPath] = await Promise.all([
+      realpath(child),
+      realpath(peer),
+    ]);
     await mkdir(evidence, { recursive: true });
     await mkdir(path.dirname(settingsPath), { recursive: true });
     await writeFile(
@@ -1337,8 +1342,9 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     await chmod(fakeOrca, 0o755);
     const orca = new CliOrca({ command: fakeOrca, cwd: repo });
     await orca.createRun("agy adapter test");
+    await mkdir(lockPath);
 
-    const worker = await orca.startWorker("task-review", {
+    const workerPromise = orca.startWorker("task-review", {
       agent: { harness: "agy" },
       name: "agy-reviewer",
       prompt: "review",
@@ -1346,6 +1352,25 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       stage: "review",
       worktree: "new-child",
     });
+    const deadline = Date.now() + 5000;
+    for (;;) {
+      const calls = await readFile(callsPath, "utf8");
+      if (calls.includes('["terminal","list"')) break;
+      if (Date.now() >= deadline) throw new Error("worker did not reach trust setup");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.ok(!(await readFile(callsPath, "utf8")).includes('"dispatch"'));
+    await writeFile(
+      settingsPath,
+      JSON.stringify({
+        trustAllWorkspaces: true,
+        trustedWorkspaces: [peerPath],
+      }),
+    );
+    await rm(lockPath, { recursive: true });
+
+    const worker = await workerPromise;
     await orca.finishWorker(worker, "release");
 
     const calls = (await readFile(callsPath, "utf8"))
@@ -1374,7 +1399,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     assert.ok(dispatch?.includes("--return-preamble"));
     assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
       trustAllWorkspaces: true,
-      trustedWorkspaces: [childPath],
+      trustedWorkspaces: [peerPath, childPath],
     });
   } finally {
     if (previousHome === undefined) delete process.env.HOME;
@@ -1823,20 +1848,26 @@ test("runPipeline extracts the trusted base policy and binds it into run evidenc
   assert.equal(manifest.base_ref, "origin/main");
   assert.equal(manifest.base_ref_sha, "sha-origin-main");
   assert.equal(manifest.local_bypass, false);
-  assert.deepEqual(manifest.effective_config, {
-    stages: {
-      review: {
-        reviewer: {
-          agent: "claude",
-          model: "claude-opus-4",
-          timeout_ms: 45000,
-        },
-      },
-    },
-  });
+  assert.deepEqual(manifest.effective_config, manifest.resolved_config);
+  assert.equal(
+    manifest.effective_config.stages.review.reviewer.agent,
+    "claude",
+  );
+  assert.equal(
+    manifest.effective_config.stages.review.reviewer.model,
+    "claude-opus-4",
+  );
+  assert.equal(
+    manifest.effective_config.stages.review.reviewer.timeout_ms,
+    45000,
+  );
   assert.equal(
     manifest.effective_policy_hash,
     effectivePolicyHash(manifest.effective_config),
+  );
+  assert.equal(
+    result.policy.effectivePolicyHash,
+    manifest.effective_policy_hash,
   );
   await rm(
     path.join(homedir(), ".orca-no-mistakes", "artifacts", result.runId),
@@ -1866,6 +1897,27 @@ test("runPipeline applies the user-global default agent", async () => {
     assert.ok(orca.launches.length > 0);
     assert.ok(
       orca.launches.every((launch) => launch.agent?.harness === "agy"),
+    );
+    const manifestPath = path.join(
+      homedir(),
+      ".orca-no-mistakes",
+      "artifacts",
+      result.runId,
+      "manifest.json",
+    );
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    assert.deepEqual(manifest.effective_config, manifest.resolved_config);
+    assert.equal(
+      manifest.effective_config.stages.review.reviewer.agent,
+      "agy",
+    );
+    assert.equal(
+      manifest.effective_policy_hash,
+      effectivePolicyHash(manifest.effective_config),
+    );
+    assert.equal(
+      result.policy.effectivePolicyHash,
+      manifest.effective_policy_hash,
     );
     await rm(
       path.join(homedir(), ".orca-no-mistakes", "artifacts", result.runId),

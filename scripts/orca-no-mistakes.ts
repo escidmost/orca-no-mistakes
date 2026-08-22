@@ -40,7 +40,11 @@ import {
   type ResolvedRoleConfig,
   type StageName,
 } from "./config.ts";
-import { resolveRunPolicy, type PolicyProvenance } from "./policy.ts";
+import {
+  effectivePolicyHash,
+  resolveRunPolicy,
+  type PolicyProvenance,
+} from "./policy.ts";
 import {
   DomainLedger,
   RUN_ID_PATTERN,
@@ -238,6 +242,13 @@ export async function runPipeline(
     repoGlobalConfig: repoPolicyConfig,
     userGlobalConfig: options.userGlobalConfig,
   });
+  const effectiveConfig = JSON.parse(
+    JSON.stringify(pipelineConfig),
+  ) as typeof pipelineConfig;
+  const effectiveProvenance = {
+    ...provenance,
+    effectivePolicyHash: effectivePolicyHash(effectiveConfig),
+  };
   const statusPrefix = provenance.localBypass
     ? "[uncertified: local config bypass] "
     : "";
@@ -285,13 +296,13 @@ export async function runPipeline(
       path.join(artifactsDir, "manifest.json"),
       JSON.stringify(
         {
-          base_ref: provenance.baseRef,
-          base_ref_sha: provenance.baseRefSha,
-          effective_policy_hash: provenance.effectivePolicyHash,
-          local_bypass: provenance.localBypass,
-          effective_config: repoPolicyConfig,
+          base_ref: effectiveProvenance.baseRef,
+          base_ref_sha: effectiveProvenance.baseRefSha,
+          effective_policy_hash: effectiveProvenance.effectivePolicyHash,
+          local_bypass: effectiveProvenance.localBypass,
+          effective_config: effectiveConfig,
           cli_overrides: options.cliFlags ?? {},
-          resolved_config: pipelineConfig,
+          resolved_config: effectiveConfig,
         },
         null,
         2,
@@ -577,7 +588,7 @@ export async function runPipeline(
     return {
       attestation,
       custodyNote,
-      policy: provenance,
+      policy: effectiveProvenance,
       runId,
       steps: PIPELINE_STEPS,
     };
@@ -1908,31 +1919,51 @@ export class CliOrca implements OrcaOperations {
       "antigravity-cli",
       "settings.json",
     );
-    let settings: Record<string, unknown> = {};
-    try {
-      const parsed: unknown = JSON.parse(await readFile(settingsPath, "utf8"));
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
-        throw new Error("Antigravity settings must be a JSON object");
-      settings = parsed as Record<string, unknown>;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    await mkdir(path.dirname(settingsPath), { recursive: true });
+    const lockPath = `${settingsPath}.lock`;
+    const lockDeadline = Date.now() + 10_000;
+    for (;;) {
+      try {
+        await mkdir(lockPath);
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        if (Date.now() >= lockDeadline)
+          throw new Error("timed out waiting for Antigravity settings lock");
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
     }
 
-    const trusted = settings.trustedWorkspaces ?? [];
-    if (!Array.isArray(trusted))
-      throw new Error("Antigravity trustedWorkspaces must be an array");
-    if (trusted.includes(workspace)) return;
-
-    settings.trustedWorkspaces = [...trusted, workspace];
-    await mkdir(path.dirname(settingsPath), { recursive: true });
-    const tempPath = `${settingsPath}.${process.pid}.${randomUUID()}.tmp`;
     try {
-      await writeFile(tempPath, `${JSON.stringify(settings, null, 2)}\n`, {
-        mode: 0o600,
-      });
-      await rename(tempPath, settingsPath);
+      let settings: Record<string, unknown> = {};
+      try {
+        const parsed: unknown = JSON.parse(
+          await readFile(settingsPath, "utf8"),
+        );
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+          throw new Error("Antigravity settings must be a JSON object");
+        settings = parsed as Record<string, unknown>;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+
+      const trusted = settings.trustedWorkspaces ?? [];
+      if (!Array.isArray(trusted))
+        throw new Error("Antigravity trustedWorkspaces must be an array");
+      if (trusted.includes(workspace)) return;
+
+      settings.trustedWorkspaces = [...trusted, workspace];
+      const tempPath = `${settingsPath}.${process.pid}.${randomUUID()}.tmp`;
+      try {
+        await writeFile(tempPath, `${JSON.stringify(settings, null, 2)}\n`, {
+          mode: 0o600,
+        });
+        await rename(tempPath, settingsPath);
+      } finally {
+        await rm(tempPath, { force: true });
+      }
     } finally {
-      await rm(tempPath, { force: true });
+      await rm(lockPath, { recursive: true, force: true });
     }
   }
 
