@@ -38,10 +38,22 @@ export type PassedAttestationManifest = {
   createdAt: string
 }
 
+/**
+ * Computes the SHA-256 digest of a string.
+ *
+ * @param value - The string to hash
+ * @returns The digest encoded as a hexadecimal string
+ */
 export function sha256(value: string): string {
   return createHash('sha256').update(value).digest('hex')
 }
 
+/**
+ * Computes the SHA-256 hash of an intent string.
+ *
+ * @param intent - The intent string to hash
+ * @returns The hexadecimal SHA-256 digest
+ */
 export function intentHash(intent: string): string {
   return sha256(intent)
 }
@@ -49,6 +61,12 @@ export function intentHash(intent: string): string {
 const HEX_40 = /^[0-9a-f]{40}$/
 const HEX_64 = /^[0-9a-f]{64}$/
 
+/**
+ * Computes a deterministic hash for stage evidence.
+ *
+ * @param input - Evidence fields used to derive the hash.
+ * @returns The SHA-256 hash of the evidence fields.
+ */
 export function evidenceSha256(input: {
   baseCommitOid: string
   candidateCommitOid: string
@@ -71,6 +89,12 @@ export function evidenceSha256(input: {
   )
 }
 
+/**
+ * Produces a deterministic serialized representation of a stage evidence entry.
+ *
+ * @param entry - The stage evidence entry to serialize
+ * @returns The canonical JSON representation of `entry`
+ */
 function canonicalEntry(entry: StageEvidenceManifestEntry): string {
   return JSON.stringify({
     baseCommitOid: entry.baseCommitOid,
@@ -85,6 +109,12 @@ function canonicalEntry(entry: StageEvidenceManifestEntry): string {
   })
 }
 
+/**
+ * Computes a Merkle root from an ordered collection of hashes.
+ *
+ * @param hashes - The leaf hashes used to build the tree.
+ * @returns The Merkle root, or the SHA-256 hash of an empty string when no hashes are provided.
+ */
 export function merkleRoot(hashes: string[]): string {
   let level = [...hashes]
   if (level.length === 0) level = [sha256('')]
@@ -109,6 +139,13 @@ const COORDINATOR_VERSION: string = (() => {
   }
 })()
 
+/**
+ * Builds a versioned attestation manifest from stage evidence and run metadata.
+ *
+ * @param entries - Stage evidence entries included in the attestation
+ * @param meta - Run, commit, intent, and policy metadata
+ * @returns The completed attestation manifest
+ */
 export function buildAttestation(
   entries: StageEvidenceManifestEntry[],
   meta: {
@@ -136,6 +173,11 @@ export function buildAttestation(
   return manifest
 }
 
+/**
+ * Validates the version, hashes, intent, stage evidence, and Merkle root of an attestation manifest.
+ *
+ * @param manifest - The attestation manifest to validate
+ */
 export function verifyManifest(manifest: PassedAttestationManifest): void {
   if (!manifest || manifest.version !== '1.0.0') {
     throw new Error('attestation version is not 1.0.0')
@@ -163,6 +205,13 @@ export function verifyManifest(manifest: PassedAttestationManifest): void {
 
 export const MAX_LOG_BYTES = 50 * 1024 * 1024
 
+/**
+ * Limits log content to a maximum byte size while preserving its beginning and end.
+ *
+ * @param content - The log content to limit
+ * @param maxBytes - The maximum target size in UTF-8 bytes
+ * @returns The original content or truncated content with a marker indicating the retained portions
+ */
 export function capLog(content: string, maxBytes = MAX_LOG_BYTES): string {
   const source = Buffer.from(content, 'utf8')
   if (source.length <= maxBytes) return content
@@ -171,14 +220,29 @@ export function capLog(content: string, maxBytes = MAX_LOG_BYTES): string {
   return `${source.subarray(0, keep).toString('utf8')}${marker}${source.subarray(source.length - keep).toString('utf8')}`
 }
 
+/**
+ * Resolves the application home directory.
+ *
+ * @returns The path from `ORCA_NO_MISTAKES_HOME`, or the `.orca-no-mistakes` directory in the user's home directory.
+ */
 export function noMistakesHome(): string {
   return process.env.ORCA_NO_MISTAKES_HOME ?? path.join(homedir(), '.orca-no-mistakes')
 }
 
+/**
+ * Resolves the default path to the ledger database.
+ *
+ * @returns The path to `ledger.db` in the application home directory
+ */
 export function defaultLedgerPath(): string {
   return path.join(noMistakesHome(), 'ledger.db')
 }
 
+/**
+ * Resolves the directory used to store artifacts.
+ *
+ * @returns The path to the artifacts directory
+ */
 export function artifactsRoot(): string {
   return path.join(noMistakesHome(), 'artifacts')
 }

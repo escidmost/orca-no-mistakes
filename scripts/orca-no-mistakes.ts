@@ -104,6 +104,15 @@ export const DEFAULT_MAX_FIX_ROUNDS = 3
 
 export class GateStopError extends Error {}
 
+/**
+ * Runs the repository review pipeline, applying configured fixes and resolving actionable findings through gates when needed.
+ *
+ * @param options - Pipeline configuration, including the review intent and fix-round limit
+ * @param orca - Operations for managing pipeline runs, tasks, workers, gates, and worktree status
+ * @param git - Operations for inspecting and updating the repository
+ * @param ledger - Ledger used to record run state, leases, checkpoints, evidence, and attestations
+ * @returns Pipeline metadata containing the run ID, completed stages, attestation, and custody note
+ */
 export async function runPipeline(
   options: PipelineOptions,
   orca: OrcaOperations,
@@ -396,6 +405,19 @@ type StageExecution = {
   workerIdentity: string
 }
 
+/**
+ * Executes a pipeline stage and returns its report and worker identity.
+ *
+ * @param stage - The stage to execute.
+ * @param attempt - The current attempt number for reviewer stages.
+ * @param taskId - The parent task identifier for reviewer stages.
+ * @param intent - The repository review intent.
+ * @param evidenceDir - The directory for reviewer evidence artifacts.
+ * @param repo - The repository state used by the stage.
+ * @param orca - Operations for launching reviewer stages.
+ * @param git - Operations for executing repository changes.
+ * @returns The stage execution result.
+ */
 async function executeStage(
   stage: StageName,
   attempt: number,
@@ -419,6 +441,16 @@ async function executeStage(
   return await runReviewer(stage, attempt, taskId, intent, evidenceDir, repo, orca)
 }
 
+/**
+ * Runs a reviewer for a pipeline stage and validates the resulting report.
+ *
+ * @param stage - The pipeline stage being reviewed
+ * @param attempt - The zero-based review attempt number
+ * @param parentTask - The task under which the reviewer task is created
+ * @param intent - The review intent provided to the reviewer
+ * @param evidenceDir - The directory used to validate review evidence
+ * @returns The validated stage execution result and reviewer identity
+ */
 async function runReviewer(
   stage: StageName,
   attempt: number,
@@ -458,6 +490,21 @@ async function runReviewer(
   }
 }
 
+/**
+ * Applies fixes for stage findings and returns the repository revisions before and after the change.
+ *
+ * @param stage - The pipeline stage associated with the findings.
+ * @param round - The fix attempt number.
+ * @param parentTask - The task under which the fixer task is created.
+ * @param intent - The requested review or pipeline intent.
+ * @param findings - Findings to address.
+ * @param guidance - Additional instructions for applying the fixes.
+ * @param reportPath - Path where the fixer report is expected.
+ * @param retainedFixer - Previously retained fixer worker, if available.
+ * @param orca - Orca operations used to create and manage the fixer worker.
+ * @param git - Git operations used to verify cleanliness and revisions.
+ * @returns The revisions before and after the fix, together with the retained worker result.
+ */
 async function runFixer(
   stage: StageName,
   round: number,
@@ -499,6 +546,12 @@ async function runFixer(
   }
 }
 
+/**
+ * Selects findings that require action from a stage report.
+ *
+ * @param report - The stage report containing findings to filter
+ * @returns Findings whose action is not `no-op`
+ */
 function actionableFindings(report: StageReport): Finding[] {
   return report.findings.filter((finding) => finding.action !== 'no-op')
 }
@@ -596,10 +649,23 @@ function stageIndex(stage: StageName): number {
   return PIPELINE_STEPS.indexOf(stage) + 1
 }
 
+/**
+ * Builds the task specification for a pipeline stage.
+ *
+ * @param stage - The pipeline stage to describe
+ * @param intent - The repository review intent
+ * @returns A formatted task specification containing the stage, its position, and intent
+ */
 function stageTaskSpec(stage: StageName, intent: string): string {
   return `[${stage}] no-mistakes stage ${stageIndex(stage)}/${PIPELINE_STEPS.length}. Intent: ${intent}`
 }
 
+/**
+ * Provides the review brief for a pipeline stage.
+ *
+ * @param stage - The stage whose reviewer brief should be retrieved.
+ * @returns The brief describing the stage's review focus.
+ */
 function checkerBrief(stage: StageName): string {
   const briefs: Record<Exclude<StageName, 'intent' | 'rebase'>, string> = {
     review: 'Adversarially review the committed change.',
@@ -610,6 +676,12 @@ function checkerBrief(stage: StageName): string {
   return briefs[stage as keyof typeof briefs]
 }
 
+/**
+ * Builds the task instructions for a checker assigned to a pipeline stage.
+ *
+ * @param stage - The pipeline stage whose checker instructions should be generated.
+ * @returns Stage-specific checker instructions.
+ */
 function checkerInstructions(stage: StageName): string {
   switch (stage) {
     case 'review':
@@ -695,6 +767,15 @@ Rules:
   }
 }
 
+/**
+ * Builds the security-framed instructions for an independent read-only reviewer.
+ *
+ * @param stage - The review stage that determines the worker's assignment and instructions
+ * @param intent - The user-provided intent to include as untrusted input
+ * @param repo - Repository context used to identify the review target
+ * @param reportPath - External path where the worker must write its JSON report
+ * @returns The completed reviewer prompt
+ */
 function checkerPrompt(
   stage: StageName,
   intent: string,
@@ -721,6 +802,12 @@ Write one JSON object to ${reportPath} with this shape:
 Create the parent directory if needed. Then report exactly once with worker_done: keep --body to the required three-sentence executive summary and pass --report-path ${reportPath}. Use auto-fix only for a concrete mechanical repair. Use ask-user for product choices, intent conflicts, destructive actions, credentials, or uncertain delivery state. An empty findings array means this phase passed.`
 }
 
+/**
+ * Builds stage-specific instructions for a fixer.
+ *
+ * @param stage - The pipeline stage whose fixing rules should be generated
+ * @returns Instructions governing fixes, verification, and commit requirements for the stage
+ */
 function fixerInstructions(stage: StageName): string {
   switch (stage) {
     case 'review':
@@ -786,6 +873,16 @@ function fixerInstructions(stage: StageName): string {
   }
 }
 
+/**
+ * Builds the instructions given to a stage fixer.
+ *
+ * @param stage - The pipeline stage being fixed
+ * @param intent - The user's requested work
+ * @param findings - Findings the fixer should address
+ * @param guidance - Additional user guidance for the fixer
+ * @param reportPath - Path where the fixer must write its report
+ * @returns The formatted fixer instructions
+ */
 function fixerPrompt(
   stage: StageName,
   intent: string,
@@ -818,6 +915,12 @@ function gateQuestion(
   return `${prefix} Resolve with ${choices}. Findings: ${JSON.stringify(actionableFindings(report))}`
 }
 
+/**
+ * Extracts the normalized action from a gate resolution.
+ *
+ * @param resolution - The gate resolution text
+ * @returns The first whitespace- or colon-delimited token in lowercase
+ */
 function gateDecision(resolution: string): string {
   return resolution.trim().toLowerCase().split(/[\s:]/, 1)[0]
 }
@@ -828,6 +931,13 @@ export type GateDecision = {
   selectedFindings: Finding[]
 }
 
+/**
+ * Parses a gate resolution and identifies the action, guidance, and findings selected for fixing.
+ *
+ * @param resolution - Plain-text or JSON gate resolution
+ * @param availableFindings - Findings that may be selected for fixing
+ * @returns The parsed gate action, user guidance, and selected findings
+ */
 export function parseGateResolution(resolution: string, availableFindings: Finding[]): GateDecision {
   const trimmed = resolution.trim()
   if (!trimmed) {
@@ -1755,6 +1865,14 @@ export class GitShell implements GitOperations {
   }
 }
 
+/**
+ * Creates a stage report containing a single error finding.
+ *
+ * @param id - The finding identifier
+ * @param action - The action associated with the finding
+ * @param description - The finding description
+ * @returns A stage report with the finding and its first line as the summary
+ */
 function failureReport(id: string, action: FindingAction, description: string): StageReport {
   return {
     findings: [{ id, action, severity: 'error', description }],
@@ -1762,6 +1880,12 @@ function failureReport(id: string, action: FindingAction, description: string): 
   }
 }
 
+/**
+ * Quotes a string for use as a shell argument.
+ *
+ * @param value - The string to quote
+ * @returns The shell-quoted string with embedded single quotes escaped
+ */
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`
 }
@@ -1802,6 +1926,12 @@ const COMMAND_FLAGS: Record<string, Set<string>> = {
   ])
 }
 
+/**
+ * Parses command-line arguments into a command, flags, and positional arguments.
+ *
+ * @param argv - The command-line arguments to parse
+ * @returns The parsed command, flag values, and positional arguments
+ */
 function parseCli(argv: string[]): { command: string; flags: RawCliFlags; positionals: string[] } {
   const [subcommand = 'run', ...rest] = argv
   const allowedFlags = COMMAND_FLAGS[subcommand]
@@ -1832,11 +1962,26 @@ function parseCli(argv: string[]): { command: string; flags: RawCliFlags; positi
   return { command: subcommand, flags, positionals }
 }
 
+/**
+ * Retrieves a string-valued command-line flag.
+ *
+ * @param flags - Parsed command-line flag values
+ * @param name - Name of the flag to retrieve
+ * @returns The flag value if it is a string, `undefined` otherwise
+ */
 function stringFlag(flags: RawCliFlags, name: string): string | undefined {
   const value = flags[name]
   return typeof value === 'string' ? value : undefined
 }
 
+/**
+ * Starts a detached coordinator run in a terminal associated with the repository.
+ *
+ * @param root - The repository path used for the terminal and run.
+ * @param flags - CLI flags forwarded to the attached coordinator run.
+ * @returns The handle of the detached coordinator terminal.
+ * @throws If terminal creation fails, the terminal disconnects, or the coordinator shell does not become ready.
+ */
 async function launchDetachedRun(root: string, flags: RawCliFlags): Promise<string> {
   const orcaCommand = resolveOrcaCommand()
   const created = unwrapJson<{ terminal: { handle: string } }>(
@@ -1917,6 +2062,11 @@ async function launchDetachedRun(root: string, flags: RawCliFlags): Promise<stri
   return terminalHandle
 }
 
+/**
+ * Runs the requested CLI command, including pipeline execution, attestation operations, or run pruning.
+ *
+ * @param argv - Command-line arguments to parse and execute
+ */
 export async function main(argv: string[]): Promise<void> {
   if (argv.length === 0 || argv[0] === '--help' || argv[0] === '-h' || argv.includes('--help')) {
     console.log(`Usage:
@@ -2000,6 +2150,12 @@ Run options:
   }
 }
 
+/**
+ * Exports or verifies an attestation manifest.
+ *
+ * @param positionals - The action (`export` or `verify`) and its run ID, commit SHA, or manifest path.
+ * @param flags - CLI flags, including the optional output path for exported attestations.
+ */
 async function runAttestationCommand(positionals: string[], flags: RawCliFlags): Promise<void> {
   const [action, ref] = positionals
   if (action !== 'export' && action !== 'verify') {
