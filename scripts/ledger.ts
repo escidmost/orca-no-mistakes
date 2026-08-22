@@ -19,6 +19,7 @@ export type StageEvidenceManifestEntry = {
   baseCommitOid: string
   workerIdentity: string
   exitCode: number
+  artifactSha256: string
   evidenceSha256: string
   summary: string
   waiverOrApproval?: GateDecisionRecord
@@ -46,10 +47,12 @@ export function intentHash(intent: string): string {
   return sha256(intent)
 }
 
-const HEX_40 = /^[0-9a-f]{40}$/
 const HEX_64 = /^[0-9a-f]{64}$/
+export const RUN_ID_PATTERN = /^[A-Za-z0-9._-]+$/
+const COMMIT_OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
 
 export function evidenceSha256(input: {
+  artifactSha256: string
   baseCommitOid: string
   candidateCommitOid: string
   exitCode: number
@@ -60,6 +63,7 @@ export function evidenceSha256(input: {
 }): string {
   return sha256(
     JSON.stringify({
+      artifactSha256: input.artifactSha256,
       baseCommitOid: input.baseCommitOid,
       candidateCommitOid: input.candidateCommitOid,
       exitCode: input.exitCode,
@@ -71,8 +75,9 @@ export function evidenceSha256(input: {
   )
 }
 
-function canonicalEntry(entry: StageEvidenceManifestEntry): string {
+export function canonicalEntry(entry: StageEvidenceManifestEntry): string {
   return JSON.stringify({
+    artifactSha256: entry.artifactSha256,
     baseCommitOid: entry.baseCommitOid,
     candidateCommitOid: entry.candidateCommitOid,
     evidenceSha256: entry.evidenceSha256,
@@ -140,8 +145,8 @@ export function verifyManifest(manifest: PassedAttestationManifest): void {
   if (!manifest || manifest.version !== '1.0.0') {
     throw new Error('attestation version is not 1.0.0')
   }
-  if (!HEX_40.test(manifest.candidateCommitOid) || !HEX_40.test(manifest.baseCommitOid)) {
-    throw new Error('attestation commit SHAs are not 40-character hex values')
+  if (!COMMIT_OID.test(manifest.candidateCommitOid) || !COMMIT_OID.test(manifest.baseCommitOid)) {
+    throw new Error('attestation commit OIDs are not 40- or 64-character hex values')
   }
   if (!HEX_64.test(manifest.policySha256)) throw new Error('attestation policy hash is not a SHA-256')
   if (manifest.intentHash !== intentHash(manifest.intent)) {
@@ -254,6 +259,10 @@ CREATE TABLE IF NOT EXISTS gate_audit (
   resolved_at TEXT NOT NULL
 );
 
+CREATE INDEX IF NOT EXISTS idx_stage_checkpoints_run ON stage_checkpoints(run_id);
+CREATE INDEX IF NOT EXISTS idx_stage_evidence_run ON stage_evidence(run_id);
+CREATE INDEX IF NOT EXISTS idx_gate_audit_run ON gate_audit(run_id);
+
 CREATE TABLE IF NOT EXISTS passed_attestations (
   run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE CASCADE,
   candidate_commit_oid TEXT NOT NULL,
@@ -289,7 +298,24 @@ export class DomainLedger {
       .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'passed_attestations'")
       .get() as { sql: string } | undefined
     if (legacyAttestations && !legacyAttestations.sql.includes('run_id TEXT PRIMARY KEY')) {
-      this.#db.exec('DROP TABLE passed_attestations')
+      this.#db.exec('BEGIN IMMEDIATE')
+      try {
+        this.#db.exec('ALTER TABLE passed_attestations RENAME TO passed_attestations_legacy')
+        this.#db.exec(SCHEMA)
+        this.#db.exec(`INSERT INTO passed_attestations (
+            run_id, candidate_commit_oid, base_commit_oid, policy_sha256, intent, intent_hash,
+            merkle_root, manifest_json, coordinator_version, created_at
+          )
+          SELECT run_id, candidate_commit_oid, base_commit_oid, policy_sha256, intent, intent_hash,
+                 merkle_root, manifest_json, coordinator_version, created_at
+          FROM passed_attestations_legacy`)
+        this.#db.exec('DROP TABLE passed_attestations_legacy')
+        this.#db.exec('COMMIT')
+        console.error('no-mistakes: rebuilt passed_attestations onto the per-run key; existing rows preserved')
+      } catch (error) {
+        this.#db.exec('ROLLBACK')
+        throw error
+      }
     }
     this.#db.exec(SCHEMA)
   }
@@ -341,6 +367,26 @@ export class DomainLedger {
   }
 
   acquireLease(options: {
+    branch: string
+    force?: boolean
+    repoRoot: string
+    runId: string
+  }): number {
+    // BEGIN IMMEDIATE serializes concurrent coordinators for the whole
+    // read-decide-write, so generation tokens stay unique and the takeover
+    // compare-and-swap below can never race.
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      const token = this.#acquireLeaseLocked(options)
+      this.#db.exec('COMMIT')
+      return token
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  #acquireLeaseLocked(options: {
     branch: string
     force?: boolean
     repoRoot: string
@@ -506,20 +552,6 @@ export class DomainLedger {
       )
   }
 
-  waiverForStage(runId: string, stageId: string, roundIndex: number): GateDecisionRecord | undefined {
-    const row = this.#db
-      .prepare(
-        `SELECT gate_id, decision, resolved_at FROM gate_audit
-         WHERE run_id = ? AND stage_id = ? AND round_index = ? AND decision IN ('approve', 'skip')
-         ORDER BY resolved_at DESC LIMIT 1`
-      )
-      .get(runId, stageId, roundIndex) as
-      | { decision: string; gate_id: string; resolved_at: string }
-      | undefined
-    if (!row || (row.decision !== 'approve' && row.decision !== 'skip')) return undefined
-    return { decision: row.decision, gateId: row.gate_id, resolvedAt: row.resolved_at }
-  }
-
   recordAttestation(manifest: PassedAttestationManifest): void {
     this.#db
       .prepare(
@@ -548,7 +580,7 @@ export class DomainLedger {
       .get(ref)
       ?? this.#db
         .prepare(
-          'SELECT manifest_json, merkle_root FROM passed_attestations WHERE candidate_commit_oid = ? ORDER BY created_at DESC LIMIT 1'
+          'SELECT manifest_json, merkle_root FROM passed_attestations WHERE candidate_commit_oid = ? ORDER BY created_at DESC, rowid DESC LIMIT 1'
         )
         .get(ref)) as { manifest_json: string; merkle_root: string } | undefined
     if (!row) throw new Error(`no passed attestation found for ${ref}`)
@@ -561,21 +593,30 @@ export class DomainLedger {
 
   prune(options: { before?: Date; repoSubstring?: string }): string[] {
     const before = options.before ? options.before.toISOString() : null
-    const rows = this.#db
-      .prepare(
-        `SELECT run_id FROM runs
-         WHERE status <> 'in-progress'
-           AND completed_at IS NOT NULL
-           AND (? IS NULL OR completed_at < ?)
-           AND (? IS NULL OR instr(repo_root, ?) > 0)`
-      )
-      .all(before, before, options.repoSubstring ?? null, options.repoSubstring ?? null) as {
-      run_id: string
-    }[]
-    for (const row of rows) {
-      this.#db.prepare('DELETE FROM runs WHERE run_id = ?').run(row.run_id)
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      const rows = this.#db
+        .prepare(
+          `SELECT run_id FROM runs
+           WHERE status <> 'in-progress'
+             AND completed_at IS NOT NULL
+             AND (? IS NULL OR completed_at < ?)
+             AND (? IS NULL OR instr(repo_root, ?) > 0)`
+        )
+        .all(before, before, options.repoSubstring ?? null, options.repoSubstring ?? null) as {
+        run_id: string
+      }[]
+      const runIds = rows.map((row) => row.run_id)
+      if (runIds.length > 0) {
+        const placeholders = runIds.map(() => '?').join(', ')
+        this.#db.prepare(`DELETE FROM runs WHERE run_id IN (${placeholders})`).run(...runIds)
+      }
+      this.#db.exec('COMMIT')
+      return runIds
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
     }
-    return rows.map((row) => row.run_id)
   }
 
   runStatus(runId: string): RunStatus | undefined {

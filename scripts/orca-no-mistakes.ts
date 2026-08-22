@@ -2,6 +2,7 @@
 
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
+import { readdirSync } from 'node:fs'
 import { mkdir, readFile, realpath, stat, writeFile, rm } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -9,15 +10,27 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { PIPELINE_STEPS, type StageName } from './config.ts'
 import {
   DomainLedger,
+  RUN_ID_PATTERN,
   artifactsRoot,
   buildAttestation,
   capLog,
   evidenceSha256,
+  sha256,
   verifyManifest,
   type PassedAttestationManifest,
   type StageEvidenceManifestEntry
 } from './ledger.ts'
-export * from './ledger.ts'
+export {
+  DomainLedger,
+  buildAttestation,
+  canonicalEntry,
+  capLog,
+  merkleRoot,
+  sha256,
+  verifyManifest,
+  type PassedAttestationManifest,
+  type StageEvidenceManifestEntry
+} from './ledger.ts'
 export type FindingAction = 'ask-user' | 'auto-fix' | 'no-op'
 
 export type Finding = {
@@ -114,6 +127,9 @@ export async function runPipeline(
   if (!intent) {
     throw new Error('--intent is required')
   }
+  if (intent.includes('<untrusted_instruction>') || intent.includes('</untrusted_instruction>')) {
+    throw new Error('--intent must not contain untrusted_instruction delimiters')
+  }
   if (intent.includes('\n') || intent.includes('\0')) {
     throw new Error('--intent must be a single line')
   }
@@ -186,10 +202,11 @@ export async function runPipeline(
     const logsDir = path.join(artifactsDir, 'logs')
     await mkdir(logsDir, { recursive: true })
     const artifactPath = path.join(logsDir, `${stage}-r${round}-${attemptCounter++}.json`)
-    await writeFile(
-      artifactPath,
-      capLog(JSON.stringify({ exitCode, findings: report.findings, summary: report.summary, tested: report.tested }, null, 2))
+    const logContent = capLog(
+      JSON.stringify({ exitCode, findings: report.findings, summary: report.summary, tested: report.tested }, null, 2)
     )
+    await writeFile(artifactPath, logContent)
+    const artifactSha256 = sha256(logContent)
     const entry: StageEvidenceManifestEntry = {
       stage,
       round,
@@ -197,7 +214,9 @@ export async function runPipeline(
       baseCommitOid,
       workerIdentity,
       exitCode,
+      artifactSha256,
       evidenceSha256: evidenceSha256({
+        artifactSha256,
         baseCommitOid,
         candidateCommitOid: candidate,
         exitCode,
@@ -301,8 +320,10 @@ export async function runPipeline(
             shouldFix = true
             targetFindings = decision.selectedFindings
             guidance = decision.guidance
-          } else {
+          } else if (decision.action === 'stop') {
             throw new GateStopError(`${stage} gate stopped the pipeline: ${resolution}`)
+          } else {
+            throw new Error(`${stage} gate could not be resolved from: ${resolution}`)
           }
         } else {
           targetFindings = autoFixable
@@ -376,7 +397,7 @@ export async function runPipeline(
     ledger.recordAttestation(attestation)
     ledger.finishRun(runId, 'passed', terminalCommitOid)
     ledger.releaseLease(runId)
-    await orca.setWorktreeStatus(`no-mistakes passed all ${PIPELINE_STEPS.length} stages`, 'completed')
+    await orca.setWorktreeStatus(`no-mistakes passed all ${PIPELINE_STEPS.length} stages`, 'completed').catch(() => {})
     return { attestation, custodyNote, runId, steps: PIPELINE_STEPS }
   } catch (error) {
     if (retainedFixer) {
@@ -407,16 +428,18 @@ async function executeStage(
   git: GitOperations
 ): Promise<StageExecution> {
   if (stage === 'intent') {
-    return {
-      exitCode: 0,
-      report: { findings: [], summary: `Intent recorded: ${intent}` },
-      workerIdentity: 'coordinator'
-    }
+    const report: StageReport = { findings: [], summary: `Intent recorded: ${intent}` }
+    return { exitCode: exitCodeFor(report), report, workerIdentity: 'coordinator' }
   }
   if (stage === 'rebase') {
-    return { exitCode: 0, report: await git.rebase(repo.base), workerIdentity: 'coordinator' }
+    const report = await git.rebase(repo.base)
+    return { exitCode: exitCodeFor(report), report, workerIdentity: 'coordinator' }
   }
   return await runReviewer(stage, attempt, taskId, intent, evidenceDir, repo, orca)
+}
+
+function exitCodeFor(report: StageReport): number {
+  return report.findings.length > 0 ? 1 : 0
 }
 
 async function runReviewer(
@@ -445,9 +468,10 @@ async function runReviewer(
     worktree: 'new-child'
   })
   try {
+    const validatedReport = await validateReport(worker.report, stage, evidenceDir)
     return {
-      exitCode: 0,
-      report: await validateReport(worker.report, stage, evidenceDir),
+      exitCode: exitCodeFor(validatedReport),
+      report: validatedReport,
       workerIdentity: `reviewer:${worker.dispatchId}`
     }
   } finally {
@@ -1698,7 +1722,11 @@ export class GitShell implements GitOperations {
   }
 
   async policySha256(base: string): Promise<string> {
-    const trustedPaths = ['scripts/orca-no-mistakes.ts', 'scripts/config.ts']
+    const scriptDir = path.dirname(fileURLToPath(import.meta.url))
+    const trustedPaths = readdirSync(scriptDir)
+      .filter((file) => file.endsWith('.ts'))
+      .sort()
+      .map((file) => `scripts/${file}`)
     const digest = createHash('sha256')
     for (const filePath of trustedPaths) {
       const ref = (await this.#git(['cat-file', '-e', `origin/${base}:${filePath}`], true)).failed
@@ -1718,7 +1746,7 @@ export class GitShell implements GitOperations {
   }
 
   async anchorRecoveryRef(runId: string, oid: string): Promise<void> {
-    if (!/^[A-Za-z0-9._-]+$/.test(runId)) {
+    if (!RUN_ID_PATTERN.test(runId)) {
       throw new Error('Orca returned an unsafe Run ID')
     }
     await this.#git(['update-ref', `refs/no-mistakes/recover/${runId}`, oid])
@@ -1828,6 +1856,9 @@ function parseCli(argv: string[]): { command: string; flags: RawCliFlags; positi
     if (!value || value.startsWith('--')) throw new Error(`--${name} requires a value`)
     flags[name] = value
     if (inlineValue === undefined) index += 1
+  }
+  if (subcommand !== 'attestation' && positionals.length > 0) {
+    throw new Error(`${subcommand} does not accept positional arguments`)
   }
   return { command: subcommand, flags, positionals }
 }
@@ -1950,6 +1981,10 @@ Run options:
     try {
       pruned = ledger.prune({ before, repoSubstring })
       for (const runId of pruned) {
+        if (!RUN_ID_PATTERN.test(runId)) {
+          console.error(`no-mistakes: skipped unsafe artifact directory for run ${runId}`)
+          continue
+        }
         await rm(path.join(artifactsRoot(), runId), { force: true, recursive: true })
       }
     } finally {
@@ -2030,7 +2065,7 @@ async function runAttestationCommand(positionals: string[], flags: RawCliFlags):
     verifyManifest(manifest)
     let stored: PassedAttestationManifest | undefined
     try {
-      stored = await ledger.getAttestation(manifest.candidateCommitOid)
+      stored = await ledger.getAttestation(manifest.runId)
     } catch {
       stored = undefined
     }

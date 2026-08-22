@@ -25,6 +25,8 @@ Release 1 pulled forward two capabilities the list above assigns to later releas
 
 Release 2 still owns `--force-with-lease` delivery and pull-request creation; Release 4 still owns coordinator restart recovery, parked-gate reattachment, and three-way custody reconciliation. Every other item stands as decided.
 
+Note that the local "Passed Attestation" emitted at the end of Release 1 is distinct from the ADR-0005 "Passed" outcome: the attestation proves the delivered tree satisfied every required *local* validation policy, while full "Passed" — including remote delivery, PR, and CI proof — remains reserved for Release 4.
+
 ## Consequences
 
 Before a release is marked complete, an automated end-to-end scenario must exercise its claimed Git, Orca, gate, failure, and recovery behavior. For what is implemented today, see [`docs/current-architecture.md`](../current-architecture.md).

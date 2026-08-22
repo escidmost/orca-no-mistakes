@@ -17,6 +17,7 @@ import {
   parseGateResolution,
   runPipeline,
   merkleRoot,
+  canonicalEntry,
   sha256,
   verifyManifest,
   type Finding,
@@ -51,19 +52,21 @@ class FakeGit implements GitOperations {
   }
 
   async head(): Promise<string> {
-    return this.#operatorDiverged ? 'operator-head' : this.#head
+    return this.#operatorDiverged ? FakeGit.#oid(9_999) : this.#head
   }
 
   async rebase(base: string): Promise<StageReport> {
     this.calls.push(`rebase:${base}`)
     this.#baseOid = 'b'.repeat(40)
     if (this.rebaseConflict) {
+      // one-shot: the next rebase models the fixer having resolved the conflict
+      this.rebaseConflict = false
       return {
         findings: [
           {
             id: 'rebase-conflict',
             severity: 'error',
-            action: 'ask-user',
+            action: 'auto-fix',
             description: 'conflict; rebase aborted'
           }
         ],
@@ -86,7 +89,7 @@ class FakeGit implements GitOperations {
 
   async advanceIfUnchanged(fromOid: string, toOid: string): Promise<boolean> {
     this.calls.push(`ff:${fromOid}->${toOid}`)
-    if ((this.#operatorDiverged ? 'operator-head' : this.#head) !== fromOid) return false
+    if ((this.#operatorDiverged ? FakeGit.#oid(9_999) : this.#head) !== fromOid) return false
     this.#head = toOid
     return true
   }
@@ -380,6 +383,7 @@ test('exhaustion gate allows user to authorize another fix round', async () => {
 test('unknown gate decisions stop the pipeline and update worktree status', async () => {
   const git = new FakeGit()
   const orca = new FakeOrca(git)
+  const ledger = new DomainLedger(':memory:')
   orca.gateResolution = 'later'
   orca.reports.set('document', [
     {
@@ -396,10 +400,13 @@ test('unknown gate decisions stop the pipeline and update worktree status', asyn
   ])
 
   await assert.rejects(
-    runPipeline({ intent: 'Reject unknown decisions.' }, orca, git),
-    /document gate stopped the pipeline: later/
+    runPipeline({ intent: 'Reject unknown decisions.' }, orca, git, ledger),
+    /document gate could not be resolved from: later/
   )
   assert.ok(orca.calls.some((call) => call.includes('status:in-review:no-mistakes stopped:')))
+  const runs = ledger.listRuns()
+  assert.equal(runs.length, 1)
+  assert.equal(ledger.runStatus(runs[0].run_id), 'failed')
 })
 
 test('unsafe Orca Run IDs cannot escape the evidence directory', async () => {
@@ -530,6 +537,8 @@ test('CLI accepts equals syntax and preserves negative numeric values', async ()
     await assert.rejects(main(['run', '--force-lease=true', '--intent=x']), /--force-lease does not take a value/)
     await assert.rejects(main(['attestation']), /attestation requires export or verify/)
     await assert.rejects(main(['attestation', 'export']), /requires a run ID/)
+  await assert.rejects(main(['run', '--intent=x', 'stray-arg']), /run does not accept positional arguments/)
+  await assert.rejects(main(['prune', 'stray-arg']), /prune does not accept positional arguments/)
   } finally {
     await rm(temp, { recursive: true, force: true })
   }
@@ -1456,19 +1465,30 @@ test('the attestation keeps the policy digest captured at run start', async () =
   verifyManifest(result.attestation)
 })
 
-test('an aborted rebase keeps the pre-fetch base in evidence and the attestation', async () => {
+test('a rebase conflict fixes forward and rebases evidence onto the resolved base', async () => {
   const git = new FakeGit()
   git.rebaseConflict = true
   const orca = new FakeOrca(git)
   orca.gateResolution = 'approve'
 
-  const result = await runPipeline({ intent: 'Approve past a rebase conflict.' }, orca, git)
+  const result = await runPipeline({ intent: 'Fix past a rebase conflict.' }, orca, git)
 
   assert.ok(result.attestation)
-  assert.equal(result.attestation.baseCommitOid, '0'.repeat(40))
-  for (const entry of result.attestation.stageEvidence) {
-    assert.equal(entry.baseCommitOid, '0'.repeat(40))
+  assert.ok(
+    orca.launches.some((launch) => launch.role === 'fixer' && launch.stage === 'rebase'),
+    'expected a rebase fixer to run'
+  )
+  const failedAttempt = result.attestation.stageEvidence.find((entry) => entry.summary === 'rebase aborted')
+  assert.ok(failedAttempt, 'expected the conflicted attempt in evidence')
+  assert.equal(failedAttempt.baseCommitOid, '0'.repeat(40))
+  const rebased = result.attestation.stageEvidence.filter(
+    (entry) => entry.stage !== 'intent' && entry.summary !== 'rebase aborted'
+  )
+  assert.ok(rebased.length > 0)
+  for (const entry of rebased) {
+    assert.equal(entry.baseCommitOid, 'b'.repeat(40))
   }
+  assert.equal(result.attestation.baseCommitOid, 'b'.repeat(40))
   verifyManifest(result.attestation)
 })
 
@@ -1481,21 +1501,7 @@ test('verifyManifest recomputes each stage evidence hash', async () => {
   const forged = structuredClone(result.attestation)
   forged.stageEvidence[3].summary = 'rewritten after the fact'
   forged.merkleRoot = merkleRoot(
-    forged.stageEvidence.map((entry) =>
-      sha256(
-        JSON.stringify({
-          baseCommitOid: entry.baseCommitOid,
-          candidateCommitOid: entry.candidateCommitOid,
-          evidenceSha256: entry.evidenceSha256,
-          exitCode: entry.exitCode,
-          round: entry.round,
-          stage: entry.stage,
-          summary: entry.summary,
-          ...(entry.waiverOrApproval ? { waiverOrApproval: entry.waiverOrApproval } : {}),
-          workerIdentity: entry.workerIdentity
-        })
-      )
-    )
+    forged.stageEvidence.map((entry) => sha256(canonicalEntry(entry)))
   )
   assert.throws(() => verifyManifest(forged), /evidence hash does not match/)
 })
@@ -1527,7 +1533,37 @@ test('forced lease takeovers are fenced by generation tokens', () => {
   }
 })
 
-test('attestations stay resolvable per run when candidate commits repeat', () => {
+test('concurrent coordinators on separate connections fail closed against one lease', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'onm-ledger-race-'))
+  const dbPath = path.join(temp, 'ledger.db')
+  const first = new DomainLedger(dbPath)
+  const second = new DomainLedger(dbPath)
+  try {
+    for (const ledger of [first, second]) {
+      ledger.startRun({
+        baseBranch: 'main',
+        branch: 'feature',
+        intent: `Intent ${ledger.path}`,
+        policySha256: 'f'.repeat(64),
+        repoRoot: '/repo',
+        runId: ledger === first ? 'run-one' : 'run-two',
+        submissionCommitOid: 'a'.repeat(40)
+      })
+    }
+    const token = first.acquireLease({ branch: 'feature', repoRoot: '/repo', runId: 'run-one' })
+    assert.equal(token, 1)
+    assert.throws(
+      () => second.acquireLease({ branch: 'feature', repoRoot: '/repo', runId: 'run-two' }),
+      /already leased by run run-one/
+    )
+  } finally {
+    first.close()
+    second.close()
+    await rm(temp, { recursive: true, force: true })
+  }
+})
+
+test('attestations stay resolvable per run when candidate commits repeat, and commit lookup returns the most recent', () => {
   const ledger = new DomainLedger(':memory:')
   try {
     const candidate = 'c'.repeat(40)
@@ -1585,12 +1621,26 @@ test('legacy attestation ledgers are rebuilt onto the per-run key', async () => 
       intent_hash TEXT NOT NULL, merkle_root TEXT NOT NULL, manifest_json TEXT NOT NULL,
       coordinator_version TEXT NOT NULL, created_at TEXT NOT NULL
     );
+    INSERT INTO runs VALUES (
+      'run-legacy', '/repo', 'feature', 'main', '${'a'.repeat(40)}', '${'c'.repeat(40)}',
+      'Legacy intent', '${sha256('Legacy intent')}', '${'f'.repeat(64)}',
+      'passed', '2026-01-01T00:00:00.000Z', '2026-01-01T00:05:00.000Z'
+    );
+    INSERT INTO passed_attestations VALUES (
+      '${'c'.repeat(40)}', 'run-legacy', '${'a'.repeat(40)}', '${'f'.repeat(64)}',
+      'Legacy intent', '${sha256('Legacy intent')}', '${'d'.repeat(64)}',
+      '${JSON.stringify({ merkleRoot: 'd'.repeat(64), runId: 'run-legacy', version: '1.0.0', candidateCommitOid: 'c'.repeat(40), baseCommitOid: 'a'.repeat(40), policySha256: 'f'.repeat(64), intent: 'Legacy intent', intentHash: sha256('Legacy intent'), stageEvidence: [], coordinatorVersion: 'test', createdAt: '2026-01-01T00:00:00.000Z' })}',
+      '0.1.0', '2026-01-01T00:05:00.000Z'
+    );
   `)
   legacy.close()
   const reopened = new DomainLedger(dbPath)
   try {
     const shape = reopened.tableDefinition('passed_attestations')
     assert.match(shape ?? '', /run_id TEXT PRIMARY KEY/)
+    const manifest = reopened.getAttestation('run-legacy')
+    assert.equal(manifest.runId, 'run-legacy')
+    assert.equal(reopened.getAttestation('c'.repeat(40)).runId, 'run-legacy')
   } finally {
     reopened.close()
     await rm(temp, { recursive: true, force: true })

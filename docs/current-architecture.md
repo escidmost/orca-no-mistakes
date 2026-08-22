@@ -21,7 +21,7 @@ All identity and provenance state lives in SQLite at `~/.orca-no-mistakes/ledger
 - `stage_checkpoints` — the intent stage records a reconciliation snapshot at round 0; every fixer round records its input and output commit OIDs (each fixer must commit a distinct change).
 - `stage_evidence` — one row per stage execution binding stage id, round, candidate/base commit OIDs, worker identity, exit code, summary, artifact path, and the SHA-256 evidence digest.
 - `gate_audit` — every human gate resolution with question, offered options, raw resolution, parsed decision, and guidance.
-- `passed_attestations` — the manifest JSON and Merkle root for each passed candidate commit.
+- `passed_attestations` — one row per passed run keyed by run ID, holding the manifest JSON and Merkle root; lookups by candidate commit OID return the most recent attestation.
 
 Set `ORCA_NO_MISTAKES_HOME` to relocate `~/.orca-no-mistakes` (used by tests and sandboxes).
 
