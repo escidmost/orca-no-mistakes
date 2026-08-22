@@ -24,6 +24,9 @@ import {
   classifyHarness,
   classifyPreflightFailure,
   collectResidualResources,
+  extractStructuredJson,
+  harnessTitleMatcher,
+  isBinaryMissingOutput,
   nativeWorkerStartArgs,
   parseAcpTarget,
   readinessMatcher,
@@ -2472,6 +2475,7 @@ export class CliOrca implements OrcaOperations {
   ): Promise<void> {
     const waitsForPrompt = harness.toLowerCase() === "agy" && !promptSubmitted;
     const ready = readinessMatcher(harness);
+    const harnessTookOver = harnessTitleMatcher(harness);
     const deadline = Date.now() + workerAgentReadyTimeoutMs();
     let consecutiveMatches = 0;
     for (;;) {
@@ -2506,6 +2510,17 @@ export class CliOrca implements OrcaOperations {
           throw new PreflightError(
             "readiness-timeout",
             "worker agent terminal disconnected during startup",
+          );
+        const titleLine = `${terminal.title ?? ""}`;
+        const renderedOutput = `${terminal.preview ?? ""}`;
+        if (
+          isBinaryMissingOutput(titleLine, harness) ||
+          (!harnessTookOver(terminal.title) &&
+            isBinaryMissingOutput(renderedOutput, harness))
+        )
+          throw new PreflightError(
+            "binary-missing",
+            `worker agent ${harness} is not installed: ${`${titleLine}\n${renderedOutput}`.trim().slice(-200)}`,
           );
         if (
           ready({
@@ -2623,6 +2638,10 @@ export class CliOrca implements OrcaOperations {
         report = acpReportFrom(unwrapJson<unknown>(result.stdout));
       } catch {
         report = undefined;
+      }
+      if (!report) {
+        const extracted = extractStructuredJson(result.stdout);
+        report = extracted === undefined ? undefined : acpReportFrom(extracted);
       }
       if (!report)
         throw new Error(`acp target ${target} returned an invalid report`);
@@ -3059,9 +3078,22 @@ export class CliOrca implements OrcaOperations {
               error: `worker ${dispatchId} used an unsafe report path`,
             };
           }
-          const report = JSON.parse(
-            await readFile(reportPath, "utf8"),
-          ) as StageReport;
+          const rawReport = await readFile(reportPath, "utf8");
+          let parsedReport: unknown;
+          try {
+            parsedReport = JSON.parse(rawReport);
+          } catch {
+            parsedReport = extractStructuredJson(rawReport);
+          }
+          if (parsedReport === undefined || parsedReport === null)
+            throw new Error("report file contained no JSON value");
+          const report = acpReportFrom(parsedReport);
+          if (!report) {
+            return {
+              deliveryId: result.deliveryId,
+              error: `worker ${dispatchId} returned an invalid report`,
+            };
+          }
           return { deliveryId: result.deliveryId, report };
         } catch (error) {
           return {
