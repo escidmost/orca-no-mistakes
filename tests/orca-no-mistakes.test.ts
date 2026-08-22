@@ -3791,6 +3791,57 @@ test("resolved role timeout_ms bounds reviewer execution", async () => {
   assert.equal(ledger.runStatus(ledger.listRuns()[0].run_id), "failed");
 });
 
+test("a timed-out fixer never applies commits after the run fails", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  class SlowFixerOrca extends FakeOrca {
+    async startWorker(
+      taskId: string,
+      launch: WorkerLaunch,
+    ): Promise<WorkerResult> {
+      if (launch.role === "fixer") {
+        await new Promise((resolve) => setTimeout(resolve, 75));
+      }
+      return super.startWorker(taskId, launch);
+    }
+  }
+  const orca = new SlowFixerOrca(git);
+  const ledger = new DomainLedger(":memory:");
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Null input crashes the command",
+        },
+      ],
+      summary: "one defect",
+    },
+  ]);
+
+  await assert.rejects(
+    runPipeline(
+      {
+        intent: "Fence late fixers.",
+        cliFlags: { fixer: { timeout_ms: 10 } } as never,
+      },
+      orca,
+      git,
+      ledger,
+    ),
+    /review fixer exceeded its 10ms execution timeout/,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(
+    git.calls.filter((call) => call.startsWith("apply:")).length,
+    0,
+    "no worktree commits may land after the timeout",
+  );
+  assert.equal(ledger.runStatus(ledger.listRuns()[0].run_id), "failed");
+});
+
 test("stage evidence binds effective policy provenance into artifacts and the ledger", async () => {
   const git = new FakeGit();
   allowReviewAutoFix(git);

@@ -321,12 +321,18 @@ export class DomainLedger {
     }
     this.#db.exec(SCHEMA)
     // ponytail: nullable provenance columns added post-release; ALTER is the
-    // idempotent path for ledgers created before ONM-40.
+    // idempotent path for ledgers created before ONM-40. Only the expected
+    // duplicate-column failure is tolerated — anything else fails startup.
     for (const column of ['effective_policy_hash TEXT', 'base_ref_sha TEXT']) {
       try {
         this.#db.exec(`ALTER TABLE stage_evidence ADD COLUMN ${column}`)
-      } catch {
-        // Column already exists.
+      } catch (error) {
+        if (
+          !(error instanceof Error) ||
+          !/duplicate column name/i.test(error.message)
+        ) {
+          throw error
+        }
       }
     }
   }

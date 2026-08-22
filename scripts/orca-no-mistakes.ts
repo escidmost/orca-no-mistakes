@@ -579,7 +579,7 @@ export async function runPipeline(
         const nextFixer = await withTimeout(
           fixerRoles.timeout_ms,
           `${stage} fixer`,
-          () =>
+          async (fence) =>
             runFixer(
               stage,
               round,
@@ -591,6 +591,7 @@ export async function runPipeline(
               fixerRoles,
               orca,
               git,
+              fence,
             ),
         );
         if (nextFixer.fallbackAttempts && nextFixer.resolvedAgent) {
@@ -721,20 +722,22 @@ function launchCandidates(
   return agents.length > 0 ? agents : [undefined];
 }
 
-// ponytail: hard wall-clock boundary only; the abandoned worker's cleanup runs
-// whenever its underlying promise settles.
+// ponytail: hard wall-clock boundary; the abandoned worker keeps running until
+// its promise settles, so `fence` lets it decline any further repo mutation.
 async function withTimeout<T>(
   timeoutMs: number | undefined,
   label: string,
-  run: () => Promise<T>,
+  run: (fence: { aborted: boolean }) => Promise<T>,
 ): Promise<T> {
-  if (timeoutMs === undefined) return await run();
+  if (timeoutMs === undefined) return await run({ aborted: false });
+  const fence = { aborted: false };
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
-      run(),
+      run(fence),
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
+          fence.aborted = true;
           reject(new Error(`${label} exceeded its ${timeoutMs}ms execution timeout`));
         }, timeoutMs);
       }),
@@ -946,6 +949,7 @@ async function runFixer(
   role: ResolvedRoleConfig,
   orca: OrcaOperations,
   git: GitOperations,
+  fence: { readonly aborted: boolean },
 ): Promise<{
   after: string;
   before: string;
@@ -985,6 +989,11 @@ async function runFixer(
     await validateReport(worker.report, stage, path.dirname(reportPath));
     if (!worker.worktreePath) {
       throw new Error(`${stage} fixer did not return a worktree path`);
+    }
+    if (fence.aborted) {
+      // The execution timeout already failed this stage; refuse late mutations
+      // so a delayed worker cannot apply commits into a settled run.
+      throw new Error(`${stage} fixer timed out; commits were not applied`);
     }
     if (!(await git.applyWorktreeCommits(worker.worktreePath, before))) {
       throw new Error(`${stage} fixer could not apply its committed change`);
