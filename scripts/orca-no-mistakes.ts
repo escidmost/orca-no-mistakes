@@ -140,7 +140,7 @@ export async function runPipeline(
   }
 
   let baseCommitOid = repo.baseOid
-  let policySha256Value = await git.policySha256(repo.base)
+  const policySha256Value = await git.policySha256(repo.base)
   ledger.startRun({
     baseBranch: repo.base,
     branch: repo.branch,
@@ -251,8 +251,6 @@ export async function runPipeline(
         const execution = await executeStage(stage, attempt++, taskId, intent, artifactsDir, repo, orca, git)
         if (stage === 'rebase' && execution.report.findings.length === 0) {
           baseCommitOid = await git.resolveBaseOid(repo.base)
-          policySha256Value = await git.policySha256(repo.base)
-          ledger.updateRunPolicy(runId, policySha256Value)
         }
         await recordStageEvidence(stage, round, execution.workerIdentity, execution.exitCode, execution.report)
         return execution.report

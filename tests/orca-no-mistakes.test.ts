@@ -75,7 +75,8 @@ class FakeGit implements GitOperations {
   }
 
   async policySha256(): Promise<string> {
-    return 'f'.repeat(64)
+    this.calls.push('policy')
+    return this.#baseOid === 'b'.repeat(40) ? 'e'.repeat(64) : 'f'.repeat(64)
   }
 
   async resolveBaseOid(): Promise<string> {
@@ -1441,6 +1442,17 @@ test('the attestation binds the base commit fetched by the rebase stage', async 
       assert.equal(entry.baseCommitOid, 'b'.repeat(40))
     }
   }
+  verifyManifest(result.attestation)
+})
+
+test('the attestation keeps the policy digest captured at run start', async () => {
+  const git = new FakeGit()
+  const orca = new FakeOrca(git)
+  const result = await runPipeline({ intent: 'Pin the policy digest.' }, orca, git)
+
+  assert.ok(result.attestation)
+  assert.equal(result.attestation.policySha256, 'f'.repeat(64))
+  assert.equal(git.calls.filter((call) => call === 'policy').length, 1)
   verifyManifest(result.attestation)
 })
 

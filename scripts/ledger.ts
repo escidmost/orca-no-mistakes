@@ -316,10 +316,6 @@ export class DomainLedger {
       )
   }
 
-  updateRunPolicy(runId: string, policySha256: string): void {
-    this.#db.prepare('UPDATE runs SET policy_sha256 = ? WHERE run_id = ?').run(policySha256, runId)
-  }
-
   finishRun(runId: string, status: Exclude<RunStatus, 'in-progress'>, terminalCommitOid?: string): void {
     this.#db
       .prepare('UPDATE runs SET status = ?, completed_at = ?, terminal_commit_oid = COALESCE(?, terminal_commit_oid) WHERE run_id = ?')
