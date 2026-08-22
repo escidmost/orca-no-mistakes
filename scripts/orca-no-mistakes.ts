@@ -575,7 +575,8 @@ export async function runPipeline(
             attempts: nextFixer.fallbackAttempts,
             resolvedAgent: nextFixer.resolvedAgent,
           };
-        }        ledger.recordCheckpoint({
+        }
+        ledger.recordCheckpoint({
           inputCommitOid: nextFixer.before,
           outputCommitOid: nextFixer.after,
           roundIndex: round,
@@ -726,8 +727,8 @@ export async function startWorkerWithFallback(
   const attempts: FallbackAttempt[] = [];
   for (const [index, launch] of launches.entries()) {
     const startedAt = Date.now();
+    const taskId = await createTask(launch);
     try {
-      const taskId = await createTask(launch);
       const worker = await orca.startWorker(taskId, launch);
       return {
         attempts,
@@ -736,6 +737,13 @@ export async function startWorkerWithFallback(
       };
     } catch (error) {
       if (!(error instanceof PreflightError)) throw error;
+      await orca
+        .completeTask(taskId, {
+          findings: [],
+          summary: `skipped: ${error.failureClass} — fallback advanced to the next candidate`,
+          tested: [],
+        })
+        .catch(() => {});
       attempts.push({
         agent: launch.agent?.harness ?? DEFAULT_WORKER_AGENT,
         durationMs: Date.now() - startedAt,
@@ -2356,12 +2364,10 @@ export class CliOrca implements OrcaOperations {
       }
       if (result.code !== 0) {
         const detail = `${result.stderr}\n${result.stdout}`.trim();
-        // exit 124 means our own runner timeout killed acpx: the target never
-        // delivered a task result, so treat it as a startup/readiness failure.
-        const failureClass =
-          result.code === 124
-            ? ("readiness-timeout" as PreflightFailureClass)
-            : classifyPreflightFailure(detail);
+        // Our own runner timeout (exit 124) stays an execution-phase error:
+        // by then the target may have accepted the task, and captured
+        // stdout/stderr give no acceptance marker to tell the phases apart.
+        const failureClass = classifyPreflightFailure(detail);
         const message = `acp target ${target} failed (exit ${result.code}): ${detail.slice(-400)}`;
         if (
           failureClass === "quota" ||

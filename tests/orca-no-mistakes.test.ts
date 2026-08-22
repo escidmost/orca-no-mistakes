@@ -2591,7 +2591,7 @@ test("fallback chains settle each failed candidate before the next launch", asyn
     await mkdir(evidence, { recursive: true });
     await writeFile(
       reportPath,
-      JSON.stringify({ findings: [], summary: "second candidate done", tested: true }),
+      JSON.stringify({ findings: [], summary: "second candidate done", tested: [] }),
     );
     await writeFile(
       fakeOrca,
@@ -2851,7 +2851,7 @@ test("each fallback candidate is dispatched with its own task spec", async () =>
   assert.doesNotMatch(checkTasks[1].spec, /Do not write a report file/);
 });
 
-test("acp runner timeouts are treated as preflight readiness failures", async () => {
+test("acp runner timeouts stay execution-phase failures", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-acp-timeout-"));
   const fakeAcpx = path.join(temp, "acpx");
   const fakeOrca = path.join(temp, "orca");
@@ -2884,9 +2884,8 @@ out({ worktree: { id: 'wt-timeout', path: ${JSON.stringify(worktreePath)} } })
         worktree: "new-child",
       }),
       (error: unknown) => {
-        assert.ok(error instanceof PreflightError);
-        assert.equal(error.failureClass, "readiness-timeout");
-        assert.match(error.message, /exit 124/);
+        assert.ok(!(error instanceof PreflightError));
+        assert.match((error as Error).message, /exit 124/);
         return true;
       },
     );
