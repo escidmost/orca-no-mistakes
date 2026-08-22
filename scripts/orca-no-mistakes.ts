@@ -217,6 +217,11 @@ export const DEFAULT_MAX_FIX_ROUNDS = 3;
 
 export class GateStopError extends Error {}
 
+// Thrown when a rewritten-history custody transfer failed after the operator's
+// branch ref was already advanced: the run must fail instead of degrading to a
+// custody note, so the operator is told something went wrong.
+export class PostMutationCustodyError extends Error {}
+
 export class RecoveryAnchorError extends Error {
   readonly outcome: "cancelled" | "failed";
 
@@ -636,6 +641,9 @@ export async function runPipeline(
             submissionCommitOid,
           );
         } catch (error) {
+          if (error instanceof PostMutationCustodyError) {
+            throw error;
+          }
           transferFailure =
             error instanceof Error ? error.message : String(error);
         }
@@ -3255,7 +3263,11 @@ export class GitShell implements GitOperations {
           true,
         ).catch(() => {});
       }
-      throw error;
+      throw new PostMutationCustodyError(
+        `custody transfer failed after advancing the operator branch: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
     }
   }
 

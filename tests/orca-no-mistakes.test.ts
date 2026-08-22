@@ -22,6 +22,7 @@ import {
   DomainLedger,
   GitShell,
   PIPELINE_STEPS,
+  PostMutationCustodyError,
   RecoveryAnchorError,
   launchAgent,
   startWorkerWithFallback,
@@ -80,6 +81,7 @@ class FakeGit implements GitOperations {
     if (content !== undefined) this.#agentsMdOids.add(this.#currentHead());
   }
   throwOnApply = false;
+  postMutationThrowOnApply = false;
   #operatorDiverged = false;
   #headReadBroken = false;
   readonly #branch: string;
@@ -204,6 +206,10 @@ class FakeGit implements GitOperations {
     this.calls.push(`apply:${sourcePath}:${expectedHead}`);
     if (this.throwOnApply)
       throw new Error("worker worktree must be clean before applying commits");
+    if (this.postMutationThrowOnApply)
+      throw new PostMutationCustodyError(
+        "custody transfer failed after advancing the operator branch: simulated reset failure",
+      );
     if (this.dirtyDelivery) return false;
     if (this.#head !== expectedHead) return false;
     this.advanceHead();
@@ -3739,6 +3745,35 @@ test("a pipeline-side transfer failure is reported as such, not as operator dive
   assert.ok(deliveryGit.calls.some((call) => call.startsWith("apply:")));
   assert.ok(deliveryGit.calls.some((call) => call.startsWith("recover:")));
   assert.equal(ledger.runStatus(result.runId), "passed");
+});
+
+test("a post-mutation transfer failure fails the run instead of certifying it passed", async () => {
+  const gateGit = new FakeGit("/gate", "no-mistakes-gate-test");
+  const deliveryGit = new FakeGit("/origin", "feature");
+  deliveryGit.postMutationThrowOnApply = true;
+  const orca = new FakeOrca(gateGit);
+  const ledger = new DomainLedger(":memory:");
+
+  let failure: unknown;
+  try {
+    await runPipeline(
+      { deliveryGit, intent: "Transfer broke after mutating the branch." },
+      orca,
+      gateGit,
+      ledger,
+    );
+  } catch (error) {
+    failure = error;
+  }
+
+  assert.ok(failure instanceof PostMutationCustodyError);
+  assert.match(
+    (failure as Error).message,
+    /custody transfer failed after advancing the operator branch/,
+  );
+  const { recoverRef } = failure as Error & { recoverRef?: string };
+  assert.match(recoverRef ?? "", /^refs\/no-mistakes\/recover\//);
+  assert.ok(deliveryGit.calls.some((call) => call.startsWith("recover:")));
 });
 
 test("failed terminations tag the anchored recovery ref for the terminal notification", async () => {
