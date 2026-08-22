@@ -793,6 +793,7 @@ function fixerInstructions(stage: StageName): string {
 
     case 'rebase':
       return `Rules:
+- The coordinator already aborted the conflicting rebase, so your worktree is clean; start by re-running the rebase onto the base branch to reproduce the conflicts.
 - Find all conflicting files and resolve the conflict markers (<<<<<<< ======= >>>>>>>).
 - After resolving each file, stage it with: git add <file>
 - Preserve the intent of both the current branch changes and the upstream changes.
