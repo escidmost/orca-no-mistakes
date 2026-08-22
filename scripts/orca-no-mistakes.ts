@@ -158,6 +158,7 @@ export type RepoSnapshot = {
 export interface GitOperations {
   assertReady(): Promise<RepoSnapshot>;
   assertClean(): Promise<void>;
+  isClean(): Promise<boolean>;
   head(): Promise<string>;
   /** Diff between the resolved trusted base and the captured HEAD snapshot
    *  (merge-base three-dot form). Must throw on failure so a missing diff
@@ -620,10 +621,11 @@ export async function runPipeline(
             submissionCommitOid,
             terminalCommitOid,
           )
-        : await deliveryGit.applyWorktreeCommits(
+        : (await deliveryGit.isClean()) &&
+          (await deliveryGit.applyWorktreeCommits(
             repo.root,
             submissionCommitOid,
-          ))
+          )))
     ) {
       custodyNote = `advanced branch ${deliveryRepo.branch} from submission to terminal commit ${terminalCommitOid}`;
     } else {
@@ -3118,9 +3120,12 @@ export class GitShell implements GitOperations {
     return resolved;
   }
 
+  async isClean(): Promise<boolean> {
+    return !(await this.#git(["status", "--porcelain"])).stdout.trim();
+  }
+
   async assertClean(): Promise<void> {
-    const status = (await this.#git(["status", "--porcelain"])).stdout.trim();
-    if (status)
+    if (!(await this.isClean()))
       throw new Error("no-mistakes requires a clean committed worktree");
   }
 

@@ -63,6 +63,7 @@ class FakeGit implements GitOperations {
   #head = FakeGit.#oid(1);
   #baseOid = FakeGit.#oid(0);
   divergeAfterAnchor = false;
+  dirtyDelivery = false;
   failRecoveryAnchor = false;
   rebaseConflict = false;
   diffOutput = "";
@@ -108,6 +109,10 @@ class FakeGit implements GitOperations {
 
   async assertClean(): Promise<void> {
     this.calls.push("assert-clean");
+  }
+
+  async isClean(): Promise<boolean> {
+    return !this.dirtyDelivery;
   }
 
   async head(): Promise<string> {
@@ -236,11 +241,9 @@ class FakeOrca implements OrcaOperations {
   gateResolution = "approve";
   #taskNumber = 0;
   #dispatchNumber = 0;
-  #git: FakeGit;
   #runId: string;
 
-  constructor(git: FakeGit, runId = `test-run-${randomUUID()}`) {
-    this.#git = git;
+  constructor(_git: FakeGit, runId = `test-run-${randomUUID()}`) {
     this.#runId = runId;
   }
 
@@ -3676,6 +3679,29 @@ test("custody return preserves diverged operator checkouts behind a recovery ref
   );
   assert.ok(!git.calls.some((call) => call.startsWith("ff:")));
   assert.ok(git.calls.some((call) => call.startsWith("recover:")));
+  assert.equal(ledger.runStatus(result.runId), "passed");
+});
+
+test("a dirty delivery checkout preserves custody behind a recovery ref instead of failing the run", async () => {
+  const gateGit = new FakeGit("/gate", "no-mistakes-gate-test");
+  const deliveryGit = new FakeGit("/origin", "feature");
+  deliveryGit.dirtyDelivery = true;
+  const orca = new FakeOrca(gateGit);
+  const ledger = new DomainLedger(":memory:");
+
+  const result = await runPipeline(
+    {
+      deliveryGit,
+      intent: "Dirty operator checkout.",
+    },
+    orca,
+    gateGit,
+    ledger,
+  );
+
+  assert.match(result.custodyNote ?? "", /refs\/no-mistakes\/recover\//);
+  assert.ok(!deliveryGit.calls.some((call) => call.startsWith("apply:")));
+  assert.ok(deliveryGit.calls.some((call) => call.startsWith("recover:")));
   assert.equal(ledger.runStatus(result.runId), "passed");
 });
 
