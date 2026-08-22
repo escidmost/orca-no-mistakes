@@ -68,6 +68,8 @@ class FakeGit implements GitOperations {
   failRecoveryAnchor = false;
   failHeadAfterAnchor = false;
   failRebase = false;
+  fixerCreatesCommit = true;
+  protectedTestMutation?: string;
   rebaseConflict = false;
   diffOutput = "";
   #agentsMdAtHead?: string;
@@ -117,6 +119,19 @@ class FakeGit implements GitOperations {
     this.calls.push("assert-clean");
   }
 
+  async assertFixerChangesAllowed(
+    sourcePath: string,
+    baseOid: string,
+    expectedHead: string,
+  ): Promise<void> {
+    this.calls.push(`guard:${sourcePath}:${baseOid}:${expectedHead}`);
+    if (this.protectedTestMutation) {
+      throw new Error(
+        `fixer modified pre-existing test files: ${this.protectedTestMutation}`,
+      );
+    }
+  }
+
   async head(): Promise<string> {
     if (this.#headReadBroken)
       throw new Error(`could not read HEAD in ${this.#root}`);
@@ -130,11 +145,10 @@ class FakeGit implements GitOperations {
 
   async headOf(worktreePath: string): Promise<string> {
     this.calls.push(`headof:${worktreePath}`);
-    let oid = this.#workerHeads.get(worktreePath);
-    if (!oid) {
-      oid = FakeGit.#oid(++this.#counter);
-      this.#workerHeads.set(worktreePath, oid);
-    }
+    const oid = this.fixerCreatesCommit
+      ? FakeGit.#oid(++this.#counter)
+      : this.#currentHead();
+    this.#workerHeads.set(worktreePath, oid);
     return oid;
   }
 
@@ -215,7 +229,7 @@ class FakeGit implements GitOperations {
       );
     if (this.dirtyDelivery) return false;
     if (this.#head !== expectedHead || fence?.aborted) return false;
-    this.advanceHead();
+    this.#head = this.#workerHeads.get(sourcePath) ?? FakeGit.#oid(++this.#counter);
     return true;
   }
 
@@ -467,17 +481,29 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
     (launch) => launch.role === "fixer",
   );
   assert.equal(fixerLaunches.length, 2);
-  assert.ok(fixerLaunches.every((launch) => launch.worktree === "new-child"));
-  assert.ok(fixerLaunches.every((launch) => launch.terminal === undefined));
+  assert.equal(fixerLaunches[0].worktree, "new-child");
+  assert.equal(fixerLaunches[0].terminal, undefined);
+  assert.equal(fixerLaunches[1].worktree, "current");
+  assert.equal(fixerLaunches[1].terminal, "term-fixer");
   assert.ok(
     orca.fixerDispatches.every((dispatchId) =>
-      orca.calls.includes(`release:${dispatchId}`),
+      orca.calls.includes(`retain:${dispatchId}`),
     ),
-    "every fixer dispatch is released",
+    "every fixer dispatch retains the durable fixer terminal",
   );
+  assert.ok(orca.calls.includes(`release:${orca.fixerDispatches.at(-1)}`));
   assert.equal(
     git.calls.filter((call) => call.startsWith("apply:/worktrees/")).length,
     2,
+  );
+  assert.equal(
+    new Set(
+      git.calls
+        .filter((call) => call.startsWith("apply:/worktrees/"))
+        .map((call) => call.split(":", 2)[1]),
+    ).size,
+    1,
+    "fix rounds share one fixer worktree",
   );
   assert.ok(
     orca.calls.some(
@@ -546,7 +572,12 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
   assert.match(
     orca.tasks.find((task) => task.spec.startsWith("[review fix 1]"))?.spec ??
       "",
-    /Do NOT modify existing test assertions/,
+    /Do NOT modify or delete pre-existing test files/,
+  );
+  assert.match(
+    orca.tasks.find((task) => task.spec.startsWith("[review fix 1]"))?.spec ??
+      "",
+    /implementation source code and new regression test files only/,
   );
   assert.match(
     orca.tasks.find((task) => task.spec.startsWith("[lint fix 1]"))?.spec ?? "",
@@ -580,6 +611,96 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
   assert.equal(
     orca.calls.at(-1),
     `status:completed:no-mistakes passed all ${PIPELINE_STEPS.length} stages`,
+  );
+});
+
+test("fix rounds reuse one durable fixer terminal and worktree", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  const orca = new FakeOrca(git);
+  const finding: Finding = {
+    id: "review-1",
+    severity: "error",
+    action: "auto-fix",
+    description: "The defect remains after the first repair.",
+  };
+  orca.reports.set("review", [
+    { findings: [finding], summary: "first failure" },
+    pass("first fix"),
+    { findings: [finding], summary: "second failure" },
+    pass("second fix"),
+    pass("clean rereview"),
+  ]);
+
+  await runPipeline({ intent: "Repair the persistent defect." }, orca, git);
+
+  const fixers = orca.launches.filter((launch) => launch.role === "fixer");
+  assert.equal(fixers.length, 2);
+  assert.equal(fixers[0].terminal, undefined);
+  assert.equal(fixers[0].worktree, "new-child");
+  assert.equal(fixers[1].terminal, "term-fixer");
+  assert.equal(fixers[1].worktree, "current");
+  assert.ok(orca.calls.includes(`release:${orca.fixerDispatches.at(-1)}`));
+});
+
+test("fixer mutations to trusted-base tests fail before commit application", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  git.protectedTestMutation = "tests/existing.test.ts";
+  const orca = new FakeOrca(git);
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Repair the implementation.",
+        },
+      ],
+      summary: "one defect",
+    },
+    pass("fix attempted"),
+  ]);
+
+  await assert.rejects(
+    runPipeline({ intent: "Protect existing assertions." }, orca, git),
+    /fixer modified pre-existing test files: tests\/existing\.test\.ts/,
+  );
+  assert.ok(git.calls.some((call) => call.startsWith("guard:/worktrees/")));
+  assert.equal(
+    git.calls.some((call) => call.startsWith("apply:/worktrees/")),
+    false,
+  );
+});
+
+test("a fixer round without a new commit fails closed", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  git.fixerCreatesCommit = false;
+  const orca = new FakeOrca(git);
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Repair the implementation.",
+        },
+      ],
+      summary: "one defect",
+    },
+    pass("no committed fix"),
+  ]);
+
+  await assert.rejects(
+    runPipeline({ intent: "Require committed fixes." }, orca, git),
+    /review fixer did not commit a change/,
+  );
+  assert.equal(
+    git.calls.some((call) => call.startsWith("apply:/worktrees/")),
+    false,
   );
 });
 
@@ -2031,6 +2152,54 @@ test("GitShell.diffBase falls back to a local base branch when origin lacks it",
       shell.diffBase("main", "f".repeat(40)),
       /could not compute the branch diff/,
     );
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("GitShell rejects fixer changes to base tests but permits new test files", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-git-fixer-guard-"));
+  const repo = path.join(temp, "repo");
+  const worker = path.join(temp, "worker");
+  try {
+    git(temp, "init", "-b", "main", repo);
+    git(repo, "config", "user.email", "test@example.com");
+    git(repo, "config", "user.name", "Test User");
+    await mkdir(path.join(repo, "tests"));
+    await writeFile(
+      path.join(repo, "tests/existing.test.ts"),
+      'assert.equal(value, "expected");\n',
+    );
+    git(repo, "add", "tests/existing.test.ts");
+    git(repo, "commit", "-m", "base test");
+    const baseOid = git(repo, "rev-parse", "HEAD");
+    git(repo, "checkout", "-b", "feature");
+    await writeFile(path.join(repo, "feature.ts"), "export const value = 1;\n");
+    git(repo, "add", "feature.ts");
+    git(repo, "commit", "-m", "feature");
+    const featureHead = git(repo, "rev-parse", "HEAD");
+    git(repo, "worktree", "add", "--detach", worker, featureHead);
+
+    await writeFile(
+      path.join(worker, "tests/existing.test.ts"),
+      'assert.ok(value);\n',
+    );
+    git(worker, "add", "tests/existing.test.ts");
+    git(worker, "commit", "-m", "weaken test");
+    const shell = new GitShell({ repo });
+    await assert.rejects(
+      shell.assertFixerChangesAllowed(worker, baseOid, featureHead),
+      /fixer modified pre-existing test files: tests\/existing\.test\.ts/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "tests/new-regression.test.ts"),
+      'assert.equal(value, 1);\n',
+    );
+    git(worker, "add", "tests/new-regression.test.ts");
+    git(worker, "commit", "-m", "add regression test");
+    await shell.assertFixerChangesAllowed(worker, baseOid, featureHead);
   } finally {
     await rm(temp, { recursive: true, force: true });
   }

@@ -33,7 +33,7 @@ The coordinator creates one Orca Run and an ordered six-task DAG:
 
 `intent` records the supplied objective behind `<untrusted_instruction>` framing. `rebase` is a coordinator-run Git operation; the other stages are worker evaluations returning structured reports. Release 1 executes no remote push, PR creation, or CI reconciliation.
 
-Reviewers and fixers run as fresh workers in disposable child worktrees; fixer commits are applied back to the coordinator's isolated gate worktree. Every fixer round must leave a clean worktree and create a new commit; review-stage fixers are forbidden from weakening existing test assertions or linter configurations.
+Reviewers run as fresh workers in disposable child worktrees. A compatible fixer terminal and child worktree are retained across fix rounds, with each committed repair applied back to the coordinator's isolated gate worktree; a role change releases them before launching the newly configured fixer. Every fixer round must leave a clean worktree and create a new commit. Fixer prompts restrict edits to implementation source and new regression tests (or the narrower stage-specific document/rebase scope), and the coordinator rejects any fixer commit that changes a test file present on the trusted base.
 
 Each stage and role resolves its own agent from the configuration tiers, and the launch adapter dispatches on the resolved harness:
 
