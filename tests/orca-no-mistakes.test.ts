@@ -1796,6 +1796,53 @@ test("GitShell applies append-only commits and adopts rewritten history behind a
   }
 });
 
+test("three-way containment advances clean checkouts and preserves diverged ones behind a recovery ref", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-containment-"));
+  const repo = path.join(temp, "repo");
+  const gate = path.join(temp, "gate");
+  try {
+    git(temp, "init", repo);
+    git(repo, "config", "user.email", "test@example.com");
+    git(repo, "config", "user.name", "Test User");
+    git(repo, "checkout", "-b", "feature");
+    await writeFile(path.join(repo, "feature.txt"), "before\n");
+    git(repo, "add", "feature.txt");
+    git(repo, "commit", "-m", "submission");
+    const submission = git(repo, "rev-parse", "HEAD");
+    git(repo, "worktree", "add", "-b", "gate", gate, "feature");
+    await writeFile(path.join(gate, "feature.txt"), "after\n");
+    git(gate, "add", "feature.txt");
+    git(gate, "commit", "-m", "terminal");
+    const terminal = git(gate, "rev-parse", "HEAD");
+    const shell = new GitShell({ repo });
+
+    // Diverged checkout (C_op != C_sub): HEAD untouched, terminal behind ref.
+    await writeFile(path.join(repo, "author.txt"), "author edit\n");
+    git(repo, "add", "author.txt");
+    git(repo, "commit", "-m", "author edit");
+    const divergedHead = git(repo, "rev-parse", "HEAD");
+    assert.notEqual(divergedHead, submission);
+    assert.equal(await shell.applyWorktreeCommits(gate, submission), false);
+    assert.equal(git(repo, "rev-parse", "HEAD"), divergedHead);
+    await shell.anchorRecoveryRef("run-containment", terminal);
+    assert.equal(
+      git(repo, "rev-parse", "refs/no-mistakes/recover/run-containment"),
+      terminal,
+    );
+
+    // Clean checkout (C_op == C_sub): custody returns via fast-forward.
+    git(repo, "reset", "--hard", submission);
+    assert.equal(await shell.applyWorktreeCommits(gate, submission), true);
+    assert.equal(git(repo, "rev-parse", "HEAD"), terminal);
+    assert.equal(
+      await readFile(path.join(repo, "feature.txt"), "utf8"),
+      "after\n",
+    );
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test("GitShell.pathExists proves absence at tree level and fails closed on inspection errors", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-git-"));
   const origin = path.join(temp, "origin.git");
@@ -3622,6 +3669,14 @@ test("custody return preserves diverged operator checkouts behind a recovery ref
   assert.match(
     result.custodyNote ?? "",
     /diverged.*refs\/no-mistakes\/recover\//,
+  );
+  assert.match(
+    result.custodyNote ?? "",
+    /git log refs\/no-mistakes\/recover\//,
+  );
+  assert.match(
+    result.custodyNote ?? "",
+    /git rebase refs\/no-mistakes\/recover\//,
   );
   assert.ok(!git.calls.some((call) => call.startsWith("ff:")));
   assert.ok(git.calls.some((call) => call.startsWith("recover:")));

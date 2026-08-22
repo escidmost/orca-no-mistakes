@@ -609,6 +609,10 @@ export async function runPipeline(
     }
 
     const terminalCommitOid = await git.head();
+    // Anchor custody before the containment decision: in gate mode the gate
+    // worktree is removed after the run, so the terminal commit must be
+    // referenced in the delivery repo before any HEAD-advancing merge is
+    // attempted. On clean runs the ref is a harmless bookmark.
     await deliveryGit.anchorRecoveryRef(runId, terminalCommitOid);
     const operatorHead = await deliveryGit.head();
     let custodyNote: string;
@@ -631,7 +635,10 @@ export async function runPipeline(
     ) {
       custodyNote = `advanced branch ${deliveryRepo.branch} from submission to terminal commit ${terminalCommitOid}`;
     } else {
-      custodyNote = `operator checkout diverged from the pipeline head; terminal commit preserved at refs/no-mistakes/recover/${runId}`;
+      const recoverRef = `refs/no-mistakes/recover/${runId}`;
+      custodyNote =
+        `operator checkout diverged from the pipeline head; pipeline commits preserved at ${recoverRef} — ` +
+        `inspect with \`git log ${recoverRef}\`, then integrate with e.g. \`git rebase ${recoverRef}\``;
     }
 
     const attestation = buildAttestation(stageEntries, {
