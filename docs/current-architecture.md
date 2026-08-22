@@ -6,7 +6,7 @@ This document describes implemented behavior for Release 1 (Local Adversarial Va
 
 `orca-no-mistakes` supports three commands:
 
-- `run` launches the coordinator detached in a dedicated Orca terminal tab and returns `{"detached":true,"terminalHandle":"..."}`. If `--notify <handle>` is passed or `ORCA_TERMINAL_HANDLE` is set, the coordinator also notifies that terminal when a decision gate opens. (The internal `--attached` flag runs synchronously inside the spawned terminal tab).
+- `run` launches the coordinator detached in an isolated child gate worktree and dedicated Orca terminal tab and returns `{"detached":true,"terminalHandle":"..."}`. If `--notify <handle>` is passed or `ORCA_TERMINAL_HANDLE` is set, the coordinator also notifies that terminal when a decision gate opens. (The internal `--attached` flag runs synchronously inside the spawned terminal tab).
 - `attestation export|verify` reads or checks Passed Attestation manifests against the domain ledger and retained evidence.
 - `prune [--before <date>] [--repo <substring>]` deletes completed runs (cascading checkpoints, evidence, gate audit rows, attestations) plus their artifact directories.
 
@@ -33,12 +33,12 @@ The coordinator creates one Orca Run and an ordered six-task DAG:
 
 `intent` records the supplied objective behind `<untrusted_instruction>` framing. `rebase` is a coordinator-run Git operation; the other stages are worker evaluations returning structured reports. Release 1 executes no remote push, PR creation, or CI reconciliation.
 
-Reviewers run as fresh workers in disposable child worktrees. Fixes run through one retained worker terminal on the operator's current worktree. Every fixer round must leave a clean worktree and create a new commit; review-stage fixers are forbidden from weakening existing test assertions or linter configurations.
+Reviewers and fixers run as fresh workers in disposable child worktrees; fixer commits are applied back to the coordinator's isolated gate worktree. Every fixer round must leave a clean worktree and create a new commit; review-stage fixers are forbidden from weakening existing test assertions or linter configurations.
 
 Each stage and role resolves its own agent from the configuration tiers, and the launch adapter dispatches on the resolved harness:
 
 - `claude`, `codex`, and `cursor` launch through native `orca orchestration worker-start`, which receives the resolved model, effort, and timeout as flags.
-- `opencode`, `grok`, and `gemini` launch in a spawned terminal by sending a shell-quoted startup command carrying the resolved model, variant, and any `agent_args_override` entries, then dispatching instructions by injection.
+- `opencode`, `grok`, `gemini`, and `agy` launch in a spawned terminal by sending a shell-quoted startup command carrying the resolved model, variant, and any `agent_args_override` entries, then dispatching instructions by injection. `agy` support includes custom readiness matching, interactive prompt dispatch, and automatic workspace trust configuration in `~/.gemini/antigravity-cli/settings.json`.
 - `acp:<target>` harnesses run through the `acpx` runner (`acpx --format quiet --approve-all <target> exec "<prompt>"`) and must return a JSON stage report.
 
 Terminal-launched harnesses use per-harness readiness matchers; startup waits up to `WORKER_AGENT_READY_TIMEOUT_MS` milliseconds (default 60000) before the terminal and any allocated worktree are torn down. With no configuration the default remains one `opencode` worker per role on the agent's own default model; `--reviewer-model`, `--fixer-model`, and `--fixer-effort` override per role at the highest precedence.
