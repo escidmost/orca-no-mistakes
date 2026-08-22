@@ -1229,6 +1229,11 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
 } else if (args[0] === 'terminal' && args[1] === 'create') {
   out({ terminal: { handle: 'agy-shell' } })
 } else if (args[0] === 'terminal' && args[1] === 'send') {
+  const text = args[args.indexOf('--text') + 1]
+  if (text?.includes('--prompt-interactive')) {
+    const promptFile = fs.readdirSync(${JSON.stringify(evidence)}).find((name) => name.startsWith('prompt-'))
+    fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(['prompt-content', fs.readFileSync(${JSON.stringify(evidence)} + '/' + promptFile, 'utf8')]) + '\\n')
+  }
   out({ accepted: true })
 } else if (args[0] === 'terminal' && args[1] === 'show') {
   out({ terminal: { connected: true, title: 'Antigravity', preview: 'ready' } })
@@ -1268,15 +1273,17 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     const dispatch = calls.find(
       (args) => args[0] === "orchestration" && args[1] === "dispatch",
     );
-    assert.equal(sends[0][sends[0].indexOf("--text") + 1], "'agy'");
-    assert.equal(sends[1][sends[1].indexOf("--text") + 1], "authenticated");
-    assert.ok(!sends[1].includes("--enter"));
-    assert.ok(sends[2].includes("--enter"));
-    assert.ok(!sends[2].includes("--text"));
+    const launchCommand = sends[0][sends[0].indexOf("--text") + 1];
+    assert.equal(sends.length, 1);
+    assert.match(launchCommand, /'agy' --prompt-interactive/);
+    assert.ok(!launchCommand.includes("authenticated"));
+    assert.deepEqual(
+      calls.find((args) => args[0] === "prompt-content"),
+      ["prompt-content", "authenticated"],
+    );
+    assert.ok(calls.indexOf(dispatch!) < calls.indexOf(sends[0]));
     assert.ok(
-      calls.filter(
-        (args) => args[0] === "terminal" && args[1] === "read",
-      ).length >= 2,
+      !(await readdir(evidence)).some((name) => name.startsWith("prompt-")),
     );
     assert.ok(!dispatch?.includes("--inject"));
     assert.ok(dispatch?.includes("--return-preamble"));

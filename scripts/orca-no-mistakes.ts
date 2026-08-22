@@ -1457,14 +1457,14 @@ export class CliOrca implements OrcaOperations {
     if (launch.agent && classifyHarness(launch.agent.harness) === "acp") {
       return await this.#startAcpWorker(taskId, launch);
     }
-    // Start the agent first, then deliver the authenticated dispatch preamble.
+    const directPreamble = launch.agent?.harness.toLowerCase() === "agy";
+    const launchWithPreamble = directPreamble && !launch.terminal;
     const prepared = launch.terminal
       ? undefined
       : await this.#prepareWorker(taskId, launch);
     const terminalHandle = prepared?.terminalHandle ?? launch.terminal;
     if (!terminalHandle)
       throw new Error("worker preparation returned no terminal handle");
-    const directPreamble = launch.agent?.harness.toLowerCase() === "agy";
     const args = [
       "orchestration",
       "dispatch",
@@ -1510,25 +1510,27 @@ export class CliOrca implements OrcaOperations {
       }
       throw new Error("dispatch returned an invalid receipt");
     }
+    let promptPath: string | undefined;
     if (directPreamble) {
       try {
-        await this.#json([
-          "terminal",
-          "send",
-          "--terminal",
-          terminalHandle,
-          "--text",
-          preamble,
-          "--json",
-        ]);
-        await this.#json([
-          "terminal",
-          "send",
-          "--terminal",
-          terminalHandle,
-          "--enter",
-          "--json",
-        ]);
+        if (launchWithPreamble) {
+          promptPath = await this.#launchWorkerAgent(
+            terminalHandle,
+            launch,
+            preamble,
+          );
+        } else {
+          await this.#json([
+            "terminal",
+            "send",
+            "--terminal",
+            terminalHandle,
+            "--text",
+            preamble,
+            "--enter",
+            "--json",
+          ]);
+        }
       } catch (error) {
         await this.#cleanupFailedWorker(
           dispatchId,
@@ -1566,6 +1568,8 @@ export class CliOrca implements OrcaOperations {
         deliveryId,
       );
       throw error;
+    } finally {
+      if (promptPath) await rm(promptPath, { force: true });
     }
   }
 
@@ -1751,7 +1755,8 @@ export class CliOrca implements OrcaOperations {
       if (!terminalHandle)
         throw new Error("terminal create returned an invalid receipt");
 
-      await this.#launchWorkerAgent(terminalHandle, launch);
+      if (launch.agent?.harness.toLowerCase() !== "agy")
+        await this.#launchWorkerAgent(terminalHandle, launch);
       return {
         terminalHandle,
         worktreeId: worktree.id,
@@ -1780,7 +1785,8 @@ export class CliOrca implements OrcaOperations {
       prepared.terminalHandle = created?.terminal?.handle ?? "";
       if (!prepared.terminalHandle)
         throw new Error("terminal create returned an invalid receipt");
-      await this.#launchWorkerAgent(prepared.terminalHandle, launch);
+      if (launch.agent?.harness.toLowerCase() !== "agy")
+        await this.#launchWorkerAgent(prepared.terminalHandle, launch);
       return prepared;
     } catch (error) {
       await this.#cleanupPreparedWorker(prepared);
@@ -1791,31 +1797,56 @@ export class CliOrca implements OrcaOperations {
   async #launchWorkerAgent(
     terminalHandle: string,
     launch: WorkerLaunch,
-  ): Promise<void> {
+    initialPrompt?: string,
+  ): Promise<string | undefined> {
     const harness = launch.agent?.harness ?? DEFAULT_WORKER_AGENT;
-    await this.#json([
-      "terminal",
-      "send",
-      "--terminal",
-      terminalHandle,
-      "--text",
-      buildCliCommand(harness, {
+    let promptPath: string | undefined;
+    try {
+      let launchCommand = buildCliCommand(harness, {
         agentArgsOverride: launch.agent?.agentArgsOverride,
         effort: launch.agent?.effort,
         model: launch.agent?.model,
         variant: launch.agent?.variant,
-      }),
-      "--enter",
-      "--json",
-    ]);
-    await this.#waitForWorkerAgent(terminalHandle, harness);
+      });
+      if (initialPrompt !== undefined) {
+        const promptDir = path.join(
+          artifactsRoot(),
+          this.#runId ?? "unbound",
+        );
+        await mkdir(promptDir, { recursive: true });
+        promptPath = path.join(promptDir, `prompt-${randomUUID()}.txt`);
+        await writeFile(promptPath, initialPrompt, { mode: 0o600 });
+        launchCommand += ` --prompt-interactive "$(cat -- ${shellQuote(promptPath)})"`;
+      }
+      await this.#json([
+        "terminal",
+        "send",
+        "--terminal",
+        terminalHandle,
+        "--text",
+        launchCommand,
+        "--enter",
+        "--json",
+      ]);
+      await this.#waitForWorkerAgent(
+        terminalHandle,
+        harness,
+        initialPrompt !== undefined,
+      );
+      return promptPath;
+    } catch (error) {
+      if (promptPath) await rm(promptPath, { force: true });
+      throw error;
+    }
   }
 
   async #waitForWorkerAgent(
     terminalHandle: string,
     harness: string,
+    promptSubmitted = false,
   ): Promise<void> {
-    const waitsForPrompt = harness.toLowerCase() === "agy";
+    const waitsForPrompt =
+      harness.toLowerCase() === "agy" && !promptSubmitted;
     const ready = readinessMatcher(harness);
     const deadline = Date.now() + workerAgentReadyTimeoutMs();
     let consecutiveMatches = 0;
