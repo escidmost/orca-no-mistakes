@@ -18,4 +18,4 @@ The target architecture is delivered in four independently useful releases. Each
 
 ## Consequences
 
-Before a release is marked complete, an automated end-to-end scenario must exercise its claimed Git, Orca, gate, failure, and recovery behavior. The current implementation contains pieces from several releases but does not complete any target release; see [`docs/current-architecture.md`](../current-architecture.md).
+Before a release is marked complete, an automated end-to-end scenario must exercise its claimed Git, Orca, gate, failure, and recovery behavior. The current implementation delivers the Release 1 stage set and pulls forward branch leases and preserved recovery refs from later releases; see [`docs/current-architecture.md`](../current-architecture.md).

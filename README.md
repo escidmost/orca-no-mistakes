@@ -46,7 +46,7 @@ Workers launch with the `opencode` agent on model `openai/gpt-5.6-luna` at max r
 
 ```bash
 orca-no-mistakes attestation export <run-id-or-commit-sha> [--out manifest.json]
-orca-no-mistakes attestation verify <manifest.json>
+orca-no-mistakes attestation verify <manifest-file|run-id|commit-sha>
 orca-no-mistakes prune [--before <date>] [--repo <name-substring>]
 ```
 

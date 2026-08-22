@@ -1,6 +1,6 @@
 # Current Architecture
 
-This document describes implemented behavior in version `0.2.0` (Release 1: Local Adversarial Validation Core). The ADRs under `docs/adr/` describe accepted target architecture; their `implementation` metadata states how much is current guarantee.
+This document describes implemented behavior for Release 1 (Local Adversarial Validation Core). The ADRs under `docs/adr/` describe accepted target architecture; their `implementation` metadata states how much is current guarantee.
 
 ## Entry points
 
