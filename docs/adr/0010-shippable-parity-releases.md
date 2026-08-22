@@ -16,6 +16,15 @@ The target architecture is delivered in four independently useful releases. Each
 3. **Authoritative PR, CI, and Delivery Proof** adds complete GitHub reconciliation, trusted check-set completeness, expected-head non-bypass delivery, and delivered-tree verification. It may report `checks-passed` and verified delivery facts, but still withholds full Passed because custody recovery is absent.
 4. **Resilient Recovery and Custody Synchronization** adds coordinator restart recovery, parked-gate reattachment, preserved recovery refs, three-way custody reconciliation, and safe return of pipeline-created commits. Once every ADR-0005 invariant is implemented and accepted, this release may emit Passed.
 
+## Amendment 2026-08-21
+
+Release 1 pulled forward two capabilities the list above assigns to later releases, because both are prerequisites for a trustworthy local attestation rather than remote-delivery features:
+
+- Repository-scoped semantic branch leases (item 2) — a local run must fail closed when a second run holds the branch, otherwise stage evidence is not bound to a single custodian.
+- Preserved recovery refs and fast-forward custody return (item 4) — `refs/no-mistakes/recover/<run-id>` anchors pipeline-created commits so a local run cannot strand them.
+
+Release 2 still owns `--force-with-lease` delivery and pull-request creation; Release 4 still owns coordinator restart recovery, parked-gate reattachment, and three-way custody reconciliation. Every other item stands as decided.
+
 ## Consequences
 
-Before a release is marked complete, an automated end-to-end scenario must exercise its claimed Git, Orca, gate, failure, and recovery behavior. The current implementation delivers the Release 1 stage set and pulls forward branch leases and preserved recovery refs from later releases; see [`docs/current-architecture.md`](../current-architecture.md).
+Before a release is marked complete, an automated end-to-end scenario must exercise its claimed Git, Orca, gate, failure, and recovery behavior. For what is implemented today, see [`docs/current-architecture.md`](../current-architecture.md).
