@@ -197,14 +197,6 @@ class FakeGit implements GitOperations {
     return this.#baseOid;
   }
 
-  async advanceIfUnchanged(fromOid: string, toOid: string): Promise<boolean> {
-    this.calls.push(`ff:${fromOid}->${toOid}`);
-    if ((this.#operatorDiverged ? FakeGit.#oid(9_999) : this.#head) !== fromOid)
-      return false;
-    this.#head = toOid;
-    return true;
-  }
-
   async applyWorktreeCommits(
     sourcePath: string,
     expectedHead: string,
@@ -1746,11 +1738,6 @@ test("GitShell rebases a clean feature branch, hashes trusted policy, and return
     assert.match(policyBefore, /^[0-9a-f]{64}$/);
     const head = await shell.head();
 
-    assert.equal(
-      await shell.advanceIfUnchanged("deadbeef".repeat(5).slice(0, 40), head),
-      false,
-    );
-    assert.equal(await shell.advanceIfUnchanged(head, head), true);
     await shell.anchorRecoveryRef("run-custody", head);
     assert.equal(
       git(repo, "rev-parse", "refs/no-mistakes/recover/run-custody"),
@@ -3695,7 +3682,7 @@ test("custody return preserves diverged operator checkouts behind a recovery ref
     result.custodyNote ?? "",
     /git rebase refs\/no-mistakes\/recover\//,
   );
-  assert.ok(!git.calls.some((call) => call.startsWith("ff:")));
+  assert.ok(!git.calls.some((call) => call.startsWith("apply:")));
   assert.ok(git.calls.some((call) => call.startsWith("recover:")));
   assert.equal(ledger.runStatus(result.runId), "passed");
 });

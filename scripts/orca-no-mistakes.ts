@@ -169,7 +169,6 @@ export interface GitOperations {
   pathExists(ref: string, filePath: string): Promise<boolean>;
   policySha256(base: string): Promise<string>;
   resolveBaseOid(base: string): Promise<string>;
-  advanceIfUnchanged(fromOid: string, toOid: string): Promise<boolean>;
   applyWorktreeCommits(
     sourcePath: string,
     expectedHead: string,
@@ -202,6 +201,10 @@ export type PipelineResult = {
 type RepoState = Awaited<ReturnType<GitOperations["assertReady"]>>;
 
 type CustodyTaggedError = Error & { recoverRef?: string };
+
+function recoveryRefFor(runId: string): string {
+  return `refs/no-mistakes/recover/${runId}`;
+}
 
 function recoveryInstructions(recoverRef: string): string {
   return (
@@ -623,25 +626,18 @@ export async function runPipeline(
           ? `branch ${deliveryRepo.branch} already at submission commit ${submissionCommitOid}`
           : `branch ${deliveryRepo.branch} carries the terminal commit ${terminalCommitOid}`;
     } else {
-      const recoverRef = `refs/no-mistakes/recover/${runId}`;
+      const recoverRef = recoveryRefFor(runId);
       let advanced = false;
       let transferFailure: string | undefined;
-      if (operatorHead === submissionCommitOid) {
-        if (deliveryGit === git) {
-          advanced = await deliveryGit.advanceIfUnchanged(
+      if (deliveryGit !== git && operatorHead === submissionCommitOid) {
+        try {
+          advanced = await deliveryGit.applyWorktreeCommits(
+            repo.root,
             submissionCommitOid,
-            terminalCommitOid,
           );
-        } else {
-          try {
-            advanced = await deliveryGit.applyWorktreeCommits(
-              repo.root,
-              submissionCommitOid,
-            );
-          } catch (error) {
-            transferFailure =
-              error instanceof Error ? error.message : String(error);
-          }
+        } catch (error) {
+          transferFailure =
+            error instanceof Error ? error.message : String(error);
         }
       }
       custodyNote = advanced
@@ -690,8 +686,7 @@ export async function runPipeline(
     if (anchoredOid !== undefined && error instanceof Error) {
       const operatorHead = await deliveryGit.head().catch(() => undefined);
       if (operatorHead !== anchoredOid) {
-        (error as CustodyTaggedError).recoverRef =
-          `refs/no-mistakes/recover/${runId}`;
+        (error as CustodyTaggedError).recoverRef = recoveryRefFor(runId);
       }
     }
     if (!anchorError) ledger.releaseLease(runId);
@@ -3194,13 +3189,6 @@ export class GitShell implements GitOperations {
     return digest.digest("hex");
   }
 
-  async advanceIfUnchanged(fromOid: string, toOid: string): Promise<boolean> {
-    const current = await this.head();
-    if (current !== fromOid) return false;
-    const merge = await this.#git(["merge", "--ff-only", toOid], true);
-    return !merge.failed;
-  }
-
   async applyWorktreeCommits(
     sourcePath: string,
     expectedHead: string,
@@ -3288,7 +3276,7 @@ export class GitShell implements GitOperations {
     if (!RUN_ID_PATTERN.test(runId)) {
       throw new Error("Orca returned an unsafe Run ID");
     }
-    await this.#git(["update-ref", `refs/no-mistakes/recover/${runId}`, oid]);
+    await this.#git(["update-ref", recoveryRefFor(runId), oid]);
   }
 
   async rebase(base: string): Promise<StageReport> {
