@@ -361,8 +361,9 @@ export async function runPipeline(
       exitCode: number,
       report: StageReport,
       fallback: { attempts: FallbackAttempt[]; resolvedAgent: string },
+      evidenceCommitOid?: string,
     ): Promise<void> => {
-      const candidate = await git.head();
+      const candidate = evidenceCommitOid ?? (await git.head());
       const logsDir = path.join(artifactsDir, "logs");
       await mkdir(logsDir, { recursive: true });
       const artifactPath = path.join(
@@ -481,10 +482,18 @@ export async function runPipeline(
         if (stage === "rebase" && execution.report.findings.length === 0) {
           baseCommitOid = await git.resolveBaseOid(repo.base);
         }
-        await recordStageEvidence(stage, round, execution.workerIdentity, execution.exitCode, execution.report, {
-          attempts: execution.fallbackAttempts ?? [],
-          resolvedAgent: execution.resolvedAgent,
-        });
+        await recordStageEvidence(
+          stage,
+          round,
+          execution.workerIdentity,
+          execution.exitCode,
+          execution.report,
+          {
+            attempts: execution.fallbackAttempts ?? [],
+            resolvedAgent: execution.resolvedAgent,
+          },
+          execution.evidenceCommitOid,
+        );
         return execution.report;
       };
       let report = await runStage();
@@ -782,8 +791,10 @@ type StageExecution = {
   exitCode: number;
   report: StageReport;
   workerIdentity: string;
-  fallbackAttempts?: FallbackAttempt[];
   resolvedAgent: string;
+  fallbackAttempts?: FallbackAttempt[];
+  /** Commit the stage actually reviewed/pinned, when it differs from HEAD. */
+  evidenceCommitOid?: string;
 };
 
 async function executeStage(
@@ -890,6 +901,7 @@ async function runReviewer(
       ...(outcome.attempts.length > 0
         ? { fallbackAttempts: outcome.attempts }
         : {}),
+      evidenceCommitOid: untrusted.headOid,
     };
   } finally {
     await orca.finishWorker(worker, "release");
@@ -3184,15 +3196,50 @@ export class GitShell implements GitOperations {
       const applied = await this.#git(["merge", "--ff-only", sourceHead], true);
       return !applied.failed;
     }
-    // The fixer rewrote history (e.g. completed an aborted rebase): adopt its
-    // HEAD only after preserving the previous checkout under a backup ref.
-    const backup = await this.#git(
-      ["update-ref", `refs/no-mistakes/backup/${expectedHead}`, expectedHead],
-      true,
-    );
-    if (backup.failed) return false;
-    const reset = await this.#git(["reset", "--hard", sourceHead], true);
-    return !reset.failed;
+    // The fixer rewrote history (e.g. completed an aborted rebase): adopt it
+    // via an atomic compare-and-swap of the branch ref so a concurrent branch
+    // update aborts before the worktree changes. Detached checkouts have no
+    // ref to clobber and adopt directly.
+    const branch = (
+      await this.#git(["rev-parse", "--abbrev-ref", "HEAD"], true)
+    ).stdout.trim();
+    const casSucceeded =
+      !branch || branch === "HEAD"
+        ? true
+        : (
+            await this.#git(
+              ["update-ref", `refs/heads/${branch}`, sourceHead, expectedHead],
+              true,
+            )
+          ).code === 0;
+    if (!casSucceeded) return false;
+    try {
+      const backup = await this.#git(
+        [
+          "update-ref",
+          `refs/no-mistakes/backup/${expectedHead}`,
+          expectedHead,
+        ],
+        true,
+      );
+      if (backup.failed) throw new Error(backup.output);
+      const reset = await this.#git(["reset", "--hard", sourceHead], true);
+      if (reset.failed) throw new Error(reset.output);
+      return true;
+    } catch (error) {
+      if (branch && branch !== "HEAD") {
+        await this.#git(
+          [
+            "update-ref",
+            `refs/heads/${branch}`,
+            expectedHead,
+            sourceHead,
+          ],
+          true,
+        ).catch(() => {});
+      }
+      throw error;
+    }
   }
 
   async headOf(worktreePath: string): Promise<string> {

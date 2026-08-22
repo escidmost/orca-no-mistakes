@@ -1946,6 +1946,82 @@ test("a failed fixer leaves its worktree commits anchored for recovery", async (
   assert.ok(orca.removedWorktrees.length > 0);
 });
 
+test("stage evidence binds to the reviewer's pinned commit even if the branch advances", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  const ledger = new DomainLedger(":memory:");
+  const finishWorker = orca.finishWorker.bind(orca);
+  let advanced = false;
+  orca.finishWorker = async (worker, disposition) => {
+    await finishWorker(worker, disposition);
+    if (!advanced) {
+      advanced = true;
+      git.advanceHead();
+    }
+  };
+  const result = await runPipeline(
+    { intent: "Add the requested command." },
+    orca,
+    git,
+    ledger,
+  );
+  const reviewedCommit = orca.launches.find(
+    (launch) => launch.role === "reviewer",
+  )?.commitOid;
+  assert.ok(reviewedCommit);
+  assert.ok(result.attestation);
+  assert.equal(
+    result.attestation.stageEvidence.find((entry) => entry.stage === "review")
+      ?.candidateCommitOid,
+    reviewedCommit,
+  );
+});
+
+test("rewritten-history adoption never clobbers a concurrently advanced branch", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-git-race-"));
+  const origin = path.join(temp, "origin.git");
+  const operator = path.join(temp, "operator");
+  try {
+    git(temp, "init", "--bare", "-b", "main", origin);
+    git(temp, "clone", origin, operator);
+    git(operator, "config", "user.email", "test@example.com");
+    git(operator, "config", "user.name", "Test User");
+    await writeFile(path.join(operator, "f.txt"), "base\nfeat\n");
+    git(operator, "add", "f.txt");
+    git(operator, "commit", "-m", "base+feat");
+    const pinnedHead = git(operator, "rev-parse", "HEAD");
+    git(operator, "checkout", "-b", "feature");
+
+    const upstream = path.join(temp, "upstream");
+    git(temp, "clone", origin, upstream);
+    git(upstream, "config", "user.email", "test@example.com");
+    git(upstream, "config", "user.name", "Test User");
+    await writeFile(path.join(upstream, "up.txt"), "upstream\n");
+    git(upstream, "add", "up.txt");
+    git(upstream, "commit", "-m", "upstream");
+    git(upstream, "push", "origin", "main");
+
+    git(operator, "fetch", "origin", "main");
+    const worker = path.join(temp, "worker-wt");
+    git(operator, "worktree", "add", "--detach", worker, pinnedHead);
+    git(worker, "rebase", "origin/main");
+    const rewritten = git(worker, "rev-parse", "HEAD");
+
+    // Concurrent advance: the feature branch moves while the checkout stays
+    // detached at the submission commit.
+    git(operator, "checkout", "--detach", pinnedHead);
+    git(operator, "branch", "-f", "feature", "origin/main");
+    const advancedBranch = git(operator, "rev-parse", "feature");
+
+    const shell = new GitShell({ repo: operator });
+    assert.equal(await shell.applyWorktreeCommits(worker, pinnedHead), true);
+    assert.equal(git(operator, "rev-parse", "HEAD"), rewritten);
+    assert.equal(git(operator, "rev-parse", "feature"), advancedBranch);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, {
     cwd,
@@ -3346,11 +3422,6 @@ test("reviewer fallback attempts are recorded in stage evidence with resolved_ag
   assert.equal(
     reviewLog.fallbackAttempts?.[0].failureClass,
     "readiness-timeout",
-||||||| parent of 2ede919 (ONM-18: review follow-ups for untrusted branch framing)
-  assert.throws(
-    () =>
-      launchAgent({ auto_fix: autoFix, agent: ["opencode", "grok"] as never }),
-    /agent fallback chains arrive in ONM-39/,
   );
 });
 
