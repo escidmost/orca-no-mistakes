@@ -13,7 +13,7 @@ The runner must launch worker agents across diverse agent harnesses without comp
 
 - **Tri-Modal Launch Dispatch Strategy**:
   1. *Native Orchestration*: Native Orca `worker-start` preferences are used for supported harnesses (`codex`, `cursor`).
-  2. *Terminal Spawn + Authenticated Dispatch*: For CLI harnesses (`claude`, `opencode`, `grok`, `gemini`), the adapter spawns an isolated terminal, sends the agent startup command formatted with configured model, effort/variant, and `agent_args_override`, and awaits readiness. OpenCode, Grok, and Gemini use injected dispatch. Claude receives a five-second shell-startup grace period, creates the authenticated dispatch without injection, and receives the returned preamble through terminal input so immediate prompt processing is not misclassified as `agent_prompt_stalled`.
+  2. *Terminal Spawn + Authenticated Dispatch*: For CLI harnesses (`claude`, `opencode`, `grok`, `gemini`), the adapter spawns an isolated terminal, sends the agent startup command formatted with configured model, effort/variant, and `agent_args_override`, and awaits readiness. OpenCode, Grok, and Gemini use injected dispatch. Claude receives a ten-second shell-startup grace period, creates the authenticated dispatch without injection, and receives the returned preamble through terminal input so immediate prompt processing is not misclassified as `agent_prompt_stalled`.
   3. *ACP Target Execution*: For `acp:<target>` harnesses, the adapter invokes the `acpx` execution runner against the target server.
 
 - **Modular Readiness Detection**:

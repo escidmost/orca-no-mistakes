@@ -1880,7 +1880,7 @@ function acpReportFrom(parsed: unknown): StageReport | undefined {
 const DEFAULT_WORKER_AGENT = "opencode";
 const WORKER_IDLE_TIMEOUT_MS = 1_800_000;
 const NATIVE_WORKER_CREATE_SLACK_MS = 120_000;
-const CLAUDE_SHELL_STARTUP_DELAY_MS = 5_000;
+const CLAUDE_SHELL_STARTUP_DELAY_MS = 10_000;
 
 function claudeShellStartupDelayMs(): number {
   const configured = Number(process.env.CLAUDE_SHELL_STARTUP_DELAY_MS);
