@@ -130,6 +130,13 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
     /cannot express effort without a model/
   )
   assert.equal(
+    buildCliCommand('opencode', {
+      agentArgsOverride: { opencode: ['--model', 'custom-model'] } as never,
+      effort: 'high'
+    }),
+    `'opencode' '--variant' 'high' '--model' 'custom-model'`
+  )
+  assert.equal(
     buildCliCommand('opencode', { effort: 'medium', variant: 'high' }),
     `'opencode' '--variant' 'high'`
   )

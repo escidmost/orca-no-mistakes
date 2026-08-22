@@ -136,7 +136,13 @@ export function buildCliCommand(harness: string, options: CliAgentCommandOptions
   }
   // Model-scoped effort carriers (--variant) need their model; an explicit
   // variant option supersedes the effort knob by one declared precedence rule.
-  if (options.effort && effortKnob?.requiresModel && !options.model && !options.variant) {
+  if (
+    options.effort &&
+    effortKnob?.requiresModel &&
+    !options.model &&
+    !pinsAnyFlag(raw, MODEL_PIN_FLAGS) &&
+    !options.variant
+  ) {
     throw new Error(
       `agent ${harness}: cannot express effort without a model; ${effortKnob.flag} selects a model-scoped variant`
     )
