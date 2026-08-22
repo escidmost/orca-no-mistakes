@@ -174,6 +174,8 @@ export interface GitOperations {
     sourcePath: string,
     expectedHead: string,
   ): Promise<boolean>;
+  /** Resolves the current HEAD commit of a worker worktree. */
+  headOf(worktreePath: string): Promise<string>;
   anchorRecoveryRef(runId: string, oid: string): Promise<void>;
 }
 
@@ -567,6 +569,7 @@ export async function runPipeline(
         );
         const nextFixer = await runFixer(
           stage,
+          runId,
           round,
           taskId,
           intent,
@@ -898,6 +901,7 @@ async function runReviewer(
 
 async function runFixer(
   stage: StageName,
+  runId: string,
   round: number,
   parentTask: string,
   intent: string,
@@ -965,6 +969,18 @@ async function runFixer(
         : {}),
     };
   } finally {
+    if (worker.worktreePath) {
+      try {
+        // Preserve fixer commits even when validation or custody fails below:
+        // the worktree is removed right after this.
+        await git.anchorRecoveryRef(
+          `${runId}-fixer-${stage}-${round}`,
+          await git.headOf(worker.worktreePath),
+        );
+      } catch {
+        // Recovery anchoring must never mask the stage outcome.
+      }
+    }
     await orca.finishWorker(worker, "release").catch(() => {});
     if (worker.worktreeId) {
       await orca.removeWorktree(worker.worktreeId).catch(() => {});
@@ -1914,9 +1930,11 @@ export class CliOrca implements OrcaOperations {
       let baseBranch: string | undefined;
       let repoRoot: string | undefined;
       if (launch.worktree === "new-child") {
-        baseBranch = (
-          await command("git", ["branch", "--show-current"], this.#cwd)
-        ).stdout.trim();
+        baseBranch =
+          launch.commitOid ??
+          (
+            await command("git", ["branch", "--show-current"], this.#cwd)
+          ).stdout.trim();
         if (!baseBranch)
           throw new Error(
             "no-mistakes requires a named branch for a worker worktree",
@@ -2036,9 +2054,11 @@ export class CliOrca implements OrcaOperations {
     let worktree: { id: string; path: string } | undefined;
     let terminalHandle = "";
     try {
-      const branch = (
-        await command("git", ["branch", "--show-current"], this.#cwd)
-      ).stdout.trim();
+      const branch =
+        launch.commitOid ??
+        (
+          await command("git", ["branch", "--show-current"], this.#cwd)
+        ).stdout.trim();
       if (!branch)
         throw new Error(
           "no-mistakes requires a named branch for a worker worktree",
@@ -2407,9 +2427,11 @@ export class CliOrca implements OrcaOperations {
     let worktreeId: string | undefined;
     try {
       if (launch.worktree === "new-child") {
-        const branch = (
-          await command("git", ["branch", "--show-current"], this.#cwd)
-        ).stdout.trim();
+        const branch =
+          launch.commitOid ??
+          (
+            await command("git", ["branch", "--show-current"], this.#cwd)
+          ).stdout.trim();
         if (!branch)
           throw new Error(
             "no-mistakes requires a named branch for a worker worktree",
@@ -3158,9 +3180,32 @@ export class GitShell implements GitOperations {
       ["merge-base", "--is-ancestor", expectedHead, sourceHead],
       true,
     );
-    if (expectedIsAncestor.failed) return false;
-    const applied = await this.#git(["merge", "--ff-only", sourceHead], true);
-    return !applied.failed;
+    if (!expectedIsAncestor.failed) {
+      const applied = await this.#git(["merge", "--ff-only", sourceHead], true);
+      return !applied.failed;
+    }
+    // The fixer rewrote history (e.g. completed an aborted rebase): adopt its
+    // HEAD only after preserving the previous checkout under a backup ref.
+    const backup = await this.#git(
+      ["update-ref", `refs/no-mistakes/backup/${expectedHead}`, expectedHead],
+      true,
+    );
+    if (backup.failed) return false;
+    const reset = await this.#git(["reset", "--hard", sourceHead], true);
+    return !reset.failed;
+  }
+
+  async headOf(worktreePath: string): Promise<string> {
+    const result = await this.#git(
+      ["-C", worktreePath, "rev-parse", "HEAD"],
+      true,
+    );
+    if (result.failed) {
+      throw new Error(
+        `could not read the worker HEAD in ${worktreePath}: ${result.output}`,
+      );
+    }
+    return result.stdout.trim();
   }
 
   async anchorRecoveryRef(runId: string, oid: string): Promise<void> {
