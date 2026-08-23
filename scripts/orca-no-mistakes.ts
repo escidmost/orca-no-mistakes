@@ -3710,6 +3710,7 @@ function isTestPath(filePath: string): boolean {
           "fixtures",
           "golden",
           "goldens",
+          "t",
           "testdata",
           "test-data",
           "test_data",
@@ -3721,6 +3722,7 @@ function isTestPath(filePath: string): boolean {
         /\.tests?$/i.test(part),
       ) ||
     fileName.toLowerCase().endsWith(".snap") ||
+    fileName.toLowerCase().endsWith(".t") ||
     /(?:^|[._-])(?:tests?|specs?|unittests?|cy|e2e)(?=[._]|$)/i.test(fileName) ||
     (!["docs", "scripts"].includes(parts[0]?.toLowerCase() ?? "") &&
       /^tests?-[A-Za-z0-9]/i.test(fileStem)) ||
@@ -3734,7 +3736,7 @@ function weakensInlineTestValidation(
   source: string | undefined,
 ): boolean {
   if (source === expectedSource) return false;
-  const protectedValidation = /^\s*(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|test)\s*\]|@(?:org\.junit\.)?Test\b|\[(?:Fact|Test|Theory)\]|(?:describe|context|it|test)(?:\.[A-Za-z_$][\w$]*(?:\s*\([^)]*\))?)*\s*\(\s*["'`]|.*\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|\bassert[A-Z][A-Za-z0-9_$]*\s*\(|\bexpect\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/imu;
+  const protectedValidation = /(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|test)\s*\]|@(?:org\.junit\.)?Test\b|\[(?:Fact|Test|Theory)\]|(?:describe|context|it|test)(?:\.[A-Za-z_$][\w$]*(?:\s*\([^)]*\))?)*\s*\(\s*["'`]|\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|\bassert[A-Z][A-Za-z0-9_$]*\s*\(|\bexpect\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
   if (protectedValidation.test(expectedSource)) return true;
   const skipMarker = /(?:#\[(?:ignore|should_panic)\]|\b(?:describe|it|test)(?:\.[A-Za-z_$][\w$]*)*\.(?:only|skip)\s*\(|\bpytest\.mark\.(?:skip|skipif|xfail)\b|@\w*Ignore\b)/giu;
   return (
@@ -3744,6 +3746,7 @@ function weakensInlineTestValidation(
 }
 
 function isProtectedValidationPolicyPath(filePath: string): boolean {
+  const originalFileName = filePath.split("/").at(-1) ?? "";
   const normalized = filePath.toLowerCase();
   const parts = normalized.split("/");
   const fileName = parts.at(-1) ?? "";
@@ -3757,6 +3760,14 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "scripts/orca-no-mistakes.ts",
       "scripts/policy.ts",
     ].includes(normalized) ||
+    [
+      "BUILD",
+      "BUILD.bazel",
+      "CMakeLists.txt",
+      "MODULE.bazel",
+      "WORKSPACE",
+      "WORKSPACE.bazel",
+    ].includes(originalFileName) ||
     ((parts[0] === ".github" || parts[0] === ".forgejo") &&
       parts[1] === "workflows") ||
     parts[0] === ".buildkite" ||

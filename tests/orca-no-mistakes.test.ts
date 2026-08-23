@@ -2774,6 +2774,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await mkdir(path.join(repo, "src"));
     await mkdir(path.join(repo, "src/__snapshots__"));
     await mkdir(path.join(repo, "testdata"));
+    await mkdir(path.join(repo, "t"));
     await mkdir(path.join(repo, "__fixtures__"));
     await writeFile(path.join(repo, "spec/openapi.yaml"), "openapi: 3.1.0\n");
     await writeFile(
@@ -2836,10 +2837,15 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "export function verify(actual) {\n  assert.deepEqual(actual, { ok: true });\n}\n",
     );
     await writeFile(
+      path.join(repo, "src/prefixed.js"),
+      'if (import.meta.vitest) test("works", () => expect(value()).toBe(1));\n',
+    );
+    await writeFile(
       path.join(repo, "src/__snapshots__/Widget.snap"),
       "exports[`Widget 1`] = `expected`;\n",
     );
     await writeFile(path.join(repo, "testdata/expected.json"), '{"ok":true}\n');
+    await writeFile(path.join(repo, "t/widget.t"), "ok(1, 'works');\n");
     await writeFile(
       path.join(repo, "__fixtures__/response.json"),
       '{"status":"expected"}\n',
@@ -2885,8 +2891,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "src/inline.js",
       "src/concurrent.js",
       "src/assertions.js",
+      "src/prefixed.js",
       "src/__snapshots__/Widget.snap",
       "testdata/expected.json",
+      "t/widget.t",
       "__fixtures__/response.json",
       "src/spec-parser.ts",
       "src/widget.spec.ts",
@@ -2935,6 +2943,12 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
 
     git(worker, "reset", "--hard", featureHead);
     await writeFile(path.join(worker, "eslint.config.js"), "export default [];\n");
+    await writeFile(path.join(worker, "BUILD"), "# tests disabled\n");
+    await writeFile(path.join(worker, "BUILD.bazel"), "# tests disabled\n");
+    await writeFile(path.join(worker, "CMakeLists.txt"), "# enable_testing removed\n");
+    await writeFile(path.join(worker, "MODULE.bazel"), "# tests disabled\n");
+    await writeFile(path.join(worker, "WORKSPACE"), "# tests disabled\n");
+    await writeFile(path.join(worker, "WORKSPACE.bazel"), "# tests disabled\n");
     await writeFile(path.join(worker, ".mocharc.json"), '{"spec":[]}\n');
     await writeFile(path.join(worker, "Cargo.lock"), "# changed lockfile\n");
     await mkdir(path.join(worker, "pkg"));
@@ -2972,7 +2986,13 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "add",
       ".mocharc.json",
       ".mvn/maven.config",
+      "BUILD",
+      "BUILD.bazel",
+      "CMakeLists.txt",
       "Cargo.lock",
+      "MODULE.bazel",
+      "WORKSPACE",
+      "WORKSPACE.bazel",
       "build.gradle",
       "build.gradle.kts",
       "cypress.config.ts",
@@ -2995,7 +3015,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "commit", "-m", "weaken validation policy");
     await assert.rejects(
       assertWorkerChangesAllowed(),
-      /unexplained-policy-relaxation:.*\.mocharc\.json, \.mvn\/maven\.config, Cargo\.lock, build\.gradle, build\.gradle\.kts, cypress\.config\.ts, eslint\.config\.js, go\.work, package-lock\.json, package\.json, pkg\/go\.mod, pnpm-lock\.yaml, pom\.xml, prompts\/fixer\.md, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, yarn\.lock/,
+      /unexplained-policy-relaxation:.*\.mocharc\.json, \.mvn\/maven\.config, BUILD, BUILD\.bazel, CMakeLists\.txt, Cargo\.lock, MODULE\.bazel, WORKSPACE, WORKSPACE\.bazel, build\.gradle, build\.gradle\.kts, cypress\.config\.ts, eslint\.config\.js, go\.work, package-lock\.json, package\.json, pkg\/go\.mod, pnpm-lock\.yaml, pom\.xml, prompts\/fixer\.md, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, yarn\.lock/,
     );
 
     git(worker, "reset", "--hard", featureHead);
@@ -3133,6 +3153,27 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await assert.rejects(
       assertWorkerChangesAllowed(),
       /fixer modified co-located test assertions or skip markers: src\/inline\.js/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/prefixed.js"),
+      'if (import.meta.vitest) test("works", () => expect(value()).toBe(2));\n',
+    );
+    git(worker, "add", "src/prefixed.js");
+    git(worker, "commit", "-m", "weaken prefixed inline assertion");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified co-located test assertions or skip markers: src\/prefixed\.js/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "t/widget.t"), "ok(0, 'works');\n");
+    git(worker, "add", "t/widget.t");
+    git(worker, "commit", "-m", "weaken Perl test");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified pre-existing test files: t\/widget\.t/,
     );
 
     git(worker, "reset", "--hard", featureHead);
