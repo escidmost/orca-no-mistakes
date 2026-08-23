@@ -2175,7 +2175,11 @@ export class CliOrca implements OrcaOperations {
           terminalHandle,
           prepared?.worktreeId,
         );
-        throw error;
+        throw new PreflightError(
+          classifyPreflightFailure(String(error)),
+          `${launchWithPreamble ? "initial prompt launch" : "retained preamble delivery"} failed: ${String(error)}`,
+          { cause: error },
+        );
       }
     }
     const worktreeId = prepared?.worktreeId;
@@ -3418,7 +3422,8 @@ function isTestPath(filePath: string): boolean {
       .some((part) =>
         ["test", "tests", "__tests__"].includes(part.toLowerCase()),
       ) ||
-    /(?:^|[._])(?:tests?|specs?)(?=[._]|$)/i.test(fileName)
+    fileName.toLowerCase() === "conftest.py" ||
+    /(?:^|[._])(?:tests?|specs?|cy|e2e)(?=[._]|$)/i.test(fileName)
   );
 }
 
@@ -3465,8 +3470,15 @@ function coordinatorPolicyBlocks(source: string | undefined): string | undefined
   const blocks: string[] = [];
   for (const [startMarker, endMarker] of COORDINATOR_POLICY_BLOCKS) {
     const start = source.indexOf(startMarker);
+    if (
+      start < 0 ||
+      start !== source.lastIndexOf(startMarker) ||
+      source.indexOf(endMarker) !== source.lastIndexOf(endMarker)
+    ) {
+      return undefined;
+    }
     const end = source.indexOf(endMarker, start + startMarker.length);
-    if (start < 0 || end < 0) return undefined;
+    if (end < 0) return undefined;
     blocks.push(source.slice(start, end));
   }
   return blocks.join("\0");

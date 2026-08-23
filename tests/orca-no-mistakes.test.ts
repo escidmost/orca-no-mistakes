@@ -2406,9 +2406,20 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(repo, "checkout", "-b", "feature");
     await writeFile(path.join(repo, "feature.ts"), "export const value = 1;\n");
     await mkdir(path.join(repo, "spec"));
+    await mkdir(path.join(repo, "cypress/e2e"), { recursive: true });
+    await mkdir(path.join(repo, "e2e"));
     await mkdir(path.join(repo, "scripts"));
     await mkdir(path.join(repo, "src"));
     await writeFile(path.join(repo, "spec/openapi.yaml"), "openapi: 3.1.0\n");
+    await writeFile(
+      path.join(repo, "cypress/e2e/login.cy.ts"),
+      "expect(true).to.equal(true);\n",
+    );
+    await writeFile(
+      path.join(repo, "e2e/checkout.e2e.ts"),
+      "expect(true).toBe(true);\n",
+    );
+    await writeFile(path.join(repo, "conftest.py"), "assert True\n");
     await writeFile(
       path.join(repo, "scripts/test-harness.ts"),
       "export const harness = 1;\n",
@@ -2435,6 +2446,9 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       repo,
       "add",
       "feature.ts",
+      "conftest.py",
+      "cypress/e2e/login.cy.ts",
+      "e2e/checkout.e2e.ts",
       "spec/openapi.yaml",
       "scripts/test-harness.ts",
       "src/spec-parser.ts",
@@ -2514,6 +2528,35 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     git(worker, "commit", "-m", "repair specification tooling");
     await shell.assertFixerChangesAllowed(worker, featureHead);
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "cypress/e2e/login.cy.ts"),
+      "expect(true).to.equal(false);\n",
+    );
+    await writeFile(
+      path.join(worker, "e2e/checkout.e2e.ts"),
+      "expect(true).toBe(false);\n",
+    );
+    await writeFile(path.join(worker, "conftest.py"), "assert False\n");
+    git(
+      worker,
+      "add",
+      "conftest.py",
+      "cypress/e2e/login.cy.ts",
+      "e2e/checkout.e2e.ts",
+    );
+    git(worker, "commit", "-m", "weaken end-to-end tests");
+    await assert.rejects(
+      shell.assertFixerChangesAllowed(worker, featureHead),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /conftest\.py/);
+        assert.match(error.message, /cypress\/e2e\/login\.cy\.ts/);
+        assert.match(error.message, /e2e\/checkout\.e2e\.ts/);
+        return true;
+      },
+    );
 
     git(worker, "reset", "--hard", featureHead);
     await writeFile(
@@ -2640,6 +2683,15 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
         "git.assertFixerChangesAllowed = async () => {};\n  const repoState = await git.assertReady();",
       ),
       "disable injected fixer guard",
+    );
+    const guardStart = coordinatorSource.indexOf(
+      "\n  async assertFixerChangesAllowed(",
+    );
+    const guardEnd = coordinatorSource.indexOf("\n  async head()", guardStart);
+    assert.ok(guardStart >= 0 && guardEnd > guardStart);
+    await assertCoordinatorChangeRejected(
+      `/*${coordinatorSource.slice(guardStart, guardEnd)}\n*/${coordinatorSource.replace("if (protectedTests.length > 0) {", "if (false) {")}`,
+      "prepend policy decoy",
     );
 
     git(worker, "reset", "--hard", featureHead);
@@ -3286,6 +3338,7 @@ test("CliOrca waits for a hidden fish shell before launching Claude", async () =
   const temp = await mkdtemp(path.join(tmpdir(), "orca-claude-shell-"));
   const fakeOrca = path.join(temp, "orca");
   const callsPath = path.join(temp, "calls.jsonl");
+  const failPreamblePath = path.join(temp, "fail-preamble");
   const evidence = path.join(
     temp,
     ".orca-no-mistakes",
@@ -3313,6 +3366,10 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
 } else if (args[0] === 'terminal' && args[1] === 'create') {
   out({ terminal: { handle: 'claude-shell' } })
 } else if (args[0] === 'terminal' && args[1] === 'send') {
+  if (fs.existsSync(${JSON.stringify(failPreamblePath)})) {
+    console.error(JSON.stringify({ error: { code: 'terminal_not_writable', message: 'terminal not writable' } }))
+    process.exit(1)
+  }
   out({ accepted: true })
 } else if (args[0] === 'terminal' && args[1] === 'show') {
   out({ terminal: { connected: true, title: 'Claude CLI', preview: 'ready' } })
@@ -3372,6 +3429,22 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     );
     assert.ok(dispatch && !dispatch.args.includes("--inject"));
     assert.equal(worker.report.summary, "claude reviewed");
+    await writeFile(failPreamblePath, "fail\n");
+    await assert.rejects(
+      orca.startWorker("task-claude-retained", {
+        agent: { effort: "high", harness: "claude", model: "opus[1m]" },
+        name: "claude-reviewer",
+        prompt: "follow-up review instructions",
+        role: "reviewer",
+        stage: "review",
+        terminal: worker.terminalHandle,
+        worktree: "current",
+      }),
+      (error: unknown) =>
+        error instanceof PreflightError &&
+        error.message.includes("retained preamble delivery failed") &&
+        error.message.includes("terminal_not_writable"),
+    );
     await assert.rejects(
       readFile(
         path.join(temp, ".gemini", "antigravity-cli", "settings.json"),
