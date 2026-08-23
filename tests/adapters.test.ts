@@ -140,6 +140,16 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
     }),
     `'codex' '--dangerously-bypass-approvals-and-sandbox' '-c' 'model="raw"'`
   )
+  assert.equal(
+    buildCliCommand('codex', {
+      agentArgsOverride: {
+        codex: ['--', '-c', 'model_reasoning_effort="low"', '--model', 'raw']
+      } as never,
+      effort: 'max',
+      model: 'mapped'
+    }),
+    `'codex' '--model' 'mapped' '-c' 'model_reasoning_effort="max"' '--dangerously-bypass-approvals-and-sandbox' '--' '-c' 'model_reasoning_effort="low"' '--model' 'raw'`
+  )
   assert.throws(
     () =>
       buildCliCommand('codex', {
@@ -288,6 +298,13 @@ test('readinessMatcher matches per-harness terminal titles and rejects interrupt
     codex({
       title: '⠇ no-mistakes-review-1',
       preview: '• Working (44s • esc to interrupt)\n› Find and fix a bug in @filename  gpt-5.6-luna max'
+    }),
+    true
+  )
+  assert.equal(
+    codex({
+      title: '⠇ no-mistakes-review-1',
+      preview: '• Working (2s • esc to interrupt)\n› Audit the change  gpt-5.6-luna ultra'
     }),
     true
   )

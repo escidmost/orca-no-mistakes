@@ -1194,7 +1194,7 @@ async function runFixer(
         .catch(() => false));
     if (!reusable) {
       retainedSession = undefined;
-      await releaseFixerSession(sessionToReuse, orca).catch(() => {});
+      await releaseFixerSession(sessionToReuse, orca);
       sessionToReuse = undefined;
     }
   }
@@ -1240,7 +1240,7 @@ async function runFixer(
     async (index) => {
       if (!sessionToReuse || index !== 0) return;
       retainedSession = undefined;
-      await releaseFixerSession(sessionToReuse, orca).catch(() => {});
+      await releaseFixerSession(sessionToReuse, orca);
     },
     fence,
   );
@@ -3716,6 +3716,12 @@ function isTestPath(filePath: string): boolean {
   );
 }
 
+function weakensInlineTestValidation(diff: string): boolean {
+  const removedAssertion = /^-(?!---).*(?:\bassert(?:_[a-z0-9]+)?!?\s*\(|\bexpect\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/imu;
+  const addedSkipMarker = /^\+(?!\+\+\+).*(?:#\[(?:ignore|should_panic)\]|\b(?:describe|it|test)\.(?:only|skip)\s*\(|\bpytest\.mark\.(?:skip|skipif|xfail)\b|@\w*Ignore\b)/imu;
+  return removedAssertion.test(diff) || addedSkipMarker.test(diff);
+}
+
 function isProtectedValidationPolicyPath(filePath: string): boolean {
   const normalized = filePath.toLowerCase();
   const parts = normalized.split("/");
@@ -3969,10 +3975,35 @@ export class GitShell implements GitOperations {
       );
     }
     const protectedTests: string[] = [];
+    const protectedInlineTests: string[] = [];
     const protectedPolicy: string[] = [];
     for (const filePath of changedPaths) {
       if (isTestPath(filePath) && (await this.pathExists(expectedHead, filePath))) {
         protectedTests.push(filePath);
+      } else if (await this.pathExists(expectedHead, filePath)) {
+        const diff = await this.#git(
+          [
+            "-C",
+            sourcePath,
+            "diff",
+            "--no-ext-diff",
+            "--unified=0",
+            "--no-renames",
+            expectedHead,
+            sourceHead,
+            "--",
+            filePath,
+          ],
+          true,
+        );
+        if (diff.failed) {
+          throw new Error(
+            `could not inspect inline test assertions in ${filePath}: ${diff.output}`,
+          );
+        }
+        if (weakensInlineTestValidation(diff.stdout)) {
+          protectedInlineTests.push(filePath);
+        }
       }
       if (isProtectedValidationPolicyPath(filePath)) {
         protectedPolicy.push(filePath);
@@ -3981,6 +4012,11 @@ export class GitShell implements GitOperations {
     if (protectedTests.length > 0) {
       throw new FixerPolicyViolationError(
         `fixer modified pre-existing test files: ${protectedTests.sort().join(", ")}`,
+      );
+    }
+    if (protectedInlineTests.length > 0) {
+      throw new FixerPolicyViolationError(
+        `fixer modified co-located test assertions or skip markers: ${protectedInlineTests.sort().join(", ")}`,
       );
     }
     if (protectedPolicy.length > 0) {

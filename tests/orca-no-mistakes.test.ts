@@ -836,6 +836,82 @@ test("a stale retained fixer retries through the fresh fallback chain", async ()
   assert.ok(orca.calls.includes(`release:${orca.fixerDispatches[0]}`));
 });
 
+test("retained fixer release failures prevent replacement and fallback", async () => {
+  const finding: Finding = {
+    id: "review-1",
+    severity: "error",
+    action: "auto-fix",
+    description: "The defect remains.",
+  };
+  for (const scenario of [
+    { name: "stale", retainedStartFails: true, fixerLaunches: 2 },
+    { name: "non-reusable", retainedStartFails: false, fixerLaunches: 1 },
+  ]) {
+    class ScenarioGit extends FakeGit {
+      override async worktreeIsReusable(
+        worktreePath: string,
+        expectedHead: string,
+      ): Promise<boolean> {
+        return scenario.retainedStartFails
+          ? super.worktreeIsReusable(worktreePath, expectedHead)
+          : false;
+      }
+    }
+    class ScenarioOrca extends FakeOrca {
+      #fixerAttempt = 0;
+
+      override async startWorker(
+        taskId: string,
+        launch: WorkerLaunch,
+      ): Promise<WorkerResult> {
+        if (
+          scenario.retainedStartFails &&
+          launch.role === "fixer" &&
+          ++this.#fixerAttempt === 2
+        ) {
+          this.launches.push(launch);
+          throw new PreflightError(
+            "readiness-timeout",
+            "retained fixer stopped responding",
+          );
+        }
+        return super.startWorker(taskId, launch);
+      }
+
+      override async finishWorker(
+        worker: WorkerResult,
+        disposition: "release" | "retain",
+      ): Promise<void> {
+        await super.finishWorker(worker, disposition);
+        if (
+          disposition === "release" &&
+          this.fixerDispatches.includes(worker.dispatchId)
+        ) {
+          throw new Error(`${scenario.name} fixer release failed`);
+        }
+      }
+    }
+    const git = new ScenarioGit();
+    allowReviewAutoFix(git);
+    const orca = new ScenarioOrca(git);
+    orca.reports.set("review", [
+      { findings: [finding], summary: "first failure" },
+      pass("first fix"),
+      { findings: [finding], summary: "second failure" },
+    ]);
+
+    await assert.rejects(
+      runPipeline({ intent: "Fail closed on retained cleanup." }, orca, git),
+      new RegExp(`${scenario.name} fixer release failed`),
+    );
+    assert.equal(
+      orca.launches.filter((launch) => launch.role === "fixer").length,
+      scenario.fixerLaunches,
+      "cleanup failure must stop before a replacement or fresh fallback launch",
+    );
+  }
+});
+
 test("protected fixer commits are rejected at a resumable human gate", async () => {
   const git = new FakeGit();
   allowReviewAutoFix(git);
@@ -2700,6 +2776,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(repo, "src/test-foo.ts"), "assert(true);\n");
     await writeFile(path.join(repo, "src/testFoo.ts"), "assert(true);\n");
     await writeFile(
+      path.join(repo, "src/lib.rs"),
+      "pub fn value() -> i32 { 1 }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn value_is_one() { assert_eq!(super::value(), 1); }\n}\n",
+    );
+    await writeFile(
       path.join(repo, "src/__snapshots__/Widget.snap"),
       "exports[`Widget 1`] = `expected`;\n",
     );
@@ -2744,6 +2824,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "src/foo-test.ts",
       "src/test-foo.ts",
       "src/testFoo.ts",
+      "src/lib.rs",
       "src/__snapshots__/Widget.snap",
       "testdata/expected.json",
       "__fixtures__/response.json",
@@ -2950,6 +3031,18 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await assert.rejects(
       assertWorkerChangesAllowed(),
       /fixer modified pre-existing test files: src\/widget\.spec\.ts/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/lib.rs"),
+      "pub fn value() -> i32 { 1 }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    #[ignore]\n    fn value_is_one() { assert_eq!(super::value(), 2); }\n}\n",
+    );
+    git(worker, "add", "src/lib.rs");
+    git(worker, "commit", "-m", "weaken inline Rust test");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified co-located test assertions or skip markers: src\/lib\.rs/,
     );
 
     git(worker, "reset", "--hard", featureHead);

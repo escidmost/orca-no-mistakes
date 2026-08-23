@@ -110,6 +110,7 @@ function flagName(arg: string): string {
 function pinsAnyFlag(args: string[], flags: string[]): boolean {
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]
+    if (arg === '--') break
     for (const flag of flags) {
       if (arg.startsWith(`${flag}=`)) {
         if (arg.length > flag.length + 1) return true
@@ -124,6 +125,7 @@ function pinsAnyFlag(args: string[], flags: string[]): boolean {
 function pinsConfigKey(args: string[], key: string): boolean {
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]
+    if (arg === '--') break
     const config =
       arg === '-c' || arg === '--config'
         ? args[i + 1]
@@ -256,7 +258,7 @@ export function readinessMatcher(
     const codexActive =
       normalizedHarness === 'codex' &&
       /\bWorking\s*\(\s*\d+\s*s\b/.test(output) &&
-      /›[\s\S]{0,500}\s[^\s·]+\s+(?:minimal|low|medium|high|xhigh|max)\s*(?:·|$)/i.test(output)
+      /›[\s\S]{0,500}\s[^\s·]+\s+(?:minimal|low|medium|high|xhigh|max|ultra)\s*(?:·|$)/i.test(output)
     return (titleTaken(title) || codexActive) && !output.includes(INTERRUPT_MARKER)
   }
 }
