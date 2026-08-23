@@ -1132,7 +1132,7 @@ test("a passing run fails closed when retained fixer cleanup fails", async () =>
   );
 });
 
-test("a fixer round without a new commit fails closed", async () => {
+test("a fixer round without a new commit opens a human gate", async () => {
   const git = new FakeGit();
   allowReviewAutoFix(git);
   git.fixerCreatesCommit = false;
@@ -1152,10 +1152,11 @@ test("a fixer round without a new commit fails closed", async () => {
     pass("no committed fix"),
   ]);
 
-  await assert.rejects(
-    runPipeline({ intent: "Require committed fixes." }, orca, git),
-    /review fixer did not commit a change/,
-  );
+  await runPipeline({ intent: "Require committed fixes." }, orca, git);
+  assert.equal(orca.gates.length, 1);
+  assert.match(orca.gates[0]?.question ?? "", /review-1/);
+  assert.match(orca.gates[0]?.question ?? "", /fixer-no-change/);
+  assert.match(orca.gates[0]?.question ?? "", /no committed fix/);
   assert.equal(
     git.calls.some((call) => call.startsWith("apply:/worktrees/")),
     false,
@@ -2808,6 +2809,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await mkdir(path.join(repo, "__specs__"));
     await mkdir(path.join(repo, "java"));
     await mkdir(path.join(repo, "cpp"));
+    await mkdir(path.join(repo, "docs"));
     await mkdir(path.join(repo, "scripts"));
     await mkdir(path.join(repo, "specs"));
     await mkdir(path.join(repo, "src"));
@@ -2834,6 +2836,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "Feature: Login\n  Scenario: works\n    Then access is granted\n",
     );
     await writeFile(path.join(repo, "cli.bats"), "@test 'works' { true; }\n");
+    await writeFile(path.join(repo, "docs/test-plan.md"), "# Test plan\n");
     await writeFile(
       path.join(repo, "package.json"),
       '{"scripts":{"test":"sh scripts/verify-ci.sh"}}\n',
@@ -2992,6 +2995,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "cli.bats",
       "conftest.py",
       "cypress/e2e/login.cy.ts",
+      "docs/test-plan.md",
       "e2e/checkout.e2e.ts",
       "features/login.feature",
       "main.tftest.hcl",
@@ -3253,6 +3257,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
 
     git(worker, "reset", "--hard", featureHead);
     await writeFile(path.join(worker, "spec/openapi.yaml"), "openapi: 3.1.1\n");
+    await writeFile(path.join(worker, "docs/test-plan.md"), "# Updated test plan\n");
     await writeFile(
       path.join(worker, "src/spec-parser.ts"),
       "export const parser = 2;\n",
@@ -3271,6 +3276,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       worker,
       "add",
       "spec/openapi.yaml",
+      "docs/test-plan.md",
       "scripts/test-harness.ts",
       "scripts/test-runner.ts",
       "src/spec-parser.ts",

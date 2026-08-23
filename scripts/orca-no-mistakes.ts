@@ -245,6 +245,15 @@ export class GateStopError extends Error {}
 
 export class FixerPolicyViolationError extends Error {}
 
+class FixerNoChangeError extends Error {
+  readonly report: StageReport;
+
+  constructor(report: StageReport, stage: StageName) {
+    super(`${stage} fixer did not commit a change`);
+    this.report = report;
+  }
+}
+
 // Thrown when a rewritten-history custody transfer failed after the operator's
 // branch ref was already advanced: the run must fail instead of degrading to a
 // custody note, so the operator is told something went wrong.
@@ -670,27 +679,45 @@ export async function runPipeline(
               ),
           );
         } catch (error) {
-          if (!(error instanceof FixerPolicyViolationError)) throw error;
+          if (
+            !(error instanceof FixerPolicyViolationError) &&
+            !(error instanceof FixerNoChangeError)
+          ) {
+            throw error;
+          }
           fixerSession = undefined;
+          const noChange = error instanceof FixerNoChangeError;
           report = {
             ...report,
             findings: [
               ...report.findings.filter(
-                (finding) => finding.id !== "fixer-policy-violation",
+                (finding) =>
+                  finding.id !== "fixer-policy-violation" &&
+                  finding.id !== "fixer-no-change",
               ),
               {
                 action: "ask-user",
-                description: `${error.message} Select the original findings to retry them without protected-path changes.`,
-                id: "fixer-policy-violation",
+                description: noChange
+                  ? `${error.message}. Fixer summary: ${error.report.summary} Select approve or skip if the original findings are not valid, or select them to retry.`
+                  : `${error.message} Select the original findings to retry them without protected-path changes.`,
+                id: noChange ? "fixer-no-change" : "fixer-policy-violation",
                 severity: "error",
               },
             ],
-            summary: `${stage} fixer commit rejected by protected-path policy`,
+            summary: noChange
+              ? `${stage} fixer produced no committed change`
+              : `${stage} fixer commit rejected by protected-path policy`,
+            ...(noChange && error.report.tested
+              ? { tested: error.report.tested }
+              : {}),
+            ...(noChange && error.report.artifacts
+              ? { artifacts: error.report.artifacts }
+              : {}),
           };
           await recordStageEvidence(
             stage,
             round,
-            "coordinator:fixer-policy",
+            noChange ? "coordinator:fixer-no-change" : "coordinator:fixer-policy",
             1,
             report,
             { attempts: [], resolvedAgent: "coordinator" },
@@ -1269,7 +1296,8 @@ async function runFixer(
     }
     workerHead = await git.headOf(worktreePath);
     if (before === workerHead) {
-      throw new Error(`${stage} fixer did not commit a change`);
+      strictCleanup = true;
+      throw new FixerNoChangeError(worker.report, stage);
     }
     try {
       await git.assertFixerChangesAllowed(
