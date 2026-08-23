@@ -727,7 +727,7 @@ test("protected fixer commits are rejected at a resumable human gate", async () 
   allowReviewAutoFix(git);
   git.protectedTestMutation = "tests/existing.test.ts";
   const orca = new FakeOrca(git);
-  orca.gateResolution = "fix";
+  orca.gateResolution = "fix review-1";
   orca.reports.set("review", [
     {
       findings: [
@@ -736,6 +736,12 @@ test("protected fixer commits are rejected at a resumable human gate", async () 
           severity: "error",
           action: "auto-fix",
           description: "Repair the implementation.",
+        },
+        {
+          id: "review-2",
+          severity: "warning",
+          action: "ask-user",
+          description: "Confirm the compatibility behavior.",
         },
       ],
       summary: "one defect",
@@ -747,19 +753,19 @@ test("protected fixer commits are rejected at a resumable human gate", async () 
 
   await runPipeline({ intent: "Protect existing assertions." }, orca, git);
 
-  assert.equal(orca.gates.length, 1);
-  assert.match(orca.gates[0].question, /fixer-policy-violation/);
+  assert.equal(orca.gates.length, 2);
+  assert.match(orca.gates[1].question, /fixer-policy-violation/);
   assert.match(
-    orca.gates[0].question,
+    orca.gates[1].question,
     /fixer modified pre-existing test files: tests\/existing\.test\.ts/,
   );
+  assert.match(orca.gates[1].question, /"id":"review-2"/);
   assert.equal(
     orca.launches.filter((launch) => launch.role === "fixer").length,
     2,
   );
   const retry = orca.launches.filter((launch) => launch.role === "fixer")[1];
   assert.match(retry.prompt, /"id":"review-1"/);
-  assert.match(retry.prompt, /"id":"fixer-policy-violation"/);
   assert.ok(git.calls.some((call) => call.startsWith("guard:/worktrees/")));
   assert.equal(
     git.calls.filter((call) => call.startsWith("apply:/worktrees/")).length,
@@ -1506,6 +1512,7 @@ test("CliOrca processes a complete gate-response delivery before acknowledgement
   const fakeOrca = path.join(temp, "orca");
   const callsPath = path.join(temp, "calls.jsonl");
   const resolvedPath = path.join(temp, "resolved");
+  const failAckPath = path.join(temp, "fail-ack");
   const previousHandle = process.env.ORCA_TERMINAL_HANDLE;
   process.env.ORCA_TERMINAL_HANDLE = "coordinator-opencode";
   try {
@@ -1532,8 +1539,11 @@ if (args[1] === 'run-create') {
   if (id === 'gate-review') fs.writeFileSync(${JSON.stringify(resolvedPath)}, 'yes')
   out({ gate: { id, status: 'resolved' } })
 } else if (args[1] === 'check' && args.includes('--ack')) {
-  console.error(JSON.stringify({ error: { code: 'stale_delivery', message: 'Delivery does not belong to this Run.' } }))
-  process.exit(1)
+  if (fs.existsSync(${JSON.stringify(failAckPath)})) {
+    console.error(JSON.stringify({ error: { code: 'stale_delivery', message: 'Delivery does not belong to this Run.' } }))
+    process.exit(1)
+  }
+  out({ acknowledged: 'gate-delivery' })
 } else {
   out({ ok: true })
 }
@@ -1570,6 +1580,20 @@ if (args[1] === 'run-create') {
     assert.ok(
       acknowledgedIndex >
         calls.findLastIndex((args) => args[1] === "gate-resolve"),
+    );
+
+    await rm(resolvedPath, { force: true });
+    await writeFile(failAckPath, "fail\n");
+    const failingOrca = new CliOrca({
+      command: fakeOrca,
+      cwd: temp,
+      notifyHandle: "originating-opencode",
+    });
+    await failingOrca.createRun("gate response acknowledgement failure");
+    await failingOrca.createGate("task-review", "Choose a review action.");
+    await assert.rejects(
+      failingOrca.waitForGate("gate-review"),
+      /stale_delivery|Delivery does not belong/,
     );
   } finally {
     if (previousHandle === undefined) delete process.env.ORCA_TERMINAL_HANDLE;
@@ -2341,9 +2365,24 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(repo, "commit", "-m", "base test");
     git(repo, "checkout", "-b", "feature");
     await writeFile(path.join(repo, "feature.ts"), "export const value = 1;\n");
+    await mkdir(path.join(repo, "spec"));
+    await mkdir(path.join(repo, "scripts"));
+    await mkdir(path.join(repo, "src"));
+    await writeFile(path.join(repo, "spec/openapi.yaml"), "openapi: 3.1.0\n");
+    await writeFile(
+      path.join(repo, "scripts/test-harness.ts"),
+      "export const harness = 1;\n",
+    );
+    await writeFile(
+      path.join(repo, "src/spec-parser.ts"),
+      "export const parser = 1;\n",
+    );
+    await writeFile(
+      path.join(repo, "src/widget.spec.ts"),
+      "assert.ok(true);\n",
+    );
     await mkdir(path.join(repo, "bin"));
     await writeFile(path.join(repo, "bin/orca-no-mistakes"), entrypointSource);
-    await mkdir(path.join(repo, "scripts"));
     await writeFile(
       path.join(repo, "scripts/orca-no-mistakes.ts"),
       `${coordinatorSource}\nexport const integrationFixture = 1;\n`,
@@ -2356,6 +2395,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       repo,
       "add",
       "feature.ts",
+      "spec/openapi.yaml",
+      "scripts/test-harness.ts",
+      "src/spec-parser.ts",
+      "src/widget.spec.ts",
       "Tests/branch-regression.ts",
       "bin/orca-no-mistakes",
       "scripts/orca-no-mistakes.ts",
@@ -2410,6 +2453,38 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await assert.rejects(
       shell.assertFixerChangesAllowed(worker, featureHead),
       /unexplained-policy-relaxation:.*\.mocharc\.json, eslint\.config\.js, package\.json, prompts\/fixer\.md, pytest\.ini, vitest\.config\.ts/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "spec/openapi.yaml"), "openapi: 3.1.1\n");
+    await writeFile(
+      path.join(worker, "scripts/test-harness.ts"),
+      "export const harness = 2;\n",
+    );
+    await writeFile(
+      path.join(worker, "src/spec-parser.ts"),
+      "export const parser = 2;\n",
+    );
+    git(
+      worker,
+      "add",
+      "spec/openapi.yaml",
+      "scripts/test-harness.ts",
+      "src/spec-parser.ts",
+    );
+    git(worker, "commit", "-m", "repair specification tooling");
+    await shell.assertFixerChangesAllowed(worker, featureHead);
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/widget.spec.ts"),
+      "assert.ok(false);\n",
+    );
+    git(worker, "add", "src/widget.spec.ts");
+    git(worker, "commit", "-m", "weaken filename test");
+    await assert.rejects(
+      shell.assertFixerChangesAllowed(worker, featureHead),
+      /fixer modified pre-existing test files: src\/widget\.spec\.ts/,
     );
 
     git(worker, "reset", "--hard", featureHead);
@@ -2518,6 +2593,13 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
         '["diff", "--name-only"],',
       ),
       "disable git execution",
+    );
+    await assertCoordinatorChangeRejected(
+      coordinatorSource.replace(
+        "const repoState = await git.assertReady();",
+        "git.assertFixerChangesAllowed = async () => {};\n  const repoState = await git.assertReady();",
+      ),
+      "disable injected fixer guard",
     );
 
     git(worker, "reset", "--hard", featureHead);

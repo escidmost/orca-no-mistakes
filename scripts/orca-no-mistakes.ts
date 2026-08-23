@@ -648,7 +648,7 @@ export async function runPipeline(
           fixerSession = undefined;
           report = {
             findings: [
-              ...targetFindings.filter(
+              ...report.findings.filter(
                 (finding) => finding.id !== "fixer-policy-violation",
               ),
               {
@@ -3092,7 +3092,7 @@ export class CliOrca implements OrcaOperations {
         "--run",
         this.#runId,
         "--json",
-      ]).catch(() => {});
+      ]);
     }
   }
 
@@ -3401,11 +3401,9 @@ function isTestPath(filePath: string): boolean {
     parts
       .slice(0, -1)
       .some((part) =>
-        ["test", "tests", "spec", "specs", "__tests__"].includes(
-          part.toLowerCase(),
-        ),
+        ["test", "tests", "__tests__"].includes(part.toLowerCase()),
       ) ||
-    /(?:^|[._-])(tests?|specs?)(?:[._-]|$)/i.test(fileName)
+    /(?:^|[._])(?:tests?|specs?)(?=[._]|$)/i.test(fileName)
   );
 }
 
@@ -3444,6 +3442,7 @@ const COORDINATOR_POLICY_BLOCKS = [
   ["\n  async headOf(", "\n  async anchorRecoveryRef("],
   ["\n  async showFile(", "\n  async #detectBase("],
   ["\n  async #git(", "\n}\n\nfunction failureReport("],
+  ["\nexport async function main(", "\nasync function runAttestationCommand("],
 ] as const;
 
 function coordinatorPolicyBlocks(source: string | undefined): string | undefined {
