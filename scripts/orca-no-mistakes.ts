@@ -163,6 +163,7 @@ export interface GitOperations {
   assertFixerChangesAllowed(
     sourcePath: string,
     expectedHead: string,
+    expectedSourceHead: string,
   ): Promise<void>;
   head(): Promise<string>;
   /** Diff between the resolved trusted base and the captured HEAD snapshot
@@ -178,6 +179,7 @@ export interface GitOperations {
   applyWorktreeCommits(
     sourcePath: string,
     expectedHead: string,
+    expectedSourceHead: string,
     fence?: { readonly aborted: boolean },
   ): Promise<boolean>;
   /** Resolves the current HEAD commit of a worker worktree. */
@@ -725,6 +727,7 @@ export async function runPipeline(
           advanced = await deliveryGit.applyWorktreeCommits(
             repo.root,
             submissionCommitOid,
+            terminalCommitOid,
           );
         } catch (error) {
           if (error instanceof PostMutationCustodyError) {
@@ -1204,14 +1207,19 @@ async function runFixer(
       throw new Error(`${stage} fixer did not commit a change`);
     }
     if (stage !== "rebase") {
-      await git.assertFixerChangesAllowed(worktreePath, before);
+      await git.assertFixerChangesAllowed(worktreePath, before, workerHead);
     }
     if (fence.aborted) {
       // The execution timeout already failed this stage; refuse late mutations
       // so a delayed worker cannot apply commits into a settled run.
       throw new Error(`${stage} fixer timed out; commits were not applied`);
     }
-    const transfer = git.applyWorktreeCommits(worktreePath, before, fence);
+    const transfer = git.applyWorktreeCommits(
+      worktreePath,
+      before,
+      workerHead,
+      fence,
+    );
     fence.settlement = transfer;
     if (!(await transfer)) {
       throw new Error(`${stage} fixer could not apply its committed change`);
@@ -1227,7 +1235,13 @@ async function runFixer(
       worker.terminalHandle = terminalHandle;
       worker.worktreeId = worktreeId;
       worker.worktreePath = worktreePath;
-      retainWorker = true;
+      try {
+        await orca.finishWorker(worker, "retain");
+        worker.deliveryId = undefined;
+        retainWorker = true;
+      } catch {
+        // The round succeeded, but this worker cannot safely be reused.
+      }
     }
     return {
       after,
@@ -1257,9 +1271,9 @@ async function runFixer(
         // Recovery anchoring must never mask the stage outcome.
       }
     }
-    await orca
-      .finishWorker(worker, retainWorker ? "retain" : "release")
-      .catch(() => {});
+    if (!retainWorker) {
+      await orca.finishWorker(worker, "release").catch(() => {});
+    }
     if (!retainWorker && worktreeId) {
       await orca.removeWorktree(worktreeId).catch(() => {});
     }
@@ -3449,9 +3463,12 @@ function isTestPath(filePath: string): boolean {
     parts
       .slice(0, -1)
       .some((part) =>
-        ["test", "tests", "__tests__"].includes(part.toLowerCase()) ||
+        ["test", "tests", "__tests__", "__snapshots__"].includes(
+          part.toLowerCase(),
+        ) ||
         /\.tests?$/i.test(part),
       ) ||
+    fileName.toLowerCase().endsWith(".snap") ||
     /(?:^|[._])(?:tests?|specs?|cy|e2e)(?=[._]|$)/i.test(fileName) ||
     /[A-Za-z0-9](?:Tests?|Specs?)$/.test(fileStem)
   );
@@ -3471,7 +3488,21 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "scripts/orca-no-mistakes.ts",
       "scripts/policy.ts",
     ].includes(normalized) ||
-    (parts[0] === ".github" && parts[1] === "workflows") ||
+    ((parts[0] === ".github" || parts[0] === ".forgejo") &&
+      parts[1] === "workflows") ||
+    parts[0] === ".buildkite" ||
+    [
+      ".circleci/config.yml",
+      ".circleci/config.yaml",
+      ".gitlab-ci.yml",
+      ".travis.yml",
+      "appveyor.yml",
+      "appveyor.yaml",
+      "azure-pipelines.yml",
+      "azure-pipelines.yaml",
+      "bitbucket-pipelines.yml",
+      "jenkinsfile",
+    ].includes(normalized) ||
     [
       "cargo.toml",
       "conftest.py",
@@ -3557,8 +3588,8 @@ export class GitShell implements GitOperations {
   async assertFixerChangesAllowed(
     sourcePath: string,
     expectedHead: string,
+    sourceHead: string,
   ): Promise<void> {
-    const sourceHead = await this.headOf(sourcePath);
     const changed = await this.#git(
       [
         "-C",
@@ -3638,6 +3669,7 @@ export class GitShell implements GitOperations {
   async applyWorktreeCommits(
     sourcePath: string,
     expectedHead: string,
+    expectedSourceHead: string,
     fence?: { readonly aborted: boolean },
   ): Promise<boolean> {
     if (fence?.aborted) return false;
@@ -3653,6 +3685,7 @@ export class GitShell implements GitOperations {
     const sourceHead = (
       await this.#git(["-C", sourcePath, "rev-parse", "HEAD"])
     ).stdout.trim();
+    if (sourceHead !== expectedSourceHead) return false;
     const expectedIsAncestor = await this.#git(
       ["merge-base", "--is-ancestor", expectedHead, sourceHead],
       true,

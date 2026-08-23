@@ -125,6 +125,7 @@ class FakeGit implements GitOperations {
   async assertFixerChangesAllowed(
     sourcePath: string,
     expectedHead: string,
+    _expectedSourceHead: string,
   ): Promise<void> {
     this.calls.push(`guard:${sourcePath}:${expectedHead}`);
     if (this.protectedTestMutation) {
@@ -228,6 +229,7 @@ class FakeGit implements GitOperations {
   async applyWorktreeCommits(
     sourcePath: string,
     expectedHead: string,
+    expectedSourceHead: string,
     fence?: { readonly aborted: boolean },
   ): Promise<boolean> {
     this.calls.push(
@@ -241,7 +243,9 @@ class FakeGit implements GitOperations {
       );
     if (this.dirtyDelivery) return false;
     if (this.#head !== expectedHead || fence?.aborted) return false;
-    this.#head = this.#workerHeads.get(sourcePath) ?? FakeGit.#oid(++this.#counter);
+    const sourceHead = this.#workerHeads.get(sourcePath) ?? expectedSourceHead;
+    if (sourceHead !== expectedSourceHead) return false;
+    this.#head = sourceHead;
     return true;
   }
 
@@ -658,6 +662,55 @@ test("fix rounds reuse one durable fixer terminal and worktree", async () => {
   assert.equal(fixers[1].terminal, "term-fixer");
   assert.equal(fixers[1].worktree, "current");
   assert.ok(orca.calls.includes(`release:${orca.fixerDispatches.at(-1)}`));
+});
+
+test("a failed retain acknowledgement discards the fixer session", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  class RetainFailureOrca extends FakeOrca {
+    #failed = false;
+
+    override async finishWorker(
+      worker: WorkerResult,
+      disposition: "release" | "retain",
+    ): Promise<void> {
+      await super.finishWorker(worker, disposition);
+      if (
+        disposition === "retain" &&
+        this.fixerDispatches.includes(worker.dispatchId) &&
+        !this.#failed
+      ) {
+        this.#failed = true;
+        throw new Error("stale_delivery");
+      }
+    }
+  }
+  const orca = new RetainFailureOrca(git);
+  const finding: Finding = {
+    id: "review-1",
+    severity: "error",
+    action: "auto-fix",
+    description: "The defect remains after the first repair.",
+  };
+  orca.reports.set("review", [
+    { findings: [finding], summary: "first failure" },
+    pass("first fix"),
+    { findings: [finding], summary: "second failure" },
+    pass("second fix"),
+    pass("clean rereview"),
+  ]);
+
+  await runPipeline({ intent: "Discard stale retained deliveries." }, orca, git);
+
+  const fixers = orca.launches.filter((launch) => launch.role === "fixer");
+  assert.deepEqual(
+    fixers.map((launch) => [launch.terminal, launch.worktree]),
+    [
+      [undefined, "new-child"],
+      [undefined, "new-child"],
+    ],
+  );
+  assert.ok(orca.calls.includes(`release:${orca.fixerDispatches[0]}`));
 });
 
 test("a successful fallback fixer is retained while its candidate chain is unchanged", async () => {
@@ -2269,7 +2322,10 @@ test("GitShell applies append-only commits and adopts rewritten history behind a
     const terminal = git(gate, "rev-parse", "HEAD");
 
     const shell = new GitShell({ repo });
-    assert.equal(await shell.applyWorktreeCommits(gate, submission), true);
+    assert.equal(
+      await shell.applyWorktreeCommits(gate, submission, terminal),
+      true,
+    );
     assert.equal(git(repo, "rev-parse", "HEAD"), terminal);
     assert.equal(
       await readFile(path.join(repo, "feature.txt"), "utf8"),
@@ -2280,7 +2336,10 @@ test("GitShell applies append-only commits and adopts rewritten history behind a
     git(gate, "add", "feature.txt");
     git(gate, "commit", "--amend", "--no-edit");
     const rewritten = git(gate, "rev-parse", "HEAD");
-    assert.equal(await shell.applyWorktreeCommits(gate, terminal), true);
+    assert.equal(
+      await shell.applyWorktreeCommits(gate, terminal, rewritten),
+      true,
+    );
     assert.equal(git(repo, "rev-parse", "HEAD"), rewritten);
     assert.equal(
       await readFile(path.join(repo, "feature.txt"), "utf8"),
@@ -2298,8 +2357,11 @@ test("GitShell applies append-only commits and adopts rewritten history behind a
     await writeFile(path.join(fencedWt, "feature.txt"), "fenced\n");
     git(fencedWt, "add", "feature.txt");
     git(fencedWt, "commit", "-m", "fenced change");
+    const fencedHead = git(fencedWt, "rev-parse", "HEAD");
     assert.equal(
-      await shell.applyWorktreeCommits(fencedWt, terminal, { aborted: true }),
+      await shell.applyWorktreeCommits(fencedWt, terminal, fencedHead, {
+        aborted: true,
+      }),
       false,
     );
     assert.equal(git(repo, "rev-parse", "HEAD"), rewritten);
@@ -2334,7 +2396,10 @@ test("three-way containment advances clean checkouts and preserves diverged ones
     git(repo, "commit", "-m", "author edit");
     const divergedHead = git(repo, "rev-parse", "HEAD");
     assert.notEqual(divergedHead, submission);
-    assert.equal(await shell.applyWorktreeCommits(gate, submission), false);
+    assert.equal(
+      await shell.applyWorktreeCommits(gate, submission, terminal),
+      false,
+    );
     assert.equal(git(repo, "rev-parse", "HEAD"), divergedHead);
     await shell.anchorRecoveryRef("run-containment", terminal);
     assert.equal(
@@ -2346,7 +2411,10 @@ test("three-way containment advances clean checkouts and preserves diverged ones
     // operator's uncommitted work are left untouched.
     git(repo, "reset", "--hard", submission);
     await writeFile(path.join(repo, "feature.txt"), "operator edit\n");
-    assert.equal(await shell.applyWorktreeCommits(gate, submission), false);
+    assert.equal(
+      await shell.applyWorktreeCommits(gate, submission, terminal),
+      false,
+    );
     assert.equal(git(repo, "rev-parse", "HEAD"), submission);
     assert.equal(
       await readFile(path.join(repo, "feature.txt"), "utf8"),
@@ -2355,7 +2423,10 @@ test("three-way containment advances clean checkouts and preserves diverged ones
 
     // Clean checkout (C_op == C_sub): custody returns via fast-forward.
     git(repo, "reset", "--hard", submission);
-    assert.equal(await shell.applyWorktreeCommits(gate, submission), true);
+    assert.equal(
+      await shell.applyWorktreeCommits(gate, submission, terminal),
+      true,
+    );
     assert.equal(git(repo, "rev-parse", "HEAD"), terminal);
     assert.equal(
       await readFile(path.join(repo, "feature.txt"), "utf8"),
@@ -2468,6 +2539,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await mkdir(path.join(repo, "MyProject.Tests"));
     await mkdir(path.join(repo, "scripts"));
     await mkdir(path.join(repo, "src"));
+    await mkdir(path.join(repo, "src/__snapshots__"));
     await writeFile(path.join(repo, "spec/openapi.yaml"), "openapi: 3.1.0\n");
     await writeFile(
       path.join(repo, "cypress/e2e/login.cy.ts"),
@@ -2502,6 +2574,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       path.join(repo, "src/WidgetSpec.kt"),
       "assertTrue(true)\n",
     );
+    await writeFile(
+      path.join(repo, "src/__snapshots__/Widget.snap"),
+      "exports[`Widget 1`] = `expected`;\n",
+    );
     await mkdir(path.join(repo, "bin"));
     await mkdir(path.join(repo, ".github/workflows"), { recursive: true });
     await writeFile(path.join(repo, "bin/orca-no-mistakes"), entrypointSource);
@@ -2532,6 +2608,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "MyProject.Tests/OrderServiceTests.cs",
       "src/OrderServiceTest.java",
       "src/WidgetSpec.kt",
+      "src/__snapshots__/Widget.snap",
       "src/spec-parser.ts",
       "src/widget.spec.ts",
       "Tests/branch-regression.ts",
@@ -2547,6 +2624,12 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     const featureHead = git(repo, "rev-parse", "HEAD");
     git(repo, "worktree", "add", "--detach", worker, featureHead);
     const shell = new GitShell({ repo });
+    const assertWorkerChangesAllowed = () =>
+      shell.assertFixerChangesAllowed(
+        worker,
+        featureHead,
+        git(worker, "rev-parse", "HEAD"),
+      );
     assert.equal(await shell.worktreeIsReusable(worker, featureHead), true);
     await writeFile(path.join(worker, "feature.ts"), "export const value = 2;\n");
     assert.equal(await shell.worktreeIsReusable(worker, featureHead), false);
@@ -2559,7 +2642,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "add", "Tests/existing.ts");
     git(worker, "commit", "-m", "weaken test");
     await assert.rejects(
-      shell.assertFixerChangesAllowed(worker, featureHead),
+      assertWorkerChangesAllowed(),
       /fixer modified pre-existing test files: Tests\/existing\.ts/,
     );
 
@@ -2567,7 +2650,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "rm", "Tests/branch-regression.ts");
     git(worker, "commit", "-m", "remove branch regression test");
     await assert.rejects(
-      shell.assertFixerChangesAllowed(worker, featureHead),
+      assertWorkerChangesAllowed(),
       /fixer modified pre-existing test files: Tests\/branch-regression\.ts/,
     );
 
@@ -2591,12 +2674,27 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     git(worker, "commit", "-m", "weaken validation policy");
     await assert.rejects(
-      shell.assertFixerChangesAllowed(worker, featureHead),
+      assertWorkerChangesAllowed(),
       /unexplained-policy-relaxation:.*\.mocharc\.json, eslint\.config\.js, package\.json, prompts\/fixer\.md, pytest\.ini, vitest\.config\.ts/,
     );
 
     git(worker, "reset", "--hard", featureHead);
-    await writeFile(path.join(worker, ".github/workflows/ci.yml"), "- run: true\n");
+    const ciPolicyPaths = [
+      ".buildkite/pipeline.yml",
+      ".circleci/config.yml",
+      ".forgejo/workflows/ci.yml",
+      ".github/workflows/ci.yml",
+      ".gitlab-ci.yml",
+      ".travis.yml",
+      "Jenkinsfile",
+      "appveyor.yml",
+      "azure-pipelines.yml",
+      "bitbucket-pipelines.yml",
+    ];
+    for (const filePath of ciPolicyPaths) {
+      await mkdir(path.dirname(path.join(worker, filePath)), { recursive: true });
+      await writeFile(path.join(worker, filePath), "disabled\n");
+    }
     await mkdir(path.join(worker, "tests/sub"), { recursive: true });
     await writeFile(
       path.join(worker, "tests/sub/conftest.py"),
@@ -2611,7 +2709,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(
       worker,
       "add",
-      ".github/workflows/ci.yml",
+      ...ciPolicyPaths,
       "scripts/adapters.ts",
       "scripts/config.ts",
       "scripts/ledger.ts",
@@ -2620,10 +2718,12 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "add", "-f", "tests/sub/conftest.py");
     git(worker, "commit", "-m", "weaken coordinator validation policy");
     await assert.rejects(
-      shell.assertFixerChangesAllowed(worker, featureHead),
+      assertWorkerChangesAllowed(),
       (error: unknown) => {
         assert.ok(error instanceof Error);
-        assert.match(error.message, /\.github\/workflows\/ci\.yml/);
+        for (const filePath of ciPolicyPaths) {
+          assert.ok(error.message.includes(filePath));
+        }
         assert.match(error.message, /scripts\/config\.ts/);
         assert.match(error.message, /scripts\/policy\.ts/);
         assert.match(error.message, /tests\/sub\/conftest\.py/i);
@@ -2649,7 +2749,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "src/spec-parser.ts",
     );
     git(worker, "commit", "-m", "repair specification tooling");
-    await shell.assertFixerChangesAllowed(worker, featureHead);
+    await assertWorkerChangesAllowed();
 
     git(worker, "reset", "--hard", featureHead);
     await writeFile(
@@ -2670,7 +2770,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     git(worker, "commit", "-m", "weaken end-to-end tests");
     await assert.rejects(
-      shell.assertFixerChangesAllowed(worker, featureHead),
+      assertWorkerChangesAllowed(),
       (error: unknown) => {
         assert.ok(error instanceof Error);
         assert.match(error.message, /cypress\/e2e\/login\.cy\.ts/);
@@ -2687,7 +2787,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "add", "src/widget.spec.ts");
     git(worker, "commit", "-m", "weaken filename test");
     await assert.rejects(
-      shell.assertFixerChangesAllowed(worker, featureHead),
+      assertWorkerChangesAllowed(),
       /fixer modified pre-existing test files: src\/widget\.spec\.ts/,
     );
 
@@ -2713,7 +2813,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     git(worker, "commit", "-m", "weaken suffix-convention tests");
     await assert.rejects(
-      shell.assertFixerChangesAllowed(worker, featureHead),
+      assertWorkerChangesAllowed(),
       (error: unknown) => {
         assert.ok(error instanceof Error);
         assert.match(error.message, /MyProject\.Tests\/OrderServiceTests\.cs/);
@@ -2721,6 +2821,18 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
         assert.match(error.message, /src\/WidgetSpec\.kt/);
         return true;
       },
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/__snapshots__/Widget.snap"),
+      "exports[`Widget 1`] = `weakened`;\n",
+    );
+    git(worker, "add", "src/__snapshots__/Widget.snap");
+    git(worker, "commit", "-m", "weaken snapshot assertion");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified pre-existing test files: src\/__snapshots__\/Widget\.snap/,
     );
 
     git(worker, "reset", "--hard", featureHead);
@@ -2734,7 +2846,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "add", "bin/orca-no-mistakes");
     git(worker, "commit", "-m", "bypass coordinator entrypoint");
     await assert.rejects(
-      shell.assertFixerChangesAllowed(worker, featureHead),
+      assertWorkerChangesAllowed(),
       /protected validation policy files: bin\/orca-no-mistakes/,
     );
 
@@ -2746,7 +2858,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     git(worker, "add", "docs/agents/prompt-templates.md");
     git(worker, "commit", "-m", "document prompt templates");
-    await shell.assertFixerChangesAllowed(worker, featureHead);
+    await assertWorkerChangesAllowed();
 
     git(worker, "reset", "--hard", featureHead);
     await mkdir(path.join(worker, "docs/prompts"), { recursive: true });
@@ -2756,7 +2868,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     git(worker, "add", "docs/prompts/reviewer.md");
     git(worker, "commit", "-m", "document reviewer prompts");
-    await shell.assertFixerChangesAllowed(worker, featureHead);
+    await assertWorkerChangesAllowed();
 
     git(worker, "reset", "--hard", featureHead);
     await writeFile(
@@ -2766,7 +2878,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "add", "scripts/orca-no-mistakes.ts");
     git(worker, "commit", "-m", "repair implementation");
     await assert.rejects(
-      shell.assertFixerChangesAllowed(worker, featureHead),
+      assertWorkerChangesAllowed(),
       /protected validation policy files: scripts\/orca-no-mistakes\.ts/,
     );
 
@@ -2777,7 +2889,16 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     git(worker, "add", "Tests/new-regression.ts");
     git(worker, "commit", "-m", "add regression test");
-    await shell.assertFixerChangesAllowed(worker, featureHead);
+    const checkedWorkerHead = git(worker, "rev-parse", "HEAD");
+    await shell.assertFixerChangesAllowed(worker, featureHead, checkedWorkerHead);
+    await writeFile(path.join(worker, "feature.ts"), "export const value = 3;\n");
+    git(worker, "add", "feature.ts");
+    git(worker, "commit", "-m", "advance after policy check");
+    assert.equal(
+      await shell.applyWorktreeCommits(worker, featureHead, checkedWorkerHead),
+      false,
+    );
+    assert.equal(git(repo, "rev-parse", "HEAD"), featureHead);
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
@@ -2814,10 +2935,14 @@ test("GitShell.applyWorktreeCommits adopts rewritten rebase history behind a bac
     const worker = path.join(temp, "worker-wt");
     git(operator, "worktree", "add", "--detach", worker, pinnedHead);
     git(worker, "rebase", "origin/main");
-    assert.notEqual(git(worker, "rev-parse", "HEAD"), pinnedHead);
+    const rebasedHead = git(worker, "rev-parse", "HEAD");
+    assert.notEqual(rebasedHead, pinnedHead);
 
     const shell = new GitShell({ repo: operator });
-    assert.equal(await shell.applyWorktreeCommits(worker, pinnedHead), true);
+    assert.equal(
+      await shell.applyWorktreeCommits(worker, pinnedHead, rebasedHead),
+      true,
+    );
     assert.equal(
       git(operator, "rev-parse", "HEAD"),
       git(worker, "rev-parse", "HEAD"),
@@ -2939,7 +3064,10 @@ test("rewritten-history adoption never clobbers a concurrently advanced branch",
     const advancedBranch = git(operator, "rev-parse", "feature");
 
     const shell = new GitShell({ repo: operator });
-    assert.equal(await shell.applyWorktreeCommits(worker, pinnedHead), true);
+    assert.equal(
+      await shell.applyWorktreeCommits(worker, pinnedHead, rewritten),
+      true,
+    );
     assert.equal(git(operator, "rev-parse", "HEAD"), rewritten);
     assert.equal(git(operator, "rev-parse", "feature"), advancedBranch);
   } finally {
@@ -5970,12 +6098,18 @@ test("a fixer timeout during commit application leaves the branch unchanged", as
     async applyWorktreeCommits(
       sourcePath: string,
       expectedHead: string,
+      expectedSourceHead: string,
       fence?: { readonly aborted: boolean },
     ): Promise<boolean> {
       this.headAtApply = await this.head();
       try {
         await new Promise((resolve) => setTimeout(resolve, 75));
-        return super.applyWorktreeCommits(sourcePath, expectedHead, fence);
+        return super.applyWorktreeCommits(
+          sourcePath,
+          expectedHead,
+          expectedSourceHead,
+          fence,
+        );
       } finally {
         this.settled = true;
       }
@@ -6031,11 +6165,13 @@ test("a fixer applied within its timeout may finish coordinator verification", a
     async applyWorktreeCommits(
       sourcePath: string,
       expectedHead: string,
+      expectedSourceHead: string,
       fence?: { readonly aborted: boolean },
     ): Promise<boolean> {
       const applied = await super.applyWorktreeCommits(
         sourcePath,
         expectedHead,
+        expectedSourceHead,
         fence,
       );
       this.#delayNextHead = applied;
