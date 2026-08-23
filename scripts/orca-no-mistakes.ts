@@ -555,6 +555,11 @@ export async function runPipeline(
         let guidance = "";
 
         if (!shouldFix) {
+          if (fixerSession) {
+            const pausedSession = fixerSession;
+            fixerSession = undefined;
+            await releaseFixerSession(pausedSession, orca);
+          }
           const gateOptions = ["approve", "fix", "skip", "stop"];
           const question = gateQuestion(
             stage,
@@ -3085,9 +3090,10 @@ export class CliOrca implements OrcaOperations {
         message.from_handle !== this.#notifyHandle ||
         !message.body
       ) {
-        throw new Error(
-          "unexpected orchestration message while waiting for a human gate",
+        console.warn(
+          `no-mistakes: ignored unrelated ${message.type ?? "unknown"} orchestration message while waiting for a human gate`,
         );
+        continue;
       }
       let response: { gateId?: unknown; resolution?: unknown };
       try {
@@ -3096,7 +3102,10 @@ export class CliOrca implements OrcaOperations {
           resolution?: unknown;
         };
       } catch {
-        throw new Error("gate response contained invalid JSON");
+        console.warn(
+          "no-mistakes: ignored a human-gate response with invalid JSON",
+        );
+        continue;
       }
       if (
         typeof response.gateId !== "string" ||
@@ -3104,7 +3113,10 @@ export class CliOrca implements OrcaOperations {
         typeof response.resolution !== "string" ||
         !response.resolution.trim()
       ) {
-        throw new Error("gate response was missing a gate ID or resolution");
+        console.warn(
+          "no-mistakes: ignored a human-gate response missing a gate ID or resolution",
+        );
+        continue;
       }
       const responseGateId = response.gateId.trim();
       if (!pendingGateIds.has(responseGateId)) continue;
@@ -3456,6 +3468,7 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "scripts/adapters.ts",
       "scripts/config.ts",
       "scripts/ledger.ts",
+      "scripts/orca-no-mistakes.ts",
       "scripts/policy.ts",
     ].includes(normalized) ||
     (parts[0] === ".github" && parts[1] === "workflows") ||
@@ -3475,37 +3488,6 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       fileName,
     )
   );
-}
-
-const COORDINATOR_POLICY_SOURCE = "scripts/orca-no-mistakes.ts";
-const COORDINATOR_POLICY_BLOCKS = [
-  ["\nexport async function runPipeline(", "\ntype CommandResult"],
-  ["\nasync function command(", "\nfunction unwrapJson<"],
-  ["\nfunction isTestPath(", "\ntype GitShellOptions"],
-  ["\n  async assertFixerChangesAllowed(", "\n  async head()"],
-  ["\n  async headOf(", "\n  async anchorRecoveryRef("],
-  ["\n  async showFile(", "\n  async #detectBase("],
-  ["\n  async #git(", "\n}\n\nfunction failureReport("],
-  ["\nexport async function main(", "\nasync function runAttestationCommand("],
-] as const;
-
-function coordinatorPolicyBlocks(source: string | undefined): string | undefined {
-  if (source === undefined) return undefined;
-  const blocks: string[] = [];
-  for (const [startMarker, endMarker] of COORDINATOR_POLICY_BLOCKS) {
-    const start = source.indexOf(startMarker);
-    if (
-      start < 0 ||
-      start !== source.lastIndexOf(startMarker) ||
-      source.indexOf(endMarker) !== source.lastIndexOf(endMarker)
-    ) {
-      return undefined;
-    }
-    const end = source.indexOf(endMarker, start + startMarker.length);
-    if (end < 0) return undefined;
-    blocks.push(source.slice(start, end));
-  }
-  return blocks.join("\0");
 }
 
 type GitShellOptions = { base?: string; expectedHead?: string; repo: string };
@@ -3602,21 +3584,6 @@ export class GitShell implements GitOperations {
       }
       if (isProtectedValidationPolicyPath(filePath)) {
         protectedPolicy.push(filePath);
-      }
-    }
-    if (changedPaths.includes(COORDINATOR_POLICY_SOURCE)) {
-      const [before, after] = await Promise.all([
-        this.showFile(expectedHead, COORDINATOR_POLICY_SOURCE),
-        this.showFile(sourceHead, COORDINATOR_POLICY_SOURCE),
-      ]);
-      const beforeBlock = coordinatorPolicyBlocks(before);
-      const afterBlock = coordinatorPolicyBlocks(after);
-      if (
-        beforeBlock === undefined ||
-        afterBlock === undefined ||
-        beforeBlock !== afterBlock
-      ) {
-        protectedPolicy.push(COORDINATOR_POLICY_SOURCE);
       }
     }
     if (protectedTests.length > 0) {

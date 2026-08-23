@@ -1602,7 +1602,6 @@ test("CliOrca processes a complete gate-response delivery before acknowledgement
   const callsPath = path.join(temp, "calls.jsonl");
   const resolvedPath = path.join(temp, "resolved");
   const failAckPath = path.join(temp, "fail-ack");
-  const unexpectedPath = path.join(temp, "unexpected");
   const previousHandle = process.env.ORCA_TERMINAL_HANDLE;
   process.env.ORCA_TERMINAL_HANDLE = "coordinator-opencode";
   try {
@@ -1623,15 +1622,12 @@ if (args[1] === 'run-create') {
     { id: 'gate-other', status: 'pending' }
   ] })
 } else if (args[1] === 'check' && args.includes('--unread')) {
-  out(fs.existsSync(${JSON.stringify(unexpectedPath)})
-    ? { deliveryId: 'unexpected-delivery', messages: [
-        { id: 'worker-question', type: 'question', from_handle: 'worker', subject: 'Need help', body: 'Question' }
-      ] }
-    : { deliveryId: 'gate-delivery', messages: [
-        { id: 'response-message', type: 'question', from_handle: 'originating-opencode', subject: 'no-mistakes gate response', body: JSON.stringify({ gateId: 'gate-review', resolution: 'fix: verified' }) },
-        { id: 'other-response', type: 'question', from_handle: 'originating-opencode', subject: 'no-mistakes gate response', body: JSON.stringify({ gateId: 'gate-other', resolution: 'approve' }) },
-        { id: 'stale-response', type: 'question', from_handle: 'originating-opencode', subject: 'no-mistakes gate response', body: JSON.stringify({ gateId: 'gate-stale', resolution: 'approve' }) }
-      ] })
+  out({ deliveryId: 'gate-delivery', messages: [
+    { id: 'response-message', type: 'question', from_handle: 'originating-opencode', subject: 'no-mistakes gate response', body: JSON.stringify({ gateId: 'gate-review', resolution: 'fix: verified' }) },
+    { id: 'other-response', type: 'question', from_handle: 'originating-opencode', subject: 'no-mistakes gate response', body: JSON.stringify({ gateId: 'gate-other', resolution: 'approve' }) },
+    { id: 'stale-response', type: 'question', from_handle: 'originating-opencode', subject: 'no-mistakes gate response', body: JSON.stringify({ gateId: 'gate-stale', resolution: 'approve' }) },
+    { id: 'straggler-heartbeat', type: 'heartbeat', from_handle: 'worker', subject: 'heartbeat', body: '{}' }
+  ] })
 } else if (args[1] === 'gate-resolve') {
   const id = args[args.indexOf('--id') + 1]
   if (id === 'gate-review') fs.writeFileSync(${JSON.stringify(resolvedPath)}, 'yes')
@@ -1680,29 +1676,9 @@ if (args[1] === 'run-create') {
       acknowledgedIndex >
         calls.findLastIndex((args) => args[1] === "gate-resolve"),
     );
+    assert.ok(!calls.some((args) => args.includes("--types")));
 
     await rm(resolvedPath, { force: true });
-    await writeFile(unexpectedPath, "unexpected\n");
-    const unexpectedOrca = new CliOrca({
-      command: fakeOrca,
-      cwd: temp,
-      notifyHandle: "originating-opencode",
-    });
-    await unexpectedOrca.createRun("unexpected gate delivery");
-    await unexpectedOrca.createGate("task-review", "Choose a review action.");
-    const callCountBeforeUnexpected = calls.length;
-    await assert.rejects(
-      unexpectedOrca.waitForGate("gate-review"),
-      /unexpected orchestration message while waiting for a human gate/,
-    );
-    const unexpectedCalls = (await readFile(callsPath, "utf8"))
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line) as string[])
-      .slice(callCountBeforeUnexpected);
-    assert.ok(!unexpectedCalls.some((args) => args.includes("--ack")));
-    await rm(unexpectedPath, { force: true });
-
     await writeFile(failAckPath, "fail\n");
     const failingOrca = new CliOrca({
       command: fakeOrca,
@@ -2789,93 +2765,9 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     git(worker, "add", "scripts/orca-no-mistakes.ts");
     git(worker, "commit", "-m", "repair implementation");
-    await shell.assertFixerChangesAllowed(worker, featureHead);
-
-    const assertCoordinatorChangeRejected = async (
-      source: string,
-      message: string,
-    ) => {
-      git(worker, "reset", "--hard", featureHead);
-      await writeFile(
-        path.join(worker, "scripts/orca-no-mistakes.ts"),
-        `${source}\nexport const integrationFixture = 1;\n`,
-      );
-      git(worker, "add", "scripts/orca-no-mistakes.ts");
-      git(worker, "commit", "-m", message);
-      await assert.rejects(
-        shell.assertFixerChangesAllowed(worker, featureHead),
-        /protected validation policy files: scripts\/orca-no-mistakes\.ts/,
-      );
-    };
-
-    await assertCoordinatorChangeRejected(
-      coordinatorSource.replace(
-        "function checkerInstructions(",
-        "function relaxedCheckerInstructions(",
-      ),
-      "weaken coordinator prompt",
-    );
-    await assertCoordinatorChangeRejected(
-      coordinatorSource.replace('if (stage !== "rebase") {', "if (false) {"),
-      "disable fixer guard call",
-    );
-    await assertCoordinatorChangeRejected(
-      coordinatorSource.replace(
-        "if (protectedTests.length > 0) {",
-        "if (false) {",
-      ),
-      "disable fixer guard enforcement",
-    );
-    await assertCoordinatorChangeRejected(
-      coordinatorSource.replace(
-        "return result.stdout.trim().length > 0;",
-        "return false;",
-      ),
-      "disable existing test detection",
-    );
-    await assertCoordinatorChangeRejected(
-      coordinatorSource.replace(
-        '["-C", worktreePath, "rev-parse", "HEAD"]',
-        '["rev-parse", "HEAD"]',
-      ),
-      "disable retained worktree validation",
-    );
-    await assertCoordinatorChangeRejected(
-      coordinatorSource.replace(
-        "const child = spawn(executable, args, {",
-        'const child = spawn("true", [], {',
-      ),
-      "disable command execution",
-    );
-    await assertCoordinatorChangeRejected(
-      coordinatorSource.replace(
-        '["-C", this.#repo, ...args],',
-        '["diff", "--name-only"],',
-      ),
-      "disable git execution",
-    );
-    await assertCoordinatorChangeRejected(
-      coordinatorSource.replace(
-        "const repoState = await git.assertReady();",
-        "git.assertFixerChangesAllowed = async () => {};\n  const repoState = await git.assertReady();",
-      ),
-      "disable injected fixer guard",
-    );
-    await assertCoordinatorChangeRejected(
-      coordinatorSource.replace(
-        "const repo = await git.assertReady();",
-        "git.assertFixerChangesAllowed = async () => {};\n  const repo = await git.assertReady();",
-      ),
-      "disable pipeline fixer guard",
-    );
-    const guardStart = coordinatorSource.indexOf(
-      "\n  async assertFixerChangesAllowed(",
-    );
-    const guardEnd = coordinatorSource.indexOf("\n  async head()", guardStart);
-    assert.ok(guardStart >= 0 && guardEnd > guardStart);
-    await assertCoordinatorChangeRejected(
-      `/*${coordinatorSource.slice(guardStart, guardEnd)}\n*/${coordinatorSource.replace("if (protectedTests.length > 0) {", "if (false) {")}`,
-      "prepend policy decoy",
+    await assert.rejects(
+      shell.assertFixerChangesAllowed(worker, featureHead),
+      /protected validation policy files: scripts\/orca-no-mistakes\.ts/,
     );
 
     git(worker, "reset", "--hard", featureHead);
