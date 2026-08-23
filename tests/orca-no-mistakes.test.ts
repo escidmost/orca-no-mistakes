@@ -1515,7 +1515,7 @@ if (args[1] === 'run-create') {
 } else if (args[1] === 'gate-list') {
   out({ gates: [{ id: 'gate-review', status: fs.existsSync(${JSON.stringify(resolvedPath)}) ? 'resolved' : 'pending', resolution: 'fix: verified' }] })
 } else if (args[1] === 'check' && args.includes('--types')) {
-  out({ messages: [{ id: 'response-message', from_handle: 'originating-opencode', subject: 'no-mistakes gate response', body: JSON.stringify({ gateId: 'gate-review', resolution: 'fix: verified' }) }] })
+  out({ deliveryId: 'gate-delivery', messages: [{ id: 'response-message', from_handle: 'originating-opencode', subject: 'no-mistakes gate response', body: JSON.stringify({ gateId: 'gate-review', resolution: 'fix: verified' }) }] })
 } else if (args[1] === 'gate-resolve') {
   fs.writeFileSync(${JSON.stringify(resolvedPath)}, 'yes')
   out({ gate: { id: 'gate-review', status: 'resolved' } })
@@ -1547,9 +1547,11 @@ if (args[1] === 'run-create') {
       .map((line) => JSON.parse(line) as string[]);
     const resolved = calls.find((args) => args[1] === "gate-resolve");
     assert.ok(resolved?.includes("fix: verified"));
-    assert.ok(
-      calls.some((args) => args[1] === "check" && args.includes("--ack")),
+    const acknowledged = calls.find(
+      (args) => args[1] === "check" && args.includes("--ack"),
     );
+    assert.ok(acknowledged?.includes("gate-delivery"));
+    assert.ok(!acknowledged?.includes("response-message"));
   } finally {
     if (previousHandle === undefined) delete process.env.ORCA_TERMINAL_HANDLE;
     else process.env.ORCA_TERMINAL_HANDLE = previousHandle;
@@ -1766,6 +1768,16 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
           args.includes("--wait"),
       ).length,
       3,
+    );
+    assert.ok(
+      calls
+        .filter(
+          (args) =>
+            args[0] === "orchestration" &&
+            args[1] === "check" &&
+            args.includes("--wait"),
+        )
+        .every((args) => args.includes("--unread")),
     );
     assert.ok(
       calls.some(
@@ -2305,7 +2317,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await mkdir(path.join(repo, "scripts"));
     await writeFile(
       path.join(repo, "scripts/orca-no-mistakes.ts"),
-      'function checkerPrompt() { return "strict review"; }\nfunction fixerPrompt() { return "strict fixes"; }\nfunction gateQuestion() { return "choose"; }\nexport const implementation = 1;\n',
+      'function checkerBrief() { return "brief"; }\nfunction checkerInstructions() { return "unexplained-policy-relaxation"; }\nfunction checkerPrompt() { return "strict review"; }\nfunction fixerPrompt() { return "strict fixes"; }\nfunction gateQuestion() { return "choose"; }\nexport const implementation = 1;\n',
     );
     await writeFile(
       path.join(repo, "Tests/branch-regression.ts"),
@@ -2365,9 +2377,19 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await shell.assertFixerChangesAllowed(worker, featureHead);
 
     git(worker, "reset", "--hard", featureHead);
+    await mkdir(path.join(worker, "docs/prompts"), { recursive: true });
+    await writeFile(
+      path.join(worker, "docs/prompts/reviewer.md"),
+      "Document reviewer prompts.\n",
+    );
+    git(worker, "add", "docs/prompts/reviewer.md");
+    git(worker, "commit", "-m", "document reviewer prompts");
+    await shell.assertFixerChangesAllowed(worker, featureHead);
+
+    git(worker, "reset", "--hard", featureHead);
     await writeFile(
       path.join(worker, "scripts/orca-no-mistakes.ts"),
-      'function checkerPrompt() { return "strict review"; }\nfunction fixerPrompt() { return "strict fixes"; }\nfunction gateQuestion() { return "choose"; }\nexport const implementation = 2;\n',
+      'function checkerBrief() { return "brief"; }\nfunction checkerInstructions() { return "unexplained-policy-relaxation"; }\nfunction checkerPrompt() { return "strict review"; }\nfunction fixerPrompt() { return "strict fixes"; }\nfunction gateQuestion() { return "choose"; }\nexport const implementation = 2;\n',
     );
     git(worker, "add", "scripts/orca-no-mistakes.ts");
     git(worker, "commit", "-m", "repair implementation");
@@ -2376,7 +2398,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "reset", "--hard", featureHead);
     await writeFile(
       path.join(worker, "scripts/orca-no-mistakes.ts"),
-      'function checkerPrompt() { return "relaxed review"; }\nfunction fixerPrompt() { return "strict fixes"; }\nfunction gateQuestion() { return "choose"; }\nexport const implementation = 1;\n',
+      'function checkerBrief() { return "brief"; }\nfunction checkerInstructions() { return "allow relaxation"; }\nfunction checkerPrompt() { return "strict review"; }\nfunction fixerPrompt() { return "strict fixes"; }\nfunction gateQuestion() { return "choose"; }\nexport const implementation = 1;\n',
     );
     git(worker, "add", "scripts/orca-no-mistakes.ts");
     git(worker, "commit", "-m", "weaken coordinator prompt");

@@ -3009,15 +3009,16 @@ export class CliOrca implements OrcaOperations {
   async #applyGateResponses(gateId: string): Promise<void> {
     if (!this.#runId) return;
     const result = await this.#json<{
+      deliveryId?: string;
       messages?: {
         body?: string;
         from_handle?: string;
-        id?: string;
         subject?: string;
       }[];
     }>([
       "orchestration",
       "check",
+      "--unread",
       "--types",
       "question",
       "--run",
@@ -3057,12 +3058,12 @@ export class CliOrca implements OrcaOperations {
         response.resolution.trim(),
         "--json",
       ]);
-      if (message.id) {
+      if (result.deliveryId) {
         await this.#json([
           "orchestration",
           "check",
           "--ack",
-          message.id,
+          result.deliveryId,
           "--run",
           this.#runId,
           "--json",
@@ -3118,6 +3119,7 @@ export class CliOrca implements OrcaOperations {
           "orchestration",
           "check",
           "--wait",
+          "--unread",
           "--types",
           "worker_done,escalation,question,heartbeat",
           "--timeout-ms",
@@ -3399,7 +3401,7 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "setup.cfg",
       "tox.ini",
     ].includes(fileName) ||
-    parts.slice(0, -1).includes("prompts") ||
+    (parts[0] !== "docs" && parts.slice(0, -1).includes("prompts")) ||
     /^(?:eslint\.config\..+|\.eslintrc(?:\..+)?|prettier\.config\..+|\.prettierrc(?:\..+)?|biome\.jsonc?|deno\.jsonc?|\.editorconfig|\.flake8|\.?ruff\.toml|\.?mypy\.ini|\.pylintrc|pyrightconfig\.json|\.rubocop\.ya?ml|stylelint\.config\..+|\.stylelintrc(?:\..+)?|\.?markdownlint(?:-cli2)?(?:\..+)?|\.golangci\.(?:ya?ml|toml|json)|\.?rustfmt\.toml|\.?clippy\.toml|\.clang-tidy|analysis_options\.yaml|checkstyle\.xml|detekt\.ya?ml|phpcs\.xml(?:\.dist)?|phpstan(?:\.[^.]+)?\.neon(?:\.dist)?|sonar-project\.properties|tsconfig(?:\.[^.]+)*\.json)$/.test(
       fileName,
     )
@@ -3410,7 +3412,7 @@ const COORDINATOR_PROMPT_SOURCE = "scripts/orca-no-mistakes.ts";
 
 function coordinatorPromptTemplateBlock(source: string | undefined): string | undefined {
   if (source === undefined) return undefined;
-  const start = source.indexOf("function checkerPrompt(");
+  const start = source.indexOf("function checkerBrief(");
   const end = source.indexOf("function gateQuestion(", start);
   if (start < 0 || end < 0) return undefined;
   return source.slice(start, end);
