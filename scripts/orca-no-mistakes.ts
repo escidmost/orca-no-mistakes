@@ -2077,6 +2077,7 @@ const DEFAULT_WORKER_AGENT = "opencode";
 const WORKER_IDLE_TIMEOUT_MS = 1_800_000;
 const NATIVE_WORKER_CREATE_SLACK_MS = 120_000;
 const FISH_SHELL_STARTUP_DELAY_MS = 12_000;
+const KIMI_STARTUP_GRACE_MS = 2_000;
 
 function workerShellStartupDelayMs(): number {
   const raw = process.env.WORKER_SHELL_STARTUP_DELAY_MS?.trim();
@@ -2724,6 +2725,7 @@ export class CliOrca implements OrcaOperations {
         agentArgsOverride: launch.agent?.agentArgsOverride,
         effort: launch.agent?.effort,
         model: launch.agent?.model,
+        nonInteractive: initialPrompt !== undefined,
         variant: launch.agent?.variant,
       });
       if (initialPrompt !== undefined) {
@@ -2744,6 +2746,22 @@ export class CliOrca implements OrcaOperations {
           setTimeout(resolve, shellStartupDelayMs),
         );
       }
+      const startupCursor =
+        normalizedHarness === "kimi" && initialPrompt !== undefined
+          ? (
+              await this.#json<{
+                terminal?: { nextCursor?: string };
+              }>([
+                "terminal",
+                "read",
+                "--terminal",
+                terminalHandle,
+                "--limit",
+                "1",
+                "--json",
+              ])
+            ).terminal?.nextCursor
+          : undefined;
       await this.#json([
         "terminal",
         "send",
@@ -2754,7 +2772,11 @@ export class CliOrca implements OrcaOperations {
         "--enter",
         "--json",
       ]);
-      if (!(normalizedHarness === "kimi" && initialPrompt !== undefined)) {
+      if (normalizedHarness === "kimi" && initialPrompt !== undefined) {
+        if (startupCursor !== undefined) {
+          await this.#waitForKimiStartup(terminalHandle, startupCursor);
+        }
+      } else {
         await this.#waitForWorkerAgent(
           terminalHandle,
           harness,
@@ -2765,6 +2787,53 @@ export class CliOrca implements OrcaOperations {
     } catch (error) {
       if (promptPath) await rm(promptPath, { force: true });
       throw error;
+    }
+  }
+
+  async #waitForKimiStartup(
+    terminalHandle: string,
+    cursor: string,
+  ): Promise<void> {
+    const deadline =
+      Date.now() + Math.min(KIMI_STARTUP_GRACE_MS, workerAgentReadyTimeoutMs());
+    for (;;) {
+      const result = await this.#json<{
+        terminal?: {
+          nextCursor?: string;
+          status?: string;
+          tail?: string[];
+        };
+      }>([
+        "terminal",
+        "read",
+        "--terminal",
+        terminalHandle,
+        "--cursor",
+        cursor,
+        "--limit",
+        "200",
+        "--json",
+      ]);
+      if (result.terminal?.status === "exited") {
+        throw new PreflightError(
+          "readiness-timeout",
+          "worker agent terminal exited during startup",
+        );
+      }
+      cursor = result.terminal?.nextCursor ?? cursor;
+      const output = result.terminal?.tail?.join("\n") ?? "";
+      const failureClass = classifyPreflightFailure(output);
+      if (
+        failureClass !== "unclassified" ||
+        /^\s*(?:error|fatal):/imu.test(output)
+      ) {
+        throw new PreflightError(
+          failureClass,
+          `worker agent Kimi failed during startup: ${output.trim().slice(-400)}`,
+        );
+      }
+      if (Date.now() >= deadline) return;
+      await new Promise((resolve) => setTimeout(resolve, 50));
     }
   }
 
@@ -3850,6 +3919,7 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "azure-pipelines.yaml",
       "bitbucket-pipelines.yml",
       "jenkinsfile",
+      ".pre-commit-config.yaml",
     ].includes(normalized) ||
     [
       "cargo.toml",
