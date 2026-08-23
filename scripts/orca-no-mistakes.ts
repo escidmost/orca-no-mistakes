@@ -109,6 +109,8 @@ export type WorkerLaunch = {
   prompt: string;
   role: "fixer" | "reviewer";
   stage: StageName;
+  retainedWorktreeId?: string;
+  retainedWorktreePath?: string;
   terminal?: string;
   worktree: "current" | "new-child";
 };
@@ -1184,6 +1186,12 @@ async function runFixer(
       prompt,
       role: "fixer",
       stage,
+      retainedWorktreeId: reuseSession
+        ? sessionToReuse?.worker.worktreeId
+        : undefined,
+      retainedWorktreePath: reuseSession
+        ? sessionToReuse?.worker.worktreePath
+        : undefined,
       terminal: reuseSession
         ? sessionToReuse?.worker.terminalHandle
         : undefined,
@@ -2119,22 +2127,18 @@ export class CliOrca implements OrcaOperations {
     if (launch.agent && classifyHarness(launch.agent.harness) === "acp") {
       return await this.#startAcpWorker(taskId, launch);
     }
+    if (launch.terminal) return await this.#startRetainedWorker(taskId, launch);
     const harness = (
       launch.agent?.harness ?? DEFAULT_WORKER_AGENT
     ).toLowerCase();
     const directPreamble = launchesWithPreamble(harness);
-    const launchWithPreamble = directPreamble && !launch.terminal;
-    const prepared = launch.terminal
-      ? undefined
-      : await this.#prepareWorker(taskId, launch);
-    const terminalHandle = prepared?.terminalHandle ?? launch.terminal;
+    const prepared = await this.#prepareWorker(taskId, launch);
+    const terminalHandle = prepared.terminalHandle;
     if (!terminalHandle)
       throw new PreflightError(
         "unclassified",
         "worker preparation returned no terminal handle",
       );
-    if (launch.terminal)
-      await this.#assertRetainedWorkerAgent(terminalHandle, harness);
     if (harness === "agy") {
       try {
         await this.#trustAgyWorkspace(prepared?.worktreePath ?? this.#cwd);
@@ -2200,25 +2204,11 @@ export class CliOrca implements OrcaOperations {
     let promptPath: string | undefined;
     if (directPreamble) {
       try {
-        if (launchWithPreamble) {
-          promptPath = await this.#launchWorkerAgent(
-            terminalHandle,
-            launch,
-            preamble,
-          );
-        } else {
-          promptPath = await this.#writeWorkerPrompt(preamble);
-          await this.#json([
-            "terminal",
-            "send",
-            "--terminal",
-            terminalHandle,
-            "--text",
-            `Read and follow the complete authenticated task in ${promptPath}`,
-            "--enter",
-            "--json",
-          ]);
-        }
+        promptPath = await this.#launchWorkerAgent(
+          terminalHandle,
+          launch,
+          preamble,
+        );
       } catch (error) {
         if (promptPath) await rm(promptPath, { force: true });
         await this.#cleanupFailedWorker(
@@ -2228,7 +2218,7 @@ export class CliOrca implements OrcaOperations {
         );
         throw new PreflightError(
           classifyPreflightFailure(String(error)),
-          `${launchWithPreamble ? "initial prompt launch" : "retained preamble delivery"} failed: ${String(error)}`,
+          `initial prompt launch failed: ${String(error)}`,
           { cause: error },
         );
       }
@@ -2263,6 +2253,81 @@ export class CliOrca implements OrcaOperations {
       throw error;
     } finally {
       if (promptPath) await rm(promptPath, { force: true });
+    }
+  }
+
+  async #startRetainedWorker(
+    taskId: string,
+    launch: WorkerLaunch,
+  ): Promise<WorkerResult> {
+    const terminalHandle = launch.terminal!;
+    const worktreeId = launch.retainedWorktreeId;
+    if (!worktreeId) {
+      throw new PreflightError(
+        "unclassified",
+        "retained worker launch has no worktree identity",
+      );
+    }
+
+    let dispatchId: string;
+    try {
+      const started = await this.#json<{
+        dispatchId?: string;
+        state?: string;
+      }>([
+        "orchestration",
+        "worker-start",
+        "--task",
+        taskId,
+        "--worktree",
+        `id:${worktreeId}`,
+        "--terminal",
+        terminalHandle,
+        "--timeout-ms",
+        String(workerAgentReadyTimeoutMs()),
+        ...(this.#runId ? ["--run", this.#runId] : []),
+        "--json",
+      ]);
+      if (!started.dispatchId || started.state !== "ready") {
+        throw new Error(
+          `worker-start returned an invalid retained-worker receipt: ${JSON.stringify(started).slice(0, 400)}`,
+        );
+      }
+      dispatchId = started.dispatchId;
+    } catch (error) {
+      throw new PreflightError(
+        classifyPreflightFailure(String(error)),
+        `retained worker start failed: ${String(error)}`,
+        { cause: error },
+      );
+    }
+
+    let deliveryId: string | undefined;
+    try {
+      const result = await this.#waitForWorker(
+        taskId,
+        dispatchId,
+        terminalHandle,
+      );
+      deliveryId = result.deliveryId;
+      if (result.error) throw new Error(result.error);
+      return {
+        deliveryId,
+        report: result.report!,
+        taskId,
+        dispatchId,
+        terminalHandle,
+        worktreeId,
+        worktreePath: launch.retainedWorktreePath,
+      };
+    } catch (error) {
+      await this.#cleanupFailedWorker(
+        dispatchId,
+        terminalHandle,
+        undefined,
+        deliveryId,
+      );
+      throw error;
     }
   }
 
@@ -2586,46 +2651,6 @@ export class CliOrca implements OrcaOperations {
     const promptPath = path.join(promptDir, `prompt-${randomUUID()}.txt`);
     await writeFile(promptPath, prompt, { mode: 0o600 });
     return promptPath;
-  }
-
-  async #assertRetainedWorkerAgent(
-    terminalHandle: string,
-    harness: string,
-  ): Promise<void> {
-    let shown: {
-      terminal: {
-        connected?: boolean;
-        preview?: string | null;
-        title?: string | null;
-        writable?: boolean;
-      };
-    };
-    try {
-      shown = await this.#json([
-        "terminal",
-        "show",
-        "--terminal",
-        terminalHandle,
-        "--json",
-      ]);
-    } catch (error) {
-      throw new PreflightError(
-        classifyPreflightFailure(String(error)),
-        `retained ${harness} terminal liveness check failed: ${String(error)}`,
-        { cause: error },
-      );
-    }
-    const terminal = shown.terminal;
-    if (
-      terminal.connected === false ||
-      terminal.writable === false ||
-      !readinessMatcher(harness)(terminal)
-    ) {
-      throw new PreflightError(
-        "readiness-timeout",
-        `retained ${harness} terminal no longer appears to run ${harness}`,
-      );
-    }
   }
 
   async #trustAgyWorkspace(worktreePath: string): Promise<void> {

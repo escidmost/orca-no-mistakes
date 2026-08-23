@@ -1784,7 +1784,7 @@ if (args[1] === 'run-create') {
   }
 });
 
-test("CliOrca creates a fixer once and reuses its terminal without creation flags", async () => {
+test("CliOrca reuses a fixer through supervised worker-start", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-cli-"));
   const fakeOrca = path.join(temp, "orca");
   const callsPath = path.join(temp, "calls.jsonl");
@@ -1818,11 +1818,15 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
 } else if (args[0] === 'terminal' && args[1] === 'send') {
   out({ accepted: true })
 } else if (args[0] === 'terminal' && args[1] === 'show') {
-  out({ terminal: { connected: true, title: 'OpenCode', preview: 'ready' } })
+  out({ terminal: { connected: true, title: 'OpenCode', preview: 'ready', worktreeId: 'worker-worktree' } })
 } else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
   const count = fs.existsSync(${JSON.stringify(startCountPath)}) ? Number(fs.readFileSync(${JSON.stringify(startCountPath)}, 'utf8')) : 0
   fs.writeFileSync(${JSON.stringify(startCountPath)}, String(count + 1))
   out({ dispatch: { id: 'dispatch-' + (count + 1), status: 'dispatched' }, injected: true, preamble: 'authenticated' })
+} else if (args[0] === 'orchestration' && args[1] === 'worker-start') {
+  const count = fs.existsSync(${JSON.stringify(startCountPath)}) ? Number(fs.readFileSync(${JSON.stringify(startCountPath)}, 'utf8')) : 0
+  fs.writeFileSync(${JSON.stringify(startCountPath)}, String(count + 1))
+  out({ dispatchId: 'dispatch-' + (count + 1), state: 'ready' })
 } else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
   const count = fs.existsSync(${JSON.stringify(countPath)}) ? Number(fs.readFileSync(${JSON.stringify(countPath)}, 'utf8')) : 0
   fs.writeFileSync(${JSON.stringify(countPath)}, String(count + 1))
@@ -1856,6 +1860,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       prompt: "second",
       role: "fixer",
       stage: "lint",
+      retainedWorktreeId: "worker-worktree",
       terminal: first.terminalHandle,
       worktree: "current",
     });
@@ -1865,6 +1870,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       prompt: "third",
       role: "fixer",
       stage: "test",
+      retainedWorktreeId: "worker-worktree",
       terminal: second.terminalHandle,
       worktree: "current",
     });
@@ -1874,8 +1880,17 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line) as string[]);
-    const starts = calls.filter((args) => args[1] === "dispatch");
-    assert.equal(starts.length, 3);
+    assert.equal(calls.filter((args) => args[1] === "dispatch").length, 1);
+    const retainedStarts = calls.filter((args) => args[1] === "worker-start");
+    assert.equal(retainedStarts.length, 2);
+    assert.ok(
+      retainedStarts.every(
+        (args) =>
+          args.includes("--terminal") &&
+          args.includes("created-fixer") &&
+          args.includes("id:worker-worktree"),
+      ),
+    );
     assert.equal(first.terminalHandle, "created-fixer");
     assert.equal(second.terminalHandle, "created-fixer");
     assert.equal(third.terminalHandle, "created-fixer");
@@ -3796,7 +3811,6 @@ test("CliOrca waits for a hidden fish shell before launching Claude", async () =
   const temp = await mkdtemp(path.join(tmpdir(), "orca-claude-shell-"));
   const fakeOrca = path.join(temp, "orca");
   const callsPath = path.join(temp, "calls.jsonl");
-  const failPreamblePath = path.join(temp, "fail-preamble");
   const shellReturnedPath = path.join(temp, "shell-returned");
   const evidence = path.join(
     temp,
@@ -3825,17 +3839,19 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
 } else if (args[0] === 'terminal' && args[1] === 'create') {
   out({ terminal: { handle: 'claude-shell' } })
 } else if (args[0] === 'terminal' && args[1] === 'send') {
-  if (fs.existsSync(${JSON.stringify(failPreamblePath)})) {
-    console.error(JSON.stringify({ error: { code: 'terminal_not_writable', message: 'terminal not writable' } }))
-    process.exit(1)
-  }
   out({ accepted: true })
 } else if (args[0] === 'terminal' && args[1] === 'show') {
   out(fs.existsSync(${JSON.stringify(shellReturnedPath)})
-    ? { terminal: { connected: true, title: 'feature', preview: '$', writable: true } }
-    : { terminal: { connected: true, title: 'Claude CLI', preview: 'ready', writable: true } })
+    ? { terminal: { connected: true, title: 'Claude CLI', preview: '$', writable: true, worktreeId: 'claude-worktree' } }
+    : { terminal: { connected: true, title: 'Claude CLI', preview: 'ready', writable: true, worktreeId: 'claude-worktree' } })
 } else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
   out({ dispatch: { id: 'dispatch-claude', status: 'dispatched' }, injected: false, preamble: 'authenticated' })
+} else if (args[0] === 'orchestration' && args[1] === 'worker-start') {
+  if (fs.existsSync(${JSON.stringify(shellReturnedPath)})) {
+    console.error(JSON.stringify({ error: { code: 'agent_unconfigured', message: 'Terminal is not running a recognized agent.' } }))
+    process.exit(1)
+  }
+  out({ dispatchId: 'dispatch-claude-retained', state: 'ready' })
 } else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
   out({ deliveryId: 'delivery-claude', messages: [{ type: 'worker_done', body: 'Reviewed. Verified. Clear.', payload: JSON.stringify({ taskId: 'task-claude', dispatchId: 'dispatch-claude', outcome: 'succeeded', reportPath: ${JSON.stringify(reportPath)} }) }] })
 } else {
@@ -3902,14 +3918,14 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
         prompt: "follow-up review instructions",
         role: "reviewer",
         stage: "review",
+        retainedWorktreeId: "claude-worktree",
         terminal: worker.terminalHandle,
         worktree: "current",
       }),
       (error: unknown) =>
         error instanceof PreflightError &&
-        error.message.includes(
-          "retained claude terminal no longer appears to run claude",
-        ),
+        error.message.includes("retained worker start failed") &&
+        error.message.includes("agent_unconfigured"),
     );
     const livenessCalls = (await readFile(callsPath, "utf8"))
       .trim()
@@ -3918,25 +3934,8 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       .map((line) => (JSON.parse(line) as { args: string[] }).args);
     assert.deepEqual(
       livenessCalls.map((args) => args.slice(0, 2)),
-      [["terminal", "show"]],
+      [["orchestration", "worker-start"]],
       "stale retained agents fail before dispatch or terminal input",
-    );
-    await rm(shellReturnedPath, { force: true });
-    await writeFile(failPreamblePath, "fail\n");
-    await assert.rejects(
-      orca.startWorker("task-claude-retained", {
-        agent: { effort: "high", harness: "claude", model: "opus[1m]" },
-        name: "claude-reviewer",
-        prompt: "follow-up review instructions",
-        role: "reviewer",
-        stage: "review",
-        terminal: worker.terminalHandle,
-        worktree: "current",
-      }),
-      (error: unknown) =>
-        error instanceof PreflightError &&
-        error.message.includes("retained preamble delivery failed") &&
-        error.message.includes("terminal_not_writable"),
     );
     assert.ok(
       !(await readdir(evidence)).some((name) => name.startsWith("prompt-")),
