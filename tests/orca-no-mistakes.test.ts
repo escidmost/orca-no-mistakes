@@ -1478,6 +1478,32 @@ test("malformed reviewer findings fail closed and still clean up the worker", as
   assert.equal(orca.removedWorktrees.length, 1);
 });
 
+test("reviewer acknowledgement failures still remove the worker worktree", async () => {
+  const git = new FakeGit();
+  class ReviewerAckFailureOrca extends FakeOrca {
+    #failed = false;
+
+    override async finishWorker(
+      worker: WorkerResult,
+      disposition: "release" | "retain",
+    ): Promise<void> {
+      await super.finishWorker(worker, disposition);
+      if (disposition === "release" && !this.#failed) {
+        this.#failed = true;
+        throw new Error("reviewer acknowledgement failed");
+      }
+    }
+  }
+  const orca = new ReviewerAckFailureOrca(git);
+
+  await assert.rejects(
+    runPipeline({ intent: "Require reviewer cleanup." }, orca, git),
+    /reviewer acknowledgement failed/,
+  );
+
+  assert.equal(orca.removedWorktrees.length, 1);
+});
+
 test("reviewer title/message findings receive canonical descriptions and IDs", async () => {
   const git = new FakeGit();
   allowReviewAutoFix(git);
@@ -3107,6 +3133,12 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
 
     git(worker, "reset", "--hard", featureHead);
     await writeFile(path.join(worker, "eslint.config.js"), "export default [];\n");
+    await writeFile(path.join(worker, ".clang-format"), "DisableFormat: true\n");
+    await writeFile(path.join(worker, ".clang-format-ignore"), "**/*\n");
+    await writeFile(path.join(worker, ".eslintignore"), "**/*\n");
+    await writeFile(path.join(worker, ".markdownlintignore"), "**/*\n");
+    await writeFile(path.join(worker, ".prettierignore"), "**/*\n");
+    await writeFile(path.join(worker, ".stylelintignore"), "**/*\n");
     await writeFile(path.join(worker, ".bazelrc"), "test --test_tag_filters=-critical\n");
     await writeFile(path.join(worker, "BUILD"), "# tests disabled\n");
     await writeFile(path.join(worker, "BUILD.bazel"), "# tests disabled\n");
@@ -3163,7 +3195,13 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       worker,
       "add",
       ".mocharc.json",
+      ".clang-format",
+      ".clang-format-ignore",
+      ".eslintignore",
+      ".markdownlintignore",
       ".mvn/maven.config",
+      ".prettierignore",
+      ".stylelintignore",
       ".bazelrc",
       "BUILD",
       "BUILD.bazel",
@@ -3209,7 +3247,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "commit", "-m", "weaken validation policy");
     await assert.rejects(
       assertWorkerChangesAllowed(),
-      /unexplained-policy-relaxation:.*\.bazelrc, \.mocharc\.json, \.mvn\/maven\.config, \.mvn\/wrapper\/maven-wrapper\.jar, \.mvn\/wrapper\/maven-wrapper\.properties, BUILD, BUILD\.bazel, CMakeLists\.txt, Cargo\.lock, MODULE\.bazel, WORKSPACE, WORKSPACE\.bazel, build\.gradle, build\.gradle\.kts, cypress\.config\.ts, eslint\.config\.js, go\.work, gradle\.properties, gradle\/wrapper\/gradle-wrapper\.jar, gradle\/wrapper\/gradle-wrapper\.properties, gradlew, mvnw, package-lock\.json, package\.json, phpunit\.xml, phpunit\.xml\.dist, pkg\/go\.mod, pnpm-lock\.yaml, pom\.xml, prompts\/fixer\.md, pylintrc, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, yarn\.lock/,
+      /unexplained-policy-relaxation:.*\.bazelrc, \.clang-format, \.clang-format-ignore, \.eslintignore, \.markdownlintignore, \.mocharc\.json, \.mvn\/maven\.config, \.mvn\/wrapper\/maven-wrapper\.jar, \.mvn\/wrapper\/maven-wrapper\.properties, \.prettierignore, \.stylelintignore, BUILD, BUILD\.bazel, CMakeLists\.txt, Cargo\.lock, MODULE\.bazel, WORKSPACE, WORKSPACE\.bazel, build\.gradle, build\.gradle\.kts, cypress\.config\.ts, eslint\.config\.js, go\.work, gradle\.properties, gradle\/wrapper\/gradle-wrapper\.jar, gradle\/wrapper\/gradle-wrapper\.properties, gradlew, mvnw, package-lock\.json, package\.json, phpunit\.xml, phpunit\.xml\.dist, pkg\/go\.mod, pnpm-lock\.yaml, pom\.xml, prompts\/fixer\.md, pylintrc, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, yarn\.lock/,
     );
 
     git(worker, "reset", "--hard", featureHead);
