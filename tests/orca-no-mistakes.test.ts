@@ -2871,12 +2871,20 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     await mkdir(path.join(repo, "bin"));
     await mkdir(path.join(repo, ".github/workflows"), { recursive: true });
+    await mkdir(path.join(repo, ".github/actions/check"), { recursive: true });
     await writeFile(path.join(repo, "bin/orca-no-mistakes"), entrypointSource);
     await writeFile(
       path.join(repo, "scripts/orca-no-mistakes.ts"),
       `${coordinatorSource}\nexport const integrationFixture = 1;\n`,
     );
-    await writeFile(path.join(repo, ".github/workflows/ci.yml"), "- run: npm test\n");
+    await writeFile(
+      path.join(repo, ".github/workflows/ci.yml"),
+      "- uses: ./.github/actions/check\n",
+    );
+    await writeFile(
+      path.join(repo, ".github/actions/check/action.yml"),
+      "runs:\n  using: composite\n  steps:\n    - run: npm test\n      shell: bash\n",
+    );
     for (const moduleName of ["adapters", "config", "ledger", "policy"]) {
       await writeFile(
         path.join(repo, `scripts/${moduleName}.ts`),
@@ -2924,6 +2932,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "src/spec-parser.ts",
       "src/widget.spec.ts",
       "Tests/branch-regression.ts",
+      ".github/actions/check/action.yml",
       ".github/workflows/ci.yml",
       "bin/orca-no-mistakes",
       "scripts/adapters.ts",
@@ -3055,6 +3064,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       ".buildkite/pipeline.yml",
       ".circleci/config.yml",
       ".forgejo/workflows/ci.yml",
+      ".github/actions/check/action.yml",
       ".github/workflows/ci.yml",
       ".gitlab-ci.yml",
       ".travis.yml",

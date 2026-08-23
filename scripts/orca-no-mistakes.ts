@@ -3774,7 +3774,9 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "WORKSPACE.bazel",
     ].includes(originalFileName) ||
     ((parts[0] === ".github" || parts[0] === ".forgejo") &&
-      parts[1] === "workflows") ||
+      (parts[1] === "workflows" ||
+        (parts[1] === "actions" &&
+          (fileName === "action.yml" || fileName === "action.yaml")))) ||
     parts[0] === ".buildkite" ||
     [
       ".circleci/config.yml",
