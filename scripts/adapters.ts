@@ -111,8 +111,20 @@ function pinsAnyFlag(args: string[], flags: string[]): boolean {
 function pinsConfigKey(args: string[], key: string): boolean {
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]
-    if ((arg === '-c' || arg === '--config') && args[i + 1]?.startsWith(`${key}=`)) return true
-    if (arg.startsWith(`-c=${key}=`) || arg.startsWith(`--config=${key}=`)) return true
+    const config =
+      arg === '-c' || arg === '--config'
+        ? args[i + 1]
+        : arg.startsWith('-c=')
+          ? arg.slice(3)
+          : arg.startsWith('--config=')
+            ? arg.slice(9)
+            : undefined
+    if (!config?.startsWith(`${key}=`)) continue
+    const value = config.slice(key.length + 1).trim()
+    if (!value || value === '""' || value === "''") {
+      throw new Error(`agent codex: config override ${key} requires a nonempty value`)
+    }
+    return true
   }
   return false
 }
@@ -154,6 +166,9 @@ export function buildCliCommand(harness: string, options: CliAgentCommandOptions
   }
   const raw = Array.isArray(override) ? override : []
   const effortKnob = EFFORT_KNOBS[harness]
+  const modelPinned =
+    pinsAnyFlag(raw, MODEL_PIN_FLAGS) ||
+    (harness === 'codex' && pinsConfigKey(raw, 'model'))
   const effortPinned =
     harness === 'codex'
       ? pinsConfigKey(raw, 'model_reasoning_effort')
@@ -170,14 +185,14 @@ export function buildCliCommand(harness: string, options: CliAgentCommandOptions
     options.effort &&
     effortKnob?.requiresModel &&
     !options.model &&
-    !pinsAnyFlag(raw, MODEL_PIN_FLAGS) &&
+    !modelPinned &&
     !options.variant
   ) {
     throw new Error(
       `agent ${harness}: cannot express effort without a model; ${effortKnob.flag} selects a model-scoped variant`
     )
   }
-  if (options.model && !pinsAnyFlag(raw, MODEL_PIN_FLAGS)) parts.push('--model', options.model)
+  if (options.model && !modelPinned) parts.push('--model', options.model)
   if (effortKnob?.requiresModel) {
     const variant = options.variant ?? options.effort
     if (variant && !pinsAnyFlag(raw, [effortKnob.flag])) parts.push(effortKnob.flag, variant)
@@ -196,8 +211,8 @@ export function buildCliCommand(harness: string, options: CliAgentCommandOptions
       }
     }
   }
-  parts.push(...raw)
   parts.push(...(REQUIRED_HARNESS_ARGS[harness] ?? []))
+  parts.push(...raw)
   // Environment assignments stay unquoted as a prefix; arguments are shell-quoted individually.
   return [...env, ...parts.map(shellQuote)].join(' ')
 }

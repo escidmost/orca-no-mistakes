@@ -127,6 +127,7 @@ class FakeGit implements GitOperations {
     sourcePath: string,
     expectedHead: string,
     _expectedSourceHead: string,
+    _rebasePolicy?: { conflictFiles: string[]; upstreamHead: string },
   ): Promise<void> {
     this.calls.push(`guard:${sourcePath}:${expectedHead}`);
     if (this.protectedTestMutation) {
@@ -208,6 +209,7 @@ class FakeGit implements GitOperations {
             severity: "error",
             action: "auto-fix",
             description: "conflict; rebase aborted",
+            file: "src/conflict.ts",
           },
         ],
         summary: "rebase aborted",
@@ -1902,7 +1904,10 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     console.log(JSON.stringify({ _keepalive: true, _heartbeat: true, elapsedMs: 15000, deadlineMs: 900000 }))
     process.exitCode = 1
   } else if (count === 1) {
-    out({ deliveryId: 'delivery-heartbeat', messages: [{ type: 'heartbeat', body: 'still reviewing', payload: JSON.stringify({ taskId: 'task-review', dispatchId: 'dispatch-review' }) }] })
+    out({ deliveryId: 'delivery-heartbeat', messages: [
+      { type: 'heartbeat', body: 'stale fixer heartbeat', payload: JSON.stringify({ taskId: 'task-stale', dispatchId: 'dispatch-stale' }) },
+      { type: 'heartbeat', body: 'still reviewing', payload: JSON.stringify({ taskId: 'task-review', dispatchId: 'dispatch-review' }) }
+    ] })
   } else {
     out({ deliveryId: 'delivery-review', messages: [{ type: 'worker_done', body: 'Reviewed. Verified. Nothing remains.', payload: JSON.stringify({ taskId: 'task-review', dispatchId: 'dispatch-review', outcome: 'succeeded', reportPath: ${JSON.stringify(reportPath)} }) }] })
   }
@@ -2983,6 +2988,80 @@ test("GitShell.applyWorktreeCommits adopts rewritten rebase history behind a bac
         `refs/no-mistakes/backup/${pinnedHead}`,
       ),
       pinnedHead,
+    );
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("GitShell bounds rebase fixer changes to upstream and reported conflicts", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-rebase-guard-"));
+  const origin = path.join(temp, "origin.git");
+  const seed = path.join(temp, "seed");
+  const operator = path.join(temp, "operator");
+  const upstream = path.join(temp, "upstream");
+  try {
+    git(temp, "init", "--bare", "-b", "main", origin);
+    git(temp, "clone", origin, seed);
+    git(seed, "config", "user.email", "test@example.com");
+    git(seed, "config", "user.name", "Test User");
+    await mkdir(path.join(seed, "tests"));
+    await writeFile(path.join(seed, "f.txt"), "base\n");
+    await writeFile(path.join(seed, "tests/existing.test.ts"), "assert(true);\n");
+    git(seed, "add", ".");
+    git(seed, "commit", "-m", "base");
+    git(seed, "push", "origin", "main");
+
+    git(temp, "clone", origin, operator);
+    git(operator, "config", "user.email", "test@example.com");
+    git(operator, "config", "user.name", "Test User");
+    git(operator, "checkout", "-b", "feature");
+    await writeFile(path.join(operator, "f.txt"), "feature\n");
+    git(operator, "add", "f.txt");
+    git(operator, "commit", "-m", "feature");
+    const featureHead = git(operator, "rev-parse", "HEAD");
+
+    git(temp, "clone", origin, upstream);
+    git(upstream, "config", "user.email", "test@example.com");
+    git(upstream, "config", "user.name", "Test User");
+    await writeFile(path.join(upstream, "f.txt"), "upstream\n");
+    git(upstream, "add", "f.txt");
+    git(upstream, "commit", "-m", "upstream");
+    git(upstream, "push", "origin", "main");
+
+    const shell = new GitShell({ repo: operator });
+    const report = await shell.rebase("main");
+    assert.deepEqual(report.findings.map((finding) => finding.file), ["f.txt"]);
+    assert.equal(git(operator, "status", "--porcelain"), "");
+
+    git(operator, "fetch", "origin", "main");
+    const upstreamHead = git(operator, "rev-parse", "origin/main");
+    const worker = path.join(temp, "worker-wt");
+    git(operator, "worktree", "add", "--detach", worker, featureHead);
+    assert.throws(() => git(worker, "rebase", "origin/main"));
+    await writeFile(path.join(worker, "f.txt"), "upstream\nfeature\n");
+    git(worker, "add", "f.txt");
+    git(worker, "-c", "core.editor=true", "rebase", "--continue");
+    const rebasedHead = git(worker, "rev-parse", "HEAD");
+    const policy = { conflictFiles: ["f.txt"], upstreamHead };
+    await shell.assertFixerChangesAllowed(
+      worker,
+      featureHead,
+      rebasedHead,
+      policy,
+    );
+
+    await writeFile(path.join(worker, "tests/existing.test.ts"), "assert(false);\n");
+    git(worker, "add", "tests/existing.test.ts");
+    git(worker, "commit", "--amend", "--no-edit");
+    await assert.rejects(
+      shell.assertFixerChangesAllowed(
+        worker,
+        featureHead,
+        git(worker, "rev-parse", "HEAD"),
+        policy,
+      ),
+      /outside upstream changes or reported conflicts: tests\/existing\.test\.ts/,
     );
   } finally {
     await rm(temp, { recursive: true, force: true });
@@ -5839,10 +5918,11 @@ test("a rebase conflict fixes forward and rebases evidence onto the resolved bas
     rebaseFixer.prompt,
     /Existing tests and validation-policy files may change only when resolving reported rebase conflicts/,
   );
+  assert.match(rebaseFixer.prompt, /"file":"src\/conflict\.ts"/);
   assert.equal(
     git.calls.filter((call) => call.startsWith("guard:")).length,
-    1,
-    "only the post-rebase review fixer uses protected-path enforcement",
+    2,
+    "rebase and post-rebase review fixers both use bounded enforcement",
   );
   const failedAttempt = result.attestation.stageEvidence.find(
     (entry) => entry.summary === "rebase aborted",

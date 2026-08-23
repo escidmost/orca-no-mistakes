@@ -123,7 +123,22 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
       agentArgsOverride: { codex: ['-c', 'model_reasoning_effort="low"'] } as never,
       effort: 'max'
     }),
-    `'codex' '-c' 'model_reasoning_effort="low"' '--dangerously-bypass-approvals-and-sandbox'`
+    `'codex' '--dangerously-bypass-approvals-and-sandbox' '-c' 'model_reasoning_effort="low"'`
+  )
+  assert.equal(
+    buildCliCommand('codex', {
+      agentArgsOverride: { codex: ['-c', 'model="raw"'] } as never,
+      model: 'mapped'
+    }),
+    `'codex' '--dangerously-bypass-approvals-and-sandbox' '-c' 'model="raw"'`
+  )
+  assert.throws(
+    () =>
+      buildCliCommand('codex', {
+        agentArgsOverride: { codex: ['-c', 'model_reasoning_effort='] } as never,
+        effort: 'max'
+      }),
+    /model_reasoning_effort requires a nonempty value/
   )
   assert.throws(
     () =>
@@ -132,6 +147,16 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
       }),
     /reserved argument/
   )
+  for (const [harness, required] of [
+    ['agy', '--dangerously-skip-permissions'],
+    ['claude', '--dangerously-skip-permissions'],
+    ['codex', '--dangerously-bypass-approvals-and-sandbox']
+  ]) {
+    const command = buildCliCommand(harness, {
+      agentArgsOverride: { [harness]: ['--', 'prompt'] } as never
+    })
+    assert.ok(command.indexOf(required) < command.indexOf("'--'"))
+  }
   // Effort maps per harness through one table.
   assert.equal(
     buildCliCommand('grok', { effort: 'high', model: 'grok-4' }),
@@ -348,7 +373,7 @@ test('buildCliCommand always sends the agy reserved flag and rejects reserved ov
   })
   assert.equal(
     overridden,
-    `'agy' '--mode' 'accept-edits' '--dangerously-skip-permissions'`
+    `'agy' '--dangerously-skip-permissions' '--mode' 'accept-edits'`
   )
   const envOverride = buildCliCommand('agy', {
     agentArgsOverride: { agy: { AGY_EFFORT: 'high' } } as never,

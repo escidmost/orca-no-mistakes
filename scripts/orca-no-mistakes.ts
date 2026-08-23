@@ -157,6 +157,11 @@ export type RepoSnapshot = {
   root: string;
 };
 
+type RebaseFixerPolicy = {
+  conflictFiles: string[];
+  upstreamHead: string;
+};
+
 export interface GitOperations {
   assertReady(): Promise<RepoSnapshot>;
   assertClean(): Promise<void>;
@@ -164,6 +169,7 @@ export interface GitOperations {
     sourcePath: string,
     expectedHead: string,
     expectedSourceHead: string,
+    rebasePolicy?: RebaseFixerPolicy,
   ): Promise<void>;
   head(): Promise<string>;
   /** Diff between the resolved trusted base and the captured HEAD snapshot
@@ -647,6 +653,9 @@ export async function runPipeline(
                 orca,
                 git,
                 fixerSession,
+                stage === "rebase"
+                  ? await git.resolveBaseOid(repo.base)
+                  : undefined,
                 fence,
               ),
           );
@@ -1127,6 +1136,7 @@ async function runFixer(
   orca: OrcaOperations,
   git: GitOperations,
   retainedSession: FixerSession | undefined,
+  rebaseUpstreamHead: string | undefined,
   fence: TimeoutFence,
 ): Promise<{
   after: string;
@@ -1206,9 +1216,19 @@ async function runFixer(
     if (before === workerHead) {
       throw new Error(`${stage} fixer did not commit a change`);
     }
-    if (stage !== "rebase") {
-      await git.assertFixerChangesAllowed(worktreePath, before, workerHead);
-    }
+    await git.assertFixerChangesAllowed(
+      worktreePath,
+      before,
+      workerHead,
+      stage === "rebase"
+        ? {
+            conflictFiles: findings.flatMap((finding) =>
+              finding.file ? [finding.file] : [],
+            ),
+            upstreamHead: rebaseUpstreamHead ?? "",
+          }
+        : undefined,
+    );
     if (fence.aborted) {
       // The execution timeout already failed this stage; refuse late mutations
       // so a delayed worker cannot apply commits into a settled run.
@@ -3263,10 +3283,9 @@ export class CliOrca implements OrcaOperations {
           };
         }
         if (payload.dispatchId !== dispatchId) {
-          return {
-            deliveryId: result.deliveryId,
-            error: `unexpected orchestration message while waiting for ${dispatchId}`,
-          };
+          // Pipeline workers run sequentially; another dispatch here is stale
+          // delivery noise and must not fail the active worker.
+          continue;
         }
         if (message.type === "heartbeat") {
           if (payload.taskId !== taskId) {
@@ -3597,6 +3616,7 @@ export class GitShell implements GitOperations {
     sourcePath: string,
     expectedHead: string,
     sourceHead: string,
+    rebasePolicy?: RebaseFixerPolicy,
   ): Promise<void> {
     const changed = await this.#git(
       [
@@ -3615,6 +3635,68 @@ export class GitShell implements GitOperations {
       throw new Error(`could not inspect fixer changes: ${changed.output}`);
     }
     const changedPaths = changed.stdout.split("\0").filter(Boolean);
+    if (rebasePolicy) {
+      const conflictFiles = new Set(rebasePolicy.conflictFiles);
+      if (!rebasePolicy.upstreamHead || conflictFiles.size === 0) {
+        throw new FixerPolicyViolationError(
+          "rebase fixer had no bounded upstream commit and conflict-file set",
+        );
+      }
+      const containsUpstream = await this.#git(
+        [
+          "-C",
+          sourcePath,
+          "merge-base",
+          "--is-ancestor",
+          rebasePolicy.upstreamHead,
+          sourceHead,
+        ],
+        true,
+      );
+      if (containsUpstream.failed) {
+        throw new FixerPolicyViolationError(
+          "rebase fixer did not complete the rebase onto the resolved upstream commit",
+        );
+      }
+      const mergeBase = (
+        await this.#git([
+          "-C",
+          sourcePath,
+          "merge-base",
+          expectedHead,
+          rebasePolicy.upstreamHead,
+        ])
+      ).stdout.trim();
+      const upstreamChanged = await this.#git(
+        [
+          "-C",
+          sourcePath,
+          "diff",
+          "--name-only",
+          "--no-renames",
+          "-z",
+          mergeBase,
+          rebasePolicy.upstreamHead,
+        ],
+        true,
+      );
+      if (upstreamChanged.failed) {
+        throw new Error(
+          `could not inspect upstream rebase changes: ${upstreamChanged.output}`,
+        );
+      }
+      const allowed = new Set([
+        ...conflictFiles,
+        ...upstreamChanged.stdout.split("\0").filter(Boolean),
+      ]);
+      const outsideScope = changedPaths.filter((filePath) => !allowed.has(filePath));
+      if (outsideScope.length > 0) {
+        throw new FixerPolicyViolationError(
+          `rebase fixer modified files outside upstream changes or reported conflicts: ${outsideScope.sort().join(", ")}`,
+        );
+      }
+      return;
+    }
     const protectedTests: string[] = [];
     const protectedPolicy: string[] = [];
     for (const filePath of changedPaths) {
@@ -3877,8 +3959,31 @@ export class GitShell implements GitOperations {
     const rebase = await this.#git(["rebase", `origin/${base}`], true);
     if (!rebase.failed)
       return { findings: [], summary: `rebased onto origin/${base}` };
+    const unmerged = await this.#git(
+      ["diff", "--name-only", "--diff-filter=U", "-z"],
+      true,
+    );
     await this.#git(["rebase", "--abort"], true);
-    return failureReport("rebase-conflict", "auto-fix", rebase.output);
+    const conflictFiles = unmerged.failed
+      ? []
+      : unmerged.stdout.split("\0").filter(Boolean);
+    if (conflictFiles.length === 0) {
+      return failureReport(
+        "rebase-conflict",
+        "ask-user",
+        `${rebase.output}\nThe coordinator could not identify a bounded conflict-file set.`,
+      );
+    }
+    return {
+      findings: conflictFiles.map((file, index) => ({
+        id: index === 0 ? "rebase-conflict" : `rebase-conflict-${index + 1}`,
+        action: "auto-fix",
+        severity: "error",
+        file,
+        description: `Rebase conflict in ${file}.\n${rebase.output}`,
+      })),
+      summary: rebase.output.split("\n")[0] || "rebase-conflict",
+    };
   }
 
   async resolveRefSha(ref: string): Promise<string | undefined> {
