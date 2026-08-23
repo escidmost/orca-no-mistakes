@@ -2088,7 +2088,7 @@ function acpReportFrom(parsed: unknown): StageReport | undefined {
 const DEFAULT_WORKER_AGENT = "opencode";
 const WORKER_IDLE_TIMEOUT_MS = 1_800_000;
 const NATIVE_WORKER_CREATE_SLACK_MS = 120_000;
-const FISH_SHELL_STARTUP_DELAY_MS = 12_000;
+const FISH_SHELL_STARTUP_DELAY_MS = 20_000;
 const KIMI_STARTUP_GRACE_MS = 2_000;
 
 function workerShellStartupDelayMs(): number {
