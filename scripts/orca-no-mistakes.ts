@@ -3908,7 +3908,9 @@ function containsValidationPathReference(
   ]);
   const basename = path.posix.basename(targetPath);
   const directoryMatches = (directory: string): boolean => {
-    const normalizedDirectory = path.posix.normalize(directory.replace(/^\.\//, ""));
+    const normalizedDirectory = path.posix
+      .normalize(directory.replace(/^\.\//, ""))
+      .replace(/\/+$/, "");
     return normalizedDirectory !== "." && workingDirectories.has(normalizedDirectory);
   };
   const commandMatches = (command: string): boolean =>
