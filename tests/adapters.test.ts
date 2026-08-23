@@ -20,16 +20,19 @@ test('classifyHarness routes native, CLI, and ACP harnesses', () => {
   assert.equal(classifyHarness('claude'), 'cli')
   assert.equal(classifyHarness('codex'), 'cli')
   assert.equal(classifyHarness('cursor'), 'native')
+  assert.equal(classifyHarness('Cursor'), 'native')
   assert.equal(classifyHarness('opencode'), 'cli')
   assert.equal(classifyHarness('grok'), 'cli')
   assert.equal(classifyHarness('gemini'), 'cli')
   assert.equal(classifyHarness('future-cli-agent'), 'cli')
   assert.equal(classifyHarness('acp:gemini-dev'), 'acp')
+  assert.equal(classifyHarness('ACP:gemini-dev'), 'acp')
 })
 
 test('parseAcpTarget extracts valid targets and rejects malformed harnesses', () => {
   assert.equal(parseAcpTarget('acp:claude-code'), 'claude-code')
   assert.equal(parseAcpTarget('acp:gemini_2-dev'), 'gemini_2-dev')
+  assert.equal(parseAcpTarget('ACP:gemini_2-dev'), 'gemini_2-dev')
   assert.throws(() => parseAcpTarget('acp:'), /invalid ACP harness 'acp:'/)
   assert.throws(() => parseAcpTarget('acp:bad target!'), /invalid ACP harness/)
   assert.throws(() => parseAcpTarget('opencode'), /invalid ACP harness/)
@@ -75,7 +78,7 @@ test('nativeWorkerStartArgs maps model, effort, timeout, and worktree placement'
   ])
 
   const fixer = nativeWorkerStartArgs({
-    agent: 'cursor',
+    agent: 'Cursor',
     effort: 'high',
     model: 'gpt-5.6',
     name: 'ignored-for-current',
@@ -89,6 +92,7 @@ test('nativeWorkerStartArgs maps model, effort, timeout, and worktree placement'
   assert.ok(!fixer.includes('--base-branch'))
   assert.ok(fixer.includes('--worktree'))
   assert.ok(fixer.includes('current'))
+  assert.ok(fixer.includes('cursor'))
 
   // Effort requires a model per the Orca worker-start contract.
   assert.throws(
@@ -115,7 +119,11 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
     `'claude' '--model' 'opus[1m]' '--effort' 'high' '--dangerously-skip-permissions'`
   )
   assert.equal(
-    buildCliCommand('codex', { effort: 'max', model: 'gpt-5.6-luna' }),
+    buildCliCommand('Claude', { effort: 'high', model: 'opus[1m]' }),
+    `'claude' '--model' 'opus[1m]' '--effort' 'high' '--dangerously-skip-permissions'`
+  )
+  assert.equal(
+    buildCliCommand('Codex', { effort: 'max', model: 'gpt-5.6-luna' }),
     `'codex' '--model' 'gpt-5.6-luna' '-c' 'model_reasoning_effort="max"' '--dangerously-bypass-approvals-and-sandbox'`
   )
   assert.equal(

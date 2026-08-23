@@ -416,6 +416,7 @@ export async function runPipeline(
         JSON.stringify(
           {
             exitCode,
+            artifacts: report.artifacts,
             findings: report.findings,
             summary: report.summary,
             tested: report.tested,
@@ -663,6 +664,7 @@ export async function runPipeline(
           if (!(error instanceof FixerPolicyViolationError)) throw error;
           fixerSession = undefined;
           report = {
+            ...report,
             findings: [
               ...report.findings.filter(
                 (finding) => finding.id !== "fixer-policy-violation",
@@ -2527,6 +2529,7 @@ export class CliOrca implements OrcaOperations {
     initialPrompt?: string,
   ): Promise<string | undefined> {
     const harness = launch.agent?.harness ?? DEFAULT_WORKER_AGENT;
+    const normalizedHarness = harness.toLowerCase();
     let promptPath: string | undefined;
     try {
       let launchCommand = buildCliCommand(harness, {
@@ -2541,7 +2544,7 @@ export class CliOrca implements OrcaOperations {
           `Read and follow the complete authenticated task in ${promptPath}`,
         );
         launchCommand +=
-          harness === "agy"
+          normalizedHarness === "agy"
             ? ` --prompt-interactive ${instruction}`
             : ` ${instruction}`;
       }
@@ -3153,7 +3156,12 @@ export class CliOrca implements OrcaOperations {
         continue;
       }
       const responseGateId = response.gateId.trim();
-      if (!pendingGateIds.has(responseGateId)) continue;
+      if (!pendingGateIds.has(responseGateId)) {
+        console.warn(
+          `no-mistakes: ignored a human-gate response for non-pending gate ${responseGateId}`,
+        );
+        continue;
+      }
       await this.#json([
         "orchestration",
         "gate-resolve",
@@ -3542,7 +3550,7 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "tox.ini",
     ].includes(fileName) ||
     (parts[0] !== "docs" && parts.slice(0, -1).includes("prompts")) ||
-    /^(?:(?:vitest|jest|playwright)\.config\..+|\.mocharc(?:\..+)?|karma\.conf\..+|eslint\.config\..+|\.eslintrc(?:\..+)?|prettier\.config\..+|\.prettierrc(?:\..+)?|biome\.jsonc?|deno\.jsonc?|\.editorconfig|\.flake8|\.?ruff\.toml|\.?mypy\.ini|\.pylintrc|pyrightconfig\.json|\.rubocop\.ya?ml|stylelint\.config\..+|\.stylelintrc(?:\..+)?|\.?markdownlint(?:-cli2)?(?:\..+)?|\.golangci\.(?:ya?ml|toml|json)|\.?rustfmt\.toml|\.?clippy\.toml|\.clang-tidy|analysis_options\.yaml|checkstyle\.xml|detekt\.ya?ml|phpcs\.xml(?:\.dist)?|phpstan(?:\.[^.]+)?\.neon(?:\.dist)?|sonar-project\.properties|tsconfig(?:\.[^.]+)*\.json|tslint(?:\.[^.]+)*\.json)$/.test(
+    /^(?:(?:vitest|jest|playwright|cypress)\.config\..+|\.mocharc(?:\..+)?|karma\.conf\..+|eslint\.config\..+|\.eslintrc(?:\..+)?|prettier\.config\..+|\.prettierrc(?:\..+)?|biome\.jsonc?|deno\.jsonc?|\.editorconfig|\.flake8|\.?ruff\.toml|\.?mypy\.ini|\.pylintrc|pyrightconfig\.json|\.rubocop\.ya?ml|stylelint\.config\..+|\.stylelintrc(?:\..+)?|\.?markdownlint(?:-cli2)?(?:\..+)?|\.golangci\.(?:ya?ml|toml|json)|\.?rustfmt\.toml|\.?clippy\.toml|\.clang-tidy|analysis_options\.yaml|checkstyle\.xml|detekt\.ya?ml|phpcs\.xml(?:\.dist)?|phpstan(?:\.[^.]+)?\.neon(?:\.dist)?|sonar-project\.properties|tsconfig(?:\.[^.]+)*\.json|tslint(?:\.[^.]+)*\.json)$/.test(
       fileName,
     )
   );

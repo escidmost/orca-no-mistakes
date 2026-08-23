@@ -4,13 +4,25 @@ export type LaunchMode = 'acp' | 'cli' | 'native'
 
 export const NATIVE_HARNESSES = ['cursor'] as const
 export const CLI_HARNESSES = ['claude', 'codex', 'gemini', 'grok', 'opencode'] as const
+const KNOWN_HARNESSES = new Set<string>([
+  ...NATIVE_HARNESSES,
+  ...CLI_HARNESSES,
+  'agy',
+  'pi'
+])
 
 const INTERRUPT_MARKER = 'esc interrupt'
-const ACP_TARGET_PATTERN = /^acp:([a-zA-Z0-9_-]+)$/
+const ACP_TARGET_PATTERN = /^acp:([a-zA-Z0-9_-]+)$/i
+
+function normalizeKnownHarness(harness: string): string {
+  const normalized = harness.toLowerCase()
+  return KNOWN_HARNESSES.has(normalized) ? normalized : harness
+}
 
 export function classifyHarness(harness: string): LaunchMode {
-  if (harness.startsWith('acp:')) return 'acp'
-  if ((NATIVE_HARNESSES as readonly string[]).includes(harness)) return 'native'
+  const normalized = harness.toLowerCase()
+  if (normalized.startsWith('acp:')) return 'acp'
+  if ((NATIVE_HARNESSES as readonly string[]).includes(normalized)) return 'native'
   return 'cli'
 }
 
@@ -34,6 +46,7 @@ export type NativeWorkerStartOptions = {
 }
 
 export function nativeWorkerStartArgs(options: NativeWorkerStartOptions): string[] {
+  const agent = normalizeKnownHarness(options.agent)
   // Orca rejects creation flags (--name/--repo/--base-branch) for current/existing worktrees.
   const createsWorktree = options.worktree === 'new-child'
   const args = [
@@ -42,13 +55,13 @@ export function nativeWorkerStartArgs(options: NativeWorkerStartOptions): string
     '--task',
     options.taskId,
     '--agent',
-    options.agent,
+    agent,
     '--worktree',
     options.worktree ?? 'new-child'
   ]
   if (options.effort && !options.model) {
     throw new Error(
-      `agent ${options.agent}: effort requires a model; set a model alongside effort or drop the effort setting`
+      `agent ${agent}: effort requires a model; set a model alongside effort or drop the effort setting`
     )
   }
   if (options.model) args.push('--model', options.model)
@@ -151,31 +164,33 @@ export type CliAgentCommandOptions = AgentProfile & {
 }
 
 export function buildCliCommand(harness: string, options: CliAgentCommandOptions = {}): string {
+  const normalizedHarness = normalizeKnownHarness(harness)
   const env: string[] = []
-  const parts: string[] = [harness]
-  const override = options.agentArgsOverride?.[harness]
+  const parts: string[] = [normalizedHarness]
+  const override =
+    options.agentArgsOverride?.[normalizedHarness] ?? options.agentArgsOverride?.[harness]
   if (override && !Array.isArray(override)) {
     for (const [key, value] of Object.entries(override)) {
       if (!ENV_NAME_PATTERN.test(key)) {
         throw new Error(
-          `agent ${harness}: invalid environment variable name '${key}' in agent_args_override`
+          `agent ${normalizedHarness}: invalid environment variable name '${key}' in agent_args_override`
         )
       }
       env.push(`${key}=${shellQuote(value)}`)
     }
   }
   const raw = Array.isArray(override) ? override : []
-  const effortKnob = EFFORT_KNOBS[harness]
+  const effortKnob = EFFORT_KNOBS[normalizedHarness]
   const modelPinned =
     pinsAnyFlag(raw, MODEL_PIN_FLAGS) ||
-    (harness === 'codex' && pinsConfigKey(raw, 'model'))
+    (normalizedHarness === 'codex' && pinsConfigKey(raw, 'model'))
   const effortPinned =
-    harness === 'codex'
+    normalizedHarness === 'codex'
       ? pinsConfigKey(raw, 'model_reasoning_effort')
       : pinsAnyFlag(raw, EFFORT_PIN_FLAGS)
   if (options.effort && !effortKnob) {
     throw new Error(
-      `agent ${harness}: cannot express effort; no verified reasoning-effort flag exists for it (use agent_args_override.${harness} if your build accepts one)`
+      `agent ${normalizedHarness}: cannot express effort; no verified reasoning-effort flag exists for it (use agent_args_override.${normalizedHarness} if your build accepts one)`
     )
   }
   // Model-scoped effort carriers (--variant) need their model, supplied either
@@ -189,7 +204,7 @@ export function buildCliCommand(harness: string, options: CliAgentCommandOptions
     !options.variant
   ) {
     throw new Error(
-      `agent ${harness}: cannot express effort without a model; ${effortKnob.flag} selects a model-scoped variant`
+      `agent ${normalizedHarness}: cannot express effort without a model; ${effortKnob.flag} selects a model-scoped variant`
     )
   }
   if (options.model && !modelPinned) parts.push('--model', options.model)
@@ -198,20 +213,20 @@ export function buildCliCommand(harness: string, options: CliAgentCommandOptions
     if (variant && !pinsAnyFlag(raw, [effortKnob.flag])) parts.push(effortKnob.flag, variant)
   } else if (effortKnob && options.effort && !effortPinned) {
     const effort =
-      harness === 'codex'
+      normalizedHarness === 'codex'
         ? `model_reasoning_effort=${JSON.stringify(options.effort)}`
         : options.effort
     parts.push(effortKnob.flag, effort)
   }
-  const reserved = RESERVED_HARNESS_ARGS[harness]
+  const reserved = RESERVED_HARNESS_ARGS[normalizedHarness]
   if (reserved) {
     for (const arg of raw) {
       if (reserved.has(flagName(arg))) {
-        throw new Error(`agent ${harness}: reserved argument '${arg}' cannot be overridden`)
+        throw new Error(`agent ${normalizedHarness}: reserved argument '${arg}' cannot be overridden`)
       }
     }
   }
-  parts.push(...(REQUIRED_HARNESS_ARGS[harness] ?? []))
+  parts.push(...(REQUIRED_HARNESS_ARGS[normalizedHarness] ?? []))
   parts.push(...raw)
   // Environment assignments stay unquoted as a prefix; arguments are shell-quoted individually.
   return [...env, ...parts.map(shellQuote)].join(' ')

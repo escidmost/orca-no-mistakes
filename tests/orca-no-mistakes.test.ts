@@ -887,7 +887,8 @@ test("a policy-violation approval waives the evidence shown at its gate", async 
   const git = new FakeGit();
   allowReviewAutoFix(git);
   git.protectedTestMutation = "tests/existing.test.ts";
-  const orca = new FakeOrca(git);
+  const runId = `policy-evidence-${randomUUID()}`;
+  const orca = new FakeOrca(git, runId);
   orca.gateResolution = "approve";
   orca.reports.set("review", [
     {
@@ -899,7 +900,9 @@ test("a policy-violation approval waives the evidence shown at its gate", async 
           description: "Repair the implementation.",
         },
       ],
+      artifacts: [],
       summary: "one defect",
+      tested: ["npm test"],
     },
     pass("fix attempted"),
   ]);
@@ -916,6 +919,20 @@ test("a policy-violation approval waives the evidence shown at its gate", async 
   assert.equal(policyEvidence?.workerIdentity, "coordinator:fixer-policy");
   assert.equal(policyEvidence?.exitCode, 1);
   assert.equal(policyEvidence?.waiverOrApproval?.decision, "approve");
+  const logsDir = path.join(artifactsRoot(), runId, "logs");
+  const policyLog = (
+    await Promise.all(
+      (await readdir(logsDir)).map(async (fileName) =>
+        JSON.parse(await readFile(path.join(logsDir, fileName), "utf8")),
+      ),
+    )
+  ).find(
+    (entry) =>
+      entry.summary === "review fixer commit rejected by protected-path policy",
+  );
+  assert.deepEqual(policyLog?.artifacts, []);
+  assert.deepEqual(policyLog?.tested, ["npm test"]);
+  await rm(path.join(artifactsRoot(), runId), { recursive: true, force: true });
 });
 
 test("a passing run fails closed when retained fixer cleanup fails", async () => {
@@ -1711,7 +1728,15 @@ if (args[1] === 'run-create') {
       await orca.createGate("task-review", "Choose a review action."),
       "gate-review",
     );
-    assert.equal(await orca.waitForGate("gate-review"), "fix: verified");
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...values) => warnings.push(values.join(" "));
+    try {
+      assert.equal(await orca.waitForGate("gate-review"), "fix: verified");
+    } finally {
+      console.warn = originalWarn;
+    }
+    assert.ok(warnings.some((warning) => warning.includes("gate-stale")));
 
     const calls = (await readFile(callsPath, "utf8"))
       .trim()
@@ -2181,7 +2206,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     );
 
     const workerPromise = orca.startWorker("task-review", {
-      agent: { harness: "agy" },
+      agent: { harness: "AGY" },
       name: "agy-reviewer",
       prompt: "review",
       role: "reviewer",
@@ -2676,6 +2701,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(worker, ".mocharc.json"), '{"spec":[]}\n');
     await writeFile(path.join(worker, "package.json"), '{"scripts":{"test":"true"}}\n');
     await writeFile(path.join(worker, "pytest.ini"), "[pytest]\naddopts = --ignore=Tests\n");
+    await writeFile(
+      path.join(worker, "cypress.config.ts"),
+      "export default { e2e: { excludeSpecPattern: ['**/*'] } };\n",
+    );
     await writeFile(path.join(worker, "tslint.build.json"), '{"rules":{}}\n');
     await writeFile(path.join(worker, "tslint.json"), '{"rules":{}}\n');
     await writeFile(path.join(worker, "vitest.config.ts"), "export default { test: { exclude: ['Tests/**'] } };\n");
@@ -2685,6 +2714,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       worker,
       "add",
       ".mocharc.json",
+      "cypress.config.ts",
       "eslint.config.js",
       "package.json",
       "prompts/fixer.md",
@@ -2696,7 +2726,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "commit", "-m", "weaken validation policy");
     await assert.rejects(
       assertWorkerChangesAllowed(),
-      /unexplained-policy-relaxation:.*\.mocharc\.json, eslint\.config\.js, package\.json, prompts\/fixer\.md, pytest\.ini, tslint\.build\.json, tslint\.json, vitest\.config\.ts/,
+      /unexplained-policy-relaxation:.*\.mocharc\.json, cypress\.config\.ts, eslint\.config\.js, package\.json, prompts\/fixer\.md, pytest\.ini, tslint\.build\.json, tslint\.json, vitest\.config\.ts/,
     );
 
     git(worker, "reset", "--hard", featureHead);
