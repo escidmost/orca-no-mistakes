@@ -720,6 +720,44 @@ test("a failed retain acknowledgement discards the fixer session", async () => {
   assert.ok(orca.calls.includes(`release:${orca.fixerDispatches[0]}`));
 });
 
+test("a failed retain acknowledgement remains fail-closed when release also fails", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  class RetainAndReleaseFailureOrca extends FakeOrca {
+    override async finishWorker(
+      worker: WorkerResult,
+      disposition: "release" | "retain",
+    ): Promise<void> {
+      await super.finishWorker(worker, disposition);
+      if (!this.fixerDispatches.includes(worker.dispatchId)) return;
+      if (disposition === "retain") throw new Error("stale_delivery");
+      throw new Error("failed-retain worker release failed");
+    }
+  }
+  const orca = new RetainAndReleaseFailureOrca(git);
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Repair the defect.",
+        },
+      ],
+      summary: "failure",
+    },
+    pass("fix"),
+  ]);
+
+  await assert.rejects(
+    runPipeline({ intent: "Fail closed on failed retain cleanup." }, orca, git),
+    /failed-retain worker release failed/,
+  );
+  assert.equal(orca.gates.length, 0);
+  assert.ok(orca.removedWorktrees.length > 0);
+});
+
 test("a successful fallback fixer is retained while its candidate chain is unchanged", async () => {
   const git = new FakeGit();
   git.baseFiles.set(
@@ -2878,6 +2916,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await mkdir(path.join(repo, ".github/actions/check"), { recursive: true });
     await mkdir(path.join(repo, "ci/check"), { recursive: true });
     await mkdir(path.join(repo, "commands"));
+    await mkdir(path.join(repo, "dist"));
     await mkdir(path.join(repo, "tools"));
     await writeFile(path.join(repo, "bin/orca-no-mistakes"), entrypointSource);
     await writeFile(
@@ -2886,8 +2925,13 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     await writeFile(
       path.join(repo, ".github/workflows/ci.yml"),
-      "- uses: ./.github/actions/check\n- uses: ./ci/check\n- run: ./check.sh\n  working-directory: commands\n",
+      "- uses: ./\n- uses: ./.github/actions/check\n- uses: ./ci/check\n- run: ./check.sh\n  working-directory: commands\n",
     );
+    await writeFile(
+      path.join(repo, "action.yml"),
+      "runs:\n  using: node20\n  main: dist/index.js\n",
+    );
+    await writeFile(path.join(repo, "dist/index.js"), "require('child_process').execFileSync('npm', ['test']);\n");
     await writeFile(
       path.join(repo, ".github/actions/check/action.yml"),
       "runs:\n  using: node20\n  main: dist/index.js\n",
@@ -2908,6 +2952,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       '{"scripts":{"test":"./verify.sh"}}\n',
     );
     await writeFile(path.join(repo, "tools/verify.sh"), "npm test\n");
+    await writeFile(path.join(repo, "tools/check.sh"), "export TOOL_CHECK=1\n");
     for (const moduleName of ["adapters", "config", "ledger", "policy"]) {
       await writeFile(
         path.join(repo, `scripts/${moduleName}.ts`),
@@ -2959,9 +3004,11 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       ".github/actions/check/action.yml",
       ".github/actions/check/dist/index.js",
       ".github/workflows/ci.yml",
+      "action.yml",
       "ci/check/action.yml",
       "ci/check/run.sh",
       "commands/check.sh",
+      "dist/index.js",
       "bin/orca-no-mistakes",
       "scripts/adapters.ts",
       "scripts/config.ts",
@@ -2969,6 +3016,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "scripts/orca-no-mistakes.ts",
       "scripts/policy.ts",
       "tools/package.json",
+      "tools/check.sh",
       "tools/verify.sh",
     );
     git(repo, "commit", "-m", "feature");
@@ -3158,6 +3206,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       path.join(worker, "scripts/test-runner.ts"),
       "export const runner = 2;\n",
     );
+    await writeFile(path.join(worker, "tools/check.sh"), "export TOOL_CHECK=2\n");
     git(
       worker,
       "add",
@@ -3165,9 +3214,25 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "scripts/test-harness.ts",
       "scripts/test-runner.ts",
       "src/spec-parser.ts",
+      "tools/check.sh",
     );
     git(worker, "commit", "-m", "repair specification tooling");
     await assertWorkerChangesAllowed();
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "action.yml"), "runs: { using: node20, main: dist/noop.js }\n");
+    await writeFile(path.join(worker, "dist/index.js"), "process.exit(0);\n");
+    git(worker, "add", "action.yml", "dist/index.js");
+    git(worker, "commit", "-m", "disable referenced root action");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /action\.yml/);
+        assert.match(error.message, /dist\/index\.js/);
+        return true;
+      },
+    );
 
     git(worker, "reset", "--hard", featureHead);
     await writeFile(path.join(worker, "scripts/verify-ci.sh"), "exit 0\n");

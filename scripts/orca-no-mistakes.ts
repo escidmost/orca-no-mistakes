@@ -1319,6 +1319,7 @@ async function runFixer(
         retainWorker = true;
       } catch {
         // The round succeeded, but this worker cannot safely be reused.
+        strictCleanup = true;
       }
     }
     return {
@@ -3836,16 +3837,41 @@ function containsValidationPathReference(
   const references = new Set([
     targetPath,
     path.posix.relative(path.posix.dirname(policyPath), targetPath),
-    path.posix.basename(targetPath),
   ]);
-  return [...references].some((reference) => {
+  const containsReference = (reference: string): boolean => {
     if (!reference || reference === ".") return false;
     const escaped = reference.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     return new RegExp(
       `(?:^|[^A-Za-z0-9_./-])(?:\\./)?${escaped}(?=$|[^A-Za-z0-9_./-])`,
       "m",
     ).test(source);
-  });
+  };
+  if ([...references].some(containsReference)) return true;
+
+  const targetDirectory = path.posix.dirname(targetPath);
+  if (targetDirectory === ".") return false;
+  const workingDirectories = new Set([
+    targetDirectory,
+    path.posix.relative(path.posix.dirname(policyPath), targetDirectory),
+  ]);
+  const commandReferenced = containsReference(path.posix.basename(targetPath));
+  return (
+    commandReferenced &&
+    [...workingDirectories].some((directory) => {
+      if (!directory || directory === ".") return false;
+      const escaped = directory.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      return new RegExp(
+        `(?:^|\\n)\\s*working-directory\\s*:\\s*["']?(?:\\./)?${escaped}(?=["'\\s]|$)`,
+        "m",
+      ).test(source);
+    })
+  );
+}
+
+function referencesRootLocalAction(source: string): boolean {
+  return /(?:^|\n)\s*(?:-\s*)?uses\s*:\s*["']?\.\/["']?(?:\s|$)/m.test(
+    source,
+  );
 }
 
 type GitShellOptions = { base?: string; expectedHead?: string; repo: string };
@@ -4077,6 +4103,21 @@ export class GitShell implements GitOperations {
         }
         policySources.set(policyPath, source);
       }
+      const rootActionPaths = ["action.yml", "action.yaml"].filter((actionPath) =>
+        trackedPathSet.has(actionPath),
+      );
+      const rootActionReferenced =
+        rootActionPaths.length > 0 &&
+        [...policySources.values()].some(referencesRootLocalAction);
+      if (rootActionReferenced) {
+        for (const actionPath of rootActionPaths) {
+          const source = await this.showFile(expectedHead, actionPath);
+          if (source === undefined) {
+            throw new Error(`could not read pre-round local action ${actionPath}`);
+          }
+          policySources.set(actionPath, source);
+        }
+      }
       for (const entrypointPath of validationEntrypoints) {
         const targets = new Set([entrypointPath]);
         let directory = path.posix.dirname(entrypointPath);
@@ -4093,6 +4134,7 @@ export class GitShell implements GitOperations {
           directory = parent;
         }
         if (
+          (rootActionReferenced && rootActionPaths.includes(entrypointPath)) ||
           [...policySources].some(([policyPath, source]) =>
             [...targets].some((targetPath) =>
               containsValidationPathReference(source, policyPath, targetPath),
