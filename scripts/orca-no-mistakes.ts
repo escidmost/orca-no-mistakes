@@ -1078,16 +1078,19 @@ async function runReviewer(
 
 type FixerSession = {
   agent?: WorkerAgent;
+  roleKey: string;
   worker: WorkerResult;
 };
+
+function fixerRoleKey(role: ResolvedRoleConfig): string {
+  return JSON.stringify(launchCandidates(role));
+}
 
 function fixerSessionMatchesRole(
   session: FixerSession,
   role: ResolvedRoleConfig,
 ): boolean {
-  const [candidate] = launchCandidates(role);
-  const retained = JSON.stringify(session.agent ?? null);
-  return JSON.stringify(candidate ?? null) === retained;
+  return session.roleKey === fixerRoleKey(role);
 }
 
 async function releaseFixerSession(
@@ -1229,6 +1232,7 @@ async function runFixer(
         ? {
             session: {
               agent: launches[outcome.attempts.length]?.agent,
+              roleKey: fixerRoleKey(role),
               worker,
             },
           }
@@ -2158,18 +2162,20 @@ export class CliOrca implements OrcaOperations {
             preamble,
           );
         } else {
+          promptPath = await this.#writeWorkerPrompt(preamble);
           await this.#json([
             "terminal",
             "send",
             "--terminal",
             terminalHandle,
             "--text",
-            preamble,
+            `Read and follow the complete authenticated task in ${promptPath}`,
             "--enter",
             "--json",
           ]);
         }
       } catch (error) {
+        if (promptPath) await rm(promptPath, { force: true });
         await this.#cleanupFailedWorker(
           dispatchId,
           terminalHandle,
@@ -2491,14 +2497,14 @@ export class CliOrca implements OrcaOperations {
         variant: launch.agent?.variant,
       });
       if (initialPrompt !== undefined) {
-        const promptDir = path.join(artifactsRoot(), this.#runId ?? "unbound");
-        await mkdir(promptDir, { recursive: true });
-        promptPath = path.join(promptDir, `prompt-${randomUUID()}.txt`);
-        await writeFile(promptPath, initialPrompt, { mode: 0o600 });
+        promptPath = await this.#writeWorkerPrompt(initialPrompt);
+        const instruction = shellQuote(
+          `Read and follow the complete authenticated task in ${promptPath}`,
+        );
         launchCommand +=
           harness === "agy"
-            ? ` --prompt-interactive "$(cat -- ${shellQuote(promptPath)})"`
-            : ` "$(cat -- ${shellQuote(promptPath)})"`;
+            ? ` --prompt-interactive ${instruction}`
+            : ` ${instruction}`;
       }
       const shellStartupDelayMs = workerShellStartupDelayMs();
       if (shellStartupDelayMs > 0) {
@@ -2526,6 +2532,14 @@ export class CliOrca implements OrcaOperations {
       if (promptPath) await rm(promptPath, { force: true });
       throw error;
     }
+  }
+
+  async #writeWorkerPrompt(prompt: string): Promise<string> {
+    const promptDir = path.join(artifactsRoot(), this.#runId ?? "unbound");
+    await mkdir(promptDir, { recursive: true });
+    const promptPath = path.join(promptDir, `prompt-${randomUUID()}.txt`);
+    await writeFile(promptPath, prompt, { mode: 0o600 });
+    return promptPath;
   }
 
   async #trustAgyWorkspace(worktreePath: string): Promise<void> {
@@ -3422,7 +3436,6 @@ function isTestPath(filePath: string): boolean {
       .some((part) =>
         ["test", "tests", "__tests__"].includes(part.toLowerCase()),
       ) ||
-    fileName.toLowerCase() === "conftest.py" ||
     /(?:^|[._])(?:tests?|specs?|cy|e2e)(?=[._]|$)/i.test(fileName)
   );
 }
@@ -3435,7 +3448,15 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
     normalized === ".orca/no-mistakes.yaml" ||
     normalized === "bin/orca-no-mistakes" ||
     [
+      "scripts/adapters.ts",
+      "scripts/config.ts",
+      "scripts/ledger.ts",
+      "scripts/policy.ts",
+    ].includes(normalized) ||
+    (parts[0] === ".github" && parts[1] === "workflows") ||
+    [
       "cargo.toml",
+      "conftest.py",
       "justfile",
       "makefile",
       "package.json",

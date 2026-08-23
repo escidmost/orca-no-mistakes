@@ -660,6 +660,60 @@ test("fix rounds reuse one durable fixer terminal and worktree", async () => {
   assert.ok(orca.calls.includes(`release:${orca.fixerDispatches.at(-1)}`));
 });
 
+test("a successful fallback fixer is retained while its candidate chain is unchanged", async () => {
+  const git = new FakeGit();
+  git.baseFiles.set(
+    "origin/main:.orca/no-mistakes.yaml",
+    "auto_fix:\n  allow_review_autofix: true\nstages:\n  review:\n    fixer:\n      agent: [claude, grok]\n",
+  );
+  class FallbackFixerOrca extends FakeOrca {
+    #primaryFailed = false;
+
+    override async startWorker(
+      taskId: string,
+      launch: WorkerLaunch,
+    ): Promise<WorkerResult> {
+      if (
+        launch.role === "fixer" &&
+        launch.agent?.harness === "claude" &&
+        !this.#primaryFailed
+      ) {
+        this.#primaryFailed = true;
+        this.launches.push(launch);
+        throw new PreflightError("quota", "Claude quota exhausted");
+      }
+      return super.startWorker(taskId, launch);
+    }
+  }
+  const orca = new FallbackFixerOrca(git);
+  const finding: Finding = {
+    id: "review-1",
+    severity: "error",
+    action: "auto-fix",
+    description: "The defect remains after the first repair.",
+  };
+  orca.reports.set("review", [
+    { findings: [finding], summary: "first failure" },
+    pass("first fix"),
+    { findings: [finding], summary: "second failure" },
+    pass("second fix"),
+    pass("clean rereview"),
+  ]);
+
+  await runPipeline({ intent: "Reuse the healthy fallback fixer." }, orca, git);
+
+  assert.deepEqual(
+    orca.launches
+      .filter((launch) => launch.role === "fixer")
+      .map((launch) => [launch.agent?.harness, launch.terminal]),
+    [
+      ["claude", undefined],
+      ["grok", undefined],
+      ["grok", "term-fixer"],
+    ],
+  );
+});
+
 test("a stale retained fixer retries through the fresh fallback chain", async () => {
   const git = new FakeGit();
   git.baseFiles.set(
@@ -2109,9 +2163,10 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     assert.equal(sends.length, 1);
     assert.match(
       launchCommand,
-      /^'agy' '--dangerously-skip-permissions' --prompt-interactive "\$\(cat -- /,
+      /^'agy' '--dangerously-skip-permissions' --prompt-interactive 'Read and follow the complete authenticated task in /,
     );
-    assert.ok(!launchCommand.includes("authenticated"));
+    assert.match(launchCommand, /prompt-[^']+\.txt'$/);
+    assert.ok(!launchCommand.includes("$(cat"));
     assert.deepEqual(
       calls.find((args) => args[0] === "prompt-content"),
       ["prompt-content", "authenticated"],
@@ -2433,11 +2488,19 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "assert.ok(true);\n",
     );
     await mkdir(path.join(repo, "bin"));
+    await mkdir(path.join(repo, ".github/workflows"), { recursive: true });
     await writeFile(path.join(repo, "bin/orca-no-mistakes"), entrypointSource);
     await writeFile(
       path.join(repo, "scripts/orca-no-mistakes.ts"),
       `${coordinatorSource}\nexport const integrationFixture = 1;\n`,
     );
+    await writeFile(path.join(repo, ".github/workflows/ci.yml"), "- run: npm test\n");
+    for (const moduleName of ["adapters", "config", "ledger", "policy"]) {
+      await writeFile(
+        path.join(repo, `scripts/${moduleName}.ts`),
+        `export const ${moduleName} = true;\n`,
+      );
+    }
     await writeFile(
       path.join(repo, "Tests/branch-regression.ts"),
       'assert.equal(value, 1);\n',
@@ -2454,8 +2517,13 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "src/spec-parser.ts",
       "src/widget.spec.ts",
       "Tests/branch-regression.ts",
+      ".github/workflows/ci.yml",
       "bin/orca-no-mistakes",
+      "scripts/adapters.ts",
+      "scripts/config.ts",
+      "scripts/ledger.ts",
       "scripts/orca-no-mistakes.ts",
+      "scripts/policy.ts",
     );
     git(repo, "commit", "-m", "feature");
     const featureHead = git(repo, "rev-parse", "HEAD");
@@ -2510,6 +2578,42 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
 
     git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, ".github/workflows/ci.yml"), "- run: true\n");
+    await mkdir(path.join(worker, "tests/sub"), { recursive: true });
+    await writeFile(
+      path.join(worker, "tests/sub/conftest.py"),
+      "collect_ignore_glob = ['*']\n",
+    );
+    for (const moduleName of ["adapters", "config", "ledger", "policy"]) {
+      await writeFile(
+        path.join(worker, `scripts/${moduleName}.ts`),
+        `export const ${moduleName} = false;\n`,
+      );
+    }
+    git(
+      worker,
+      "add",
+      ".github/workflows/ci.yml",
+      "scripts/adapters.ts",
+      "scripts/config.ts",
+      "scripts/ledger.ts",
+      "scripts/policy.ts",
+    );
+    git(worker, "add", "-f", "tests/sub/conftest.py");
+    git(worker, "commit", "-m", "weaken coordinator validation policy");
+    await assert.rejects(
+      shell.assertFixerChangesAllowed(worker, featureHead),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /\.github\/workflows\/ci\.yml/);
+        assert.match(error.message, /scripts\/config\.ts/);
+        assert.match(error.message, /scripts\/policy\.ts/);
+        assert.match(error.message, /tests\/sub\/conftest\.py/i);
+        return true;
+      },
+    );
+
+    git(worker, "reset", "--hard", featureHead);
     await writeFile(path.join(worker, "spec/openapi.yaml"), "openapi: 3.1.1\n");
     await writeFile(
       path.join(worker, "scripts/test-harness.ts"),
@@ -2551,7 +2655,6 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       shell.assertFixerChangesAllowed(worker, featureHead),
       (error: unknown) => {
         assert.ok(error instanceof Error);
-        assert.match(error.message, /conftest\.py/);
         assert.match(error.message, /cypress\/e2e\/login\.cy\.ts/);
         assert.match(error.message, /e2e\/checkout\.e2e\.ts/);
         return true;
@@ -3418,10 +3521,11 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     const startupCommand = sent.args[sent.args.indexOf("--text") + 1];
     assert.ok(
       startupCommand.startsWith(
-        "'claude' '--model' 'opus[1m]' '--effort' 'high' '--dangerously-skip-permissions' \"$(cat -- '",
+        "'claude' '--model' 'opus[1m]' '--effort' 'high' '--dangerously-skip-permissions' 'Read and follow the complete authenticated task in ",
       ),
     );
-    assert.match(startupCommand, /prompt-[^']+\.txt'\)"$/);
+    assert.match(startupCommand, /prompt-[^']+\.txt'$/);
+    assert.ok(!startupCommand.includes("$(cat"));
     assert.equal(sends.length, 1);
     assert.equal(
       calls.find(({ args }) => args[1] === "worker-start"),
@@ -3444,6 +3548,9 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
         error instanceof PreflightError &&
         error.message.includes("retained preamble delivery failed") &&
         error.message.includes("terminal_not_writable"),
+    );
+    assert.ok(
+      !(await readdir(evidence)).some((name) => name.startsWith("prompt-")),
     );
     await assert.rejects(
       readFile(
