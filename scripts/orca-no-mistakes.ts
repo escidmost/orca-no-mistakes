@@ -3798,11 +3798,13 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "cargo.lock",
       "composer.lock",
       "conftest.py",
+      ".bazelrc",
       "gemfile.lock",
       "go.mod",
       "go.sum",
       "go.work",
       "go.work.sum",
+      "gradle.properties",
       "justfile",
       "makefile",
       "npm-shrinkwrap.json",
@@ -3860,10 +3862,15 @@ function containsValidationPathReference(
     [...workingDirectories].some((directory) => {
       if (!directory || directory === ".") return false;
       const escaped = directory.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      return new RegExp(
+      const yamlWorkingDirectory = new RegExp(
         `(?:^|\\n)\\s*working-directory\\s*:\\s*["']?(?:\\./)?${escaped}(?=["'\\s]|$)`,
         "m",
       ).test(source);
+      const shellWorkingDirectory = new RegExp(
+        `\\bcd\\s+["']?(?:\\./)?${escaped}["']?\\s*(?:&&|;)`,
+        "m",
+      ).test(source);
+      return yamlWorkingDirectory || shellWorkingDirectory;
     })
   );
 }
@@ -4127,7 +4134,6 @@ export class GitShell implements GitOperations {
             trackedPathSet.has(`${directory}/action.yaml`)
           ) {
             targets.add(directory);
-            break;
           }
           const parent = path.posix.dirname(directory);
           if (parent === directory) break;
