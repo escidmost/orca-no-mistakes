@@ -108,6 +108,7 @@ export type WorkerLaunch = {
   commitOid?: string;
   name: string;
   prompt: string;
+  reportPath?: string;
   role: "fixer" | "reviewer";
   stage: StageName;
   retainedWorktreeId?: string;
@@ -1090,6 +1091,7 @@ async function runReviewer(
       commitOid: untrusted.headOid,
       name: `no-mistakes-${stage}-${attempt + 1}`,
       prompt,
+      reportPath,
       role: "reviewer",
       stage,
       worktree: "new-child",
@@ -1224,6 +1226,7 @@ async function runFixer(
       commitOid: before,
       name: `no-mistakes-fixer-${stage}-${round}`,
       prompt,
+      reportPath,
       role: "fixer",
       stage,
       retainedWorktreeId: reuseSession
@@ -2179,6 +2182,7 @@ export class CliOrca implements OrcaOperations {
     if (launch.agent && classifyHarness(launch.agent.harness) === "acp") {
       return await this.#startAcpWorker(taskId, launch, fence);
     }
+    if (launch.reportPath) await rm(launch.reportPath, { force: true });
     if (launch.terminal)
       return await this.#startRetainedWorker(taskId, launch, fence);
     const harness = (
@@ -2296,6 +2300,7 @@ export class CliOrca implements OrcaOperations {
         taskId,
         dispatchId,
         terminalHandle,
+        launch.reportPath,
         fence,
       );
       deliveryId = result.deliveryId;
@@ -2387,6 +2392,7 @@ export class CliOrca implements OrcaOperations {
         taskId,
         dispatchId,
         terminalHandle,
+        launch.reportPath,
         fence,
       );
       deliveryId = result.deliveryId;
@@ -3415,6 +3421,7 @@ export class CliOrca implements OrcaOperations {
     taskId: string,
     dispatchId: string,
     terminalHandle: string,
+    expectedReportPath?: string,
     fence?: TimeoutFence,
   ): Promise<{ deliveryId?: string; error?: string; report?: StageReport }> {
     let lastActivityAt = Date.now();
@@ -3532,13 +3539,26 @@ export class CliOrca implements OrcaOperations {
             error: `worker ${dispatchId} failed: ${message.body ?? message.subject ?? ""}`,
           };
         }
-        if (typeof payload.reportPath !== "string") {
+        const reportPath =
+          typeof payload.reportPath === "string"
+            ? payload.reportPath
+            : expectedReportPath;
+        if (reportPath === undefined) {
           return {
             deliveryId: result.deliveryId,
             error: `worker ${dispatchId} returned no report path`,
           };
         }
-        const requestedReportPath = path.resolve(payload.reportPath);
+        const requestedReportPath = path.resolve(reportPath);
+        if (
+          expectedReportPath !== undefined &&
+          requestedReportPath !== path.resolve(expectedReportPath)
+        ) {
+          return {
+            deliveryId: result.deliveryId,
+            error: `worker ${dispatchId} returned an unexpected report path`,
+          };
+        }
         const artifactsBase = artifactsRoot();
         const artifactsRunRoot = this.#runId
           ? path.resolve(artifactsBase, this.#runId)

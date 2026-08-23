@@ -4617,7 +4617,7 @@ test("CliOrca launches Codex locally with its protected task artifact", async ()
   try {
     git(temp, "init", "-b", "feature");
     await mkdir(evidence, { recursive: true });
-    await writeFile(reportPath, JSON.stringify(pass("codex reviewed")));
+    await writeFile(reportPath, JSON.stringify(pass("stale report")));
     await writeFile(
       fakeOrca,
       `#!/usr/bin/env node
@@ -4634,9 +4634,14 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
 } else if (args[0] === 'terminal' && args[1] === 'show') {
   out({ terminal: { connected: true, title: '⠇ no-mistakes-review-1', preview: '• Working (44s • esc to interrupt)\\n› Find and fix a bug in @filename  gpt-5.6-luna max' } })
 } else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
+  if (fs.existsSync(${JSON.stringify(reportPath)})) {
+    process.stderr.write('stale report was not removed')
+    process.exit(1)
+  }
   out({ dispatch: { id: 'dispatch-codex', status: 'dispatched' }, injected: false, preamble: 'authenticated' })
 } else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
-  out({ deliveryId: 'delivery-codex', messages: [{ type: 'worker_done', body: 'Reviewed. Verified. Clear.', payload: JSON.stringify({ taskId: 'task-codex', dispatchId: 'dispatch-codex', outcome: 'succeeded', reportPath: ${JSON.stringify(reportPath)} }) }] })
+  fs.writeFileSync(${JSON.stringify(reportPath)}, JSON.stringify({ findings: [], summary: 'codex reviewed' }))
+  out({ deliveryId: 'delivery-codex', messages: [{ type: 'worker_done', body: 'Reviewed. Verified. Clear.', payload: JSON.stringify({ taskId: 'task-codex', dispatchId: 'dispatch-codex', outcome: 'succeeded' }) }] })
 } else {
   out({ ok: true })
 }
@@ -4650,6 +4655,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       agent: { effort: "max", harness: "codex", model: "gpt-5.6-luna" },
       name: "codex-reviewer",
       prompt: "review instructions",
+      reportPath,
       role: "reviewer",
       stage: "review",
       worktree: "current",
