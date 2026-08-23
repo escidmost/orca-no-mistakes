@@ -2883,7 +2883,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     await writeFile(
       path.join(repo, "src/inline.js"),
-      "test.each(cases)('response', () => {\n  assert.deepEqual(actual, {\n    ok: true,\n  });\n});\n",
+      "test.each(buildCases(seed()))('response', () => {\n  assert.deepEqual(actual, {\n    ok: true,\n  });\n});\n",
     );
     await writeFile(
       path.join(repo, "src/concurrent.js"),
@@ -2918,6 +2918,9 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await mkdir(path.join(repo, "ci/check/sub/dist"), { recursive: true });
     await mkdir(path.join(repo, "commands"));
     await mkdir(path.join(repo, "dist"));
+    await mkdir(path.join(repo, "gradle/wrapper"), { recursive: true });
+    await mkdir(path.join(repo, ".mvn/wrapper"), { recursive: true });
+    await mkdir(path.join(repo, "other"));
     await mkdir(path.join(repo, "shell-commands"));
     await mkdir(path.join(repo, "tools"));
     await writeFile(path.join(repo, "bin/orca-no-mistakes"), entrypointSource);
@@ -2927,7 +2930,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     await writeFile(
       path.join(repo, ".github/workflows/ci.yml"),
-      "- uses: ./\n- uses: ./.github/actions/check\n- uses: ./ci/check\n- run: ./check.sh\n  working-directory: commands\n- run: cd shell-commands && ./check.sh\n",
+      "- uses: ./\n- uses: ./.github/actions/check\n- uses: ./ci/check\n- run: ./check.sh\n  working-directory: commands\n- run: ./lint.sh\n  working-directory: other\n- run: cd shell-commands && ./check.sh\n",
     );
     await writeFile(
       path.join(repo, "action.yml"),
@@ -2957,7 +2960,15 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "require('child_process').execFileSync('npm', ['test']);\n",
     );
     await writeFile(path.join(repo, "commands/check.sh"), "npm test\n");
+    await writeFile(path.join(repo, "other/check.sh"), "export OTHER_CHECK=1\n");
+    await writeFile(path.join(repo, "other/lint.sh"), "npm run lint\n");
     await writeFile(path.join(repo, "shell-commands/check.sh"), "npm test\n");
+    await writeFile(path.join(repo, "gradlew"), "#!/bin/sh\nexec java -jar gradle/wrapper/gradle-wrapper.jar\n");
+    await writeFile(path.join(repo, "gradle/wrapper/gradle-wrapper.properties"), "distributionUrl=https://services.gradle.org/distributions/gradle.zip\n");
+    await writeFile(path.join(repo, "gradle/wrapper/gradle-wrapper.jar"), "gradle wrapper\n");
+    await writeFile(path.join(repo, "mvnw"), "#!/bin/sh\nexec java -jar .mvn/wrapper/maven-wrapper.jar\n");
+    await writeFile(path.join(repo, ".mvn/wrapper/maven-wrapper.properties"), "distributionUrl=https://repo.maven.apache.org/wrapper.zip\n");
+    await writeFile(path.join(repo, ".mvn/wrapper/maven-wrapper.jar"), "maven wrapper\n");
     await writeFile(
       path.join(repo, "tools/package.json"),
       '{"scripts":{"test":"./verify.sh"}}\n',
@@ -3022,6 +3033,12 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "ci/check/sub/dist/index.js",
       "commands/check.sh",
       "dist/index.js",
+      "gradle/wrapper/gradle-wrapper.properties",
+      "gradlew",
+      ".mvn/wrapper/maven-wrapper.properties",
+      "mvnw",
+      "other/check.sh",
+      "other/lint.sh",
       "shell-commands/check.sh",
       "bin/orca-no-mistakes",
       "scripts/adapters.ts",
@@ -3032,6 +3049,13 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "tools/package.json",
       "tools/check.sh",
       "tools/verify.sh",
+    );
+    git(
+      repo,
+      "add",
+      "-f",
+      "gradle/wrapper/gradle-wrapper.jar",
+      ".mvn/wrapper/maven-wrapper.jar",
     );
     git(repo, "commit", "-m", "feature");
     const featureHead = git(repo, "rev-parse", "HEAD");
@@ -3084,6 +3108,12 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(worker, "build.gradle"), "test { enabled = false }\n");
     await writeFile(path.join(worker, "build.gradle.kts"), "tasks.test { enabled = false }\n");
     await writeFile(path.join(worker, "gradle.properties"), "org.gradle.test=false\n");
+    await writeFile(path.join(worker, "gradlew"), "#!/bin/sh\nexit 0\n");
+    await writeFile(path.join(worker, "gradle/wrapper/gradle-wrapper.properties"), "distributionUrl=https://example.invalid/gradle.zip\n");
+    await writeFile(path.join(worker, "gradle/wrapper/gradle-wrapper.jar"), "replacement\n");
+    await writeFile(path.join(worker, "mvnw"), "#!/bin/sh\nexit 0\n");
+    await writeFile(path.join(worker, ".mvn/wrapper/maven-wrapper.properties"), "distributionUrl=https://example.invalid/maven.zip\n");
+    await writeFile(path.join(worker, ".mvn/wrapper/maven-wrapper.jar"), "replacement\n");
     await writeFile(path.join(worker, "package.json"), '{"scripts":{"test":"true"}}\n');
     await writeFile(path.join(worker, "package-lock.json"), '{"lockfileVersion":3}\n');
     await writeFile(path.join(worker, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
@@ -3093,7 +3123,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       path.join(worker, "phpunit.xml.dist"),
       '<phpunit><testsuites/></phpunit>\n',
     );
-    await mkdir(path.join(worker, ".mvn"));
+    await mkdir(path.join(worker, ".mvn"), { recursive: true });
     await writeFile(path.join(worker, ".mvn/maven.config"), "-DskipTests\n");
     await writeFile(
       path.join(worker, "settings.gradle"),
@@ -3132,6 +3162,8 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "cypress.config.ts",
       "eslint.config.js",
       "gradle.properties",
+      "gradle/wrapper/gradle-wrapper.properties",
+      "gradlew",
       "package-lock.json",
       "package.json",
       "pkg/go.mod",
@@ -3143,16 +3175,25 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "pytest.ini",
       "settings.gradle",
       "settings.gradle.kts",
+      ".mvn/wrapper/maven-wrapper.properties",
+      "mvnw",
       "tslint.build.json",
       "tslint.json",
       "vitest.config.ts",
       "yarn.lock",
     );
+    git(
+      worker,
+      "add",
+      "-f",
+      "gradle/wrapper/gradle-wrapper.jar",
+      ".mvn/wrapper/maven-wrapper.jar",
+    );
     git(worker, "add", "-f", "go.work");
     git(worker, "commit", "-m", "weaken validation policy");
     await assert.rejects(
       assertWorkerChangesAllowed(),
-      /unexplained-policy-relaxation:.*\.bazelrc, \.mocharc\.json, \.mvn\/maven\.config, BUILD, BUILD\.bazel, CMakeLists\.txt, Cargo\.lock, MODULE\.bazel, WORKSPACE, WORKSPACE\.bazel, build\.gradle, build\.gradle\.kts, cypress\.config\.ts, eslint\.config\.js, go\.work, gradle\.properties, package-lock\.json, package\.json, phpunit\.xml, phpunit\.xml\.dist, pkg\/go\.mod, pnpm-lock\.yaml, pom\.xml, prompts\/fixer\.md, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, yarn\.lock/,
+      /unexplained-policy-relaxation:.*\.bazelrc, \.mocharc\.json, \.mvn\/maven\.config, \.mvn\/wrapper\/maven-wrapper\.jar, \.mvn\/wrapper\/maven-wrapper\.properties, BUILD, BUILD\.bazel, CMakeLists\.txt, Cargo\.lock, MODULE\.bazel, WORKSPACE, WORKSPACE\.bazel, build\.gradle, build\.gradle\.kts, cypress\.config\.ts, eslint\.config\.js, go\.work, gradle\.properties, gradle\/wrapper\/gradle-wrapper\.jar, gradle\/wrapper\/gradle-wrapper\.properties, gradlew, mvnw, package-lock\.json, package\.json, phpunit\.xml, phpunit\.xml\.dist, pkg\/go\.mod, pnpm-lock\.yaml, pom\.xml, prompts\/fixer\.md, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, yarn\.lock/,
     );
 
     git(worker, "reset", "--hard", featureHead);
@@ -3225,6 +3266,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "export const runner = 2;\n",
     );
     await writeFile(path.join(worker, "tools/check.sh"), "export TOOL_CHECK=2\n");
+    await writeFile(path.join(worker, "other/check.sh"), "export OTHER_CHECK=2\n");
     git(
       worker,
       "add",
@@ -3232,6 +3274,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "scripts/test-harness.ts",
       "scripts/test-runner.ts",
       "src/spec-parser.ts",
+      "other/check.sh",
       "tools/check.sh",
     );
     git(worker, "commit", "-m", "repair specification tooling");
@@ -3367,7 +3410,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "reset", "--hard", featureHead);
     await writeFile(
       path.join(worker, "src/inline.js"),
-      "test.each(cases)('response', () => {\n  assert.deepEqual(actual, {\n    ok: false,\n  });\n});\n",
+      "test.each(buildCases(seed()))('response', () => {\n  assert.deepEqual(actual, {\n    ok: false,\n  });\n});\n",
     );
     git(worker, "add", "src/inline.js");
     git(worker, "commit", "-m", "weaken multiline inline assertion");

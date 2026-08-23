@@ -142,6 +142,14 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
   )
   assert.equal(
     buildCliCommand('codex', {
+      agentArgsOverride: { codex: ['-cmodel="raw"', '-cmodel_reasoning_effort="low"'] } as never,
+      effort: 'max',
+      model: 'mapped'
+    }),
+    `'codex' '--dangerously-bypass-approvals-and-sandbox' '-cmodel="raw"' '-cmodel_reasoning_effort="low"'`
+  )
+  assert.equal(
+    buildCliCommand('codex', {
       agentArgsOverride: {
         codex: ['--', '-c', 'model_reasoning_effort="low"', '--model', 'raw']
       } as never,
@@ -171,6 +179,10 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
     ['codex', ['--sandbox', 'read-only']],
     ['codex', ['--ask-for-approval', 'on-request']],
     ['codex', ['-c', 'sandbox_mode="read-only"']],
+    ['codex', ['-sread-only']],
+    ['codex', ['-aon-request']],
+    ['codex', ['-pdefault']],
+    ['codex', ['-csandbox_mode="read-only"']],
   ] as const) {
     assert.throws(
       () =>

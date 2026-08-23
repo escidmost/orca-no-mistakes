@@ -16,6 +16,7 @@ import {
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import YAML from "yaml";
 
 import {
   PreflightError,
@@ -3742,7 +3743,7 @@ function weakensInlineTestValidation(
   source: string | undefined,
 ): boolean {
   if (source === expectedSource) return false;
-  const protectedValidation = /(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|test)\s*\]|@(?:org\.junit\.)?Test\b|\[(?:Fact|Test|Theory)\]|(?:describe|context|it|test)(?:\.[A-Za-z_$][\w$]*(?:\s*\([^)]*\))?)*\s*\(\s*["'`]|(?:^|\n)\s*(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(|(?:^|\n)\s*assert\s+\S|\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|\bassert[A-Z][A-Za-z0-9_$]*\s*\(|\bexpect\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
+  const protectedValidation = /(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|test)\s*\]|@(?:org\.junit\.)?Test\b|\[(?:Fact|Test|Theory)\]|\b(?:describe|context|it|test)(?:\.[A-Za-z_$][\w$]*)*\s*\(|(?:^|\n)\s*(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(|(?:^|\n)\s*assert\s+\S|\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|\bassert[A-Z][A-Za-z0-9_$]*\s*\(|\bexpect\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
   if (protectedValidation.test(expectedSource)) return true;
   const skipMarker = /(?:#\[(?:ignore|should_panic)\]|\b(?:describe|it|test)(?:\.[A-Za-z_$][\w$]*)*\.(?:only|skip)\s*\(|\bpytest\.mark\.(?:skip|skipif|xfail)\b|@\w*Ignore\b)/giu;
   return (
@@ -3776,6 +3777,10 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
     ].includes(originalFileName) ||
     ((parts[0] === ".github" || parts[0] === ".forgejo") &&
       (parts[1] === "workflows" || parts[1] === "actions")) ||
+    normalized.startsWith("gradle/wrapper/") ||
+    normalized.includes("/gradle/wrapper/") ||
+    normalized.startsWith(".mvn/wrapper/") ||
+    normalized.includes("/.mvn/wrapper/") ||
     parts[0] === ".buildkite" ||
     [
       ".circleci/config.yml",
@@ -3805,9 +3810,13 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "go.work",
       "go.work.sum",
       "gradle.properties",
+      "gradlew",
+      "gradlew.bat",
       "justfile",
       "makefile",
       "npm-shrinkwrap.json",
+      "mvnw",
+      "mvnw.cmd",
       "package-lock.json",
       "package.json",
       "packages.lock.json",
@@ -3831,6 +3840,30 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
   );
 }
 
+function containsPathReference(source: string, reference: string): boolean {
+  if (!reference || reference === ".") return false;
+  const escaped = reference.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(
+    `(?:^|[^A-Za-z0-9_./-])(?:\\./)?${escaped}(?=$|[^A-Za-z0-9_./-])`,
+    "m",
+  ).test(source);
+}
+
+function shellCommandReferencesTarget(
+  command: string,
+  directories: ReadonlySet<string>,
+  basename: string,
+): boolean {
+  return [...directories].some((directory) => {
+    if (!directory || directory === ".") return false;
+    const escaped = directory.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const composed = command.match(
+      new RegExp(`\\bcd\\s+["']?(?:\\./)?${escaped}/?["']?\\s*(?:&&|;)[^\\n]*`, "m"),
+    );
+    return composed !== null && containsPathReference(composed[0], basename);
+  });
+}
+
 function containsValidationPathReference(
   source: string,
   policyPath: string,
@@ -3840,14 +3873,8 @@ function containsValidationPathReference(
     targetPath,
     path.posix.relative(path.posix.dirname(policyPath), targetPath),
   ]);
-  const containsReference = (reference: string): boolean => {
-    if (!reference || reference === ".") return false;
-    const escaped = reference.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    return new RegExp(
-      `(?:^|[^A-Za-z0-9_./-])(?:\\./)?${escaped}(?=$|[^A-Za-z0-9_./-])`,
-      "m",
-    ).test(source);
-  };
+  const containsReference = (reference: string): boolean =>
+    containsPathReference(source, reference);
   if ([...references].some(containsReference)) return true;
 
   const targetDirectory = path.posix.dirname(targetPath);
@@ -3856,23 +3883,45 @@ function containsValidationPathReference(
     targetDirectory,
     path.posix.relative(path.posix.dirname(policyPath), targetDirectory),
   ]);
-  const commandReferenced = containsReference(path.posix.basename(targetPath));
-  return (
-    commandReferenced &&
-    [...workingDirectories].some((directory) => {
-      if (!directory || directory === ".") return false;
-      const escaped = directory.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const yamlWorkingDirectory = new RegExp(
-        `(?:^|\\n)\\s*working-directory\\s*:\\s*["']?(?:\\./)?${escaped}(?=["'\\s]|$)`,
-        "m",
-      ).test(source);
-      const shellWorkingDirectory = new RegExp(
-        `\\bcd\\s+["']?(?:\\./)?${escaped}["']?\\s*(?:&&|;)`,
-        "m",
-      ).test(source);
-      return yamlWorkingDirectory || shellWorkingDirectory;
-    })
-  );
+  const basename = path.posix.basename(targetPath);
+  const directoryMatches = (directory: string): boolean => {
+    const normalizedDirectory = path.posix.normalize(directory.replace(/^\.\//, ""));
+    return normalizedDirectory !== "." && workingDirectories.has(normalizedDirectory);
+  };
+  const commandMatches = (command: string): boolean =>
+    containsPathReference(command, basename);
+
+  try {
+    const visit = (value: unknown, inheritedDirectory?: string): boolean => {
+      if (Array.isArray(value)) return value.some((item) => visit(item, inheritedDirectory));
+      if (!value || typeof value !== "object") return false;
+      const record = value as Record<string, unknown>;
+      const defaults = record.defaults as Record<string, unknown> | undefined;
+      const runDefaults = defaults?.run as Record<string, unknown> | undefined;
+      const directory =
+        (typeof record["working-directory"] === "string"
+          ? record["working-directory"]
+          : undefined) ??
+        (typeof runDefaults?.["working-directory"] === "string"
+          ? runDefaults["working-directory"]
+          : undefined) ??
+        inheritedDirectory;
+      if (
+        typeof record.run === "string" &&
+        ((directory !== undefined && directoryMatches(directory) && commandMatches(record.run)) ||
+          shellCommandReferencesTarget(record.run, workingDirectories, basename))
+      ) {
+        return true;
+      }
+      return Object.values(record).some((item) => visit(item, directory));
+    };
+    if (visit(YAML.parse(source))) return true;
+  } catch {
+    // Non-YAML policy sources still receive exact-path and shell-command checks.
+  }
+  return source
+    .split("\n")
+    .some((line) => shellCommandReferencesTarget(line, workingDirectories, basename));
 }
 
 function referencesRootLocalAction(source: string): boolean {

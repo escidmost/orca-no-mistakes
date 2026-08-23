@@ -104,7 +104,8 @@ const EFFORT_PIN_FLAGS = ['--effort', '--reasoning-effort', '--thinking']
 // A reserved flag stays reserved when joined to its value as --flag=value.
 function flagName(arg: string): string {
   const equals = arg.indexOf('=')
-  return equals < 0 ? arg : arg.slice(0, equals)
+  if (equals >= 0) return arg.slice(0, equals)
+  return /^-[A-Za-z].+/.test(arg) && !arg.startsWith('--') ? arg.slice(0, 2) : arg
 }
 
 function pinsAnyFlag(args: string[], flags: string[]): boolean {
@@ -114,6 +115,8 @@ function pinsAnyFlag(args: string[], flags: string[]): boolean {
     for (const flag of flags) {
       if (arg.startsWith(`${flag}=`)) {
         if (arg.length > flag.length + 1) return true
+      } else if (flag.length === 2 && arg.startsWith(flag) && arg.length > 2) {
+        return true
       } else if (arg === flag) {
         if (i + 1 < args.length && args[i + 1] !== '') return true
       }
@@ -141,8 +144,8 @@ function configOverride(args: string[], index: number): string | undefined {
   const arg = args[index]
   return arg === '-c' || arg === '--config'
     ? args[index + 1]
-    : arg.startsWith('-c=')
-      ? arg.slice(3)
+    : arg.startsWith('-c') && arg.length > 2
+      ? arg.slice(2).replace(/^=/, '')
       : arg.startsWith('--config=')
         ? arg.slice(9)
         : undefined
