@@ -823,6 +823,7 @@ function launchCandidates(
 
 type TimeoutFence = {
   aborted: boolean;
+  deadlineSatisfied: boolean;
   settlement?: Promise<unknown>;
 };
 
@@ -831,8 +832,9 @@ async function withTimeout<T>(
   label: string,
   run: (fence: TimeoutFence) => Promise<T>,
 ): Promise<T> {
-  if (timeoutMs === undefined) return await run({ aborted: false });
-  const fence: TimeoutFence = { aborted: false };
+  if (timeoutMs === undefined)
+    return await run({ aborted: false, deadlineSatisfied: false });
+  const fence: TimeoutFence = { aborted: false, deadlineSatisfied: false };
   let timer: ReturnType<typeof setTimeout> | undefined;
   const operation = run(fence);
   try {
@@ -840,6 +842,7 @@ async function withTimeout<T>(
       operation,
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
+          if (fence.deadlineSatisfied) return;
           fence.aborted = true;
           reject(
             new Error(`${label} exceeded its ${timeoutMs}ms execution timeout`),
@@ -1180,6 +1183,7 @@ async function runFixer(
     if (!(await transfer)) {
       throw new Error(`${stage} fixer could not apply its committed change`);
     }
+    fence.deadlineSatisfied = true;
     const after = await git.head();
     if (before === after) {
       throw new Error(`${stage} fixer did not commit a change`);
@@ -3408,14 +3412,25 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
   );
 }
 
-const COORDINATOR_PROMPT_SOURCE = "scripts/orca-no-mistakes.ts";
+const COORDINATOR_POLICY_SOURCE = "scripts/orca-no-mistakes.ts";
+const COORDINATOR_POLICY_BLOCKS = [
+  ["let nextFixer:", "fixerSession = nextFixer.session;"],
+  ["async function runFixer(", "async function validateReport("],
+  ["function checkerBrief(", "function gateQuestion("],
+  ["function isTestPath(", "type GitShellOptions"],
+  ["async assertFixerChangesAllowed(", "async head()"],
+] as const;
 
-function coordinatorPromptTemplateBlock(source: string | undefined): string | undefined {
+function coordinatorPolicyBlocks(source: string | undefined): string | undefined {
   if (source === undefined) return undefined;
-  const start = source.indexOf("function checkerBrief(");
-  const end = source.indexOf("function gateQuestion(", start);
-  if (start < 0 || end < 0) return undefined;
-  return source.slice(start, end);
+  const blocks: string[] = [];
+  for (const [startMarker, endMarker] of COORDINATOR_POLICY_BLOCKS) {
+    const start = source.indexOf(startMarker);
+    const end = source.indexOf(endMarker, start);
+    if (start < 0 || end < 0) return undefined;
+    blocks.push(source.slice(start, end));
+  }
+  return blocks.join("\0");
 }
 
 type GitShellOptions = { base?: string; expectedHead?: string; repo: string };
@@ -3514,19 +3529,19 @@ export class GitShell implements GitOperations {
         protectedPolicy.push(filePath);
       }
     }
-    if (changedPaths.includes(COORDINATOR_PROMPT_SOURCE)) {
+    if (changedPaths.includes(COORDINATOR_POLICY_SOURCE)) {
       const [before, after] = await Promise.all([
-        this.showFile(expectedHead, COORDINATOR_PROMPT_SOURCE),
-        this.showFile(sourceHead, COORDINATOR_PROMPT_SOURCE),
+        this.showFile(expectedHead, COORDINATOR_POLICY_SOURCE),
+        this.showFile(sourceHead, COORDINATOR_POLICY_SOURCE),
       ]);
-      const beforeBlock = coordinatorPromptTemplateBlock(before);
-      const afterBlock = coordinatorPromptTemplateBlock(after);
+      const beforeBlock = coordinatorPolicyBlocks(before);
+      const afterBlock = coordinatorPolicyBlocks(after);
       if (
         beforeBlock === undefined ||
         afterBlock === undefined ||
         beforeBlock !== afterBlock
       ) {
-        protectedPolicy.push(COORDINATOR_PROMPT_SOURCE);
+        protectedPolicy.push(COORDINATOR_POLICY_SOURCE);
       }
     }
     if (protectedTests.length > 0) {

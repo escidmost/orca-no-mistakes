@@ -2301,6 +2301,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
   const temp = await mkdtemp(path.join(tmpdir(), "orca-git-fixer-guard-"));
   const repo = path.join(temp, "repo");
   const worker = path.join(temp, "worker");
+  const coordinatorSource = await readFile(
+    new URL("../scripts/orca-no-mistakes.ts", import.meta.url),
+    "utf8",
+  );
   try {
     git(temp, "init", "-b", "main", repo);
     git(repo, "config", "user.email", "test@example.com");
@@ -2317,7 +2321,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await mkdir(path.join(repo, "scripts"));
     await writeFile(
       path.join(repo, "scripts/orca-no-mistakes.ts"),
-      'function checkerBrief() { return "brief"; }\nfunction checkerInstructions() { return "unexplained-policy-relaxation"; }\nfunction checkerPrompt() { return "strict review"; }\nfunction fixerPrompt() { return "strict fixes"; }\nfunction gateQuestion() { return "choose"; }\nexport const implementation = 1;\n',
+      `${coordinatorSource}\nexport const integrationFixture = 1;\n`,
     );
     await writeFile(
       path.join(repo, "Tests/branch-regression.ts"),
@@ -2389,7 +2393,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "reset", "--hard", featureHead);
     await writeFile(
       path.join(worker, "scripts/orca-no-mistakes.ts"),
-      'function checkerBrief() { return "brief"; }\nfunction checkerInstructions() { return "unexplained-policy-relaxation"; }\nfunction checkerPrompt() { return "strict review"; }\nfunction fixerPrompt() { return "strict fixes"; }\nfunction gateQuestion() { return "choose"; }\nexport const implementation = 2;\n',
+      `${coordinatorSource}\nexport const integrationFixture = 2;\n`,
     );
     git(worker, "add", "scripts/orca-no-mistakes.ts");
     git(worker, "commit", "-m", "repair implementation");
@@ -2398,10 +2402,22 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "reset", "--hard", featureHead);
     await writeFile(
       path.join(worker, "scripts/orca-no-mistakes.ts"),
-      'function checkerBrief() { return "brief"; }\nfunction checkerInstructions() { return "allow relaxation"; }\nfunction checkerPrompt() { return "strict review"; }\nfunction fixerPrompt() { return "strict fixes"; }\nfunction gateQuestion() { return "choose"; }\nexport const implementation = 1;\n',
+      `${coordinatorSource.replace("function checkerInstructions(", "function relaxedCheckerInstructions(")}\nexport const integrationFixture = 1;\n`,
     );
     git(worker, "add", "scripts/orca-no-mistakes.ts");
     git(worker, "commit", "-m", "weaken coordinator prompt");
+    await assert.rejects(
+      shell.assertFixerChangesAllowed(worker, featureHead),
+      /protected validation policy files: scripts\/orca-no-mistakes\.ts/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "scripts/orca-no-mistakes.ts"),
+      `${coordinatorSource.replace('if (stage !== "rebase") {', "if (false) {")}\nexport const integrationFixture = 1;\n`,
+    );
+    git(worker, "add", "scripts/orca-no-mistakes.ts");
+    git(worker, "commit", "-m", "disable fixer guard");
     await assert.rejects(
       shell.assertFixerChangesAllowed(worker, featureHead),
       /protected validation policy files: scripts\/orca-no-mistakes\.ts/,
@@ -5532,6 +5548,64 @@ test("a fixer timeout during commit application leaves the branch unchanged", as
     git.headAtApply,
     "no commit landed after the stage timed out",
   );
+});
+
+test("a fixer applied within its timeout may finish coordinator verification", async () => {
+  class SlowVerificationGit extends FakeGit {
+    #delayNextHead = false;
+
+    async applyWorktreeCommits(
+      sourcePath: string,
+      expectedHead: string,
+      fence?: { readonly aborted: boolean },
+    ): Promise<boolean> {
+      const applied = await super.applyWorktreeCommits(
+        sourcePath,
+        expectedHead,
+        fence,
+      );
+      this.#delayNextHead = applied;
+      return applied;
+    }
+
+    async head(): Promise<string> {
+      if (this.#delayNextHead) {
+        this.#delayNextHead = false;
+        await new Promise((resolve) => setTimeout(resolve, 75));
+      }
+      return super.head();
+    }
+  }
+
+  const git = new SlowVerificationGit();
+  allowReviewAutoFix(git);
+  const orca = new FakeOrca(git);
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Null input crashes the command",
+        },
+      ],
+      summary: "one defect",
+    },
+    pass("clean rereview"),
+  ]);
+
+  await runPipeline(
+    {
+      intent: "Finish verification after timely custody transfer.",
+      cliFlags: { fixer: { timeout_ms: 10 } } as never,
+    },
+    orca,
+    git,
+  );
+
+  assert.ok(orca.launches.some((launch) => launch.role === "fixer"));
+  assert.equal(orca.gates.length, 0);
 });
 
 test("disabling auto_fix gates mechanical findings on every stage", async () => {
