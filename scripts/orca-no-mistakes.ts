@@ -644,9 +644,12 @@ export async function runPipeline(
           fixerSession = undefined;
           report = {
             findings: [
+              ...targetFindings.filter(
+                (finding) => finding.id !== "fixer-policy-violation",
+              ),
               {
                 action: "ask-user",
-                description: `${error.message} Rejected while addressing: ${JSON.stringify(targetFindings.map(({ description, id }) => ({ description, id })))}`,
+                description: `${error.message} Select the original findings to retry them without protected-path changes.`,
                 id: "fixer-policy-violation",
                 severity: "error",
               },
@@ -1824,7 +1827,6 @@ async function command(
   options: {
     allowFailure?: boolean;
     timeoutMs?: number | null;
-    signal?: { readonly aborted: boolean };
   } = {},
 ): Promise<CommandResult> {
   return await new Promise((resolve, reject) => {
@@ -1833,14 +1835,6 @@ async function command(
       env: process.env,
       stdio: ["ignore", "pipe", "pipe"],
     });
-    // Kill in-flight work (e.g. a fenced ff-only merge) once the caller's
-    // abort fence flips, so nothing lands after its stage already failed.
-    const watchAbort =
-      options.signal == null
-        ? undefined
-        : setInterval(() => {
-            if (options.signal?.aborted) child.kill("SIGKILL");
-          }, 25);
     const timeoutMs =
       options.timeoutMs === undefined ? 120_000 : options.timeoutMs;
     let timedOut = false;
@@ -1860,12 +1854,10 @@ async function command(
       stderr += chunk;
     });
     child.on("error", (error) => {
-      if (watchAbort) clearInterval(watchAbort);
       if (timer) clearTimeout(timer);
       reject(error);
     });
     child.on("close", (code) => {
-      if (watchAbort) clearInterval(watchAbort);
       if (timer) clearTimeout(timer);
       if (timedOut) {
         const message = `${executable} ${args.slice(0, 2).join(" ")} timed out after ${timeoutMs}ms`;
@@ -3074,7 +3066,7 @@ export class CliOrca implements OrcaOperations {
           "--run",
           this.#runId,
           "--json",
-        ]);
+        ]).catch(() => {});
       }
       return;
     }
@@ -3414,6 +3406,16 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
   );
 }
 
+const COORDINATOR_PROMPT_SOURCE = "scripts/orca-no-mistakes.ts";
+
+function coordinatorPromptTemplateBlock(source: string | undefined): string | undefined {
+  if (source === undefined) return undefined;
+  const start = source.indexOf("function checkerPrompt(");
+  const end = source.indexOf("function gateQuestion(", start);
+  if (start < 0 || end < 0) return undefined;
+  return source.slice(start, end);
+}
+
 type GitShellOptions = { base?: string; expectedHead?: string; repo: string };
 
 export class GitShell implements GitOperations {
@@ -3499,14 +3501,30 @@ export class GitShell implements GitOperations {
     if (changed.failed) {
       throw new Error(`could not inspect fixer changes: ${changed.output}`);
     }
+    const changedPaths = changed.stdout.split("\0").filter(Boolean);
     const protectedTests: string[] = [];
     const protectedPolicy: string[] = [];
-    for (const filePath of changed.stdout.split("\0").filter(Boolean)) {
+    for (const filePath of changedPaths) {
       if (isTestPath(filePath) && (await this.pathExists(expectedHead, filePath))) {
         protectedTests.push(filePath);
       }
       if (isProtectedValidationPolicyPath(filePath)) {
         protectedPolicy.push(filePath);
+      }
+    }
+    if (changedPaths.includes(COORDINATOR_PROMPT_SOURCE)) {
+      const [before, after] = await Promise.all([
+        this.showFile(expectedHead, COORDINATOR_PROMPT_SOURCE),
+        this.showFile(sourceHead, COORDINATOR_PROMPT_SOURCE),
+      ]);
+      const beforeBlock = coordinatorPromptTemplateBlock(before);
+      const afterBlock = coordinatorPromptTemplateBlock(after);
+      if (
+        beforeBlock === undefined ||
+        afterBlock === undefined ||
+        beforeBlock !== afterBlock
+      ) {
+        protectedPolicy.push(COORDINATOR_PROMPT_SOURCE);
       }
     }
     if (protectedTests.length > 0) {
@@ -3580,11 +3598,12 @@ export class GitShell implements GitOperations {
       ["merge-base", "--is-ancestor", expectedHead, sourceHead],
       true,
     );
+    // Let custody mutations settle before checking the fence so rollback never
+    // races Git's index or ref locks.
     if (!expectedIsAncestor.failed) {
       const applied = await this.#git(
         ["merge", "--ff-only", sourceHead],
         true,
-        fence,
       );
       if (fence?.aborted) {
         await this.#restoreExpectedHeadAfterAbort(expectedHead, sourceHead);
@@ -3606,7 +3625,6 @@ export class GitShell implements GitOperations {
         : await this.#git(
             ["update-ref", `refs/heads/${branch}`, sourceHead, expectedHead],
             true,
-            fence,
           );
     if (fence?.aborted) {
       await this.#restoreExpectedHeadAfterAbort(expectedHead, sourceHead);
@@ -3617,7 +3635,6 @@ export class GitShell implements GitOperations {
       const backup = await this.#git(
         ["update-ref", `refs/no-mistakes/backup/${expectedHead}`, expectedHead],
         true,
-        fence,
       );
       if (fence?.aborted) {
         await this.#restoreExpectedHeadAfterAbort(expectedHead, sourceHead);
@@ -3627,7 +3644,6 @@ export class GitShell implements GitOperations {
       const reset = await this.#git(
         ["reset", "--hard", sourceHead],
         true,
-        fence,
       );
       if (fence?.aborted) {
         await this.#restoreExpectedHeadAfterAbort(expectedHead, sourceHead);
@@ -3749,13 +3765,12 @@ export class GitShell implements GitOperations {
   async #git(
     args: string[],
     allowFailure = false,
-    signal?: { readonly aborted: boolean },
   ): Promise<CommandResult & { failed: boolean; output: string }> {
     const result = await command(
       "git",
       ["-C", this.#repo, ...args],
       this.#repo,
-      { allowFailure, signal },
+      { allowFailure },
     );
     const output = `${result.stdout}${result.stderr}`.trim();
     return { ...result, failed: result.code !== 0, output };

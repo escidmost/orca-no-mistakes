@@ -719,7 +719,7 @@ test("protected fixer commits are rejected at a resumable human gate", async () 
   allowReviewAutoFix(git);
   git.protectedTestMutation = "tests/existing.test.ts";
   const orca = new FakeOrca(git);
-  orca.gateResolution = "fix fixer-policy-violation";
+  orca.gateResolution = "fix";
   orca.reports.set("review", [
     {
       findings: [
@@ -749,6 +749,9 @@ test("protected fixer commits are rejected at a resumable human gate", async () 
     orca.launches.filter((launch) => launch.role === "fixer").length,
     2,
   );
+  const retry = orca.launches.filter((launch) => launch.role === "fixer")[1];
+  assert.match(retry.prompt, /"id":"review-1"/);
+  assert.match(retry.prompt, /"id":"fixer-policy-violation"/);
   assert.ok(git.calls.some((call) => call.startsWith("guard:/worktrees/")));
   assert.equal(
     git.calls.filter((call) => call.startsWith("apply:/worktrees/")).length,
@@ -1490,7 +1493,7 @@ console.log(JSON.stringify({ result }))
   }
 });
 
-test("CliOrca applies gate responses through the bound coordinator", async () => {
+test("CliOrca applies gate responses when acknowledgement ownership is stale", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-gate-response-"));
   const fakeOrca = path.join(temp, "orca");
   const callsPath = path.join(temp, "calls.jsonl");
@@ -1516,6 +1519,9 @@ if (args[1] === 'run-create') {
 } else if (args[1] === 'gate-resolve') {
   fs.writeFileSync(${JSON.stringify(resolvedPath)}, 'yes')
   out({ gate: { id: 'gate-review', status: 'resolved' } })
+} else if (args[1] === 'check' && args.includes('--ack')) {
+  console.error(JSON.stringify({ error: { code: 'stale_delivery', message: 'Delivery does not belong to this Run.' } }))
+  process.exit(1)
 } else {
   out({ ok: true })
 }
@@ -2296,11 +2302,22 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(repo, "commit", "-m", "base test");
     git(repo, "checkout", "-b", "feature");
     await writeFile(path.join(repo, "feature.ts"), "export const value = 1;\n");
+    await mkdir(path.join(repo, "scripts"));
+    await writeFile(
+      path.join(repo, "scripts/orca-no-mistakes.ts"),
+      'function checkerPrompt() { return "strict review"; }\nfunction fixerPrompt() { return "strict fixes"; }\nfunction gateQuestion() { return "choose"; }\nexport const implementation = 1;\n',
+    );
     await writeFile(
       path.join(repo, "Tests/branch-regression.ts"),
       'assert.equal(value, 1);\n',
     );
-    git(repo, "add", "feature.ts", "Tests/branch-regression.ts");
+    git(
+      repo,
+      "add",
+      "feature.ts",
+      "Tests/branch-regression.ts",
+      "scripts/orca-no-mistakes.ts",
+    );
     git(repo, "commit", "-m", "feature");
     const featureHead = git(repo, "rev-parse", "HEAD");
     git(repo, "worktree", "add", "--detach", worker, featureHead);
@@ -2346,6 +2363,27 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "add", "docs/agents/prompt-templates.md");
     git(worker, "commit", "-m", "document prompt templates");
     await shell.assertFixerChangesAllowed(worker, featureHead);
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "scripts/orca-no-mistakes.ts"),
+      'function checkerPrompt() { return "strict review"; }\nfunction fixerPrompt() { return "strict fixes"; }\nfunction gateQuestion() { return "choose"; }\nexport const implementation = 2;\n',
+    );
+    git(worker, "add", "scripts/orca-no-mistakes.ts");
+    git(worker, "commit", "-m", "repair implementation");
+    await shell.assertFixerChangesAllowed(worker, featureHead);
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "scripts/orca-no-mistakes.ts"),
+      'function checkerPrompt() { return "relaxed review"; }\nfunction fixerPrompt() { return "strict fixes"; }\nfunction gateQuestion() { return "choose"; }\nexport const implementation = 1;\n',
+    );
+    git(worker, "add", "scripts/orca-no-mistakes.ts");
+    git(worker, "commit", "-m", "weaken coordinator prompt");
+    await assert.rejects(
+      shell.assertFixerChangesAllowed(worker, featureHead),
+      /protected validation policy files: scripts\/orca-no-mistakes\.ts/,
+    );
 
     git(worker, "reset", "--hard", featureHead);
     await writeFile(
