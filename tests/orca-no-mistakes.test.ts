@@ -2765,6 +2765,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await mkdir(path.join(repo, "spec"));
     await mkdir(path.join(repo, "cypress/e2e"), { recursive: true });
     await mkdir(path.join(repo, "e2e"));
+    await mkdir(path.join(repo, "features"));
     await mkdir(path.join(repo, "MyProject.Tests"));
     await mkdir(path.join(repo, "__specs__"));
     await mkdir(path.join(repo, "java"));
@@ -2787,8 +2788,25 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     await writeFile(path.join(repo, "conftest.py"), "assert True\n");
     await writeFile(
+      path.join(repo, "main.tftest.hcl"),
+      'run "works" { assert { condition = true } }\n',
+    );
+    await writeFile(
+      path.join(repo, "features/login.feature"),
+      "Feature: Login\n  Scenario: works\n    Then access is granted\n",
+    );
+    await writeFile(path.join(repo, "cli.bats"), "@test 'works' { true; }\n");
+    await writeFile(
+      path.join(repo, "package.json"),
+      '{"scripts":{"test":"node scripts/test-harness.ts"}}\n',
+    );
+    await writeFile(
       path.join(repo, "scripts/test-harness.ts"),
       "export const harness = 1;\n",
+    );
+    await writeFile(
+      path.join(repo, "scripts/test-runner.ts"),
+      "export const runner = 1;\n",
     );
     await writeFile(
       path.join(repo, "src/spec-parser.ts"),
@@ -2872,11 +2890,16 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       repo,
       "add",
       "feature.ts",
+      "cli.bats",
       "conftest.py",
       "cypress/e2e/login.cy.ts",
       "e2e/checkout.e2e.ts",
+      "features/login.feature",
+      "main.tftest.hcl",
+      "package.json",
       "spec/openapi.yaml",
       "scripts/test-harness.ts",
+      "scripts/test-runner.ts",
       "MyProject.Tests/OrderServiceTests.cs",
       "__specs__/widget.ts",
       "java/TestFoo.java",
@@ -2960,6 +2983,11 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(worker, "package-lock.json"), '{"lockfileVersion":3}\n');
     await writeFile(path.join(worker, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
     await writeFile(path.join(worker, "pom.xml"), "<skipTests>true</skipTests>\n");
+    await writeFile(path.join(worker, "phpunit.xml"), '<phpunit><testsuites/></phpunit>\n');
+    await writeFile(
+      path.join(worker, "phpunit.xml.dist"),
+      '<phpunit><testsuites/></phpunit>\n',
+    );
     await mkdir(path.join(worker, ".mvn"));
     await writeFile(path.join(worker, ".mvn/maven.config"), "-DskipTests\n");
     await writeFile(
@@ -3002,6 +3030,8 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "pkg/go.mod",
       "pnpm-lock.yaml",
       "pom.xml",
+      "phpunit.xml",
+      "phpunit.xml.dist",
       "prompts/fixer.md",
       "pytest.ini",
       "settings.gradle",
@@ -3015,7 +3045,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "commit", "-m", "weaken validation policy");
     await assert.rejects(
       assertWorkerChangesAllowed(),
-      /unexplained-policy-relaxation:.*\.mocharc\.json, \.mvn\/maven\.config, BUILD, BUILD\.bazel, CMakeLists\.txt, Cargo\.lock, MODULE\.bazel, WORKSPACE, WORKSPACE\.bazel, build\.gradle, build\.gradle\.kts, cypress\.config\.ts, eslint\.config\.js, go\.work, package-lock\.json, package\.json, pkg\/go\.mod, pnpm-lock\.yaml, pom\.xml, prompts\/fixer\.md, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, yarn\.lock/,
+      /unexplained-policy-relaxation:.*\.mocharc\.json, \.mvn\/maven\.config, BUILD, BUILD\.bazel, CMakeLists\.txt, Cargo\.lock, MODULE\.bazel, WORKSPACE, WORKSPACE\.bazel, build\.gradle, build\.gradle\.kts, cypress\.config\.ts, eslint\.config\.js, go\.work, package-lock\.json, package\.json, phpunit\.xml, phpunit\.xml\.dist, pkg\/go\.mod, pnpm-lock\.yaml, pom\.xml, prompts\/fixer\.md, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, yarn\.lock/,
     );
 
     git(worker, "reset", "--hard", featureHead);
@@ -3074,22 +3104,34 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "reset", "--hard", featureHead);
     await writeFile(path.join(worker, "spec/openapi.yaml"), "openapi: 3.1.1\n");
     await writeFile(
-      path.join(worker, "scripts/test-harness.ts"),
-      "export const harness = 2;\n",
-    );
-    await writeFile(
       path.join(worker, "src/spec-parser.ts"),
       "export const parser = 2;\n",
+    );
+    await writeFile(
+      path.join(worker, "scripts/test-runner.ts"),
+      "export const runner = 2;\n",
     );
     git(
       worker,
       "add",
       "spec/openapi.yaml",
-      "scripts/test-harness.ts",
+      "scripts/test-runner.ts",
       "src/spec-parser.ts",
     );
     git(worker, "commit", "-m", "repair specification tooling");
     await assertWorkerChangesAllowed();
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "scripts/test-harness.ts"),
+      "export const harness = 2;\n",
+    );
+    git(worker, "add", "scripts/test-harness.ts");
+    git(worker, "commit", "-m", "disable referenced test harness");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /protected validation policy files: scripts\/test-harness\.ts/,
+    );
 
     git(worker, "reset", "--hard", featureHead);
     await writeFile(
@@ -3175,6 +3217,26 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       assertWorkerChangesAllowed(),
       /fixer modified pre-existing test files: t\/widget\.t/,
     );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "main.tftest.hcl"),
+      'run "works" { assert { condition = false } }\n',
+    );
+    await writeFile(
+      path.join(worker, "features/login.feature"),
+      "Feature: Login\n  Scenario: works\n    Then access is denied\n",
+    );
+    await writeFile(path.join(worker, "cli.bats"), "@test 'works' { false; }\n");
+    git(worker, "add", "main.tftest.hcl", "features/login.feature", "cli.bats");
+    git(worker, "commit", "-m", "weaken declarative tests");
+    await assert.rejects(assertWorkerChangesAllowed(), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /cli\.bats/);
+      assert.match(error.message, /features\/login\.feature/);
+      assert.match(error.message, /main\.tftest\.hcl/);
+      return true;
+    });
 
     git(worker, "reset", "--hard", featureHead);
     await writeFile(

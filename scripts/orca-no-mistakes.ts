@@ -3722,7 +3722,10 @@ function isTestPath(filePath: string): boolean {
         /\.tests?$/i.test(part),
       ) ||
     fileName.toLowerCase().endsWith(".snap") ||
+    fileName.toLowerCase().endsWith(".bats") ||
+    fileName.toLowerCase().endsWith(".feature") ||
     fileName.toLowerCase().endsWith(".t") ||
+    fileName.toLowerCase().endsWith(".tftest.hcl") ||
     /(?:^|[._-])(?:tests?|specs?|unittests?|cy|e2e)(?=[._]|$)/i.test(fileName) ||
     (!["docs", "scripts"].includes(parts[0]?.toLowerCase() ?? "") &&
       /^tests?-[A-Za-z0-9]/i.test(fileStem)) ||
@@ -3817,9 +3820,16 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
     (parts.at(-2) === ".mvn" && fileName === "maven.config") ||
     /^settings\.gradle(?:\.kts)?$/.test(fileName) ||
     (parts[0] !== "docs" && parts.slice(0, -1).includes("prompts")) ||
-    /^(?:(?:vitest|jest|playwright|cypress)\.config\..+|\.mocharc(?:\..+)?|karma\.conf\..+|eslint\.config\..+|\.eslintrc(?:\..+)?|prettier\.config\..+|\.prettierrc(?:\..+)?|biome\.jsonc?|deno\.jsonc?|\.editorconfig|\.flake8|\.?ruff\.toml|\.?mypy\.ini|\.pylintrc|pyrightconfig\.json|\.rubocop\.ya?ml|stylelint\.config\..+|\.stylelintrc(?:\..+)?|\.?markdownlint(?:-cli2)?(?:\..+)?|\.golangci\.(?:ya?ml|toml|json)|\.?rustfmt\.toml|\.?clippy\.toml|\.clang-tidy|analysis_options\.yaml|checkstyle\.xml|detekt\.ya?ml|phpcs\.xml(?:\.dist)?|phpstan(?:\.[^.]+)?\.neon(?:\.dist)?|sonar-project\.properties|tsconfig(?:\.[^.]+)*\.json|tslint(?:\.[^.]+)*\.json)$/.test(
+    /^(?:(?:vitest|jest|playwright|cypress)\.config\..+|\.mocharc(?:\..+)?|karma\.conf\..+|phpunit\.xml(?:\.dist)?|eslint\.config\..+|\.eslintrc(?:\..+)?|prettier\.config\..+|\.prettierrc(?:\..+)?|biome\.jsonc?|deno\.jsonc?|\.editorconfig|\.flake8|\.?ruff\.toml|\.?mypy\.ini|\.pylintrc|pyrightconfig\.json|\.rubocop\.ya?ml|stylelint\.config\..+|\.stylelintrc(?:\..+)?|\.?markdownlint(?:-cli2)?(?:\..+)?|\.golangci\.(?:ya?ml|toml|json)|\.?rustfmt\.toml|\.?clippy\.toml|\.clang-tidy|analysis_options\.yaml|checkstyle\.xml|detekt\.ya?ml|phpcs\.xml(?:\.dist)?|phpstan(?:\.[^.]+)?\.neon(?:\.dist)?|sonar-project\.properties|tsconfig(?:\.[^.]+)*\.json|tslint(?:\.[^.]+)*\.json)$/.test(
       fileName,
     )
+  );
+}
+
+function isValidationHarnessPath(filePath: string): boolean {
+  const fileName = filePath.split("/").at(-1) ?? "";
+  return /(?:^|[._-])(?:tests?|specs?)[._-](?:harness|runner)(?=[._-]|$)|(?:^|[._-])(?:harness|runner)[._-](?:tests?|specs?)(?=[._-]|$)|(?:^|[._-])run[._-]tests?(?=[._-]|$)/i.test(
+    fileName,
   );
 }
 
@@ -4014,6 +4024,7 @@ export class GitShell implements GitOperations {
     const protectedTests: string[] = [];
     const protectedInlineTests: string[] = [];
     const protectedPolicy: string[] = [];
+    const validationHarnesses: string[] = [];
     for (const filePath of changedPaths) {
       if (isProtectedValidationPolicyPath(filePath)) {
         protectedPolicy.push(filePath);
@@ -4022,6 +4033,7 @@ export class GitShell implements GitOperations {
       if (isTestPath(filePath) && (await this.pathExists(expectedHead, filePath))) {
         protectedTests.push(filePath);
       } else if (await this.pathExists(expectedHead, filePath)) {
+        if (isValidationHarnessPath(filePath)) validationHarnesses.push(filePath);
         const expectedSource = await this.showFile(expectedHead, filePath);
         if (expectedSource === undefined) {
           throw new Error(`could not read pre-round source file ${filePath}`);
@@ -4029,6 +4041,30 @@ export class GitShell implements GitOperations {
         const source = await this.showFile(sourceHead, filePath);
         if (weakensInlineTestValidation(expectedSource, source)) {
           protectedInlineTests.push(filePath);
+        }
+      }
+    }
+    if (validationHarnesses.length > 0) {
+      for (const harnessPath of validationHarnesses) {
+        const references = await this.#git(
+          ["grep", "-l", "-F", "-z", "-e", harnessPath, expectedHead, "--"],
+          true,
+        );
+        if (references.failed && references.output.trim()) {
+          throw new Error(
+            `could not inspect validation policy references: ${references.output}`,
+          );
+        }
+        const prefix = `${expectedHead}:`;
+        if (
+          references.stdout
+            .split("\0")
+            .map((value) =>
+              value.startsWith(prefix) ? value.slice(prefix.length) : value,
+            )
+            .some(isProtectedValidationPolicyPath)
+        ) {
+          protectedPolicy.push(harnessPath);
         }
       }
     }
