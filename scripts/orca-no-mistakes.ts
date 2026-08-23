@@ -182,7 +182,7 @@ export interface GitOperations {
   ): Promise<boolean>;
   /** Resolves the current HEAD commit of a worker worktree. */
   headOf(worktreePath: string): Promise<string>;
-  worktreeHeadMatches(
+  worktreeIsReusable(
     worktreePath: string,
     expectedHead: string,
   ): Promise<boolean>;
@@ -1125,7 +1125,7 @@ async function runFixer(
     const reusable =
       retainedPath !== undefined &&
       (await git
-        .worktreeHeadMatches(retainedPath, before)
+        .worktreeIsReusable(retainedPath, before)
         .catch(() => false));
     if (!reusable) {
       retainedSession = undefined;
@@ -3022,12 +3022,12 @@ export class CliOrca implements OrcaOperations {
       if (gate?.status === "resolved") return gate.resolution ?? "";
       if (gate?.status === "timeout")
         throw new Error(`gate ${gateId} timed out`);
-      await this.#applyGateResponses(gateId);
+      await this.#applyGateResponses();
       await new Promise((resolve) => setTimeout(resolve, 1000));
     }
   }
 
-  async #applyGateResponses(gateId: string): Promise<void> {
+  async #applyGateResponses(): Promise<void> {
     if (!this.#runId) return;
     const result = await this.#json<{
       deliveryId?: string;
@@ -3046,6 +3046,7 @@ export class CliOrca implements OrcaOperations {
       this.#runId,
       "--json",
     ]);
+    let applied = false;
     for (const message of result.messages ?? []) {
       if (
         message.subject !== "no-mistakes gate response" ||
@@ -3064,7 +3065,8 @@ export class CliOrca implements OrcaOperations {
         continue;
       }
       if (
-        response.gateId !== gateId ||
+        typeof response.gateId !== "string" ||
+        !response.gateId.trim() ||
         typeof response.resolution !== "string" ||
         !response.resolution.trim()
       ) {
@@ -3074,23 +3076,23 @@ export class CliOrca implements OrcaOperations {
         "orchestration",
         "gate-resolve",
         "--id",
-        gateId,
+        response.gateId.trim(),
         "--resolution",
         response.resolution.trim(),
         "--json",
       ]);
-      if (result.deliveryId) {
-        await this.#json([
-          "orchestration",
-          "check",
-          "--ack",
-          result.deliveryId,
-          "--run",
-          this.#runId,
-          "--json",
-        ]).catch(() => {});
-      }
-      return;
+      applied = true;
+    }
+    if (applied && result.deliveryId) {
+      await this.#json([
+        "orchestration",
+        "check",
+        "--ack",
+        result.deliveryId,
+        "--run",
+        this.#runId,
+        "--json",
+      ]).catch(() => {});
     }
   }
 
@@ -3413,6 +3415,7 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
   const fileName = parts.at(-1) ?? "";
   return (
     normalized === ".orca/no-mistakes.yaml" ||
+    normalized === "bin/orca-no-mistakes" ||
     [
       "cargo.toml",
       "justfile",
@@ -3435,10 +3438,12 @@ const COORDINATOR_POLICY_BLOCKS = [
   ["\n        let nextFixer:", "\n        fixerSession = nextFixer.session;"],
   ["\nasync function runFixer(", "\nasync function validateReport("],
   ["\nfunction checkerBrief(", "\nfunction gateQuestion("],
+  ["\nasync function command(", "\nfunction unwrapJson<"],
   ["\nfunction isTestPath(", "\ntype GitShellOptions"],
   ["\n  async assertFixerChangesAllowed(", "\n  async head()"],
   ["\n  async headOf(", "\n  async anchorRecoveryRef("],
   ["\n  async showFile(", "\n  async #detectBase("],
+  ["\n  async #git(", "\n}\n\nfunction failureReport("],
 ] as const;
 
 function coordinatorPolicyBlocks(source: string | undefined): string | undefined {
@@ -3735,11 +3740,14 @@ export class GitShell implements GitOperations {
     return result.stdout.trim();
   }
 
-  async worktreeHeadMatches(
+  async worktreeIsReusable(
     worktreePath: string,
     expectedHead: string,
   ): Promise<boolean> {
-    return (await this.headOf(worktreePath)) === expectedHead;
+    if ((await this.headOf(worktreePath)) !== expectedHead) return false;
+    return !(
+      await this.#git(["-C", worktreePath, "status", "--porcelain"])
+    ).stdout.trim();
   }
 
   async anchorRecoveryRef(runId: string, oid: string): Promise<void> {
