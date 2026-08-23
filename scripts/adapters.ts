@@ -126,14 +126,7 @@ function pinsConfigKey(args: string[], key: string): boolean {
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]
     if (arg === '--') break
-    const config =
-      arg === '-c' || arg === '--config'
-        ? args[i + 1]
-        : arg.startsWith('-c=')
-          ? arg.slice(3)
-          : arg.startsWith('--config=')
-            ? arg.slice(9)
-            : undefined
+    const config = configOverride(args, i)
     if (!config?.startsWith(`${key}=`)) continue
     const value = config.slice(key.length + 1).trim()
     if (!value || value === '""' || value === "''") {
@@ -144,13 +137,44 @@ function pinsConfigKey(args: string[], key: string): boolean {
   return false
 }
 
+function configOverride(args: string[], index: number): string | undefined {
+  const arg = args[index]
+  return arg === '-c' || arg === '--config'
+    ? args[index + 1]
+    : arg.startsWith('-c=')
+      ? arg.slice(3)
+      : arg.startsWith('--config=')
+        ? arg.slice(9)
+        : undefined
+}
+
 // Flags no-mistakes manages itself for a harness. agent_args_override entries
 // may not supply them; always-present flags are appended after override args so
 // they cannot be dropped or reordered away.
 const RESERVED_HARNESS_ARGS: Record<string, ReadonlySet<string>> = {
-  agy: new Set(['--dangerously-skip-permissions', '--prompt-interactive', '-i']),
-  claude: new Set(['--dangerously-skip-permissions']),
-  codex: new Set(['--dangerously-bypass-approvals-and-sandbox']),
+  agy: new Set([
+    '--dangerously-skip-permissions',
+    '--prompt-interactive',
+    '--sandbox',
+    '-i',
+  ]),
+  claude: new Set([
+    '--allow-dangerously-skip-permissions',
+    '--dangerously-skip-permissions',
+    '--permission-mode',
+  ]),
+  codex: new Set([
+    '--ask-for-approval',
+    '--dangerously-bypass-approvals-and-sandbox',
+    '--profile',
+    '--sandbox',
+    '-a',
+    '-p',
+    '-s',
+  ]),
+}
+const RESERVED_CONFIG_KEYS: Record<string, ReadonlySet<string>> = {
+  codex: new Set(['approval_policy', 'sandbox_mode', 'sandbox_permissions']),
 }
 const REQUIRED_HARNESS_ARGS: Record<string, readonly string[]> = {
   agy: ['--dangerously-skip-permissions'],
@@ -221,10 +245,20 @@ export function buildCliCommand(harness: string, options: CliAgentCommandOptions
     parts.push(effortKnob.flag, effort)
   }
   const reserved = RESERVED_HARNESS_ARGS[normalizedHarness]
+  const reservedConfig = RESERVED_CONFIG_KEYS[normalizedHarness]
   if (reserved) {
-    for (const arg of raw) {
+    for (let index = 0; index < raw.length; index++) {
+      const arg = raw[index]
+      if (arg === '--') break
       if (reserved.has(flagName(arg))) {
         throw new Error(`agent ${normalizedHarness}: reserved argument '${arg}' cannot be overridden`)
+      }
+      const config = configOverride(raw, index)
+      const configKey = config?.slice(0, config.indexOf('=')).trim()
+      if (configKey && reservedConfig?.has(configKey)) {
+        throw new Error(
+          `agent ${normalizedHarness}: reserved config '${configKey}' cannot be overridden`
+        )
       }
     }
   }

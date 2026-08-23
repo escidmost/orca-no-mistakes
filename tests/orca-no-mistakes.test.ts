@@ -2780,6 +2780,14 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "pub fn value() -> i32 { 1 }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn value_is_one() { assert_eq!(super::value(), 1); }\n}\n",
     );
     await writeFile(
+      path.join(repo, "src/inline.js"),
+      "test('response', () => {\n  assert.deepEqual(actual, {\n    ok: true,\n  });\n});\n",
+    );
+    await writeFile(
+      path.join(repo, "src/assertions.js"),
+      "export function verify(actual) {\n  assert.deepEqual(actual, { ok: true });\n}\n",
+    );
+    await writeFile(
       path.join(repo, "src/__snapshots__/Widget.snap"),
       "exports[`Widget 1`] = `expected`;\n",
     );
@@ -2825,6 +2833,8 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "src/test-foo.ts",
       "src/testFoo.ts",
       "src/lib.rs",
+      "src/inline.js",
+      "src/assertions.js",
       "src/__snapshots__/Widget.snap",
       "testdata/expected.json",
       "__fixtures__/response.json",
@@ -2877,6 +2887,9 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(worker, "eslint.config.js"), "export default [];\n");
     await writeFile(path.join(worker, ".mocharc.json"), '{"spec":[]}\n');
     await writeFile(path.join(worker, "Cargo.lock"), "# changed lockfile\n");
+    await mkdir(path.join(worker, "pkg"));
+    await writeFile(path.join(worker, "pkg/go.mod"), "module example.com/nested\n");
+    await writeFile(path.join(worker, "go.work"), "go 1.24\nuse ./pkg\n");
     await writeFile(path.join(worker, "build.gradle"), "test { enabled = false }\n");
     await writeFile(path.join(worker, "build.gradle.kts"), "tasks.test { enabled = false }\n");
     await writeFile(path.join(worker, "package.json"), '{"scripts":{"test":"true"}}\n');
@@ -2905,6 +2918,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "eslint.config.js",
       "package-lock.json",
       "package.json",
+      "pkg/go.mod",
       "pnpm-lock.yaml",
       "pom.xml",
       "prompts/fixer.md",
@@ -2914,10 +2928,11 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "vitest.config.ts",
       "yarn.lock",
     );
+    git(worker, "add", "-f", "go.work");
     git(worker, "commit", "-m", "weaken validation policy");
     await assert.rejects(
       assertWorkerChangesAllowed(),
-      /unexplained-policy-relaxation:.*\.mocharc\.json, Cargo\.lock, build\.gradle, build\.gradle\.kts, cypress\.config\.ts, eslint\.config\.js, package-lock\.json, package\.json, pnpm-lock\.yaml, pom\.xml, prompts\/fixer\.md, pytest\.ini, tslint\.build\.json, tslint\.json, vitest\.config\.ts, yarn\.lock/,
+      /unexplained-policy-relaxation:.*\.mocharc\.json, Cargo\.lock, build\.gradle, build\.gradle\.kts, cypress\.config\.ts, eslint\.config\.js, go\.work, package-lock\.json, package\.json, pkg\/go\.mod, pnpm-lock\.yaml, pom\.xml, prompts\/fixer\.md, pytest\.ini, tslint\.build\.json, tslint\.json, vitest\.config\.ts, yarn\.lock/,
     );
 
     git(worker, "reset", "--hard", featureHead);
@@ -3044,6 +3059,24 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       assertWorkerChangesAllowed(),
       /fixer modified co-located test assertions or skip markers: src\/lib\.rs/,
     );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/inline.js"),
+      "test('response', () => {\n  assert.deepEqual(actual, {\n    ok: false,\n  });\n});\n",
+    );
+    await writeFile(
+      path.join(worker, "src/assertions.js"),
+      "export function verify(_actual) {}\n",
+    );
+    git(worker, "add", "src/assertions.js", "src/inline.js");
+    git(worker, "commit", "-m", "weaken multiline inline assertion");
+    await assert.rejects(assertWorkerChangesAllowed(), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /src\/assertions\.js/);
+      assert.match(error.message, /src\/inline\.js/);
+      return true;
+    });
 
     git(worker, "reset", "--hard", featureHead);
     await writeFile(

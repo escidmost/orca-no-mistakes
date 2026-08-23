@@ -165,6 +165,21 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
       }),
     /reserved argument/
   )
+  for (const [harness, args] of [
+    ['agy', ['--sandbox']],
+    ['claude', ['--permission-mode', 'manual']],
+    ['codex', ['--sandbox', 'read-only']],
+    ['codex', ['--ask-for-approval', 'on-request']],
+    ['codex', ['-c', 'sandbox_mode="read-only"']],
+  ] as const) {
+    assert.throws(
+      () =>
+        buildCliCommand(harness, {
+          agentArgsOverride: { [harness]: [...args] } as never,
+        }),
+      /reserved (?:argument|config)/,
+    )
+  }
   for (const [harness, required] of [
     ['agy', '--dangerously-skip-permissions'],
     ['claude', '--dangerously-skip-permissions'],

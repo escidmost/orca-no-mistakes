@@ -3716,10 +3716,17 @@ function isTestPath(filePath: string): boolean {
   );
 }
 
-function weakensInlineTestValidation(diff: string): boolean {
-  const removedAssertion = /^-(?!---).*(?:\bassert(?:_[a-z0-9]+)?!?\s*\(|\bexpect\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/imu;
+function weakensInlineTestValidation(diff: string, expectedSource: string): boolean {
+  const inlineTestRegistration = /^\s*(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|test)\s*\]|@(?:org\.junit\.)?Test\b|\[(?:Fact|Test|Theory)\]|(?:describe|context|it|test)\s*\(\s*["'`]|.*\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b|>>>)/imu;
+  if (inlineTestRegistration.test(expectedSource)) return true;
+  const removedAssertion = /^-(?!---).*(?:\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|\bassert[A-Z][A-Za-z0-9_$]*\s*\(|\bexpect\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/imu;
+  const removedTestMarker = /^-(?!---).*\s*(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|test)\s*\]|@(?:org\.junit\.)?Test\b|\[(?:Fact|Test|Theory)\])/imu;
   const addedSkipMarker = /^\+(?!\+\+\+).*(?:#\[(?:ignore|should_panic)\]|\b(?:describe|it|test)\.(?:only|skip)\s*\(|\bpytest\.mark\.(?:skip|skipif|xfail)\b|@\w*Ignore\b)/imu;
-  return removedAssertion.test(diff) || addedSkipMarker.test(diff);
+  return (
+    removedAssertion.test(diff) ||
+    removedTestMarker.test(diff) ||
+    addedSkipMarker.test(diff)
+  );
 }
 
 function isProtectedValidationPolicyPath(filePath: string): boolean {
@@ -3761,7 +3768,10 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "composer.lock",
       "conftest.py",
       "gemfile.lock",
+      "go.mod",
       "go.sum",
+      "go.work",
+      "go.work.sum",
       "justfile",
       "makefile",
       "npm-shrinkwrap.json",
@@ -4001,7 +4011,11 @@ export class GitShell implements GitOperations {
             `could not inspect inline test assertions in ${filePath}: ${diff.output}`,
           );
         }
-        if (weakensInlineTestValidation(diff.stdout)) {
+        const expectedSource = await this.showFile(expectedHead, filePath);
+        if (expectedSource === undefined) {
+          throw new Error(`could not read pre-round source file ${filePath}`);
+        }
+        if (weakensInlineTestValidation(diff.stdout, expectedSource)) {
           protectedInlineTests.push(filePath);
         }
       }
