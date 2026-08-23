@@ -3741,7 +3741,7 @@ function weakensInlineTestValidation(
   source: string | undefined,
 ): boolean {
   if (source === expectedSource) return false;
-  const protectedValidation = /(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|test)\s*\]|@(?:org\.junit\.)?Test\b|\[(?:Fact|Test|Theory)\]|(?:describe|context|it|test)(?:\.[A-Za-z_$][\w$]*(?:\s*\([^)]*\))?)*\s*\(\s*["'`]|\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|\bassert[A-Z][A-Za-z0-9_$]*\s*\(|\bexpect\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
+  const protectedValidation = /(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|test)\s*\]|@(?:org\.junit\.)?Test\b|\[(?:Fact|Test|Theory)\]|(?:describe|context|it|test)(?:\.[A-Za-z_$][\w$]*(?:\s*\([^)]*\))?)*\s*\(\s*["'`]|(?:^|\n)\s*(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(|(?:^|\n)\s*assert\s+\S|\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|\bassert[A-Z][A-Za-z0-9_$]*\s*\(|\bexpect\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
   if (protectedValidation.test(expectedSource)) return true;
   const skipMarker = /(?:#\[(?:ignore|should_panic)\]|\b(?:describe|it|test)(?:\.[A-Za-z_$][\w$]*)*\.(?:only|skip)\s*\(|\bpytest\.mark\.(?:skip|skipif|xfail)\b|@\w*Ignore\b)/giu;
   return (
@@ -3774,9 +3774,7 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "WORKSPACE.bazel",
     ].includes(originalFileName) ||
     ((parts[0] === ".github" || parts[0] === ".forgejo") &&
-      (parts[1] === "workflows" ||
-        (parts[1] === "actions" &&
-          (fileName === "action.yml" || fileName === "action.yaml")))) ||
+      (parts[1] === "workflows" || parts[1] === "actions")) ||
     parts[0] === ".buildkite" ||
     [
       ".circleci/config.yml",

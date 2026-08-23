@@ -2860,6 +2860,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       'if (import.meta.vitest) test("works", () => expect(value()).toBe(1));\n',
     );
     await writeFile(
+      path.join(repo, "src/check.py"),
+      "def test_value():\n    assert value == 1\n",
+    );
+    await writeFile(
       path.join(repo, "src/__snapshots__/Widget.snap"),
       "exports[`Widget 1`] = `expected`;\n",
     );
@@ -2883,7 +2887,12 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     await writeFile(
       path.join(repo, ".github/actions/check/action.yml"),
-      "runs:\n  using: composite\n  steps:\n    - run: npm test\n      shell: bash\n",
+      "runs:\n  using: node20\n  main: dist/index.js\n",
+    );
+    await mkdir(path.join(repo, ".github/actions/check/dist"), { recursive: true });
+    await writeFile(
+      path.join(repo, ".github/actions/check/dist/index.js"),
+      "process.exit(require('child_process').spawnSync('npm', ['test'], { stdio: 'inherit' }).status ?? 1);\n",
     );
     for (const moduleName of ["adapters", "config", "ledger", "policy"]) {
       await writeFile(
@@ -2925,6 +2934,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "src/concurrent.js",
       "src/assertions.js",
       "src/prefixed.js",
+      "src/check.py",
       "src/__snapshots__/Widget.snap",
       "testdata/expected.json",
       "t/widget.t",
@@ -2933,6 +2943,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "src/widget.spec.ts",
       "Tests/branch-regression.ts",
       ".github/actions/check/action.yml",
+      ".github/actions/check/dist/index.js",
       ".github/workflows/ci.yml",
       "bin/orca-no-mistakes",
       "scripts/adapters.ts",
@@ -3065,6 +3076,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       ".circleci/config.yml",
       ".forgejo/workflows/ci.yml",
       ".github/actions/check/action.yml",
+      ".github/actions/check/dist/index.js",
       ".github/workflows/ci.yml",
       ".gitlab-ci.yml",
       ".travis.yml",
@@ -3221,6 +3233,18 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await assert.rejects(
       assertWorkerChangesAllowed(),
       /fixer modified co-located test assertions or skip markers: src\/prefixed\.js/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/check.py"),
+      "def test_value():\n    assert value == 2\n",
+    );
+    git(worker, "add", "src/check.py");
+    git(worker, "commit", "-m", "weaken Python inline assertion");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified co-located test assertions or skip markers: src\/check\.py/,
     );
 
     git(worker, "reset", "--hard", featureHead);
