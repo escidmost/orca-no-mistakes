@@ -3858,7 +3858,10 @@ function shellCommandReferencesTarget(
     if (!directory || directory === ".") return false;
     const escaped = directory.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const composed = command.match(
-      new RegExp(`\\bcd\\s+["']?(?:\\./)?${escaped}/?["']?\\s*(?:&&|;)[^\\n]*`, "m"),
+      new RegExp(
+        `\\bcd\\s+["']?(?:\\./)?${escaped}/?["']?\\s*(?:(?:&&|;)\\s*|\\r?\\n\\s*)[^\\n]*`,
+        "m",
+      ),
     );
     return composed !== null && containsPathReference(composed[0], basename);
   });

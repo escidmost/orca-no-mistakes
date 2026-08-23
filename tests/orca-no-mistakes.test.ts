@@ -2930,7 +2930,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     await writeFile(
       path.join(repo, ".github/workflows/ci.yml"),
-      "- uses: ./\n- uses: ./.github/actions/check\n- uses: ./ci/check\n- run: ./check.sh\n  working-directory: commands\n- run: ./lint.sh\n  working-directory: other\n- run: cd shell-commands && ./check.sh\n",
+      "- uses: ./\n- uses: ./.github/actions/check\n- uses: ./ci/check\n- run: ./check.sh\n  working-directory: commands\n- run: ./lint.sh\n  working-directory: other\n- run: |\n    cd shell-commands\n    ./check.sh\n",
     );
     await writeFile(
       path.join(repo, "action.yml"),
