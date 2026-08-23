@@ -3,7 +3,7 @@ import type { AgentArgsOverride } from './config.ts'
 export type LaunchMode = 'acp' | 'cli' | 'native'
 
 export const NATIVE_HARNESSES = ['cursor'] as const
-export const CLI_HARNESSES = ['claude', 'codex', 'gemini', 'grok', 'opencode'] as const
+export const CLI_HARNESSES = ['claude', 'codex', 'gemini', 'grok', 'kimi', 'opencode'] as const
 const KNOWN_HARNESSES = new Set<string>([
   ...NATIVE_HARNESSES,
   ...CLI_HARNESSES,
@@ -175,6 +175,7 @@ const RESERVED_HARNESS_ARGS: Record<string, ReadonlySet<string>> = {
     '-p',
     '-s',
   ]),
+  kimi: new Set(['--auto', '--plan', '--prompt', '--yolo', '-p']),
 }
 const RESERVED_CONFIG_KEYS: Record<string, ReadonlySet<string>> = {
   codex: new Set(['approval_policy', 'sandbox_mode', 'sandbox_permissions']),
@@ -183,6 +184,7 @@ const REQUIRED_HARNESS_ARGS: Record<string, readonly string[]> = {
   agy: ['--dangerously-skip-permissions'],
   claude: ['--dangerously-skip-permissions'],
   codex: ['--dangerously-bypass-approvals-and-sandbox'],
+  kimi: ['--auto'],
 }
 
 const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
@@ -209,9 +211,9 @@ export function buildCliCommand(harness: string, options: CliAgentCommandOptions
     }
   }
   const raw = Array.isArray(override) ? override : []
-  if (normalizedHarness === 'agy' && raw.includes('--')) {
+  if ((normalizedHarness === 'agy' || normalizedHarness === 'kimi') && raw.includes('--')) {
     throw new Error(
-      "agent agy: option terminator '--' cannot precede the managed prompt carrier"
+      `agent ${normalizedHarness}: option terminator '--' cannot precede the managed prompt carrier`
     )
   }
   const effortKnob = EFFORT_KNOBS[normalizedHarness]

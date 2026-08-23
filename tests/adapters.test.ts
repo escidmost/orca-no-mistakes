@@ -24,6 +24,7 @@ test('classifyHarness routes native, CLI, and ACP harnesses', () => {
   assert.equal(classifyHarness('opencode'), 'cli')
   assert.equal(classifyHarness('grok'), 'cli')
   assert.equal(classifyHarness('gemini'), 'cli')
+  assert.equal(classifyHarness('Kimi'), 'cli')
   assert.equal(classifyHarness('future-cli-agent'), 'cli')
   assert.equal(classifyHarness('acp:gemini-dev'), 'acp')
   assert.equal(classifyHarness('ACP:gemini-dev'), 'acp')
@@ -115,6 +116,10 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
   assert.equal(buildCliCommand('grok', { model: 'grok-4', variant: 'high' }), `'grok' '--model' 'grok-4'`)
   assert.equal(buildCliCommand('gemini', { model: 'gemini-3-pro' }), `'gemini' '--model' 'gemini-3-pro'`)
   assert.equal(
+    buildCliCommand('Kimi', { model: 'kimi-k2.5' }),
+    `'kimi' '--model' 'kimi-k2.5' '--auto'`
+  )
+  assert.equal(
     buildCliCommand('claude', { effort: 'high', model: 'opus[1m]' }),
     `'claude' '--model' 'opus[1m]' '--effort' 'high' '--dangerously-skip-permissions'`
   )
@@ -183,6 +188,7 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
     ['codex', ['-aon-request']],
     ['codex', ['-pdefault']],
     ['codex', ['-csandbox_mode="read-only"']],
+    ['kimi', ['--prompt', 'raw']],
   ] as const) {
     assert.throws(
       () =>
@@ -192,6 +198,13 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
       /reserved (?:argument|config)/,
     )
   }
+  assert.throws(
+    () =>
+      buildCliCommand('kimi', {
+        agentArgsOverride: { kimi: ['--'] } as never,
+      }),
+    /managed prompt carrier/,
+  )
   for (const [harness, required] of [
     ['claude', '--dangerously-skip-permissions'],
     ['codex', '--dangerously-bypass-approvals-and-sandbox']

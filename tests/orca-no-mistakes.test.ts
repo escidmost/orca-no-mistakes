@@ -4690,6 +4690,93 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
   }
 });
 
+test("CliOrca launches Kimi noninteractively with its protected task artifact", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-kimi-shell-"));
+  const fakeOrca = path.join(temp, "orca");
+  const callsPath = path.join(temp, "calls.jsonl");
+  const previousHome = process.env.HOME;
+  const evidence = path.join(
+    temp,
+    ".orca-no-mistakes",
+    "artifacts",
+    "kimi-shell-run",
+  );
+  const reportPath = path.join(evidence, "test.json");
+  process.env.HOME = temp;
+  try {
+    await mkdir(evidence, { recursive: true });
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+const out = (result) => console.log(JSON.stringify({ result }))
+if (args[0] === 'orchestration' && args[1] === 'run-create') {
+  out({ run: { id: 'kimi-shell-run' } })
+} else if (args[0] === 'terminal' && args[1] === 'create') {
+  out({ terminal: { handle: 'kimi-shell' } })
+} else if (args[0] === 'terminal' && args[1] === 'send') {
+  out({ accepted: true })
+} else if (args[0] === 'terminal' && args[1] === 'show') {
+  out({ terminal: { connected: true, lastOutputAt: 1, title: 'feature' } })
+} else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
+  if (args.includes('--inject')) {
+    process.stderr.write('Kimi dispatch must not use Orca prompt injection')
+    process.exit(1)
+  }
+  out({ dispatch: { id: 'dispatch-kimi', status: 'dispatched' }, injected: false, preamble: 'authenticated' })
+} else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
+  fs.writeFileSync(${JSON.stringify(reportPath)}, JSON.stringify({ findings: [], summary: 'kimi tested' }))
+  out({ deliveryId: 'delivery-kimi', messages: [{ type: 'worker_done', body: 'Tested.', payload: JSON.stringify({ taskId: 'task-kimi', dispatchId: 'dispatch-kimi', outcome: 'succeeded' }) }] })
+} else {
+  out({ ok: true })
+}
+`,
+    );
+    await chmod(fakeOrca, 0o755);
+    const orca = new CliOrca({ command: fakeOrca, cwd: temp });
+    await orca.createRun("kimi local launch test");
+
+    const worker = await orca.startWorker("task-kimi", {
+      agent: { harness: "Kimi", model: "kimi-k2.5" },
+      name: "kimi-tester",
+      prompt: "test instructions",
+      reportPath,
+      role: "reviewer",
+      stage: "test",
+      worktree: "current",
+    });
+
+    const calls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    const dispatch = calls.find((args) => args[1] === "dispatch");
+    assert.ok(dispatch && !dispatch.includes("--inject"));
+    assert.equal(
+      calls.filter(
+        (args) => args[0] === "terminal" && args[1] === "show",
+      ).length,
+      1,
+      "Kimi uses terminal show only for worker liveness, not TUI readiness",
+    );
+    const send = calls.find(
+      (args) => args[0] === "terminal" && args[1] === "send",
+    );
+    const startupCommand = send?.[send.indexOf("--text") + 1] ?? "";
+    assert.match(
+      startupCommand,
+      /^'kimi' '--model' 'kimi-k2\.5' '--auto' --prompt 'Read and follow the complete authenticated task in .*prompt-[^']+\.txt'$/,
+    );
+    assert.equal(worker.report.summary, "kimi tested");
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test("CliOrca preserves initial dispatch failures and closes the terminal", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-dispatch-failure-"));
   const fakeOrca = path.join(temp, "orca");

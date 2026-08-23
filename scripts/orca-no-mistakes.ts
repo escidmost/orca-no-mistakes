@@ -2088,7 +2088,12 @@ function workerShellStartupDelayMs(): number {
 }
 
 function launchesWithPreamble(harness: string | undefined): boolean {
-  return harness === "agy" || harness === "claude" || harness === "codex";
+  return (
+    harness === "agy" ||
+    harness === "claude" ||
+    harness === "codex" ||
+    harness === "kimi"
+  );
 }
 
 type PreparedWorker = {
@@ -2729,7 +2734,9 @@ export class CliOrca implements OrcaOperations {
         launchCommand +=
           normalizedHarness === "agy"
             ? ` --prompt-interactive ${instruction}`
-            : ` ${instruction}`;
+            : normalizedHarness === "kimi"
+              ? ` --prompt ${instruction}`
+              : ` ${instruction}`;
       }
       const shellStartupDelayMs = workerShellStartupDelayMs();
       if (shellStartupDelayMs > 0) {
@@ -2747,11 +2754,13 @@ export class CliOrca implements OrcaOperations {
         "--enter",
         "--json",
       ]);
-      await this.#waitForWorkerAgent(
-        terminalHandle,
-        harness,
-        initialPrompt !== undefined,
-      );
+      if (!(normalizedHarness === "kimi" && initialPrompt !== undefined)) {
+        await this.#waitForWorkerAgent(
+          terminalHandle,
+          harness,
+          initialPrompt !== undefined,
+        );
+      }
       return promptPath;
     } catch (error) {
       if (promptPath) await rm(promptPath, { force: true });
