@@ -3828,6 +3828,25 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
   );
 }
 
+function containsValidationPathReference(
+  source: string,
+  policyPath: string,
+  targetPath: string,
+): boolean {
+  const references = new Set([
+    targetPath,
+    path.posix.relative(path.posix.dirname(policyPath), targetPath),
+  ]);
+  return [...references].some((reference) => {
+    if (!reference || reference === ".") return false;
+    const escaped = reference.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(
+      `(?:^|[^A-Za-z0-9_./-])(?:\\./)?${escaped}(?=$|[^A-Za-z0-9_./-])`,
+      "m",
+    ).test(source);
+  });
+}
+
 type GitShellOptions = { base?: string; expectedHead?: string; repo: string };
 
 export class GitShell implements GitOperations {
@@ -4040,24 +4059,44 @@ export class GitShell implements GitOperations {
       }
     }
     if (validationEntrypoints.length > 0) {
-      for (const entrypointPath of validationEntrypoints) {
-        const references = await this.#git(
-          ["grep", "-l", "-F", "-z", "-e", entrypointPath, expectedHead, "--"],
-          true,
-        );
-        if (references.failed && references.output.trim()) {
-          throw new Error(
-            `could not inspect validation policy references: ${references.output}`,
-          );
+      const tracked = await this.#git([
+        "ls-tree",
+        "-r",
+        "--name-only",
+        "-z",
+        expectedHead,
+      ]);
+      const trackedPaths = tracked.stdout.split("\0").filter(Boolean);
+      const trackedPathSet = new Set(trackedPaths);
+      const policySources = new Map<string, string>();
+      for (const policyPath of trackedPaths.filter(isProtectedValidationPolicyPath)) {
+        const source = await this.showFile(expectedHead, policyPath);
+        if (source === undefined) {
+          throw new Error(`could not read pre-round validation policy ${policyPath}`);
         }
-        const prefix = `${expectedHead}:`;
+        policySources.set(policyPath, source);
+      }
+      for (const entrypointPath of validationEntrypoints) {
+        const targets = new Set([entrypointPath]);
+        let directory = path.posix.dirname(entrypointPath);
+        while (directory !== ".") {
+          if (
+            trackedPathSet.has(`${directory}/action.yml`) ||
+            trackedPathSet.has(`${directory}/action.yaml`)
+          ) {
+            targets.add(directory);
+            break;
+          }
+          const parent = path.posix.dirname(directory);
+          if (parent === directory) break;
+          directory = parent;
+        }
         if (
-          references.stdout
-            .split("\0")
-            .map((value) =>
-              value.startsWith(prefix) ? value.slice(prefix.length) : value,
-            )
-            .some(isProtectedValidationPolicyPath)
+          [...policySources].some(([policyPath, source]) =>
+            [...targets].some((targetPath) =>
+              containsValidationPathReference(source, policyPath, targetPath),
+            ),
+          )
         ) {
           protectedPolicy.push(entrypointPath);
         }

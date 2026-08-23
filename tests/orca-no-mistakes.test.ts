@@ -2876,6 +2876,8 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await mkdir(path.join(repo, "bin"));
     await mkdir(path.join(repo, ".github/workflows"), { recursive: true });
     await mkdir(path.join(repo, ".github/actions/check"), { recursive: true });
+    await mkdir(path.join(repo, "ci/check"), { recursive: true });
+    await mkdir(path.join(repo, "tools"));
     await writeFile(path.join(repo, "bin/orca-no-mistakes"), entrypointSource);
     await writeFile(
       path.join(repo, "scripts/orca-no-mistakes.ts"),
@@ -2883,7 +2885,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     await writeFile(
       path.join(repo, ".github/workflows/ci.yml"),
-      "- uses: ./.github/actions/check\n",
+      "- uses: ./.github/actions/check\n- uses: ./ci/check\n",
     );
     await writeFile(
       path.join(repo, ".github/actions/check/action.yml"),
@@ -2894,6 +2896,16 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       path.join(repo, ".github/actions/check/dist/index.js"),
       "process.exit(require('child_process').spawnSync('npm', ['test'], { stdio: 'inherit' }).status ?? 1);\n",
     );
+    await writeFile(
+      path.join(repo, "ci/check/action.yml"),
+      "runs:\n  using: composite\n  steps:\n    - shell: bash\n      run: ./run.sh\n",
+    );
+    await writeFile(path.join(repo, "ci/check/run.sh"), "npm test\n");
+    await writeFile(
+      path.join(repo, "tools/package.json"),
+      '{"scripts":{"test":"./verify.sh"}}\n',
+    );
+    await writeFile(path.join(repo, "tools/verify.sh"), "npm test\n");
     for (const moduleName of ["adapters", "config", "ledger", "policy"]) {
       await writeFile(
         path.join(repo, `scripts/${moduleName}.ts`),
@@ -2945,12 +2957,16 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       ".github/actions/check/action.yml",
       ".github/actions/check/dist/index.js",
       ".github/workflows/ci.yml",
+      "ci/check/action.yml",
+      "ci/check/run.sh",
       "bin/orca-no-mistakes",
       "scripts/adapters.ts",
       "scripts/config.ts",
       "scripts/ledger.ts",
       "scripts/orca-no-mistakes.ts",
       "scripts/policy.ts",
+      "tools/package.json",
+      "tools/verify.sh",
     );
     git(repo, "commit", "-m", "feature");
     const featureHead = git(repo, "rev-parse", "HEAD");
@@ -3157,6 +3173,30 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await assert.rejects(
       assertWorkerChangesAllowed(),
       /protected validation policy files: scripts\/verify-ci\.sh/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "ci/check/action.yml"), "runs: { using: composite, steps: [] }\n");
+    await writeFile(path.join(worker, "ci/check/run.sh"), "exit 0\n");
+    git(worker, "add", "ci/check/action.yml", "ci/check/run.sh");
+    git(worker, "commit", "-m", "disable referenced local action");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /ci\/check\/action\.yml/);
+        assert.match(error.message, /ci\/check\/run\.sh/);
+        return true;
+      },
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "tools/verify.sh"), "exit 0\n");
+    git(worker, "add", "tools/verify.sh");
+    git(worker, "commit", "-m", "disable manifest-relative validation entrypoint");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /protected validation policy files: tools\/verify\.sh/,
     );
 
     git(worker, "reset", "--hard", featureHead);
