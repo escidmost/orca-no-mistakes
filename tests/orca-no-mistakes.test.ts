@@ -123,10 +123,9 @@ class FakeGit implements GitOperations {
 
   async assertFixerChangesAllowed(
     sourcePath: string,
-    baseOid: string,
     expectedHead: string,
   ): Promise<void> {
-    this.calls.push(`guard:${sourcePath}:${baseOid}:${expectedHead}`);
+    this.calls.push(`guard:${sourcePath}:${expectedHead}`);
     if (this.protectedTestMutation) {
       throw new Error(
         `fixer modified pre-existing test files: ${this.protectedTestMutation}`,
@@ -2179,10 +2178,13 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     git(repo, "add", "Tests/existing.ts");
     git(repo, "commit", "-m", "base test");
-    const baseOid = git(repo, "rev-parse", "HEAD");
     git(repo, "checkout", "-b", "feature");
     await writeFile(path.join(repo, "feature.ts"), "export const value = 1;\n");
-    git(repo, "add", "feature.ts");
+    await writeFile(
+      path.join(repo, "Tests/branch-regression.ts"),
+      'assert.equal(value, 1);\n',
+    );
+    git(repo, "add", "feature.ts", "Tests/branch-regression.ts");
     git(repo, "commit", "-m", "feature");
     const featureHead = git(repo, "rev-parse", "HEAD");
     git(repo, "worktree", "add", "--detach", worker, featureHead);
@@ -2195,19 +2197,28 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "commit", "-m", "weaken test");
     const shell = new GitShell({ repo });
     await assert.rejects(
-      shell.assertFixerChangesAllowed(worker, baseOid, featureHead),
+      shell.assertFixerChangesAllowed(worker, featureHead),
       /fixer modified pre-existing test files: Tests\/existing\.ts/,
     );
 
     git(worker, "reset", "--hard", featureHead);
+    git(worker, "rm", "Tests/branch-regression.ts");
+    git(worker, "commit", "-m", "remove branch regression test");
+    await assert.rejects(
+      shell.assertFixerChangesAllowed(worker, featureHead),
+      /fixer modified pre-existing test files: Tests\/branch-regression\.ts/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
     await writeFile(path.join(worker, "eslint.config.js"), "export default [];\n");
+    await writeFile(path.join(worker, "package.json"), '{"scripts":{"test":"true"}}\n');
     await mkdir(path.join(worker, "prompts"));
     await writeFile(path.join(worker, "prompts/fixer.md"), "weaken checks\n");
-    git(worker, "add", "eslint.config.js", "prompts/fixer.md");
+    git(worker, "add", "eslint.config.js", "package.json", "prompts/fixer.md");
     git(worker, "commit", "-m", "weaken validation policy");
     await assert.rejects(
-      shell.assertFixerChangesAllowed(worker, baseOid, featureHead),
-      /unexplained-policy-relaxation:.*eslint\.config\.js, prompts\/fixer\.md/,
+      shell.assertFixerChangesAllowed(worker, featureHead),
+      /unexplained-policy-relaxation:.*eslint\.config\.js, package\.json, prompts\/fixer\.md/,
     );
 
     git(worker, "reset", "--hard", featureHead);
@@ -2217,7 +2228,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     git(worker, "add", "Tests/new-regression.ts");
     git(worker, "commit", "-m", "add regression test");
-    await shell.assertFixerChangesAllowed(worker, baseOid, featureHead);
+    await shell.assertFixerChangesAllowed(worker, featureHead);
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
@@ -2855,14 +2866,16 @@ test("CliOrca waits for a hidden fish shell before launching Claude", async () =
   const fakeOrca = path.join(temp, "orca");
   const callsPath = path.join(temp, "calls.jsonl");
   const evidence = path.join(
-    homedir(),
+    temp,
     ".orca-no-mistakes",
     "artifacts",
     "claude-shell-run",
   );
   const reportPath = path.join(evidence, "review.json");
   const previousDelay = process.env.WORKER_SHELL_STARTUP_DELAY_MS;
+  const previousHome = process.env.HOME;
   process.env.WORKER_SHELL_STARTUP_DELAY_MS = "80";
+  process.env.HOME = temp;
   try {
     git(temp, "init", "-b", "feature");
     await mkdir(evidence, { recursive: true });
@@ -2938,12 +2951,20 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     );
     assert.ok(dispatch && !dispatch.args.includes("--inject"));
     assert.equal(worker.report.summary, "claude reviewed");
+    await assert.rejects(
+      readFile(
+        path.join(temp, ".gemini", "antigravity-cli", "settings.json"),
+        "utf8",
+      ),
+      { code: "ENOENT" },
+    );
   } finally {
     if (previousDelay === undefined)
       delete process.env.WORKER_SHELL_STARTUP_DELAY_MS;
     else process.env.WORKER_SHELL_STARTUP_DELAY_MS = previousDelay;
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
     await rm(temp, { recursive: true, force: true });
-    await rm(evidence, { recursive: true, force: true });
   }
 });
 
@@ -5392,6 +5413,7 @@ test("resolved role timeout_ms bounds reviewer execution", async () => {
 test("a timed-out fixer never applies commits after the run fails", async () => {
   const git = new FakeGit();
   allowReviewAutoFix(git);
+  const fixerSettled = Promise.withResolvers<void>();
   class SlowFixerOrca extends FakeOrca {
     async startWorker(
       taskId: string,
@@ -5401,6 +5423,16 @@ test("a timed-out fixer never applies commits after the run fails", async () => 
         await new Promise((resolve) => setTimeout(resolve, 75));
       }
       return super.startWorker(taskId, launch);
+    }
+
+    override async finishWorker(
+      worker: WorkerResult,
+      disposition: "release" | "retain",
+    ): Promise<void> {
+      await super.finishWorker(worker, disposition);
+      if (this.fixerDispatches.includes(worker.dispatchId)) {
+        fixerSettled.resolve();
+      }
     }
   }
   const orca = new SlowFixerOrca(git);
@@ -5431,6 +5463,7 @@ test("a timed-out fixer never applies commits after the run fails", async () => 
     ),
     /review fixer exceeded its 10ms execution timeout/,
   );
+  await fixerSettled.promise;
   assert.equal(
     git.calls.filter((call) => call.startsWith("apply:")).length,
     0,

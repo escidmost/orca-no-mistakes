@@ -162,7 +162,6 @@ export interface GitOperations {
   assertClean(): Promise<void>;
   assertFixerChangesAllowed(
     sourcePath: string,
-    baseOid: string,
     expectedHead: string,
   ): Promise<void>;
   head(): Promise<string>;
@@ -629,7 +628,6 @@ export async function runPipeline(
               targetFindings,
               guidance,
               path.join(artifactsDir, `fixer-${stage}-${round}.json`),
-              baseCommitOid,
               fixerRoles,
               orca,
               git,
@@ -1072,7 +1070,6 @@ async function runFixer(
   findings: Finding[],
   guidance: string,
   reportPath: string,
-  baseCommitOid: string,
   role: ResolvedRoleConfig,
   orca: OrcaOperations,
   git: GitOperations,
@@ -1133,7 +1130,7 @@ async function runFixer(
     if (before === workerHead) {
       throw new Error(`${stage} fixer did not commit a change`);
     }
-    await git.assertFixerChangesAllowed(worktreePath, baseCommitOid, before);
+    await git.assertFixerChangesAllowed(worktreePath, before);
     if (fence.aborted) {
       // The execution timeout already failed this stage; refuse late mutations
       // so a delayed worker cannot apply commits into a settled run.
@@ -2024,7 +2021,7 @@ export class CliOrca implements OrcaOperations {
         "unclassified",
         "worker preparation returned no terminal handle",
       );
-    if (directPreamble) {
+    if (harness === "agy") {
       try {
         await this.#trustAgyWorkspace(prepared?.worktreePath ?? this.#cwd);
       } catch (error) {
@@ -2089,7 +2086,7 @@ export class CliOrca implements OrcaOperations {
     let promptPath: string | undefined;
     if (directPreamble) {
       try {
-        if (directPreamble && launchWithPreamble) {
+        if (launchWithPreamble) {
           promptPath = await this.#launchWorkerAgent(
             terminalHandle,
             launch,
@@ -3358,6 +3355,15 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
   const fileName = parts.at(-1) ?? "";
   return (
     normalized === ".orca/no-mistakes.yaml" ||
+    [
+      "cargo.toml",
+      "justfile",
+      "makefile",
+      "package.json",
+      "pyproject.toml",
+      "setup.cfg",
+      "tox.ini",
+    ].includes(fileName) ||
     parts.slice(0, -1).includes("prompts") ||
     /(?:^|[._-])prompts?(?:[._-]|$)/.test(fileName) ||
     /^(?:eslint\.config\..+|\.eslintrc(?:\..+)?|prettier\.config\..+|\.prettierrc(?:\..+)?|biome\.jsonc?|deno\.jsonc?|\.editorconfig|\.flake8|\.?ruff\.toml|\.?mypy\.ini|\.pylintrc|pyrightconfig\.json|\.rubocop\.ya?ml|stylelint\.config\..+|\.stylelintrc(?:\..+)?|\.?markdownlint(?:-cli2)?(?:\..+)?|\.golangci\.(?:ya?ml|toml|json)|\.?rustfmt\.toml|\.?clippy\.toml|\.clang-tidy|analysis_options\.yaml|checkstyle\.xml|detekt\.ya?ml|phpcs\.xml(?:\.dist)?|phpstan(?:\.[^.]+)?\.neon(?:\.dist)?|sonar-project\.properties|tsconfig(?:\.[^.]+)*\.json)$/.test(
@@ -3432,7 +3438,6 @@ export class GitShell implements GitOperations {
 
   async assertFixerChangesAllowed(
     sourcePath: string,
-    baseOid: string,
     expectedHead: string,
   ): Promise<void> {
     const sourceHead = await this.headOf(sourcePath);
@@ -3455,7 +3460,7 @@ export class GitShell implements GitOperations {
     const protectedTests: string[] = [];
     const protectedPolicy: string[] = [];
     for (const filePath of changed.stdout.split("\0").filter(Boolean)) {
-      if (isTestPath(filePath) && (await this.pathExists(baseOid, filePath))) {
+      if (isTestPath(filePath) && (await this.pathExists(expectedHead, filePath))) {
         protectedTests.push(filePath);
       }
       if (isProtectedValidationPolicyPath(filePath)) {
