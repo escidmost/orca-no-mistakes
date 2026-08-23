@@ -2708,9 +2708,12 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "reset", "--hard", featureHead);
     await writeFile(path.join(worker, "eslint.config.js"), "export default [];\n");
     await writeFile(path.join(worker, ".mocharc.json"), '{"spec":[]}\n');
+    await writeFile(path.join(worker, "Cargo.lock"), "# changed lockfile\n");
     await writeFile(path.join(worker, "build.gradle"), "test { enabled = false }\n");
     await writeFile(path.join(worker, "build.gradle.kts"), "tasks.test { enabled = false }\n");
     await writeFile(path.join(worker, "package.json"), '{"scripts":{"test":"true"}}\n');
+    await writeFile(path.join(worker, "package-lock.json"), '{"lockfileVersion":3}\n');
+    await writeFile(path.join(worker, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
     await writeFile(path.join(worker, "pom.xml"), "<skipTests>true</skipTests>\n");
     await writeFile(path.join(worker, "pytest.ini"), "[pytest]\naddopts = --ignore=Tests\n");
     await writeFile(
@@ -2720,28 +2723,33 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(worker, "tslint.build.json"), '{"rules":{}}\n');
     await writeFile(path.join(worker, "tslint.json"), '{"rules":{}}\n');
     await writeFile(path.join(worker, "vitest.config.ts"), "export default { test: { exclude: ['Tests/**'] } };\n");
+    await writeFile(path.join(worker, "yarn.lock"), "# changed lockfile\n");
     await mkdir(path.join(worker, "prompts"));
     await writeFile(path.join(worker, "prompts/fixer.md"), "weaken checks\n");
     git(
       worker,
       "add",
       ".mocharc.json",
+      "Cargo.lock",
       "build.gradle",
       "build.gradle.kts",
       "cypress.config.ts",
       "eslint.config.js",
+      "package-lock.json",
       "package.json",
+      "pnpm-lock.yaml",
       "pom.xml",
       "prompts/fixer.md",
       "pytest.ini",
       "tslint.build.json",
       "tslint.json",
       "vitest.config.ts",
+      "yarn.lock",
     );
     git(worker, "commit", "-m", "weaken validation policy");
     await assert.rejects(
       assertWorkerChangesAllowed(),
-      /unexplained-policy-relaxation:.*\.mocharc\.json, build\.gradle, build\.gradle\.kts, cypress\.config\.ts, eslint\.config\.js, package\.json, pom\.xml, prompts\/fixer\.md, pytest\.ini, tslint\.build\.json, tslint\.json, vitest\.config\.ts/,
+      /unexplained-policy-relaxation:.*\.mocharc\.json, Cargo\.lock, build\.gradle, build\.gradle\.kts, cypress\.config\.ts, eslint\.config\.js, package-lock\.json, package\.json, pnpm-lock\.yaml, pom\.xml, prompts\/fixer\.md, pytest\.ini, tslint\.build\.json, tslint\.json, vitest\.config\.ts, yarn\.lock/,
     );
 
     git(worker, "reset", "--hard", featureHead);
@@ -3789,6 +3797,7 @@ test("CliOrca waits for a hidden fish shell before launching Claude", async () =
   const fakeOrca = path.join(temp, "orca");
   const callsPath = path.join(temp, "calls.jsonl");
   const failPreamblePath = path.join(temp, "fail-preamble");
+  const shellReturnedPath = path.join(temp, "shell-returned");
   const evidence = path.join(
     temp,
     ".orca-no-mistakes",
@@ -3822,7 +3831,9 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
   }
   out({ accepted: true })
 } else if (args[0] === 'terminal' && args[1] === 'show') {
-  out({ terminal: { connected: true, title: 'Claude CLI', preview: 'ready' } })
+  out(fs.existsSync(${JSON.stringify(shellReturnedPath)})
+    ? { terminal: { connected: true, title: 'feature', preview: '$', writable: true } }
+    : { terminal: { connected: true, title: 'Claude CLI', preview: 'ready', writable: true } })
 } else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
   out({ dispatch: { id: 'dispatch-claude', status: 'dispatched' }, injected: false, preamble: 'authenticated' })
 } else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
@@ -3880,6 +3891,37 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     );
     assert.ok(dispatch && !dispatch.args.includes("--inject"));
     assert.equal(worker.report.summary, "claude reviewed");
+    await writeFile(shellReturnedPath, "shell\n");
+    const callsBeforeLivenessCheck = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n").length;
+    await assert.rejects(
+      orca.startWorker("task-claude-shell", {
+        agent: { effort: "high", harness: "claude", model: "opus[1m]" },
+        name: "claude-reviewer",
+        prompt: "follow-up review instructions",
+        role: "reviewer",
+        stage: "review",
+        terminal: worker.terminalHandle,
+        worktree: "current",
+      }),
+      (error: unknown) =>
+        error instanceof PreflightError &&
+        error.message.includes(
+          "retained claude terminal no longer appears to run claude",
+        ),
+    );
+    const livenessCalls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .slice(callsBeforeLivenessCheck)
+      .map((line) => (JSON.parse(line) as { args: string[] }).args);
+    assert.deepEqual(
+      livenessCalls.map((args) => args.slice(0, 2)),
+      [["terminal", "show"]],
+      "stale retained agents fail before dispatch or terminal input",
+    );
+    await rm(shellReturnedPath, { force: true });
     await writeFile(failPreamblePath, "fail\n");
     await assert.rejects(
       orca.startWorker("task-claude-retained", {

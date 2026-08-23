@@ -2119,7 +2119,9 @@ export class CliOrca implements OrcaOperations {
     if (launch.agent && classifyHarness(launch.agent.harness) === "acp") {
       return await this.#startAcpWorker(taskId, launch);
     }
-    const harness = launch.agent?.harness.toLowerCase();
+    const harness = (
+      launch.agent?.harness ?? DEFAULT_WORKER_AGENT
+    ).toLowerCase();
     const directPreamble = launchesWithPreamble(harness);
     const launchWithPreamble = directPreamble && !launch.terminal;
     const prepared = launch.terminal
@@ -2131,6 +2133,8 @@ export class CliOrca implements OrcaOperations {
         "unclassified",
         "worker preparation returned no terminal handle",
       );
+    if (launch.terminal)
+      await this.#assertRetainedWorkerAgent(terminalHandle, harness);
     if (harness === "agy") {
       try {
         await this.#trustAgyWorkspace(prepared?.worktreePath ?? this.#cwd);
@@ -2582,6 +2586,46 @@ export class CliOrca implements OrcaOperations {
     const promptPath = path.join(promptDir, `prompt-${randomUUID()}.txt`);
     await writeFile(promptPath, prompt, { mode: 0o600 });
     return promptPath;
+  }
+
+  async #assertRetainedWorkerAgent(
+    terminalHandle: string,
+    harness: string,
+  ): Promise<void> {
+    let shown: {
+      terminal: {
+        connected?: boolean;
+        preview?: string | null;
+        title?: string | null;
+        writable?: boolean;
+      };
+    };
+    try {
+      shown = await this.#json([
+        "terminal",
+        "show",
+        "--terminal",
+        terminalHandle,
+        "--json",
+      ]);
+    } catch (error) {
+      throw new PreflightError(
+        classifyPreflightFailure(String(error)),
+        `retained ${harness} terminal liveness check failed: ${String(error)}`,
+        { cause: error },
+      );
+    }
+    const terminal = shown.terminal;
+    if (
+      terminal.connected === false ||
+      terminal.writable === false ||
+      !readinessMatcher(harness)(terminal)
+    ) {
+      throw new PreflightError(
+        "readiness-timeout",
+        `retained ${harness} terminal no longer appears to run ${harness}`,
+      );
+    }
   }
 
   async #trustAgyWorkspace(worktreePath: string): Promise<void> {
@@ -3545,15 +3589,29 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "cargo.toml",
       "build.gradle",
       "build.gradle.kts",
+      "bun.lock",
+      "bun.lockb",
+      "cargo.lock",
+      "composer.lock",
       "conftest.py",
+      "gemfile.lock",
+      "go.sum",
       "justfile",
       "makefile",
+      "npm-shrinkwrap.json",
+      "package-lock.json",
       "package.json",
+      "packages.lock.json",
+      "pipfile.lock",
+      "pnpm-lock.yaml",
       "pom.xml",
+      "poetry.lock",
       "pyproject.toml",
       "pytest.ini",
       "setup.cfg",
       "tox.ini",
+      "uv.lock",
+      "yarn.lock",
     ].includes(fileName) ||
     (parts[0] !== "docs" && parts.slice(0, -1).includes("prompts")) ||
     /^(?:(?:vitest|jest|playwright|cypress)\.config\..+|\.mocharc(?:\..+)?|karma\.conf\..+|eslint\.config\..+|\.eslintrc(?:\..+)?|prettier\.config\..+|\.prettierrc(?:\..+)?|biome\.jsonc?|deno\.jsonc?|\.editorconfig|\.flake8|\.?ruff\.toml|\.?mypy\.ini|\.pylintrc|pyrightconfig\.json|\.rubocop\.ya?ml|stylelint\.config\..+|\.stylelintrc(?:\..+)?|\.?markdownlint(?:-cli2)?(?:\..+)?|\.golangci\.(?:ya?ml|toml|json)|\.?rustfmt\.toml|\.?clippy\.toml|\.clang-tidy|analysis_options\.yaml|checkstyle\.xml|detekt\.ya?ml|phpcs\.xml(?:\.dist)?|phpstan(?:\.[^.]+)?\.neon(?:\.dist)?|sonar-project\.properties|tsconfig(?:\.[^.]+)*\.json|tslint(?:\.[^.]+)*\.json)$/.test(
