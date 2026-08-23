@@ -1290,14 +1290,18 @@ async function runFixer(
   let retainWorker = false;
   let strictCleanup = false;
   try {
-    await validateReport(worker.report, stage, path.dirname(reportPath));
+    const validatedReport = await validateFixerReport(
+      worker.report,
+      stage,
+      path.dirname(reportPath),
+    );
     if (!worktreePath) {
       throw new Error(`${stage} fixer did not return a worktree path`);
     }
     workerHead = await git.headOf(worktreePath);
     if (before === workerHead) {
       strictCleanup = true;
-      throw new FixerNoChangeError(worker.report, stage);
+      throw new FixerNoChangeError(validatedReport, stage);
     }
     try {
       await git.assertFixerChangesAllowed(
@@ -1487,6 +1491,17 @@ async function validateReport(
     }
   }
   return normalizedReport;
+}
+
+async function validateFixerReport(
+  report: StageReport,
+  stage: StageName,
+  evidenceRoot: string,
+): Promise<StageReport> {
+  if (!Array.isArray(report?.findings)) {
+    throw new Error(`${stage} fixer returned an invalid report`);
+  }
+  return validateReport({ ...report, findings: [] }, stage, evidenceRoot);
 }
 
 function optionalStringArray(value: string[] | undefined): boolean {

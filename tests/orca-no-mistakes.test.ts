@@ -414,7 +414,17 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
   };
   orca.reports.set("review", [
     { findings: [autoFix], summary: "one defect" },
-    pass("clean rereview"),
+    {
+      findings: [
+        {
+          id: "review-1",
+          verdict: "confirmed, should change",
+          resolution: "Applied the requested repair.",
+        },
+      ] as unknown as Finding[],
+      summary: "repair committed",
+      tested: ["node --test tests/regression.test.ts"],
+    },
   ]);
   orca.reports.set("document", [
     { findings: [askUser], summary: "decision needed" },
@@ -3872,7 +3882,7 @@ test("a failed fixer leaves its worktree commits anchored for recovery", async (
   ]);
   await assert.rejects(
     runPipeline({ intent: "Fix it." }, orca, git, ledger),
-    /review worker returned an invalid report/,
+    /review fixer returned an invalid report/,
   );
   assert.ok(
     git.calls.some((call) => call.startsWith("headof:/worktrees/dispatch-")),
@@ -4767,7 +4777,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     const startupCommand = send?.[send.indexOf("--text") + 1] ?? "";
     assert.match(
       startupCommand,
-      /^'kimi' '--model' 'kimi-k2\.5' '--auto' --prompt 'Read and follow the complete authenticated task in .*prompt-[^']+\.txt'$/,
+      /^'kimi' '--model' 'kimi-k2\.5' --prompt 'Read and follow the complete authenticated task in .*prompt-[^']+\.txt'$/,
     );
     assert.equal(worker.report.summary, "kimi tested");
   } finally {
