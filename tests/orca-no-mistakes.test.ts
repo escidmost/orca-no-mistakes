@@ -1697,6 +1697,7 @@ if (args[1] === 'run-create') {
 } else if (args[1] === 'check' && args.includes('--unread')) {
   out({ deliveryId: 'gate-delivery', messages: [
     { id: 'response-message', type: 'question', from_handle: 'originating-opencode', subject: 'no-mistakes gate response', body: JSON.stringify({ gateId: 'gate-review', resolution: 'fix: verified' }) },
+    { id: 'duplicate-response', type: 'question', from_handle: 'originating-opencode', subject: 'no-mistakes gate response', body: JSON.stringify({ gateId: 'gate-review', resolution: 'approve' }) },
     { id: 'other-response', type: 'question', from_handle: 'originating-opencode', subject: 'no-mistakes gate response', body: JSON.stringify({ gateId: 'gate-other', resolution: 'approve' }) },
     { id: 'stale-response', type: 'question', from_handle: 'originating-opencode', subject: 'no-mistakes gate response', body: JSON.stringify({ gateId: 'gate-stale', resolution: 'approve' }) },
     { id: 'straggler-heartbeat', type: 'heartbeat', from_handle: 'worker', subject: 'heartbeat', body: '{}' }
@@ -1745,6 +1746,10 @@ if (args[1] === 'run-create') {
     const resolved = calls.filter((args) => args[1] === "gate-resolve");
     assert.equal(resolved.length, 2);
     assert.ok(resolved.some((args) => args.includes("gate-review")));
+    assert.equal(
+      resolved.filter((args) => args.includes("gate-review")).length,
+      1,
+    );
     assert.ok(resolved.some((args) => args.includes("gate-other")));
     assert.ok(!resolved.some((args) => args.includes("gate-stale")));
     const acknowledgedIndex = calls.findIndex(
@@ -2703,7 +2708,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "reset", "--hard", featureHead);
     await writeFile(path.join(worker, "eslint.config.js"), "export default [];\n");
     await writeFile(path.join(worker, ".mocharc.json"), '{"spec":[]}\n');
+    await writeFile(path.join(worker, "build.gradle"), "test { enabled = false }\n");
+    await writeFile(path.join(worker, "build.gradle.kts"), "tasks.test { enabled = false }\n");
     await writeFile(path.join(worker, "package.json"), '{"scripts":{"test":"true"}}\n');
+    await writeFile(path.join(worker, "pom.xml"), "<skipTests>true</skipTests>\n");
     await writeFile(path.join(worker, "pytest.ini"), "[pytest]\naddopts = --ignore=Tests\n");
     await writeFile(
       path.join(worker, "cypress.config.ts"),
@@ -2718,9 +2726,12 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       worker,
       "add",
       ".mocharc.json",
+      "build.gradle",
+      "build.gradle.kts",
       "cypress.config.ts",
       "eslint.config.js",
       "package.json",
+      "pom.xml",
       "prompts/fixer.md",
       "pytest.ini",
       "tslint.build.json",
@@ -2730,7 +2741,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "commit", "-m", "weaken validation policy");
     await assert.rejects(
       assertWorkerChangesAllowed(),
-      /unexplained-policy-relaxation:.*\.mocharc\.json, cypress\.config\.ts, eslint\.config\.js, package\.json, prompts\/fixer\.md, pytest\.ini, tslint\.build\.json, tslint\.json, vitest\.config\.ts/,
+      /unexplained-policy-relaxation:.*\.mocharc\.json, build\.gradle, build\.gradle\.kts, cypress\.config\.ts, eslint\.config\.js, package\.json, pom\.xml, prompts\/fixer\.md, pytest\.ini, tslint\.build\.json, tslint\.json, vitest\.config\.ts/,
     );
 
     git(worker, "reset", "--hard", featureHead);
@@ -3084,7 +3095,8 @@ test("GitShell bounds rebase fixer changes to upstream and reported conflicts", 
     git(upstream, "config", "user.email", "test@example.com");
     git(upstream, "config", "user.name", "Test User");
     await writeFile(path.join(upstream, "f.txt"), "upstream\n");
-    git(upstream, "add", "f.txt");
+    await writeFile(path.join(upstream, "upstream-only.txt"), "upstream\n");
+    git(upstream, "add", "f.txt", "upstream-only.txt");
     git(upstream, "commit", "-m", "upstream");
     git(upstream, "push", "origin", "main");
 
@@ -3110,6 +3122,44 @@ test("GitShell bounds rebase fixer changes to upstream and reported conflicts", 
       policy,
     );
 
+    const mergeWorker = path.join(temp, "merge-worker-wt");
+    git(operator, "worktree", "add", "--detach", mergeWorker, featureHead);
+    assert.throws(() =>
+      git(mergeWorker, "merge", "--no-ff", "--no-edit", upstreamHead),
+    );
+    assert.equal(git(mergeWorker, "rev-parse", "MERGE_HEAD"), upstreamHead);
+    await writeFile(path.join(mergeWorker, "f.txt"), "upstream\nfeature\n");
+    git(mergeWorker, "add", "f.txt");
+    git(mergeWorker, "commit", "-m", "merge upstream instead of rebasing");
+    assert.match(
+      git(mergeWorker, "rev-list", "--parents", "-n", "1", "HEAD"),
+      new RegExp(upstreamHead),
+    );
+    await assert.rejects(
+      shell.assertFixerChangesAllowed(
+        mergeWorker,
+        featureHead,
+        git(mergeWorker, "rev-parse", "HEAD"),
+        policy,
+      ),
+      /rebase fixer produced merge commits instead of replaying branch history linearly/,
+    );
+
+    git(worker, "reset", "--hard", rebasedHead);
+    await writeFile(path.join(worker, "upstream-only.txt"), "tampered\n");
+    git(worker, "add", "upstream-only.txt");
+    git(worker, "commit", "--amend", "--no-edit");
+    await assert.rejects(
+      shell.assertFixerChangesAllowed(
+        worker,
+        featureHead,
+        git(worker, "rev-parse", "HEAD"),
+        policy,
+      ),
+      /rebase fixer changed non-conflict files beyond the deterministic rebase result: upstream-only\.txt/,
+    );
+
+    git(worker, "reset", "--hard", rebasedHead);
     await writeFile(path.join(worker, "tests/existing.test.ts"), "assert(false);\n");
     git(worker, "add", "tests/existing.test.ts");
     git(worker, "commit", "--amend", "--no-edit");
@@ -3120,7 +3170,7 @@ test("GitShell bounds rebase fixer changes to upstream and reported conflicts", 
         git(worker, "rev-parse", "HEAD"),
         policy,
       ),
-      /outside upstream changes or reported conflicts: tests\/existing\.test\.ts/,
+      /rebase fixer changed non-conflict files beyond the deterministic rebase result: tests\/existing\.test\.ts/,
     );
   } finally {
     await rm(temp, { recursive: true, force: true });

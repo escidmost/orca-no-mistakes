@@ -3102,7 +3102,7 @@ export class CliOrca implements OrcaOperations {
     }
   }
 
-  async #applyGateResponses(pendingGateIds: ReadonlySet<string>): Promise<void> {
+  async #applyGateResponses(pendingGateIds: Set<string>): Promise<void> {
     if (!this.#runId) return;
     const result = await this.#json<{
       deliveryId?: string;
@@ -3171,6 +3171,7 @@ export class CliOrca implements OrcaOperations {
         response.resolution.trim(),
         "--json",
       ]);
+      pendingGateIds.delete(responseGateId);
     }
     if (result.deliveryId) {
       await this.#json([
@@ -3542,10 +3543,13 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
     ].includes(normalized) ||
     [
       "cargo.toml",
+      "build.gradle",
+      "build.gradle.kts",
       "conftest.py",
       "justfile",
       "makefile",
       "package.json",
+      "pom.xml",
       "pyproject.toml",
       "pytest.ini",
       "setup.cfg",
@@ -3668,16 +3672,41 @@ export class GitShell implements GitOperations {
           "rebase fixer did not complete the rebase onto the resolved upstream commit",
         );
       }
-      const mergeBase = (
-        await this.#git([
+      const mergeCommits = await this.#git(
+        [
           "-C",
           sourcePath,
-          "merge-base",
-          expectedHead,
+          "rev-list",
+          "--merges",
+          `${rebasePolicy.upstreamHead}..${sourceHead}`,
+        ],
+        true,
+      );
+      if (mergeCommits.failed || mergeCommits.stdout.trim()) {
+        throw new FixerPolicyViolationError(
+          "rebase fixer produced merge commits instead of replaying branch history linearly",
+        );
+      }
+      const deterministicMerge = await this.#git(
+        [
+          "-C",
+          sourcePath,
+          "merge-tree",
+          "--write-tree",
           rebasePolicy.upstreamHead,
-        ])
-      ).stdout.trim();
-      const upstreamChanged = await this.#git(
+          expectedHead,
+        ],
+        true,
+      );
+      const deterministicTree = deterministicMerge.stdout
+        .split(/\s/u)
+        .find((value) => /^[0-9a-f]{40}$/u.test(value));
+      if (!deterministicTree) {
+        throw new Error(
+          `could not compute deterministic rebase tree: ${deterministicMerge.output}`,
+        );
+      }
+      const deterministicDifferences = await this.#git(
         [
           "-C",
           sourcePath,
@@ -3685,24 +3714,22 @@ export class GitShell implements GitOperations {
           "--name-only",
           "--no-renames",
           "-z",
-          mergeBase,
-          rebasePolicy.upstreamHead,
+          deterministicTree,
+          sourceHead,
         ],
         true,
       );
-      if (upstreamChanged.failed) {
+      if (deterministicDifferences.failed) {
         throw new Error(
-          `could not inspect upstream rebase changes: ${upstreamChanged.output}`,
+          `could not inspect deterministic rebase result: ${deterministicDifferences.output}`,
         );
       }
-      const allowed = new Set([
-        ...conflictFiles,
-        ...upstreamChanged.stdout.split("\0").filter(Boolean),
-      ]);
-      const outsideScope = changedPaths.filter((filePath) => !allowed.has(filePath));
-      if (outsideScope.length > 0) {
+      const nonConflictChanges = deterministicDifferences.stdout
+        .split("\0")
+        .filter((filePath) => filePath && !conflictFiles.has(filePath));
+      if (nonConflictChanges.length > 0) {
         throw new FixerPolicyViolationError(
-          `rebase fixer modified files outside upstream changes or reported conflicts: ${outsideScope.sort().join(", ")}`,
+          `rebase fixer changed non-conflict files beyond the deterministic rebase result: ${nonConflictChanges.sort().join(", ")}`,
         );
       }
       return;
