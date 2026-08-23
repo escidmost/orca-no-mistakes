@@ -2877,6 +2877,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await mkdir(path.join(repo, ".github/workflows"), { recursive: true });
     await mkdir(path.join(repo, ".github/actions/check"), { recursive: true });
     await mkdir(path.join(repo, "ci/check"), { recursive: true });
+    await mkdir(path.join(repo, "commands"));
     await mkdir(path.join(repo, "tools"));
     await writeFile(path.join(repo, "bin/orca-no-mistakes"), entrypointSource);
     await writeFile(
@@ -2885,7 +2886,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     await writeFile(
       path.join(repo, ".github/workflows/ci.yml"),
-      "- uses: ./.github/actions/check\n- uses: ./ci/check\n",
+      "- uses: ./.github/actions/check\n- uses: ./ci/check\n- run: ./check.sh\n  working-directory: commands\n",
     );
     await writeFile(
       path.join(repo, ".github/actions/check/action.yml"),
@@ -2901,6 +2902,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "runs:\n  using: composite\n  steps:\n    - shell: bash\n      run: ./run.sh\n",
     );
     await writeFile(path.join(repo, "ci/check/run.sh"), "npm test\n");
+    await writeFile(path.join(repo, "commands/check.sh"), "npm test\n");
     await writeFile(
       path.join(repo, "tools/package.json"),
       '{"scripts":{"test":"./verify.sh"}}\n',
@@ -2959,6 +2961,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       ".github/workflows/ci.yml",
       "ci/check/action.yml",
       "ci/check/run.sh",
+      "commands/check.sh",
       "bin/orca-no-mistakes",
       "scripts/adapters.ts",
       "scripts/config.ts",
@@ -3197,6 +3200,15 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await assert.rejects(
       assertWorkerChangesAllowed(),
       /protected validation policy files: tools\/verify\.sh/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "commands/check.sh"), "exit 0\n");
+    git(worker, "add", "commands/check.sh");
+    git(worker, "commit", "-m", "disable working-directory validation entrypoint");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /protected validation policy files: commands\/check\.sh/,
     );
 
     git(worker, "reset", "--hard", featureHead);

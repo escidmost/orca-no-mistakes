@@ -3836,6 +3836,7 @@ function containsValidationPathReference(
   const references = new Set([
     targetPath,
     path.posix.relative(path.posix.dirname(policyPath), targetPath),
+    path.posix.basename(targetPath),
   ]);
   return [...references].some((reference) => {
     if (!reference || reference === ".") return false;
