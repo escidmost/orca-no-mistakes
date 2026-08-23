@@ -2611,6 +2611,8 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       path.join(repo, "src/WidgetSpec.kt"),
       "assertTrue(true)\n",
     );
+    await writeFile(path.join(repo, "src/foo-test.ts"), "assert(true);\n");
+    await writeFile(path.join(repo, "src/test-foo.ts"), "assert(true);\n");
     await writeFile(path.join(repo, "src/testFoo.ts"), "assert(true);\n");
     await writeFile(
       path.join(repo, "src/__snapshots__/Widget.snap"),
@@ -2649,6 +2651,8 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "specs/widget.ts",
       "src/OrderServiceTest.java",
       "src/WidgetSpec.kt",
+      "src/foo-test.ts",
+      "src/test-foo.ts",
       "src/testFoo.ts",
       "src/__snapshots__/Widget.snap",
       "src/spec-parser.ts",
@@ -2858,6 +2862,8 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(worker, "__specs__/widget.ts"), "assert(false);\n");
     await writeFile(path.join(worker, "java/TestFoo.java"), "assert false;\n");
     await writeFile(path.join(worker, "specs/widget.ts"), "assert(false);\n");
+    await writeFile(path.join(worker, "src/foo-test.ts"), "assert(false);\n");
+    await writeFile(path.join(worker, "src/test-foo.ts"), "assert(false);\n");
     await writeFile(path.join(worker, "src/testFoo.ts"), "assert(false);\n");
     git(
       worker,
@@ -2868,6 +2874,8 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "specs/widget.ts",
       "src/OrderServiceTest.java",
       "src/WidgetSpec.kt",
+      "src/foo-test.ts",
+      "src/test-foo.ts",
       "src/testFoo.ts",
     );
     git(worker, "commit", "-m", "weaken suffix-convention tests");
@@ -2881,6 +2889,8 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
         assert.match(error.message, /specs\/widget\.ts/);
         assert.match(error.message, /src\/OrderServiceTest\.java/);
         assert.match(error.message, /src\/WidgetSpec\.kt/);
+        assert.match(error.message, /src\/foo-test\.ts/);
+        assert.match(error.message, /src\/test-foo\.ts/);
         assert.match(error.message, /src\/testFoo\.ts/);
         return true;
       },
@@ -2943,6 +2953,25 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await assert.rejects(
       assertWorkerChangesAllowed(),
       /protected validation policy files: scripts\/orca-no-mistakes\.ts/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "feature.ts"), "export const value = 99;\n");
+    git(worker, "add", "feature.ts");
+    const rewrittenTree = git(worker, "write-tree");
+    const rewrittenHead = git(
+      worker,
+      "commit-tree",
+      rewrittenTree,
+      "-p",
+      `${featureHead}^`,
+      "-m",
+      "rewrite implementation history",
+    );
+    git(worker, "reset", "--hard", rewrittenHead);
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /ordinary fixer commit rewrote history instead of descending from the pre-round head/,
     );
 
     git(worker, "reset", "--hard", featureHead);

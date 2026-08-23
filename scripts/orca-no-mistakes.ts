@@ -3503,7 +3503,9 @@ function isTestPath(filePath: string): boolean {
         /\.tests?$/i.test(part),
       ) ||
     fileName.toLowerCase().endsWith(".snap") ||
-    /(?:^|[._])(?:tests?|specs?|cy|e2e)(?=[._]|$)/i.test(fileName) ||
+    /(?:^|[._-])(?:tests?|specs?|cy|e2e)(?=[._]|$)/i.test(fileName) ||
+    (!["docs", "scripts"].includes(parts[0]?.toLowerCase() ?? "") &&
+      /^tests?-[A-Za-z0-9]/i.test(fileStem)) ||
     /^(?:test|spec|Test|Spec)[A-Z0-9]/.test(fileStem) ||
     /[A-Za-z0-9](?:Tests?|Specs?)$/.test(fileStem)
   );
@@ -3704,6 +3706,22 @@ export class GitShell implements GitOperations {
         );
       }
       return;
+    }
+    const expectedIsAncestor = await this.#git(
+      [
+        "-C",
+        sourcePath,
+        "merge-base",
+        "--is-ancestor",
+        expectedHead,
+        sourceHead,
+      ],
+      true,
+    );
+    if (expectedIsAncestor.failed) {
+      throw new FixerPolicyViolationError(
+        "ordinary fixer commit rewrote history instead of descending from the pre-round head",
+      );
     }
     const protectedTests: string[] = [];
     const protectedPolicy: string[] = [];
