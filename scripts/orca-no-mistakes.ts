@@ -4177,6 +4177,34 @@ export class GitShell implements GitOperations {
           policySources.set(actionPath, source);
         }
       }
+      let policySourceCount = -1;
+      while (policySources.size !== policySourceCount) {
+        policySourceCount = policySources.size;
+        for (const candidatePath of trackedPaths) {
+          if (policySources.has(candidatePath)) continue;
+          const targets = [candidatePath];
+          if (/^action\.ya?ml$/i.test(path.posix.basename(candidatePath))) {
+            const actionDirectory = path.posix.dirname(candidatePath);
+            if (actionDirectory !== ".") targets.push(actionDirectory);
+          }
+          if (
+            ![...policySources].some(([policyPath, source]) =>
+              targets.some((targetPath) =>
+                containsValidationPathReference(source, policyPath, targetPath),
+              ),
+            )
+          ) {
+            continue;
+          }
+          const source = await this.showFile(expectedHead, candidatePath);
+          if (source === undefined) {
+            throw new Error(
+              `could not read pre-round validation entrypoint ${candidatePath}`,
+            );
+          }
+          policySources.set(candidatePath, source);
+        }
+      }
       for (const entrypointPath of validationEntrypoints) {
         const targets = new Set([entrypointPath]);
         let directory = path.posix.dirname(entrypointPath);
@@ -4285,7 +4313,8 @@ export class GitShell implements GitOperations {
       await this.#git(["rev-parse", "--abbrev-ref", "HEAD"], true)
     ).stdout.trim();
     if (!branch || branch === "HEAD") {
-      const reset = await this.#git(["reset", "--hard", sourceHead], true);
+      if (!(await this.isClean())) return false;
+      const reset = await this.#git(["reset", "--keep", sourceHead], true);
       if (fence?.aborted) {
         await this.#restoreExpectedHeadAfterAbort(expectedHead, sourceHead);
         return false;
@@ -4305,12 +4334,21 @@ export class GitShell implements GitOperations {
       true,
     );
     if (detached.failed) return false;
-    const reset = await this.#git(["reset", "--hard", sourceHead], true);
-    if (reset.failed) {
+    if (!(await this.isClean())) {
       const currentBranchHead = (
         await this.#git(["rev-parse", branchRef])
       ).stdout.trim();
       await this.#reattachBranch(branchRef, currentBranchHead);
+      return false;
+    }
+    const reset = await this.#git(["reset", "--keep", sourceHead], true);
+    if (reset.failed) {
+      const dirty = !(await this.isClean());
+      const currentBranchHead = (
+        await this.#git(["rev-parse", branchRef])
+      ).stdout.trim();
+      await this.#reattachBranch(branchRef, currentBranchHead);
+      if (dirty) return false;
       throw new Error(reset.output);
     }
     if (fence?.aborted) {
@@ -4365,11 +4403,16 @@ export class GitShell implements GitOperations {
   }
 
   async #reattachBranch(branchRef: string, head: string): Promise<void> {
-    const reset = await this.#git(["reset", "--hard", head], true);
-    const attach = await this.#git(["symbolic-ref", "HEAD", branchRef], true);
-    if (reset.failed || attach.failed) {
+    const reset = await this.#git(["reset", "--keep", head], true);
+    if (reset.failed) {
       throw new PostMutationCustodyError(
-        `custody transfer could not restore ${branchRef}: ${reset.output || attach.output}`,
+        `custody transfer could not restore ${branchRef}: ${reset.output}`,
+      );
+    }
+    const attach = await this.#git(["symbolic-ref", "HEAD", branchRef], true);
+    if (attach.failed) {
+      throw new PostMutationCustodyError(
+        `custody transfer could not restore ${branchRef}: ${attach.output}`,
       );
     }
   }
@@ -4414,7 +4457,7 @@ export class GitShell implements GitOperations {
         `timed-out custody transfer left unexpected HEAD ${currentHead}`,
       );
     }
-    const rollback = await this.#git(["reset", "--hard", expectedHead], true);
+    const rollback = await this.#git(["reset", "--keep", expectedHead], true);
     if (rollback.failed) {
       throw new PostMutationCustodyError(
         `timed-out custody transfer could not restore ${expectedHead}: ${rollback.output}`,
