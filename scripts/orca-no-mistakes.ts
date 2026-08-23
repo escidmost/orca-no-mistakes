@@ -135,7 +135,12 @@ export interface OrcaOperations {
   // created (close terminals, remove created worktrees, abandon dispatches)
   // before rejecting, so the fallback chain can start the next candidate
   // immediately after the rejection.
-  startWorker(taskId: string, launch: WorkerLaunch): Promise<WorkerResult>;
+  startWorker(
+    taskId: string,
+    launch: WorkerLaunch,
+    fence?: TimeoutFence,
+  ): Promise<WorkerResult>;
+  cancelTaskWorkers(taskId: string): Promise<void>;
   finishWorker(
     worker: WorkerResult,
     disposition: "release" | "retain",
@@ -856,6 +861,7 @@ function launchCandidates(
 
 type TimeoutFence = {
   aborted: boolean;
+  cancel?: () => Promise<void>;
   deadlineSatisfied: boolean;
   settlement?: Promise<unknown>;
 };
@@ -884,14 +890,19 @@ async function withTimeout<T>(
       }),
     ]);
   } catch (error) {
-    if (fence.aborted && fence.settlement) {
+    if (fence.aborted) {
+      let cancellationError: unknown;
       try {
-        await fence.settlement;
-      } catch (settledError) {
-        if (settledError instanceof PostMutationCustodyError) {
-          throw settledError;
-        }
+        await fence.cancel?.();
+      } catch (cancelError) {
+        cancellationError = cancelError;
       }
+      try {
+        await (fence.settlement ?? operation);
+      } catch (settledError) {
+        if (settledError instanceof PostMutationCustodyError) throw settledError;
+      }
+      if (cancellationError) throw cancellationError;
     }
     throw error;
   } finally {
@@ -923,6 +934,7 @@ export async function startWorkerWithFallback(
   createTask: (launch: WorkerLaunch) => Promise<string>,
   launches: WorkerLaunch[],
   onPreflightFailure?: (index: number) => Promise<void>,
+  fence?: TimeoutFence,
 ): Promise<WorkerLaunchOutcome> {
   if (launches.length === 0)
     throw new Error("no agent configured for this role");
@@ -930,14 +942,23 @@ export async function startWorkerWithFallback(
   for (const [index, launch] of launches.entries()) {
     const startedAt = Date.now();
     const taskId = await createTask(launch);
+    if (fence) fence.cancel = () => orca.cancelTaskWorkers(taskId);
+    if (fence?.aborted) {
+      await fence.cancel?.();
+      fence.cancel = undefined;
+      throw new Error(`${launch.stage} worker attempt was cancelled`);
+    }
     try {
-      const worker = await orca.startWorker(taskId, launch);
+      const worker = await orca.startWorker(taskId, launch, fence);
+      if (fence) fence.cancel = undefined;
       return {
         attempts,
         resolvedAgent: launch.agent?.harness ?? DEFAULT_WORKER_AGENT,
         worker,
       };
     } catch (error) {
+      if (fence) fence.cancel = undefined;
+      if (fence?.aborted) throw error;
       if (!(error instanceof PreflightError)) throw error;
       await orca
         .completeTask(taskId, {
@@ -1013,7 +1034,7 @@ async function executeStage(
       resolvedAgent: "coordinator",
     };
   }
-  return await withTimeout(roles.reviewer.timeout_ms, `${stage} reviewer`, () =>
+  return await withTimeout(roles.reviewer.timeout_ms, `${stage} reviewer`, (fence) =>
     runReviewer(
       stage,
       attempt,
@@ -1024,6 +1045,7 @@ async function executeStage(
       orca,
       git,
       roles.reviewer,
+      fence,
     ),
   );
 }
@@ -1042,6 +1064,7 @@ async function runReviewer(
   orca: OrcaOperations,
   git: GitOperations,
   role: ResolvedRoleConfig,
+  fence: TimeoutFence,
 ): Promise<StageExecution> {
   const reportPath = path.join(evidenceDir, `${stage}-${attempt + 1}.json`);
   const untrusted = await untrustedBranchContext(git, repo.base);
@@ -1071,6 +1094,8 @@ async function runReviewer(
         parent: parentTask,
       }),
     launches,
+    undefined,
+    fence,
   );
   const worker = outcome.worker;
   try {
@@ -1210,6 +1235,7 @@ async function runFixer(
       retainedSession = undefined;
       await releaseFixerSession(sessionToReuse, orca).catch(() => {});
     },
+    fence,
   );
   const worker = outcome.worker;
   const worktreePath =
@@ -2123,11 +2149,13 @@ export class CliOrca implements OrcaOperations {
   async startWorker(
     taskId: string,
     launch: WorkerLaunch,
+    fence?: TimeoutFence,
   ): Promise<WorkerResult> {
     if (launch.agent && classifyHarness(launch.agent.harness) === "acp") {
-      return await this.#startAcpWorker(taskId, launch);
+      return await this.#startAcpWorker(taskId, launch, fence);
     }
-    if (launch.terminal) return await this.#startRetainedWorker(taskId, launch);
+    if (launch.terminal)
+      return await this.#startRetainedWorker(taskId, launch, fence);
     const harness = (
       launch.agent?.harness ?? DEFAULT_WORKER_AGENT
     ).toLowerCase();
@@ -2139,6 +2167,10 @@ export class CliOrca implements OrcaOperations {
         "unclassified",
         "worker preparation returned no terminal handle",
       );
+    if (fence?.aborted) {
+      await this.#cleanupPreparedWorker(prepared);
+      throw new Error(`${launch.stage} worker attempt was cancelled`);
+    }
     if (harness === "agy") {
       try {
         await this.#trustAgyWorkspace(prepared?.worktreePath ?? this.#cwd);
@@ -2172,6 +2204,14 @@ export class CliOrca implements OrcaOperations {
         injected?: boolean;
         preamble?: string;
       }>(args);
+      if (fence?.aborted) {
+        await this.#cleanupFailedWorker(
+          receipt.dispatch?.id ?? "",
+          terminalHandle,
+          prepared.worktreeId,
+        );
+        throw new Error(`${launch.stage} worker attempt was cancelled`);
+      }
     } catch (error) {
       if (prepared) await this.#cleanupPreparedWorker(prepared);
       throw new PreflightError(
@@ -2259,6 +2299,7 @@ export class CliOrca implements OrcaOperations {
   async #startRetainedWorker(
     taskId: string,
     launch: WorkerLaunch,
+    fence?: TimeoutFence,
   ): Promise<WorkerResult> {
     const terminalHandle = launch.terminal!;
     const worktreeId = launch.retainedWorktreeId;
@@ -2294,6 +2335,14 @@ export class CliOrca implements OrcaOperations {
         );
       }
       dispatchId = started.dispatchId;
+      if (fence?.aborted) {
+        await this.#cleanupFailedWorker(
+          dispatchId,
+          terminalHandle,
+          worktreeId,
+        );
+        throw new Error(`${launch.stage} worker attempt was cancelled`);
+      }
     } catch (error) {
       throw new PreflightError(
         classifyPreflightFailure(String(error)),
@@ -2875,6 +2924,7 @@ export class CliOrca implements OrcaOperations {
   async #startAcpWorker(
     taskId: string,
     launch: WorkerLaunch,
+    fence?: TimeoutFence,
   ): Promise<WorkerResult> {
     const agent = launch.agent!;
     const target = parseAcpTarget(agent.harness);
@@ -2943,6 +2993,9 @@ export class CliOrca implements OrcaOperations {
           `acp target ${target} could not start: ${String(error)}`,
           { cause: error },
         );
+      }
+      if (fence?.aborted) {
+        throw new Error(`${launch.stage} worker attempt was cancelled`);
       }
       if (result.code !== 0) {
         const detail = `${result.stderr}\n${result.stdout}`.trim();
@@ -3043,6 +3096,58 @@ export class CliOrca implements OrcaOperations {
         "--json",
       ]);
       worker.deliveryId = undefined;
+    }
+  }
+
+  async cancelTaskWorkers(taskId: string): Promise<void> {
+    if (!this.#runId) return;
+    const result = await this.#json<{
+      workers?: {
+        agentTerminalHandle?: string;
+        dispatchId?: string;
+        resource?: { worktreeId?: string } | null;
+        taskId?: string;
+      }[];
+    }>([
+      "orchestration",
+      "worker-list",
+      "--run",
+      this.#runId,
+      "--json",
+    ]);
+    for (const worker of result.workers ?? []) {
+      if (worker.taskId !== taskId || !worker.dispatchId) continue;
+      let worktreeId = worker.resource?.worktreeId;
+      if (worker.agentTerminalHandle && !worktreeId) {
+        const shown: { terminal?: { worktreeId?: string } } = await this.#json<{
+          terminal?: { worktreeId?: string };
+        }>([
+          "terminal",
+          "show",
+          "--terminal",
+          worker.agentTerminalHandle,
+          "--json",
+        ], true).catch(() => ({}));
+        worktreeId = shown.terminal?.worktreeId;
+      }
+      if (worker.agentTerminalHandle) {
+        await this.#cleanupFailedWorker(
+          worker.dispatchId,
+          worker.agentTerminalHandle,
+          worktreeId,
+        );
+      } else {
+        await this.#json(
+          [
+            "orchestration",
+            "worker-abandon",
+            "--dispatch",
+            worker.dispatchId,
+            "--json",
+          ],
+          true,
+        );
+      }
     }
   }
 
@@ -3567,6 +3672,13 @@ function isTestPath(filePath: string): boolean {
           "__tests__",
           "__specs__",
           "__snapshots__",
+          "__fixtures__",
+          "fixtures",
+          "golden",
+          "goldens",
+          "testdata",
+          "test-data",
+          "test_data",
         ].includes(
           part.toLowerCase(),
         ) ||

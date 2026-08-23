@@ -255,7 +255,7 @@ export function readinessMatcher(
     const output = preview ?? ''
     const codexActive =
       normalizedHarness === 'codex' &&
-      /\bWorking\(\d+s\b/.test(output) &&
+      /\bWorking\s*\(\s*\d+\s*s\b/.test(output) &&
       /›[\s\S]{0,500}\s[^\s·]+\s+(?:minimal|low|medium|high|xhigh|max)\s*(?:·|$)/i.test(output)
     return (titleTaken(title) || codexActive) && !output.includes(INTERRUPT_MARKER)
   }

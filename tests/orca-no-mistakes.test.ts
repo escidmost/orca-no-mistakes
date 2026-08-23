@@ -343,6 +343,10 @@ class FakeOrca implements OrcaOperations {
     this.calls.push(`${disposition}:${worker.dispatchId}`);
   }
 
+  async cancelTaskWorkers(taskId: string): Promise<void> {
+    this.calls.push(`cancel:${taskId}`);
+  }
+
   async removeWorktree(worktreeId: string): Promise<void> {
     this.removedWorktrees.push(worktreeId);
   }
@@ -1827,6 +1831,10 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
   const count = fs.existsSync(${JSON.stringify(startCountPath)}) ? Number(fs.readFileSync(${JSON.stringify(startCountPath)}, 'utf8')) : 0
   fs.writeFileSync(${JSON.stringify(startCountPath)}, String(count + 1))
   out({ dispatchId: 'dispatch-' + (count + 1), state: 'ready' })
+} else if (args[0] === 'orchestration' && args[1] === 'worker-list') {
+  out({ workers: [{ taskId: 'task-cancel', dispatchId: 'dispatch-cancel', agentTerminalHandle: 'created-fixer', terminalState: 'active', resource: null }] })
+} else if (args[0] === 'orchestration' && args[1] === 'worker-abandon') {
+  out({ abandoned: true })
 } else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
   const count = fs.existsSync(${JSON.stringify(countPath)}) ? Number(fs.readFileSync(${JSON.stringify(countPath)}, 'utf8')) : 0
   fs.writeFileSync(${JSON.stringify(countPath)}, String(count + 1))
@@ -1875,6 +1883,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       worktree: "current",
     });
     await orca.finishWorker(third, "release");
+    await orca.cancelTaskWorkers("task-cancel");
 
     const calls = (await readFile(callsPath, "utf8"))
       .trim()
@@ -1897,8 +1906,24 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     const closes = calls.filter(
       (args) => args[0] === "terminal" && args[1] === "close",
     );
-    assert.equal(closes.length, 1);
+    assert.equal(closes.length, 2);
     assert.ok(closes[0].includes("created-fixer"));
+    assert.ok(
+      calls.some(
+        (args) =>
+          args[0] === "orchestration" &&
+          args[1] === "worker-abandon" &&
+          args.includes("dispatch-cancel"),
+      ),
+    );
+    assert.ok(
+      calls.some(
+        (args) =>
+          args[0] === "worktree" &&
+          args[1] === "rm" &&
+          args.includes("id:worker-worktree"),
+      ),
+    );
   } finally {
     await rm(temp, { recursive: true, force: true });
     await rm(evidence, { recursive: true, force: true });
@@ -2594,6 +2619,8 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await mkdir(path.join(repo, "specs"));
     await mkdir(path.join(repo, "src"));
     await mkdir(path.join(repo, "src/__snapshots__"));
+    await mkdir(path.join(repo, "testdata"));
+    await mkdir(path.join(repo, "__fixtures__"));
     await writeFile(path.join(repo, "spec/openapi.yaml"), "openapi: 3.1.0\n");
     await writeFile(
       path.join(repo, "cypress/e2e/login.cy.ts"),
@@ -2638,6 +2665,11 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       path.join(repo, "src/__snapshots__/Widget.snap"),
       "exports[`Widget 1`] = `expected`;\n",
     );
+    await writeFile(path.join(repo, "testdata/expected.json"), '{"ok":true}\n');
+    await writeFile(
+      path.join(repo, "__fixtures__/response.json"),
+      '{"status":"expected"}\n',
+    );
     await mkdir(path.join(repo, "bin"));
     await mkdir(path.join(repo, ".github/workflows"), { recursive: true });
     await writeFile(path.join(repo, "bin/orca-no-mistakes"), entrypointSource);
@@ -2675,6 +2707,8 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "src/test-foo.ts",
       "src/testFoo.ts",
       "src/__snapshots__/Widget.snap",
+      "testdata/expected.json",
+      "__fixtures__/response.json",
       "src/spec-parser.ts",
       "src/widget.spec.ts",
       "Tests/branch-regression.ts",
@@ -2941,6 +2975,21 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       assertWorkerChangesAllowed(),
       /fixer modified pre-existing test files: src\/__snapshots__\/Widget\.snap/,
     );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "testdata/expected.json"), '{"ok":false}\n');
+    await writeFile(
+      path.join(worker, "__fixtures__/response.json"),
+      '{"status":"weakened"}\n',
+    );
+    git(worker, "add", "testdata/expected.json", "__fixtures__/response.json");
+    git(worker, "commit", "-m", "weaken fixture assertions");
+    await assert.rejects(assertWorkerChangesAllowed(), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /__fixtures__\/response\.json/);
+      assert.match(error.message, /testdata\/expected\.json/);
+      return true;
+    });
 
     git(worker, "reset", "--hard", featureHead);
     await writeFile(
@@ -3988,7 +4037,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
 } else if (args[0] === 'terminal' && args[1] === 'send') {
   out({ accepted: true })
 } else if (args[0] === 'terminal' && args[1] === 'show') {
-  out({ terminal: { connected: true, title: '⠇ no-mistakes-review-1', preview: '•Working(44s • esc to interrupt)\\n› Find and fix a bug in @filename  gpt-5.6-luna max' } })
+  out({ terminal: { connected: true, title: '⠇ no-mistakes-review-1', preview: '• Working (44s • esc to interrupt)\\n› Find and fix a bug in @filename  gpt-5.6-luna max' } })
 } else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
   out({ dispatch: { id: 'dispatch-codex', status: 'dispatched' }, injected: false, preamble: 'authenticated' })
 } else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
@@ -6573,12 +6622,19 @@ test("resolved role timeout_ms bounds reviewer execution", async () => {
   );
   assert.equal(ledger.listRuns().length, 1);
   assert.equal(ledger.runStatus(ledger.listRuns()[0].run_id), "failed");
+  assert.ok(
+    orca.calls.some((call) => call.startsWith("cancel:task-")),
+    "the timed-out reviewer task is actively cancelled",
+  );
+  assert.ok(
+    orca.calls.some((call) => call.startsWith("release:dispatch-")),
+    "the run waits for reviewer cleanup before failing",
+  );
 });
 
 test("a timed-out fixer never applies commits after the run fails", async () => {
   const git = new FakeGit();
   allowReviewAutoFix(git);
-  const fixerSettled = Promise.withResolvers<void>();
   class SlowFixerOrca extends FakeOrca {
     async startWorker(
       taskId: string,
@@ -6588,16 +6644,6 @@ test("a timed-out fixer never applies commits after the run fails", async () => 
         await new Promise((resolve) => setTimeout(resolve, 75));
       }
       return super.startWorker(taskId, launch);
-    }
-
-    override async finishWorker(
-      worker: WorkerResult,
-      disposition: "release" | "retain",
-    ): Promise<void> {
-      await super.finishWorker(worker, disposition);
-      if (this.fixerDispatches.includes(worker.dispatchId)) {
-        fixerSettled.resolve();
-      }
     }
   }
   const orca = new SlowFixerOrca(git);
@@ -6628,7 +6674,14 @@ test("a timed-out fixer never applies commits after the run fails", async () => 
     ),
     /review fixer exceeded its 10ms execution timeout/,
   );
-  await fixerSettled.promise;
+  assert.ok(
+    orca.calls.some((call) => call.startsWith("cancel:task-")),
+    "the timed-out fixer task is actively cancelled",
+  );
+  assert.ok(
+    orca.calls.some((call) => call.startsWith("release:dispatch-")),
+    "the run waits for fixer cleanup before failing",
+  );
   assert.equal(
     git.calls.filter((call) => call.startsWith("apply:")).length,
     0,
