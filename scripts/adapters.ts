@@ -130,8 +130,8 @@ function pinsConfigKey(args: string[], key: string): boolean {
     const arg = args[i]
     if (arg === '--') break
     const config = configOverride(args, i)
-    if (!config?.startsWith(`${key}=`)) continue
-    const value = config.slice(key.length + 1).trim()
+    if (config?.key !== key) continue
+    const value = config.value
     if (!value || value === '""' || value === "''") {
       throw new Error(`agent codex: config override ${key} requires a nonempty value`)
     }
@@ -140,15 +140,25 @@ function pinsConfigKey(args: string[], key: string): boolean {
   return false
 }
 
-function configOverride(args: string[], index: number): string | undefined {
+function configOverride(
+  args: string[],
+  index: number
+): { key: string; value: string } | undefined {
   const arg = args[index]
-  return arg === '-c' || arg === '--config'
+  const assignment =
+    arg === '-c' || arg === '--config'
     ? args[index + 1]
     : arg.startsWith('-c') && arg.length > 2
       ? arg.slice(2).replace(/^=/, '')
       : arg.startsWith('--config=')
         ? arg.slice(9)
         : undefined
+  const equals = assignment?.indexOf('=') ?? -1
+  if (!assignment || equals < 0) return undefined
+  return {
+    key: assignment.slice(0, equals).trim(),
+    value: assignment.slice(equals + 1).trim(),
+  }
 }
 
 // Flags no-mistakes manages itself for a harness. agent_args_override entries
@@ -265,7 +275,7 @@ export function buildCliCommand(harness: string, options: CliAgentCommandOptions
         throw new Error(`agent ${normalizedHarness}: reserved argument '${arg}' cannot be overridden`)
       }
       const config = configOverride(raw, index)
-      const configKey = config?.slice(0, config.indexOf('=')).trim()
+      const configKey = config?.key
       if (configKey && reservedConfig?.has(configKey)) {
         throw new Error(
           `agent ${normalizedHarness}: reserved config '${configKey}' cannot be overridden`

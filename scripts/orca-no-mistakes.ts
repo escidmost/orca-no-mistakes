@@ -2913,9 +2913,18 @@ export class CliOrca implements OrcaOperations {
 
       const owner = await readOwner();
       let stale = owner ? !ownerIsAlive(owner.pid) : false;
+      let ownerlessLock:
+        | { dev: number; ino: number; mtimeMs: number }
+        | undefined;
       if (!owner) {
         try {
-          stale = Date.now() - (await stat(lockPath)).mtimeMs >= 1_000;
+          const lockStats = await stat(lockPath);
+          ownerlessLock = {
+            dev: lockStats.dev,
+            ino: lockStats.ino,
+            mtimeMs: lockStats.mtimeMs,
+          };
+          stale = Date.now() - ownerlessLock.mtimeMs >= 1_000;
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
           throw error;
@@ -2938,11 +2947,15 @@ export class CliOrca implements OrcaOperations {
           let reclaimed = false;
           try {
             const currentOwner = await readOwner();
+            const currentLock =
+              !owner && ownerlessLock ? await stat(lockPath) : undefined;
             const sameStaleOwner = owner
               ? currentOwner?.token === owner.token &&
                 !ownerIsAlive(currentOwner.pid)
               : currentOwner === undefined &&
-                Date.now() - (await stat(lockPath)).mtimeMs >= 1_000;
+                currentLock?.dev === ownerlessLock?.dev &&
+                currentLock?.ino === ownerlessLock?.ino &&
+                Date.now() - (ownerlessLock?.mtimeMs ?? Date.now()) >= 1_000;
             if (sameStaleOwner) {
               const stalePath = `${lockPath}.stale-${claimToken}`;
               try {
@@ -3229,17 +3242,14 @@ export class CliOrca implements OrcaOperations {
     disposition: "release" | "retain",
   ): Promise<void> {
     if (disposition === "release" && worker.terminalHandle) {
-      await this.#json(
-        [
-          "terminal",
-          "close",
-          "--terminal",
-          worker.terminalHandle,
-          "--tab",
-          "--json",
-        ],
-        true,
-      ).catch(() => {});
+      await this.#json([
+        "terminal",
+        "close",
+        "--terminal",
+        worker.terminalHandle,
+        "--tab",
+        "--json",
+      ]);
     }
     if (worker.deliveryId) {
       await this.#json([
@@ -3881,7 +3891,7 @@ function weakensInlineTestValidation(
   source: string | undefined,
 ): boolean {
   if (source === expectedSource) return false;
-  const protectedValidation = /(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|test)\s*\]|@(?:org\.junit\.)?Test\b|\[(?:Fact|Test|Theory)\]|\b(?:describe|context|it|test)(?:\.[A-Za-z_$][\w$]*)*\s*\(|(?:^|\n)\s*(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(|(?:^|\n)\s*assert\s+\S|\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|\bassert[A-Z][A-Za-z0-9_$]*\s*\(|\bexpect\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
+  const protectedValidation = /(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|test)\s*\]|@(?:org\.junit\.)?Test\b|\[(?:Fact|Test|Theory)\]|\b(?:describe|context|it|test)(?:\.[A-Za-z_$][\w$]*)*\s*\(|\btest\s+"(?:[^"\\]|\\.)*"\s*\{|(?:^|\n)\s*(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(|(?:^|\n)\s*assert\s+\S|\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|\bassert[A-Z][A-Za-z0-9_$]*\s*\(|\bstd\.testing\.expect[A-Za-z0-9_]*\s*\(|\bexpect\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
   if (protectedValidation.test(expectedSource)) return true;
   const skipMarker = /(?:#\[(?:ignore|should_panic)\]|\b(?:describe|it|test)(?:\.[A-Za-z_$][\w$]*)*\.(?:only|skip)\s*\(|\bpytest\.mark\.(?:skip|skipif|xfail)\b|@\w*Ignore\b)/giu;
   return (
@@ -3973,7 +3983,7 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
     (parts.at(-2) === ".mvn" && fileName === "maven.config") ||
     /^settings\.gradle(?:\.kts)?$/.test(fileName) ||
     (parts[0] !== "docs" && parts.slice(0, -1).includes("prompts")) ||
-    /^(?:(?:vitest|jest|playwright|cypress)\.config\..+|\.mocharc(?:\..+)?|karma\.conf\..+|phpunit\.xml(?:\.dist)?|eslint\.config\..+|\.eslintrc(?:\..+)?|\.eslintignore|prettier\.config\..+|\.prettierrc(?:\..+)?|\.prettierignore|biome\.jsonc?|deno\.jsonc?|\.editorconfig|\.flake8|\.?ruff\.toml|\.?mypy\.ini|\.?pylintrc|pyrightconfig\.json|\.rubocop\.ya?ml|stylelint\.config\..+|\.stylelintrc(?:\..+)?|\.stylelintignore|\.?markdownlint(?:-cli2)?(?:\..+)?|\.markdownlintignore|\.golangci\.(?:ya?ml|toml|json)|\.?rustfmt\.toml|\.?clippy\.toml|\.clang-format|\.clang-format-ignore|\.clang-tidy|analysis_options\.yaml|checkstyle\.xml|detekt\.ya?ml|phpcs\.xml(?:\.dist)?|phpstan(?:\.[^.]+)?\.neon(?:\.dist)?|sonar-project\.properties|tsconfig(?:\.[^.]+)*\.json|tslint(?:\.[^.]+)*\.json)$/.test(
+    /^(?:(?:vitest|jest|playwright|cypress)\.config\..+|\.mocharc(?:\..+)?|karma\.conf\..+|phpunit\.xml(?:\.dist)?|eslint\.config\..+|\.eslintrc(?:\..+)?|\.eslintignore|prettier\.config\..+|\.prettierrc(?:\..+)?|\.prettierignore|biome\.jsonc?|deno\.jsonc?|\.editorconfig|\.flake8|\.?ruff\.toml|\.?mypy\.ini|\.?pylintrc|pyrightconfig\.json|\.rubocop\.ya?ml|stylelint\.config\..+|\.stylelintrc(?:\..+)?|\.stylelintignore|\.?markdownlint(?:-cli2)?(?:\..+)?|\.markdownlintignore|\.shellcheckrc|\.golangci\.(?:ya?ml|toml|json)|\.?rustfmt\.toml|\.?clippy\.toml|\.clang-format|\.clang-format-ignore|\.clang-tidy|analysis_options\.yaml|checkstyle\.xml|detekt\.ya?ml|phpcs\.xml(?:\.dist)?|phpstan(?:\.[^.]+)?\.neon(?:\.dist)?|sonar-project\.properties|tsconfig(?:\.[^.]+)*\.json|tslint(?:\.[^.]+)*\.json)$/.test(
       fileName,
     )
   );
@@ -3984,6 +3994,15 @@ function containsPathReference(source: string, reference: string): boolean {
   const escaped = reference.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return new RegExp(
     `(?:^|[^A-Za-z0-9_./-])(?:\\./)?${escaped}(?=$|[^A-Za-z0-9_./-])`,
+    "m",
+  ).test(source);
+}
+
+function containsPrefixedPathReference(source: string, reference: string): boolean {
+  if (!reference || reference === ".") return false;
+  const escaped = reference.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(
+    `(?:\\$\\{\\{[^}\\n]+\\}\\}|\\$\\{?[A-Za-z_][A-Za-z0-9_]*\\}?)/${escaped}(?=$|[^A-Za-z0-9_./-])`,
     "m",
   ).test(source);
 }
@@ -4016,7 +4035,8 @@ function containsValidationPathReference(
     path.posix.relative(path.posix.dirname(policyPath), targetPath),
   ]);
   const containsReference = (reference: string): boolean =>
-    containsPathReference(source, reference);
+    containsPathReference(source, reference) ||
+    containsPrefixedPathReference(source, reference);
   if ([...references].some(containsReference)) return true;
 
   const targetDirectory = path.posix.dirname(targetPath);

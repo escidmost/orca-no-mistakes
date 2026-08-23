@@ -10,6 +10,7 @@ import {
   realpath,
   rm,
   stat,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
@@ -1984,6 +1985,7 @@ test("CliOrca reuses a fixer through supervised worker-start", async () => {
   const callsPath = path.join(temp, "calls.jsonl");
   const countPath = path.join(temp, "count");
   const blockWaitPath = path.join(temp, "block-wait");
+  const failClosePath = path.join(temp, "fail-close");
   const startCountPath = path.join(temp, "start-count");
   const evidence = path.join(
     homedir(),
@@ -2012,6 +2014,9 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
   out({ terminal: { handle: 'created-fixer' } })
 } else if (args[0] === 'terminal' && args[1] === 'send') {
   out({ accepted: true })
+} else if (args[0] === 'terminal' && args[1] === 'close' && fs.existsSync(${JSON.stringify(failClosePath)})) {
+  console.log(JSON.stringify({ ok: false, error: { code: 'terminal_close_failed', message: 'terminal_close_failed' } }))
+  process.exit(1)
 } else if (args[0] === 'terminal' && args[1] === 'show') {
   out({ terminal: { connected: true, title: 'OpenCode', preview: 'ready', worktreeId: 'worker-worktree' } })
 } else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
@@ -2078,6 +2083,12 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       worktree: "current",
     });
     await orca.finishWorker(third, "release");
+    await writeFile(failClosePath, "fail\n");
+    await assert.rejects(
+      orca.finishWorker({ ...third, deliveryId: undefined }, "release"),
+      /terminal_close_failed/,
+    );
+    await rm(failClosePath);
     await writeFile(blockWaitPath, "block");
     const abortController = new AbortController();
     const fence = {
@@ -2134,7 +2145,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     const closes = calls.filter(
       (args) => args[0] === "terminal" && args[1] === "close",
     );
-    assert.equal(closes.length, 3);
+    assert.equal(closes.length, 4);
     assert.ok(closes[0].includes("created-fixer"));
     assert.ok(
       calls.some(
@@ -2556,6 +2567,20 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     });
     await orca.finishWorker(recoveredWorker, "release");
     await assert.rejects(stat(lockPath), { code: "ENOENT" });
+
+    await mkdir(lockPath);
+    const old = new Date(Date.now() - 2_000);
+    await utimes(lockPath, old, old);
+    const ownerlessWorker = await orca.startWorker("task-review", {
+      agent: { harness: "agy" },
+      name: "agy-reviewer-ownerless-lock",
+      prompt: "review",
+      role: "reviewer",
+      stage: "review",
+      worktree: "new-child",
+    });
+    await orca.finishWorker(ownerlessWorker, "release");
+    await assert.rejects(stat(lockPath), { code: "ENOENT" });
   } finally {
     if (previousHome === undefined) delete process.env.HOME;
     else process.env.HOME = previousHome;
@@ -2941,6 +2966,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "def test_value():\n    assert value == 1\n",
     );
     await writeFile(
+      path.join(repo, "src/math.zig"),
+      'const std = @import("std");\ntest "value" { try std.testing.expectEqual(@as(i32, 1), value()); }\n',
+    );
+    await writeFile(
       path.join(repo, "src/__snapshots__/Widget.snap"),
       "exports[`Widget 1`] = `expected`;\n",
     );
@@ -2969,7 +2998,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     await writeFile(
       path.join(repo, ".github/workflows/ci.yml"),
-      "- uses: ./\n- uses: ./.github/actions/check\n- uses: ./ci/check\n- run: ./check.sh\n  working-directory: commands/\n- run: ./lint.sh\n  working-directory: other\n- run: |\n    cd shell-commands\n    ./check.sh\n",
+      "- uses: ./\n- uses: ./.github/actions/check\n- uses: ./ci/check\n- run: ${{ github.workspace }}/scripts/workspace-verify.sh\n- run: ./check.sh\n  working-directory: commands/\n- run: ./lint.sh\n  working-directory: other\n- run: |\n    cd shell-commands\n    ./check.sh\n",
     );
     await writeFile(
       path.join(repo, "action.yml"),
@@ -3014,6 +3043,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     await writeFile(path.join(repo, "tools/verify.sh"), "npm test\n");
     await writeFile(path.join(repo, "tools/check.sh"), "export TOOL_CHECK=1\n");
+    await writeFile(path.join(repo, "scripts/workspace-verify.sh"), "npm test\n");
     for (const moduleName of ["adapters", "config", "ledger", "policy"]) {
       await writeFile(
         path.join(repo, `scripts/${moduleName}.ts`),
@@ -3040,6 +3070,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "scripts/test-harness.ts",
       "scripts/test-runner.ts",
       "scripts/verify-ci.sh",
+      "scripts/workspace-verify.sh",
       "MyProject.Tests/OrderServiceTests.cs",
       "__specs__/widget.ts",
       "java/TestFoo.java",
@@ -3051,6 +3082,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "src/test-foo.ts",
       "src/testFoo.ts",
       "src/lib.rs",
+      "src/math.zig",
       "src/inline.js",
       "src/concurrent.js",
       "src/assertions.js",
@@ -3138,6 +3170,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(worker, ".eslintignore"), "**/*\n");
     await writeFile(path.join(worker, ".markdownlintignore"), "**/*\n");
     await writeFile(path.join(worker, ".prettierignore"), "**/*\n");
+    await writeFile(path.join(worker, ".shellcheckrc"), "disable=all\n");
     await writeFile(path.join(worker, ".stylelintignore"), "**/*\n");
     await writeFile(path.join(worker, ".bazelrc"), "test --test_tag_filters=-critical\n");
     await writeFile(path.join(worker, "BUILD"), "# tests disabled\n");
@@ -3201,6 +3234,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       ".markdownlintignore",
       ".mvn/maven.config",
       ".prettierignore",
+      ".shellcheckrc",
       ".stylelintignore",
       ".bazelrc",
       "BUILD",
@@ -3247,7 +3281,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "commit", "-m", "weaken validation policy");
     await assert.rejects(
       assertWorkerChangesAllowed(),
-      /unexplained-policy-relaxation:.*\.bazelrc, \.clang-format, \.clang-format-ignore, \.eslintignore, \.markdownlintignore, \.mocharc\.json, \.mvn\/maven\.config, \.mvn\/wrapper\/maven-wrapper\.jar, \.mvn\/wrapper\/maven-wrapper\.properties, \.prettierignore, \.stylelintignore, BUILD, BUILD\.bazel, CMakeLists\.txt, Cargo\.lock, MODULE\.bazel, WORKSPACE, WORKSPACE\.bazel, build\.gradle, build\.gradle\.kts, cypress\.config\.ts, eslint\.config\.js, go\.work, gradle\.properties, gradle\/wrapper\/gradle-wrapper\.jar, gradle\/wrapper\/gradle-wrapper\.properties, gradlew, mvnw, package-lock\.json, package\.json, phpunit\.xml, phpunit\.xml\.dist, pkg\/go\.mod, pnpm-lock\.yaml, pom\.xml, prompts\/fixer\.md, pylintrc, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, yarn\.lock/,
+      /unexplained-policy-relaxation:.*\.bazelrc, \.clang-format, \.clang-format-ignore, \.eslintignore, \.markdownlintignore, \.mocharc\.json, \.mvn\/maven\.config, \.mvn\/wrapper\/maven-wrapper\.jar, \.mvn\/wrapper\/maven-wrapper\.properties, \.prettierignore, \.shellcheckrc, \.stylelintignore, BUILD, BUILD\.bazel, CMakeLists\.txt, Cargo\.lock, MODULE\.bazel, WORKSPACE, WORKSPACE\.bazel, build\.gradle, build\.gradle\.kts, cypress\.config\.ts, eslint\.config\.js, go\.work, gradle\.properties, gradle\/wrapper\/gradle-wrapper\.jar, gradle\/wrapper\/gradle-wrapper\.properties, gradlew, mvnw, package-lock\.json, package\.json, phpunit\.xml, phpunit\.xml\.dist, pkg\/go\.mod, pnpm-lock\.yaml, pom\.xml, prompts\/fixer\.md, pylintrc, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, yarn\.lock/,
     );
 
     git(worker, "reset", "--hard", featureHead);
@@ -3358,6 +3392,15 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await assert.rejects(
       assertWorkerChangesAllowed(),
       /protected validation policy files: scripts\/verify-ci\.sh/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "scripts/workspace-verify.sh"), "exit 0\n");
+    git(worker, "add", "scripts/workspace-verify.sh");
+    git(worker, "commit", "-m", "disable prefixed validation entrypoint");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /protected validation policy files: scripts\/workspace-verify\.sh/,
     );
 
     git(worker, "reset", "--hard", featureHead);
@@ -3497,6 +3540,18 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await assert.rejects(
       assertWorkerChangesAllowed(),
       /fixer modified co-located test assertions or skip markers: src\/check\.py/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/math.zig"),
+      'const std = @import("std");\ntest "value" { try std.testing.expectEqual(@as(i32, 2), value()); }\n',
+    );
+    git(worker, "add", "src/math.zig");
+    git(worker, "commit", "-m", "weaken Zig inline assertion");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified co-located test assertions or skip markers: src\/math\.zig/,
     );
 
     git(worker, "reset", "--hard", featureHead);
