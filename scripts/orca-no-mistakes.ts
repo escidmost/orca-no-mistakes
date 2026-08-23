@@ -1962,7 +1962,7 @@ function workerShellStartupDelayMs(): number {
 }
 
 function launchesWithPreamble(harness: string | undefined): boolean {
-  return harness === "agy" || harness === "claude";
+  return harness === "agy" || harness === "claude" || harness === "codex";
 }
 
 type PreparedWorker = {

@@ -355,7 +355,8 @@ defaults:
   # model: "claude-3-7-sonnet"
 
   # Reasoning effort (e.g. "low", "medium", "high"). Mapped per harness:
-  # codex/cursor -> Orca worker-start --model/--effort,
+  # cursor -> Orca worker-start --model/--effort,
+  # codex -> -c model_reasoning_effort=...,
   # claude/agy -> --effort,
   # grok -> --reasoning-effort, pi -> --thinking,
   # opencode -> --variant (model-scoped: needs a model, a raw model pin, or

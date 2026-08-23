@@ -2,8 +2,8 @@ import type { AgentArgsOverride } from './config.ts'
 
 export type LaunchMode = 'acp' | 'cli' | 'native'
 
-export const NATIVE_HARNESSES = ['codex', 'cursor'] as const
-export const CLI_HARNESSES = ['claude', 'gemini', 'grok', 'opencode'] as const
+export const NATIVE_HARNESSES = ['cursor'] as const
+export const CLI_HARNESSES = ['claude', 'codex', 'gemini', 'grok', 'opencode'] as const
 
 const INTERRUPT_MARKER = 'esc interrupt'
 const ACP_TARGET_PATTERN = /^acp:([a-zA-Z0-9_-]+)$/
@@ -71,12 +71,13 @@ export type AgentProfile = {
 
 // One table: how each terminal-launched harness expresses reasoning effort,
 // and which harnesses expose no mechanism at all. Model is uniformly --model
-// where a harness accepts it. Native harnesses (codex/cursor) bypass
+// where a harness accepts it. Native harnesses (cursor) bypass
 // this table: Orca worker-start owns their per-harness flags; acp:<target>
 // rides acpx's own --model and exposes no effort surface.
 const EFFORT_KNOBS: Record<string, { flag: string; requiresModel?: boolean }> = {
   agy: { flag: '--effort' },
   claude: { flag: '--effort' },
+  codex: { flag: '-c' },
   grok: { flag: '--reasoning-effort' },
   opencode: { flag: '--variant', requiresModel: true },
   pi: { flag: '--thinking' },
@@ -107,16 +108,27 @@ function pinsAnyFlag(args: string[], flags: string[]): boolean {
   return false
 }
 
+function pinsConfigKey(args: string[], key: string): boolean {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]
+    if ((arg === '-c' || arg === '--config') && args[i + 1]?.startsWith(`${key}=`)) return true
+    if (arg.startsWith(`-c=${key}=`) || arg.startsWith(`--config=${key}=`)) return true
+  }
+  return false
+}
+
 // Flags no-mistakes manages itself for a harness. agent_args_override entries
 // may not supply them; always-present flags are appended after override args so
 // they cannot be dropped or reordered away.
 const RESERVED_HARNESS_ARGS: Record<string, ReadonlySet<string>> = {
   agy: new Set(['--dangerously-skip-permissions', '--prompt-interactive', '-i']),
   claude: new Set(['--dangerously-skip-permissions']),
+  codex: new Set(['--dangerously-bypass-approvals-and-sandbox']),
 }
 const REQUIRED_HARNESS_ARGS: Record<string, readonly string[]> = {
   agy: ['--dangerously-skip-permissions'],
   claude: ['--dangerously-skip-permissions'],
+  codex: ['--dangerously-bypass-approvals-and-sandbox'],
 }
 
 const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
@@ -142,6 +154,10 @@ export function buildCliCommand(harness: string, options: CliAgentCommandOptions
   }
   const raw = Array.isArray(override) ? override : []
   const effortKnob = EFFORT_KNOBS[harness]
+  const effortPinned =
+    harness === 'codex'
+      ? pinsConfigKey(raw, 'model_reasoning_effort')
+      : pinsAnyFlag(raw, EFFORT_PIN_FLAGS)
   if (options.effort && !effortKnob) {
     throw new Error(
       `agent ${harness}: cannot express effort; no verified reasoning-effort flag exists for it (use agent_args_override.${harness} if your build accepts one)`
@@ -165,8 +181,12 @@ export function buildCliCommand(harness: string, options: CliAgentCommandOptions
   if (effortKnob?.requiresModel) {
     const variant = options.variant ?? options.effort
     if (variant && !pinsAnyFlag(raw, [effortKnob.flag])) parts.push(effortKnob.flag, variant)
-  } else if (effortKnob && options.effort && !pinsAnyFlag(raw, EFFORT_PIN_FLAGS)) {
-    parts.push(effortKnob.flag, options.effort)
+  } else if (effortKnob && options.effort && !effortPinned) {
+    const effort =
+      harness === 'codex'
+        ? `model_reasoning_effort=${JSON.stringify(options.effort)}`
+        : options.effort
+    parts.push(effortKnob.flag, effort)
   }
   const reserved = RESERVED_HARNESS_ARGS[harness]
   if (reserved) {

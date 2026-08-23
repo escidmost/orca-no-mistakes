@@ -18,7 +18,7 @@ import {
 
 test('classifyHarness routes native, CLI, and ACP harnesses', () => {
   assert.equal(classifyHarness('claude'), 'cli')
-  assert.equal(classifyHarness('codex'), 'native')
+  assert.equal(classifyHarness('codex'), 'cli')
   assert.equal(classifyHarness('cursor'), 'native')
   assert.equal(classifyHarness('opencode'), 'cli')
   assert.equal(classifyHarness('grok'), 'cli')
@@ -75,7 +75,7 @@ test('nativeWorkerStartArgs maps model, effort, timeout, and worktree placement'
   ])
 
   const fixer = nativeWorkerStartArgs({
-    agent: 'codex',
+    agent: 'cursor',
     effort: 'high',
     model: 'gpt-5.6',
     name: 'ignored-for-current',
@@ -113,6 +113,24 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
   assert.equal(
     buildCliCommand('claude', { effort: 'high', model: 'opus[1m]' }),
     `'claude' '--model' 'opus[1m]' '--effort' 'high' '--dangerously-skip-permissions'`
+  )
+  assert.equal(
+    buildCliCommand('codex', { effort: 'max', model: 'gpt-5.6-luna' }),
+    `'codex' '--model' 'gpt-5.6-luna' '-c' 'model_reasoning_effort="max"' '--dangerously-bypass-approvals-and-sandbox'`
+  )
+  assert.equal(
+    buildCliCommand('codex', {
+      agentArgsOverride: { codex: ['-c', 'model_reasoning_effort="low"'] } as never,
+      effort: 'max'
+    }),
+    `'codex' '-c' 'model_reasoning_effort="low"' '--dangerously-bypass-approvals-and-sandbox'`
+  )
+  assert.throws(
+    () =>
+      buildCliCommand('codex', {
+        agentArgsOverride: { codex: ['--dangerously-bypass-approvals-and-sandbox'] } as never
+      }),
+    /reserved argument/
   )
   // Effort maps per harness through one table.
   assert.equal(

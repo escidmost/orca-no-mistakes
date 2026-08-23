@@ -3542,6 +3542,83 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
   }
 });
 
+test("CliOrca launches Codex locally with its protected task artifact", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-codex-shell-"));
+  const fakeOrca = path.join(temp, "orca");
+  const callsPath = path.join(temp, "calls.jsonl");
+  const previousHome = process.env.HOME;
+  const evidence = path.join(
+    temp,
+    ".orca-no-mistakes",
+    "artifacts",
+    "codex-shell-run",
+  );
+  const reportPath = path.join(evidence, "review.json");
+  process.env.HOME = temp;
+  try {
+    git(temp, "init", "-b", "feature");
+    await mkdir(evidence, { recursive: true });
+    await writeFile(reportPath, JSON.stringify(pass("codex reviewed")));
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+const out = (result) => console.log(JSON.stringify({ result }))
+if (args[0] === 'orchestration' && args[1] === 'run-create') {
+  out({ run: { id: 'codex-shell-run' } })
+} else if (args[0] === 'terminal' && args[1] === 'create') {
+  out({ terminal: { handle: 'codex-shell' } })
+} else if (args[0] === 'terminal' && args[1] === 'send') {
+  out({ accepted: true })
+} else if (args[0] === 'terminal' && args[1] === 'show') {
+  out({ terminal: { connected: true, title: 'Codex', preview: 'ready' } })
+} else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
+  out({ dispatch: { id: 'dispatch-codex', status: 'dispatched' }, injected: false, preamble: 'authenticated' })
+} else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
+  out({ deliveryId: 'delivery-codex', messages: [{ type: 'worker_done', body: 'Reviewed. Verified. Clear.', payload: JSON.stringify({ taskId: 'task-codex', dispatchId: 'dispatch-codex', outcome: 'succeeded', reportPath: ${JSON.stringify(reportPath)} }) }] })
+} else {
+  out({ ok: true })
+}
+`,
+    );
+    await chmod(fakeOrca, 0o755);
+    const orca = new CliOrca({ command: fakeOrca, cwd: temp });
+    await orca.createRun("codex local launch test");
+
+    const worker = await orca.startWorker("task-codex", {
+      agent: { effort: "max", harness: "codex", model: "gpt-5.6-luna" },
+      name: "codex-reviewer",
+      prompt: "review instructions",
+      role: "reviewer",
+      stage: "review",
+      worktree: "current",
+    });
+
+    const calls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    assert.equal(calls.find((args) => args[1] === "worker-start"), undefined);
+    const dispatch = calls.find((args) => args[1] === "dispatch");
+    assert.ok(dispatch && !dispatch.includes("--inject"));
+    const send = calls.find(
+      (args) => args[0] === "terminal" && args[1] === "send",
+    );
+    const startupCommand = send?.[send.indexOf("--text") + 1] ?? "";
+    assert.match(
+      startupCommand,
+      /^'codex' '--model' 'gpt-5\.6-luna' '-c' 'model_reasoning_effort="max"' '--dangerously-bypass-approvals-and-sandbox' 'Read and follow the complete authenticated task in .*prompt-[^']+\.txt'$/,
+    );
+    assert.equal(worker.report.summary, "codex reviewed");
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test("CliOrca preserves initial dispatch failures and closes the terminal", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-dispatch-failure-"));
   const fakeOrca = path.join(temp, "orca");
@@ -3639,7 +3716,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     await orca.createRun("native test");
 
     const worker = await orca.startWorker("task-nat", {
-      agent: { effort: "high", harness: "codex", model: "gpt-5.6" },
+      agent: { effort: "high", harness: "cursor", model: "gpt-5.6" },
       name: "nm-review",
       prompt: "review instructions",
       role: "reviewer",
@@ -3656,7 +3733,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       .map((line) => JSON.parse(line) as string[]);
     const workerStart = calls.find((args) => args[1] === "worker-start");
     assert.ok(workerStart?.includes("--agent"));
-    assert.ok(workerStart?.includes("codex"));
+    assert.ok(workerStart?.includes("cursor"));
     assert.ok(workerStart?.includes("--model"));
     assert.ok(workerStart?.includes("gpt-5.6"));
     assert.ok(workerStart?.includes("--effort"));
@@ -3718,7 +3795,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     await orca.createRun("native pin test");
     await assert.rejects(
       orca.startWorker("task-nat", {
-        agent: { harness: "codex" },
+        agent: { harness: "cursor" },
         commitOid: "a".repeat(40),
         name: "nm-review",
         prompt: "review instructions",
@@ -3779,7 +3856,7 @@ if (args[0] === 'orchestration' && args[1] === 'worker-start') {
 
     await assert.rejects(
       orca.startWorker("task-residual", {
-        agent: { harness: "codex" },
+        agent: { harness: "cursor" },
         name: "nm-review",
         prompt: "review instructions",
         role: "reviewer",
@@ -3844,7 +3921,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
 
     await assert.rejects(
       orca.startWorker("task-fail", {
-        agent: { harness: "codex", model: "gpt-5.6" },
+        agent: { harness: "cursor", model: "gpt-5.6" },
         name: "nm-review",
         prompt: "review instructions",
         role: "reviewer",
@@ -4497,7 +4574,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       max_rounds: 0,
       allow_review_autofix: false,
     };
-    const [grok, codex] = ["grok", "codex"].map(
+    const [grok, cursor] = ["grok", "cursor"].map(
       (harness) => launchAgent({ auto_fix: roleConfig, agent: harness })![0],
     );
     const launches: WorkerLaunch[] = [
@@ -4510,7 +4587,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
         worktree: "current",
       },
       {
-        agent: codex,
+        agent: cursor,
         name: "second",
         prompt: "instructions",
         role: "reviewer",
@@ -4527,7 +4604,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       launches,
     );
 
-    assert.equal(outcome.resolvedAgent, "codex");
+    assert.equal(outcome.resolvedAgent, "cursor");
     assert.deepEqual(
       outcome.attempts.map((attempt) => [attempt.agent, attempt.failureClass]),
       [["grok", "readiness-timeout"]],
