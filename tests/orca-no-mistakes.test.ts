@@ -1602,6 +1602,7 @@ test("CliOrca processes a complete gate-response delivery before acknowledgement
   const callsPath = path.join(temp, "calls.jsonl");
   const resolvedPath = path.join(temp, "resolved");
   const failAckPath = path.join(temp, "fail-ack");
+  const unexpectedPath = path.join(temp, "unexpected");
   const previousHandle = process.env.ORCA_TERMINAL_HANDLE;
   process.env.ORCA_TERMINAL_HANDLE = "coordinator-opencode";
   try {
@@ -1621,12 +1622,16 @@ if (args[1] === 'run-create') {
     { id: 'gate-review', status: fs.existsSync(${JSON.stringify(resolvedPath)}) ? 'resolved' : 'pending', resolution: 'fix: verified' },
     { id: 'gate-other', status: 'pending' }
   ] })
-} else if (args[1] === 'check' && args.includes('--types')) {
-  out({ deliveryId: 'gate-delivery', messages: [
-    { id: 'response-message', from_handle: 'originating-opencode', subject: 'no-mistakes gate response', body: JSON.stringify({ gateId: 'gate-review', resolution: 'fix: verified' }) },
-    { id: 'other-response', from_handle: 'originating-opencode', subject: 'no-mistakes gate response', body: JSON.stringify({ gateId: 'gate-other', resolution: 'approve' }) },
-    { id: 'stale-response', from_handle: 'originating-opencode', subject: 'no-mistakes gate response', body: JSON.stringify({ gateId: 'gate-stale', resolution: 'approve' }) }
-  ] })
+} else if (args[1] === 'check' && args.includes('--unread')) {
+  out(fs.existsSync(${JSON.stringify(unexpectedPath)})
+    ? { deliveryId: 'unexpected-delivery', messages: [
+        { id: 'worker-question', type: 'question', from_handle: 'worker', subject: 'Need help', body: 'Question' }
+      ] }
+    : { deliveryId: 'gate-delivery', messages: [
+        { id: 'response-message', type: 'question', from_handle: 'originating-opencode', subject: 'no-mistakes gate response', body: JSON.stringify({ gateId: 'gate-review', resolution: 'fix: verified' }) },
+        { id: 'other-response', type: 'question', from_handle: 'originating-opencode', subject: 'no-mistakes gate response', body: JSON.stringify({ gateId: 'gate-other', resolution: 'approve' }) },
+        { id: 'stale-response', type: 'question', from_handle: 'originating-opencode', subject: 'no-mistakes gate response', body: JSON.stringify({ gateId: 'gate-stale', resolution: 'approve' }) }
+      ] })
 } else if (args[1] === 'gate-resolve') {
   const id = args[args.indexOf('--id') + 1]
   if (id === 'gate-review') fs.writeFileSync(${JSON.stringify(resolvedPath)}, 'yes')
@@ -1677,6 +1682,27 @@ if (args[1] === 'run-create') {
     );
 
     await rm(resolvedPath, { force: true });
+    await writeFile(unexpectedPath, "unexpected\n");
+    const unexpectedOrca = new CliOrca({
+      command: fakeOrca,
+      cwd: temp,
+      notifyHandle: "originating-opencode",
+    });
+    await unexpectedOrca.createRun("unexpected gate delivery");
+    await unexpectedOrca.createGate("task-review", "Choose a review action.");
+    const callCountBeforeUnexpected = calls.length;
+    await assert.rejects(
+      unexpectedOrca.waitForGate("gate-review"),
+      /unexpected orchestration message while waiting for a human gate/,
+    );
+    const unexpectedCalls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[])
+      .slice(callCountBeforeUnexpected);
+    assert.ok(!unexpectedCalls.some((args) => args.includes("--ack")));
+    await rm(unexpectedPath, { force: true });
+
     await writeFile(failAckPath, "fail\n");
     const failingOrca = new CliOrca({
       command: fakeOrca,
@@ -2463,6 +2489,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await mkdir(path.join(repo, "spec"));
     await mkdir(path.join(repo, "cypress/e2e"), { recursive: true });
     await mkdir(path.join(repo, "e2e"));
+    await mkdir(path.join(repo, "MyProject.Tests"));
     await mkdir(path.join(repo, "scripts"));
     await mkdir(path.join(repo, "src"));
     await writeFile(path.join(repo, "spec/openapi.yaml"), "openapi: 3.1.0\n");
@@ -2486,6 +2513,18 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(
       path.join(repo, "src/widget.spec.ts"),
       "assert.ok(true);\n",
+    );
+    await writeFile(
+      path.join(repo, "MyProject.Tests/OrderServiceTests.cs"),
+      "Assert.True(true);\n",
+    );
+    await writeFile(
+      path.join(repo, "src/OrderServiceTest.java"),
+      "assertTrue(true);\n",
+    );
+    await writeFile(
+      path.join(repo, "src/WidgetSpec.kt"),
+      "assertTrue(true)\n",
     );
     await mkdir(path.join(repo, "bin"));
     await mkdir(path.join(repo, ".github/workflows"), { recursive: true });
@@ -2514,6 +2553,9 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "e2e/checkout.e2e.ts",
       "spec/openapi.yaml",
       "scripts/test-harness.ts",
+      "MyProject.Tests/OrderServiceTests.cs",
+      "src/OrderServiceTest.java",
+      "src/WidgetSpec.kt",
       "src/spec-parser.ts",
       "src/widget.spec.ts",
       "Tests/branch-regression.ts",
@@ -2675,6 +2717,38 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
 
     git(worker, "reset", "--hard", featureHead);
     await writeFile(
+      path.join(worker, "MyProject.Tests/OrderServiceTests.cs"),
+      "Assert.True(false);\n",
+    );
+    await writeFile(
+      path.join(worker, "src/OrderServiceTest.java"),
+      "assertTrue(false);\n",
+    );
+    await writeFile(
+      path.join(worker, "src/WidgetSpec.kt"),
+      "assertTrue(false)\n",
+    );
+    git(
+      worker,
+      "add",
+      "MyProject.Tests/OrderServiceTests.cs",
+      "src/OrderServiceTest.java",
+      "src/WidgetSpec.kt",
+    );
+    git(worker, "commit", "-m", "weaken suffix-convention tests");
+    await assert.rejects(
+      shell.assertFixerChangesAllowed(worker, featureHead),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /MyProject\.Tests\/OrderServiceTests\.cs/);
+        assert.match(error.message, /src\/OrderServiceTest\.java/);
+        assert.match(error.message, /src\/WidgetSpec\.kt/);
+        return true;
+      },
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
       path.join(worker, "bin/orca-no-mistakes"),
       entrypointSource.replace(
         "../scripts/orca-no-mistakes.ts",
@@ -2786,6 +2860,13 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
         "git.assertFixerChangesAllowed = async () => {};\n  const repoState = await git.assertReady();",
       ),
       "disable injected fixer guard",
+    );
+    await assertCoordinatorChangeRejected(
+      coordinatorSource.replace(
+        "const repo = await git.assertReady();",
+        "git.assertFixerChangesAllowed = async () => {};\n  const repo = await git.assertReady();",
+      ),
+      "disable pipeline fixer guard",
     );
     const guardStart = coordinatorSource.indexOf(
       "\n  async assertFixerChangesAllowed(",

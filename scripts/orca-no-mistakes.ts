@@ -3068,24 +3068,26 @@ export class CliOrca implements OrcaOperations {
         body?: string;
         from_handle?: string;
         subject?: string;
+        type?: string;
       }[];
     }>([
       "orchestration",
       "check",
       "--unread",
-      "--types",
-      "question",
       "--run",
       this.#runId,
       "--json",
     ]);
     for (const message of result.messages ?? []) {
       if (
+        message.type !== "question" ||
         message.subject !== "no-mistakes gate response" ||
         message.from_handle !== this.#notifyHandle ||
         !message.body
       ) {
-        continue;
+        throw new Error(
+          "unexpected orchestration message while waiting for a human gate",
+        );
       }
       let response: { gateId?: unknown; resolution?: unknown };
       try {
@@ -3094,7 +3096,7 @@ export class CliOrca implements OrcaOperations {
           resolution?: unknown;
         };
       } catch {
-        continue;
+        throw new Error("gate response contained invalid JSON");
       }
       if (
         typeof response.gateId !== "string" ||
@@ -3102,7 +3104,7 @@ export class CliOrca implements OrcaOperations {
         typeof response.resolution !== "string" ||
         !response.resolution.trim()
       ) {
-        continue;
+        throw new Error("gate response was missing a gate ID or resolution");
       }
       const responseGateId = response.gateId.trim();
       if (!pendingGateIds.has(responseGateId)) continue;
@@ -3430,13 +3432,16 @@ function isWithin(root: string, target: string): boolean {
 function isTestPath(filePath: string): boolean {
   const parts = filePath.split("/");
   const fileName = parts.at(-1) ?? "";
+  const fileStem = fileName.replace(/\.[^.]+$/, "");
   return (
     parts
       .slice(0, -1)
       .some((part) =>
-        ["test", "tests", "__tests__"].includes(part.toLowerCase()),
+        ["test", "tests", "__tests__"].includes(part.toLowerCase()) ||
+        /\.tests?$/i.test(part),
       ) ||
-    /(?:^|[._])(?:tests?|specs?|cy|e2e)(?=[._]|$)/i.test(fileName)
+    /(?:^|[._])(?:tests?|specs?|cy|e2e)(?=[._]|$)/i.test(fileName) ||
+    /[A-Za-z0-9](?:Tests?|Specs?)$/.test(fileStem)
   );
 }
 
@@ -3474,9 +3479,7 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
 
 const COORDINATOR_POLICY_SOURCE = "scripts/orca-no-mistakes.ts";
 const COORDINATOR_POLICY_BLOCKS = [
-  ["\n        let nextFixer:", "\n        fixerSession = nextFixer.session;"],
-  ["\nasync function runFixer(", "\nasync function validateReport("],
-  ["\nfunction checkerBrief(", "\nfunction gateQuestion("],
+  ["\nexport async function runPipeline(", "\ntype CommandResult"],
   ["\nasync function command(", "\nfunction unwrapJson<"],
   ["\nfunction isTestPath(", "\ntype GitShellOptions"],
   ["\n  async assertFixerChangesAllowed(", "\n  async head()"],

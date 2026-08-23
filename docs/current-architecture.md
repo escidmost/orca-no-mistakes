@@ -37,6 +37,8 @@ Reviewers run as fresh workers in disposable child worktrees. A compatible fixer
 
 A successful fallback fixer remains compatible while the exact configured candidate chain and order stay unchanged. CI workflows, any `conftest.py`, and the imported coordinator modules (`scripts/adapters.ts`, `scripts/config.ts`, `scripts/ledger.ts`, and `scripts/policy.ts`) are protected validation policy and cannot be changed by a fixer commit.
 
+The protected coordinator source spans the complete stage/fix pipeline, reviewer dispatch, and report validation. Dedicated test-path protection also recognizes `.Tests` project directories and Pascal/camel-case `Test(s)` or `Spec(s)` filename suffixes. While a human gate is open, the coordinator inspects the complete Orca delivery and refuses to acknowledge a batch containing unrelated messages rather than discarding them.
+
 Each stage and role resolves its own agent from the configuration tiers, and the launch adapter dispatches on the resolved harness:
 
 - `codex` and `cursor` launch through native `orca orchestration worker-start`, which receives the resolved model, effort, and timeout as flags. Fresh Claude and Antigravity workers create their authenticated dispatch first, then launch with a short instruction to read the mode-0600 preamble artifact; retained sessions receive the same file instruction through Orca's agent-prompt terminal transport. This avoids empty initial TUIs, prompt-processing races, and OS argument-size limits.
