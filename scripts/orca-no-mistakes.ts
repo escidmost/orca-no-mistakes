@@ -3463,13 +3463,21 @@ function isTestPath(filePath: string): boolean {
     parts
       .slice(0, -1)
       .some((part) =>
-        ["test", "tests", "__tests__", "__snapshots__"].includes(
+        [
+          "test",
+          "tests",
+          "specs",
+          "__tests__",
+          "__specs__",
+          "__snapshots__",
+        ].includes(
           part.toLowerCase(),
         ) ||
         /\.tests?$/i.test(part),
       ) ||
     fileName.toLowerCase().endsWith(".snap") ||
     /(?:^|[._])(?:tests?|specs?|cy|e2e)(?=[._]|$)/i.test(fileName) ||
+    /^(?:test|spec|Test|Spec)[A-Z0-9]/.test(fileStem) ||
     /[A-Za-z0-9](?:Tests?|Specs?)$/.test(fileStem)
   );
 }
@@ -3515,7 +3523,7 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "tox.ini",
     ].includes(fileName) ||
     (parts[0] !== "docs" && parts.slice(0, -1).includes("prompts")) ||
-    /^(?:(?:vitest|jest|playwright)\.config\..+|\.mocharc(?:\..+)?|karma\.conf\..+|eslint\.config\..+|\.eslintrc(?:\..+)?|prettier\.config\..+|\.prettierrc(?:\..+)?|biome\.jsonc?|deno\.jsonc?|\.editorconfig|\.flake8|\.?ruff\.toml|\.?mypy\.ini|\.pylintrc|pyrightconfig\.json|\.rubocop\.ya?ml|stylelint\.config\..+|\.stylelintrc(?:\..+)?|\.?markdownlint(?:-cli2)?(?:\..+)?|\.golangci\.(?:ya?ml|toml|json)|\.?rustfmt\.toml|\.?clippy\.toml|\.clang-tidy|analysis_options\.yaml|checkstyle\.xml|detekt\.ya?ml|phpcs\.xml(?:\.dist)?|phpstan(?:\.[^.]+)?\.neon(?:\.dist)?|sonar-project\.properties|tsconfig(?:\.[^.]+)*\.json)$/.test(
+    /^(?:(?:vitest|jest|playwright)\.config\..+|\.mocharc(?:\..+)?|karma\.conf\..+|eslint\.config\..+|\.eslintrc(?:\..+)?|prettier\.config\..+|\.prettierrc(?:\..+)?|biome\.jsonc?|deno\.jsonc?|\.editorconfig|\.flake8|\.?ruff\.toml|\.?mypy\.ini|\.pylintrc|pyrightconfig\.json|\.rubocop\.ya?ml|stylelint\.config\..+|\.stylelintrc(?:\..+)?|\.?markdownlint(?:-cli2)?(?:\..+)?|\.golangci\.(?:ya?ml|toml|json)|\.?rustfmt\.toml|\.?clippy\.toml|\.clang-tidy|analysis_options\.yaml|checkstyle\.xml|detekt\.ya?ml|phpcs\.xml(?:\.dist)?|phpstan(?:\.[^.]+)?\.neon(?:\.dist)?|sonar-project\.properties|tsconfig(?:\.[^.]+)*\.json|tslint(?:\.[^.]+)*\.json)$/.test(
       fileName,
     )
   );
@@ -3690,70 +3698,124 @@ export class GitShell implements GitOperations {
       ["merge-base", "--is-ancestor", expectedHead, sourceHead],
       true,
     );
-    // Let custody mutations settle before checking the fence so rollback never
-    // races Git's index or ref locks.
-    if (!expectedIsAncestor.failed) {
-      const applied = await this.#git(
-        ["merge", "--ff-only", sourceHead],
-        true,
-      );
+    const branch = (
+      await this.#git(["rev-parse", "--abbrev-ref", "HEAD"], true)
+    ).stdout.trim();
+    if (!branch || branch === "HEAD") {
+      const reset = await this.#git(["reset", "--hard", sourceHead], true);
       if (fence?.aborted) {
         await this.#restoreExpectedHeadAfterAbort(expectedHead, sourceHead);
         return false;
       }
-      return !applied.failed;
+      return !reset.failed;
     }
-    if (fence?.aborted) return false;
-    // The fixer rewrote history (e.g. completed an aborted rebase): adopt it
-    // via an atomic compare-and-swap of the branch ref so a concurrent branch
-    // update aborts before the worktree changes. Detached checkouts have no
-    // ref to clobber and adopt directly.
-    const branch = (
-      await this.#git(["rev-parse", "--abbrev-ref", "HEAD"], true)
-    ).stdout.trim();
-    const cas =
-      !branch || branch === "HEAD"
-        ? undefined
-        : await this.#git(
-            ["update-ref", `refs/heads/${branch}`, sourceHead, expectedHead],
-            true,
-          );
-    if (fence?.aborted) {
-      await this.#restoreExpectedHeadAfterAbort(expectedHead, sourceHead);
-      return false;
-    }
-    if (cas?.failed) return false;
-    try {
+    const branchRef = `refs/heads/${branch}`;
+    if (expectedIsAncestor.failed) {
       const backup = await this.#git(
         ["update-ref", `refs/no-mistakes/backup/${expectedHead}`, expectedHead],
         true,
       );
-      if (fence?.aborted) {
-        await this.#restoreExpectedHeadAfterAbort(expectedHead, sourceHead);
-        return false;
-      }
       if (backup.failed) throw new Error(backup.output);
-      const reset = await this.#git(
-        ["reset", "--hard", sourceHead],
+    }
+    const detached = await this.#git(
+      ["checkout", "--detach", expectedHead],
+      true,
+    );
+    if (detached.failed) return false;
+    const reset = await this.#git(["reset", "--hard", sourceHead], true);
+    if (reset.failed) {
+      const currentBranchHead = (
+        await this.#git(["rev-parse", branchRef])
+      ).stdout.trim();
+      await this.#reattachBranch(branchRef, currentBranchHead);
+      throw new Error(reset.output);
+    }
+    if (fence?.aborted) {
+      const currentBranchHead = (
+        await this.#git(["rev-parse", branchRef])
+      ).stdout.trim();
+      await this.#reattachBranch(branchRef, currentBranchHead);
+      return false;
+    }
+    const cas = await this.#git(
+      ["update-ref", branchRef, sourceHead, expectedHead],
+      true,
+    );
+    if (cas.failed) {
+      const currentBranchHead = (
+        await this.#git(["rev-parse", branchRef])
+      ).stdout.trim();
+      await this.#reattachBranch(branchRef, currentBranchHead);
+      return false;
+    }
+    if (fence?.aborted) {
+      await this.#restoreBranchAfterAbort(branchRef, expectedHead, sourceHead);
+      return false;
+    }
+    const adoptedHead = (
+      await this.#git(["rev-parse", branchRef])
+    ).stdout.trim();
+    if (adoptedHead !== sourceHead) {
+      await this.#reattachBranch(branchRef, adoptedHead);
+      return false;
+    }
+    await this.#reattachBranch(branchRef, sourceHead);
+    if (fence?.aborted) {
+      await this.#restoreBranchAfterAbort(branchRef, expectedHead, sourceHead);
+      return false;
+    }
+    const finalHead = await this.head();
+    if (finalHead !== sourceHead) {
+      const detachedAgain = await this.#git(
+        ["checkout", "--detach", sourceHead],
         true,
       );
-      if (fence?.aborted) {
-        await this.#restoreExpectedHeadAfterAbort(expectedHead, sourceHead);
-        return false;
+      if (detachedAgain.failed) {
+        throw new PostMutationCustodyError(
+          `custody transfer could not detach from concurrently advanced ${branchRef}: ${detachedAgain.output}`,
+        );
       }
-      if (reset.failed) throw new Error(reset.output);
-      return true;
-    } catch (error) {
-      if (branch && branch !== "HEAD") {
-        await this.#git(
-          ["update-ref", `refs/heads/${branch}`, expectedHead, sourceHead],
-          true,
-        ).catch(() => {});
-      }
+      await this.#reattachBranch(branchRef, finalHead);
+      return false;
+    }
+    return true;
+  }
+
+  async #reattachBranch(branchRef: string, head: string): Promise<void> {
+    const reset = await this.#git(["reset", "--hard", head], true);
+    const attach = await this.#git(["symbolic-ref", "HEAD", branchRef], true);
+    if (reset.failed || attach.failed) {
       throw new PostMutationCustodyError(
-        `custody transfer failed after advancing the operator branch: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        `custody transfer could not restore ${branchRef}: ${reset.output || attach.output}`,
+      );
+    }
+  }
+
+  async #restoreBranchAfterAbort(
+    branchRef: string,
+    expectedHead: string,
+    sourceHead: string,
+  ): Promise<void> {
+    const detached = await this.#git(
+      ["checkout", "--detach", sourceHead],
+      true,
+    );
+    if (detached.failed) {
+      throw new PostMutationCustodyError(
+        `timed-out custody transfer could not detach from ${branchRef}: ${detached.output}`,
+      );
+    }
+    const rollback = await this.#git(
+      ["update-ref", branchRef, expectedHead, sourceHead],
+      true,
+    );
+    const currentBranchHead = (
+      await this.#git(["rev-parse", branchRef])
+    ).stdout.trim();
+    await this.#reattachBranch(branchRef, currentBranchHead);
+    if (rollback.failed && currentBranchHead === sourceHead) {
+      throw new PostMutationCustodyError(
+        `timed-out custody transfer could not restore ${branchRef}: ${rollback.output}`,
       );
     }
   }

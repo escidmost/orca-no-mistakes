@@ -48,6 +48,7 @@ import {
   PreflightError,
   buildCliCommand,
   classifyPreflightFailure,
+  shellQuote,
 } from "../scripts/adapters.ts";
 import { artifactsRoot } from "../scripts/ledger.ts";
 import { loadUserConfig } from "../scripts/config.ts";
@@ -2537,7 +2538,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await mkdir(path.join(repo, "cypress/e2e"), { recursive: true });
     await mkdir(path.join(repo, "e2e"));
     await mkdir(path.join(repo, "MyProject.Tests"));
+    await mkdir(path.join(repo, "__specs__"));
+    await mkdir(path.join(repo, "java"));
     await mkdir(path.join(repo, "scripts"));
+    await mkdir(path.join(repo, "specs"));
     await mkdir(path.join(repo, "src"));
     await mkdir(path.join(repo, "src/__snapshots__"));
     await writeFile(path.join(repo, "spec/openapi.yaml"), "openapi: 3.1.0\n");
@@ -2566,6 +2570,9 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       path.join(repo, "MyProject.Tests/OrderServiceTests.cs"),
       "Assert.True(true);\n",
     );
+    await writeFile(path.join(repo, "__specs__/widget.ts"), "assert(true);\n");
+    await writeFile(path.join(repo, "java/TestFoo.java"), "assert true;\n");
+    await writeFile(path.join(repo, "specs/widget.ts"), "assert(true);\n");
     await writeFile(
       path.join(repo, "src/OrderServiceTest.java"),
       "assertTrue(true);\n",
@@ -2574,6 +2581,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       path.join(repo, "src/WidgetSpec.kt"),
       "assertTrue(true)\n",
     );
+    await writeFile(path.join(repo, "src/testFoo.ts"), "assert(true);\n");
     await writeFile(
       path.join(repo, "src/__snapshots__/Widget.snap"),
       "exports[`Widget 1`] = `expected`;\n",
@@ -2606,8 +2614,12 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "spec/openapi.yaml",
       "scripts/test-harness.ts",
       "MyProject.Tests/OrderServiceTests.cs",
+      "__specs__/widget.ts",
+      "java/TestFoo.java",
+      "specs/widget.ts",
       "src/OrderServiceTest.java",
       "src/WidgetSpec.kt",
+      "src/testFoo.ts",
       "src/__snapshots__/Widget.snap",
       "src/spec-parser.ts",
       "src/widget.spec.ts",
@@ -2659,6 +2671,8 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(worker, ".mocharc.json"), '{"spec":[]}\n');
     await writeFile(path.join(worker, "package.json"), '{"scripts":{"test":"true"}}\n');
     await writeFile(path.join(worker, "pytest.ini"), "[pytest]\naddopts = --ignore=Tests\n");
+    await writeFile(path.join(worker, "tslint.build.json"), '{"rules":{}}\n');
+    await writeFile(path.join(worker, "tslint.json"), '{"rules":{}}\n');
     await writeFile(path.join(worker, "vitest.config.ts"), "export default { test: { exclude: ['Tests/**'] } };\n");
     await mkdir(path.join(worker, "prompts"));
     await writeFile(path.join(worker, "prompts/fixer.md"), "weaken checks\n");
@@ -2670,12 +2684,14 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "package.json",
       "prompts/fixer.md",
       "pytest.ini",
+      "tslint.build.json",
+      "tslint.json",
       "vitest.config.ts",
     );
     git(worker, "commit", "-m", "weaken validation policy");
     await assert.rejects(
       assertWorkerChangesAllowed(),
-      /unexplained-policy-relaxation:.*\.mocharc\.json, eslint\.config\.js, package\.json, prompts\/fixer\.md, pytest\.ini, vitest\.config\.ts/,
+      /unexplained-policy-relaxation:.*\.mocharc\.json, eslint\.config\.js, package\.json, prompts\/fixer\.md, pytest\.ini, tslint\.build\.json, tslint\.json, vitest\.config\.ts/,
     );
 
     git(worker, "reset", "--hard", featureHead);
@@ -2804,12 +2820,20 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       path.join(worker, "src/WidgetSpec.kt"),
       "assertTrue(false)\n",
     );
+    await writeFile(path.join(worker, "__specs__/widget.ts"), "assert(false);\n");
+    await writeFile(path.join(worker, "java/TestFoo.java"), "assert false;\n");
+    await writeFile(path.join(worker, "specs/widget.ts"), "assert(false);\n");
+    await writeFile(path.join(worker, "src/testFoo.ts"), "assert(false);\n");
     git(
       worker,
       "add",
       "MyProject.Tests/OrderServiceTests.cs",
+      "__specs__/widget.ts",
+      "java/TestFoo.java",
+      "specs/widget.ts",
       "src/OrderServiceTest.java",
       "src/WidgetSpec.kt",
+      "src/testFoo.ts",
     );
     git(worker, "commit", "-m", "weaken suffix-convention tests");
     await assert.rejects(
@@ -2817,8 +2841,12 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       (error: unknown) => {
         assert.ok(error instanceof Error);
         assert.match(error.message, /MyProject\.Tests\/OrderServiceTests\.cs/);
+        assert.match(error.message, /__specs__\/widget\.ts/);
+        assert.match(error.message, /java\/TestFoo\.java/);
+        assert.match(error.message, /specs\/widget\.ts/);
         assert.match(error.message, /src\/OrderServiceTest\.java/);
         assert.match(error.message, /src\/WidgetSpec\.kt/);
+        assert.match(error.message, /src\/testFoo\.ts/);
         return true;
       },
     );
@@ -3057,19 +3085,49 @@ test("rewritten-history adoption never clobbers a concurrently advanced branch",
     git(worker, "rebase", "origin/main");
     const rewritten = git(worker, "rev-parse", "HEAD");
 
-    // Concurrent advance: the feature branch moves while the checkout stays
-    // detached at the submission commit.
-    git(operator, "checkout", "--detach", pinnedHead);
-    git(operator, "branch", "-f", "feature", "origin/main");
-    const advancedBranch = git(operator, "rev-parse", "feature");
+    const concurrentWorktree = path.join(temp, "concurrent-wt");
+    git(operator, "worktree", "add", "--detach", concurrentWorktree, pinnedHead);
+    await writeFile(path.join(concurrentWorktree, "concurrent.txt"), "preserve me\n");
+    git(concurrentWorktree, "add", "concurrent.txt");
+    git(concurrentWorktree, "commit", "-m", "concurrent branch advance");
+    const advancedBranch = git(concurrentWorktree, "rev-parse", "HEAD");
+
+    const wrapperDir = path.join(temp, "bin");
+    const wrapper = path.join(wrapperDir, "git");
+    const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+    const advancedFlag = path.join(temp, "advanced");
+    await mkdir(wrapperDir);
+    await writeFile(
+      wrapper,
+      `#!/bin/sh
+${shellQuote(realGit)} "$@"
+status=$?
+if [ "$status" -eq 0 ] && [ "$1" = "-C" ] && [ "$2" = ${shellQuote(operator)} ] && [ "$3" = "update-ref" ] && [ "$4" = "refs/heads/feature" ] && [ "$5" = ${shellQuote(rewritten)} ] && [ ! -e ${shellQuote(advancedFlag)} ]; then
+  touch ${shellQuote(advancedFlag)}
+  ${shellQuote(realGit)} -C ${shellQuote(operator)} update-ref refs/heads/feature ${shellQuote(advancedBranch)} ${shellQuote(rewritten)}
+fi
+exit "$status"
+`,
+    );
+    await chmod(wrapper, 0o755);
 
     const shell = new GitShell({ repo: operator });
-    assert.equal(
-      await shell.applyWorktreeCommits(worker, pinnedHead, rewritten),
-      true,
-    );
-    assert.equal(git(operator, "rev-parse", "HEAD"), rewritten);
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${wrapperDir}:${previousPath ?? ""}`;
+    try {
+      assert.equal(
+        await shell.applyWorktreeCommits(worker, pinnedHead, rewritten),
+        false,
+      );
+    } finally {
+      process.env.PATH = previousPath;
+    }
+    assert.equal(git(operator, "rev-parse", "HEAD"), advancedBranch);
     assert.equal(git(operator, "rev-parse", "feature"), advancedBranch);
+    assert.equal(
+      await readFile(path.join(operator, "concurrent.txt"), "utf8"),
+      "preserve me\n",
+    );
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
