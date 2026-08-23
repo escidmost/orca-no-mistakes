@@ -1890,6 +1890,10 @@ function workerShellStartupDelayMs(): number {
     : 0;
 }
 
+function launchesWithPreamble(harness: string | undefined): boolean {
+  return harness === "agy" || harness === "claude";
+}
+
 type PreparedWorker = {
   terminalHandle: string;
   worktreeId?: string;
@@ -2009,8 +2013,7 @@ export class CliOrca implements OrcaOperations {
       return await this.#startAcpWorker(taskId, launch);
     }
     const harness = launch.agent?.harness.toLowerCase();
-    const directPreamble = harness === "agy";
-    const manualDispatch = directPreamble || harness === "claude";
+    const directPreamble = launchesWithPreamble(harness);
     const launchWithPreamble = directPreamble && !launch.terminal;
     const prepared = launch.terminal
       ? undefined
@@ -2040,7 +2043,7 @@ export class CliOrca implements OrcaOperations {
       terminalHandle,
       "--return-preamble",
     ];
-    if (!manualDispatch) args.push("--inject");
+    if (!directPreamble) args.push("--inject");
     if (this.#runId) args.push("--run", this.#runId);
     args.push("--json");
     let receipt: {
@@ -2067,7 +2070,7 @@ export class CliOrca implements OrcaOperations {
     if (
       !dispatchId ||
       !preamble ||
-      (!manualDispatch && receipt.injected !== true)
+      (!directPreamble && receipt.injected !== true)
     ) {
       if (dispatchId) {
         await this.#cleanupFailedWorker(
@@ -2084,7 +2087,7 @@ export class CliOrca implements OrcaOperations {
       );
     }
     let promptPath: string | undefined;
-    if (manualDispatch) {
+    if (directPreamble) {
       try {
         if (directPreamble && launchWithPreamble) {
           promptPath = await this.#launchWorkerAgent(
@@ -2365,7 +2368,7 @@ export class CliOrca implements OrcaOperations {
           "terminal create returned an invalid receipt",
         );
 
-      if (launch.agent?.harness.toLowerCase() !== "agy")
+      if (!launchesWithPreamble(launch.agent?.harness.toLowerCase()))
         await this.#launchWorkerAgent(terminalHandle, launch);
       return {
         terminalHandle,
@@ -2398,7 +2401,7 @@ export class CliOrca implements OrcaOperations {
           "unclassified",
           "terminal create returned an invalid receipt",
         );
-      if (launch.agent?.harness.toLowerCase() !== "agy")
+      if (!launchesWithPreamble(launch.agent?.harness.toLowerCase()))
         await this.#launchWorkerAgent(prepared.terminalHandle, launch);
       return prepared;
     } catch (error) {
@@ -2426,7 +2429,10 @@ export class CliOrca implements OrcaOperations {
         await mkdir(promptDir, { recursive: true });
         promptPath = path.join(promptDir, `prompt-${randomUUID()}.txt`);
         await writeFile(promptPath, initialPrompt, { mode: 0o600 });
-        launchCommand += ` --prompt-interactive "$(cat -- ${shellQuote(promptPath)})"`;
+        launchCommand +=
+          harness === "agy"
+            ? ` --prompt-interactive "$(cat -- ${shellQuote(promptPath)})"`
+            : ` "$(cat -- ${shellQuote(promptPath)})"`;
       }
       const shellStartupDelayMs = workerShellStartupDelayMs();
       if (shellStartupDelayMs > 0) {

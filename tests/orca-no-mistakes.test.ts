@@ -2917,22 +2917,26 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     const sends = calls.filter(
       ({ args }) => args[0] === "terminal" && args[1] === "send",
     );
-    const sent = sends[0];
-    assert.ok(created && sent);
-    assert.ok(sent.at - created.at >= 70, "worker starts after the shell delay");
-    assert.equal(
-      sent.args[sent.args.indexOf("--text") + 1],
-      "'claude' '--model' 'opus[1m]' '--effort' 'high' '--dangerously-skip-permissions'",
+    const dispatch = calls.find(
+      ({ args }) => args[0] === "orchestration" && args[1] === "dispatch",
     );
+    const sent = sends[0];
+    assert.ok(created && dispatch && sent);
+    assert.ok(dispatch.at < sent.at, "dispatch preamble is created before launch");
+    assert.ok(sent.at - created.at >= 70, "worker starts after the shell delay");
+    const startupCommand = sent.args[sent.args.indexOf("--text") + 1];
+    assert.ok(
+      startupCommand.startsWith(
+        "'claude' '--model' 'opus[1m]' '--effort' 'high' '--dangerously-skip-permissions' \"$(cat -- '",
+      ),
+    );
+    assert.match(startupCommand, /prompt-[^']+\.txt'\)"$/);
+    assert.equal(sends.length, 1);
     assert.equal(
       calls.find(({ args }) => args[1] === "worker-start"),
       undefined,
     );
-    const dispatch = calls.find(
-      ({ args }) => args[0] === "orchestration" && args[1] === "dispatch",
-    );
     assert.ok(dispatch && !dispatch.args.includes("--inject"));
-    assert.equal(sends[1]?.args[sends[1].args.indexOf("--text") + 1], "authenticated");
     assert.equal(worker.report.summary, "claude reviewed");
   } finally {
     if (previousDelay === undefined)
