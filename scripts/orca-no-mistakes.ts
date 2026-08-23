@@ -3717,7 +3717,7 @@ function isTestPath(filePath: string): boolean {
 }
 
 function weakensInlineTestValidation(diff: string, expectedSource: string): boolean {
-  const inlineTestRegistration = /^\s*(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|test)\s*\]|@(?:org\.junit\.)?Test\b|\[(?:Fact|Test|Theory)\]|(?:describe|context|it|test)\s*\(\s*["'`]|.*\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b|>>>)/imu;
+  const inlineTestRegistration = /^\s*(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|test)\s*\]|@(?:org\.junit\.)?Test\b|\[(?:Fact|Test|Theory)\]|(?:describe|context|it|test)(?:\.each\s*\([^)]*\))?\s*\(\s*["'`]|.*\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b|>>>)/imu;
   if (inlineTestRegistration.test(expectedSource)) return true;
   const removedAssertion = /^-(?!---).*(?:\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|\bassert[A-Z][A-Za-z0-9_$]*\s*\(|\bexpect\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/imu;
   const removedTestMarker = /^-(?!---).*\s*(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|test)\s*\]|@(?:org\.junit\.)?Test\b|\[(?:Fact|Test|Theory)\])/imu;

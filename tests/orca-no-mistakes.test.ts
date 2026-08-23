@@ -2781,7 +2781,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     await writeFile(
       path.join(repo, "src/inline.js"),
-      "test('response', () => {\n  assert.deepEqual(actual, {\n    ok: true,\n  });\n});\n",
+      "test.each(cases)('response', () => {\n  assert.deepEqual(actual, {\n    ok: true,\n  });\n});\n",
     );
     await writeFile(
       path.join(repo, "src/assertions.js"),
@@ -3063,20 +3063,26 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "reset", "--hard", featureHead);
     await writeFile(
       path.join(worker, "src/inline.js"),
-      "test('response', () => {\n  assert.deepEqual(actual, {\n    ok: false,\n  });\n});\n",
+      "test.each(cases)('response', () => {\n  assert.deepEqual(actual, {\n    ok: false,\n  });\n});\n",
     );
+    git(worker, "add", "src/inline.js");
+    git(worker, "commit", "-m", "weaken multiline inline assertion");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified co-located test assertions or skip markers: src\/inline\.js/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
     await writeFile(
       path.join(worker, "src/assertions.js"),
       "export function verify(_actual) {}\n",
     );
-    git(worker, "add", "src/assertions.js", "src/inline.js");
-    git(worker, "commit", "-m", "weaken multiline inline assertion");
-    await assert.rejects(assertWorkerChangesAllowed(), (error: unknown) => {
-      assert.ok(error instanceof Error);
-      assert.match(error.message, /src\/assertions\.js/);
-      assert.match(error.message, /src\/inline\.js/);
-      return true;
-    });
+    git(worker, "add", "src/assertions.js");
+    git(worker, "commit", "-m", "remove common assertion");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified co-located test assertions or skip markers: src\/assertions\.js/,
+    );
 
     git(worker, "reset", "--hard", featureHead);
     await writeFile(
