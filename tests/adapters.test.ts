@@ -181,7 +181,6 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
     )
   }
   for (const [harness, required] of [
-    ['agy', '--dangerously-skip-permissions'],
     ['claude', '--dangerously-skip-permissions'],
     ['codex', '--dangerously-bypass-approvals-and-sandbox']
   ]) {
@@ -447,6 +446,10 @@ test('buildCliCommand always sends the agy reserved flag and rejects reserved ov
         error.message === `agent agy: reserved argument '${flag}' cannot be overridden`
     )
   }
+  assert.throws(
+    () => buildCliCommand('agy', { agentArgsOverride: { agy: ['--'] } } as never),
+    /option terminator '--' cannot precede the managed prompt carrier/
+  )
   // Other harnesses keep plain passthrough overrides.
   assert.equal(
     buildCliCommand('grok', { agentArgsOverride: { grok: ['-q'] } as never }),

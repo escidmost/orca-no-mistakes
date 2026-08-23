@@ -1150,11 +1150,18 @@ async function releaseFixerSession(
   session: FixerSession,
   orca: OrcaOperations,
 ): Promise<void> {
+  await releaseWorker(session.worker, orca);
+}
+
+async function releaseWorker(
+  worker: WorkerResult,
+  orca: OrcaOperations,
+): Promise<void> {
   try {
-    await orca.finishWorker(session.worker, "release");
+    await orca.finishWorker(worker, "release");
   } finally {
-    if (session.worker.worktreeId) {
-      await orca.removeWorktree(session.worker.worktreeId);
+    if (worker.worktreeId) {
+      await orca.removeWorktree(worker.worktreeId);
     }
   }
 }
@@ -1250,6 +1257,7 @@ async function runFixer(
   const worktreeId = worker.worktreeId ?? retainedSession?.worker.worktreeId;
   let workerHead: string | undefined;
   let retainWorker = false;
+  let strictCleanup = false;
   try {
     await validateReport(worker.report, stage, path.dirname(reportPath));
     if (!worktreePath) {
@@ -1259,19 +1267,24 @@ async function runFixer(
     if (before === workerHead) {
       throw new Error(`${stage} fixer did not commit a change`);
     }
-    await git.assertFixerChangesAllowed(
-      worktreePath,
-      before,
-      workerHead,
-      stage === "rebase"
-        ? {
-            conflictFiles: findings.flatMap((finding) =>
-              finding.file ? [finding.file] : [],
-            ),
-            upstreamHead: rebaseUpstreamHead ?? "",
-          }
-        : undefined,
-    );
+    try {
+      await git.assertFixerChangesAllowed(
+        worktreePath,
+        before,
+        workerHead,
+        stage === "rebase"
+          ? {
+              conflictFiles: findings.flatMap((finding) =>
+                finding.file ? [finding.file] : [],
+              ),
+              upstreamHead: rebaseUpstreamHead ?? "",
+            }
+          : undefined,
+      );
+    } catch (error) {
+      strictCleanup = error instanceof FixerPolicyViolationError;
+      throw error;
+    }
     if (fence.aborted) {
       // The execution timeout already failed this stage; refuse late mutations
       // so a delayed worker cannot apply commits into a settled run.
@@ -1335,10 +1348,8 @@ async function runFixer(
       }
     }
     if (!retainWorker) {
-      await orca.finishWorker(worker, "release").catch(() => {});
-    }
-    if (!retainWorker && worktreeId) {
-      await orca.removeWorktree(worktreeId).catch(() => {});
+      const cleanup = releaseWorker(worker, orca);
+      await (strictCleanup ? cleanup : cleanup.catch(() => {}));
     }
   }
 }
@@ -3702,13 +3713,15 @@ function isTestPath(filePath: string): boolean {
           "testdata",
           "test-data",
           "test_data",
+          "unittest",
+          "unittests",
         ].includes(
           part.toLowerCase(),
         ) ||
         /\.tests?$/i.test(part),
       ) ||
     fileName.toLowerCase().endsWith(".snap") ||
-    /(?:^|[._-])(?:tests?|specs?|cy|e2e)(?=[._]|$)/i.test(fileName) ||
+    /(?:^|[._-])(?:tests?|specs?|unittests?|cy|e2e)(?=[._]|$)/i.test(fileName) ||
     (!["docs", "scripts"].includes(parts[0]?.toLowerCase() ?? "") &&
       /^tests?-[A-Za-z0-9]/i.test(fileStem)) ||
     /^(?:test|spec|Test|Spec)[A-Z0-9]/.test(fileStem) ||
@@ -3716,16 +3729,17 @@ function isTestPath(filePath: string): boolean {
   );
 }
 
-function weakensInlineTestValidation(diff: string, expectedSource: string): boolean {
-  const inlineTestRegistration = /^\s*(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|test)\s*\]|@(?:org\.junit\.)?Test\b|\[(?:Fact|Test|Theory)\]|(?:describe|context|it|test)(?:\.each\s*\([^)]*\))?\s*\(\s*["'`]|.*\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b|>>>)/imu;
-  if (inlineTestRegistration.test(expectedSource)) return true;
-  const removedAssertion = /^-(?!---).*(?:\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|\bassert[A-Z][A-Za-z0-9_$]*\s*\(|\bexpect\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/imu;
-  const removedTestMarker = /^-(?!---).*\s*(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|test)\s*\]|@(?:org\.junit\.)?Test\b|\[(?:Fact|Test|Theory)\])/imu;
-  const addedSkipMarker = /^\+(?!\+\+\+).*(?:#\[(?:ignore|should_panic)\]|\b(?:describe|it|test)\.(?:only|skip)\s*\(|\bpytest\.mark\.(?:skip|skipif|xfail)\b|@\w*Ignore\b)/imu;
+function weakensInlineTestValidation(
+  expectedSource: string,
+  source: string | undefined,
+): boolean {
+  if (source === expectedSource) return false;
+  const protectedValidation = /^\s*(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|test)\s*\]|@(?:org\.junit\.)?Test\b|\[(?:Fact|Test|Theory)\]|(?:describe|context|it|test)(?:\.[A-Za-z_$][\w$]*(?:\s*\([^)]*\))?)*\s*\(\s*["'`]|.*\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|\bassert[A-Z][A-Za-z0-9_$]*\s*\(|\bexpect\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/imu;
+  if (protectedValidation.test(expectedSource)) return true;
+  const skipMarker = /(?:#\[(?:ignore|should_panic)\]|\b(?:describe|it|test)(?:\.[A-Za-z_$][\w$]*)*\.(?:only|skip)\s*\(|\bpytest\.mark\.(?:skip|skipif|xfail)\b|@\w*Ignore\b)/giu;
   return (
-    removedAssertion.test(diff) ||
-    removedTestMarker.test(diff) ||
-    addedSkipMarker.test(diff)
+    (source?.match(skipMarker)?.length ?? 0) >
+    (expectedSource.match(skipMarker)?.length ?? 0)
   );
 }
 
@@ -3789,6 +3803,8 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "uv.lock",
       "yarn.lock",
     ].includes(fileName) ||
+    (parts.at(-2) === ".mvn" && fileName === "maven.config") ||
+    /^settings\.gradle(?:\.kts)?$/.test(fileName) ||
     (parts[0] !== "docs" && parts.slice(0, -1).includes("prompts")) ||
     /^(?:(?:vitest|jest|playwright|cypress)\.config\..+|\.mocharc(?:\..+)?|karma\.conf\..+|eslint\.config\..+|\.eslintrc(?:\..+)?|prettier\.config\..+|\.prettierrc(?:\..+)?|biome\.jsonc?|deno\.jsonc?|\.editorconfig|\.flake8|\.?ruff\.toml|\.?mypy\.ini|\.pylintrc|pyrightconfig\.json|\.rubocop\.ya?ml|stylelint\.config\..+|\.stylelintrc(?:\..+)?|\.?markdownlint(?:-cli2)?(?:\..+)?|\.golangci\.(?:ya?ml|toml|json)|\.?rustfmt\.toml|\.?clippy\.toml|\.clang-tidy|analysis_options\.yaml|checkstyle\.xml|detekt\.ya?ml|phpcs\.xml(?:\.dist)?|phpstan(?:\.[^.]+)?\.neon(?:\.dist)?|sonar-project\.properties|tsconfig(?:\.[^.]+)*\.json|tslint(?:\.[^.]+)*\.json)$/.test(
       fileName,
@@ -3988,39 +4004,21 @@ export class GitShell implements GitOperations {
     const protectedInlineTests: string[] = [];
     const protectedPolicy: string[] = [];
     for (const filePath of changedPaths) {
+      if (isProtectedValidationPolicyPath(filePath)) {
+        protectedPolicy.push(filePath);
+        continue;
+      }
       if (isTestPath(filePath) && (await this.pathExists(expectedHead, filePath))) {
         protectedTests.push(filePath);
       } else if (await this.pathExists(expectedHead, filePath)) {
-        const diff = await this.#git(
-          [
-            "-C",
-            sourcePath,
-            "diff",
-            "--no-ext-diff",
-            "--unified=0",
-            "--no-renames",
-            expectedHead,
-            sourceHead,
-            "--",
-            filePath,
-          ],
-          true,
-        );
-        if (diff.failed) {
-          throw new Error(
-            `could not inspect inline test assertions in ${filePath}: ${diff.output}`,
-          );
-        }
         const expectedSource = await this.showFile(expectedHead, filePath);
         if (expectedSource === undefined) {
           throw new Error(`could not read pre-round source file ${filePath}`);
         }
-        if (weakensInlineTestValidation(diff.stdout, expectedSource)) {
+        const source = await this.showFile(sourceHead, filePath);
+        if (weakensInlineTestValidation(expectedSource, source)) {
           protectedInlineTests.push(filePath);
         }
-      }
-      if (isProtectedValidationPolicyPath(filePath)) {
-        protectedPolicy.push(filePath);
       }
     }
     if (protectedTests.length > 0) {

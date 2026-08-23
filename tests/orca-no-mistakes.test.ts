@@ -1015,6 +1015,45 @@ test("a policy-violation approval waives the evidence shown at its gate", async 
   await rm(path.join(artifactsRoot(), runId), { recursive: true, force: true });
 });
 
+test("a rejected fixer fails closed when its cleanup fails", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  git.protectedTestMutation = "tests/existing.test.ts";
+  class CleanupFailureOrca extends FakeOrca {
+    override async finishWorker(
+      worker: WorkerResult,
+      disposition: "release" | "retain",
+    ): Promise<void> {
+      await super.finishWorker(worker, disposition);
+      if (disposition === "release" && this.fixerDispatches.includes(worker.dispatchId)) {
+        throw new Error("rejected fixer cleanup failed");
+      }
+    }
+  }
+  const orca = new CleanupFailureOrca(git);
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Repair the implementation.",
+        },
+      ],
+      summary: "one defect",
+    },
+    pass("fix attempted"),
+  ]);
+
+  await assert.rejects(
+    runPipeline({ intent: "Clean rejected fixer resources." }, orca, git),
+    /rejected fixer cleanup failed/,
+  );
+  assert.equal(orca.gates.length, 0);
+  assert.ok(orca.removedWorktrees.length > 0);
+});
+
 test("a passing run fails closed when retained fixer cleanup fails", async () => {
   const git = new FakeGit();
   allowReviewAutoFix(git);
@@ -2729,6 +2768,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await mkdir(path.join(repo, "MyProject.Tests"));
     await mkdir(path.join(repo, "__specs__"));
     await mkdir(path.join(repo, "java"));
+    await mkdir(path.join(repo, "cpp"));
     await mkdir(path.join(repo, "scripts"));
     await mkdir(path.join(repo, "specs"));
     await mkdir(path.join(repo, "src"));
@@ -2763,6 +2803,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     await writeFile(path.join(repo, "__specs__/widget.ts"), "assert(true);\n");
     await writeFile(path.join(repo, "java/TestFoo.java"), "assert true;\n");
+    await writeFile(
+      path.join(repo, "cpp/foo_unittest.cc"),
+      "TEST(Foo, Works) { EXPECT_EQ(value(), 1); }\n",
+    );
     await writeFile(path.join(repo, "specs/widget.ts"), "assert(true);\n");
     await writeFile(
       path.join(repo, "src/OrderServiceTest.java"),
@@ -2782,6 +2826,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(
       path.join(repo, "src/inline.js"),
       "test.each(cases)('response', () => {\n  assert.deepEqual(actual, {\n    ok: true,\n  });\n});\n",
+    );
+    await writeFile(
+      path.join(repo, "src/concurrent.js"),
+      "test.concurrent('works', async () => { expect(await value()).toBe(1); });\n",
     );
     await writeFile(
       path.join(repo, "src/assertions.js"),
@@ -2826,6 +2874,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "MyProject.Tests/OrderServiceTests.cs",
       "__specs__/widget.ts",
       "java/TestFoo.java",
+      "cpp/foo_unittest.cc",
       "specs/widget.ts",
       "src/OrderServiceTest.java",
       "src/WidgetSpec.kt",
@@ -2834,6 +2883,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "src/testFoo.ts",
       "src/lib.rs",
       "src/inline.js",
+      "src/concurrent.js",
       "src/assertions.js",
       "src/__snapshots__/Widget.snap",
       "testdata/expected.json",
@@ -2896,6 +2946,16 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(worker, "package-lock.json"), '{"lockfileVersion":3}\n');
     await writeFile(path.join(worker, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
     await writeFile(path.join(worker, "pom.xml"), "<skipTests>true</skipTests>\n");
+    await mkdir(path.join(worker, ".mvn"));
+    await writeFile(path.join(worker, ".mvn/maven.config"), "-DskipTests\n");
+    await writeFile(
+      path.join(worker, "settings.gradle"),
+      "gradle.startParameter.excludedTaskNames.add('test')\n",
+    );
+    await writeFile(
+      path.join(worker, "settings.gradle.kts"),
+      "gradle.startParameter.excludedTaskNames.add(\"test\")\n",
+    );
     await writeFile(path.join(worker, "pytest.ini"), "[pytest]\naddopts = --ignore=Tests\n");
     await writeFile(
       path.join(worker, "cypress.config.ts"),
@@ -2911,6 +2971,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       worker,
       "add",
       ".mocharc.json",
+      ".mvn/maven.config",
       "Cargo.lock",
       "build.gradle",
       "build.gradle.kts",
@@ -2923,6 +2984,8 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "pom.xml",
       "prompts/fixer.md",
       "pytest.ini",
+      "settings.gradle",
+      "settings.gradle.kts",
       "tslint.build.json",
       "tslint.json",
       "vitest.config.ts",
@@ -2932,7 +2995,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "commit", "-m", "weaken validation policy");
     await assert.rejects(
       assertWorkerChangesAllowed(),
-      /unexplained-policy-relaxation:.*\.mocharc\.json, Cargo\.lock, build\.gradle, build\.gradle\.kts, cypress\.config\.ts, eslint\.config\.js, go\.work, package-lock\.json, package\.json, pkg\/go\.mod, pnpm-lock\.yaml, pom\.xml, prompts\/fixer\.md, pytest\.ini, tslint\.build\.json, tslint\.json, vitest\.config\.ts, yarn\.lock/,
+      /unexplained-policy-relaxation:.*\.mocharc\.json, \.mvn\/maven\.config, Cargo\.lock, build\.gradle, build\.gradle\.kts, cypress\.config\.ts, eslint\.config\.js, go\.work, package-lock\.json, package\.json, pkg\/go\.mod, pnpm-lock\.yaml, pom\.xml, prompts\/fixer\.md, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, yarn\.lock/,
     );
 
     git(worker, "reset", "--hard", featureHead);
@@ -3074,14 +3137,39 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
 
     git(worker, "reset", "--hard", featureHead);
     await writeFile(
+      path.join(worker, "src/concurrent.js"),
+      "test.concurrent.skip('works', async () => { expect(await value()).toBe(1); });\n",
+    );
+    git(worker, "add", "src/concurrent.js");
+    git(worker, "commit", "-m", "skip chained inline test");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified co-located test assertions or skip markers: src\/concurrent\.js/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
       path.join(worker, "src/assertions.js"),
       "export function verify(_actual) {}\n",
     );
-    git(worker, "add", "src/assertions.js");
+    await writeFile(path.join(worker, ".gitattributes"), "src/assertions.js -diff\n");
+    git(worker, "add", ".gitattributes", "src/assertions.js");
     git(worker, "commit", "-m", "remove common assertion");
     await assert.rejects(
       assertWorkerChangesAllowed(),
       /fixer modified co-located test assertions or skip markers: src\/assertions\.js/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "cpp/foo_unittest.cc"),
+      "TEST(Foo, Works) { EXPECT_EQ(value(), 2); }\n",
+    );
+    git(worker, "add", "cpp/foo_unittest.cc");
+    git(worker, "commit", "-m", "weaken C++ unit test");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified pre-existing test files: cpp\/foo_unittest\.cc/,
     );
 
     git(worker, "reset", "--hard", featureHead);

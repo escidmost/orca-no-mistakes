@@ -206,6 +206,11 @@ export function buildCliCommand(harness: string, options: CliAgentCommandOptions
     }
   }
   const raw = Array.isArray(override) ? override : []
+  if (normalizedHarness === 'agy' && raw.includes('--')) {
+    throw new Error(
+      "agent agy: option terminator '--' cannot precede the managed prompt carrier"
+    )
+  }
   const effortKnob = EFFORT_KNOBS[normalizedHarness]
   const modelPinned =
     pinsAnyFlag(raw, MODEL_PIN_FLAGS) ||
