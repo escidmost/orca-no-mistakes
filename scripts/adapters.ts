@@ -234,8 +234,16 @@ export function harnessTitleMatcher(harness: string): (title?: string | null) =>
 export function readinessMatcher(
   harness: string
 ): (terminal: TerminalView) => boolean {
+  const normalizedHarness = harness.toLowerCase()
   const titleTaken = harnessTitleMatcher(harness)
-  return ({ preview, title }) => titleTaken(title) && !(preview ?? '').includes(INTERRUPT_MARKER)
+  return ({ preview, title }) => {
+    const output = preview ?? ''
+    const codexActive =
+      normalizedHarness === 'codex' &&
+      /\bWorking\(\d+s\b/.test(output) &&
+      /›[\s\S]{0,500}\s[^\s·]+\s+(?:minimal|low|medium|high|xhigh|max)\s*(?:·|$)/i.test(output)
+    return (titleTaken(title) || codexActive) && !output.includes(INTERRUPT_MARKER)
+  }
 }
 
 function escapeRegExp(value: string): string {

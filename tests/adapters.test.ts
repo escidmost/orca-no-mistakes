@@ -274,6 +274,19 @@ test('readinessMatcher matches per-harness terminal titles and rejects interrupt
   assert.equal(agy({ title: 'Antigravity', preview: 'ready' }), true)
   assert.equal(agy({ title: 'agy', preview: 'esc interrupt' }), false)
   assert.equal(agy({ title: 'notagy', preview: 'ready' }), false)
+
+  const codex = readinessMatcher('codex')
+  assert.equal(
+    codex({
+      title: '⠇ no-mistakes-review-1',
+      preview: '•Working(44s • esc to interrupt)\n› Find and fix a bug in @filename  gpt-5.6-luna max'
+    }),
+    true
+  )
+  assert.equal(
+    codex({ title: 'no-mistakes-review-1', preview: '•Working(44s)' }),
+    false
+  )
 })
 
 test('workerAgentReadyTimeoutMs honors the environment override with a safe default', () => {

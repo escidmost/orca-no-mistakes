@@ -17,7 +17,7 @@ The runner must launch worker agents across diverse agent harnesses without comp
   3. *ACP Target Execution*: For `acp:<target>` harnesses, the adapter invokes the `acpx` execution runner against the target server.
 
 - **Modular Readiness Detection**:
-  - Readiness for CLI-injected terminals is detected via per-harness matchers inspecting terminal title state and preview content (e.g., verifying `OpenCode` / `OC |` titles and absence of active interrupt markers for OpenCode, and dedicated prompt signatures for Grok/Gemini).
+  - Readiness for CLI-injected terminals is detected via per-harness matchers inspecting terminal title state and preview content. Titles are primary; Codex also accepts its active working indicator plus model/effort footer because a hidden pane can retain its worktree title after Codex starts processing.
   - A configurable startup deadline (`WORKER_AGENT_READY_TIMEOUT_MS`) prevents unbounded hangs; failure immediately triggers clean worker termination and worktree deallocation.
 
 - **Prompt Guardrails and Untrusted Data Framing**:

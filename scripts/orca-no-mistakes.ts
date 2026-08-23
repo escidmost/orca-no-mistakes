@@ -2769,21 +2769,21 @@ export class CliOrca implements OrcaOperations {
           );
         const titleLine = `${terminal.title ?? ""}`;
         const renderedOutput = `${terminal.preview ?? ""}`;
+        const startupReady = ready({
+          preview: terminal.preview ?? null,
+          title: terminal.title ?? null,
+        });
         if (
           isBinaryMissingOutput(titleLine, harness) ||
-          (!harnessTookOver(terminal.title) &&
+          (!startupReady &&
+            !harnessTookOver(terminal.title) &&
             isBinaryMissingOutput(renderedOutput, harness))
         )
           throw new PreflightError(
             "binary-missing",
             `worker agent ${harness} is not installed: ${`${titleLine}\n${renderedOutput}`.trim().slice(-200)}`,
           );
-        if (
-          ready({
-            preview: terminal.preview ?? null,
-            title: terminal.title ?? null,
-          })
-        ) {
+        if (startupReady) {
           consecutiveMatches += 1;
           if (consecutiveMatches >= 2) return;
         } else {

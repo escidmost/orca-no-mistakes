@@ -3838,7 +3838,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
 } else if (args[0] === 'terminal' && args[1] === 'send') {
   out({ accepted: true })
 } else if (args[0] === 'terminal' && args[1] === 'show') {
-  out({ terminal: { connected: true, title: 'Codex', preview: 'ready' } })
+  out({ terminal: { connected: true, title: '⠇ no-mistakes-review-1', preview: '•Working(44s • esc to interrupt)\\n› Find and fix a bug in @filename  gpt-5.6-luna max' } })
 } else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
   out({ dispatch: { id: 'dispatch-codex', status: 'dispatched' }, injected: false, preamble: 'authenticated' })
 } else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
