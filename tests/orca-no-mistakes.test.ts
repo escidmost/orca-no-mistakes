@@ -20,6 +20,7 @@ import test from "node:test";
 import {
   CliOrca,
   DomainLedger,
+  FixerPolicyViolationError,
   GitShell,
   PIPELINE_STEPS,
   PostMutationCustodyError,
@@ -127,8 +128,10 @@ class FakeGit implements GitOperations {
   ): Promise<void> {
     this.calls.push(`guard:${sourcePath}:${expectedHead}`);
     if (this.protectedTestMutation) {
-      throw new Error(
-        `fixer modified pre-existing test files: ${this.protectedTestMutation}`,
+      const mutation = this.protectedTestMutation;
+      this.protectedTestMutation = undefined;
+      throw new FixerPolicyViolationError(
+        `fixer modified pre-existing test files: ${mutation}`,
       );
     }
   }
@@ -649,11 +652,74 @@ test("fix rounds reuse one durable fixer terminal and worktree", async () => {
   assert.ok(orca.calls.includes(`release:${orca.fixerDispatches.at(-1)}`));
 });
 
-test("fixer mutations to trusted-base tests fail before commit application", async () => {
+test("a stale retained fixer retries through the fresh fallback chain", async () => {
+  const git = new FakeGit();
+  git.baseFiles.set(
+    "origin/main:.orca/no-mistakes.yaml",
+    "auto_fix:\n  allow_review_autofix: true\nstages:\n  review:\n    fixer:\n      agent: [claude, grok]\n",
+  );
+  class StaleFixerOrca extends FakeOrca {
+    #fixerAttempt = 0;
+
+    override async startWorker(
+      taskId: string,
+      launch: WorkerLaunch,
+    ): Promise<WorkerResult> {
+      if (launch.role === "fixer") {
+        this.#fixerAttempt += 1;
+        if (this.#fixerAttempt === 2 || this.#fixerAttempt === 3) {
+          this.launches.push(launch);
+          throw new PreflightError(
+            this.#fixerAttempt === 2 ? "readiness-timeout" : "quota",
+            this.#fixerAttempt === 2
+              ? "retained Claude terminal disconnected"
+              : "fresh Claude quota exhausted",
+          );
+        }
+      }
+      return super.startWorker(taskId, launch);
+    }
+  }
+  const orca = new StaleFixerOrca(git);
+  const finding: Finding = {
+    id: "review-1",
+    severity: "error",
+    action: "auto-fix",
+    description: "The defect remains after the first repair.",
+  };
+  orca.reports.set("review", [
+    { findings: [finding], summary: "first failure" },
+    pass("first fix"),
+    { findings: [finding], summary: "second failure" },
+    pass("fallback fix"),
+    pass("clean rereview"),
+  ]);
+
+  await runPipeline({ intent: "Recover a stale fixer session." }, orca, git);
+
+  const fixers = orca.launches.filter((launch) => launch.role === "fixer");
+  assert.deepEqual(
+    fixers.map((launch) => [
+      launch.agent?.harness,
+      launch.terminal,
+      launch.worktree,
+    ]),
+    [
+      ["claude", undefined, "new-child"],
+      ["claude", "term-fixer", "current"],
+      ["claude", undefined, "new-child"],
+      ["grok", undefined, "new-child"],
+    ],
+  );
+  assert.ok(orca.calls.includes(`release:${orca.fixerDispatches[0]}`));
+});
+
+test("protected fixer commits are rejected at a resumable human gate", async () => {
   const git = new FakeGit();
   allowReviewAutoFix(git);
   git.protectedTestMutation = "tests/existing.test.ts";
   const orca = new FakeOrca(git);
+  orca.gateResolution = "fix fixer-policy-violation";
   orca.reports.set("review", [
     {
       findings: [
@@ -667,16 +733,66 @@ test("fixer mutations to trusted-base tests fail before commit application", asy
       summary: "one defect",
     },
     pass("fix attempted"),
+    pass("safe retry"),
+    pass("clean rereview"),
   ]);
 
-  await assert.rejects(
-    runPipeline({ intent: "Protect existing assertions." }, orca, git),
+  await runPipeline({ intent: "Protect existing assertions." }, orca, git);
+
+  assert.equal(orca.gates.length, 1);
+  assert.match(orca.gates[0].question, /fixer-policy-violation/);
+  assert.match(
+    orca.gates[0].question,
     /fixer modified pre-existing test files: tests\/existing\.test\.ts/,
+  );
+  assert.equal(
+    orca.launches.filter((launch) => launch.role === "fixer").length,
+    2,
   );
   assert.ok(git.calls.some((call) => call.startsWith("guard:/worktrees/")));
   assert.equal(
-    git.calls.some((call) => call.startsWith("apply:/worktrees/")),
-    false,
+    git.calls.filter((call) => call.startsWith("apply:/worktrees/")).length,
+    1,
+  );
+});
+
+test("a passing run fails closed when retained fixer cleanup fails", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  class CleanupFailureOrca extends FakeOrca {
+    override async finishWorker(
+      worker: WorkerResult,
+      disposition: "release" | "retain",
+    ): Promise<void> {
+      await super.finishWorker(worker, disposition);
+      if (
+        disposition === "release" &&
+        this.fixerDispatches.includes(worker.dispatchId)
+      ) {
+        throw new Error("retained fixer cleanup failed");
+      }
+    }
+  }
+  const orca = new CleanupFailureOrca(git);
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Repair the implementation.",
+        },
+      ],
+      summary: "one defect",
+    },
+    pass("fix committed"),
+    pass("clean rereview"),
+  ]);
+
+  await assert.rejects(
+    runPipeline({ intent: "Require fixer cleanup." }, orca, git),
+    /retained fixer cleanup failed/,
   );
 });
 
@@ -2220,6 +2336,16 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       shell.assertFixerChangesAllowed(worker, featureHead),
       /unexplained-policy-relaxation:.*eslint\.config\.js, package\.json, prompts\/fixer\.md/,
     );
+
+    git(worker, "reset", "--hard", featureHead);
+    await mkdir(path.join(worker, "docs/agents"), { recursive: true });
+    await writeFile(
+      path.join(worker, "docs/agents/prompt-templates.md"),
+      "Document application prompt templates.\n",
+    );
+    git(worker, "add", "docs/agents/prompt-templates.md");
+    git(worker, "commit", "-m", "document prompt templates");
+    await shell.assertFixerChangesAllowed(worker, featureHead);
 
     git(worker, "reset", "--hard", featureHead);
     await writeFile(
@@ -4969,11 +5095,18 @@ test("a rebase conflict fixes forward and rebases evidence onto the resolved bas
   );
 
   assert.ok(result.attestation);
-  assert.ok(
-    orca.launches.some(
-      (launch) => launch.role === "fixer" && launch.stage === "rebase",
-    ),
-    "expected a rebase fixer to run",
+  const rebaseFixer = orca.launches.find(
+    (launch) => launch.role === "fixer" && launch.stage === "rebase",
+  );
+  assert.ok(rebaseFixer, "expected a rebase fixer to run");
+  assert.match(
+    rebaseFixer.prompt,
+    /Existing tests and validation-policy files may change only when resolving reported rebase conflicts/,
+  );
+  assert.equal(
+    git.calls.some((call) => call.startsWith("guard:")),
+    false,
+    "the post-rebase review owns validation-policy auditing",
   );
   const failedAttempt = result.attestation.stageEvidence.find(
     (entry) => entry.summary === "rebase aborted",
