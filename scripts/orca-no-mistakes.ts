@@ -182,6 +182,10 @@ export interface GitOperations {
   ): Promise<boolean>;
   /** Resolves the current HEAD commit of a worker worktree. */
   headOf(worktreePath: string): Promise<string>;
+  worktreeHeadMatches(
+    worktreePath: string,
+    expectedHead: string,
+  ): Promise<boolean>;
   anchorRecoveryRef(runId: string, oid: string): Promise<void>;
 }
 
@@ -1115,7 +1119,20 @@ async function runFixer(
   await git.assertClean();
   const before = await git.head();
   const agents = launchCandidates(role);
-  const sessionToReuse = retainedSession;
+  let sessionToReuse = retainedSession;
+  if (sessionToReuse) {
+    const retainedPath = sessionToReuse.worker.worktreePath;
+    const reusable =
+      retainedPath !== undefined &&
+      (await git
+        .worktreeHeadMatches(retainedPath, before)
+        .catch(() => false));
+    if (!reusable) {
+      retainedSession = undefined;
+      await releaseFixerSession(sessionToReuse, orca).catch(() => {});
+      sessionToReuse = undefined;
+    }
+  }
   const launches = (sessionToReuse
     ? [sessionToReuse.agent, ...agents]
     : agents
@@ -1137,7 +1154,7 @@ async function runFixer(
       role: "fixer",
       stage,
       terminal: reuseSession
-        ? sessionToReuse.worker.terminalHandle
+        ? sessionToReuse?.worker.terminalHandle
         : undefined,
       worktree: reuseSession ? "current" : "new-child",
     };
@@ -3402,11 +3419,12 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "makefile",
       "package.json",
       "pyproject.toml",
+      "pytest.ini",
       "setup.cfg",
       "tox.ini",
     ].includes(fileName) ||
     (parts[0] !== "docs" && parts.slice(0, -1).includes("prompts")) ||
-    /^(?:eslint\.config\..+|\.eslintrc(?:\..+)?|prettier\.config\..+|\.prettierrc(?:\..+)?|biome\.jsonc?|deno\.jsonc?|\.editorconfig|\.flake8|\.?ruff\.toml|\.?mypy\.ini|\.pylintrc|pyrightconfig\.json|\.rubocop\.ya?ml|stylelint\.config\..+|\.stylelintrc(?:\..+)?|\.?markdownlint(?:-cli2)?(?:\..+)?|\.golangci\.(?:ya?ml|toml|json)|\.?rustfmt\.toml|\.?clippy\.toml|\.clang-tidy|analysis_options\.yaml|checkstyle\.xml|detekt\.ya?ml|phpcs\.xml(?:\.dist)?|phpstan(?:\.[^.]+)?\.neon(?:\.dist)?|sonar-project\.properties|tsconfig(?:\.[^.]+)*\.json)$/.test(
+    /^(?:(?:vitest|jest|playwright)\.config\..+|\.mocharc(?:\..+)?|karma\.conf\..+|eslint\.config\..+|\.eslintrc(?:\..+)?|prettier\.config\..+|\.prettierrc(?:\..+)?|biome\.jsonc?|deno\.jsonc?|\.editorconfig|\.flake8|\.?ruff\.toml|\.?mypy\.ini|\.pylintrc|pyrightconfig\.json|\.rubocop\.ya?ml|stylelint\.config\..+|\.stylelintrc(?:\..+)?|\.?markdownlint(?:-cli2)?(?:\..+)?|\.golangci\.(?:ya?ml|toml|json)|\.?rustfmt\.toml|\.?clippy\.toml|\.clang-tidy|analysis_options\.yaml|checkstyle\.xml|detekt\.ya?ml|phpcs\.xml(?:\.dist)?|phpstan(?:\.[^.]+)?\.neon(?:\.dist)?|sonar-project\.properties|tsconfig(?:\.[^.]+)*\.json)$/.test(
       fileName,
     )
   );
@@ -3414,11 +3432,13 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
 
 const COORDINATOR_POLICY_SOURCE = "scripts/orca-no-mistakes.ts";
 const COORDINATOR_POLICY_BLOCKS = [
-  ["let nextFixer:", "fixerSession = nextFixer.session;"],
-  ["async function runFixer(", "async function validateReport("],
-  ["function checkerBrief(", "function gateQuestion("],
-  ["function isTestPath(", "type GitShellOptions"],
-  ["async assertFixerChangesAllowed(", "async head()"],
+  ["\n        let nextFixer:", "\n        fixerSession = nextFixer.session;"],
+  ["\nasync function runFixer(", "\nasync function validateReport("],
+  ["\nfunction checkerBrief(", "\nfunction gateQuestion("],
+  ["\nfunction isTestPath(", "\ntype GitShellOptions"],
+  ["\n  async assertFixerChangesAllowed(", "\n  async head()"],
+  ["\n  async headOf(", "\n  async anchorRecoveryRef("],
+  ["\n  async showFile(", "\n  async #detectBase("],
 ] as const;
 
 function coordinatorPolicyBlocks(source: string | undefined): string | undefined {
@@ -3426,7 +3446,7 @@ function coordinatorPolicyBlocks(source: string | undefined): string | undefined
   const blocks: string[] = [];
   for (const [startMarker, endMarker] of COORDINATOR_POLICY_BLOCKS) {
     const start = source.indexOf(startMarker);
-    const end = source.indexOf(endMarker, start);
+    const end = source.indexOf(endMarker, start + startMarker.length);
     if (start < 0 || end < 0) return undefined;
     blocks.push(source.slice(start, end));
   }
@@ -3713,6 +3733,13 @@ export class GitShell implements GitOperations {
       );
     }
     return result.stdout.trim();
+  }
+
+  async worktreeHeadMatches(
+    worktreePath: string,
+    expectedHead: string,
+  ): Promise<boolean> {
+    return (await this.headOf(worktreePath)) === expectedHead;
   }
 
   async anchorRecoveryRef(runId: string, oid: string): Promise<void> {

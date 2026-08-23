@@ -156,6 +156,14 @@ class FakeGit implements GitOperations {
     return oid;
   }
 
+  async worktreeHeadMatches(
+    worktreePath: string,
+    expectedHead: string,
+  ): Promise<boolean> {
+    this.calls.push(`worktree-head:${worktreePath}:${expectedHead}`);
+    return this.#workerHeads.get(worktreePath) === expectedHead;
+  }
+
   async resolveRefSha(ref: string): Promise<string | undefined> {
     return `sha-${ref.replaceAll("/", "-")}`;
   }
@@ -2360,14 +2368,26 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
 
     git(worker, "reset", "--hard", featureHead);
     await writeFile(path.join(worker, "eslint.config.js"), "export default [];\n");
+    await writeFile(path.join(worker, ".mocharc.json"), '{"spec":[]}\n');
     await writeFile(path.join(worker, "package.json"), '{"scripts":{"test":"true"}}\n');
+    await writeFile(path.join(worker, "pytest.ini"), "[pytest]\naddopts = --ignore=Tests\n");
+    await writeFile(path.join(worker, "vitest.config.ts"), "export default { test: { exclude: ['Tests/**'] } };\n");
     await mkdir(path.join(worker, "prompts"));
     await writeFile(path.join(worker, "prompts/fixer.md"), "weaken checks\n");
-    git(worker, "add", "eslint.config.js", "package.json", "prompts/fixer.md");
+    git(
+      worker,
+      "add",
+      ".mocharc.json",
+      "eslint.config.js",
+      "package.json",
+      "prompts/fixer.md",
+      "pytest.ini",
+      "vitest.config.ts",
+    );
     git(worker, "commit", "-m", "weaken validation policy");
     await assert.rejects(
       shell.assertFixerChangesAllowed(worker, featureHead),
-      /unexplained-policy-relaxation:.*eslint\.config\.js, package\.json, prompts\/fixer\.md/,
+      /unexplained-policy-relaxation:.*\.mocharc\.json, eslint\.config\.js, package\.json, prompts\/fixer\.md, pytest\.ini, vitest\.config\.ts/,
     );
 
     git(worker, "reset", "--hard", featureHead);
@@ -2399,28 +2419,54 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "commit", "-m", "repair implementation");
     await shell.assertFixerChangesAllowed(worker, featureHead);
 
-    git(worker, "reset", "--hard", featureHead);
-    await writeFile(
-      path.join(worker, "scripts/orca-no-mistakes.ts"),
-      `${coordinatorSource.replace("function checkerInstructions(", "function relaxedCheckerInstructions(")}\nexport const integrationFixture = 1;\n`,
-    );
-    git(worker, "add", "scripts/orca-no-mistakes.ts");
-    git(worker, "commit", "-m", "weaken coordinator prompt");
-    await assert.rejects(
-      shell.assertFixerChangesAllowed(worker, featureHead),
-      /protected validation policy files: scripts\/orca-no-mistakes\.ts/,
-    );
+    const assertCoordinatorChangeRejected = async (
+      source: string,
+      message: string,
+    ) => {
+      git(worker, "reset", "--hard", featureHead);
+      await writeFile(
+        path.join(worker, "scripts/orca-no-mistakes.ts"),
+        `${source}\nexport const integrationFixture = 1;\n`,
+      );
+      git(worker, "add", "scripts/orca-no-mistakes.ts");
+      git(worker, "commit", "-m", message);
+      await assert.rejects(
+        shell.assertFixerChangesAllowed(worker, featureHead),
+        /protected validation policy files: scripts\/orca-no-mistakes\.ts/,
+      );
+    };
 
-    git(worker, "reset", "--hard", featureHead);
-    await writeFile(
-      path.join(worker, "scripts/orca-no-mistakes.ts"),
-      `${coordinatorSource.replace('if (stage !== "rebase") {', "if (false) {")}\nexport const integrationFixture = 1;\n`,
+    await assertCoordinatorChangeRejected(
+      coordinatorSource.replace(
+        "function checkerInstructions(",
+        "function relaxedCheckerInstructions(",
+      ),
+      "weaken coordinator prompt",
     );
-    git(worker, "add", "scripts/orca-no-mistakes.ts");
-    git(worker, "commit", "-m", "disable fixer guard");
-    await assert.rejects(
-      shell.assertFixerChangesAllowed(worker, featureHead),
-      /protected validation policy files: scripts\/orca-no-mistakes\.ts/,
+    await assertCoordinatorChangeRejected(
+      coordinatorSource.replace('if (stage !== "rebase") {', "if (false) {"),
+      "disable fixer guard call",
+    );
+    await assertCoordinatorChangeRejected(
+      coordinatorSource.replace(
+        "if (protectedTests.length > 0) {",
+        "if (false) {",
+      ),
+      "disable fixer guard enforcement",
+    );
+    await assertCoordinatorChangeRejected(
+      coordinatorSource.replace(
+        "return result.stdout.trim().length > 0;",
+        "return false;",
+      ),
+      "disable existing test detection",
+    );
+    await assertCoordinatorChangeRejected(
+      coordinatorSource.replace(
+        '["-C", worktreePath, "rev-parse", "HEAD"]',
+        '["rev-parse", "HEAD"]',
+      ),
+      "disable retained worktree validation",
     );
 
     git(worker, "reset", "--hard", featureHead);
@@ -5160,9 +5206,24 @@ test("the attestation keeps the policy digest captured at run start", async () =
 
 test("a rebase conflict fixes forward and rebases evidence onto the resolved base", async () => {
   const git = new FakeGit();
+  allowReviewAutoFix(git);
   git.rebaseConflict = true;
   const orca = new FakeOrca(git);
   orca.gateResolution = "approve";
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Repair after the rebase.",
+        },
+      ],
+      summary: "one defect",
+    },
+    pass("clean rereview"),
+  ]);
 
   const result = await runPipeline(
     { intent: "Fix past a rebase conflict." },
@@ -5175,14 +5236,24 @@ test("a rebase conflict fixes forward and rebases evidence onto the resolved bas
     (launch) => launch.role === "fixer" && launch.stage === "rebase",
   );
   assert.ok(rebaseFixer, "expected a rebase fixer to run");
+  const reviewFixer = orca.launches.find(
+    (launch) => launch.role === "fixer" && launch.stage === "review",
+  );
+  assert.ok(reviewFixer, "expected a review fixer to run");
+  assert.equal(reviewFixer.terminal, undefined);
+  assert.equal(reviewFixer.worktree, "new-child");
+  assert.ok(
+    git.calls.some((call) => call.startsWith("worktree-head:")),
+    "retained fixer reuse must verify the worktree head",
+  );
   assert.match(
     rebaseFixer.prompt,
     /Existing tests and validation-policy files may change only when resolving reported rebase conflicts/,
   );
   assert.equal(
-    git.calls.some((call) => call.startsWith("guard:")),
-    false,
-    "the post-rebase review owns validation-policy auditing",
+    git.calls.filter((call) => call.startsWith("guard:")).length,
+    1,
+    "only the post-rebase review fixer uses protected-path enforcement",
   );
   const failedAttempt = result.attestation.stageEvidence.find(
     (entry) => entry.summary === "rebase aborted",
