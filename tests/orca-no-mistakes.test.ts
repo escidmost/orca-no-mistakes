@@ -1793,6 +1793,7 @@ test("CliOrca reuses a fixer through supervised worker-start", async () => {
   const fakeOrca = path.join(temp, "orca");
   const callsPath = path.join(temp, "calls.jsonl");
   const countPath = path.join(temp, "count");
+  const blockWaitPath = path.join(temp, "block-wait");
   const startCountPath = path.join(temp, "start-count");
   const evidence = path.join(
     homedir(),
@@ -1836,12 +1837,16 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
 } else if (args[0] === 'orchestration' && args[1] === 'worker-abandon') {
   out({ abandoned: true })
 } else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
+  if (fs.existsSync(${JSON.stringify(blockWaitPath)})) {
+    setInterval(() => {}, 1000)
+  } else {
   const count = fs.existsSync(${JSON.stringify(countPath)}) ? Number(fs.readFileSync(${JSON.stringify(countPath)}, 'utf8')) : 0
   fs.writeFileSync(${JSON.stringify(countPath)}, String(count + 1))
   const dispatchId = 'dispatch-' + (count + 1)
   const taskId = 'task-' + (count + 1)
   const reportPath = count === 0 ? ${JSON.stringify(reportOne)} : count === 1 ? ${JSON.stringify(reportTwo)} : ${JSON.stringify(reportThree)}
   out({ deliveryId: 'delivery-' + count, messages: [{ type: 'worker_done', body: 'Fixed the issue. Verified the change. Nothing remains.', payload: JSON.stringify({ taskId, dispatchId, outcome: 'succeeded', reportPath }) }] })
+  }
 } else {
   out({ ok: true })
 }
@@ -1883,6 +1888,39 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       worktree: "current",
     });
     await orca.finishWorker(third, "release");
+    await writeFile(blockWaitPath, "block");
+    const abortController = new AbortController();
+    const fence = {
+      aborted: false,
+      deadlineSatisfied: false,
+      signal: abortController.signal,
+    };
+    const abortTimer = setTimeout(() => {
+      fence.aborted = true;
+      abortController.abort();
+    }, 50);
+    const blockedAt = Date.now();
+    await assert.rejects(
+      orca.startWorker(
+        "task-blocked",
+        {
+          name: "blocked-fixer",
+          prompt: "blocked",
+          role: "fixer",
+          stage: "test",
+          retainedWorktreeId: "worker-worktree",
+          terminal: third.terminalHandle,
+          worktree: "current",
+        },
+        fence,
+      ),
+      /aborted|cancelled/i,
+    );
+    clearTimeout(abortTimer);
+    assert.ok(
+      Date.now() - blockedAt < 2_000,
+      "an aborted attempt must kill its run-mailbox wait promptly",
+    );
     await orca.cancelTaskWorkers("task-cancel");
 
     const calls = (await readFile(callsPath, "utf8"))
@@ -1891,7 +1929,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       .map((line) => JSON.parse(line) as string[]);
     assert.equal(calls.filter((args) => args[1] === "dispatch").length, 1);
     const retainedStarts = calls.filter((args) => args[1] === "worker-start");
-    assert.equal(retainedStarts.length, 2);
+    assert.equal(retainedStarts.length, 3);
     assert.ok(
       retainedStarts.every(
         (args) =>
@@ -1906,7 +1944,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     const closes = calls.filter(
       (args) => args[0] === "terminal" && args[1] === "close",
     );
-    assert.equal(closes.length, 2);
+    assert.equal(closes.length, 3);
     assert.ok(closes[0].includes("created-fixer"));
     assert.ok(
       calls.some(

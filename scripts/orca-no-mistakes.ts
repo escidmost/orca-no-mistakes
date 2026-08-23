@@ -864,6 +864,7 @@ type TimeoutFence = {
   cancel?: () => Promise<void>;
   deadlineSatisfied: boolean;
   settlement?: Promise<unknown>;
+  signal?: AbortSignal;
 };
 
 async function withTimeout<T>(
@@ -873,7 +874,12 @@ async function withTimeout<T>(
 ): Promise<T> {
   if (timeoutMs === undefined)
     return await run({ aborted: false, deadlineSatisfied: false });
-  const fence: TimeoutFence = { aborted: false, deadlineSatisfied: false };
+  const abortController = new AbortController();
+  const fence: TimeoutFence = {
+    aborted: false,
+    deadlineSatisfied: false,
+    signal: abortController.signal,
+  };
   let timer: ReturnType<typeof setTimeout> | undefined;
   const operation = run(fence);
   try {
@@ -883,6 +889,7 @@ async function withTimeout<T>(
         timer = setTimeout(() => {
           if (fence.deadlineSatisfied) return;
           fence.aborted = true;
+          abortController.abort();
           reject(
             new Error(`${label} exceeded its ${timeoutMs}ms execution timeout`),
           );
@@ -1933,6 +1940,7 @@ async function command(
   args: string[],
   cwd: string,
   options: {
+    abortSignal?: AbortSignal;
     allowFailure?: boolean;
     timeoutMs?: number | null;
   } = {},
@@ -1941,6 +1949,8 @@ async function command(
     const child = spawn(executable, args, {
       cwd,
       env: process.env,
+      killSignal: "SIGKILL",
+      signal: options.abortSignal,
       stdio: ["ignore", "pipe", "pipe"],
     });
     const timeoutMs =
@@ -2271,6 +2281,7 @@ export class CliOrca implements OrcaOperations {
         taskId,
         dispatchId,
         terminalHandle,
+        fence,
       );
       deliveryId = result.deliveryId;
       if (result.error) throw new Error(result.error);
@@ -2315,20 +2326,24 @@ export class CliOrca implements OrcaOperations {
       const started = await this.#json<{
         dispatchId?: string;
         state?: string;
-      }>([
-        "orchestration",
-        "worker-start",
-        "--task",
-        taskId,
-        "--worktree",
-        `id:${worktreeId}`,
-        "--terminal",
-        terminalHandle,
-        "--timeout-ms",
-        String(workerAgentReadyTimeoutMs()),
-        ...(this.#runId ? ["--run", this.#runId] : []),
-        "--json",
-      ]);
+      }>(
+        [
+          "orchestration",
+          "worker-start",
+          "--task",
+          taskId,
+          "--worktree",
+          `id:${worktreeId}`,
+          "--terminal",
+          terminalHandle,
+          "--timeout-ms",
+          String(workerAgentReadyTimeoutMs()),
+          ...(this.#runId ? ["--run", this.#runId] : []),
+          "--json",
+        ],
+        false,
+        fence,
+      );
       if (!started.dispatchId || started.state !== "ready") {
         throw new Error(
           `worker-start returned an invalid retained-worker receipt: ${JSON.stringify(started).slice(0, 400)}`,
@@ -2357,6 +2372,7 @@ export class CliOrca implements OrcaOperations {
         taskId,
         dispatchId,
         terminalHandle,
+        fence,
       );
       deliveryId = result.deliveryId;
       if (result.error) throw new Error(result.error);
@@ -3384,6 +3400,7 @@ export class CliOrca implements OrcaOperations {
     taskId: string,
     dispatchId: string,
     terminalHandle: string,
+    fence?: TimeoutFence,
   ): Promise<{ deliveryId?: string; error?: string; report?: StageReport }> {
     let lastActivityAt = Date.now();
     let lastOutputAt = await this.#workerOutputAt(terminalHandle);
@@ -3415,6 +3432,7 @@ export class CliOrca implements OrcaOperations {
           "--json",
         ],
         true,
+        fence,
       );
       if (result._keepalive || result._heartbeat || result.timedOut) {
         const outputAt = await this.#workerOutputAt(terminalHandle);
@@ -3626,8 +3644,13 @@ export class CliOrca implements OrcaOperations {
     }
   }
 
-  async #json<T = unknown>(args: string[], acceptFailure = false): Promise<T> {
+  async #json<T = unknown>(
+    args: string[],
+    acceptFailure = false,
+    fence?: TimeoutFence,
+  ): Promise<T> {
     const result = await command(this.#command, args, this.#cwd, {
+      abortSignal: fence?.signal,
       allowFailure: acceptFailure,
       timeoutMs: args.includes("--wait") ? 910_000 : undefined,
     });
