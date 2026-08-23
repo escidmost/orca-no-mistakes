@@ -2798,7 +2798,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(repo, "cli.bats"), "@test 'works' { true; }\n");
     await writeFile(
       path.join(repo, "package.json"),
-      '{"scripts":{"test":"node scripts/test-harness.ts"}}\n',
+      '{"scripts":{"test":"sh scripts/verify-ci.sh"}}\n',
     );
     await writeFile(
       path.join(repo, "scripts/test-harness.ts"),
@@ -2808,6 +2808,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       path.join(repo, "scripts/test-runner.ts"),
       "export const runner = 1;\n",
     );
+    await writeFile(path.join(repo, "scripts/verify-ci.sh"), "npm test\n");
     await writeFile(
       path.join(repo, "src/spec-parser.ts"),
       "export const parser = 1;\n",
@@ -2900,6 +2901,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "spec/openapi.yaml",
       "scripts/test-harness.ts",
       "scripts/test-runner.ts",
+      "scripts/verify-ci.sh",
       "MyProject.Tests/OrderServiceTests.cs",
       "__specs__/widget.ts",
       "java/TestFoo.java",
@@ -3108,6 +3110,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "export const parser = 2;\n",
     );
     await writeFile(
+      path.join(worker, "scripts/test-harness.ts"),
+      "export const harness = 2;\n",
+    );
+    await writeFile(
       path.join(worker, "scripts/test-runner.ts"),
       "export const runner = 2;\n",
     );
@@ -3115,6 +3121,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       worker,
       "add",
       "spec/openapi.yaml",
+      "scripts/test-harness.ts",
       "scripts/test-runner.ts",
       "src/spec-parser.ts",
     );
@@ -3122,15 +3129,12 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await assertWorkerChangesAllowed();
 
     git(worker, "reset", "--hard", featureHead);
-    await writeFile(
-      path.join(worker, "scripts/test-harness.ts"),
-      "export const harness = 2;\n",
-    );
-    git(worker, "add", "scripts/test-harness.ts");
-    git(worker, "commit", "-m", "disable referenced test harness");
+    await writeFile(path.join(worker, "scripts/verify-ci.sh"), "exit 0\n");
+    git(worker, "add", "scripts/verify-ci.sh");
+    git(worker, "commit", "-m", "disable referenced validation entrypoint");
     await assert.rejects(
       assertWorkerChangesAllowed(),
-      /protected validation policy files: scripts\/test-harness\.ts/,
+      /protected validation policy files: scripts\/verify-ci\.sh/,
     );
 
     git(worker, "reset", "--hard", featureHead);
@@ -6914,6 +6918,62 @@ test("a fixer applied within its timeout may finish coordinator verification", a
 
   assert.ok(orca.launches.some((launch) => launch.role === "fixer"));
   assert.equal(orca.gates.length, 0);
+});
+
+test("a concurrent post-transfer commit fails fixer custody verification", async () => {
+  class ConcurrentPostTransferGit extends FakeGit {
+    #returnConcurrentHead = false;
+
+    async applyWorktreeCommits(
+      sourcePath: string,
+      expectedHead: string,
+      expectedSourceHead: string,
+      fence?: { readonly aborted: boolean },
+    ): Promise<boolean> {
+      const applied = await super.applyWorktreeCommits(
+        sourcePath,
+        expectedHead,
+        expectedSourceHead,
+        fence,
+      );
+      this.#returnConcurrentHead = applied;
+      return applied;
+    }
+
+    async head(): Promise<string> {
+      if (this.#returnConcurrentHead) {
+        this.#returnConcurrentHead = false;
+        return "f".repeat(40);
+      }
+      return super.head();
+    }
+  }
+
+  const git = new ConcurrentPostTransferGit();
+  allowReviewAutoFix(git);
+  const orca = new FakeOrca(git);
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Null input crashes the command",
+        },
+      ],
+      summary: "one defect",
+    },
+  ]);
+
+  await assert.rejects(
+    runPipeline(
+      { intent: "Bind custody to the validated fixer commit." },
+      orca,
+      git,
+    ),
+    /fixer custody ended at unexpected HEAD/,
+  );
 });
 
 test("disabling auto_fix gates mechanical findings on every stage", async () => {

@@ -1302,8 +1302,10 @@ async function runFixer(
     }
     fence.deadlineSatisfied = true;
     const after = await git.head();
-    if (before === after) {
-      throw new Error(`${stage} fixer did not commit a change`);
+    if (after !== workerHead) {
+      throw new PostMutationCustodyError(
+        `${stage} fixer custody ended at unexpected HEAD ${after}; expected ${workerHead}`,
+      );
     }
     const terminalHandle =
       worker.terminalHandle ?? retainedSession?.worker.terminalHandle;
@@ -3826,13 +3828,6 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
   );
 }
 
-function isValidationHarnessPath(filePath: string): boolean {
-  const fileName = filePath.split("/").at(-1) ?? "";
-  return /(?:^|[._-])(?:tests?|specs?)[._-](?:harness|runner)(?=[._-]|$)|(?:^|[._-])(?:harness|runner)[._-](?:tests?|specs?)(?=[._-]|$)|(?:^|[._-])run[._-]tests?(?=[._-]|$)/i.test(
-    fileName,
-  );
-}
-
 type GitShellOptions = { base?: string; expectedHead?: string; repo: string };
 
 export class GitShell implements GitOperations {
@@ -4024,7 +4019,7 @@ export class GitShell implements GitOperations {
     const protectedTests: string[] = [];
     const protectedInlineTests: string[] = [];
     const protectedPolicy: string[] = [];
-    const validationHarnesses: string[] = [];
+    const validationEntrypoints: string[] = [];
     for (const filePath of changedPaths) {
       if (isProtectedValidationPolicyPath(filePath)) {
         protectedPolicy.push(filePath);
@@ -4033,7 +4028,7 @@ export class GitShell implements GitOperations {
       if (isTestPath(filePath) && (await this.pathExists(expectedHead, filePath))) {
         protectedTests.push(filePath);
       } else if (await this.pathExists(expectedHead, filePath)) {
-        if (isValidationHarnessPath(filePath)) validationHarnesses.push(filePath);
+        validationEntrypoints.push(filePath);
         const expectedSource = await this.showFile(expectedHead, filePath);
         if (expectedSource === undefined) {
           throw new Error(`could not read pre-round source file ${filePath}`);
@@ -4044,10 +4039,10 @@ export class GitShell implements GitOperations {
         }
       }
     }
-    if (validationHarnesses.length > 0) {
-      for (const harnessPath of validationHarnesses) {
+    if (validationEntrypoints.length > 0) {
+      for (const entrypointPath of validationEntrypoints) {
         const references = await this.#git(
-          ["grep", "-l", "-F", "-z", "-e", harnessPath, expectedHead, "--"],
+          ["grep", "-l", "-F", "-z", "-e", entrypointPath, expectedHead, "--"],
           true,
         );
         if (references.failed && references.output.trim()) {
@@ -4064,7 +4059,7 @@ export class GitShell implements GitOperations {
             )
             .some(isProtectedValidationPolicyPath)
         ) {
-          protectedPolicy.push(harnessPath);
+          protectedPolicy.push(entrypointPath);
         }
       }
     }
