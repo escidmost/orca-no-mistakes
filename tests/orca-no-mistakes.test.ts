@@ -773,6 +773,41 @@ test("protected fixer commits are rejected at a resumable human gate", async () 
   );
 });
 
+test("a policy-violation approval waives the evidence shown at its gate", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  git.protectedTestMutation = "tests/existing.test.ts";
+  const orca = new FakeOrca(git);
+  orca.gateResolution = "approve";
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Repair the implementation.",
+        },
+      ],
+      summary: "one defect",
+    },
+    pass("fix attempted"),
+  ]);
+
+  const result = await runPipeline(
+    { intent: "Record protected-path rejections." },
+    orca,
+    git,
+  );
+
+  const policyEvidence = result.attestation?.stageEvidence.find(
+    (entry) => entry.summary === "review fixer commit rejected by protected-path policy",
+  );
+  assert.equal(policyEvidence?.workerIdentity, "coordinator:fixer-policy");
+  assert.equal(policyEvidence?.exitCode, 1);
+  assert.equal(policyEvidence?.waiverOrApproval?.decision, "approve");
+});
+
 test("a passing run fails closed when retained fixer cleanup fails", async () => {
   const git = new FakeGit();
   allowReviewAutoFix(git);
@@ -1528,11 +1563,15 @@ if (args[1] === 'run-create') {
 } else if (args[1] === 'gate-create') {
   out({ gate: { id: 'gate-review' } })
 } else if (args[1] === 'gate-list') {
-  out({ gates: [{ id: 'gate-review', status: fs.existsSync(${JSON.stringify(resolvedPath)}) ? 'resolved' : 'pending', resolution: 'fix: verified' }] })
+  out({ gates: [
+    { id: 'gate-review', status: fs.existsSync(${JSON.stringify(resolvedPath)}) ? 'resolved' : 'pending', resolution: 'fix: verified' },
+    { id: 'gate-other', status: 'pending' }
+  ] })
 } else if (args[1] === 'check' && args.includes('--types')) {
   out({ deliveryId: 'gate-delivery', messages: [
     { id: 'response-message', from_handle: 'originating-opencode', subject: 'no-mistakes gate response', body: JSON.stringify({ gateId: 'gate-review', resolution: 'fix: verified' }) },
-    { id: 'other-response', from_handle: 'originating-opencode', subject: 'no-mistakes gate response', body: JSON.stringify({ gateId: 'gate-other', resolution: 'approve' }) }
+    { id: 'other-response', from_handle: 'originating-opencode', subject: 'no-mistakes gate response', body: JSON.stringify({ gateId: 'gate-other', resolution: 'approve' }) },
+    { id: 'stale-response', from_handle: 'originating-opencode', subject: 'no-mistakes gate response', body: JSON.stringify({ gateId: 'gate-stale', resolution: 'approve' }) }
   ] })
 } else if (args[1] === 'gate-resolve') {
   const id = args[args.indexOf('--id') + 1]
@@ -1571,6 +1610,7 @@ if (args[1] === 'run-create') {
     assert.equal(resolved.length, 2);
     assert.ok(resolved.some((args) => args.includes("gate-review")));
     assert.ok(resolved.some((args) => args.includes("gate-other")));
+    assert.ok(!resolved.some((args) => args.includes("gate-stale")));
     const acknowledgedIndex = calls.findIndex(
       (args) => args[1] === "check" && args.includes("--ack"),
     );

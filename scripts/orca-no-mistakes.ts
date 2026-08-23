@@ -660,6 +660,14 @@ export async function runPipeline(
             ],
             summary: `${stage} fixer commit rejected by protected-path policy`,
           };
+          await recordStageEvidence(
+            stage,
+            round,
+            "coordinator:fixer-policy",
+            1,
+            report,
+            { attempts: [], resolvedAgent: "coordinator" },
+          );
           continue;
         }
         fixerSession = nextFixer.session;
@@ -1936,7 +1944,8 @@ const NATIVE_WORKER_CREATE_SLACK_MS = 120_000;
 const FISH_SHELL_STARTUP_DELAY_MS = 12_000;
 
 function workerShellStartupDelayMs(): number {
-  const configured = Number(process.env.WORKER_SHELL_STARTUP_DELAY_MS);
+  const raw = process.env.WORKER_SHELL_STARTUP_DELAY_MS?.trim();
+  const configured = raw ? Number(raw) : Number.NaN;
   if (Number.isFinite(configured) && configured >= 0) return configured;
   return path.basename(process.env.SHELL ?? "") === "fish"
     ? FISH_SHELL_STARTUP_DELAY_MS
@@ -3022,12 +3031,18 @@ export class CliOrca implements OrcaOperations {
       if (gate?.status === "resolved") return gate.resolution ?? "";
       if (gate?.status === "timeout")
         throw new Error(`gate ${gateId} timed out`);
-      await this.#applyGateResponses();
+      await this.#applyGateResponses(
+        new Set(
+          result.gates
+            .filter((candidate) => candidate.status === "pending")
+            .map((candidate) => candidate.id),
+        ),
+      );
       await new Promise((resolve) => setTimeout(resolve, 1000));
     }
   }
 
-  async #applyGateResponses(): Promise<void> {
+  async #applyGateResponses(pendingGateIds: ReadonlySet<string>): Promise<void> {
     if (!this.#runId) return;
     const result = await this.#json<{
       deliveryId?: string;
@@ -3046,7 +3061,6 @@ export class CliOrca implements OrcaOperations {
       this.#runId,
       "--json",
     ]);
-    let applied = false;
     for (const message of result.messages ?? []) {
       if (
         message.subject !== "no-mistakes gate response" ||
@@ -3072,18 +3086,19 @@ export class CliOrca implements OrcaOperations {
       ) {
         continue;
       }
+      const responseGateId = response.gateId.trim();
+      if (!pendingGateIds.has(responseGateId)) continue;
       await this.#json([
         "orchestration",
         "gate-resolve",
         "--id",
-        response.gateId.trim(),
+        responseGateId,
         "--resolution",
         response.resolution.trim(),
         "--json",
       ]);
-      applied = true;
     }
-    if (applied && result.deliveryId) {
+    if (result.deliveryId) {
       await this.#json([
         "orchestration",
         "check",
