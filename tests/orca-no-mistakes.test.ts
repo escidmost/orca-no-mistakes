@@ -2032,6 +2032,7 @@ test("CliOrca reuses a fixer through supervised worker-start", async () => {
   const blockWaitPath = path.join(temp, "block-wait");
   const failClosePath = path.join(temp, "fail-close");
   const failAbandonPath = path.join(temp, "fail-abandon");
+  const invalidStartPath = path.join(temp, "invalid-start");
   const startCountPath = path.join(temp, "start-count");
   const evidence = path.join(
     homedir(),
@@ -2072,7 +2073,9 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
 } else if (args[0] === 'orchestration' && args[1] === 'worker-start') {
   const count = fs.existsSync(${JSON.stringify(startCountPath)}) ? Number(fs.readFileSync(${JSON.stringify(startCountPath)}, 'utf8')) : 0
   fs.writeFileSync(${JSON.stringify(startCountPath)}, String(count + 1))
-  out({ dispatchId: 'dispatch-' + (count + 1), state: 'ready' })
+  out(fs.existsSync(${JSON.stringify(invalidStartPath)})
+    ? { dispatchId: 'dispatch-invalid', state: 'failed' }
+    : { dispatchId: 'dispatch-' + (count + 1), state: 'ready' })
 } else if (args[0] === 'orchestration' && args[1] === 'worker-list') {
   out({ workers: [
     { taskId: 'task-cancel', dispatchId: 'dispatch-cancel', agentTerminalHandle: 'created-fixer', terminalState: 'active', resource: null },
@@ -2136,6 +2139,38 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       worktree: "current",
     });
     await orca.finishWorker(third, "release");
+
+    await writeFile(invalidStartPath, "fail\n");
+    const callsBeforeInvalidStart = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n").length;
+    await assert.rejects(
+      orca.startWorker("task-invalid-retained", {
+        name: "invalid-retained-fixer",
+        prompt: "invalid retained receipt",
+        role: "fixer",
+        stage: "review",
+        retainedWorktreeId: "worker-worktree",
+        terminal: first.terminalHandle,
+        worktree: "current",
+      }),
+      /invalid retained-worker receipt/,
+    );
+    const invalidStartCalls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .slice(callsBeforeInvalidStart)
+      .map((line) => JSON.parse(line) as string[]);
+    assert.ok(
+      invalidStartCalls.some(
+        (args) =>
+          args[0] === "orchestration" &&
+          args[1] === "worker-abandon" &&
+          args.includes("dispatch-invalid"),
+      ),
+      "a dispatch from a non-ready retained receipt is abandoned before fallback",
+    );
+    await rm(invalidStartPath, { force: true });
     await writeFile(failClosePath, "fail\n");
     await assert.rejects(
       orca.finishWorker({ ...third, deliveryId: undefined }, "release"),
@@ -2188,7 +2223,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       .map((line) => JSON.parse(line) as string[]);
     assert.equal(calls.filter((args) => args[1] === "dispatch").length, 1);
     const retainedStarts = calls.filter((args) => args[1] === "worker-start");
-    assert.equal(retainedStarts.length, 3);
+    assert.equal(retainedStarts.length, 4);
     assert.ok(
       retainedStarts.every(
         (args) =>
@@ -7979,6 +8014,76 @@ test("a fixer timeout during commit application leaves the branch unchanged", as
     await git.head(),
     git.headAtApply,
     "no commit landed after the stage timed out",
+  );
+});
+
+test("a fixer timeout waits for strict worker cleanup failures", async () => {
+  class SlowApplyGit extends FakeGit {
+    async applyWorktreeCommits(
+      sourcePath: string,
+      expectedHead: string,
+      expectedSourceHead: string,
+      fence?: { readonly aborted: boolean },
+    ): Promise<boolean> {
+      await new Promise((resolve) => setTimeout(resolve, 75));
+      return super.applyWorktreeCommits(
+        sourcePath,
+        expectedHead,
+        expectedSourceHead,
+        fence,
+      );
+    }
+  }
+  const git = new SlowApplyGit();
+  allowReviewAutoFix(git);
+  class SlowCleanupOrca extends FakeOrca {
+    cleanupSettled = false;
+
+    override async finishWorker(
+      worker: WorkerResult,
+      disposition: "release" | "retain",
+    ): Promise<void> {
+      await super.finishWorker(worker, disposition);
+      if (
+        disposition === "release" &&
+        this.fixerDispatches.includes(worker.dispatchId)
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        this.cleanupSettled = true;
+        throw new Error("timeout cleanup failed");
+      }
+    }
+  }
+  const orca = new SlowCleanupOrca(git);
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Null input crashes the command",
+        },
+      ],
+      summary: "one defect",
+    },
+  ]);
+
+  await assert.rejects(
+    runPipeline(
+      {
+        intent: "Wait for timed-out fixer cleanup.",
+        cliFlags: { fixer: { timeout_ms: 10 } } as never,
+      },
+      orca,
+      git,
+    ),
+    /review fixer cleanup failed.*timeout cleanup failed/,
+  );
+  assert.equal(
+    orca.cleanupSettled,
+    true,
+    "the timeout does not settle before the owning fixer cleanup",
   );
 });
 

@@ -894,7 +894,6 @@ function launchCandidates(
 type TimeoutFence = {
   aborted: boolean;
   deadlineSatisfied: boolean;
-  settlement?: Promise<unknown>;
   signal?: AbortSignal;
 };
 
@@ -930,7 +929,7 @@ async function withTimeout<T>(
   } catch (error) {
     if (fence.aborted) {
       try {
-        await (fence.settlement ?? operation);
+        await operation;
       } catch (settledError) {
         if (
           settledError instanceof PostMutationCustodyError ||
@@ -1333,7 +1332,6 @@ async function runFixer(
       workerHead,
       fence,
     );
-    fence.settlement = transfer;
     if (!(await transfer)) {
       throw new Error(`${stage} fixer could not apply its committed change`);
     }
@@ -2397,12 +2395,12 @@ export class CliOrca implements OrcaOperations {
       );
     }
 
-    let dispatchId: string;
     if (fence?.aborted) {
       throw new Error(`${launch.stage} worker attempt was cancelled`);
     }
+    let started: { dispatchId?: string; state?: string };
     try {
-      const started = await this.#json<{
+      started = await this.#json<{
         dispatchId?: string;
         state?: string;
       }>(
@@ -2421,12 +2419,6 @@ export class CliOrca implements OrcaOperations {
           "--json",
         ],
       );
-      if (!started.dispatchId || started.state !== "ready") {
-        throw new Error(
-          `worker-start returned an invalid retained-worker receipt: ${JSON.stringify(started).slice(0, 400)}`,
-        );
-      }
-      dispatchId = started.dispatchId;
     } catch (error) {
       throw new PreflightError(
         classifyPreflightFailure(String(error)),
@@ -2435,8 +2427,26 @@ export class CliOrca implements OrcaOperations {
       );
     }
     if (fence?.aborted) {
-      await this.#cleanupFailedWorker(dispatchId, terminalHandle, worktreeId);
+      await this.#cleanupWorkerResources({
+        dispatchId: started.dispatchId,
+        terminalHandle,
+        worktreeId,
+      });
       throw new Error(`${launch.stage} worker attempt was cancelled`);
+    }
+    if (!started.dispatchId) {
+      throw new PreflightError(
+        "unclassified",
+        `retained worker start failed: worker-start returned an invalid retained-worker receipt: ${JSON.stringify(started).slice(0, 400)}`,
+      );
+    }
+    const dispatchId = started.dispatchId;
+    if (started.state !== "ready") {
+      await this.#cleanupWorkerResources({ dispatchId });
+      throw new PreflightError(
+        "unclassified",
+        `retained worker start failed: worker-start returned an invalid retained-worker receipt: ${JSON.stringify(started).slice(0, 400)}`,
+      );
     }
 
     let deliveryId: string | undefined;
