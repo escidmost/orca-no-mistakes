@@ -3938,9 +3938,16 @@ function isTestPath(filePath: string): boolean {
       parts[index - 1]?.toLowerCase() === "src" &&
       /^[a-z][A-Za-z0-9]*Test$/.test(part),
   );
+  const mavenInvokerTestSource = parts.some(
+    (part, index) =>
+      index > 0 &&
+      parts[index - 1]?.toLowerCase() === "src" &&
+      part.toLowerCase() === "it",
+  );
   return (
     singularSpecSource ||
     variantTestSourceSet ||
+    mavenInvokerTestSource ||
     parts
       .slice(0, -1)
       .some((part) =>
@@ -4061,6 +4068,7 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
     [
       "cargo.toml",
       "build.sbt",
+      "build.xml",
       "build.zig",
       "build.gradle",
       "build.gradle.kts",
