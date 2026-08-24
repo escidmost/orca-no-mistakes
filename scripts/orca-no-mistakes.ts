@@ -826,10 +826,18 @@ export async function runPipeline(
       steps: PIPELINE_STEPS,
     };
   } catch (error) {
+    let failure: unknown = error;
     if (fixerSession) {
       const failedSession = fixerSession;
       fixerSession = undefined;
-      await releaseFixerSession(failedSession, orca).catch(() => {});
+      try {
+        await releaseFixerSession(failedSession, orca);
+      } catch (cleanupError) {
+        failure = new WorkerCleanupError(
+          `retained fixer cleanup failed: ${String(cleanupError)}`,
+          { cause: error },
+        );
+      }
     }
     const outcome = error instanceof GateStopError ? "cancelled" : "failed";
     let anchorError: unknown;
@@ -841,15 +849,15 @@ export async function runPipeline(
       anchorError = recoveryError;
       anchoredOid = undefined;
     }
-    if (anchoredOid !== undefined && error instanceof Error) {
+    if (anchoredOid !== undefined && failure instanceof Error) {
       const operatorHead = await deliveryGit.head().catch(() => undefined);
       if (operatorHead !== anchoredOid) {
-        (error as CustodyTaggedError).recoverRef = recoveryRefFor(runId);
+        (failure as CustodyTaggedError).recoverRef = recoveryRefFor(runId);
       }
     }
     if (!anchorError) ledger.releaseLease(runId);
     ledger.finishRun(runId, outcome);
-    const message = error instanceof Error ? error.message : String(error);
+    const message = failure instanceof Error ? failure.message : String(failure);
     await orca
       .setWorktreeStatus(
         `${statusPrefix}no-mistakes stopped: ${message}`,
@@ -857,9 +865,9 @@ export async function runPipeline(
       )
       .catch(() => {});
     if (anchorError) {
-      throw new RecoveryAnchorError(runId, outcome, error, anchorError);
+      throw new RecoveryAnchorError(runId, outcome, failure, anchorError);
     }
-    throw error;
+    throw failure;
   }
 }
 
@@ -4223,7 +4231,14 @@ function containsValidationPathReference(
     containsPrefixedPathReference(source, reference);
   if ([...references].some(containsReference)) return true;
   if (targetPath.toLowerCase().endsWith(".py")) {
-    const modules = [...references]
+    const moduleReferences = new Set(references);
+    for (const reference of references) {
+      const normalized = reference.replace(/^\.\//, "");
+      if (normalized.startsWith("src/")) {
+        moduleReferences.add(normalized.slice("src/".length));
+      }
+    }
+    const modules = [...moduleReferences]
       .filter((reference) => !reference.startsWith(".."))
       .map((reference) =>
         reference

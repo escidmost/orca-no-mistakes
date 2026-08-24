@@ -1187,6 +1187,53 @@ test("a passing run fails closed when retained fixer cleanup fails", async () =>
   );
 });
 
+test("a failed run surfaces retained fixer cleanup failure with the stage error as cause", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  class CleanupFailureOrca extends FakeOrca {
+    override async finishWorker(
+      worker: WorkerResult,
+      disposition: "release" | "retain",
+    ): Promise<void> {
+      await super.finishWorker(worker, disposition);
+      if (
+        disposition === "release" &&
+        this.fixerDispatches.includes(worker.dispatchId)
+      ) {
+        throw new Error("failed-run retained fixer cleanup failed");
+      }
+    }
+  }
+  const orca = new CleanupFailureOrca(git);
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Repair the implementation.",
+        },
+      ],
+      summary: "one defect",
+    },
+    pass("fix committed"),
+    pass("clean rereview"),
+  ]);
+  orca.reports.set("test", [{ findings: [], summary: "" }]);
+
+  await assert.rejects(
+    runPipeline({ intent: "Preserve stage and cleanup failures." }, orca, git),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /failed-run retained fixer cleanup failed/);
+      assert.ok(error.cause instanceof Error);
+      assert.match(error.cause.message, /test worker returned an invalid report/);
+      return true;
+    },
+  );
+});
+
 test("a fixer round without a new commit opens a human gate", async () => {
   const git = new FakeGit();
   allowReviewAutoFix(git);
@@ -3152,7 +3199,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     await writeFile(
       path.join(repo, ".github/workflows/ci.yml"),
-      "- uses: ./\n- uses: ./.github/actions/check\n- uses: ./ci/check/\n- run: ${{ github.workspace }}/scripts/workspace-verify.sh\n- run: '& \"$env:GITHUB_WORKSPACE\\scripts\\powershell-verify.ps1\"'\n- run: 'Set-Location -Path \"$env:GITHUB_WORKSPACE/scripts\"; ./powershell-location.ps1'\n- run: '%GITHUB_WORKSPACE%\\scripts\\cmd-verify.cmd'\n- run: python -m tools.module_check\n- run: py -3 -m tools\n- run: node scripts/check.ts\n- run: \"$(pwd)/scripts/pwd-verify.sh\"\n- run: \"$(git rev-parse --show-toplevel)/scripts/root-verify.sh\"\n- run: .\\scripts\\check.ps1\n- run: ./check.sh\n  working-directory: ${{ github.workspace }}/commands/\n- run: .\\windows-check.ps1\n  working-directory: commands\\\n- run: ./lint.sh\n  working-directory: other\n- run: |\n    cd shell-commands\n    ./check.sh\n- run: |\n    cd guarded-commands || exit 1\n    set -euo pipefail\n    ./check.sh\n- run: |\n    pushd \"$GITHUB_WORKSPACE/prefixed-commands\"\n    ./verify.sh\n- run: |\n    cd nested-commands\n    cd validation\n    ./check.sh\n",
+      "- uses: ./\n- uses: ./.github/actions/check\n- uses: ./ci/check/\n- run: ${{ github.workspace }}/scripts/workspace-verify.sh\n- run: '& \"$env:GITHUB_WORKSPACE\\scripts\\powershell-verify.ps1\"'\n- run: 'Set-Location -Path \"$env:GITHUB_WORKSPACE/scripts\"; ./powershell-location.ps1'\n- run: '%GITHUB_WORKSPACE%\\scripts\\cmd-verify.cmd'\n- run: python -m tools.module_check\n- run: py -3 -m tools\n- run: python -m myproj.check\n- run: node scripts/check.ts\n- run: \"$(pwd)/scripts/pwd-verify.sh\"\n- run: \"$(git rev-parse --show-toplevel)/scripts/root-verify.sh\"\n- run: .\\scripts\\check.ps1\n- run: ./check.sh\n  working-directory: ${{ github.workspace }}/commands/\n- run: .\\windows-check.ps1\n  working-directory: commands\\\n- run: ./lint.sh\n  working-directory: other\n- run: |\n    cd shell-commands\n    ./check.sh\n- run: |\n    cd guarded-commands || exit 1\n    set -euo pipefail\n    ./check.sh\n- run: |\n    pushd \"$GITHUB_WORKSPACE/prefixed-commands\"\n    ./verify.sh\n- run: |\n    cd nested-commands\n    cd validation\n    ./check.sh\n",
     );
     await writeFile(
       path.join(repo, "action.yml"),
@@ -3205,6 +3252,8 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(repo, "tools/check.sh"), "export TOOL_CHECK=1\n");
     await writeFile(path.join(repo, "tools/module_check.py"), "def main():\n    verify_behavior()\n");
     await writeFile(path.join(repo, "tools/__main__.py"), "def main():\n    verify_behavior()\n");
+    await mkdir(path.join(repo, "src/myproj"), { recursive: true });
+    await writeFile(path.join(repo, "src/myproj/check.py"), "def main():\n    verify_behavior()\n");
     await writeFile(
       path.join(repo, "Jenkinsfile"),
       "pipeline {\n  stages {\n    stage('test') {\n      steps {\n        sh '''\n          cd tools\n          set -euo pipefail\n          ./jenkins-verify.sh\n        '''\n      }\n    }\n  }\n}\n",
@@ -3324,6 +3373,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "tools/jenkins-verify.sh",
       "tools/module_check.py",
       "tools/__main__.py",
+      "src/myproj/check.py",
       "tools/verify.sh",
       "Jenkinsfile",
     );
@@ -3713,6 +3763,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(worker, "scripts/cmd-verify.cmd"), "exit 0\n");
     await writeFile(path.join(worker, "tools/module_check.py"), "def main():\n    pass\n");
     await writeFile(path.join(worker, "tools/__main__.py"), "def main():\n    pass\n");
+    await writeFile(path.join(worker, "src/myproj/check.py"), "def main():\n    pass\n");
     await writeFile(path.join(worker, "scripts/assertions.ts"), "export const skipped = true;\n");
     git(
       worker,
@@ -3722,6 +3773,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "scripts/assertions.ts",
       "tools/module_check.py",
       "tools/__main__.py",
+      "src/myproj/check.py",
     );
     git(worker, "commit", "-m", "disable platform validation entrypoints");
     await assert.rejects(assertWorkerChangesAllowed(), (error: unknown) => {
@@ -3731,6 +3783,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       assert.match(error.message, /scripts\/assertions\.ts/);
       assert.match(error.message, /tools\/__main__\.py/);
       assert.match(error.message, /tools\/module_check\.py/);
+      assert.match(error.message, /src\/myproj\/check\.py/);
       return true;
     });
 
