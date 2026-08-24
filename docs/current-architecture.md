@@ -56,7 +56,7 @@ Each stage and role resolves its own agent from the configuration tiers, and the
 - Rust test attributes include namespaced async/proc-macro forms such as `#[tokio::test]` and `#[rstest]`; JUnit `@ParameterizedTest` and NUnit `[TestCase]` registrations are protected too. Canonical Scala, Swift, Zig, Composer, Ruby, .NET, Elixir, and Dart package/build manifests and their standard lockfiles are protected validation policy because their test targets may be discovered implicitly.
 - Qualified C# registrations and assertions, including NUnit and MSTest namespace-qualified attributes plus `Assert.*` calls, make a pre-round implementation source immutable to fixers.
 - Recognizable JavaScript assertions include Chai modifier/property chains such as `value.should.not.equal(...)` and destructured Node assertion calls when the source imports `node:assert`, including `ok`, `equal`, `deepEqual`, `match`, and strict variants.
-- Robot Framework `.robot` files are dedicated tests, and imported Node assertion APIs include `partialDeepStrictEqual(...)`.
+- Robot Framework `.robot` suites and `.resource` keyword files are dedicated test assets. Any pre-round source importing `node:assert` or `node:assert/strict` is immutable to fixers, so aliased assertion APIs cannot bypass protection.
 - Nox's implicit `noxfile.py` runner configuration is protected validation policy.
 - Central MSBuild policy files `Directory.Build.props`, `Directory.Build.targets`, and `Directory.Packages.props` are protected case-insensitively because projects import them implicitly.
 - Jest image baselines under `__image_snapshots__/` are treated as test assertions alongside `__snapshots__/`, `*-snapshots`, and `*.snap` files.

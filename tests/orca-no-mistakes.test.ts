@@ -3012,6 +3012,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       path.join(repo, "acceptance/login.robot"),
       "*** Test Cases ***\nLogin works\n    Should Be Equal    granted    granted\n",
     );
+    await writeFile(
+      path.join(repo, "acceptance/common.resource"),
+      "*** Keywords ***\nVerify access\n    Should Be Equal    granted    granted\n",
+    );
     await writeFile(path.join(repo, "cli.bats"), "@test 'works' { true; }\n");
     await writeFile(path.join(repo, "docs/test-plan.md"), "# Test plan\n");
     await writeFile(
@@ -3100,6 +3104,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(
       path.join(repo, "src/node_assertions.js"),
       'import { deepEqual, ok, partialDeepStrictEqual } from "node:assert/strict";\nexport function verify(actual) {\n  ok(actual);\n  deepEqual(actual, true);\n  partialDeepStrictEqual(actual, { ok: true });\n}\n',
+    );
+    await writeFile(
+      path.join(repo, "src/node_alias.js"),
+      'import { strictEqual as eq } from "node:assert/strict";\nexport function verify(actual) {\n  eq(actual, true);\n}\n',
     );
     await writeFile(
       path.join(repo, "src/prefixed.js"),
@@ -3223,6 +3231,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       repo,
       "add",
       "feature.ts",
+      "acceptance/common.resource",
       "acceptance/login.robot",
       "cli.bats",
       "conftest.py",
@@ -3261,6 +3270,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "src/assertions.js",
       "src/chai_assertions.js",
       "src/node_assertions.js",
+      "src/node_alias.js",
       "src/prefixed.js",
       "src/check.py",
       "src/__image_snapshots__/widget-snap.png",
@@ -3920,11 +3930,16 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       path.join(worker, "acceptance/login.robot"),
       "*** Test Cases ***\nLogin works\n    Should Be Equal    denied    granted\n",
     );
+    await writeFile(
+      path.join(worker, "acceptance/common.resource"),
+      "*** Keywords ***\nVerify access\n    Should Be Equal    denied    granted\n",
+    );
     git(
       worker,
       "add",
       "main.tftest.hcl",
       "features/login.feature",
+      "acceptance/common.resource",
       "acceptance/login.robot",
       "cli.bats",
     );
@@ -3932,6 +3947,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await assert.rejects(assertWorkerChangesAllowed(), (error: unknown) => {
       assert.ok(error instanceof Error);
       assert.match(error.message, /cli\.bats/);
+      assert.match(error.message, /acceptance\/common\.resource/);
       assert.match(error.message, /acceptance\/login\.robot/);
       assert.match(error.message, /features\/login\.feature/);
       assert.match(error.message, /main\.tftest\.hcl/);
@@ -3980,6 +3996,18 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       assert.match(error.message, /src\/node_assertions\.js/);
       return true;
     });
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/node_alias.js"),
+      'import { strictEqual as eq } from "node:assert/strict";\nexport function verify(_actual) {}\n',
+    );
+    git(worker, "add", "src/node_alias.js");
+    git(worker, "commit", "-m", "remove aliased Node assertion");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified co-located test assertions or skip markers: src\/node_alias\.js/,
+    );
 
     git(worker, "reset", "--hard", featureHead);
     await writeFile(
