@@ -2316,6 +2316,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     process.exitCode = 1
   } else if (count === 1) {
     out({ deliveryId: 'delivery-heartbeat', messages: [
+      { type: 'heartbeat', body: 'malformed stale heartbeat', payload: '{not-json' },
       { type: 'heartbeat', body: 'stale fixer heartbeat', payload: JSON.stringify({ taskId: 'task-stale', dispatchId: 'dispatch-stale' }) },
       { type: 'heartbeat', body: 'still reviewing', payload: JSON.stringify({ taskId: 'task-review', dispatchId: 'dispatch-review' }) }
     ] })
@@ -3087,6 +3088,14 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "export function verify(actual) {\n  assert.deepEqual(actual, { ok: true });\n}\n",
     );
     await writeFile(
+      path.join(repo, "src/chai_assertions.js"),
+      "export function verify(result) {\n  result.should.equal(true);\n}\n",
+    );
+    await writeFile(
+      path.join(repo, "src/node_assertions.js"),
+      "export function verify(actual) {\n  strictEqual(actual, true);\n}\n",
+    );
+    await writeFile(
       path.join(repo, "src/prefixed.js"),
       'if (import.meta.vitest) test("works", () => expect(value()).toBe(1));\n',
     );
@@ -3243,6 +3252,8 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "src/inline.js",
       "src/concurrent.js",
       "src/assertions.js",
+      "src/chai_assertions.js",
+      "src/node_assertions.js",
       "src/prefixed.js",
       "src/check.py",
       "src/__image_snapshots__/widget-snap.png",
@@ -3341,6 +3352,8 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(worker, "BUILD"), "# tests disabled\n");
     await writeFile(path.join(worker, "BUILD.bazel"), "# tests disabled\n");
     await writeFile(path.join(worker, "CMakeLists.txt"), "# enable_testing removed\n");
+    await writeFile(path.join(worker, "Directory.Build.props"), "<Project><PropertyGroup><IsTestProject>false</IsTestProject></PropertyGroup></Project>\n");
+    await writeFile(path.join(worker, "Directory.Build.targets"), "<Project><Target Name=\"SkipTests\" /></Project>\n");
     await writeFile(path.join(worker, "MODULE.bazel"), "# tests disabled\n");
     await writeFile(path.join(worker, "WORKSPACE"), "# tests disabled\n");
     await writeFile(path.join(worker, "WORKSPACE.bazel"), "# tests disabled\n");
@@ -3406,6 +3419,8 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "BUILD",
       "BUILD.bazel",
       "CMakeLists.txt",
+      "Directory.Build.props",
+      "Directory.Build.targets",
       "Cargo.lock",
       "MODULE.bazel",
       "WORKSPACE",
@@ -3448,7 +3463,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "commit", "-m", "weaken validation policy");
     await assert.rejects(
       assertWorkerChangesAllowed(),
-      /unexplained-policy-relaxation:.*\.bazelrc, \.clang-format, \.clang-format-ignore, \.eslintignore, \.markdownlintignore, \.mocharc\.json, \.mvn\/maven\.config, \.mvn\/wrapper\/maven-wrapper\.jar, \.mvn\/wrapper\/maven-wrapper\.properties, \.prettierignore, \.shellcheckrc, \.stylelintignore, BUILD, BUILD\.bazel, CMakeLists\.txt, Cargo\.lock, MODULE\.bazel, Pipfile, WORKSPACE, WORKSPACE\.bazel, build\.gradle, build\.gradle\.kts, cypress\.config\.ts, eslint\.config\.js, go\.work, gradle\.properties, gradle\/wrapper\/gradle-wrapper\.jar, gradle\/wrapper\/gradle-wrapper\.properties, gradlew, mvnw, package-lock\.json, package\.json, phpunit\.xml, phpunit\.xml\.dist, pkg\/go\.mod, pnpm-lock\.yaml, pom\.xml, prompts\/fixer\.md, pylintrc, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, yarn\.lock/,
+      /unexplained-policy-relaxation:.*\.bazelrc, \.clang-format, \.clang-format-ignore, \.eslintignore, \.markdownlintignore, \.mocharc\.json, \.mvn\/maven\.config, \.mvn\/wrapper\/maven-wrapper\.jar, \.mvn\/wrapper\/maven-wrapper\.properties, \.prettierignore, \.shellcheckrc, \.stylelintignore, BUILD, BUILD\.bazel, CMakeLists\.txt, Cargo\.lock, Directory\.Build\.props, Directory\.Build\.targets, MODULE\.bazel, Pipfile, WORKSPACE, WORKSPACE\.bazel, build\.gradle, build\.gradle\.kts, cypress\.config\.ts, eslint\.config\.js, go\.work, gradle\.properties, gradle\/wrapper\/gradle-wrapper\.jar, gradle\/wrapper\/gradle-wrapper\.properties, gradlew, mvnw, package-lock\.json, package\.json, phpunit\.xml, phpunit\.xml\.dist, pkg\/go\.mod, pnpm-lock\.yaml, pom\.xml, prompts\/fixer\.md, pylintrc, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, yarn\.lock/,
     );
 
     git(worker, "reset", "--hard", featureHead);
@@ -3921,6 +3936,24 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       assertWorkerChangesAllowed(),
       /fixer modified co-located test assertions or skip markers: src\/assertions\.js/,
     );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/chai_assertions.js"),
+      "export function verify(_result) {}\n",
+    );
+    await writeFile(
+      path.join(worker, "src/node_assertions.js"),
+      "export function verify(_actual) {}\n",
+    );
+    git(worker, "add", "src/chai_assertions.js", "src/node_assertions.js");
+    git(worker, "commit", "-m", "remove should and strict assertions");
+    await assert.rejects(assertWorkerChangesAllowed(), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /src\/chai_assertions\.js/);
+      assert.match(error.message, /src\/node_assertions\.js/);
+      return true;
+    });
 
     git(worker, "reset", "--hard", featureHead);
     await writeFile(
