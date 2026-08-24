@@ -3052,7 +3052,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await mkdir(path.join(repo, "cypress/snapshots"), { recursive: true });
     await mkdir(path.join(repo, "e2e"));
     await mkdir(path.join(repo, "integration"));
-    await mkdir(path.join(repo, "features"));
+    await mkdir(path.join(repo, "features/support"), { recursive: true });
     await mkdir(path.join(repo, "MyProject.Tests"));
     await mkdir(path.join(repo, "Shop.UnitTests"));
     await mkdir(path.join(repo, "__specs__"));
@@ -3112,6 +3112,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(
       path.join(repo, "features/login.feature"),
       "Feature: Login\n  Scenario: works\n    Then access is granted\n",
+    );
+    await writeFile(
+      path.join(repo, "features/support/env.rb"),
+      "Before do\n  prepare_scenario\nend\n",
     );
     await mkdir(path.join(repo, "acceptance"));
     await writeFile(
@@ -3246,6 +3250,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(
       path.join(repo, "src/default_expect_reexport.ts"),
       'export { default as expect } from "expect";\n',
+    );
+    await writeFile(
+      path.join(repo, "src/wildcard_expect_reexport.ts"),
+      'export * from "expect";\n',
     );
     await writeFile(
       path.join(repo, "src/playwright_types.ts"),
@@ -3469,6 +3477,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "e2e/login.ts",
       "integration/login.ts",
       "features/login.feature",
+      "features/support/env.rb",
       "main.tftest.hcl",
       "package.json",
       "spec/openapi.yaml",
@@ -3518,6 +3527,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "src/aliased_playwright.ts",
       "src/reexported_assertion.ts",
       "src/default_expect_reexport.ts",
+      "src/wildcard_expect_reexport.ts",
       "src/playwright_types.ts",
       "src/prefixed.js",
       "src/soft_expect.ts",
@@ -3692,6 +3702,8 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(worker, "workspace.slnx"), "<Solution />\n");
     await writeFile(path.join(worker, "lerna.json"), '{"packages":[]}\n');
     await writeFile(path.join(worker, "meson.build"), "# tests removed\n");
+    await writeFile(path.join(worker, "meson.options"), "option('tests', type: 'boolean', value: false)\n");
+    await writeFile(path.join(worker, "meson_options.txt"), "option('tests', type: 'boolean', value: false)\n");
     await writeFile(path.join(worker, "Pipfile"), '[scripts]\ntest = "true"\n');
     await writeFile(path.join(worker, "Taskfile.yml"), "tasks:\n  test:\n    cmds: [true]\n");
     await writeFile(path.join(worker, "Taskfile.dist.yml"), "tasks:\n  test:\n    cmds: [true]\n");
@@ -3784,6 +3796,8 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "gradlew",
       "lerna.json",
       "meson.build",
+      "meson.options",
+      "meson_options.txt",
       "lint-staged.config.js",
       "noxfile.py",
       "nyc.config.js",
@@ -3825,7 +3839,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "commit", "-m", "weaken validation policy");
     await assert.rejects(
       assertWorkerChangesAllowed(),
-      /unexplained-policy-relaxation:.*\.bazelrc, \.clang-format, \.clang-format-ignore, \.coveragerc, \.eslintignore, \.github\/actionlint\.yaml, \.husky\/pre-commit, \.justfile, \.lintstagedrc\.json, \.markdownlintignore, \.mocharc\.json, \.mvn\/jvm\.config, \.mvn\/maven\.config, \.mvn\/wrapper\/maven-wrapper\.jar, \.mvn\/wrapper\/maven-wrapper\.properties, \.npmrc, \.nycrc, \.oxlintrc\.json, \.prettierignore, \.rspec, \.shellcheckrc, \.stylelintignore, \.swiftlint\.yml, \.yamllint, BUILD, BUILD\.bazel, CMakeLists\.txt, CMakePresets\.json, CMakeUserPresets\.json, Cargo\.lock, Directory\.Build\.targets, Directory\.Packages\.props, GNUmakefile, MODULE\.bazel, Pipfile, Taskfile\.dist\.yaml, Taskfile\.dist\.yml, Taskfile\.yml, WORKSPACE, WORKSPACE\.bazel, build\.gradle, build\.gradle\.kts, build\.xml, cypress\.config\.ts, directory\.build\.props, eslint\.config\.js, go\.work, gradle\.properties, gradle\/wrapper\/gradle-wrapper\.jar, gradle\/wrapper\/gradle-wrapper\.properties, gradlew, lerna\.json, lint-staged\.config\.js, meson\.build, mvnw, noxfile\.py, nyc\.config\.js, package-lock\.json, package\.json, phpunit\.xml, phpunit\.xml\.dist, pkg\/go\.mod, pnpm-lock\.yaml, pnpm-workspace\.yaml, pom\.xml, prompts\/fixer\.md, pylintrc, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, vitest\.workspace\.ts, workspace\.sln, workspace\.slnx, yarn\.lock/,
+      /unexplained-policy-relaxation:.*\.bazelrc, \.clang-format, \.clang-format-ignore, \.coveragerc, \.eslintignore, \.github\/actionlint\.yaml, \.husky\/pre-commit, \.justfile, \.lintstagedrc\.json, \.markdownlintignore, \.mocharc\.json, \.mvn\/jvm\.config, \.mvn\/maven\.config, \.mvn\/wrapper\/maven-wrapper\.jar, \.mvn\/wrapper\/maven-wrapper\.properties, \.npmrc, \.nycrc, \.oxlintrc\.json, \.prettierignore, \.rspec, \.shellcheckrc, \.stylelintignore, \.swiftlint\.yml, \.yamllint, BUILD, BUILD\.bazel, CMakeLists\.txt, CMakePresets\.json, CMakeUserPresets\.json, Cargo\.lock, Directory\.Build\.targets, Directory\.Packages\.props, GNUmakefile, MODULE\.bazel, Pipfile, Taskfile\.dist\.yaml, Taskfile\.dist\.yml, Taskfile\.yml, WORKSPACE, WORKSPACE\.bazel, build\.gradle, build\.gradle\.kts, build\.xml, cypress\.config\.ts, directory\.build\.props, eslint\.config\.js, go\.work, gradle\.properties, gradle\/wrapper\/gradle-wrapper\.jar, gradle\/wrapper\/gradle-wrapper\.properties, gradlew, lerna\.json, lint-staged\.config\.js, meson\.build, meson\.options, meson_options\.txt, mvnw, noxfile\.py, nyc\.config\.js, package-lock\.json, package\.json, phpunit\.xml, phpunit\.xml\.dist, pkg\/go\.mod, pnpm-lock\.yaml, pnpm-workspace\.yaml, pom\.xml, prompts\/fixer\.md, pylintrc, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, vitest\.workspace\.ts, workspace\.sln, workspace\.slnx, yarn\.lock/,
     );
 
     git(worker, "reset", "--hard", featureHead);
@@ -4586,6 +4600,30 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await assert.rejects(
       assertWorkerChangesAllowed(),
       /fixer modified co-located test assertions or skip markers: src\/default_expect_reexport\.ts/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/wildcard_expect_reexport.ts"),
+      "export function expect() { return { toBe() {} }; }\n",
+    );
+    git(worker, "add", "src/wildcard_expect_reexport.ts");
+    git(worker, "commit", "-m", "replace wildcard assertion re-export");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified co-located test assertions or skip markers: src\/wildcard_expect_reexport\.ts/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "features/support/env.rb"),
+      "Before do\n  skip_this_scenario\nend\n",
+    );
+    git(worker, "add", "features/support/env.rb");
+    git(worker, "commit", "-m", "weaken Gherkin support hook");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified pre-existing test files: features\/support\/env\.rb/,
     );
 
     git(worker, "reset", "--hard", featureHead);

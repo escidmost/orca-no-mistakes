@@ -3966,10 +3966,14 @@ function isTestPath(filePath: string): boolean {
       parts[index - 1]?.toLowerCase() === "src" &&
       part.toLowerCase() === "it",
   );
+  const gherkinSupportSource =
+    parts[0]?.toLowerCase() === "features" &&
+    (parts[1]?.toLowerCase() === "support" || fileName.toLowerCase() === "environment.py");
   return (
     singularSpecSource ||
     variantTestSourceSet ||
     mavenInvokerTestSource ||
+    gherkinSupportSource ||
     parts
       .slice(0, -1)
       .some((part) =>
@@ -4087,6 +4091,11 @@ function importsAssertionFrameworkApi(source: string): boolean {
     "su",
   );
   if (requiredProperty.test(source)) return true;
+  const forwardedModule = new RegExp(
+    String.raw`(?:\bexport\s+\*\s+(?:as\s+[A-Za-z_$][\w$]*\s+)?from\s*["']${modules}["']|\bmodule\.exports\s*=\s*require\s*\(\s*["']${modules}["']\s*\))`,
+    "su",
+  );
+  if (forwardedModule.test(source)) return true;
   return /\bimport\s+(?!type\b)[A-Za-z_$][\w$]*\s+from\s+["']expect["']/u.test(source) ||
     /\b(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*require\s*\(\s*["']expect["']\s*\)/u.test(source);
 }
@@ -4169,6 +4178,8 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "justfile",
       "lerna.json",
       "meson.build",
+      "meson.options",
+      "meson_options.txt",
       "gnumakefile",
       "makefile",
       "noxfile.py",
