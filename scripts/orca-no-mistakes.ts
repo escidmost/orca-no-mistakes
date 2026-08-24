@@ -4167,7 +4167,7 @@ function shellCommandReferencesTarget(
   const directoryStack: string[] = [];
   for (const statement of normalizedCommand.split(/\r?\n|&&|;/)) {
     const changedDirectory = statement.match(
-      /\b(cd|pushd|set-location|push-location)\s+(?:"([^"]+)"|'([^']+)'|([^&|\s]+))/i,
+      /\b(cd|pushd|set-location|push-location)\s+(?:-(?:literal)?path\s+)?(?:"([^"]+)"|'([^']+)'|([^&|\s]+))/i,
     );
     if (changedDirectory) {
       const rawDirectory =
@@ -4206,6 +4206,18 @@ function containsValidationPathReference(
     targetPath,
     path.posix.relative(path.posix.dirname(policyPath), targetPath),
   ]);
+  if (/\.(?:[cm]?[jt]sx?|mts|cts)$/i.test(targetPath)) {
+    for (const reference of [...references]) {
+      const extensionless = reference.replace(/\.(?:[cm]?[jt]sx?|mts|cts)$/i, "");
+      references.add(extensionless);
+      if (!extensionless.startsWith("..")) references.add(`./${extensionless}`);
+      if (/\/index$/i.test(extensionless)) {
+        const directoryModule = extensionless.replace(/\/index$/i, "");
+        references.add(directoryModule);
+        if (!directoryModule.startsWith("..")) references.add(`./${directoryModule}`);
+      }
+    }
+  }
   const containsReference = (reference: string): boolean =>
     containsPathReference(source, reference) ||
     containsPrefixedPathReference(source, reference);
@@ -4216,6 +4228,7 @@ function containsValidationPathReference(
       .map((reference) =>
         reference
           .replace(/^\.\//, "")
+          .replace(/\/__main__\.py$/i, "")
           .replace(/\.py$/i, "")
           .replace(/\/__init__$/i, "")
           .replace(/\//g, "."),
@@ -4224,7 +4237,7 @@ function containsValidationPathReference(
     if (
       modules.some((moduleName) =>
         new RegExp(
-          `\\b(?:python(?:3(?:\\.\\d+)?)?|py)\\s+-m\\s+${moduleName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?=$|\\s|["'])`,
+          `\\b(?:python(?:3(?:\\.\\d+)?)?|py)(?:\\s+(?!-m\\b)-\\S+)*\\s+-m\\s+${moduleName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?=$|\\s|["'])`,
           "m",
         ).test(source),
       )
