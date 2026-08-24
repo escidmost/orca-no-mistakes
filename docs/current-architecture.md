@@ -65,6 +65,8 @@ Each stage and role resolves its own agent from the configuration tiers, and the
 - Python's discovered `test*.py` files are dedicated tests. Protected validation commands resolve quoted or unquoted `python -m package.module`, launcher flags and value-taking options such as `py -3 -m` and `python -X dev -m`, package `__main__.py` entrypoints, and conventional `src/` package layouts to the corresponding tracked Python module.
 
 - Gradle `testFixtures` trees are protected test data. Maven `.mvn/jvm.config` and Coverage.py `.coveragerc` are protected implicit validation policy.
+
+- Conventional `e2e/` trees are protected test data. Actionlint `actionlint.yaml` and SwiftLint `.swiftlint.yml`/`.swiftlint.yaml` are protected implicit validation policy.
 - Catch2/doctest `TEST_CASE` registrations and `REQUIRE`/`CHECK` assertions are protected co-located validation, and `vitest.workspace.*` is protected runner policy.
 - Every rebase conflict requires human resolution. The conflict report carries the immutable upstream OID fetched by that exact attempt; selecting `fix` reruns the coordinator rebase after the human resolves or otherwise updates the branch, while `stop` cancels the run. Clean rebases remain automatic.
 - Nox's implicit `noxfile.py` runner configuration is protected validation policy.

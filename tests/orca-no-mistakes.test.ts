@@ -3033,6 +3033,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       path.join(repo, "e2e/checkout.e2e.ts"),
       "expect(true).toBe(true);\n",
     );
+    await writeFile(
+      path.join(repo, "e2e/login.ts"),
+      "export const expected = { ok: true };\n",
+    );
     await writeFile(path.join(repo, "conftest.py"), "assert True\n");
     await writeFile(
       path.join(repo, "main.tftest.hcl"),
@@ -3309,6 +3313,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "cypress/snapshots/login.png",
       "docs/test-plan.md",
       "e2e/checkout.e2e.ts",
+      "e2e/login.ts",
       "features/login.feature",
       "main.tftest.hcl",
       "package.json",
@@ -3454,11 +3459,13 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(worker, ".rspec"), "--tag ~focus\n");
     await writeFile(path.join(worker, ".clang-format-ignore"), "**/*\n");
     await writeFile(path.join(worker, ".eslintignore"), "**/*\n");
+    await writeFile(path.join(worker, ".github/actionlint.yaml"), "self-hosted-runner:\n  labels: []\n");
     await writeFile(path.join(worker, ".markdownlintignore"), "**/*\n");
     await writeFile(path.join(worker, ".npmrc"), "ignore-scripts=true\n");
     await writeFile(path.join(worker, ".prettierignore"), "**/*\n");
     await writeFile(path.join(worker, ".shellcheckrc"), "disable=all\n");
     await writeFile(path.join(worker, ".stylelintignore"), "**/*\n");
+    await writeFile(path.join(worker, ".swiftlint.yml"), "disabled_rules: [all]\n");
     await writeFile(path.join(worker, ".bazelrc"), "test --test_tag_filters=-critical\n");
     await writeFile(path.join(worker, "BUILD"), "# tests disabled\n");
     await writeFile(path.join(worker, "BUILD.bazel"), "# tests disabled\n");
@@ -3537,6 +3544,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       ".nycrc",
       ".rspec",
       ".eslintignore",
+      ".github/actionlint.yaml",
       ".justfile",
       ".markdownlintignore",
       ".mvn/maven.config",
@@ -3545,6 +3553,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       ".prettierignore",
       ".shellcheckrc",
       ".stylelintignore",
+      ".swiftlint.yml",
       ".bazelrc",
       "BUILD",
       "BUILD.bazel",
@@ -3601,7 +3610,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "commit", "-m", "weaken validation policy");
     await assert.rejects(
       assertWorkerChangesAllowed(),
-      /unexplained-policy-relaxation:.*\.bazelrc, \.clang-format, \.clang-format-ignore, \.coveragerc, \.eslintignore, \.justfile, \.markdownlintignore, \.mocharc\.json, \.mvn\/jvm\.config, \.mvn\/maven\.config, \.mvn\/wrapper\/maven-wrapper\.jar, \.mvn\/wrapper\/maven-wrapper\.properties, \.npmrc, \.nycrc, \.prettierignore, \.rspec, \.shellcheckrc, \.stylelintignore, BUILD, BUILD\.bazel, CMakeLists\.txt, Cargo\.lock, Directory\.Build\.targets, Directory\.Packages\.props, GNUmakefile, MODULE\.bazel, Pipfile, Taskfile\.dist\.yaml, Taskfile\.dist\.yml, Taskfile\.yml, WORKSPACE, WORKSPACE\.bazel, build\.gradle, build\.gradle\.kts, cypress\.config\.ts, directory\.build\.props, eslint\.config\.js, go\.work, gradle\.properties, gradle\/wrapper\/gradle-wrapper\.jar, gradle\/wrapper\/gradle-wrapper\.properties, gradlew, mvnw, noxfile\.py, nyc\.config\.js, package-lock\.json, package\.json, phpunit\.xml, phpunit\.xml\.dist, pkg\/go\.mod, pnpm-lock\.yaml, pom\.xml, prompts\/fixer\.md, pylintrc, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, vitest\.workspace\.ts, yarn\.lock/,
+      /unexplained-policy-relaxation:.*\.bazelrc, \.clang-format, \.clang-format-ignore, \.coveragerc, \.eslintignore, \.github\/actionlint\.yaml, \.justfile, \.markdownlintignore, \.mocharc\.json, \.mvn\/jvm\.config, \.mvn\/maven\.config, \.mvn\/wrapper\/maven-wrapper\.jar, \.mvn\/wrapper\/maven-wrapper\.properties, \.npmrc, \.nycrc, \.prettierignore, \.rspec, \.shellcheckrc, \.stylelintignore, \.swiftlint\.yml, BUILD, BUILD\.bazel, CMakeLists\.txt, Cargo\.lock, Directory\.Build\.targets, Directory\.Packages\.props, GNUmakefile, MODULE\.bazel, Pipfile, Taskfile\.dist\.yaml, Taskfile\.dist\.yml, Taskfile\.yml, WORKSPACE, WORKSPACE\.bazel, build\.gradle, build\.gradle\.kts, cypress\.config\.ts, directory\.build\.props, eslint\.config\.js, go\.work, gradle\.properties, gradle\/wrapper\/gradle-wrapper\.jar, gradle\/wrapper\/gradle-wrapper\.properties, gradlew, mvnw, noxfile\.py, nyc\.config\.js, package-lock\.json, package\.json, phpunit\.xml, phpunit\.xml\.dist, pkg\/go\.mod, pnpm-lock\.yaml, pom\.xml, prompts\/fixer\.md, pylintrc, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, vitest\.workspace\.ts, yarn\.lock/,
     );
 
     git(worker, "reset", "--hard", featureHead);
@@ -3979,6 +3988,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       path.join(worker, "e2e/checkout.e2e.ts"),
       "expect(true).toBe(false);\n",
     );
+    await writeFile(path.join(worker, "e2e/login.ts"), "export const expected = { ok: false };\n");
     await writeFile(path.join(worker, "conftest.py"), "assert False\n");
     git(
       worker,
@@ -3986,6 +3996,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "conftest.py",
       "cypress/e2e/login.cy.ts",
       "e2e/checkout.e2e.ts",
+      "e2e/login.ts",
     );
     git(worker, "commit", "-m", "weaken end-to-end tests");
     await assert.rejects(
@@ -3994,6 +4005,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
         assert.ok(error instanceof Error);
         assert.match(error.message, /cypress\/e2e\/login\.cy\.ts/);
         assert.match(error.message, /e2e\/checkout\.e2e\.ts/);
+        assert.match(error.message, /e2e\/login\.ts/);
         return true;
       },
     );
