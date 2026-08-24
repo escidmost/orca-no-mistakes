@@ -208,13 +208,6 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
       /reserved (?:argument|config)/,
     )
   }
-  assert.throws(
-    () =>
-      buildCliCommand('kimi', {
-        agentArgsOverride: { kimi: ['--'] } as never,
-      }),
-    /managed prompt carrier/,
-  )
   for (const [harness, required] of [
     ['claude', '--dangerously-skip-permissions'],
     ['codex', '--dangerously-bypass-approvals-and-sandbox']

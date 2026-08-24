@@ -6078,7 +6078,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
   }
 });
 
-test("CliOrca launches Kimi noninteractively with its protected task artifact", async () => {
+test("CliOrca launches Kimi interactively and submits its protected task after readiness", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-kimi-shell-"));
   const fakeOrca = path.join(temp, "orca");
   const callsPath = path.join(temp, "calls.jsonl");
@@ -6107,7 +6107,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
 } else if (args[0] === 'terminal' && args[1] === 'send') {
   out({ accepted: true })
 } else if (args[0] === 'terminal' && args[1] === 'show') {
-  out({ terminal: { connected: true, lastOutputAt: 1, title: 'feature' } })
+  out({ terminal: { connected: true, lastOutputAt: 1, title: 'Kimi Code', preview: 'Ready' } })
 } else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
   if (args.includes('--inject')) {
     process.stderr.write('Kimi dispatch must not use Orca prompt injection')
@@ -6142,20 +6142,24 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       .map((line) => JSON.parse(line) as string[]);
     const dispatch = calls.find((args) => args[1] === "dispatch");
     assert.ok(dispatch && !dispatch.includes("--inject"));
-    assert.equal(
-      calls.filter(
-        (args) => args[0] === "terminal" && args[1] === "show",
-      ).length,
-      1,
-      "Kimi uses terminal show only for worker liveness, not TUI readiness",
+    const showIndexes = calls.flatMap((args, index) =>
+      args[0] === "terminal" && args[1] === "show" ? [index] : [],
     );
-    const send = calls.find(
+    assert.ok(showIndexes.length >= 2);
+    const sends = calls.filter(
       (args) => args[0] === "terminal" && args[1] === "send",
     );
-    const startupCommand = send?.[send.indexOf("--text") + 1] ?? "";
+    assert.equal(sends.length, 2);
+    const startupCommand = sends[0]?.[sends[0].indexOf("--text") + 1] ?? "";
+    assert.equal(startupCommand, "'kimi' '--model' 'kimi-k2.5' '--auto'");
+    const promptInstruction = sends[1]?.[sends[1].indexOf("--text") + 1] ?? "";
+    assert.ok(
+      calls.indexOf(sends[1]) > showIndexes[1],
+      "Kimi receives its task only after stable TUI readiness",
+    );
     assert.match(
-      startupCommand,
-      /^'kimi' '--model' 'kimi-k2\.5' --prompt 'Read and follow the complete authenticated task in .*prompt-[^']+\.txt'$/,
+      promptInstruction,
+      /^Read and follow the complete authenticated task in .*prompt-[^ ]+\.txt$/,
     );
     assert.equal(worker.report.summary, "kimi tested");
   } finally {
@@ -6984,7 +6988,7 @@ if (args[0] === 'terminal' && args[1] === 'create') {
       (error: unknown) => {
         assert.ok(error instanceof PreflightError);
         assert.equal(error.failureClass, "binary-missing");
-        assert.match(error.message, /worker agent opencode is not installed/);
+        assert.match(error.message, /command not found: opencode/);
         return true;
       },
     );

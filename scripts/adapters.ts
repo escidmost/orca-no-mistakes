@@ -201,7 +201,6 @@ const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
 
 export type CliAgentCommandOptions = AgentProfile & {
   agentArgsOverride?: AgentArgsOverride
-  nonInteractive?: boolean
   variant?: string
 }
 
@@ -222,7 +221,7 @@ export function buildCliCommand(harness: string, options: CliAgentCommandOptions
     }
   }
   const raw = Array.isArray(override) ? override : []
-  if ((normalizedHarness === 'agy' || normalizedHarness === 'kimi') && raw.includes('--')) {
+  if (normalizedHarness === 'agy' && raw.includes('--')) {
     throw new Error(
       `agent ${normalizedHarness}: option terminator '--' cannot precede the managed prompt carrier`
     )
@@ -283,9 +282,7 @@ export function buildCliCommand(harness: string, options: CliAgentCommandOptions
       }
     }
   }
-  if (!(normalizedHarness === 'kimi' && options.nonInteractive)) {
-    parts.push(...(REQUIRED_HARNESS_ARGS[normalizedHarness] ?? []))
-  }
+  parts.push(...(REQUIRED_HARNESS_ARGS[normalizedHarness] ?? []))
   parts.push(...raw)
   // Environment assignments stay unquoted as a prefix; arguments are shell-quoted individually.
   return [...env, ...parts.map(shellQuote)].join(' ')

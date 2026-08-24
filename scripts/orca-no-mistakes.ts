@@ -2091,7 +2091,6 @@ const DEFAULT_WORKER_AGENT = "opencode";
 const WORKER_IDLE_TIMEOUT_MS = 1_800_000;
 const NATIVE_WORKER_CREATE_SLACK_MS = 120_000;
 const FISH_SHELL_STARTUP_DELAY_MS = 20_000;
-const KIMI_STARTUP_GRACE_MS = 2_000;
 
 function workerShellStartupDelayMs(): number {
   const raw = process.env.WORKER_SHELL_STARTUP_DELAY_MS?.trim();
@@ -2828,49 +2827,27 @@ export class CliOrca implements OrcaOperations {
         agentArgsOverride: launch.agent?.agentArgsOverride,
         effort: launch.agent?.effort,
         model: launch.agent?.model,
-        nonInteractive: initialPrompt !== undefined,
         variant: launch.agent?.variant,
       });
+      let promptInstruction: string | undefined;
       if (initialPrompt !== undefined) {
         promptPath = await this.#writeWorkerPrompt(initialPrompt);
         if (fence?.aborted)
           throw new Error(`${launch.stage} worker attempt was cancelled`);
-        const instruction = shellQuote(
-          `Read and follow the complete authenticated task in ${promptPath}`,
-        );
+        const instruction = `Read and follow the complete authenticated task in ${promptPath}`;
+        const quotedInstruction = shellQuote(instruction);
         launchCommand +=
           normalizedHarness === "agy"
-            ? ` --prompt-interactive ${instruction}`
+            ? ` --prompt-interactive ${quotedInstruction}`
             : normalizedHarness === "kimi"
-              ? ` --prompt ${instruction}`
-              : ` ${instruction}`;
+              ? ""
+              : ` ${quotedInstruction}`;
+        if (normalizedHarness === "kimi") promptInstruction = instruction;
       }
       const shellStartupDelayMs = workerShellStartupDelayMs();
       if (shellStartupDelayMs > 0) {
         await delay(shellStartupDelayMs, undefined, { signal: fence?.signal });
       }
-      if (fence?.aborted)
-        throw new Error(`${launch.stage} worker attempt was cancelled`);
-      const startupCursor =
-        normalizedHarness === "kimi" && initialPrompt !== undefined
-          ? (
-              await this.#json<{
-                terminal?: { nextCursor?: string };
-              }>(
-                [
-                  "terminal",
-                  "read",
-                  "--terminal",
-                  terminalHandle,
-                  "--limit",
-                  "1",
-                  "--json",
-                ],
-                false,
-                fence,
-              )
-            ).terminal?.nextCursor
-          : undefined;
       if (fence?.aborted)
         throw new Error(`${launch.stage} worker attempt was cancelled`);
       await this.#json(
@@ -2887,15 +2864,27 @@ export class CliOrca implements OrcaOperations {
         false,
         fence,
       );
-      if (normalizedHarness === "kimi" && initialPrompt !== undefined) {
-        if (startupCursor !== undefined) {
-          await this.#waitForKimiStartup(terminalHandle, startupCursor, fence);
-        }
-      } else {
-        await this.#waitForWorkerAgent(
-          terminalHandle,
-          harness,
-          initialPrompt !== undefined,
+      await this.#waitForWorkerAgent(
+        terminalHandle,
+        harness,
+        initialPrompt !== undefined && normalizedHarness !== "kimi",
+        fence,
+      );
+      if (promptInstruction !== undefined) {
+        if (fence?.aborted)
+          throw new Error(`${launch.stage} worker attempt was cancelled`);
+        await this.#json(
+          [
+            "terminal",
+            "send",
+            "--terminal",
+            terminalHandle,
+            "--text",
+            promptInstruction,
+            "--enter",
+            "--json",
+          ],
+          false,
           fence,
         );
       }
@@ -2903,59 +2892,6 @@ export class CliOrca implements OrcaOperations {
     } catch (error) {
       if (promptPath) await rm(promptPath, { force: true });
       throw error;
-    }
-  }
-
-  async #waitForKimiStartup(
-    terminalHandle: string,
-    cursor: string,
-    fence?: TimeoutFence,
-  ): Promise<void> {
-    const deadline =
-      Date.now() + Math.min(KIMI_STARTUP_GRACE_MS, workerAgentReadyTimeoutMs());
-    for (;;) {
-      if (fence?.aborted) throw new Error("worker attempt was cancelled");
-      const result = await this.#json<{
-        terminal?: {
-          nextCursor?: string;
-          status?: string;
-          tail?: string[];
-        };
-      }>(
-        [
-          "terminal",
-          "read",
-          "--terminal",
-          terminalHandle,
-          "--cursor",
-          cursor,
-          "--limit",
-          "200",
-          "--json",
-        ],
-        false,
-        fence,
-      );
-      if (result.terminal?.status === "exited") {
-        throw new PreflightError(
-          "readiness-timeout",
-          "worker agent terminal exited during startup",
-        );
-      }
-      cursor = result.terminal?.nextCursor ?? cursor;
-      const output = result.terminal?.tail?.join("\n") ?? "";
-      const failureClass = classifyPreflightFailure(output);
-      if (
-        failureClass !== "unclassified" ||
-        /^\s*(?:error|fatal):/imu.test(output)
-      ) {
-        throw new PreflightError(
-          failureClass,
-          `worker agent Kimi failed during startup: ${output.trim().slice(-400)}`,
-        );
-      }
-      if (Date.now() >= deadline) return;
-      await delay(50, undefined, { signal: fence?.signal });
     }
   }
 
@@ -3182,6 +3118,17 @@ export class CliOrca implements OrcaOperations {
           preview: terminal.preview ?? null,
           title: terminal.title ?? null,
         });
+        const failureClass = classifyPreflightFailure(renderedOutput);
+        if (
+          !startupReady &&
+          (failureClass !== "unclassified" ||
+            /^\s*(?:error|fatal):/imu.test(renderedOutput))
+        ) {
+          throw new PreflightError(
+            failureClass,
+            `worker agent ${harness} failed during startup: ${renderedOutput.trim().slice(-400)}`,
+          );
+        }
         if (
           isBinaryMissingOutput(titleLine, harness) ||
           (!startupReady &&

@@ -5,42 +5,12 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { buildCliCommand, PreflightError } from "../scripts/adapters.ts";
+import { PreflightError } from "../scripts/adapters.ts";
 import { CliOrca, GitShell } from "../scripts/orca-no-mistakes.ts";
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 }
-
-test("Kimi prompt mode omits the incompatible auto flag", async () => {
-  const temp = await mkdtemp(path.join(tmpdir(), "orca-kimi-contract-"));
-  const kimi = path.join(temp, "kimi");
-  try {
-    await writeFile(
-      kimi,
-      `#!/bin/sh
-auto=
-prompt=
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --auto) auto=1 ;;
-    --prompt) prompt=1; shift ;;
-  esac
-  shift
-done
-[ -z "$auto" ] || [ -z "$prompt" ] || exit 64
-[ -n "$prompt" ] || exit 65
-`,
-    );
-    await chmod(kimi, 0o755);
-    const command = `${buildCliCommand("Kimi", { nonInteractive: true })} --prompt task`;
-    execFileSync("/bin/sh", ["-c", command], {
-      env: { ...process.env, PATH: `${temp}:${process.env.PATH ?? ""}` },
-    });
-  } finally {
-    await rm(temp, { recursive: true, force: true });
-  }
-});
 
 test("Kimi immediate startup errors remain preflight failures", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-kimi-preflight-"));
@@ -62,10 +32,8 @@ if (args[0] === 'terminal' && args[1] === 'create') {
   out({ terminal: { handle: 'kimi-shell' } })
 } else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
   out({ dispatch: { id: 'dispatch-kimi', status: 'dispatched' }, preamble: 'authenticated' })
-} else if (args[0] === 'terminal' && args[1] === 'read' && args.includes('--cursor')) {
-  out({ terminal: { nextCursor: '1', status: 'running', tail: ['error: login required'] } })
-} else if (args[0] === 'terminal' && args[1] === 'read') {
-  out({ terminal: { nextCursor: '0', status: 'running', tail: [] } })
+} else if (args[0] === 'terminal' && args[1] === 'show') {
+  out({ terminal: { connected: true, title: 'feature', preview: 'error: login required' } })
 } else {
   out({ ok: true })
 }
@@ -95,7 +63,8 @@ if (args[0] === 'terminal' && args[1] === 'create') {
     const sent = calls.find(
       (args) => args[0] === "terminal" && args[1] === "send",
     );
-    assert.ok(!sent?.[sent.indexOf("--text") + 1]?.includes("--auto"));
+    assert.ok(sent?.[sent.indexOf("--text") + 1]?.includes("--auto"));
+    assert.ok(!sent?.[sent.indexOf("--text") + 1]?.includes("--prompt"));
     assert.ok(
       calls.some(
         (args) =>
