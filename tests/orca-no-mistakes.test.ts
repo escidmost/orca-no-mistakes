@@ -2875,6 +2875,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await mkdir(path.join(repo, "scripts"));
     await mkdir(path.join(repo, "specs"));
     await mkdir(path.join(repo, "src"));
+    await mkdir(path.join(repo, "src/__image_snapshots__"));
     await mkdir(path.join(repo, "src/__snapshots__"));
     await mkdir(path.join(repo, "src/button.spec.ts-snapshots"));
     await mkdir(path.join(repo, "testdata"));
@@ -2976,6 +2977,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       'const std = @import("std");\ntest "value" { try std.testing.expectEqual(@as(i32, 1), value()); }\n',
     );
     await writeFile(
+      path.join(repo, "src/__image_snapshots__/widget-snap.png"),
+      "expected image\n",
+    );
+    await writeFile(
       path.join(repo, "src/__snapshots__/Widget.snap"),
       "exports[`Widget 1`] = `expected`;\n",
     );
@@ -3009,7 +3014,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     await writeFile(
       path.join(repo, ".github/workflows/ci.yml"),
-      "- uses: ./\n- uses: ./.github/actions/check\n- uses: ./ci/check/\n- run: ${{ github.workspace }}/scripts/workspace-verify.sh\n- run: .\\scripts\\check.ps1\n- run: ./check.sh\n  working-directory: ${{ github.workspace }}/commands/\n- run: .\\windows-check.ps1\n  working-directory: commands\\\n- run: ./lint.sh\n  working-directory: other\n- run: |\n    cd shell-commands\n    ./check.sh\n- run: |\n    cd guarded-commands || exit 1\n    ./check.sh\n",
+      "- uses: ./\n- uses: ./.github/actions/check\n- uses: ./ci/check/\n- run: ${{ github.workspace }}/scripts/workspace-verify.sh\n- run: .\\scripts\\check.ps1\n- run: ./check.sh\n  working-directory: ${{ github.workspace }}/commands/\n- run: .\\windows-check.ps1\n  working-directory: commands\\\n- run: ./lint.sh\n  working-directory: other\n- run: |\n    cd shell-commands\n    ./check.sh\n- run: |\n    cd guarded-commands || exit 1\n    set -euo pipefail\n    ./check.sh\n",
     );
     await writeFile(
       path.join(repo, "action.yml"),
@@ -3104,6 +3109,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "src/assertions.js",
       "src/prefixed.js",
       "src/check.py",
+      "src/__image_snapshots__/widget-snap.png",
       "src/__snapshots__/Widget.snap",
       "src/button.spec.ts-snapshots/button-chromium.png",
       "testdata/expected.json",
@@ -3740,6 +3746,18 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await assert.rejects(
       assertWorkerChangesAllowed(),
       /fixer modified pre-existing test files: src\/__snapshots__\/Widget\.snap/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/__image_snapshots__/widget-snap.png"),
+      "updated image\n",
+    );
+    git(worker, "add", "src/__image_snapshots__/widget-snap.png");
+    git(worker, "commit", "-m", "weaken Jest image snapshot assertion");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified pre-existing test files: src\/__image_snapshots__\/widget-snap\.png/,
     );
 
     git(worker, "reset", "--hard", featureHead);
@@ -4638,6 +4656,7 @@ test("CliOrca waits for a hidden fish shell before launching Claude", async () =
   const temp = await mkdtemp(path.join(tmpdir(), "orca-claude-shell-"));
   const fakeOrca = path.join(temp, "orca");
   const callsPath = path.join(temp, "calls.jsonl");
+  const delayedCreatePath = path.join(temp, "delay-create");
   const shellReturnedPath = path.join(temp, "shell-returned");
   const evidence = path.join(
     temp,
@@ -4664,6 +4683,10 @@ const out = (result) => console.log(JSON.stringify({ result }))
 if (args[0] === 'orchestration' && args[1] === 'run-create') {
   out({ run: { id: 'claude-shell-run' } })
 } else if (args[0] === 'terminal' && args[1] === 'create') {
+  if (fs.existsSync(${JSON.stringify(delayedCreatePath)})) {
+    const deadline = Date.now() + 150
+    while (Date.now() < deadline) {}
+  }
   out({ terminal: { handle: 'claude-shell' } })
 } else if (args[0] === 'terminal' && args[1] === 'send') {
   out({ accepted: true })
@@ -4734,6 +4757,52 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     );
     assert.ok(dispatch && !dispatch.args.includes("--inject"));
     assert.equal(worker.report.summary, "claude reviewed");
+
+    await writeFile(delayedCreatePath, "delay\n");
+    const createController = new AbortController();
+    const createFence = {
+      aborted: false,
+      deadlineSatisfied: false,
+      signal: createController.signal,
+    };
+    const callsBeforeCreateTimeout = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n").length;
+    const createAttempt = orca.startWorker(
+      "task-claude-create-timeout",
+      {
+        agent: { effort: "high", harness: "claude", model: "opus[1m]" },
+        name: "claude-create-timeout-reviewer",
+        prompt: "review instructions",
+        role: "reviewer",
+        stage: "review",
+        worktree: "current",
+      },
+      createFence,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    createFence.aborted = true;
+    createController.abort();
+    await assert.rejects(createAttempt, /cancelled/i);
+    const createTimeoutCalls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .slice(callsBeforeCreateTimeout)
+      .map((line) => (JSON.parse(line) as { args: string[] }).args);
+    assert.ok(
+      createTimeoutCalls.some(
+        (args) => args[0] === "terminal" && args[1] === "close",
+      ),
+      "a terminal created after the deadline is closed from its settled receipt",
+    );
+    assert.equal(
+      createTimeoutCalls.filter(
+        (args) => args[0] === "orchestration" && args[1] === "dispatch",
+      ).length,
+      0,
+      "an expired attempt does not dispatch after resource creation settles",
+    );
+    await rm(delayedCreatePath, { force: true });
 
     process.env.WORKER_SHELL_STARTUP_DELAY_MS = "5000";
     const timeoutController = new AbortController();

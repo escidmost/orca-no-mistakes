@@ -2674,7 +2674,6 @@ export class CliOrca implements OrcaOperations {
           "--json",
         ],
         false,
-        fence,
       );
       worktree = created.worktree;
       if (!worktree?.id || !worktree.path)
@@ -2682,6 +2681,8 @@ export class CliOrca implements OrcaOperations {
           "unclassified",
           "worktree create returned an invalid receipt",
         );
+      if (fence?.aborted)
+        throw new Error(`${launch.stage} worker attempt was cancelled`);
       await this.#detachWorkerWorktree(launch, worktree.path);
       if (fence?.aborted)
         throw new Error(`${launch.stage} worker attempt was cancelled`);
@@ -2714,9 +2715,10 @@ export class CliOrca implements OrcaOperations {
             "--json",
           ],
           false,
-          fence,
         );
         terminalHandle = createdTerminal?.terminal?.handle ?? "";
+        if (fence?.aborted)
+          throw new Error(`${launch.stage} worker attempt was cancelled`);
       }
       if (!terminalHandle)
         throw new PreflightError(
@@ -2756,7 +2758,6 @@ export class CliOrca implements OrcaOperations {
           "--json",
         ],
         false,
-        fence,
       );
       prepared.terminalHandle = created?.terminal?.handle ?? "";
       if (!prepared.terminalHandle)
@@ -2764,6 +2765,8 @@ export class CliOrca implements OrcaOperations {
           "unclassified",
           "terminal create returned an invalid receipt",
         );
+      if (fence?.aborted)
+        throw new Error(`${launch.stage} worker attempt was cancelled`);
       if (!launchesWithPreamble(launch.agent?.harness.toLowerCase()))
         await this.#launchWorkerAgent(
           prepared.terminalHandle,
@@ -3960,6 +3963,7 @@ function isTestPath(filePath: string): boolean {
           "__tests__",
           "__specs__",
           "__snapshots__",
+          "__image_snapshots__",
           "__fixtures__",
           "fixtures",
           "golden",
@@ -3973,7 +3977,7 @@ function isTestPath(filePath: string): boolean {
         ].includes(
           part.toLowerCase(),
         ) ||
-        /-snapshots$/i.test(part) ||
+        /(?:-|_)snapshots$/i.test(part) ||
         /\.tests?$/i.test(part),
       ) ||
     fileName.toLowerCase().endsWith(".snap") ||
@@ -4144,13 +4148,16 @@ function shellCommandReferencesTarget(
       /[.*+?^${}()|[\]\\]/g,
       "\\$&",
     );
-    const composed = normalizedCommand.match(
-      new RegExp(
-        `\\bcd\\s+["']?(?:\\./)?${escaped}/?["']?\\s*(?:(?:&&|;)\\s*|\\|\\|\\s*exit(?:\\s+[^;\\n]+)?\\s*(?:;\\s*|\\r?\\n\\s*)|\\r?\\n\\s*)[^\\n]*`,
-        "m",
-      ),
+    const cd = new RegExp(
+      `\\bcd\\s+["']?(?:\\./)?${escaped}/?["']?(?:\\s|$)`,
     );
-    return composed !== null && containsPathReference(composed[0], basename);
+    let activeDirectory = false;
+    for (const line of normalizedCommand.split(/\r?\n/)) {
+      const changedDirectory = line.match(/\bcd\s+[^;&|\s]+/);
+      if (changedDirectory) activeDirectory = cd.test(line);
+      if (activeDirectory && containsPathReference(line, basename)) return true;
+    }
+    return false;
   });
 }
 
