@@ -129,21 +129,21 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
   )
   assert.equal(
     buildCliCommand('Codex', { effort: 'max', model: 'gpt-5.6-luna' }),
-    `'codex' '--model' 'gpt-5.6-luna' '-c' 'model_reasoning_effort="max"' '--dangerously-bypass-approvals-and-sandbox'`
+    `'codex' '--model' 'gpt-5.6-luna' '-c' 'model_reasoning_effort="max"' '--dangerously-bypass-approvals-and-sandbox' '--disable' 'hooks' '--disable' 'plugin_hooks'`
   )
   assert.equal(
     buildCliCommand('codex', {
       agentArgsOverride: { codex: ['-c', 'model_reasoning_effort="low"'] } as never,
       effort: 'max'
     }),
-    `'codex' '--dangerously-bypass-approvals-and-sandbox' '-c' 'model_reasoning_effort="low"'`
+    `'codex' '--dangerously-bypass-approvals-and-sandbox' '--disable' 'hooks' '--disable' 'plugin_hooks' '-c' 'model_reasoning_effort="low"'`
   )
   assert.equal(
     buildCliCommand('codex', {
       agentArgsOverride: { codex: ['-c', 'model="raw"'] } as never,
       model: 'mapped'
     }),
-    `'codex' '--dangerously-bypass-approvals-and-sandbox' '-c' 'model="raw"'`
+    `'codex' '--dangerously-bypass-approvals-and-sandbox' '--disable' 'hooks' '--disable' 'plugin_hooks' '-c' 'model="raw"'`
   )
   assert.equal(
     buildCliCommand('codex', {
@@ -153,7 +153,7 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
       effort: 'max',
       model: 'mapped'
     }),
-    `'codex' '--dangerously-bypass-approvals-and-sandbox' '-c' 'model = "raw"' '-c' 'model_reasoning_effort = "low"'`
+    `'codex' '--dangerously-bypass-approvals-and-sandbox' '--disable' 'hooks' '--disable' 'plugin_hooks' '-c' 'model = "raw"' '-c' 'model_reasoning_effort = "low"'`
   )
   assert.equal(
     buildCliCommand('codex', {
@@ -161,7 +161,7 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
       effort: 'max',
       model: 'mapped'
     }),
-    `'codex' '--dangerously-bypass-approvals-and-sandbox' '-cmodel="raw"' '-cmodel_reasoning_effort="low"'`
+    `'codex' '--dangerously-bypass-approvals-and-sandbox' '--disable' 'hooks' '--disable' 'plugin_hooks' '-cmodel="raw"' '-cmodel_reasoning_effort="low"'`
   )
   assert.equal(
     buildCliCommand('codex', {
@@ -171,7 +171,7 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
       effort: 'max',
       model: 'mapped'
     }),
-    `'codex' '--model' 'mapped' '-c' 'model_reasoning_effort="max"' '--dangerously-bypass-approvals-and-sandbox' '--' '-c' 'model_reasoning_effort="low"' '--model' 'raw'`
+    `'codex' '--model' 'mapped' '-c' 'model_reasoning_effort="max"' '--dangerously-bypass-approvals-and-sandbox' '--disable' 'hooks' '--disable' 'plugin_hooks' '--' '-c' 'model_reasoning_effort="low"' '--model' 'raw'`
   )
   assert.throws(
     () =>
@@ -198,6 +198,9 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
     ['codex', ['-aon-request']],
     ['codex', ['-pdefault']],
     ['codex', ['-csandbox_mode="read-only"']],
+    ['codex', ['--enable', 'hooks']],
+    ['codex', ['--enable=plugin_hooks']],
+    ['codex', ['-c', 'features.hooks=true']],
     ['kimi', ['--prompt', 'raw']],
   ] as const) {
     assert.throws(
@@ -205,7 +208,7 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
         buildCliCommand(harness, {
           agentArgsOverride: { [harness]: [...args] } as never,
         }),
-      /reserved (?:argument|config)/,
+      /reserved (?:argument|config|feature)/,
     )
   }
   assert.throws(

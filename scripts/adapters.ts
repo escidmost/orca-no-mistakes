@@ -188,12 +188,27 @@ const RESERVED_HARNESS_ARGS: Record<string, ReadonlySet<string>> = {
   kimi: new Set(['--auto', '--plan', '--prompt', '--yolo', '-p']),
 }
 const RESERVED_CONFIG_KEYS: Record<string, ReadonlySet<string>> = {
-  codex: new Set(['approval_policy', 'sandbox_mode', 'sandbox_permissions']),
+  codex: new Set([
+    'approval_policy',
+    'features.hooks',
+    'features.plugin_hooks',
+    'sandbox_mode',
+    'sandbox_permissions',
+  ]),
+}
+const RESERVED_FEATURES: Record<string, ReadonlySet<string>> = {
+  codex: new Set(['hooks', 'plugin_hooks']),
 }
 const REQUIRED_HARNESS_ARGS: Record<string, readonly string[]> = {
   agy: ['--dangerously-skip-permissions'],
   claude: ['--dangerously-skip-permissions'],
-  codex: ['--dangerously-bypass-approvals-and-sandbox'],
+  codex: [
+    '--dangerously-bypass-approvals-and-sandbox',
+    '--disable',
+    'hooks',
+    '--disable',
+    'plugin_hooks',
+  ],
   kimi: ['--auto'],
 }
 
@@ -267,6 +282,7 @@ export function buildCliCommand(harness: string, options: CliAgentCommandOptions
   }
   const reserved = RESERVED_HARNESS_ARGS[normalizedHarness]
   const reservedConfig = RESERVED_CONFIG_KEYS[normalizedHarness]
+  const reservedFeatures = RESERVED_FEATURES[normalizedHarness]
   if (reserved) {
     for (let index = 0; index < raw.length; index++) {
       const arg = raw[index]
@@ -280,6 +296,21 @@ export function buildCliCommand(harness: string, options: CliAgentCommandOptions
         throw new Error(
           `agent ${normalizedHarness}: reserved config '${configKey}' cannot be overridden`
         )
+      }
+      if (arg === '--enable' || arg === '--disable') {
+        const feature = raw[index + 1]
+        if (feature && reservedFeatures?.has(feature)) {
+          throw new Error(
+            `agent ${normalizedHarness}: reserved feature '${feature}' cannot be overridden`
+          )
+        }
+      } else if (arg.startsWith('--enable=') || arg.startsWith('--disable=')) {
+        const feature = arg.slice(arg.indexOf('=') + 1)
+        if (reservedFeatures?.has(feature)) {
+          throw new Error(
+            `agent ${normalizedHarness}: reserved feature '${feature}' cannot be overridden`
+          )
+        }
       }
     }
   }
