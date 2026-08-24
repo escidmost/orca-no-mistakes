@@ -4049,7 +4049,7 @@ function importsAssertionFrameworkApi(source: string): boolean {
   const modules = String.raw`(?:@jest/globals|@playwright/test|chai|expect|vitest)`;
   const assertionBinding = /^(?:expect|assert|should)$/u;
   const namedImports = new RegExp(
-    String.raw`\bimport\s*\{([^}]*)\}\s*from\s*["']${modules}["']`,
+    String.raw`\b(?:import|export)\s*\{([^}]*)\}\s*from\s*["']${modules}["']`,
     "gsu",
   );
   for (const match of source.matchAll(namedImports)) {
@@ -4077,6 +4077,11 @@ function importsAssertionFrameworkApi(source: string): boolean {
       return true;
     }
   }
+  const requiredProperty = new RegExp(
+    String.raw`\b(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*require\s*\(\s*["']${modules}["']\s*\)\s*\.\s*(?:expect|assert|should)\b`,
+    "su",
+  );
+  if (requiredProperty.test(source)) return true;
   return /\bimport\s+(?!type\b)[A-Za-z_$][\w$]*\s+from\s+["']expect["']/u.test(source) ||
     /\b(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*require\s*\(\s*["']expect["']\s*\)/u.test(source);
 }
@@ -4100,6 +4105,8 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "BUILD",
       "BUILD.bazel",
       "CMakeLists.txt",
+      "CMakePresets.json",
+      "CMakeUserPresets.json",
       "MODULE.bazel",
       "WORKSPACE",
       "WORKSPACE.bazel",
@@ -4904,8 +4911,10 @@ export class GitShell implements GitOperations {
     }
     return candidates.filter((entrypointPath) => {
       const targets = new Set([entrypointPath]);
+      const rootActionTargets: string[] = [];
       let directory = path.posix.dirname(entrypointPath);
       while (directory !== ".") {
+        rootActionTargets.push(directory);
         if (
           trackedPathSet.has(`${directory}/action.yml`) ||
           trackedPathSet.has(`${directory}/action.yaml`)
@@ -4916,8 +4925,21 @@ export class GitShell implements GitOperations {
         if (parent === directory) break;
         directory = parent;
       }
+      const protectedByRootAction =
+        rootActionReferenced &&
+        rootActionPaths.some((actionPath) => {
+          if (entrypointPath === actionPath) return true;
+          const source = policySources.get(actionPath);
+          return source !== undefined &&
+            policySourceReferences(
+              actionPath,
+              source,
+              entrypointPath,
+              [...targets, ...rootActionTargets],
+            );
+        });
       return (
-        (rootActionReferenced && rootActionPaths.includes(entrypointPath)) ||
+        protectedByRootAction ||
         [...policySources].some(([policyPath, source]) =>
           policySourceReferences(policyPath, source, entrypointPath, [...targets]),
         )

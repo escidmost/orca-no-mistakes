@@ -3240,6 +3240,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       'import { expect as verify } from "@playwright/test";\nexport function check(page) {\n  verify(page).toHaveTitle("ok");\n}\n',
     );
     await writeFile(
+      path.join(repo, "src/reexported_assertion.ts"),
+      'export { expect as verify } from "vitest";\n',
+    );
+    await writeFile(
       path.join(repo, "src/playwright_types.ts"),
       'import type { Page } from "@playwright/test";\nexport type BrowserPage = Page;\nexport const browser = 1;\n',
     );
@@ -3284,6 +3288,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await mkdir(path.join(repo, "ci/check"), { recursive: true });
     await mkdir(path.join(repo, "ci/check/sub/dist"), { recursive: true });
     await mkdir(path.join(repo, "ci/check/cmd/check"), { recursive: true });
+    await mkdir(path.join(repo, "cmd/check"), { recursive: true });
     await mkdir(path.join(repo, "cd-options"));
     await mkdir(path.join(repo, "commands"));
     await mkdir(path.join(repo, "dist"));
@@ -3329,9 +3334,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     await writeFile(
       path.join(repo, "action.yml"),
-      "runs:\n  using: node20\n  main: dist/index.js\n",
+      "runs:\n  using: composite\n  steps:\n    - shell: bash\n      run: node ./dist/index.js\n    - shell: bash\n      run: go run ./cmd/check\n",
     );
     await writeFile(path.join(repo, "dist/index.js"), "require('child_process').execFileSync('npm', ['test']);\n");
+    await writeFile(path.join(repo, "cmd/check/main.go"), "package main\nfunc main() { verifyBehavior() }\n");
     await writeFile(
       path.join(repo, ".github/actions/check/action.yml"),
       "runs:\n  using: node20\n  main: dist/index.js\n",
@@ -3506,6 +3512,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "src/node_assertions.js",
       "src/node_alias.js",
       "src/aliased_playwright.ts",
+      "src/reexported_assertion.ts",
       "src/playwright_types.ts",
       "src/prefixed.js",
       "src/soft_expect.ts",
@@ -3536,6 +3543,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "jest.config.ts",
       "validation/jest.setup.ts",
       "action.yml",
+      "cmd/check/main.go",
       "ci/check/action.yml",
       "ci/check/run.sh",
       "ci/check/cmd/check/main.go",
@@ -3651,6 +3659,8 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(worker, "BUILD"), "# tests disabled\n");
     await writeFile(path.join(worker, "BUILD.bazel"), "# tests disabled\n");
     await writeFile(path.join(worker, "CMakeLists.txt"), "# enable_testing removed\n");
+    await writeFile(path.join(worker, "CMakePresets.json"), '{"testPresets":[]}\n');
+    await writeFile(path.join(worker, "CMakeUserPresets.json"), '{"testPresets":[]}\n');
     await writeFile(path.join(worker, "build.xml"), "<project><target name=\"test\" /></project>\n");
     await writeFile(path.join(worker, "directory.build.props"), "<Project><PropertyGroup><IsTestProject>false</IsTestProject></PropertyGroup></Project>\n");
     await writeFile(path.join(worker, "Directory.Build.targets"), "<Project><Target Name=\"SkipTests\" /></Project>\n");
@@ -3748,6 +3758,8 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "BUILD",
       "BUILD.bazel",
       "CMakeLists.txt",
+      "CMakePresets.json",
+      "CMakeUserPresets.json",
       "build.xml",
       "directory.build.props",
       "Directory.Build.targets",
@@ -3806,7 +3818,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "commit", "-m", "weaken validation policy");
     await assert.rejects(
       assertWorkerChangesAllowed(),
-      /unexplained-policy-relaxation:.*\.bazelrc, \.clang-format, \.clang-format-ignore, \.coveragerc, \.eslintignore, \.github\/actionlint\.yaml, \.husky\/pre-commit, \.justfile, \.lintstagedrc\.json, \.markdownlintignore, \.mocharc\.json, \.mvn\/jvm\.config, \.mvn\/maven\.config, \.mvn\/wrapper\/maven-wrapper\.jar, \.mvn\/wrapper\/maven-wrapper\.properties, \.npmrc, \.nycrc, \.oxlintrc\.json, \.prettierignore, \.rspec, \.shellcheckrc, \.stylelintignore, \.swiftlint\.yml, \.yamllint, BUILD, BUILD\.bazel, CMakeLists\.txt, Cargo\.lock, Directory\.Build\.targets, Directory\.Packages\.props, GNUmakefile, MODULE\.bazel, Pipfile, Taskfile\.dist\.yaml, Taskfile\.dist\.yml, Taskfile\.yml, WORKSPACE, WORKSPACE\.bazel, build\.gradle, build\.gradle\.kts, build\.xml, cypress\.config\.ts, directory\.build\.props, eslint\.config\.js, go\.work, gradle\.properties, gradle\/wrapper\/gradle-wrapper\.jar, gradle\/wrapper\/gradle-wrapper\.properties, gradlew, lerna\.json, lint-staged\.config\.js, mvnw, noxfile\.py, nyc\.config\.js, package-lock\.json, package\.json, phpunit\.xml, phpunit\.xml\.dist, pkg\/go\.mod, pnpm-lock\.yaml, pnpm-workspace\.yaml, pom\.xml, prompts\/fixer\.md, pylintrc, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, vitest\.workspace\.ts, workspace\.sln, workspace\.slnx, yarn\.lock/,
+      /unexplained-policy-relaxation:.*\.bazelrc, \.clang-format, \.clang-format-ignore, \.coveragerc, \.eslintignore, \.github\/actionlint\.yaml, \.husky\/pre-commit, \.justfile, \.lintstagedrc\.json, \.markdownlintignore, \.mocharc\.json, \.mvn\/jvm\.config, \.mvn\/maven\.config, \.mvn\/wrapper\/maven-wrapper\.jar, \.mvn\/wrapper\/maven-wrapper\.properties, \.npmrc, \.nycrc, \.oxlintrc\.json, \.prettierignore, \.rspec, \.shellcheckrc, \.stylelintignore, \.swiftlint\.yml, \.yamllint, BUILD, BUILD\.bazel, CMakeLists\.txt, CMakePresets\.json, CMakeUserPresets\.json, Cargo\.lock, Directory\.Build\.targets, Directory\.Packages\.props, GNUmakefile, MODULE\.bazel, Pipfile, Taskfile\.dist\.yaml, Taskfile\.dist\.yml, Taskfile\.yml, WORKSPACE, WORKSPACE\.bazel, build\.gradle, build\.gradle\.kts, build\.xml, cypress\.config\.ts, directory\.build\.props, eslint\.config\.js, go\.work, gradle\.properties, gradle\/wrapper\/gradle-wrapper\.jar, gradle\/wrapper\/gradle-wrapper\.properties, gradlew, lerna\.json, lint-staged\.config\.js, mvnw, noxfile\.py, nyc\.config\.js, package-lock\.json, package\.json, phpunit\.xml, phpunit\.xml\.dist, pkg\/go\.mod, pnpm-lock\.yaml, pnpm-workspace\.yaml, pom\.xml, prompts\/fixer\.md, pylintrc, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, vitest\.workspace\.ts, workspace\.sln, workspace\.slnx, yarn\.lock/,
     );
 
     git(worker, "reset", "--hard", featureHead);
@@ -4031,7 +4043,8 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "reset", "--hard", featureHead);
     await writeFile(path.join(worker, "action.yml"), "runs: { using: node20, main: dist/noop.js }\n");
     await writeFile(path.join(worker, "dist/index.js"), "process.exit(0);\n");
-    git(worker, "add", "action.yml", "dist/index.js");
+    await writeFile(path.join(worker, "cmd/check/main.go"), "package main\nfunc main() {}\n");
+    git(worker, "add", "action.yml", "dist/index.js", "cmd/check/main.go");
     git(worker, "commit", "-m", "disable referenced root action");
     await assert.rejects(
       assertWorkerChangesAllowed(),
@@ -4039,6 +4052,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
         assert.ok(error instanceof Error);
         assert.match(error.message, /action\.yml/);
         assert.match(error.message, /dist\/index\.js/);
+        assert.match(error.message, /cmd\/check\/main\.go/);
         return true;
       },
     );
@@ -4541,6 +4555,18 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await assert.rejects(
       assertWorkerChangesAllowed(),
       /fixer modified co-located test assertions or skip markers: src\/aliased_playwright\.ts/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/reexported_assertion.ts"),
+      "export function verify() {}\n",
+    );
+    git(worker, "add", "src/reexported_assertion.ts");
+    git(worker, "commit", "-m", "replace re-exported assertion");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified co-located test assertions or skip markers: src\/reexported_assertion\.ts/,
     );
 
     git(worker, "reset", "--hard", featureHead);
