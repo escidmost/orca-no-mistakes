@@ -2996,6 +2996,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await mkdir(path.join(repo, "ci/check/sub/dist"), { recursive: true });
     await mkdir(path.join(repo, "commands"));
     await mkdir(path.join(repo, "dist"));
+    await mkdir(path.join(repo, "guarded-commands"));
     await mkdir(path.join(repo, "gradle/wrapper"), { recursive: true });
     await mkdir(path.join(repo, ".mvn/wrapper"), { recursive: true });
     await mkdir(path.join(repo, "other"));
@@ -3008,7 +3009,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     await writeFile(
       path.join(repo, ".github/workflows/ci.yml"),
-      "- uses: ./\n- uses: ./.github/actions/check\n- uses: ./ci/check/\n- run: ${{ github.workspace }}/scripts/workspace-verify.sh\n- run: .\\scripts\\check.ps1\n- run: ./check.sh\n  working-directory: ${{ github.workspace }}/commands/\n- run: .\\windows-check.ps1\n  working-directory: commands\\\n- run: ./lint.sh\n  working-directory: other\n- run: |\n    cd shell-commands\n    ./check.sh\n",
+      "- uses: ./\n- uses: ./.github/actions/check\n- uses: ./ci/check/\n- run: ${{ github.workspace }}/scripts/workspace-verify.sh\n- run: .\\scripts\\check.ps1\n- run: ./check.sh\n  working-directory: ${{ github.workspace }}/commands/\n- run: .\\windows-check.ps1\n  working-directory: commands\\\n- run: ./lint.sh\n  working-directory: other\n- run: |\n    cd shell-commands\n    ./check.sh\n- run: |\n    cd guarded-commands || exit 1\n    ./check.sh\n",
     );
     await writeFile(
       path.join(repo, "action.yml"),
@@ -3039,6 +3040,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     await writeFile(path.join(repo, "commands/check.sh"), "npm test\n");
     await writeFile(path.join(repo, "commands/windows-check.ps1"), "npm test\n");
+    await writeFile(path.join(repo, "guarded-commands/check.sh"), "npm test\n");
     await writeFile(path.join(repo, "other/check.sh"), "export OTHER_CHECK=1\n");
     await writeFile(path.join(repo, "other/lint.sh"), "npm run lint\n");
     await writeFile(path.join(repo, "shell-commands/check.sh"), "npm test\n");
@@ -3121,6 +3123,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "commands/check.sh",
       "commands/windows-check.ps1",
       "dist/index.js",
+      "guarded-commands/check.sh",
       "gradle/wrapper/gradle-wrapper.properties",
       "gradlew",
       ".mvn/wrapper/maven-wrapper.properties",
@@ -3491,6 +3494,15 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await assert.rejects(
       assertWorkerChangesAllowed(),
       /protected validation policy files: shell-commands\/check\.sh/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "guarded-commands/check.sh"), "exit 0\n");
+    git(worker, "add", "guarded-commands/check.sh");
+    git(worker, "commit", "-m", "disable guarded shell validation entrypoint");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /protected validation policy files: guarded-commands\/check\.sh/,
     );
 
     git(worker, "reset", "--hard", featureHead);
@@ -4722,6 +4734,73 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     );
     assert.ok(dispatch && !dispatch.args.includes("--inject"));
     assert.equal(worker.report.summary, "claude reviewed");
+
+    process.env.WORKER_SHELL_STARTUP_DELAY_MS = "5000";
+    const timeoutController = new AbortController();
+    const timeoutFence = {
+      aborted: false,
+      deadlineSatisfied: false,
+      signal: timeoutController.signal,
+    };
+    const callsBeforeTimeout = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n").length;
+    const timeoutStartedAt = Date.now();
+    const timedOutLaunch = orca.startWorker(
+      "task-claude-timeout",
+      {
+        agent: { effort: "high", harness: "claude", model: "opus[1m]" },
+        name: "claude-timeout-reviewer",
+        prompt: "review instructions",
+        role: "reviewer",
+        stage: "review",
+        worktree: "current",
+      },
+      timeoutFence,
+    );
+    const dispatchDeadline = Date.now() + 2_000;
+    while (Date.now() < dispatchDeadline) {
+      const dispatchStarted = (await readFile(callsPath, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => (JSON.parse(line) as { args: string[] }).args)
+        .some(
+          (args) =>
+            args[0] === "orchestration" &&
+            args[1] === "dispatch" &&
+            args.includes("task-claude-timeout"),
+        );
+      if (dispatchStarted) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    timeoutFence.aborted = true;
+    timeoutController.abort();
+    await assert.rejects(timedOutLaunch, /aborted|cancelled/i);
+    assert.ok(
+      Date.now() - timeoutStartedAt < 2_000,
+      "a timeout interrupts the shell startup delay",
+    );
+    const timeoutCalls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .slice(callsBeforeTimeout)
+      .map((line) => (JSON.parse(line) as { args: string[] }).args);
+    assert.equal(
+      timeoutCalls.filter(
+        (args) => args[0] === "terminal" && args[1] === "send",
+      ).length,
+      0,
+      "an expired attempt never sends the delayed startup command",
+    );
+    assert.ok(
+      timeoutCalls.some(
+        (args) =>
+          args[0] === "orchestration" && args[1] === "worker-abandon",
+      ),
+    );
+    process.env.WORKER_SHELL_STARTUP_DELAY_MS = "80";
+
     await writeFile(shellReturnedPath, "shell\n");
     const callsBeforeLivenessCheck = (await readFile(callsPath, "utf8"))
       .trim()
@@ -5912,6 +5991,7 @@ test("fallback chains settle each failed candidate before the next launch", asyn
   const temp = await mkdtemp(path.join(tmpdir(), "orca-fallback-settle-"));
   const fakeOrca = path.join(temp, "orca");
   const callsPath = path.join(temp, "calls.jsonl");
+  const failClosePath = path.join(temp, "fail-close");
   const evidence = path.join(
     homedir(),
     ".orca-no-mistakes",
@@ -5952,6 +6032,9 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
   } else {
     out({ terminal: { connected: true, title: 'Claude CLI', preview: 'ready' } })
   }
+} else if (args[0] === 'terminal' && args[1] === 'close' && args.includes('stuck-terminal') && fs.existsSync(${JSON.stringify(failClosePath)})) {
+  console.error('terminal_close_failed')
+  process.exit(1)
 } else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
   out({ dispatch: { id: 'dispatch-claude', status: 'dispatched' }, injected: true, preamble: 'ok' })
 } else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
@@ -6027,6 +6110,34 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     assert.ok(
       closeIndex < nextLaunchIndex,
       "the failed candidate's terminal closes before the next candidate starts",
+    );
+
+    await writeFile(failClosePath, "fail\n");
+    await writeFile(callsPath, "");
+    await assert.rejects(
+      startWorkerWithFallback(
+        orca,
+        () => Promise.resolve("task-chain-cleanup-failure"),
+        launches,
+      ),
+      /worker cleanup failed.*terminal close/s,
+    );
+    const failedCleanupCalls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    assert.equal(
+      failedCleanupCalls.filter(
+        (args) => args[0] === "terminal" && args[1] === "create",
+      ).length,
+      1,
+    );
+    assert.equal(
+      failedCleanupCalls.filter(
+        (args) => args[0] === "orchestration" && args[1] === "worker-start",
+      ).length,
+      0,
+      "cleanup failure prevents the next fallback candidate from starting",
     );
   } finally {
     if (previousTimeout === undefined)

@@ -15,6 +15,7 @@ import {
 } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import YAML from "yaml";
 
@@ -2235,7 +2236,7 @@ export class CliOrca implements OrcaOperations {
       launch.agent?.harness ?? DEFAULT_WORKER_AGENT
     ).toLowerCase();
     const directPreamble = launchesWithPreamble(harness);
-    const prepared = await this.#prepareWorker(taskId, launch);
+    const prepared = await this.#prepareWorker(taskId, launch, fence);
     const terminalHandle = prepared.terminalHandle;
     if (!terminalHandle)
       throw new PreflightError(
@@ -2255,6 +2256,10 @@ export class CliOrca implements OrcaOperations {
           cause: error,
         });
       }
+    }
+    if (fence?.aborted) {
+      await this.#cleanupPreparedWorker(prepared);
+      throw new Error(`${launch.stage} worker attempt was cancelled`);
     }
     const args = [
       "orchestration",
@@ -2278,7 +2283,7 @@ export class CliOrca implements OrcaOperations {
         dispatch: { id: string; status: string } | null;
         injected?: boolean;
         preamble?: string;
-      }>(args);
+      }>(args, false, fence);
       if (fence?.aborted) {
         await this.#cleanupFailedWorker(
           receipt.dispatch?.id ?? "",
@@ -2323,6 +2328,7 @@ export class CliOrca implements OrcaOperations {
           terminalHandle,
           launch,
           preamble,
+          fence,
         );
       } catch (error) {
         if (promptPath) await rm(promptPath, { force: true });
@@ -2466,18 +2472,20 @@ export class CliOrca implements OrcaOperations {
   async #prepareWorker(
     taskId: string,
     launch: WorkerLaunch,
+    fence?: TimeoutFence,
   ): Promise<PreparedWorker> {
     const mode = launch.agent ? classifyHarness(launch.agent.harness) : "cli";
     if (mode === "native")
-      return await this.#prepareNativeWorker(taskId, launch);
+      return await this.#prepareNativeWorker(taskId, launch, fence);
     return launch.worktree === "new-child"
-      ? await this.#prepareNewChildWorker(launch)
-      : await this.#prepareCurrentWorker(launch);
+      ? await this.#prepareNewChildWorker(launch, fence)
+      : await this.#prepareCurrentWorker(launch, fence);
   }
 
   async #prepareNativeWorker(
     taskId: string,
     launch: WorkerLaunch,
+    fence?: TimeoutFence,
   ): Promise<PreparedWorker> {
     const agent = launch.agent!;
     let terminalHandle = "";
@@ -2520,6 +2528,7 @@ export class CliOrca implements OrcaOperations {
         }),
         this.#cwd,
         {
+          abortSignal: fence?.signal,
           allowFailure: true,
           timeoutMs:
             workerAgentReadyTimeoutMs() + NATIVE_WORKER_CREATE_SLACK_MS,
@@ -2566,21 +2575,37 @@ export class CliOrca implements OrcaOperations {
           `worker-start did not produce a ready ${agent.harness} worker: ${JSON.stringify(receipt).slice(0, 400)}`,
         );
       }
+      if (fence?.aborted)
+        throw new Error(`${launch.stage} worker attempt was cancelled`);
       await this.#detachWorkerWorktree(launch, worktreePath);
       return { terminalHandle, worktreeId, worktreePath };
     } catch (error) {
+      const cleanupFailures: string[] = [];
       for (const handle of new Set(
         [terminalHandle, ...residual.terminalHandles].filter(Boolean),
       )) {
-        await this.#cleanupPreparedWorker({ terminalHandle: handle });
+        try {
+          await this.#cleanupPreparedWorker({ terminalHandle: handle });
+        } catch (cleanupError) {
+          cleanupFailures.push(String(cleanupError));
+        }
       }
       const worktrees = [worktreeId, ...residual.worktreeIds].filter(
         (value): value is string => Boolean(value),
       );
       for (const id of new Set(worktrees)) {
-        await this.#cleanupPreparedWorker({
-          terminalHandle: "",
-          worktreeId: id,
+        try {
+          await this.#cleanupPreparedWorker({
+            terminalHandle: "",
+            worktreeId: id,
+          });
+        } catch (cleanupError) {
+          cleanupFailures.push(String(cleanupError));
+        }
+      }
+      if (cleanupFailures.length > 0) {
+        throw new Error(`worker cleanup failed: ${cleanupFailures.join("; ")}`, {
+          cause: error,
         });
       }
       throw error;
@@ -2610,7 +2635,10 @@ export class CliOrca implements OrcaOperations {
     }
   }
 
-  async #prepareNewChildWorker(launch: WorkerLaunch): Promise<PreparedWorker> {
+  async #prepareNewChildWorker(
+    launch: WorkerLaunch,
+    fence?: TimeoutFence,
+  ): Promise<PreparedWorker> {
     let worktree: { id: string; path: string } | undefined;
     let terminalHandle = "";
     try {
@@ -2629,21 +2657,25 @@ export class CliOrca implements OrcaOperations {
       const repoRoot = path.dirname(path.resolve(this.#cwd, commonGitDir));
       const created = await this.#json<{
         worktree: { id: string; path: string };
-      }>([
-        "worktree",
-        "create",
-        "--repo",
-        `path:${repoRoot}`,
-        "--name",
-        launch.name,
-        "--base-branch",
-        branch,
-        "--parent-worktree",
-        `path:${this.#cwd}`,
-        "--setup",
-        "run",
-        "--json",
-      ]);
+      }>(
+        [
+          "worktree",
+          "create",
+          "--repo",
+          `path:${repoRoot}`,
+          "--name",
+          launch.name,
+          "--base-branch",
+          branch,
+          "--parent-worktree",
+          `path:${this.#cwd}`,
+          "--setup",
+          "run",
+          "--json",
+        ],
+        false,
+        fence,
+      );
       worktree = created.worktree;
       if (!worktree?.id || !worktree.path)
         throw new PreflightError(
@@ -2651,6 +2683,8 @@ export class CliOrca implements OrcaOperations {
           "worktree create returned an invalid receipt",
         );
       await this.#detachWorkerWorktree(launch, worktree.path);
+      if (fence?.aborted)
+        throw new Error(`${launch.stage} worker attempt was cancelled`);
 
       const listed = await this.#json<{
         terminals: {
@@ -2658,7 +2692,11 @@ export class CliOrca implements OrcaOperations {
           handle: string;
           writable?: boolean;
         }[];
-      }>(["terminal", "list", "--worktree", `path:${worktree.path}`, "--json"]);
+      }>(
+        ["terminal", "list", "--worktree", `path:${worktree.path}`, "--json"],
+        false,
+        fence,
+      );
       terminalHandle =
         listed.terminals.find(
           (terminal) =>
@@ -2667,13 +2705,17 @@ export class CliOrca implements OrcaOperations {
       if (!terminalHandle) {
         const createdTerminal = await this.#json<{
           terminal: { handle: string };
-        }>([
-          "terminal",
-          "create",
-          "--worktree",
-          `path:${worktree.path}`,
-          "--json",
-        ]);
+        }>(
+          [
+            "terminal",
+            "create",
+            "--worktree",
+            `path:${worktree.path}`,
+            "--json",
+          ],
+          false,
+          fence,
+        );
         terminalHandle = createdTerminal?.terminal?.handle ?? "";
       }
       if (!terminalHandle)
@@ -2683,7 +2725,7 @@ export class CliOrca implements OrcaOperations {
         );
 
       if (!launchesWithPreamble(launch.agent?.harness.toLowerCase()))
-        await this.#launchWorkerAgent(terminalHandle, launch);
+        await this.#launchWorkerAgent(terminalHandle, launch, undefined, fence);
       return {
         terminalHandle,
         worktreeId: worktree.id,
@@ -2699,16 +2741,23 @@ export class CliOrca implements OrcaOperations {
     }
   }
 
-  async #prepareCurrentWorker(launch: WorkerLaunch): Promise<PreparedWorker> {
+  async #prepareCurrentWorker(
+    launch: WorkerLaunch,
+    fence?: TimeoutFence,
+  ): Promise<PreparedWorker> {
     const prepared: PreparedWorker = { terminalHandle: "" };
     try {
-      const created = await this.#json<{ terminal: { handle: string } }>([
-        "terminal",
-        "create",
-        "--worktree",
-        `path:${this.#cwd}`,
-        "--json",
-      ]);
+      const created = await this.#json<{ terminal: { handle: string } }>(
+        [
+          "terminal",
+          "create",
+          "--worktree",
+          `path:${this.#cwd}`,
+          "--json",
+        ],
+        false,
+        fence,
+      );
       prepared.terminalHandle = created?.terminal?.handle ?? "";
       if (!prepared.terminalHandle)
         throw new PreflightError(
@@ -2716,7 +2765,12 @@ export class CliOrca implements OrcaOperations {
           "terminal create returned an invalid receipt",
         );
       if (!launchesWithPreamble(launch.agent?.harness.toLowerCase()))
-        await this.#launchWorkerAgent(prepared.terminalHandle, launch);
+        await this.#launchWorkerAgent(
+          prepared.terminalHandle,
+          launch,
+          undefined,
+          fence,
+        );
       return prepared;
     } catch (error) {
       await this.#cleanupPreparedWorker(prepared);
@@ -2728,11 +2782,14 @@ export class CliOrca implements OrcaOperations {
     terminalHandle: string,
     launch: WorkerLaunch,
     initialPrompt?: string,
+    fence?: TimeoutFence,
   ): Promise<string | undefined> {
     const harness = launch.agent?.harness ?? DEFAULT_WORKER_AGENT;
     const normalizedHarness = harness.toLowerCase();
     let promptPath: string | undefined;
     try {
+      if (fence?.aborted)
+        throw new Error(`${launch.stage} worker attempt was cancelled`);
       let launchCommand = buildCliCommand(harness, {
         agentArgsOverride: launch.agent?.agentArgsOverride,
         effort: launch.agent?.effort,
@@ -2742,6 +2799,8 @@ export class CliOrca implements OrcaOperations {
       });
       if (initialPrompt !== undefined) {
         promptPath = await this.#writeWorkerPrompt(initialPrompt);
+        if (fence?.aborted)
+          throw new Error(`${launch.stage} worker attempt was cancelled`);
         const instruction = shellQuote(
           `Read and follow the complete authenticated task in ${promptPath}`,
         );
@@ -2754,45 +2813,56 @@ export class CliOrca implements OrcaOperations {
       }
       const shellStartupDelayMs = workerShellStartupDelayMs();
       if (shellStartupDelayMs > 0) {
-        await new Promise((resolve) =>
-          setTimeout(resolve, shellStartupDelayMs),
-        );
+        await delay(shellStartupDelayMs, undefined, { signal: fence?.signal });
       }
+      if (fence?.aborted)
+        throw new Error(`${launch.stage} worker attempt was cancelled`);
       const startupCursor =
         normalizedHarness === "kimi" && initialPrompt !== undefined
           ? (
               await this.#json<{
                 terminal?: { nextCursor?: string };
-              }>([
-                "terminal",
-                "read",
-                "--terminal",
-                terminalHandle,
-                "--limit",
-                "1",
-                "--json",
-              ])
+              }>(
+                [
+                  "terminal",
+                  "read",
+                  "--terminal",
+                  terminalHandle,
+                  "--limit",
+                  "1",
+                  "--json",
+                ],
+                false,
+                fence,
+              )
             ).terminal?.nextCursor
           : undefined;
-      await this.#json([
-        "terminal",
-        "send",
-        "--terminal",
-        terminalHandle,
-        "--text",
-        launchCommand,
-        "--enter",
-        "--json",
-      ]);
+      if (fence?.aborted)
+        throw new Error(`${launch.stage} worker attempt was cancelled`);
+      await this.#json(
+        [
+          "terminal",
+          "send",
+          "--terminal",
+          terminalHandle,
+          "--text",
+          launchCommand,
+          "--enter",
+          "--json",
+        ],
+        false,
+        fence,
+      );
       if (normalizedHarness === "kimi" && initialPrompt !== undefined) {
         if (startupCursor !== undefined) {
-          await this.#waitForKimiStartup(terminalHandle, startupCursor);
+          await this.#waitForKimiStartup(terminalHandle, startupCursor, fence);
         }
       } else {
         await this.#waitForWorkerAgent(
           terminalHandle,
           harness,
           initialPrompt !== undefined,
+          fence,
         );
       }
       return promptPath;
@@ -2805,27 +2875,33 @@ export class CliOrca implements OrcaOperations {
   async #waitForKimiStartup(
     terminalHandle: string,
     cursor: string,
+    fence?: TimeoutFence,
   ): Promise<void> {
     const deadline =
       Date.now() + Math.min(KIMI_STARTUP_GRACE_MS, workerAgentReadyTimeoutMs());
     for (;;) {
+      if (fence?.aborted) throw new Error("worker attempt was cancelled");
       const result = await this.#json<{
         terminal?: {
           nextCursor?: string;
           status?: string;
           tail?: string[];
         };
-      }>([
-        "terminal",
-        "read",
-        "--terminal",
-        terminalHandle,
-        "--cursor",
-        cursor,
-        "--limit",
-        "200",
-        "--json",
-      ]);
+      }>(
+        [
+          "terminal",
+          "read",
+          "--terminal",
+          terminalHandle,
+          "--cursor",
+          cursor,
+          "--limit",
+          "200",
+          "--json",
+        ],
+        false,
+        fence,
+      );
       if (result.terminal?.status === "exited") {
         throw new PreflightError(
           "readiness-timeout",
@@ -2845,7 +2921,7 @@ export class CliOrca implements OrcaOperations {
         );
       }
       if (Date.now() >= deadline) return;
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await delay(50, undefined, { signal: fence?.signal });
     }
   }
 
@@ -3017,6 +3093,7 @@ export class CliOrca implements OrcaOperations {
     terminalHandle: string,
     harness: string,
     promptSubmitted = false,
+    fence?: TimeoutFence,
   ): Promise<void> {
     const waitsForPrompt = harness.toLowerCase() === "agy" && !promptSubmitted;
     const ready = readinessMatcher(harness);
@@ -3024,17 +3101,22 @@ export class CliOrca implements OrcaOperations {
     const deadline = Date.now() + workerAgentReadyTimeoutMs();
     let consecutiveMatches = 0;
     for (;;) {
+      if (fence?.aborted) throw new Error("worker attempt was cancelled");
       if (waitsForPrompt) {
         const screen = await this.#json<{
           terminal: { status?: string; tail?: string[] };
-        }>([
-          "terminal",
-          "read",
-          "--terminal",
-          terminalHandle,
-          "--screen",
-          "--json",
-        ]);
+        }>(
+          [
+            "terminal",
+            "read",
+            "--terminal",
+            terminalHandle,
+            "--screen",
+            "--json",
+          ],
+          false,
+          fence,
+        );
         if (screen.terminal.status === "exited") {
           throw new PreflightError(
             "readiness-timeout",
@@ -3049,7 +3131,11 @@ export class CliOrca implements OrcaOperations {
             preview?: string | null;
             title?: string | null;
           };
-        }>(["terminal", "show", "--terminal", terminalHandle, "--json"]);
+        }>(
+          ["terminal", "show", "--terminal", terminalHandle, "--json"],
+          false,
+          fence,
+        );
         const terminal = shown.terminal;
         if (terminal.connected === false)
           throw new PreflightError(
@@ -3085,7 +3171,7 @@ export class CliOrca implements OrcaOperations {
           `${harness} did not become ready before the timeout`,
         );
       }
-      await new Promise((resolve) => setTimeout(resolve, 250));
+      await delay(250, undefined, { signal: fence?.signal });
     }
   }
 
@@ -3216,32 +3302,7 @@ export class CliOrca implements OrcaOperations {
   }
 
   async #cleanupPreparedWorker(prepared: PreparedWorker): Promise<void> {
-    if (prepared.terminalHandle) {
-      await this.#json(
-        [
-          "terminal",
-          "close",
-          "--terminal",
-          prepared.terminalHandle,
-          "--tab",
-          "--json",
-        ],
-        true,
-      ).catch(() => {});
-    }
-    if (prepared.worktreeId) {
-      await this.#json(
-        [
-          "worktree",
-          "rm",
-          "--worktree",
-          `id:${prepared.worktreeId}`,
-          "--force",
-          "--json",
-        ],
-        true,
-      ).catch(() => {});
-    }
+    await this.#cleanupWorkerResources(prepared);
   }
 
   async finishWorker(
@@ -3778,39 +3839,69 @@ export class CliOrca implements OrcaOperations {
     worktreeId?: string,
     deliveryId?: string,
   ): Promise<void> {
-    await this.#json(
-      ["orchestration", "worker-abandon", "--dispatch", dispatchId, "--json"],
-      true,
-    ).catch(() => {});
-    await this.#json(
-      ["terminal", "close", "--terminal", terminalHandle, "--tab", "--json"],
-      true,
-    ).catch(() => {});
-    if (worktreeId) {
-      await this.#json(
-        [
-          "worktree",
-          "rm",
-          "--worktree",
-          `id:${worktreeId}`,
-          "--force",
-          "--json",
-        ],
-        true,
-      ).catch(() => {});
+    await this.#cleanupWorkerResources({
+      deliveryId,
+      dispatchId,
+      terminalHandle,
+      worktreeId,
+    });
+  }
+
+  async #cleanupWorkerResources(resources: {
+    deliveryId?: string;
+    dispatchId?: string;
+    terminalHandle: string;
+    worktreeId?: string;
+  }): Promise<void> {
+    const failures: string[] = [];
+    const attempt = async (label: string, args: string[]): Promise<void> => {
+      try {
+        await this.#json(args);
+      } catch (error) {
+        failures.push(`${label}: ${String(error)}`);
+      }
+    };
+    if (resources.dispatchId) {
+      await attempt("worker abandon", [
+        "orchestration",
+        "worker-abandon",
+        "--dispatch",
+        resources.dispatchId,
+        "--json",
+      ]);
     }
-    if (deliveryId) {
-      await this.#json(
-        [
-          "orchestration",
-          "check",
-          "--ack",
-          deliveryId,
-          ...(this.#runId ? ["--run", this.#runId] : []),
-          "--json",
-        ],
-        true,
-      ).catch(() => {});
+    if (resources.terminalHandle) {
+      await attempt("terminal close", [
+        "terminal",
+        "close",
+        "--terminal",
+        resources.terminalHandle,
+        "--tab",
+        "--json",
+      ]);
+    }
+    if (resources.worktreeId) {
+      await attempt("worktree removal", [
+        "worktree",
+        "rm",
+        "--worktree",
+        `id:${resources.worktreeId}`,
+        "--force",
+        "--json",
+      ]);
+    }
+    if (resources.deliveryId) {
+      await attempt("delivery acknowledgement", [
+        "orchestration",
+        "check",
+        "--ack",
+        resources.deliveryId,
+        ...(this.#runId ? ["--run", this.#runId] : []),
+        "--json",
+      ]);
+    }
+    if (failures.length > 0) {
+      throw new Error(`worker cleanup failed: ${failures.join("; ")}`);
     }
   }
 
@@ -4055,7 +4146,7 @@ function shellCommandReferencesTarget(
     );
     const composed = normalizedCommand.match(
       new RegExp(
-        `\\bcd\\s+["']?(?:\\./)?${escaped}/?["']?\\s*(?:(?:&&|;)\\s*|\\r?\\n\\s*)[^\\n]*`,
+        `\\bcd\\s+["']?(?:\\./)?${escaped}/?["']?\\s*(?:(?:&&|;)\\s*|\\|\\|\\s*exit(?:\\s+[^;\\n]+)?\\s*(?:;\\s*|\\r?\\n\\s*)|\\r?\\n\\s*)[^\\n]*`,
         "m",
       ),
     );
