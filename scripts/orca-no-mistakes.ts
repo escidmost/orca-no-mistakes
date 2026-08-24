@@ -3962,6 +3962,7 @@ function isTestPath(filePath: string): boolean {
     fileName.toLowerCase().endsWith(".robot") ||
     fileName.toLowerCase().endsWith(".t") ||
     fileName.toLowerCase().endsWith(".tftest.hcl") ||
+    /^test.*\.py$/i.test(fileName) ||
     /(?:^|[._-])(?:tests?|specs?|unittests?|cy|e2e)(?=[._]|$)/i.test(fileName) ||
     (!["docs", "scripts"].includes(parts[0]?.toLowerCase() ?? "") &&
       /^tests?-[A-Za-z0-9]/i.test(fileStem)) ||
@@ -4059,7 +4060,9 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "gradle.properties",
       "gradlew",
       "gradlew.bat",
+      ".justfile",
       "justfile",
+      "gnumakefile",
       "makefile",
       "noxfile.py",
       "npm-shrinkwrap.json",
@@ -4082,6 +4085,8 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "setup.cfg",
       "taskfile.yaml",
       "taskfile.yml",
+      "taskfile.dist.yaml",
+      "taskfile.dist.yml",
       "mix.exs",
       "mix.lock",
       "tox.ini",
@@ -4112,7 +4117,7 @@ function containsPathReference(source: string, reference: string): boolean {
   ).test(source);
 }
 
-const ROOT_PATH_PREFIX_PATTERN = String.raw`(?:\$\{\{[^}\n]+\}\}|\$[Ee][Nn][Vv]:[A-Za-z_][A-Za-z0-9_]*|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\$\(\s*pwd\s*\)|\$\(\s*git\s+rev-parse\s+--show-toplevel\s*\))`;
+const ROOT_PATH_PREFIX_PATTERN = String.raw`(?:\$\{\{[^}\n]+\}\}|\$[Ee][Nn][Vv]:[A-Za-z_][A-Za-z0-9_]*|%[A-Za-z_][A-Za-z0-9_]*%|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\$\(\s*pwd\s*\)|\$\(\s*git\s+rev-parse\s+--show-toplevel\s*\))`;
 
 function normalizeQuotedPathPrefixes(source: string): string {
   return source.replace(
@@ -4162,7 +4167,7 @@ function shellCommandReferencesTarget(
   const directoryStack: string[] = [];
   for (const statement of normalizedCommand.split(/\r?\n|&&|;/)) {
     const changedDirectory = statement.match(
-      /\b(cd|pushd)\s+(?:"([^"]+)"|'([^']+)'|([^&|\s]+))/,
+      /\b(cd|pushd|set-location|push-location)\s+(?:"([^"]+)"|'([^']+)'|([^&|\s]+))/i,
     );
     if (changedDirectory) {
       const rawDirectory =
@@ -4174,11 +4179,12 @@ function shellCommandReferencesTarget(
           ? rawDirectory
           : path.posix.join(currentDirectory || ".", rawDirectory),
       );
-      if (changedDirectory[1] === "pushd") directoryStack.push(currentDirectory);
+      if (/^(?:pushd|push-location)$/i.test(changedDirectory[1]))
+        directoryStack.push(currentDirectory);
       currentDirectory = nextDirectory;
       continue;
     }
-    if (/\bpopd\b/.test(statement)) {
+    if (/\b(?:popd|pop-location)\b/i.test(statement)) {
       currentDirectory = directoryStack.pop() ?? "";
       continue;
     }
@@ -4204,6 +4210,27 @@ function containsValidationPathReference(
     containsPathReference(source, reference) ||
     containsPrefixedPathReference(source, reference);
   if ([...references].some(containsReference)) return true;
+  if (targetPath.toLowerCase().endsWith(".py")) {
+    const modules = [...references]
+      .filter((reference) => !reference.startsWith(".."))
+      .map((reference) =>
+        reference
+          .replace(/^\.\//, "")
+          .replace(/\.py$/i, "")
+          .replace(/\/__init__$/i, "")
+          .replace(/\//g, "."),
+      )
+      .filter(Boolean);
+    if (
+      modules.some((moduleName) =>
+        new RegExp(
+          `\\b(?:python(?:3(?:\\.\\d+)?)?|py)\\s+-m\\s+${moduleName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?=$|\\s|["'])`,
+          "m",
+        ).test(source),
+      )
+    )
+      return true;
+  }
 
   const targetDirectory = path.posix.dirname(targetPath);
   if (targetDirectory === ".") return false;
