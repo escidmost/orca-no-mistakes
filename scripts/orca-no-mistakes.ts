@@ -3955,6 +3955,7 @@ function isTestPath(filePath: string): boolean {
           "testdata",
           "test-data",
           "test_data",
+          "testfixtures",
           "unittest",
           "unittests",
         ].includes(
@@ -4104,10 +4105,10 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "yarn.lock",
     ].includes(fileName) ||
     fileName.endsWith(".csproj") ||
-    (parts.at(-2) === ".mvn" && fileName === "maven.config") ||
+    (parts.at(-2) === ".mvn" && ["jvm.config", "maven.config"].includes(fileName)) ||
     /^settings\.gradle(?:\.kts)?$/.test(fileName) ||
     (parts[0] !== "docs" && parts.slice(0, -1).includes("prompts")) ||
-    /^(?:(?:vitest|jest|playwright|cypress)\.config\..+|vitest\.workspace\..+|\.mocharc(?:\..+)?|karma\.conf\..+|phpunit\.xml(?:\.dist)?|eslint\.config\..+|\.eslintrc(?:\..+)?|\.eslintignore|prettier\.config\..+|\.prettierrc(?:\..+)?|\.prettierignore|biome\.jsonc?|deno\.jsonc?|\.editorconfig|\.flake8|\.?ruff\.toml|\.?mypy\.ini|\.?pylintrc|pyrightconfig\.json|\.rubocop\.ya?ml|stylelint\.config\..+|\.stylelintrc(?:\..+)?|\.stylelintignore|\.?markdownlint(?:-cli2)?(?:\..+)?|\.markdownlintignore|\.shellcheckrc|\.golangci\.(?:ya?ml|toml|json)|\.?rustfmt\.toml|\.?clippy\.toml|\.clang-format|\.clang-format-ignore|\.clang-tidy|analysis_options\.yaml|checkstyle\.xml|detekt\.ya?ml|phpcs\.xml(?:\.dist)?|phpstan(?:\.[^.]+)?\.neon(?:\.dist)?|sonar-project\.properties|tsconfig(?:\.[^.]+)*\.json|tslint(?:\.[^.]+)*\.json)$/.test(
+    /^(?:(?:vitest|jest|playwright|cypress)\.config\..+|vitest\.workspace\..+|\.mocharc(?:\..+)?|karma\.conf\..+|phpunit\.xml(?:\.dist)?|eslint\.config\..+|\.eslintrc(?:\..+)?|\.eslintignore|prettier\.config\..+|\.prettierrc(?:\..+)?|\.prettierignore|biome\.jsonc?|deno\.jsonc?|\.coveragerc|\.editorconfig|\.flake8|\.?ruff\.toml|\.?mypy\.ini|\.?pylintrc|pyrightconfig\.json|\.rubocop\.ya?ml|stylelint\.config\..+|\.stylelintrc(?:\..+)?|\.stylelintignore|\.?markdownlint(?:-cli2)?(?:\..+)?|\.markdownlintignore|\.shellcheckrc|\.golangci\.(?:ya?ml|toml|json)|\.?rustfmt\.toml|\.?clippy\.toml|\.clang-format|\.clang-format-ignore|\.clang-tidy|analysis_options\.yaml|checkstyle\.xml|detekt\.ya?ml|phpcs\.xml(?:\.dist)?|phpstan(?:\.[^.]+)?\.neon(?:\.dist)?|sonar-project\.properties|tsconfig(?:\.[^.]+)*\.json|tslint(?:\.[^.]+)*\.json)$/.test(
       fileName,
     )
   );
@@ -4252,7 +4253,7 @@ function containsValidationPathReference(
     if (
       modules.some((moduleName) =>
         new RegExp(
-          `\\b(?:python(?:3(?:\\.\\d+)?)?|py)(?:\\s+(?!-m\\b)-\\S+)*\\s+-m\\s+["']?${moduleName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}["']?(?=$|\\s)`,
+          `\\b(?:python(?:3(?:\\.\\d+)?)?|py)(?:\\s+(?:(?:-X|-W|--check-hash-based-pycs)\\s+\\S+|(?!-m\\b)-\\S+))*\\s+-m\\s+["']?${moduleName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}["']?(?=$|\\s)`,
           "m",
         ).test(source),
       )

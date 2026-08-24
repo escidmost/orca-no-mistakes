@@ -3006,6 +3006,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await mkdir(path.join(repo, "src/__mocks__"));
     await mkdir(path.join(repo, "src/__snapshots__"));
     await mkdir(path.join(repo, "src/button.spec.ts-snapshots"));
+    await mkdir(path.join(repo, "src/testFixtures/java"), { recursive: true });
     await mkdir(path.join(repo, "testdata"));
     await mkdir(path.join(repo, "t"));
     await mkdir(path.join(repo, "__fixtures__"));
@@ -3073,6 +3074,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(
       path.join(repo, "src/widget.spec.ts"),
       "assert.ok(true);\n",
+    );
+    await writeFile(
+      path.join(repo, "src/testFixtures/java/Fixture.java"),
+      "class Fixture { static int expected() { return 1; } }\n",
     );
     await writeFile(
       path.join(repo, "MyProject.Tests/OrderServiceTests.cs"),
@@ -3203,7 +3208,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     await writeFile(
       path.join(repo, ".github/workflows/python.yml"),
-      '- run: python -m "quotedpkg.check"\n',
+      '- run: python -X dev -m "quotedpkg.check"\n',
     );
     await writeFile(
       path.join(repo, "action.yml"),
@@ -3346,6 +3351,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "__fixtures__/response.json",
       "src/spec-parser.ts",
       "src/widget.spec.ts",
+      "src/testFixtures/java/Fixture.java",
       "Tests/branch-regression.ts",
       ".github/actions/check/action.yml",
       ".github/actions/check/dist/index.js",
@@ -3429,6 +3435,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "reset", "--hard", featureHead);
     await writeFile(path.join(worker, "eslint.config.js"), "export default [];\n");
     await writeFile(path.join(worker, ".clang-format"), "DisableFormat: true\n");
+    await writeFile(path.join(worker, ".coveragerc"), "[report]\nfail_under = 0\n");
     await writeFile(path.join(worker, ".clang-format-ignore"), "**/*\n");
     await writeFile(path.join(worker, ".eslintignore"), "**/*\n");
     await writeFile(path.join(worker, ".markdownlintignore"), "**/*\n");
@@ -3482,6 +3489,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(worker, "pylintrc"), "[MESSAGES CONTROL]\ndisable=all\n");
     await mkdir(path.join(worker, ".mvn"), { recursive: true });
     await writeFile(path.join(worker, ".mvn/maven.config"), "-DskipTests\n");
+    await writeFile(path.join(worker, ".mvn/jvm.config"), "-DskipTests\n");
     await writeFile(
       path.join(worker, "settings.gradle"),
       "gradle.startParameter.excludedTaskNames.add('test')\n",
@@ -3508,10 +3516,12 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       ".mocharc.json",
       ".clang-format",
       ".clang-format-ignore",
+      ".coveragerc",
       ".eslintignore",
       ".justfile",
       ".markdownlintignore",
       ".mvn/maven.config",
+      ".mvn/jvm.config",
       ".npmrc",
       ".prettierignore",
       ".shellcheckrc",
@@ -3571,7 +3581,19 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "commit", "-m", "weaken validation policy");
     await assert.rejects(
       assertWorkerChangesAllowed(),
-      /unexplained-policy-relaxation:.*\.bazelrc, \.clang-format, \.clang-format-ignore, \.eslintignore, \.justfile, \.markdownlintignore, \.mocharc\.json, \.mvn\/maven\.config, \.mvn\/wrapper\/maven-wrapper\.jar, \.mvn\/wrapper\/maven-wrapper\.properties, \.npmrc, \.prettierignore, \.shellcheckrc, \.stylelintignore, BUILD, BUILD\.bazel, CMakeLists\.txt, Cargo\.lock, Directory\.Build\.targets, Directory\.Packages\.props, GNUmakefile, MODULE\.bazel, Pipfile, Taskfile\.dist\.yaml, Taskfile\.dist\.yml, Taskfile\.yml, WORKSPACE, WORKSPACE\.bazel, build\.gradle, build\.gradle\.kts, cypress\.config\.ts, directory\.build\.props, eslint\.config\.js, go\.work, gradle\.properties, gradle\/wrapper\/gradle-wrapper\.jar, gradle\/wrapper\/gradle-wrapper\.properties, gradlew, mvnw, noxfile\.py, package-lock\.json, package\.json, phpunit\.xml, phpunit\.xml\.dist, pkg\/go\.mod, pnpm-lock\.yaml, pom\.xml, prompts\/fixer\.md, pylintrc, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, vitest\.workspace\.ts, yarn\.lock/,
+      /unexplained-policy-relaxation:.*\.bazelrc, \.clang-format, \.clang-format-ignore, \.coveragerc, \.eslintignore, \.justfile, \.markdownlintignore, \.mocharc\.json, \.mvn\/jvm\.config, \.mvn\/maven\.config, \.mvn\/wrapper\/maven-wrapper\.jar, \.mvn\/wrapper\/maven-wrapper\.properties, \.npmrc, \.prettierignore, \.shellcheckrc, \.stylelintignore, BUILD, BUILD\.bazel, CMakeLists\.txt, Cargo\.lock, Directory\.Build\.targets, Directory\.Packages\.props, GNUmakefile, MODULE\.bazel, Pipfile, Taskfile\.dist\.yaml, Taskfile\.dist\.yml, Taskfile\.yml, WORKSPACE, WORKSPACE\.bazel, build\.gradle, build\.gradle\.kts, cypress\.config\.ts, directory\.build\.props, eslint\.config\.js, go\.work, gradle\.properties, gradle\/wrapper\/gradle-wrapper\.jar, gradle\/wrapper\/gradle-wrapper\.properties, gradlew, mvnw, noxfile\.py, package-lock\.json, package\.json, phpunit\.xml, phpunit\.xml\.dist, pkg\/go\.mod, pnpm-lock\.yaml, pom\.xml, prompts\/fixer\.md, pylintrc, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, vitest\.workspace\.ts, yarn\.lock/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/testFixtures/java/Fixture.java"),
+      "class Fixture { static int expected() { return 0; } }\n",
+    );
+    git(worker, "add", "src/testFixtures/java/Fixture.java");
+    git(worker, "commit", "-m", "weaken Gradle test fixture");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified pre-existing test files: src\/testFixtures\/java\/Fixture\.java/,
     );
 
     git(worker, "reset", "--hard", featureHead);
