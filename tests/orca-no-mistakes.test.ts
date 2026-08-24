@@ -1103,6 +1103,51 @@ test("a rejected fixer fails closed when its cleanup fails", async () => {
   assert.ok(orca.removedWorktrees.length > 0);
 });
 
+test("an invalid fixer report preserves its error when cleanup also fails", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  class CleanupFailureOrca extends FakeOrca {
+    override async finishWorker(
+      worker: WorkerResult,
+      disposition: "release" | "retain",
+    ): Promise<void> {
+      await super.finishWorker(worker, disposition);
+      if (
+        disposition === "release" &&
+        this.fixerDispatches.includes(worker.dispatchId)
+      ) {
+        throw new Error("invalid fixer cleanup failed");
+      }
+    }
+  }
+  const orca = new CleanupFailureOrca(git);
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Repair the implementation.",
+        },
+      ],
+      summary: "one defect",
+    },
+    { findings: [], summary: "" },
+  ]);
+
+  await assert.rejects(
+    runPipeline({ intent: "Preserve fixer and cleanup failures." }, orca, git),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /review fixer cleanup failed.*invalid fixer cleanup failed/);
+      assert.ok(error.cause instanceof Error);
+      assert.match(error.cause.message, /review worker returned an invalid report/);
+      return true;
+    },
+  );
+});
+
 test("a passing run fails closed when retained fixer cleanup fails", async () => {
   const git = new FakeGit();
   allowReviewAutoFix(git);
@@ -2991,6 +3036,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "[TestCase(1)]\nvoid Works(int value) { Verify(value); }\n",
     );
     await writeFile(
+      path.join(repo, "src/Calculator.cs"),
+      "[NUnit.Framework.Test]\nvoid Calculates() { NUnit.Framework.Assert.AreEqual(1, Calculate()); }\n",
+    );
+    await writeFile(
       path.join(repo, "src/inline.js"),
       "test.each(buildCases(seed()))('response', () => {\n  assert.deepEqual(actual, {\n    ok: true,\n  });\n});\n",
     );
@@ -3154,6 +3203,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "src/registered_cases.rs",
       "src/ParameterizedExample.java",
       "src/NUnitExample.cs",
+      "src/Calculator.cs",
       "src/math.zig",
       "src/inline.js",
       "src/concurrent.js",
@@ -3393,6 +3443,18 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       }
       return true;
     });
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/Calculator.cs"),
+      "[NUnit.Framework.Test]\nvoid Calculates() { NUnit.Framework.Assert.AreEqual(2, Calculate()); }\n",
+    );
+    git(worker, "add", "src/Calculator.cs");
+    git(worker, "commit", "-m", "weaken qualified C sharp inline test");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified co-located test assertions or skip markers: src\/Calculator\.cs/,
+    );
 
     git(worker, "reset", "--hard", featureHead);
     const ciPolicyPaths = [
@@ -4808,6 +4870,8 @@ test("CliOrca waits for a hidden fish shell before launching Claude", async () =
   const fakeOrca = path.join(temp, "orca");
   const callsPath = path.join(temp, "calls.jsonl");
   const delayedCreatePath = path.join(temp, "delay-create");
+  const delayedDispatchPath = path.join(temp, "delay-dispatch");
+  const delayedRetainedStartPath = path.join(temp, "delay-retained-start");
   const shellReturnedPath = path.join(temp, "shell-returned");
   const evidence = path.join(
     temp,
@@ -4846,8 +4910,16 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     ? { terminal: { connected: true, title: 'Claude CLI', preview: '$', writable: true, worktreeId: 'claude-worktree' } }
     : { terminal: { connected: true, title: 'Claude CLI', preview: 'ready', writable: true, worktreeId: 'claude-worktree' } })
 } else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
+  if (fs.existsSync(${JSON.stringify(delayedDispatchPath)})) {
+    const deadline = Date.now() + 150
+    while (Date.now() < deadline) {}
+  }
   out({ dispatch: { id: 'dispatch-claude', status: 'dispatched' }, injected: false, preamble: 'authenticated' })
 } else if (args[0] === 'orchestration' && args[1] === 'worker-start') {
+  if (fs.existsSync(${JSON.stringify(delayedRetainedStartPath)})) {
+    const deadline = Date.now() + 150
+    while (Date.now() < deadline) {}
+  }
   if (fs.existsSync(${JSON.stringify(shellReturnedPath)})) {
     console.error(JSON.stringify({ error: { code: 'agent_unconfigured', message: 'Terminal is not running a recognized agent.' } }))
     process.exit(1)
@@ -4954,6 +5026,99 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       "an expired attempt does not dispatch after resource creation settles",
     );
     await rm(delayedCreatePath, { force: true });
+
+    await writeFile(delayedDispatchPath, "delay\n");
+    const dispatchController = new AbortController();
+    const dispatchFence = {
+      aborted: false,
+      deadlineSatisfied: false,
+      signal: dispatchController.signal,
+    };
+    const callsBeforeDispatchTimeout = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n").length;
+    const dispatchAttempt = orca.startWorker(
+      "task-claude-dispatch-timeout",
+      {
+        agent: { effort: "high", harness: "claude", model: "opus[1m]" },
+        name: "claude-dispatch-timeout-reviewer",
+        prompt: "review instructions",
+        role: "reviewer",
+        stage: "review",
+        worktree: "current",
+      },
+      dispatchFence,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    dispatchFence.aborted = true;
+    dispatchController.abort();
+    await assert.rejects(dispatchAttempt, /cancelled/i);
+    const dispatchTimeoutCalls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .slice(callsBeforeDispatchTimeout)
+      .map((line) => (JSON.parse(line) as { args: string[] }).args);
+    assert.ok(
+      dispatchTimeoutCalls.some(
+        (args) =>
+          args[0] === "orchestration" &&
+          args[1] === "worker-abandon" &&
+          args.includes("dispatch-claude"),
+      ),
+      "a dispatch created at the deadline is abandoned from its settled receipt",
+    );
+    assert.equal(
+      dispatchTimeoutCalls.filter(
+        (args) => args[0] === "terminal" && args[1] === "send",
+      ).length,
+      0,
+      "an expired attempt does not launch after dispatch creation settles",
+    );
+    await rm(delayedDispatchPath, { force: true });
+
+    await writeFile(delayedRetainedStartPath, "delay\n");
+    const retainedController = new AbortController();
+    const retainedFence = {
+      aborted: false,
+      deadlineSatisfied: false,
+      signal: retainedController.signal,
+    };
+    const callsBeforeRetainedTimeout = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n").length;
+    const retainedAttempt = orca.startWorker(
+      "task-claude-retained-timeout",
+      {
+        agent: { effort: "high", harness: "claude", model: "opus[1m]" },
+        name: "claude-retained-timeout-reviewer",
+        prompt: "follow-up review instructions",
+        role: "reviewer",
+        stage: "review",
+        retainedWorktreeId: "claude-worktree",
+        terminal: worker.terminalHandle,
+        worktree: "current",
+      },
+      retainedFence,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    retainedFence.aborted = true;
+    retainedController.abort();
+    await assert.rejects(retainedAttempt, /cancelled/i);
+    const retainedTimeoutCalls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .slice(callsBeforeRetainedTimeout)
+      .map((line) => (JSON.parse(line) as { args: string[] }).args);
+    assert.ok(
+      retainedTimeoutCalls.some(
+        (args) =>
+          args[0] === "orchestration" &&
+          args[1] === "worker-abandon" &&
+          args.includes("dispatch-claude-retained"),
+      ),
+      "a retained dispatch created at the deadline is abandoned from its settled receipt",
+    );
+    await rm(delayedRetainedStartPath, { force: true });
 
     process.env.WORKER_SHELL_STARTUP_DELAY_MS = "5000";
     const timeoutController = new AbortController();

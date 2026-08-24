@@ -1187,6 +1187,22 @@ async function releaseWorker(
   }
 }
 
+async function releaseFixerWorker(
+  worker: WorkerResult,
+  orca: OrcaOperations,
+  stage: StageName,
+  failure: unknown,
+): Promise<void> {
+  try {
+    await releaseWorker(worker, orca);
+  } catch (cleanupError) {
+    throw new WorkerCleanupError(
+      `${stage} fixer cleanup failed: ${String(cleanupError)}`,
+      failure === undefined ? undefined : { cause: failure },
+    );
+  }
+}
+
 async function runFixer(
   stage: StageName,
   runId: string,
@@ -1279,7 +1295,7 @@ async function runFixer(
   const worktreeId = worker.worktreeId ?? retainedSession?.worker.worktreeId;
   let workerHead: string | undefined;
   let retainWorker = false;
-  let strictCleanup = false;
+  let failure: unknown;
   try {
     const validatedReport = await validateFixerReport(
       worker.report,
@@ -1291,27 +1307,21 @@ async function runFixer(
     }
     workerHead = await git.headOf(worktreePath);
     if (before === workerHead) {
-      strictCleanup = true;
       throw new FixerNoChangeError(validatedReport, stage);
     }
-    try {
-      await git.assertFixerChangesAllowed(
-        worktreePath,
-        before,
-        workerHead,
-        stage === "rebase"
-          ? {
-              conflictFiles: findings.flatMap((finding) =>
-                finding.file ? [finding.file] : [],
-              ),
-              upstreamHead: rebaseUpstreamHead ?? "",
-            }
-          : undefined,
-      );
-    } catch (error) {
-      strictCleanup = error instanceof FixerPolicyViolationError;
-      throw error;
-    }
+    await git.assertFixerChangesAllowed(
+      worktreePath,
+      before,
+      workerHead,
+      stage === "rebase"
+        ? {
+            conflictFiles: findings.flatMap((finding) =>
+              finding.file ? [finding.file] : [],
+            ),
+            upstreamHead: rebaseUpstreamHead ?? "",
+          }
+        : undefined,
+    );
     if (fence.aborted) {
       // The execution timeout already failed this stage; refuse late mutations
       // so a delayed worker cannot apply commits into a settled run.
@@ -1346,7 +1356,6 @@ async function runFixer(
         retainWorker = true;
       } catch {
         // The round succeeded, but this worker cannot safely be reused.
-        strictCleanup = true;
       }
     }
     return {
@@ -1366,6 +1375,9 @@ async function runFixer(
         ? { fallbackAttempts: outcome.attempts }
         : {}),
     };
+  } catch (error) {
+    failure = error;
+    throw error;
   } finally {
     if (worktreePath) {
       try {
@@ -1378,8 +1390,7 @@ async function runFixer(
       }
     }
     if (!retainWorker) {
-      const cleanup = releaseWorker(worker, orca);
-      await (strictCleanup ? cleanup : cleanup.catch(() => {}));
+      await releaseFixerWorker(worker, orca, stage, failure);
     }
   }
 }
@@ -2276,7 +2287,7 @@ export class CliOrca implements OrcaOperations {
         dispatch: { id: string; status: string } | null;
         injected?: boolean;
         preamble?: string;
-      }>(args, false, fence);
+      }>(args);
     } catch (error) {
       if (prepared) await this.#cleanupPreparedWorker(prepared);
       throw new PreflightError(
@@ -2387,6 +2398,9 @@ export class CliOrca implements OrcaOperations {
     }
 
     let dispatchId: string;
+    if (fence?.aborted) {
+      throw new Error(`${launch.stage} worker attempt was cancelled`);
+    }
     try {
       const started = await this.#json<{
         dispatchId?: string;
@@ -2406,8 +2420,6 @@ export class CliOrca implements OrcaOperations {
           ...(this.#runId ? ["--run", this.#runId] : []),
           "--json",
         ],
-        false,
-        fence,
       );
       if (!started.dispatchId || started.state !== "ready") {
         throw new Error(
@@ -2415,20 +2427,16 @@ export class CliOrca implements OrcaOperations {
         );
       }
       dispatchId = started.dispatchId;
-      if (fence?.aborted) {
-        await this.#cleanupFailedWorker(
-          dispatchId,
-          terminalHandle,
-          worktreeId,
-        );
-        throw new Error(`${launch.stage} worker attempt was cancelled`);
-      }
     } catch (error) {
       throw new PreflightError(
         classifyPreflightFailure(String(error)),
         `retained worker start failed: ${String(error)}`,
         { cause: error },
       );
+    }
+    if (fence?.aborted) {
+      await this.#cleanupFailedWorker(dispatchId, terminalHandle, worktreeId);
+      throw new Error(`${launch.stage} worker attempt was cancelled`);
     }
 
     let deliveryId: string | undefined;
@@ -3979,7 +3987,7 @@ function weakensInlineTestValidation(
   source: string | undefined,
 ): boolean {
   if (source === expectedSource) return false;
-  const protectedValidation = /(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|rstest|(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test)\s*\]|@(?:org\.junit\.)?(?:ParameterizedTest|Test)\b|\[(?:(?:Fact|Test|Theory)|TestCase(?:\([^\]\n]*\))?)\]|\b(?:describe|context|it|test)(?:\.[A-Za-z_$][\w$]*)*\s*\(|\btest\s+"(?:[^"\\]|\\.)*"\s*\{|(?:^|\n)\s*(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(|(?:^|\n)\s*assert\s+\S|\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|\bassert[A-Z][A-Za-z0-9_$]*\s*\(|\bstd\.testing\.expect[A-Za-z0-9_]*\s*\(|\bexpect\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
+  const protectedValidation = /(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|rstest|(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test)\s*\]|@(?:[A-Za-z_][\w]*\.)*(?:ParameterizedTest|Test|TestMethod|DataTestMethod)\b|\[(?:(?:[A-Za-z_][\w]*\.)*(?:Fact|Test|Theory|TestMethod|DataTestMethod)|(?:[A-Za-z_][\w]*\.)*TestCase(?:\([^\]\n]*\))?)\]|\b(?:describe|context|it|test)(?:\.[A-Za-z_$][\w$]*)*\s*\(|\btest\s+"(?:[^"\\]|\\.)*"\s*\{|(?:^|\n)\s*(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(|(?:^|\n)\s*assert\s+\S|\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\b(?:[A-Za-z_][\w]*\.)*Assert\.[A-Za-z_][\w]*\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|\bassert[A-Z][A-Za-z0-9_$]*\s*\(|\bstd\.testing\.expect[A-Za-z0-9_]*\s*\(|\bexpect\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
   if (protectedValidation.test(expectedSource)) return true;
   const skipMarker = /(?:#\[(?:ignore|should_panic)\]|\b(?:describe|it|test)(?:\.[A-Za-z_$][\w$]*)*\.(?:only|skip)\s*\(|\bpytest\.mark\.(?:skip|skipif|xfail)\b|@\w*Ignore\b)/giu;
   return (
