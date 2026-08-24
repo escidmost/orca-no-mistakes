@@ -1738,6 +1738,9 @@ console.log(JSON.stringify({ result }))
     const worktreeCreate = calls.find(
       (args) => args[0] === "worktree" && args[1] === "create",
     );
+    const worktreeSet = calls.find(
+      (args) => args[0] === "worktree" && args[1] === "set",
+    );
     const terminalSend = calls.find(
       (args) => args[0] === "terminal" && args[1] === "send",
     );
@@ -1760,6 +1763,10 @@ console.log(JSON.stringify({ result }))
     );
     assert.equal(
       worktreeCreate?.[worktreeCreate.indexOf("--parent-worktree") + 1],
+      `path:${canonicalRepo}`,
+    );
+    assert.equal(
+      worktreeSet?.[worktreeSet.indexOf("--parent-worktree") + 1],
       `path:${canonicalRepo}`,
     );
     assert.equal(
@@ -2306,6 +2313,9 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     const worktreeCreate = calls.find(
       (args) => args[0] === "worktree" && args[1] === "create",
     );
+    const worktreeSet = calls.find(
+      (args) => args[0] === "worktree" && args[1] === "set",
+    );
     const terminalSend = calls.find(
       (args) => args[0] === "terminal" && args[1] === "send",
     );
@@ -2314,6 +2324,14 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     );
     assert.ok(worktreeCreate?.includes("--base-branch"));
     assert.ok(worktreeCreate?.includes("feature"));
+    assert.equal(
+      worktreeSet?.[worktreeSet.indexOf("--worktree") + 1],
+      `id:${worktreeId}`,
+    );
+    assert.equal(
+      worktreeSet?.[worktreeSet.indexOf("--parent-worktree") + 1],
+      `path:${temp}`,
+    );
     assert.deepEqual(terminalSend?.slice(0, 6), [
       "terminal",
       "send",
@@ -4976,6 +4994,19 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     await chmod(fakeOrca, 0o755);
     const orca = new CliOrca({ command: fakeOrca, cwd: temp });
     await orca.createRun("claude shell delay test");
+    const waitForCall = async (matches: (args: string[]) => boolean) => {
+      const deadline = Date.now() + 2_000;
+      while (Date.now() < deadline) {
+        const found = (await readFile(callsPath, "utf8"))
+          .trim()
+          .split("\n")
+          .map((line) => (JSON.parse(line) as { args: string[] }).args)
+          .some(matches);
+        if (found) return;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.fail("timed out waiting for the expected Orca call");
+    };
 
     const worker = await orca.startWorker("task-claude", {
       agent: { effort: "high", harness: "claude", model: "opus[1m]" },
@@ -5090,6 +5121,12 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       },
       dispatchFence,
     );
+    await waitForCall(
+      (args) =>
+        args[0] === "orchestration" &&
+        args[1] === "dispatch" &&
+        args.includes("task-claude-dispatch-timeout"),
+    );
     await new Promise((resolve) => setTimeout(resolve, 50));
     dispatchFence.aborted = true;
     dispatchController.abort();
@@ -5141,6 +5178,12 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       },
       retainedFence,
     );
+    await waitForCall(
+      (args) =>
+        args[0] === "orchestration" &&
+        args[1] === "worker-start" &&
+        args.includes("task-claude-retained-timeout"),
+    );
     await new Promise((resolve) => setTimeout(resolve, 50));
     retainedFence.aborted = true;
     retainedController.abort();
@@ -5184,21 +5227,12 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       },
       timeoutFence,
     );
-    const dispatchDeadline = Date.now() + 2_000;
-    while (Date.now() < dispatchDeadline) {
-      const dispatchStarted = (await readFile(callsPath, "utf8"))
-        .trim()
-        .split("\n")
-        .map((line) => (JSON.parse(line) as { args: string[] }).args)
-        .some(
-          (args) =>
-            args[0] === "orchestration" &&
-            args[1] === "dispatch" &&
-            args.includes("task-claude-timeout"),
-        );
-      if (dispatchStarted) break;
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
+    await waitForCall(
+      (args) =>
+        args[0] === "orchestration" &&
+        args[1] === "dispatch" &&
+        args.includes("task-claude-timeout"),
+    );
     await new Promise((resolve) => setTimeout(resolve, 50));
     timeoutFence.aborted = true;
     timeoutController.abort();
@@ -7645,7 +7679,7 @@ test("rebase conflicts require manual resolution and retry", async () => {
   );
   assert.equal(failedAttempts.length, 2);
   assert.ok(
-    failedAttempts.every((entry) => entry.baseCommitOid === "0".repeat(40)),
+    failedAttempts.every((entry) => entry.baseCommitOid === "b".repeat(40)),
   );
   assert.equal(orca.gates.length, 2);
   assert.ok(

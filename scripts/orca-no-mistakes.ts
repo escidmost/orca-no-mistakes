@@ -2677,6 +2677,18 @@ export class CliOrca implements OrcaOperations {
           "unclassified",
           "worktree create returned an invalid receipt",
         );
+      await this.#json(
+        [
+          "worktree",
+          "set",
+          "--worktree",
+          `id:${worktree.id}`,
+          "--parent-worktree",
+          `path:${this.#cwd}`,
+          "--json",
+        ],
+        false,
+      );
       if (fence?.aborted)
         throw new Error(`${launch.stage} worker attempt was cancelled`);
       await this.#detachWorkerWorktree(launch, worktree.path);
@@ -4994,6 +5006,19 @@ async function launchDetachedRun(
   gate.branch = gate.branch.replace(/^refs\/heads\//, "");
   let terminalHandle = "";
   try {
+    await command(
+      orcaCommand,
+      [
+        "worktree",
+        "set",
+        "--worktree",
+        `id:${gate.id}`,
+        "--parent-worktree",
+        `path:${repo.root}`,
+        "--json",
+      ],
+      repo.root,
+    );
     const listed = unwrapJson<{
       terminals: {
         connected?: boolean;
