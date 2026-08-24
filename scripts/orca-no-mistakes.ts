@@ -260,6 +260,8 @@ class FixerNoChangeError extends Error {
 // custody note, so the operator is told something went wrong.
 export class PostMutationCustodyError extends Error {}
 
+class WorkerCleanupError extends Error {}
+
 export class RecoveryAnchorError extends Error {
   readonly outcome: "cancelled" | "failed";
 
@@ -891,7 +893,6 @@ function launchCandidates(
 
 type TimeoutFence = {
   aborted: boolean;
-  cancel?: () => Promise<void>;
   deadlineSatisfied: boolean;
   settlement?: Promise<unknown>;
   signal?: AbortSignal;
@@ -928,18 +929,15 @@ async function withTimeout<T>(
     ]);
   } catch (error) {
     if (fence.aborted) {
-      let cancellationError: unknown;
-      try {
-        await fence.cancel?.();
-      } catch (cancelError) {
-        cancellationError = cancelError;
-      }
       try {
         await (fence.settlement ?? operation);
       } catch (settledError) {
-        if (settledError instanceof PostMutationCustodyError) throw settledError;
+        if (
+          settledError instanceof PostMutationCustodyError ||
+          settledError instanceof WorkerCleanupError
+        )
+          throw settledError;
       }
-      if (cancellationError) throw cancellationError;
     }
     throw error;
   } finally {
@@ -979,22 +977,17 @@ export async function startWorkerWithFallback(
   for (const [index, launch] of launches.entries()) {
     const startedAt = Date.now();
     const taskId = await createTask(launch);
-    if (fence) fence.cancel = () => orca.cancelTaskWorkers(taskId);
     if (fence?.aborted) {
-      await fence.cancel?.();
-      fence.cancel = undefined;
       throw new Error(`${launch.stage} worker attempt was cancelled`);
     }
     try {
       const worker = await orca.startWorker(taskId, launch, fence);
-      if (fence) fence.cancel = undefined;
       return {
         attempts,
         resolvedAgent: launch.agent?.harness ?? DEFAULT_WORKER_AGENT,
         worker,
       };
     } catch (error) {
-      if (fence) fence.cancel = undefined;
       if (fence?.aborted) throw error;
       if (!(error instanceof PreflightError)) throw error;
       await orca
@@ -2284,14 +2277,6 @@ export class CliOrca implements OrcaOperations {
         injected?: boolean;
         preamble?: string;
       }>(args, false, fence);
-      if (fence?.aborted) {
-        await this.#cleanupFailedWorker(
-          receipt.dispatch?.id ?? "",
-          terminalHandle,
-          prepared.worktreeId,
-        );
-        throw new Error(`${launch.stage} worker attempt was cancelled`);
-      }
     } catch (error) {
       if (prepared) await this.#cleanupPreparedWorker(prepared);
       throw new PreflightError(
@@ -2299,6 +2284,14 @@ export class CliOrca implements OrcaOperations {
         `initial dispatch failed: ${String(error)}`,
         { cause: error },
       );
+    }
+    if (fence?.aborted) {
+      await this.#cleanupFailedWorker(
+        receipt.dispatch?.id ?? "",
+        terminalHandle,
+        prepared.worktreeId,
+      );
+      throw new Error(`${launch.stage} worker attempt was cancelled`);
     }
     const dispatchId = receipt?.dispatch?.id;
     const preamble = receipt.preamble?.trim();
@@ -3892,7 +3885,7 @@ export class CliOrca implements OrcaOperations {
       ]);
     }
     if (failures.length > 0) {
-      throw new Error(`worker cleanup failed: ${failures.join("; ")}`);
+      throw new WorkerCleanupError(`worker cleanup failed: ${failures.join("; ")}`);
     }
   }
 
@@ -3986,7 +3979,7 @@ function weakensInlineTestValidation(
   source: string | undefined,
 ): boolean {
   if (source === expectedSource) return false;
-  const protectedValidation = /(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test)\s*\]|@(?:org\.junit\.)?Test\b|\[(?:Fact|Test|Theory)\]|\b(?:describe|context|it|test)(?:\.[A-Za-z_$][\w$]*)*\s*\(|\btest\s+"(?:[^"\\]|\\.)*"\s*\{|(?:^|\n)\s*(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(|(?:^|\n)\s*assert\s+\S|\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|\bassert[A-Z][A-Za-z0-9_$]*\s*\(|\bstd\.testing\.expect[A-Za-z0-9_]*\s*\(|\bexpect\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
+  const protectedValidation = /(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|rstest|(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test)\s*\]|@(?:org\.junit\.)?(?:ParameterizedTest|Test)\b|\[(?:(?:Fact|Test|Theory)|TestCase(?:\([^\]\n]*\))?)\]|\b(?:describe|context|it|test)(?:\.[A-Za-z_$][\w$]*)*\s*\(|\btest\s+"(?:[^"\\]|\\.)*"\s*\{|(?:^|\n)\s*(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(|(?:^|\n)\s*assert\s+\S|\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|\bassert[A-Z][A-Za-z0-9_$]*\s*\(|\bstd\.testing\.expect[A-Za-z0-9_]*\s*\(|\bexpect\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
   if (protectedValidation.test(expectedSource)) return true;
   const skipMarker = /(?:#\[(?:ignore|should_panic)\]|\b(?:describe|it|test)(?:\.[A-Za-z_$][\w$]*)*\.(?:only|skip)\s*\(|\bpytest\.mark\.(?:skip|skipif|xfail)\b|@\w*Ignore\b)/giu;
   return (
@@ -4040,6 +4033,7 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
     ].includes(normalized) ||
     [
       "cargo.toml",
+      "build.sbt",
       "build.zig",
       "build.gradle",
       "build.gradle.kts",
@@ -4067,6 +4061,7 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "package-lock.json",
       "package.json",
       "package.swift",
+      "package.resolved",
       "packages.lock.json",
       "pipfile",
       "pipfile.lock",
@@ -4078,9 +4073,11 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "rakefile",
       "setup.cfg",
       "mix.exs",
+      "mix.lock",
       "tox.ini",
       "uv.lock",
       "pubspec.yaml",
+      "pubspec.lock",
       "yarn.lock",
     ].includes(fileName) ||
     fileName.endsWith(".csproj") ||
@@ -4142,20 +4139,37 @@ function shellCommandReferencesTarget(
     [...directories].map(normalizeReferencedDirectory).filter(Boolean),
   );
   if (normalizedDirectories.size === 0) return false;
-  let activeDirectory = false;
-  for (const line of normalizedCommand.split(/\r?\n/)) {
-    const changedDirectory = line.match(
-      /\b(?:cd|pushd)\s+(?:"([^"]+)"|'([^']+)'|([^;&|\s]+))/,
+  let currentDirectory = "";
+  const directoryStack: string[] = [];
+  for (const statement of normalizedCommand.split(/\r?\n|&&|;/)) {
+    const changedDirectory = statement.match(
+      /\b(cd|pushd)\s+(?:"([^"]+)"|'([^']+)'|([^&|\s]+))/,
     );
     if (changedDirectory) {
+      const rawDirectory =
+        changedDirectory[2] ?? changedDirectory[3] ?? changedDirectory[4] ?? "";
+      const rootPrefixed =
+        /^(?:\$\{\{[^}\n]+\}\}|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?)(?:\/|$)/.test(
+          rawDirectory,
+        );
       const nextDirectory = normalizeReferencedDirectory(
-        changedDirectory[1] ?? changedDirectory[2] ?? changedDirectory[3] ?? "",
+        rootPrefixed
+          ? rawDirectory
+          : path.posix.join(currentDirectory || ".", rawDirectory),
       );
-      activeDirectory = normalizedDirectories.has(nextDirectory);
-    } else if (/\bpopd\b/.test(line)) {
-      activeDirectory = false;
+      if (changedDirectory[1] === "pushd") directoryStack.push(currentDirectory);
+      currentDirectory = nextDirectory;
+      continue;
     }
-    if (activeDirectory && containsPathReference(line, basename)) return true;
+    if (/\bpopd\b/.test(statement)) {
+      currentDirectory = directoryStack.pop() ?? "";
+      continue;
+    }
+    if (
+      normalizedDirectories.has(currentDirectory) &&
+      containsPathReference(statement, basename)
+    )
+      return true;
   }
   return false;
 }

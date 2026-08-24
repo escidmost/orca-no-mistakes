@@ -2979,6 +2979,18 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "#[tokio::test]\nasync fn smoke() -> Result<(), Box<dyn std::error::Error>> {\n    run().await?;\n    Ok(())\n}\n",
     );
     await writeFile(
+      path.join(repo, "src/registered_cases.rs"),
+      "#[rstest]\nfn smoke(case: i32) { verify(case); }\n",
+    );
+    await writeFile(
+      path.join(repo, "src/ParameterizedExample.java"),
+      "@ParameterizedTest\nvoid works() { verify(); }\n",
+    );
+    await writeFile(
+      path.join(repo, "src/NUnitExample.cs"),
+      "[TestCase(1)]\nvoid Works(int value) { Verify(value); }\n",
+    );
+    await writeFile(
       path.join(repo, "src/inline.js"),
       "test.each(buildCases(seed()))('response', () => {\n  assert.deepEqual(actual, {\n    ok: true,\n  });\n});\n",
     );
@@ -3031,6 +3043,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await mkdir(path.join(repo, "gradle/wrapper"), { recursive: true });
     await mkdir(path.join(repo, ".mvn/wrapper"), { recursive: true });
     await mkdir(path.join(repo, "other"));
+    await mkdir(path.join(repo, "nested-commands/validation"), { recursive: true });
     await mkdir(path.join(repo, "shell-commands"));
     await mkdir(path.join(repo, "tools"));
     await writeFile(path.join(repo, "bin/orca-no-mistakes"), entrypointSource);
@@ -3040,7 +3053,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     await writeFile(
       path.join(repo, ".github/workflows/ci.yml"),
-      "- uses: ./\n- uses: ./.github/actions/check\n- uses: ./ci/check/\n- run: ${{ github.workspace }}/scripts/workspace-verify.sh\n- run: .\\scripts\\check.ps1\n- run: ./check.sh\n  working-directory: ${{ github.workspace }}/commands/\n- run: .\\windows-check.ps1\n  working-directory: commands\\\n- run: ./lint.sh\n  working-directory: other\n- run: |\n    cd shell-commands\n    ./check.sh\n- run: |\n    cd guarded-commands || exit 1\n    set -euo pipefail\n    ./check.sh\n- run: |\n    pushd \"$GITHUB_WORKSPACE/prefixed-commands\"\n    ./verify.sh\n",
+      "- uses: ./\n- uses: ./.github/actions/check\n- uses: ./ci/check/\n- run: ${{ github.workspace }}/scripts/workspace-verify.sh\n- run: .\\scripts\\check.ps1\n- run: ./check.sh\n  working-directory: ${{ github.workspace }}/commands/\n- run: .\\windows-check.ps1\n  working-directory: commands\\\n- run: ./lint.sh\n  working-directory: other\n- run: |\n    cd shell-commands\n    ./check.sh\n- run: |\n    cd guarded-commands || exit 1\n    set -euo pipefail\n    ./check.sh\n- run: |\n    pushd \"$GITHUB_WORKSPACE/prefixed-commands\"\n    ./verify.sh\n- run: |\n    cd nested-commands\n    cd validation\n    ./check.sh\n",
     );
     await writeFile(
       path.join(repo, "action.yml"),
@@ -3074,6 +3087,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(repo, "guarded-commands/check.sh"), "npm test\n");
     await writeFile(path.join(repo, "other/check.sh"), "export OTHER_CHECK=1\n");
     await writeFile(path.join(repo, "other/lint.sh"), "npm run lint\n");
+    await writeFile(path.join(repo, "nested-commands/validation/check.sh"), "npm test\n");
     await mkdir(path.join(repo, "prefixed-commands"));
     await writeFile(path.join(repo, "prefixed-commands/verify.sh"), "npm test\n");
     await writeFile(path.join(repo, "shell-commands/check.sh"), "npm test\n");
@@ -3137,6 +3151,9 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "src/testFoo.ts",
       "src/lib.rs",
       "src/async_runtime.rs",
+      "src/registered_cases.rs",
+      "src/ParameterizedExample.java",
+      "src/NUnitExample.cs",
       "src/math.zig",
       "src/inline.js",
       "src/concurrent.js",
@@ -3170,6 +3187,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "mvnw",
       "other/check.sh",
       "other/lint.sh",
+      "nested-commands/validation/check.sh",
       "prefixed-commands/verify.sh",
       "shell-commands/check.sh",
       "bin/orca-no-mistakes",
@@ -3351,11 +3369,15 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "reset", "--hard", featureHead);
     const canonicalManifests = [
       "Package.swift",
+      "Package.resolved",
       "app.csproj",
+      "build.sbt",
       "build.zig",
       "composer.json",
       "Gemfile",
       "mix.exs",
+      "mix.lock",
+      "pubspec.lock",
       "pubspec.yaml",
       "Rakefile",
     ];
@@ -3582,6 +3604,15 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
 
     git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "nested-commands/validation/check.sh"), "exit 0\n");
+    git(worker, "add", "nested-commands/validation/check.sh");
+    git(worker, "commit", "-m", "disable nested-directory validation entrypoint");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /protected validation policy files: nested-commands\/validation\/check\.sh/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
     await writeFile(path.join(worker, "prefixed-commands/verify.sh"), "exit 0\n");
     git(worker, "add", "prefixed-commands/verify.sh");
     git(worker, "commit", "-m", "disable prefixed shell validation entrypoint");
@@ -3662,6 +3693,35 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       assertWorkerChangesAllowed(),
       /fixer modified co-located test assertions or skip markers: src\/async_runtime\.rs/,
     );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/registered_cases.rs"),
+      "#[rstest]\nfn smoke(case: i32) { verify(0); }\n",
+    );
+    await writeFile(
+      path.join(worker, "src/ParameterizedExample.java"),
+      "@ParameterizedTest\nvoid works() { verifyDisabled(); }\n",
+    );
+    await writeFile(
+      path.join(worker, "src/NUnitExample.cs"),
+      "[TestCase(2)]\nvoid Works(int value) { VerifyDisabled(value); }\n",
+    );
+    git(
+      worker,
+      "add",
+      "src/registered_cases.rs",
+      "src/ParameterizedExample.java",
+      "src/NUnitExample.cs",
+    );
+    git(worker, "commit", "-m", "weaken helper-based inline test cases");
+    await assert.rejects(assertWorkerChangesAllowed(), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /src\/NUnitExample\.cs/);
+      assert.match(error.message, /src\/ParameterizedExample\.java/);
+      assert.match(error.message, /src\/registered_cases\.rs/);
+      return true;
+    });
 
     git(worker, "reset", "--hard", featureHead);
     await writeFile(
@@ -7940,9 +8000,10 @@ test("resolved role timeout_ms bounds reviewer execution", async () => {
   );
   assert.equal(ledger.listRuns().length, 1);
   assert.equal(ledger.runStatus(ledger.listRuns()[0].run_id), "failed");
-  assert.ok(
+  assert.equal(
     orca.calls.some((call) => call.startsWith("cancel:task-")),
-    "the timed-out reviewer task is actively cancelled",
+    false,
+    "the active reviewer operation owns timeout cleanup",
   );
   assert.ok(
     orca.calls.some((call) => call.startsWith("release:dispatch-")),
@@ -7992,9 +8053,10 @@ test("a timed-out fixer never applies commits after the run fails", async () => 
     ),
     /review fixer exceeded its 10ms execution timeout/,
   );
-  assert.ok(
+  assert.equal(
     orca.calls.some((call) => call.startsWith("cancel:task-")),
-    "the timed-out fixer task is actively cancelled",
+    false,
+    "the active fixer operation owns timeout cleanup",
   );
   assert.ok(
     orca.calls.some((call) => call.startsWith("release:dispatch-")),
