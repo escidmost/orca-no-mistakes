@@ -3240,6 +3240,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       'import { expect as verify } from "@playwright/test";\nexport function check(page) {\n  verify(page).toHaveTitle("ok");\n}\n',
     );
     await writeFile(
+      path.join(repo, "src/playwright_types.ts"),
+      'import type { Page } from "@playwright/test";\nexport type BrowserPage = Page;\nexport const browser = 1;\n',
+    );
+    await writeFile(
       path.join(repo, "src/prefixed.js"),
       'if (import.meta.vitest) test("works", () => expect(value()).toBe(1));\n',
     );
@@ -3502,6 +3506,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "src/node_assertions.js",
       "src/node_alias.js",
       "src/aliased_playwright.ts",
+      "src/playwright_types.ts",
       "src/prefixed.js",
       "src/soft_expect.ts",
       "src/check.py",
@@ -3633,6 +3638,8 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(worker, ".clang-format-ignore"), "**/*\n");
     await writeFile(path.join(worker, ".eslintignore"), "**/*\n");
     await writeFile(path.join(worker, ".github/actionlint.yaml"), "self-hosted-runner:\n  labels: []\n");
+    await mkdir(path.join(worker, ".husky"));
+    await writeFile(path.join(worker, ".husky/pre-commit"), "true\n");
     await writeFile(path.join(worker, ".markdownlintignore"), "**/*\n");
     await writeFile(path.join(worker, ".npmrc"), "ignore-scripts=true\n");
     await writeFile(path.join(worker, ".prettierignore"), "**/*\n");
@@ -3725,6 +3732,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       ".rspec",
       ".eslintignore",
       ".github/actionlint.yaml",
+      ".husky/pre-commit",
       ".justfile",
       ".lintstagedrc.json",
       ".markdownlintignore",
@@ -3798,7 +3806,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "commit", "-m", "weaken validation policy");
     await assert.rejects(
       assertWorkerChangesAllowed(),
-      /unexplained-policy-relaxation:.*\.bazelrc, \.clang-format, \.clang-format-ignore, \.coveragerc, \.eslintignore, \.github\/actionlint\.yaml, \.justfile, \.lintstagedrc\.json, \.markdownlintignore, \.mocharc\.json, \.mvn\/jvm\.config, \.mvn\/maven\.config, \.mvn\/wrapper\/maven-wrapper\.jar, \.mvn\/wrapper\/maven-wrapper\.properties, \.npmrc, \.nycrc, \.oxlintrc\.json, \.prettierignore, \.rspec, \.shellcheckrc, \.stylelintignore, \.swiftlint\.yml, \.yamllint, BUILD, BUILD\.bazel, CMakeLists\.txt, Cargo\.lock, Directory\.Build\.targets, Directory\.Packages\.props, GNUmakefile, MODULE\.bazel, Pipfile, Taskfile\.dist\.yaml, Taskfile\.dist\.yml, Taskfile\.yml, WORKSPACE, WORKSPACE\.bazel, build\.gradle, build\.gradle\.kts, build\.xml, cypress\.config\.ts, directory\.build\.props, eslint\.config\.js, go\.work, gradle\.properties, gradle\/wrapper\/gradle-wrapper\.jar, gradle\/wrapper\/gradle-wrapper\.properties, gradlew, lerna\.json, lint-staged\.config\.js, mvnw, noxfile\.py, nyc\.config\.js, package-lock\.json, package\.json, phpunit\.xml, phpunit\.xml\.dist, pkg\/go\.mod, pnpm-lock\.yaml, pnpm-workspace\.yaml, pom\.xml, prompts\/fixer\.md, pylintrc, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, vitest\.workspace\.ts, workspace\.sln, workspace\.slnx, yarn\.lock/,
+      /unexplained-policy-relaxation:.*\.bazelrc, \.clang-format, \.clang-format-ignore, \.coveragerc, \.eslintignore, \.github\/actionlint\.yaml, \.husky\/pre-commit, \.justfile, \.lintstagedrc\.json, \.markdownlintignore, \.mocharc\.json, \.mvn\/jvm\.config, \.mvn\/maven\.config, \.mvn\/wrapper\/maven-wrapper\.jar, \.mvn\/wrapper\/maven-wrapper\.properties, \.npmrc, \.nycrc, \.oxlintrc\.json, \.prettierignore, \.rspec, \.shellcheckrc, \.stylelintignore, \.swiftlint\.yml, \.yamllint, BUILD, BUILD\.bazel, CMakeLists\.txt, Cargo\.lock, Directory\.Build\.targets, Directory\.Packages\.props, GNUmakefile, MODULE\.bazel, Pipfile, Taskfile\.dist\.yaml, Taskfile\.dist\.yml, Taskfile\.yml, WORKSPACE, WORKSPACE\.bazel, build\.gradle, build\.gradle\.kts, build\.xml, cypress\.config\.ts, directory\.build\.props, eslint\.config\.js, go\.work, gradle\.properties, gradle\/wrapper\/gradle-wrapper\.jar, gradle\/wrapper\/gradle-wrapper\.properties, gradlew, lerna\.json, lint-staged\.config\.js, mvnw, noxfile\.py, nyc\.config\.js, package-lock\.json, package\.json, phpunit\.xml, phpunit\.xml\.dist, pkg\/go\.mod, pnpm-lock\.yaml, pnpm-workspace\.yaml, pom\.xml, prompts\/fixer\.md, pylintrc, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, vitest\.workspace\.ts, workspace\.sln, workspace\.slnx, yarn\.lock/,
     );
 
     git(worker, "reset", "--hard", featureHead);
@@ -3971,6 +3979,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "export const parser = 2;\n",
     );
     await writeFile(
+      path.join(worker, "src/playwright_types.ts"),
+      'import type { Page } from "@playwright/test";\nexport type BrowserPage = Page;\nexport const browser = 2;\n',
+    );
+    await writeFile(
       path.join(worker, "scripts/test-harness.ts"),
       "export const harness = 2;\n",
     );
@@ -3987,6 +3999,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "docs/test-plan.md",
       "scripts/test-harness.ts",
       "scripts/test-runner.ts",
+      "src/playwright_types.ts",
       "src/spec-parser.ts",
       "other/check.sh",
       "tools/check.sh",

@@ -4030,12 +4030,11 @@ function weakensInlineTestValidation(
   if (source === expectedSource) return false;
   const protectedValidation = /(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|rstest|(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test)\s*\]|@(?:[A-Za-z_][\w]*\.)*(?:ParameterizedTest|Test|TestMethod|DataTestMethod)\b|\[(?:(?:[A-Za-z_][\w]*\.)*(?:Fact|Test|Theory|TestMethod|DataTestMethod)|(?:[A-Za-z_][\w]*\.)*TestCase(?:\([^\]\n]*\))?)\]|\b(?:describe|context|it|test)(?:\.[A-Za-z_$][\w$]*)*\s*\(|\b(?:SCENARIO|TEMPLATE_TEST_CASE|TEST_CASE)\s*\(|\btest\s+"(?:[^"\\]|\\.)*"\s*\{|(?:^|\n)\s*(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(|(?:^|\n)\s*assert\s+\S|\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\b(?:CHECK|REQUIRE)(?:_[A-Z0-9_]+)?\s*\(|\b(?:[A-Za-z_][\w]*\.)*Assert\.[A-Za-z_][\w]*\s*\(|\.should\.(?:deep\.)?(?:equal|eql|match|throw)\s*\(|\b(?:deepStrictEqual|strictEqual|notDeepStrictEqual|notStrictEqual|doesNotReject|doesNotThrow|ifError|rejects|throws)\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|\bassert[A-Z][A-Za-z0-9_$]*\s*\(|\bstd\.testing\.expect[A-Za-z0-9_]*\s*\(|\bexpect(?:\.(?:poll|soft))?\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
   const nodeAssertImport = /(?:from\s+["'](?:node:)?assert(?:\/strict)?["']|require\s*\(\s*["'](?:node:)?assert(?:\/strict)?["']\s*\))/u;
-  const assertionFrameworkImport = /(?:from\s+["'](?:@jest\/globals|@playwright\/test|chai|expect|vitest)["']|require\s*\(\s*["'](?:@jest\/globals|@playwright\/test|chai|expect|vitest)["']\s*\))/u;
   if (
     protectedValidation.test(expectedSource) ||
     /\.should(?:\.[A-Za-z_$][\w$]*)+/u.test(expectedSource) ||
     nodeAssertImport.test(expectedSource) ||
-    assertionFrameworkImport.test(expectedSource)
+    importsAssertionFrameworkApi(expectedSource)
   ) {
     return true;
   }
@@ -4044,6 +4043,42 @@ function weakensInlineTestValidation(
     (source?.match(skipMarker)?.length ?? 0) >
     (expectedSource.match(skipMarker)?.length ?? 0)
   );
+}
+
+function importsAssertionFrameworkApi(source: string): boolean {
+  const modules = String.raw`(?:@jest/globals|@playwright/test|chai|expect|vitest)`;
+  const assertionBinding = /^(?:expect|assert|should)$/u;
+  const namedImports = new RegExp(
+    String.raw`\bimport\s*\{([^}]*)\}\s*from\s*["']${modules}["']`,
+    "gsu",
+  );
+  for (const match of source.matchAll(namedImports)) {
+    if (
+      match[1]
+        ?.split(",")
+        .map((binding) => binding.trim())
+        .filter((binding) => !binding.startsWith("type "))
+        .some((binding) => assertionBinding.test(binding.split(/\s+as\s+/u)[0] ?? ""))
+    ) {
+      return true;
+    }
+  }
+  const requiredBindings = new RegExp(
+    String.raw`\b(?:const|let|var)\s*\{([^}]*)\}\s*=\s*require\s*\(\s*["']${modules}["']\s*\)`,
+    "gsu",
+  );
+  for (const match of source.matchAll(requiredBindings)) {
+    if (
+      match[1]
+        ?.split(",")
+        .map((binding) => binding.trim().split(/\s*:\s*/u)[0] ?? "")
+        .some((binding) => assertionBinding.test(binding))
+    ) {
+      return true;
+    }
+  }
+  return /\bimport\s+(?!type\b)[A-Za-z_$][\w$]*\s+from\s+["']expect["']/u.test(source) ||
+    /\b(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*require\s*\(\s*["']expect["']\s*\)/u.test(source);
 }
 
 function isProtectedValidationPolicyPath(filePath: string): boolean {
@@ -4071,6 +4106,7 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
     ].includes(originalFileName) ||
     ((parts[0] === ".github" || parts[0] === ".forgejo") &&
       (parts[1] === "workflows" || parts[1] === "actions")) ||
+    parts[0] === ".husky" ||
     normalized.startsWith("gradle/wrapper/") ||
     normalized.includes("/gradle/wrapper/") ||
     normalized.startsWith(".mvn/wrapper/") ||
