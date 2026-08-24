@@ -4049,16 +4049,21 @@ function importsAssertionFrameworkApi(source: string): boolean {
   const modules = String.raw`(?:@jest/globals|@playwright/test|chai|expect|vitest)`;
   const assertionBinding = /^(?:expect|assert|should)$/u;
   const namedImports = new RegExp(
-    String.raw`\b(?:import|export)\s*\{([^}]*)\}\s*from\s*["']${modules}["']`,
+    String.raw`\b(import|export)\s*\{([^}]*)\}\s*from\s*["'](${modules})["']`,
     "gsu",
   );
   for (const match of source.matchAll(namedImports)) {
     if (
-      match[1]
+      match[2]
         ?.split(",")
         .map((binding) => binding.trim())
         .filter((binding) => !binding.startsWith("type "))
-        .some((binding) => assertionBinding.test(binding.split(/\s+as\s+/u)[0] ?? ""))
+        .some((binding) => {
+          const [imported = "", exported = imported] = binding.split(/\s+as\s+/u);
+          return assertionBinding.test(imported) ||
+            (match[1] === "export" && assertionBinding.test(exported)) ||
+            (match[1] === "export" && match[3] === "expect" && imported === "default");
+        })
     ) {
       return true;
     }
@@ -4163,6 +4168,7 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       ".justfile",
       "justfile",
       "lerna.json",
+      "meson.build",
       "gnumakefile",
       "makefile",
       "noxfile.py",
