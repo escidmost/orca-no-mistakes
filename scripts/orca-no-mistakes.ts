@@ -3367,24 +3367,11 @@ export class CliOrca implements OrcaOperations {
         ], true).catch(() => ({}));
         worktreeId = shown.terminal?.worktreeId;
       }
-      if (worker.agentTerminalHandle) {
-        await this.#cleanupFailedWorker(
-          worker.dispatchId,
-          worker.agentTerminalHandle,
-          worktreeId,
-        );
-      } else {
-        await this.#json(
-          [
-            "orchestration",
-            "worker-abandon",
-            "--dispatch",
-            worker.dispatchId,
-            "--json",
-          ],
-          true,
-        );
-      }
+      await this.#cleanupWorkerResources({
+        dispatchId: worker.dispatchId,
+        terminalHandle: worker.agentTerminalHandle,
+        worktreeId,
+      });
     }
   }
 
@@ -3854,7 +3841,7 @@ export class CliOrca implements OrcaOperations {
   async #cleanupWorkerResources(resources: {
     deliveryId?: string;
     dispatchId?: string;
-    terminalHandle: string;
+    terminalHandle?: string;
     worktreeId?: string;
   }): Promise<void> {
     const failures: string[] = [];
@@ -3999,7 +3986,7 @@ function weakensInlineTestValidation(
   source: string | undefined,
 ): boolean {
   if (source === expectedSource) return false;
-  const protectedValidation = /(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|test)\s*\]|@(?:org\.junit\.)?Test\b|\[(?:Fact|Test|Theory)\]|\b(?:describe|context|it|test)(?:\.[A-Za-z_$][\w$]*)*\s*\(|\btest\s+"(?:[^"\\]|\\.)*"\s*\{|(?:^|\n)\s*(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(|(?:^|\n)\s*assert\s+\S|\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|\bassert[A-Z][A-Za-z0-9_$]*\s*\(|\bstd\.testing\.expect[A-Za-z0-9_]*\s*\(|\bexpect\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
+  const protectedValidation = /(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test)\s*\]|@(?:org\.junit\.)?Test\b|\[(?:Fact|Test|Theory)\]|\b(?:describe|context|it|test)(?:\.[A-Za-z_$][\w$]*)*\s*\(|\btest\s+"(?:[^"\\]|\\.)*"\s*\{|(?:^|\n)\s*(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(|(?:^|\n)\s*assert\s+\S|\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|\bassert[A-Z][A-Za-z0-9_$]*\s*\(|\bstd\.testing\.expect[A-Za-z0-9_]*\s*\(|\bexpect\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
   if (protectedValidation.test(expectedSource)) return true;
   const skipMarker = /(?:#\[(?:ignore|should_panic)\]|\b(?:describe|it|test)(?:\.[A-Za-z_$][\w$]*)*\.(?:only|skip)\s*\(|\bpytest\.mark\.(?:skip|skipif|xfail)\b|@\w*Ignore\b)/giu;
   return (
@@ -4053,14 +4040,17 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
     ].includes(normalized) ||
     [
       "cargo.toml",
+      "build.zig",
       "build.gradle",
       "build.gradle.kts",
       "bun.lock",
       "bun.lockb",
       "cargo.lock",
       "composer.lock",
+      "composer.json",
       "conftest.py",
       ".bazelrc",
+      "gemfile",
       "gemfile.lock",
       "go.mod",
       "go.sum",
@@ -4076,6 +4066,7 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "mvnw.cmd",
       "package-lock.json",
       "package.json",
+      "package.swift",
       "packages.lock.json",
       "pipfile",
       "pipfile.lock",
@@ -4084,11 +4075,15 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "poetry.lock",
       "pyproject.toml",
       "pytest.ini",
+      "rakefile",
       "setup.cfg",
+      "mix.exs",
       "tox.ini",
       "uv.lock",
+      "pubspec.yaml",
       "yarn.lock",
     ].includes(fileName) ||
+    fileName.endsWith(".csproj") ||
     (parts.at(-2) === ".mvn" && fileName === "maven.config") ||
     /^settings\.gradle(?:\.kts)?$/.test(fileName) ||
     (parts[0] !== "docs" && parts.slice(0, -1).includes("prompts")) ||
@@ -4143,23 +4138,26 @@ function shellCommandReferencesTarget(
   basename: string,
 ): boolean {
   const normalizedCommand = command.replace(/\\/g, "/");
-  return [...directories].some((directory) => {
-    if (!directory || directory === ".") return false;
-    const escaped = normalizeReferencedDirectory(directory).replace(
-      /[.*+?^${}()|[\]\\]/g,
-      "\\$&",
+  const normalizedDirectories = new Set(
+    [...directories].map(normalizeReferencedDirectory).filter(Boolean),
+  );
+  if (normalizedDirectories.size === 0) return false;
+  let activeDirectory = false;
+  for (const line of normalizedCommand.split(/\r?\n/)) {
+    const changedDirectory = line.match(
+      /\b(?:cd|pushd)\s+(?:"([^"]+)"|'([^']+)'|([^;&|\s]+))/,
     );
-    const cd = new RegExp(
-      `\\bcd\\s+["']?(?:\\./)?${escaped}/?["']?(?:\\s|$)`,
-    );
-    let activeDirectory = false;
-    for (const line of normalizedCommand.split(/\r?\n/)) {
-      const changedDirectory = line.match(/\bcd\s+[^;&|\s]+/);
-      if (changedDirectory) activeDirectory = cd.test(line);
-      if (activeDirectory && containsPathReference(line, basename)) return true;
+    if (changedDirectory) {
+      const nextDirectory = normalizeReferencedDirectory(
+        changedDirectory[1] ?? changedDirectory[2] ?? changedDirectory[3] ?? "",
+      );
+      activeDirectory = normalizedDirectories.has(nextDirectory);
+    } else if (/\bpopd\b/.test(line)) {
+      activeDirectory = false;
     }
-    return false;
-  });
+    if (activeDirectory && containsPathReference(line, basename)) return true;
+  }
+  return false;
 }
 
 function containsValidationPathReference(
