@@ -2512,6 +2512,8 @@ export class CliOrca implements OrcaOperations {
         ).stdout.trim();
         repoRoot = path.dirname(path.resolve(this.#cwd, commonGitDir));
       }
+      if (fence?.aborted)
+        throw new Error(`${launch.stage} worker attempt was cancelled`);
       const started = await command(
         this.#command,
         nativeWorkerStartArgs({
@@ -2528,7 +2530,6 @@ export class CliOrca implements OrcaOperations {
         }),
         this.#cwd,
         {
-          abortSignal: fence?.signal,
           allowFailure: true,
           timeoutMs:
             workerAgentReadyTimeoutMs() + NATIVE_WORKER_CREATE_SLACK_MS,
@@ -4217,9 +4218,7 @@ function containsValidationPathReference(
   } catch {
     // Non-YAML policy sources still receive exact-path and shell-command checks.
   }
-  return source
-    .split("\n")
-    .some((line) => shellCommandReferencesTarget(line, workingDirectories, basename));
+  return shellCommandReferencesTarget(source, workingDirectories, basename);
 }
 
 function referencesRootLocalAction(source: string): boolean {

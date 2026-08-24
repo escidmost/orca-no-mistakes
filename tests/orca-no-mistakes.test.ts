@@ -3060,7 +3060,12 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       '{"scripts":{"test":"./verify.sh"}}\n',
     );
     await writeFile(path.join(repo, "tools/verify.sh"), "npm test\n");
+    await writeFile(path.join(repo, "tools/jenkins-verify.sh"), "npm test\n");
     await writeFile(path.join(repo, "tools/check.sh"), "export TOOL_CHECK=1\n");
+    await writeFile(
+      path.join(repo, "Jenkinsfile"),
+      "pipeline {\n  stages {\n    stage('test') {\n      steps {\n        sh '''\n          cd tools\n          set -euo pipefail\n          ./jenkins-verify.sh\n        '''\n      }\n    }\n  }\n}\n",
+    );
     await writeFile(path.join(repo, "scripts/workspace-verify.sh"), "npm test\n");
     await writeFile(path.join(repo, "scripts/check.ps1"), "npm test\n");
     for (const moduleName of ["adapters", "config", "ledger", "policy"]) {
@@ -3145,7 +3150,9 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "scripts/policy.ts",
       "tools/package.json",
       "tools/check.sh",
+      "tools/jenkins-verify.sh",
       "tools/verify.sh",
+      "Jenkinsfile",
     );
     git(
       repo,
@@ -3473,6 +3480,15 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await assert.rejects(
       assertWorkerChangesAllowed(),
       /protected validation policy files: tools\/verify\.sh/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "tools/jenkins-verify.sh"), "exit 0\n");
+    git(worker, "add", "tools/jenkins-verify.sh");
+    git(worker, "commit", "-m", "disable Jenkins validation entrypoint");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /protected validation policy files: tools\/jenkins-verify\.sh/,
     );
 
     git(worker, "reset", "--hard", featureHead);
@@ -5151,6 +5167,7 @@ test("CliOrca starts native workers through orchestration worker-start", async (
   const temp = await mkdtemp(path.join(tmpdir(), "orca-native-"));
   const fakeOrca = path.join(temp, "orca");
   const callsPath = path.join(temp, "calls.jsonl");
+  const delayedStartPath = path.join(temp, "delay-worker-start");
   const evidence = path.join(
     homedir(),
     ".orca-no-mistakes",
@@ -5172,6 +5189,10 @@ const out = (result) => console.log(JSON.stringify({ result }))
 if (args[0] === 'orchestration' && args[1] === 'run-create') {
   out({ run: { id: 'native-run' } })
 } else if (args[0] === 'orchestration' && args[1] === 'worker-start') {
+  if (fs.existsSync(${JSON.stringify(delayedStartPath)})) {
+    const deadline = Date.now() + 150
+    while (Date.now() < deadline) {}
+  }
   out({ terminal: { handle: 'native-worker' }, worktree: { id: 'wt-native', path: '/worktrees/native' } })
 } else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
   out({ dispatch: { id: 'dispatch-nat', status: 'dispatched' }, injected: true, preamble: 'authenticated' })
@@ -5218,6 +5239,63 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     const dispatch = calls.find((args) => args[1] === "dispatch");
     assert.ok(dispatch?.includes("native-worker"));
     assert.equal(reportPath && worker.report.summary, "native reviewed");
+
+    await writeFile(delayedStartPath, "delay\n");
+    const timeoutController = new AbortController();
+    const timeoutFence = {
+      aborted: false,
+      deadlineSatisfied: false,
+      signal: timeoutController.signal,
+    };
+    const callsBeforeTimeout = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n").length;
+    const timedOutWorker = orca.startWorker(
+      "task-native-timeout",
+      {
+        agent: { effort: "high", harness: "cursor", model: "gpt-5.6" },
+        name: "nm-review-timeout",
+        prompt: "review instructions",
+        role: "reviewer",
+        stage: "review",
+        worktree: "new-child",
+      },
+      timeoutFence,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    timeoutFence.aborted = true;
+    timeoutController.abort();
+    await assert.rejects(timedOutWorker, /cancelled/i);
+    const timeoutCalls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .slice(callsBeforeTimeout)
+      .map((line) => JSON.parse(line) as string[]);
+    assert.ok(
+      timeoutCalls.some(
+        (args) =>
+          args[0] === "terminal" &&
+          args[1] === "close" &&
+          args.includes("native-worker"),
+      ),
+      "a native terminal created at the deadline is closed from its receipt",
+    );
+    assert.ok(
+      timeoutCalls.some(
+        (args) =>
+          args[0] === "worktree" &&
+          args[1] === "rm" &&
+          args.includes("id:wt-native"),
+      ),
+      "a native worktree created at the deadline is removed from its receipt",
+    );
+    assert.equal(
+      timeoutCalls.filter(
+        (args) => args[0] === "orchestration" && args[1] === "dispatch",
+      ).length,
+      0,
+    );
+    await rm(delayedStartPath, { force: true });
 
     await orca.finishWorker(worker, "release");
     const postReleaseCalls = (await readFile(callsPath, "utf8"))
