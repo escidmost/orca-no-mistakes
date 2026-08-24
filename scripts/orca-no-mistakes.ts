@@ -3970,7 +3970,7 @@ function isTestPath(filePath: string): boolean {
           part.toLowerCase(),
         ) ||
         /(?:-|_)snapshots$/i.test(part) ||
-        /\.tests?$/i.test(part),
+        /\.(?:unit|integration)?tests?$/i.test(part),
       ) ||
     fileName.toLowerCase().endsWith(".snap") ||
     fileName.toLowerCase().endsWith(".bats") ||
@@ -3993,7 +3993,7 @@ function weakensInlineTestValidation(
   source: string | undefined,
 ): boolean {
   if (source === expectedSource) return false;
-  const protectedValidation = /(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|rstest|(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test)\s*\]|@(?:[A-Za-z_][\w]*\.)*(?:ParameterizedTest|Test|TestMethod|DataTestMethod)\b|\[(?:(?:[A-Za-z_][\w]*\.)*(?:Fact|Test|Theory|TestMethod|DataTestMethod)|(?:[A-Za-z_][\w]*\.)*TestCase(?:\([^\]\n]*\))?)\]|\b(?:describe|context|it|test)(?:\.[A-Za-z_$][\w$]*)*\s*\(|\b(?:SCENARIO|TEMPLATE_TEST_CASE|TEST_CASE)\s*\(|\btest\s+"(?:[^"\\]|\\.)*"\s*\{|(?:^|\n)\s*(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(|(?:^|\n)\s*assert\s+\S|\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\b(?:CHECK|REQUIRE)(?:_[A-Z0-9_]+)?\s*\(|\b(?:[A-Za-z_][\w]*\.)*Assert\.[A-Za-z_][\w]*\s*\(|\.should\.(?:deep\.)?(?:equal|eql|match|throw)\s*\(|\b(?:deepStrictEqual|strictEqual|notDeepStrictEqual|notStrictEqual|doesNotReject|doesNotThrow|ifError|rejects|throws)\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|\bassert[A-Z][A-Za-z0-9_$]*\s*\(|\bstd\.testing\.expect[A-Za-z0-9_]*\s*\(|\bexpect\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
+  const protectedValidation = /(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|rstest|(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test)\s*\]|@(?:[A-Za-z_][\w]*\.)*(?:ParameterizedTest|Test|TestMethod|DataTestMethod)\b|\[(?:(?:[A-Za-z_][\w]*\.)*(?:Fact|Test|Theory|TestMethod|DataTestMethod)|(?:[A-Za-z_][\w]*\.)*TestCase(?:\([^\]\n]*\))?)\]|\b(?:describe|context|it|test)(?:\.[A-Za-z_$][\w$]*)*\s*\(|\b(?:SCENARIO|TEMPLATE_TEST_CASE|TEST_CASE)\s*\(|\btest\s+"(?:[^"\\]|\\.)*"\s*\{|(?:^|\n)\s*(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(|(?:^|\n)\s*assert\s+\S|\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\b(?:CHECK|REQUIRE)(?:_[A-Z0-9_]+)?\s*\(|\b(?:[A-Za-z_][\w]*\.)*Assert\.[A-Za-z_][\w]*\s*\(|\.should\.(?:deep\.)?(?:equal|eql|match|throw)\s*\(|\b(?:deepStrictEqual|strictEqual|notDeepStrictEqual|notStrictEqual|doesNotReject|doesNotThrow|ifError|rejects|throws)\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|\bassert[A-Z][A-Za-z0-9_$]*\s*\(|\bstd\.testing\.expect[A-Za-z0-9_]*\s*\(|\bexpect(?:\.(?:poll|soft))?\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
   const nodeAssertImport = /(?:from\s+["'](?:node:)?assert(?:\/strict)?["']|require\s*\(\s*["'](?:node:)?assert(?:\/strict)?["']\s*\))/u;
   if (
     protectedValidation.test(expectedSource) ||
@@ -4094,6 +4094,7 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "pipfile",
       "pipfile.lock",
       "pnpm-lock.yaml",
+      "pnpm-workspace.yaml",
       "pom.xml",
       "poetry.lock",
       "pyproject.toml",
@@ -4155,6 +4156,101 @@ function containsPrefixedPathReference(source: string, reference: string): boole
   ).test(normalizeQuotedPathPrefixes(source));
 }
 
+type TypeScriptPathAlias = {
+  alias: string;
+  configPath: string;
+  target: string;
+};
+
+function parseJsonConfig(source: string): unknown {
+  let result = "";
+  let quoted = false;
+  let escaped = false;
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+    const next = source[index + 1];
+    if (quoted) {
+      result += char;
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') quoted = false;
+      continue;
+    }
+    if (char === '"') {
+      quoted = true;
+      result += char;
+      continue;
+    }
+    if (char === "/" && next === "/") {
+      while (index < source.length && source[index] !== "\n") index += 1;
+      result += "\n";
+      continue;
+    }
+    if (char === "/" && next === "*") {
+      index += 2;
+      while (index < source.length && !(source[index] === "*" && source[index + 1] === "/"))
+        index += 1;
+      index += 1;
+      continue;
+    }
+    result += char;
+  }
+  return JSON.parse(result.replace(/,\s*([}\]])/g, "$1"));
+}
+
+function typeScriptPathAliases(configPath: string, source: string): TypeScriptPathAlias[] {
+  let config: unknown;
+  try {
+    config = parseJsonConfig(source);
+  } catch {
+    return [];
+  }
+  if (!config || typeof config !== "object" || Array.isArray(config)) return [];
+  const compilerOptions = (config as Record<string, unknown>).compilerOptions;
+  if (!compilerOptions || typeof compilerOptions !== "object" || Array.isArray(compilerOptions))
+    return [];
+  const options = compilerOptions as Record<string, unknown>;
+  const paths = options.paths;
+  if (!paths || typeof paths !== "object" || Array.isArray(paths)) return [];
+  const baseUrl = typeof options.baseUrl === "string" ? options.baseUrl : ".";
+  return Object.entries(paths as Record<string, unknown>).flatMap(([alias, targets]) =>
+    Array.isArray(targets)
+      ? targets
+          .filter((target): target is string => typeof target === "string")
+          .map((target) => ({
+            alias,
+            configPath,
+            target: path.posix.normalize(
+              path.posix.join(path.posix.dirname(configPath), baseUrl, target),
+            ),
+          }))
+      : [],
+  );
+}
+
+function typeScriptAliasReferences(
+  targetPath: string,
+  aliases: TypeScriptPathAlias[],
+): Array<{ configPath: string; reference: string }> {
+  const targetForms = new Set([targetPath]);
+  const extensionless = targetPath.replace(/\.(?:[cm]?[jt]sx?|mts|cts)$/i, "");
+  targetForms.add(extensionless);
+  if (/\/index$/i.test(extensionless)) targetForms.add(extensionless.replace(/\/index$/i, ""));
+
+  return aliases.flatMap(({ alias, configPath, target }) => {
+    const escaped = target
+      .split("*")
+      .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+      .join("(.*)");
+    const references = new Set<string>();
+    for (const targetForm of targetForms) {
+      const match = targetForm.match(new RegExp(`^${escaped}$`));
+      if (match) references.add(alias.replace("*", match[1] ?? ""));
+    }
+    return [...references].map((reference) => ({ configPath, reference }));
+  });
+}
+
 function normalizeReferencedDirectory(directory: string): string {
   return path.posix
     .normalize(
@@ -4184,7 +4280,7 @@ function shellCommandReferencesTarget(
   const directoryStack: string[] = [];
   for (const statement of normalizedCommand.split(/\r?\n|&&|;/)) {
     const changedDirectory = statement.match(
-      /\b(cd|pushd|set-location|push-location)\s+(?:-(?:literal)?path\s+)?(?:"([^"]+)"|'([^']+)'|([^&|\s]+))/i,
+      /\b(cd|pushd|set-location|push-location)\s+(?:-(?:literal)?path\s+)?(?:\/d\s+)?(?:"([^"]+)"|'([^']+)'|([^&|\s]+))/i,
     );
     if (changedDirectory) {
       const rawDirectory =
@@ -4531,6 +4627,23 @@ export class GitShell implements GitOperations {
         policySources.set(actionPath, source);
       }
     }
+    const typeScriptAliases = [...policySources]
+      .filter(([policyPath]) => /(?:^|\/)tsconfig(?:\.[^/]+)*\.json$/i.test(policyPath))
+      .flatMap(([policyPath, source]) => typeScriptPathAliases(policyPath, source));
+    const policySourceReferences = (
+      policyPath: string,
+      source: string,
+      candidatePath: string,
+      targets: string[],
+    ): boolean =>
+      targets.some((targetPath) =>
+        containsValidationPathReference(source, policyPath, targetPath),
+      ) ||
+      typeScriptAliasReferences(candidatePath, typeScriptAliases).some(
+        (alias) =>
+          alias.configPath !== policyPath &&
+          containsPathReference(source, alias.reference),
+      );
     let policySourceCount = -1;
     while (policySources.size !== policySourceCount) {
       policySourceCount = policySources.size;
@@ -4543,9 +4656,7 @@ export class GitShell implements GitOperations {
         }
         if (
           ![...policySources].some(([policyPath, source]) =>
-            targets.some((targetPath) =>
-              containsValidationPathReference(source, policyPath, targetPath),
-            ),
+            policySourceReferences(policyPath, source, candidatePath, targets),
           )
         ) {
           continue;
@@ -4575,9 +4686,7 @@ export class GitShell implements GitOperations {
       return (
         (rootActionReferenced && rootActionPaths.includes(entrypointPath)) ||
         [...policySources].some(([policyPath, source]) =>
-          [...targets].some((targetPath) =>
-            containsValidationPathReference(source, policyPath, targetPath),
-          ),
+          policySourceReferences(policyPath, source, entrypointPath, [...targets]),
         )
       );
     });
