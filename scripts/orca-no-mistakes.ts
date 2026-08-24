@@ -4252,7 +4252,7 @@ function containsValidationPathReference(
     if (
       modules.some((moduleName) =>
         new RegExp(
-          `\\b(?:python(?:3(?:\\.\\d+)?)?|py)(?:\\s+(?!-m\\b)-\\S+)*\\s+-m\\s+${moduleName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?=$|\\s|["'])`,
+          `\\b(?:python(?:3(?:\\.\\d+)?)?|py)(?:\\s+(?!-m\\b)-\\S+)*\\s+-m\\s+["']?${moduleName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}["']?(?=$|\\s)`,
           "m",
         ).test(source),
       )

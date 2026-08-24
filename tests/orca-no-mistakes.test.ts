@@ -3202,6 +3202,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "- uses: ./\n- uses: ./.github/actions/check\n- uses: ./ci/check/\n- run: ${{ github.workspace }}/scripts/workspace-verify.sh\n- run: '& \"$env:GITHUB_WORKSPACE\\scripts\\powershell-verify.ps1\"'\n- run: 'Set-Location -Path \"$env:GITHUB_WORKSPACE/scripts\"; ./powershell-location.ps1'\n- run: '%GITHUB_WORKSPACE%\\scripts\\cmd-verify.cmd'\n- run: python -m tools.module_check\n- run: py -3 -m tools\n- run: python -m myproj.check\n- run: node scripts/check.ts\n- run: \"$(pwd)/scripts/pwd-verify.sh\"\n- run: \"$(git rev-parse --show-toplevel)/scripts/root-verify.sh\"\n- run: .\\scripts\\check.ps1\n- run: ./check.sh\n  working-directory: ${{ github.workspace }}/commands/\n- run: .\\windows-check.ps1\n  working-directory: commands\\\n- run: ./lint.sh\n  working-directory: other\n- run: |\n    cd shell-commands\n    ./check.sh\n- run: |\n    cd guarded-commands || exit 1\n    set -euo pipefail\n    ./check.sh\n- run: |\n    pushd \"$GITHUB_WORKSPACE/prefixed-commands\"\n    ./verify.sh\n- run: |\n    cd nested-commands\n    cd validation\n    ./check.sh\n",
     );
     await writeFile(
+      path.join(repo, ".github/workflows/python.yml"),
+      '- run: python -m "quotedpkg.check"\n',
+    );
+    await writeFile(
       path.join(repo, "action.yml"),
       "runs:\n  using: node20\n  main: dist/index.js\n",
     );
@@ -3254,6 +3258,8 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(repo, "tools/__main__.py"), "def main():\n    verify_behavior()\n");
     await mkdir(path.join(repo, "src/myproj"), { recursive: true });
     await writeFile(path.join(repo, "src/myproj/check.py"), "def main():\n    verify_behavior()\n");
+    await mkdir(path.join(repo, "src/quotedpkg"), { recursive: true });
+    await writeFile(path.join(repo, "src/quotedpkg/check.py"), "def main():\n    verify_behavior()\n");
     await writeFile(
       path.join(repo, "Jenkinsfile"),
       "pipeline {\n  stages {\n    stage('test') {\n      steps {\n        sh '''\n          cd tools\n          set -euo pipefail\n          ./jenkins-verify.sh\n        '''\n      }\n    }\n  }\n}\n",
@@ -3344,6 +3350,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       ".github/actions/check/action.yml",
       ".github/actions/check/dist/index.js",
       ".github/workflows/ci.yml",
+      ".github/workflows/python.yml",
       "action.yml",
       "ci/check/action.yml",
       "ci/check/run.sh",
@@ -3374,6 +3381,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "tools/module_check.py",
       "tools/__main__.py",
       "src/myproj/check.py",
+      "src/quotedpkg/check.py",
       "tools/verify.sh",
       "Jenkinsfile",
     );
@@ -3764,6 +3772,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(worker, "tools/module_check.py"), "def main():\n    pass\n");
     await writeFile(path.join(worker, "tools/__main__.py"), "def main():\n    pass\n");
     await writeFile(path.join(worker, "src/myproj/check.py"), "def main():\n    pass\n");
+    await writeFile(path.join(worker, "src/quotedpkg/check.py"), "def main():\n    pass\n");
     await writeFile(path.join(worker, "scripts/assertions.ts"), "export const skipped = true;\n");
     git(
       worker,
@@ -3774,6 +3783,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "tools/module_check.py",
       "tools/__main__.py",
       "src/myproj/check.py",
+      "src/quotedpkg/check.py",
     );
     git(worker, "commit", "-m", "disable platform validation entrypoints");
     await assert.rejects(assertWorkerChangesAllowed(), (error: unknown) => {
@@ -3784,6 +3794,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       assert.match(error.message, /tools\/__main__\.py/);
       assert.match(error.message, /tools\/module_check\.py/);
       assert.match(error.message, /src\/myproj\/check\.py/);
+      assert.match(error.message, /src\/quotedpkg\/check\.py/);
       return true;
     });
 
