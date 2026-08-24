@@ -4336,28 +4336,58 @@ export class GitShell implements GitOperations {
           "rebase fixer had no bounded upstream commit and conflict-file set",
         );
       }
-      const protectedConflictFiles: string[] = [];
+      const protectedConflictFiles = new Set<string>();
       for (const filePath of conflictFiles) {
         if (isProtectedValidationPolicyPath(filePath)) {
-          protectedConflictFiles.push(filePath);
+          protectedConflictFiles.add(filePath);
           continue;
         }
-        if (!(await this.pathExists(expectedHead, filePath))) continue;
-        if (isTestPath(filePath)) {
-          protectedConflictFiles.push(filePath);
+        const existsAtExpected = await this.pathExists(expectedHead, filePath);
+        const existsUpstream = await this.pathExists(
+          rebasePolicy.upstreamHead,
+          filePath,
+        );
+        if (isTestPath(filePath) && (existsAtExpected || existsUpstream)) {
+          protectedConflictFiles.add(filePath);
           continue;
         }
-        const expectedSource = await this.showFile(expectedHead, filePath);
+        const sources = await Promise.all(
+          [
+            [expectedHead, existsAtExpected],
+            [rebasePolicy.upstreamHead, existsUpstream],
+          ].map(async ([ref, exists]) => {
+            if (!exists) return undefined;
+            const source = await this.showFile(ref as string, filePath);
+            if (source === undefined) {
+              throw new Error(`could not read protected rebase source ${ref}:${filePath}`);
+            }
+            return source;
+          }),
+        );
         if (
-          expectedSource === undefined ||
-          weakensInlineTestValidation(expectedSource, undefined)
+          sources.some(
+            (source) =>
+              source !== undefined && weakensInlineTestValidation(source, undefined),
+          )
         ) {
-          protectedConflictFiles.push(filePath);
+          protectedConflictFiles.add(filePath);
         }
       }
-      if (protectedConflictFiles.length > 0) {
+      for (const filePath of [
+        ...(await this.#referencedValidationEntrypoints(
+          expectedHead,
+          [...conflictFiles],
+        )),
+        ...(await this.#referencedValidationEntrypoints(
+          rebasePolicy.upstreamHead,
+          [...conflictFiles],
+        )),
+      ]) {
+        protectedConflictFiles.add(filePath);
+      }
+      if (protectedConflictFiles.size > 0) {
         throw new FixerPolicyViolationError(
-          `rebase conflicts require human review for protected validation files: ${protectedConflictFiles.sort().join(", ")}`,
+          `rebase conflicts require human review for protected validation files: ${[...protectedConflictFiles].sort().join(", ")}`,
         );
       }
       const containsUpstream = await this.#git(
@@ -4477,93 +4507,12 @@ export class GitShell implements GitOperations {
         }
       }
     }
-    if (validationEntrypoints.length > 0) {
-      const tracked = await this.#git([
-        "ls-tree",
-        "-r",
-        "--name-only",
-        "-z",
+    protectedPolicy.push(
+      ...(await this.#referencedValidationEntrypoints(
         expectedHead,
-      ]);
-      const trackedPaths = tracked.stdout.split("\0").filter(Boolean);
-      const trackedPathSet = new Set(trackedPaths);
-      const policySources = new Map<string, string>();
-      for (const policyPath of trackedPaths.filter(isProtectedValidationPolicyPath)) {
-        const source = await this.showFile(expectedHead, policyPath);
-        if (source === undefined) {
-          throw new Error(`could not read pre-round validation policy ${policyPath}`);
-        }
-        policySources.set(policyPath, source);
-      }
-      const rootActionPaths = ["action.yml", "action.yaml"].filter((actionPath) =>
-        trackedPathSet.has(actionPath),
-      );
-      const rootActionReferenced =
-        rootActionPaths.length > 0 &&
-        [...policySources.values()].some(referencesRootLocalAction);
-      if (rootActionReferenced) {
-        for (const actionPath of rootActionPaths) {
-          const source = await this.showFile(expectedHead, actionPath);
-          if (source === undefined) {
-            throw new Error(`could not read pre-round local action ${actionPath}`);
-          }
-          policySources.set(actionPath, source);
-        }
-      }
-      let policySourceCount = -1;
-      while (policySources.size !== policySourceCount) {
-        policySourceCount = policySources.size;
-        for (const candidatePath of trackedPaths) {
-          if (policySources.has(candidatePath)) continue;
-          const targets = [candidatePath];
-          if (/^action\.ya?ml$/i.test(path.posix.basename(candidatePath))) {
-            const actionDirectory = path.posix.dirname(candidatePath);
-            if (actionDirectory !== ".") targets.push(actionDirectory);
-          }
-          if (
-            ![...policySources].some(([policyPath, source]) =>
-              targets.some((targetPath) =>
-                containsValidationPathReference(source, policyPath, targetPath),
-              ),
-            )
-          ) {
-            continue;
-          }
-          const source = await this.showFile(expectedHead, candidatePath);
-          if (source === undefined) {
-            throw new Error(
-              `could not read pre-round validation entrypoint ${candidatePath}`,
-            );
-          }
-          policySources.set(candidatePath, source);
-        }
-      }
-      for (const entrypointPath of validationEntrypoints) {
-        const targets = new Set([entrypointPath]);
-        let directory = path.posix.dirname(entrypointPath);
-        while (directory !== ".") {
-          if (
-            trackedPathSet.has(`${directory}/action.yml`) ||
-            trackedPathSet.has(`${directory}/action.yaml`)
-          ) {
-            targets.add(directory);
-          }
-          const parent = path.posix.dirname(directory);
-          if (parent === directory) break;
-          directory = parent;
-        }
-        if (
-          (rootActionReferenced && rootActionPaths.includes(entrypointPath)) ||
-          [...policySources].some(([policyPath, source]) =>
-            [...targets].some((targetPath) =>
-              containsValidationPathReference(source, policyPath, targetPath),
-            ),
-          )
-        ) {
-          protectedPolicy.push(entrypointPath);
-        }
-      }
-    }
+        validationEntrypoints,
+      )),
+    );
     if (protectedTests.length > 0) {
       throw new FixerPolicyViolationError(
         `fixer modified pre-existing test files: ${protectedTests.sort().join(", ")}`,
@@ -4582,6 +4531,95 @@ export class GitShell implements GitOperations {
         `unexplained-policy-relaxation: fixer modified protected validation policy files: ${protectedPolicy.sort().join(", ")}`,
       );
     }
+  }
+
+  async #referencedValidationEntrypoints(
+    ref: string,
+    candidates: string[],
+  ): Promise<string[]> {
+    if (candidates.length === 0) return [];
+    const tracked = await this.#git([
+      "ls-tree",
+      "-r",
+      "--name-only",
+      "-z",
+      ref,
+    ]);
+    const trackedPaths = tracked.stdout.split("\0").filter(Boolean);
+    const trackedPathSet = new Set(trackedPaths);
+    const policySources = new Map<string, string>();
+    for (const policyPath of trackedPaths.filter(isProtectedValidationPolicyPath)) {
+      const source = await this.showFile(ref, policyPath);
+      if (source === undefined) {
+        throw new Error(`could not read validation policy ${ref}:${policyPath}`);
+      }
+      policySources.set(policyPath, source);
+    }
+    const rootActionPaths = ["action.yml", "action.yaml"].filter((actionPath) =>
+      trackedPathSet.has(actionPath),
+    );
+    const rootActionReferenced =
+      rootActionPaths.length > 0 &&
+      [...policySources.values()].some(referencesRootLocalAction);
+    if (rootActionReferenced) {
+      for (const actionPath of rootActionPaths) {
+        const source = await this.showFile(ref, actionPath);
+        if (source === undefined) {
+          throw new Error(`could not read local action ${ref}:${actionPath}`);
+        }
+        policySources.set(actionPath, source);
+      }
+    }
+    let policySourceCount = -1;
+    while (policySources.size !== policySourceCount) {
+      policySourceCount = policySources.size;
+      for (const candidatePath of trackedPaths) {
+        if (policySources.has(candidatePath)) continue;
+        const targets = [candidatePath];
+        if (/^action\.ya?ml$/i.test(path.posix.basename(candidatePath))) {
+          const actionDirectory = path.posix.dirname(candidatePath);
+          if (actionDirectory !== ".") targets.push(actionDirectory);
+        }
+        if (
+          ![...policySources].some(([policyPath, source]) =>
+            targets.some((targetPath) =>
+              containsValidationPathReference(source, policyPath, targetPath),
+            ),
+          )
+        ) {
+          continue;
+        }
+        const source = await this.showFile(ref, candidatePath);
+        if (source === undefined) {
+          throw new Error(`could not read validation entrypoint ${ref}:${candidatePath}`);
+        }
+        policySources.set(candidatePath, source);
+      }
+    }
+    return candidates.filter((entrypointPath) => {
+      if (!trackedPathSet.has(entrypointPath)) return false;
+      const targets = new Set([entrypointPath]);
+      let directory = path.posix.dirname(entrypointPath);
+      while (directory !== ".") {
+        if (
+          trackedPathSet.has(`${directory}/action.yml`) ||
+          trackedPathSet.has(`${directory}/action.yaml`)
+        ) {
+          targets.add(directory);
+        }
+        const parent = path.posix.dirname(directory);
+        if (parent === directory) break;
+        directory = parent;
+      }
+      return (
+        (rootActionReferenced && rootActionPaths.includes(entrypointPath)) ||
+        [...policySources].some(([policyPath, source]) =>
+          [...targets].some((targetPath) =>
+            containsValidationPathReference(source, policyPath, targetPath),
+          ),
+        )
+      );
+    });
   }
 
   async head(): Promise<string> {

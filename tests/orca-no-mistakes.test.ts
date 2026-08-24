@@ -4270,9 +4270,21 @@ test("GitShell bounds rebase fixer changes to upstream and reported conflicts", 
     git(temp, "clone", origin, upstream);
     git(upstream, "config", "user.email", "test@example.com");
     git(upstream, "config", "user.name", "Test User");
+    await mkdir(path.join(upstream, ".github/workflows"), { recursive: true });
+    await mkdir(path.join(upstream, "scripts"), { recursive: true });
+    await mkdir(path.join(upstream, "src"), { recursive: true });
     await writeFile(path.join(upstream, "f.txt"), "upstream\n");
     await writeFile(path.join(upstream, "upstream-only.txt"), "upstream\n");
-    git(upstream, "add", "f.txt", "upstream-only.txt");
+    await writeFile(
+      path.join(upstream, ".github/workflows/ci.yml"),
+      "steps:\n  - run: ./scripts/check.sh\n",
+    );
+    await writeFile(path.join(upstream, "scripts/check.sh"), "npm test\n");
+    await writeFile(
+      path.join(upstream, "src/upstream-inline.ts"),
+      'test("upstream validation", () => verify());\n',
+    );
+    git(upstream, "add", ".");
     git(upstream, "commit", "-m", "upstream");
     git(upstream, "push", "origin", "main");
 
@@ -4303,6 +4315,20 @@ test("GitShell bounds rebase fixer changes to upstream and reported conflicts", 
         upstreamHead,
       }),
       /rebase conflicts require human review for protected validation files: tests\/existing\.test\.ts/,
+    );
+    await assert.rejects(
+      shell.assertFixerChangesAllowed(worker, featureHead, rebasedHead, {
+        conflictFiles: ["src/upstream-inline.ts"],
+        upstreamHead,
+      }),
+      /rebase conflicts require human review for protected validation files: src\/upstream-inline\.ts/,
+    );
+    await assert.rejects(
+      shell.assertFixerChangesAllowed(worker, featureHead, rebasedHead, {
+        conflictFiles: ["scripts/check.sh"],
+        upstreamHead,
+      }),
+      /rebase conflicts require human review for protected validation files: scripts\/check\.sh/,
     );
 
     const mergeWorker = path.join(temp, "merge-worker-wt");

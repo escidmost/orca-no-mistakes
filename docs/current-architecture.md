@@ -59,7 +59,7 @@ Each stage and role resolves its own agent from the configuration tiers, and the
 - Recognizable JavaScript assertions include Chai modifier/property chains such as `value.should.not.equal(...)` and destructured Node assertion calls when the source imports `node:assert`, including `ok`, `equal`, `deepEqual`, `match`, and strict variants.
 - Robot Framework `.robot` suites and `.resource` keyword files are dedicated test assets. Any pre-round source importing `node:assert` or `node:assert/strict` is immutable to fixers, so aliased assertion APIs cannot bypass protection.
 - Catch2/doctest `TEST_CASE` registrations and `REQUIRE`/`CHECK` assertions are protected co-located validation, and `vitest.workspace.*` is protected runner policy.
-- Rebase conflicts in protected tests, inline-test sources, or validation-policy files require a human decision; automatic rebase fixing remains limited to non-protected conflict files.
+- Rebase conflicts in protected tests, inline-test sources, referenced validation entrypoints, or validation-policy files require a human decision. Protection is evaluated against both the pre-rebase branch and resolved upstream snapshots; automatic rebase fixing remains limited to non-protected conflict files.
 - Nox's implicit `noxfile.py` runner configuration is protected validation policy.
 - Central MSBuild policy files `Directory.Build.props`, `Directory.Build.targets`, and `Directory.Packages.props` are protected case-insensitively because projects import them implicitly.
 - Jest image baselines under `__image_snapshots__/` are treated as test assertions alongside `__snapshots__/`, `*-snapshots`, and `*.snap` files.
