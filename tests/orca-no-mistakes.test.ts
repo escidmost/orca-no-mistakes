@@ -75,7 +75,7 @@ class FakeGit implements GitOperations {
   failRebase = false;
   fixerCreatesCommit = true;
   protectedTestMutation?: string;
-  rebaseConflict = false;
+  rebaseConflicts: string[] = [];
   diffOutput = "";
   #agentsMdAtHead?: string;
   readonly #agentsMdOids = new Set<string>();
@@ -128,7 +128,6 @@ class FakeGit implements GitOperations {
     sourcePath: string,
     expectedHead: string,
     _expectedSourceHead: string,
-    _rebasePolicy?: { conflictFiles: string[]; upstreamHead: string },
   ): Promise<void> {
     this.calls.push(`guard:${sourcePath}:${expectedHead}`);
     if (this.protectedTestMutation) {
@@ -200,24 +199,28 @@ class FakeGit implements GitOperations {
     this.calls.push(`rebase:${base}`);
     if (this.failRebase) throw new Error("rebase stage could not run");
     this.#baseOid = "b".repeat(40);
-    if (this.rebaseConflict) {
-      // one-shot: the next rebase models the fixer having resolved the conflict
-      this.rebaseConflict = false;
+    const conflictFile = this.rebaseConflicts.shift();
+    if (conflictFile) {
       return {
         findings: [
           {
             id: "rebase-conflict",
             severity: "error",
-            action: "auto-fix",
+            action: "ask-user",
             description: "conflict; rebase aborted",
-            file: "src/conflict.ts",
+            file: conflictFile,
           },
         ],
+        rebaseUpstreamHead: this.#baseOid,
         summary: "rebase aborted",
       };
     }
     this.#head = FakeGit.#oid(++this.#counter);
-    return pass("rebased");
+    return {
+      findings: [],
+      rebaseUpstreamHead: this.#baseOid,
+      summary: "rebased",
+    };
   }
 
   async policySha256(): Promise<string> {
@@ -4240,7 +4243,7 @@ test("GitShell.applyWorktreeCommits adopts rewritten rebase history behind a bac
   }
 });
 
-test("GitShell bounds rebase fixer changes to upstream and reported conflicts", async () => {
+test("GitShell binds rebase conflicts to the fetched upstream snapshot", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-rebase-guard-"));
   const origin = path.join(temp, "origin.git");
   const seed = path.join(temp, "seed");
@@ -4253,7 +4256,6 @@ test("GitShell bounds rebase fixer changes to upstream and reported conflicts", 
     git(seed, "config", "user.name", "Test User");
     await mkdir(path.join(seed, "tests"));
     await writeFile(path.join(seed, "f.txt"), "base\n");
-    await writeFile(path.join(seed, "tests/existing.test.ts"), "assert(true);\n");
     git(seed, "add", ".");
     git(seed, "commit", "-m", "base");
     git(seed, "push", "origin", "main");
@@ -4270,20 +4272,7 @@ test("GitShell bounds rebase fixer changes to upstream and reported conflicts", 
     git(temp, "clone", origin, upstream);
     git(upstream, "config", "user.email", "test@example.com");
     git(upstream, "config", "user.name", "Test User");
-    await mkdir(path.join(upstream, ".github/workflows"), { recursive: true });
-    await mkdir(path.join(upstream, "scripts"), { recursive: true });
-    await mkdir(path.join(upstream, "src"), { recursive: true });
     await writeFile(path.join(upstream, "f.txt"), "upstream\n");
-    await writeFile(path.join(upstream, "upstream-only.txt"), "upstream\n");
-    await writeFile(
-      path.join(upstream, ".github/workflows/ci.yml"),
-      "steps:\n  - run: ./scripts/check.sh\n",
-    );
-    await writeFile(path.join(upstream, "scripts/check.sh"), "npm test\n");
-    await writeFile(
-      path.join(upstream, "src/upstream-inline.ts"),
-      'test("upstream validation", () => verify());\n',
-    );
     git(upstream, "add", ".");
     git(upstream, "commit", "-m", "upstream");
     git(upstream, "push", "origin", "main");
@@ -4291,95 +4280,19 @@ test("GitShell bounds rebase fixer changes to upstream and reported conflicts", 
     const shell = new GitShell({ repo: operator });
     const report = await shell.rebase("main");
     assert.deepEqual(report.findings.map((finding) => finding.file), ["f.txt"]);
+    assert.ok(report.findings.every((finding) => finding.action === "ask-user"));
     assert.equal(git(operator, "status", "--porcelain"), "");
-
-    git(operator, "fetch", "origin", "main");
     const upstreamHead = git(operator, "rev-parse", "origin/main");
-    const worker = path.join(temp, "worker-wt");
-    git(operator, "worktree", "add", "--detach", worker, featureHead);
-    assert.throws(() => git(worker, "rebase", "origin/main"));
-    await writeFile(path.join(worker, "f.txt"), "upstream\nfeature\n");
-    git(worker, "add", "f.txt");
-    git(worker, "-c", "core.editor=true", "rebase", "--continue");
-    const rebasedHead = git(worker, "rev-parse", "HEAD");
-    const policy = { conflictFiles: ["f.txt"], upstreamHead };
-    await shell.assertFixerChangesAllowed(
-      worker,
-      featureHead,
-      rebasedHead,
-      policy,
-    );
-    await assert.rejects(
-      shell.assertFixerChangesAllowed(worker, featureHead, rebasedHead, {
-        conflictFiles: ["tests/existing.test.ts"],
-        upstreamHead,
-      }),
-      /rebase conflicts require human review for protected validation files: tests\/existing\.test\.ts/,
-    );
-    await assert.rejects(
-      shell.assertFixerChangesAllowed(worker, featureHead, rebasedHead, {
-        conflictFiles: ["src/upstream-inline.ts"],
-        upstreamHead,
-      }),
-      /rebase conflicts require human review for protected validation files: src\/upstream-inline\.ts/,
-    );
-    await assert.rejects(
-      shell.assertFixerChangesAllowed(worker, featureHead, rebasedHead, {
-        conflictFiles: ["scripts/check.sh"],
-        upstreamHead,
-      }),
-      /rebase conflicts require human review for protected validation files: scripts\/check\.sh/,
-    );
+    assert.equal(report.rebaseUpstreamHead, upstreamHead);
 
-    const mergeWorker = path.join(temp, "merge-worker-wt");
-    git(operator, "worktree", "add", "--detach", mergeWorker, featureHead);
-    assert.throws(() =>
-      git(mergeWorker, "merge", "--no-ff", "--no-edit", upstreamHead),
-    );
-    assert.equal(git(mergeWorker, "rev-parse", "MERGE_HEAD"), upstreamHead);
-    await writeFile(path.join(mergeWorker, "f.txt"), "upstream\nfeature\n");
-    git(mergeWorker, "add", "f.txt");
-    git(mergeWorker, "commit", "-m", "merge upstream instead of rebasing");
-    assert.match(
-      git(mergeWorker, "rev-list", "--parents", "-n", "1", "HEAD"),
-      new RegExp(upstreamHead),
-    );
-    await assert.rejects(
-      shell.assertFixerChangesAllowed(
-        mergeWorker,
-        featureHead,
-        git(mergeWorker, "rev-parse", "HEAD"),
-        policy,
-      ),
-      /rebase fixer produced merge commits instead of replaying branch history linearly/,
-    );
-
-    git(worker, "reset", "--hard", rebasedHead);
-    await writeFile(path.join(worker, "upstream-only.txt"), "tampered\n");
-    git(worker, "add", "upstream-only.txt");
-    git(worker, "commit", "--amend", "--no-edit");
-    await assert.rejects(
-      shell.assertFixerChangesAllowed(
-        worker,
-        featureHead,
-        git(worker, "rev-parse", "HEAD"),
-        policy,
-      ),
-      /rebase fixer changed non-conflict files beyond the deterministic rebase result: upstream-only\.txt/,
-    );
-
-    git(worker, "reset", "--hard", rebasedHead);
-    await writeFile(path.join(worker, "tests/existing.test.ts"), "assert(false);\n");
-    git(worker, "add", "tests/existing.test.ts");
-    git(worker, "commit", "--amend", "--no-edit");
-    await assert.rejects(
-      shell.assertFixerChangesAllowed(
-        worker,
-        featureHead,
-        git(worker, "rev-parse", "HEAD"),
-        policy,
-      ),
-      /rebase fixer changed non-conflict files beyond the deterministic rebase result: tests\/existing\.test\.ts/,
+    await writeFile(path.join(upstream, "later.txt"), "later\n");
+    git(upstream, "add", "later.txt");
+    git(upstream, "commit", "-m", "later upstream");
+    git(upstream, "push", "origin", "main");
+    assert.equal(
+      report.rebaseUpstreamHead,
+      upstreamHead,
+      "the conflict report remains bound to the upstream fetched by that attempt",
     );
   } finally {
     await rm(temp, { recursive: true, force: true });
@@ -7686,12 +7599,12 @@ test("the attestation keeps the policy digest captured at run start", async () =
   verifyManifest(result.attestation);
 });
 
-test("a rebase conflict fixes forward and rebases evidence onto the resolved base", async () => {
+test("rebase conflicts require manual resolution and retry", async () => {
   const git = new FakeGit();
   allowReviewAutoFix(git);
-  git.rebaseConflict = true;
+  git.rebaseConflicts = ["src/a.ts", "src/b.ts"];
   const orca = new FakeOrca(git);
-  orca.gateResolution = "approve";
+  orca.gateResolution = "fix";
   orca.reports.set("review", [
     {
       findings: [
@@ -7717,32 +7630,30 @@ test("a rebase conflict fixes forward and rebases evidence onto the resolved bas
   const rebaseFixer = orca.launches.find(
     (launch) => launch.role === "fixer" && launch.stage === "rebase",
   );
-  assert.ok(rebaseFixer, "expected a rebase fixer to run");
+  assert.equal(rebaseFixer, undefined, "rebase conflicts are never agent-fixed");
   const reviewFixer = orca.launches.find(
     (launch) => launch.role === "fixer" && launch.stage === "review",
   );
   assert.ok(reviewFixer, "expected a review fixer to run");
-  assert.equal(reviewFixer.terminal, undefined);
-  assert.equal(reviewFixer.worktree, "new-child");
-  assert.ok(
-    git.calls.some((call) => call.startsWith("worktree-reusable:")),
-    "retained fixer reuse must verify the worktree head",
-  );
-  assert.match(
-    rebaseFixer.prompt,
-    /Existing tests and validation-policy files may change only when resolving reported rebase conflicts/,
-  );
-  assert.match(rebaseFixer.prompt, /"file":"src\/conflict\.ts"/);
   assert.equal(
     git.calls.filter((call) => call.startsWith("guard:")).length,
-    2,
-    "rebase and post-rebase review fixers both use bounded enforcement",
+    1,
+    "only the post-rebase review fixer uses commit enforcement",
   );
-  const failedAttempt = result.attestation.stageEvidence.find(
+  const failedAttempts = result.attestation.stageEvidence.filter(
     (entry) => entry.summary === "rebase aborted",
   );
-  assert.ok(failedAttempt, "expected the conflicted attempt in evidence");
-  assert.equal(failedAttempt.baseCommitOid, "0".repeat(40));
+  assert.equal(failedAttempts.length, 2);
+  assert.ok(
+    failedAttempts.every((entry) => entry.baseCommitOid === "0".repeat(40)),
+  );
+  assert.equal(orca.gates.length, 2);
+  assert.ok(
+    orca.gates.every(
+      (gate) =>
+        JSON.stringify(gate.options) === JSON.stringify(["fix", "stop"]),
+    ),
+  );
   const rebased = result.attestation.stageEvidence.filter(
     (entry) => entry.stage !== "intent" && entry.summary !== "rebase aborted",
   );
