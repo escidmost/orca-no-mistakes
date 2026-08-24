@@ -3053,6 +3053,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await mkdir(path.join(repo, "e2e"));
     await mkdir(path.join(repo, "integration"));
     await mkdir(path.join(repo, "features/support"), { recursive: true });
+    await mkdir(path.join(repo, "packages/web/features/support"), { recursive: true });
     await mkdir(path.join(repo, "MyProject.Tests"));
     await mkdir(path.join(repo, "Shop.UnitTests"));
     await mkdir(path.join(repo, "__specs__"));
@@ -3116,6 +3117,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(
       path.join(repo, "features/support/env.rb"),
       "Before do\n  prepare_scenario\nend\n",
+    );
+    await writeFile(
+      path.join(repo, "packages/web/features/support/env.rb"),
+      "Before do\n  prepare_package_scenario\nend\n",
     );
     await mkdir(path.join(repo, "acceptance"));
     await writeFile(
@@ -3478,6 +3483,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "integration/login.ts",
       "features/login.feature",
       "features/support/env.rb",
+      "packages/web/features/support/env.rb",
       "main.tftest.hcl",
       "package.json",
       "spec/openapi.yaml",
@@ -4624,6 +4630,18 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await assert.rejects(
       assertWorkerChangesAllowed(),
       /fixer modified pre-existing test files: features\/support\/env\.rb/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "packages/web/features/support/env.rb"),
+      "Before do\n  skip_package_scenario\nend\n",
+    );
+    git(worker, "add", "packages/web/features/support/env.rb");
+    git(worker, "commit", "-m", "weaken nested Gherkin support hook");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified pre-existing test files: packages\/web\/features\/support\/env\.rb/,
     );
 
     git(worker, "reset", "--hard", featureHead);

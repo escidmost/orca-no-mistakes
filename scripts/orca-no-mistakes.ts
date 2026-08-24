@@ -3966,9 +3966,12 @@ function isTestPath(filePath: string): boolean {
       parts[index - 1]?.toLowerCase() === "src" &&
       part.toLowerCase() === "it",
   );
-  const gherkinSupportSource =
-    parts[0]?.toLowerCase() === "features" &&
-    (parts[1]?.toLowerCase() === "support" || fileName.toLowerCase() === "environment.py");
+  const gherkinSupportSource = parts.some(
+    (part, index) =>
+      part.toLowerCase() === "features" &&
+      (parts[index + 1]?.toLowerCase() === "support" ||
+        parts[index + 1]?.toLowerCase() === "environment.py"),
+  );
   return (
     singularSpecSource ||
     variantTestSourceSet ||
