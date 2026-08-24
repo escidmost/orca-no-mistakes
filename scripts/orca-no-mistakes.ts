@@ -174,7 +174,7 @@ export interface GitOperations {
     sourcePath: string,
     expectedHead: string,
     expectedSourceHead: string,
-  ): Promise<void>;
+  ): Promise<boolean | void>;
   head(): Promise<string>;
   /** Diff between the resolved trusted base and the captured HEAD snapshot
    *  (merge-base three-dot form). Must throw on failure so a missing diff
@@ -1321,11 +1321,14 @@ async function runFixer(
     if (before === workerHead) {
       throw new FixerNoChangeError(validatedReport, stage);
     }
-    await git.assertFixerChangesAllowed(
+    const changedTree = await git.assertFixerChangesAllowed(
       worktreePath,
       before,
       workerHead,
     );
+    if (changedTree === false) {
+      throw new FixerNoChangeError(validatedReport, stage);
+    }
     if (fence.aborted) {
       // The execution timeout already failed this stage; refuse late mutations
       // so a delayed worker cannot apply commits into a settled run.
@@ -4068,6 +4071,7 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
     [
       "cargo.toml",
       "build.sbt",
+      "build.boot",
       "build.xml",
       "build.zig",
       "build.gradle",
@@ -4081,6 +4085,7 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "directory.build.props",
       "directory.build.targets",
       "directory.packages.props",
+      "deps.edn",
       ".bazelrc",
       "gemfile",
       "gemfile.lock",
@@ -4112,6 +4117,7 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "pnpm-workspace.yaml",
       "pom.xml",
       "poetry.lock",
+      "project.clj",
       "pyproject.toml",
       "pytest.ini",
       "rakefile",
@@ -4565,7 +4571,7 @@ export class GitShell implements GitOperations {
     sourcePath: string,
     expectedHead: string,
     sourceHead: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const changed = await this.#git(
       [
         "-C",
@@ -4608,10 +4614,12 @@ export class GitShell implements GitOperations {
         protectedPolicy.push(filePath);
         continue;
       }
-      if (isTestPath(filePath) && (await this.pathExists(expectedHead, filePath))) {
+      const existedBefore = await this.pathExists(expectedHead, filePath);
+      if (isTestPath(filePath) && existedBefore) {
         protectedTests.push(filePath);
-      } else if (await this.pathExists(expectedHead, filePath)) {
+      } else {
         validationEntrypoints.push(filePath);
+        if (!existedBefore) continue;
         const expectedSource = await this.showFile(expectedHead, filePath);
         if (expectedSource === undefined) {
           throw new Error(`could not read pre-round source file ${filePath}`);
@@ -4646,6 +4654,7 @@ export class GitShell implements GitOperations {
         `unexplained-policy-relaxation: fixer modified protected validation policy files: ${protectedPolicy.sort().join(", ")}`,
       );
     }
+    return changedPaths.length > 0;
   }
 
   async #referencedValidationEntrypoints(
@@ -4727,7 +4736,6 @@ export class GitShell implements GitOperations {
       }
     }
     return candidates.filter((entrypointPath) => {
-      if (!trackedPathSet.has(entrypointPath)) return false;
       const targets = new Set([entrypointPath]);
       let directory = path.posix.dirname(entrypointPath);
       while (directory !== ".") {

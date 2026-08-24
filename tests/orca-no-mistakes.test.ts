@@ -74,6 +74,7 @@ class FakeGit implements GitOperations {
   failHeadAfterAnchor = false;
   failRebase = false;
   fixerCreatesCommit = true;
+  fixerChangesTree = true;
   protectedTestMutation?: string;
   rebaseConflicts: string[] = [];
   diffOutput = "";
@@ -128,7 +129,7 @@ class FakeGit implements GitOperations {
     sourcePath: string,
     expectedHead: string,
     _expectedSourceHead: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     this.calls.push(`guard:${sourcePath}:${expectedHead}`);
     if (this.protectedTestMutation) {
       const mutation = this.protectedTestMutation;
@@ -137,6 +138,7 @@ class FakeGit implements GitOperations {
         `fixer modified pre-existing test files: ${mutation}`,
       );
     }
+    return this.fixerChangesTree;
   }
 
   async head(): Promise<string> {
@@ -1234,35 +1236,38 @@ test("a failed run surfaces retained fixer cleanup failure with the stage error 
   );
 });
 
-test("a fixer round without a new commit opens a human gate", async () => {
-  const git = new FakeGit();
-  allowReviewAutoFix(git);
-  git.fixerCreatesCommit = false;
-  const orca = new FakeOrca(git);
-  orca.reports.set("review", [
-    {
-      findings: [
-        {
-          id: "review-1",
-          severity: "error",
-          action: "auto-fix",
-          description: "Repair the implementation.",
-        },
-      ],
-      summary: "one defect",
-    },
-    pass("no committed fix"),
-  ]);
+test("fixer rounds without tree changes open a human gate", async () => {
+  for (const createsCommit of [false, true]) {
+    const git = new FakeGit();
+    allowReviewAutoFix(git);
+    git.fixerCreatesCommit = createsCommit;
+    git.fixerChangesTree = !createsCommit;
+    const orca = new FakeOrca(git);
+    orca.reports.set("review", [
+      {
+        findings: [
+          {
+            id: "review-1",
+            severity: "error",
+            action: "auto-fix",
+            description: "Repair the implementation.",
+          },
+        ],
+        summary: "one defect",
+      },
+      pass("no committed fix"),
+    ]);
 
-  await runPipeline({ intent: "Require committed fixes." }, orca, git);
-  assert.equal(orca.gates.length, 1);
-  assert.match(orca.gates[0]?.question ?? "", /review-1/);
-  assert.match(orca.gates[0]?.question ?? "", /fixer-no-change/);
-  assert.match(orca.gates[0]?.question ?? "", /no committed fix/);
-  assert.equal(
-    git.calls.some((call) => call.startsWith("apply:/worktrees/")),
-    false,
-  );
+    await runPipeline({ intent: "Require committed fixes." }, orca, git);
+    assert.equal(orca.gates.length, 1);
+    assert.match(orca.gates[0]?.question ?? "", /review-1/);
+    assert.match(orca.gates[0]?.question ?? "", /fixer-no-change/);
+    assert.match(orca.gates[0]?.question ?? "", /no committed fix/);
+    assert.equal(
+      git.calls.some((call) => call.startsWith("apply:/worktrees/")),
+      false,
+    );
+  }
 });
 
 test("a passing gate transfers final custody to the unchanged initiating worktree", async () => {
@@ -3258,6 +3263,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "steps:\n  - run: node scripts/baseurl-check.ts\n  - run: cd -- cd-options && ./check.sh\n  - run: cd -P physical-commands && ./check.sh\n",
     );
     await writeFile(
+      path.join(repo, ".github/workflows/new-entrypoint.yml"),
+      "steps:\n  - run: ./scripts/new-validation.sh\n",
+    );
+    await writeFile(
       path.join(repo, "action.yml"),
       "runs:\n  using: node20\n  main: dist/index.js\n",
     );
@@ -3445,6 +3454,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       ".github/actions/check/action.yml",
       ".github/actions/check/dist/index.js",
       ".github/workflows/ci.yml",
+      ".github/workflows/new-entrypoint.yml",
       ".github/workflows/python.yml",
       ".github/workflows/python-working.yml",
       ".github/workflows/resolver.yml",
@@ -3765,14 +3775,17 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "Package.swift",
       "Package.resolved",
       "app.csproj",
+      "build.boot",
       "build.sbt",
       "build.zig",
       "composer.json",
+      "deps.edn",
       "Gemfile",
       "mix.exs",
       "mix.lock",
       "pubspec.lock",
       "pubspec.yaml",
+      "project.clj",
       "Rakefile",
     ];
     for (const filePath of canonicalManifests) {
@@ -3897,6 +3910,15 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     git(worker, "commit", "-m", "repair specification tooling");
     await assertWorkerChangesAllowed();
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "scripts/new-validation.sh"), "exit 0\n");
+    git(worker, "add", "scripts/new-validation.sh");
+    git(worker, "commit", "-m", "add disabled validation entrypoint");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /protected validation policy files: scripts\/new-validation\.sh/,
+    );
 
     git(worker, "reset", "--hard", featureHead);
     await writeFile(
