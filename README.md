@@ -70,4 +70,4 @@ npm test
 npm run typecheck
 ```
 
-GitHub Actions runs both on every pull request and on pushes to `main`.
+GitHub Actions runs on same-repository pull requests and on pushes to `main`; fork pull requests are skipped.
