@@ -3937,6 +3937,7 @@ function isTestPath(filePath: string): boolean {
           "__specs__",
           "__snapshots__",
           "__image_snapshots__",
+          "__mocks__",
           "snapshots",
           "__fixtures__",
           "fixtures",
@@ -4079,6 +4080,8 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "pytest.ini",
       "rakefile",
       "setup.cfg",
+      "taskfile.yaml",
+      "taskfile.yml",
       "mix.exs",
       "mix.lock",
       "tox.ini",
@@ -4109,7 +4112,7 @@ function containsPathReference(source: string, reference: string): boolean {
   ).test(source);
 }
 
-const ROOT_PATH_PREFIX_PATTERN = String.raw`(?:\$\{\{[^}\n]+\}\}|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\$\(\s*pwd\s*\)|\$\(\s*git\s+rev-parse\s+--show-toplevel\s*\))`;
+const ROOT_PATH_PREFIX_PATTERN = String.raw`(?:\$\{\{[^}\n]+\}\}|\$[Ee][Nn][Vv]:[A-Za-z_][A-Za-z0-9_]*|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\$\(\s*pwd\s*\)|\$\(\s*git\s+rev-parse\s+--show-toplevel\s*\))`;
 
 function normalizeQuotedPathPrefixes(source: string): string {
   return source.replace(

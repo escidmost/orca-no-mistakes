@@ -47,7 +47,7 @@ A successful fallback fixer remains compatible while the exact configured candid
 
 Dedicated test-path protection also recognizes `.Tests` project directories, hyphenated `foo-test` and non-document `test-foo` names, and Pascal/camel-case `Test(s)` or `Spec(s)` filename suffixes. While a human gate is open, the coordinator inspects and acknowledges the complete Orca delivery, applying authenticated gate responses and warning about unrelated messages rather than blocking or discarding the batch silently.
 
-Every rebase attempt records the upstream OID fetched by that attempt, including conflicts, hook failures, and failures without unmerged paths; only a clean rebase updates the accepted run base. Exact `snapshots/` directories are protected test data. npm's implicit `.npmrc` is protected validation policy. Validation references recognize repository-root command substitutions such as `$(pwd)` and `$(git rev-parse --show-toplevel)` in addition to workflow and environment prefixes.
+Every rebase attempt records the upstream OID fetched by that attempt, including conflicts, hook failures, and failures without unmerged paths; only a clean rebase updates the accepted run base. Exact `snapshots/` and Jest `__mocks__/` directories are protected test data. npm's implicit `.npmrc` and Go Task's `Taskfile.yml`/`Taskfile.yaml` are protected validation policy. Validation references recognize repository-root command substitutions such as `$(pwd)` and `$(git rev-parse --show-toplevel)`, POSIX environment variables, PowerShell `$env:NAME`, and workflow-expression prefixes.
 
 Each stage and role resolves its own agent from the configuration tiers, and the launch adapter dispatches on the resolved harness:
 
