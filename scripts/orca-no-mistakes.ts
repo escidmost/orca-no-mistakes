@@ -421,6 +421,10 @@ export async function runPipeline(
       evidenceCommitOid?: string,
     ): Promise<void> => {
       const candidate = evidenceCommitOid ?? (await git.head());
+      const evidenceBaseCommitOid =
+        stage === "rebase" && report.rebaseUpstreamHead
+          ? report.rebaseUpstreamHead
+          : baseCommitOid;
       const logsDir = path.join(artifactsDir, "logs");
       await mkdir(logsDir, { recursive: true });
       const artifactPath = path.join(
@@ -433,6 +437,7 @@ export async function runPipeline(
             exitCode,
             artifacts: report.artifacts,
             findings: report.findings,
+            rebaseUpstreamHead: report.rebaseUpstreamHead,
             summary: report.summary,
             tested: report.tested,
             resolvedAgent: fallback.resolvedAgent,
@@ -454,13 +459,13 @@ export async function runPipeline(
         stage,
         round,
         candidateCommitOid: candidate,
-        baseCommitOid,
+        baseCommitOid: evidenceBaseCommitOid,
         workerIdentity,
         exitCode,
         artifactSha256,
         evidenceSha256: evidenceSha256({
           artifactSha256,
-          baseCommitOid,
+          baseCommitOid: evidenceBaseCommitOid,
           candidateCommitOid: candidate,
           exitCode,
           round,
@@ -472,7 +477,7 @@ export async function runPipeline(
       };
       ledger.recordEvidence({
         artifactPath,
-        baseCommitOid,
+        baseCommitOid: evidenceBaseCommitOid,
         candidateCommitOid: candidate,
         evidenceSha256: entry.evidenceSha256,
         exitCode,
@@ -4081,6 +4086,13 @@ function containsPathReference(source: string, reference: string): boolean {
   ).test(source);
 }
 
+function normalizeQuotedPathPrefixes(source: string): string {
+  return source.replace(
+    /(["'])((?:\$\{\{[^}\n]+\}\}|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?))\1(?=[/\\])/g,
+    "$2",
+  );
+}
+
 function containsPrefixedPathReference(source: string, reference: string): boolean {
   if (!reference || reference === ".") return false;
   const escaped = reference
@@ -4090,7 +4102,7 @@ function containsPrefixedPathReference(source: string, reference: string): boole
   return new RegExp(
     `(?:\\$\\{\\{[^}\\n]+\\}\\}|\\$\\{?[A-Za-z_][A-Za-z0-9_]*\\}?)[/\\\\]${escaped}(?=$|[^A-Za-z0-9_./\\\\-])`,
     "m",
-  ).test(source);
+  ).test(normalizeQuotedPathPrefixes(source));
 }
 
 function normalizeReferencedDirectory(directory: string): string {
@@ -4113,7 +4125,10 @@ function shellCommandReferencesTarget(
   directories: ReadonlySet<string>,
   basename: string,
 ): boolean {
-  const normalizedCommand = command.replace(/\\/g, "/");
+  const normalizedCommand = normalizeQuotedPathPrefixes(command).replace(
+    /\\/g,
+    "/",
+  );
   const normalizedDirectories = new Set(
     [...directories].map(normalizeReferencedDirectory).filter(Boolean),
   );
