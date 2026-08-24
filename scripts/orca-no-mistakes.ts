@@ -3932,8 +3932,15 @@ function isTestPath(filePath: string): boolean {
   const singularSpecSource =
     parts.slice(0, -1).some((part) => part.toLowerCase() === "spec") &&
     !/\.(?:ya?ml|json|md|txt|toml)$/i.test(fileName);
+  const variantTestSourceSet = parts.some(
+    (part, index) =>
+      index > 0 &&
+      parts[index - 1]?.toLowerCase() === "src" &&
+      /^[a-z][A-Za-z0-9]*Test$/.test(part),
+  );
   return (
     singularSpecSource ||
+    variantTestSourceSet ||
     parts
       .slice(0, -1)
       .some((part) =>
@@ -4108,7 +4115,7 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
     (parts.at(-2) === ".mvn" && ["jvm.config", "maven.config"].includes(fileName)) ||
     /^settings\.gradle(?:\.kts)?$/.test(fileName) ||
     (parts[0] !== "docs" && parts.slice(0, -1).includes("prompts")) ||
-    /^(?:(?:vitest|jest|playwright|cypress)\.config\..+|vitest\.workspace\..+|\.mocharc(?:\..+)?|karma\.conf\..+|phpunit\.xml(?:\.dist)?|eslint\.config\..+|\.eslintrc(?:\..+)?|\.eslintignore|prettier\.config\..+|\.prettierrc(?:\..+)?|\.prettierignore|biome\.jsonc?|deno\.jsonc?|\.coveragerc|\.editorconfig|\.flake8|\.?ruff\.toml|\.?mypy\.ini|\.?pylintrc|pyrightconfig\.json|\.rubocop\.ya?ml|stylelint\.config\..+|\.stylelintrc(?:\..+)?|\.stylelintignore|\.?markdownlint(?:-cli2)?(?:\..+)?|\.markdownlintignore|\.shellcheckrc|\.golangci\.(?:ya?ml|toml|json)|\.?rustfmt\.toml|\.?clippy\.toml|\.clang-format|\.clang-format-ignore|\.clang-tidy|analysis_options\.yaml|checkstyle\.xml|detekt\.ya?ml|phpcs\.xml(?:\.dist)?|phpstan(?:\.[^.]+)?\.neon(?:\.dist)?|sonar-project\.properties|tsconfig(?:\.[^.]+)*\.json|tslint(?:\.[^.]+)*\.json)$/.test(
+    /^(?:(?:vitest|jest|playwright|cypress)\.config\..+|vitest\.workspace\..+|nyc\.config\..+|\.mocharc(?:\..+)?|karma\.conf\..+|phpunit\.xml(?:\.dist)?|eslint\.config\..+|\.eslintrc(?:\..+)?|\.eslintignore|prettier\.config\..+|\.prettierrc(?:\..+)?|\.prettierignore|biome\.jsonc?|deno\.jsonc?|\.coveragerc|\.nycrc(?:\..+)?|\.rspec|\.editorconfig|\.flake8|\.?ruff\.toml|\.?mypy\.ini|\.?pylintrc|pyrightconfig\.json|\.rubocop\.ya?ml|stylelint\.config\..+|\.stylelintrc(?:\..+)?|\.stylelintignore|\.?markdownlint(?:-cli2)?(?:\..+)?|\.markdownlintignore|\.shellcheckrc|\.golangci\.(?:ya?ml|toml|json)|\.?rustfmt\.toml|\.?clippy\.toml|\.clang-format|\.clang-format-ignore|\.clang-tidy|analysis_options\.yaml|checkstyle\.xml|detekt\.ya?ml|phpcs\.xml(?:\.dist)?|phpstan(?:\.[^.]+)?\.neon(?:\.dist)?|sonar-project\.properties|tsconfig(?:\.[^.]+)*\.json|tslint(?:\.[^.]+)*\.json)$/.test(
       fileName,
     )
   );
@@ -4231,6 +4238,7 @@ function containsValidationPathReference(
     containsPathReference(source, reference) ||
     containsPrefixedPathReference(source, reference);
   if ([...references].some(containsReference)) return true;
+  let referencesPythonModule: ((command: string, directory?: string) => boolean) | undefined;
   if (targetPath.toLowerCase().endsWith(".py")) {
     const moduleReferences = new Set(references);
     for (const reference of references) {
@@ -4250,15 +4258,35 @@ function containsValidationPathReference(
           .replace(/\//g, "."),
       )
       .filter(Boolean);
-    if (
-      modules.some((moduleName) =>
+    const commandReferencesModules = (command: string, moduleNames: string[]): boolean =>
+      moduleNames.some((moduleName) =>
         new RegExp(
           `\\b(?:python(?:3(?:\\.\\d+)?)?|py)(?:\\s+(?:(?:-X|-W|--check-hash-based-pycs)\\s+\\S+|(?!-m\\b)-\\S+))*\\s+-m\\s+["']?${moduleName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}["']?(?=$|\\s)`,
           "m",
-        ).test(source),
-      )
-    )
-      return true;
+        ).test(command),
+      );
+    referencesPythonModule = (command, directory) => {
+      if (commandReferencesModules(command, modules)) return true;
+      if (directory === undefined) return false;
+      const normalizedDirectory = normalizeReferencedDirectory(directory);
+      const roots = new Set([
+        normalizedDirectory,
+        path.posix.normalize(path.posix.join(path.posix.dirname(policyPath), normalizedDirectory)),
+      ]);
+      const relativeModules = [...roots]
+        .filter((root) => root !== "." && targetPath.startsWith(`${root}/`))
+        .map((root) =>
+          targetPath
+            .slice(root.length + 1)
+            .replace(/\/__main__\.py$/i, "")
+            .replace(/\.py$/i, "")
+            .replace(/\/__init__$/i, "")
+            .replace(/\//g, "."),
+        )
+        .filter(Boolean);
+      return commandReferencesModules(command, relativeModules);
+    };
+    if (referencesPythonModule(source)) return true;
   }
 
   const targetDirectory = path.posix.dirname(targetPath);
@@ -4292,7 +4320,9 @@ function containsValidationPathReference(
         inheritedDirectory;
       if (
         typeof record.run === "string" &&
-        ((directory !== undefined && directoryMatches(directory) && commandMatches(record.run)) ||
+        ((directory !== undefined &&
+          ((directoryMatches(directory) && commandMatches(record.run)) ||
+            referencesPythonModule?.(record.run, directory))) ||
           shellCommandReferencesTarget(record.run, workingDirectories, basename))
       ) {
         return true;

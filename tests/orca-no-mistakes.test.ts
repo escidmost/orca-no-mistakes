@@ -3007,6 +3007,8 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await mkdir(path.join(repo, "src/__snapshots__"));
     await mkdir(path.join(repo, "src/button.spec.ts-snapshots"));
     await mkdir(path.join(repo, "src/testFixtures/java"), { recursive: true });
+    await mkdir(path.join(repo, "src/androidTest/resources"), { recursive: true });
+    await mkdir(path.join(repo, "src/commonTest/resources"), { recursive: true });
     await mkdir(path.join(repo, "testdata"));
     await mkdir(path.join(repo, "t"));
     await mkdir(path.join(repo, "__fixtures__"));
@@ -3079,6 +3081,8 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       path.join(repo, "src/testFixtures/java/Fixture.java"),
       "class Fixture { static int expected() { return 1; } }\n",
     );
+    await writeFile(path.join(repo, "src/androidTest/resources/expected.json"), '{"ok":true}\n');
+    await writeFile(path.join(repo, "src/commonTest/resources/expected.json"), '{"ok":true}\n');
     await writeFile(
       path.join(repo, "MyProject.Tests/OrderServiceTests.cs"),
       "Assert.True(true);\n",
@@ -3211,6 +3215,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       '- run: python -X dev -m "quotedpkg.check"\n',
     );
     await writeFile(
+      path.join(repo, ".github/workflows/python-working.yml"),
+      "defaults:\n  run:\n    working-directory: backend\nsteps:\n  - run: python -m checks.validate\n",
+    );
+    await writeFile(
       path.join(repo, "action.yml"),
       "runs:\n  using: node20\n  main: dist/index.js\n",
     );
@@ -3265,6 +3273,8 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(repo, "src/myproj/check.py"), "def main():\n    verify_behavior()\n");
     await mkdir(path.join(repo, "src/quotedpkg"), { recursive: true });
     await writeFile(path.join(repo, "src/quotedpkg/check.py"), "def main():\n    verify_behavior()\n");
+    await mkdir(path.join(repo, "backend/checks"), { recursive: true });
+    await writeFile(path.join(repo, "backend/checks/validate.py"), "def main():\n    verify_behavior()\n");
     await writeFile(
       path.join(repo, "Jenkinsfile"),
       "pipeline {\n  stages {\n    stage('test') {\n      steps {\n        sh '''\n          cd tools\n          set -euo pipefail\n          ./jenkins-verify.sh\n        '''\n      }\n    }\n  }\n}\n",
@@ -3352,11 +3362,14 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "src/spec-parser.ts",
       "src/widget.spec.ts",
       "src/testFixtures/java/Fixture.java",
+      "src/androidTest/resources/expected.json",
+      "src/commonTest/resources/expected.json",
       "Tests/branch-regression.ts",
       ".github/actions/check/action.yml",
       ".github/actions/check/dist/index.js",
       ".github/workflows/ci.yml",
       ".github/workflows/python.yml",
+      ".github/workflows/python-working.yml",
       "action.yml",
       "ci/check/action.yml",
       "ci/check/run.sh",
@@ -3388,6 +3401,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "tools/__main__.py",
       "src/myproj/check.py",
       "src/quotedpkg/check.py",
+      "backend/checks/validate.py",
       "tools/verify.sh",
       "Jenkinsfile",
     );
@@ -3436,6 +3450,8 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(worker, "eslint.config.js"), "export default [];\n");
     await writeFile(path.join(worker, ".clang-format"), "DisableFormat: true\n");
     await writeFile(path.join(worker, ".coveragerc"), "[report]\nfail_under = 0\n");
+    await writeFile(path.join(worker, ".nycrc"), '{"check-coverage":false}\n');
+    await writeFile(path.join(worker, ".rspec"), "--tag ~focus\n");
     await writeFile(path.join(worker, ".clang-format-ignore"), "**/*\n");
     await writeFile(path.join(worker, ".eslintignore"), "**/*\n");
     await writeFile(path.join(worker, ".markdownlintignore"), "**/*\n");
@@ -3478,6 +3494,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       path.join(worker, "noxfile.py"),
       "import nox\n@nox.session\ndef tests(session): pass\n",
     );
+    await writeFile(path.join(worker, "nyc.config.js"), "module.exports = { checkCoverage: false };\n");
     await writeFile(path.join(worker, "package-lock.json"), '{"lockfileVersion":3}\n');
     await writeFile(path.join(worker, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
     await writeFile(path.join(worker, "pom.xml"), "<skipTests>true</skipTests>\n");
@@ -3517,6 +3534,8 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       ".clang-format",
       ".clang-format-ignore",
       ".coveragerc",
+      ".nycrc",
+      ".rspec",
       ".eslintignore",
       ".justfile",
       ".markdownlintignore",
@@ -3546,6 +3565,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "gradle/wrapper/gradle-wrapper.properties",
       "gradlew",
       "noxfile.py",
+      "nyc.config.js",
       "package-lock.json",
       "package.json",
       "Pipfile",
@@ -3581,7 +3601,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "commit", "-m", "weaken validation policy");
     await assert.rejects(
       assertWorkerChangesAllowed(),
-      /unexplained-policy-relaxation:.*\.bazelrc, \.clang-format, \.clang-format-ignore, \.coveragerc, \.eslintignore, \.justfile, \.markdownlintignore, \.mocharc\.json, \.mvn\/jvm\.config, \.mvn\/maven\.config, \.mvn\/wrapper\/maven-wrapper\.jar, \.mvn\/wrapper\/maven-wrapper\.properties, \.npmrc, \.prettierignore, \.shellcheckrc, \.stylelintignore, BUILD, BUILD\.bazel, CMakeLists\.txt, Cargo\.lock, Directory\.Build\.targets, Directory\.Packages\.props, GNUmakefile, MODULE\.bazel, Pipfile, Taskfile\.dist\.yaml, Taskfile\.dist\.yml, Taskfile\.yml, WORKSPACE, WORKSPACE\.bazel, build\.gradle, build\.gradle\.kts, cypress\.config\.ts, directory\.build\.props, eslint\.config\.js, go\.work, gradle\.properties, gradle\/wrapper\/gradle-wrapper\.jar, gradle\/wrapper\/gradle-wrapper\.properties, gradlew, mvnw, noxfile\.py, package-lock\.json, package\.json, phpunit\.xml, phpunit\.xml\.dist, pkg\/go\.mod, pnpm-lock\.yaml, pom\.xml, prompts\/fixer\.md, pylintrc, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, vitest\.workspace\.ts, yarn\.lock/,
+      /unexplained-policy-relaxation:.*\.bazelrc, \.clang-format, \.clang-format-ignore, \.coveragerc, \.eslintignore, \.justfile, \.markdownlintignore, \.mocharc\.json, \.mvn\/jvm\.config, \.mvn\/maven\.config, \.mvn\/wrapper\/maven-wrapper\.jar, \.mvn\/wrapper\/maven-wrapper\.properties, \.npmrc, \.nycrc, \.prettierignore, \.rspec, \.shellcheckrc, \.stylelintignore, BUILD, BUILD\.bazel, CMakeLists\.txt, Cargo\.lock, Directory\.Build\.targets, Directory\.Packages\.props, GNUmakefile, MODULE\.bazel, Pipfile, Taskfile\.dist\.yaml, Taskfile\.dist\.yml, Taskfile\.yml, WORKSPACE, WORKSPACE\.bazel, build\.gradle, build\.gradle\.kts, cypress\.config\.ts, directory\.build\.props, eslint\.config\.js, go\.work, gradle\.properties, gradle\/wrapper\/gradle-wrapper\.jar, gradle\/wrapper\/gradle-wrapper\.properties, gradlew, mvnw, noxfile\.py, nyc\.config\.js, package-lock\.json, package\.json, phpunit\.xml, phpunit\.xml\.dist, pkg\/go\.mod, pnpm-lock\.yaml, pom\.xml, prompts\/fixer\.md, pylintrc, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, vitest\.workspace\.ts, yarn\.lock/,
     );
 
     git(worker, "reset", "--hard", featureHead);
@@ -3594,6 +3614,16 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await assert.rejects(
       assertWorkerChangesAllowed(),
       /fixer modified pre-existing test files: src\/testFixtures\/java\/Fixture\.java/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "src/androidTest/resources/expected.json"), '{"ok":false}\n');
+    await writeFile(path.join(worker, "src/commonTest/resources/expected.json"), '{"ok":false}\n');
+    git(worker, "add", "src/androidTest/resources/expected.json", "src/commonTest/resources/expected.json");
+    git(worker, "commit", "-m", "weaken variant test fixtures");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified pre-existing test files: src\/androidTest\/resources\/expected\.json, src\/commonTest\/resources\/expected\.json/,
     );
 
     git(worker, "reset", "--hard", featureHead);
@@ -3795,6 +3825,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(worker, "tools/__main__.py"), "def main():\n    pass\n");
     await writeFile(path.join(worker, "src/myproj/check.py"), "def main():\n    pass\n");
     await writeFile(path.join(worker, "src/quotedpkg/check.py"), "def main():\n    pass\n");
+    await writeFile(path.join(worker, "backend/checks/validate.py"), "def main():\n    pass\n");
     await writeFile(path.join(worker, "scripts/assertions.ts"), "export const skipped = true;\n");
     git(
       worker,
@@ -3806,6 +3837,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "tools/__main__.py",
       "src/myproj/check.py",
       "src/quotedpkg/check.py",
+      "backend/checks/validate.py",
     );
     git(worker, "commit", "-m", "disable platform validation entrypoints");
     await assert.rejects(assertWorkerChangesAllowed(), (error: unknown) => {
@@ -3817,6 +3849,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       assert.match(error.message, /tools\/module_check\.py/);
       assert.match(error.message, /src\/myproj\/check\.py/);
       assert.match(error.message, /src\/quotedpkg\/check\.py/);
+      assert.match(error.message, /backend\/checks\/validate\.py/);
       return true;
     });
 
