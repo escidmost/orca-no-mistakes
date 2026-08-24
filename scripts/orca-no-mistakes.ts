@@ -143,7 +143,6 @@ export interface OrcaOperations {
     launch: WorkerLaunch,
     fence?: TimeoutFence,
   ): Promise<WorkerResult>;
-  cancelTaskWorkers(taskId: string): Promise<void>;
   finishWorker(
     worker: WorkerResult,
     disposition: "release" | "retain",
@@ -2398,6 +2397,7 @@ export class CliOrca implements OrcaOperations {
     if (fence?.aborted) {
       throw new Error(`${launch.stage} worker attempt was cancelled`);
     }
+    const readyTimeoutMs = workerAgentReadyTimeoutMs();
     let started: { dispatchId?: string; state?: string };
     try {
       started = await this.#json<{
@@ -2414,10 +2414,13 @@ export class CliOrca implements OrcaOperations {
           "--terminal",
           terminalHandle,
           "--timeout-ms",
-          String(workerAgentReadyTimeoutMs()),
+          String(readyTimeoutMs),
           ...(this.#runId ? ["--run", this.#runId] : []),
           "--json",
         ],
+        false,
+        undefined,
+        readyTimeoutMs + NATIVE_WORKER_CREATE_SLACK_MS,
       );
     } catch (error) {
       throw new PreflightError(
@@ -3347,45 +3350,6 @@ export class CliOrca implements OrcaOperations {
     }
   }
 
-  async cancelTaskWorkers(taskId: string): Promise<void> {
-    if (!this.#runId) return;
-    const result = await this.#json<{
-      workers?: {
-        agentTerminalHandle?: string;
-        dispatchId?: string;
-        resource?: { worktreeId?: string } | null;
-        taskId?: string;
-      }[];
-    }>([
-      "orchestration",
-      "worker-list",
-      "--run",
-      this.#runId,
-      "--json",
-    ]);
-    for (const worker of result.workers ?? []) {
-      if (worker.taskId !== taskId || !worker.dispatchId) continue;
-      let worktreeId = worker.resource?.worktreeId;
-      if (worker.agentTerminalHandle && !worktreeId) {
-        const shown: { terminal?: { worktreeId?: string } } = await this.#json<{
-          terminal?: { worktreeId?: string };
-        }>([
-          "terminal",
-          "show",
-          "--terminal",
-          worker.agentTerminalHandle,
-          "--json",
-        ], true).catch(() => ({}));
-        worktreeId = shown.terminal?.worktreeId;
-      }
-      await this.#cleanupWorkerResources({
-        dispatchId: worker.dispatchId,
-        terminalHandle: worker.agentTerminalHandle,
-        worktreeId,
-      });
-    }
-  }
-
   async removeWorktree(worktreeId: string): Promise<void> {
     await this.#json([
       "worktree",
@@ -3918,11 +3882,12 @@ export class CliOrca implements OrcaOperations {
     args: string[],
     acceptFailure = false,
     fence?: TimeoutFence,
+    timeoutMs?: number | null,
   ): Promise<T> {
     const result = await command(this.#command, args, this.#cwd, {
       abortSignal: fence?.signal,
       allowFailure: acceptFailure,
-      timeoutMs: args.includes("--wait") ? 910_000 : undefined,
+      timeoutMs: timeoutMs ?? (args.includes("--wait") ? 910_000 : undefined),
     });
     if (result.code !== 0 && !result.stdout.trim()) {
       throw new Error(
@@ -4006,7 +3971,7 @@ function weakensInlineTestValidation(
   source: string | undefined,
 ): boolean {
   if (source === expectedSource) return false;
-  const protectedValidation = /(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|rstest|(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test)\s*\]|@(?:[A-Za-z_][\w]*\.)*(?:ParameterizedTest|Test|TestMethod|DataTestMethod)\b|\[(?:(?:[A-Za-z_][\w]*\.)*(?:Fact|Test|Theory|TestMethod|DataTestMethod)|(?:[A-Za-z_][\w]*\.)*TestCase(?:\([^\]\n]*\))?)\]|\b(?:describe|context|it|test)(?:\.[A-Za-z_$][\w$]*)*\s*\(|\btest\s+"(?:[^"\\]|\\.)*"\s*\{|(?:^|\n)\s*(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(|(?:^|\n)\s*assert\s+\S|\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\b(?:[A-Za-z_][\w]*\.)*Assert\.[A-Za-z_][\w]*\s*\(|\.should\.(?:deep\.)?(?:equal|eql|match|throw)\s*\(|\b(?:deepStrictEqual|strictEqual|notDeepStrictEqual|notStrictEqual|doesNotReject|doesNotThrow|ifError|rejects|throws)\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|\bassert[A-Z][A-Za-z0-9_$]*\s*\(|\bstd\.testing\.expect[A-Za-z0-9_]*\s*\(|\bexpect\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
+  const protectedValidation = /(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|rstest|(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test)\s*\]|@(?:[A-Za-z_][\w]*\.)*(?:ParameterizedTest|Test|TestMethod|DataTestMethod)\b|\[(?:(?:[A-Za-z_][\w]*\.)*(?:Fact|Test|Theory|TestMethod|DataTestMethod)|(?:[A-Za-z_][\w]*\.)*TestCase(?:\([^\]\n]*\))?)\]|\b(?:describe|context|it|test)(?:\.[A-Za-z_$][\w$]*)*\s*\(|\b(?:SCENARIO|TEMPLATE_TEST_CASE|TEST_CASE)\s*\(|\btest\s+"(?:[^"\\]|\\.)*"\s*\{|(?:^|\n)\s*(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(|(?:^|\n)\s*assert\s+\S|\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\b(?:CHECK|REQUIRE)(?:_[A-Z0-9_]+)?\s*\(|\b(?:[A-Za-z_][\w]*\.)*Assert\.[A-Za-z_][\w]*\s*\(|\.should\.(?:deep\.)?(?:equal|eql|match|throw)\s*\(|\b(?:deepStrictEqual|strictEqual|notDeepStrictEqual|notStrictEqual|doesNotReject|doesNotThrow|ifError|rejects|throws)\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|\bassert[A-Z][A-Za-z0-9_$]*\s*\(|\bstd\.testing\.expect[A-Za-z0-9_]*\s*\(|\bexpect\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
   const nodeAssertImport = /(?:from\s+["'](?:node:)?assert(?:\/strict)?["']|require\s*\(\s*["'](?:node:)?assert(?:\/strict)?["']\s*\))/u;
   if (
     protectedValidation.test(expectedSource) ||
@@ -4122,7 +4087,7 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
     (parts.at(-2) === ".mvn" && fileName === "maven.config") ||
     /^settings\.gradle(?:\.kts)?$/.test(fileName) ||
     (parts[0] !== "docs" && parts.slice(0, -1).includes("prompts")) ||
-    /^(?:(?:vitest|jest|playwright|cypress)\.config\..+|\.mocharc(?:\..+)?|karma\.conf\..+|phpunit\.xml(?:\.dist)?|eslint\.config\..+|\.eslintrc(?:\..+)?|\.eslintignore|prettier\.config\..+|\.prettierrc(?:\..+)?|\.prettierignore|biome\.jsonc?|deno\.jsonc?|\.editorconfig|\.flake8|\.?ruff\.toml|\.?mypy\.ini|\.?pylintrc|pyrightconfig\.json|\.rubocop\.ya?ml|stylelint\.config\..+|\.stylelintrc(?:\..+)?|\.stylelintignore|\.?markdownlint(?:-cli2)?(?:\..+)?|\.markdownlintignore|\.shellcheckrc|\.golangci\.(?:ya?ml|toml|json)|\.?rustfmt\.toml|\.?clippy\.toml|\.clang-format|\.clang-format-ignore|\.clang-tidy|analysis_options\.yaml|checkstyle\.xml|detekt\.ya?ml|phpcs\.xml(?:\.dist)?|phpstan(?:\.[^.]+)?\.neon(?:\.dist)?|sonar-project\.properties|tsconfig(?:\.[^.]+)*\.json|tslint(?:\.[^.]+)*\.json)$/.test(
+    /^(?:(?:vitest|jest|playwright|cypress)\.config\..+|vitest\.workspace\..+|\.mocharc(?:\..+)?|karma\.conf\..+|phpunit\.xml(?:\.dist)?|eslint\.config\..+|\.eslintrc(?:\..+)?|\.eslintignore|prettier\.config\..+|\.prettierrc(?:\..+)?|\.prettierignore|biome\.jsonc?|deno\.jsonc?|\.editorconfig|\.flake8|\.?ruff\.toml|\.?mypy\.ini|\.?pylintrc|pyrightconfig\.json|\.rubocop\.ya?ml|stylelint\.config\..+|\.stylelintrc(?:\..+)?|\.stylelintignore|\.?markdownlint(?:-cli2)?(?:\..+)?|\.markdownlintignore|\.shellcheckrc|\.golangci\.(?:ya?ml|toml|json)|\.?rustfmt\.toml|\.?clippy\.toml|\.clang-format|\.clang-format-ignore|\.clang-tidy|analysis_options\.yaml|checkstyle\.xml|detekt\.ya?ml|phpcs\.xml(?:\.dist)?|phpstan(?:\.[^.]+)?\.neon(?:\.dist)?|sonar-project\.properties|tsconfig(?:\.[^.]+)*\.json|tslint(?:\.[^.]+)*\.json)$/.test(
       fileName,
     )
   );
@@ -4371,6 +4336,30 @@ export class GitShell implements GitOperations {
           "rebase fixer had no bounded upstream commit and conflict-file set",
         );
       }
+      const protectedConflictFiles: string[] = [];
+      for (const filePath of conflictFiles) {
+        if (isProtectedValidationPolicyPath(filePath)) {
+          protectedConflictFiles.push(filePath);
+          continue;
+        }
+        if (!(await this.pathExists(expectedHead, filePath))) continue;
+        if (isTestPath(filePath)) {
+          protectedConflictFiles.push(filePath);
+          continue;
+        }
+        const expectedSource = await this.showFile(expectedHead, filePath);
+        if (
+          expectedSource === undefined ||
+          weakensInlineTestValidation(expectedSource, undefined)
+        ) {
+          protectedConflictFiles.push(filePath);
+        }
+      }
+      if (protectedConflictFiles.length > 0) {
+        throw new FixerPolicyViolationError(
+          `rebase conflicts require human review for protected validation files: ${protectedConflictFiles.sort().join(", ")}`,
+        );
+      }
       const containsUpstream = await this.#git(
         [
           "-C",
@@ -4580,9 +4569,12 @@ export class GitShell implements GitOperations {
         `fixer modified pre-existing test files: ${protectedTests.sort().join(", ")}`,
       );
     }
-    if (protectedInlineTests.length > 0) {
+    const inlineOnly = protectedInlineTests.filter(
+      (filePath) => !protectedPolicy.includes(filePath),
+    );
+    if (inlineOnly.length > 0) {
       throw new FixerPolicyViolationError(
-        `fixer modified co-located test assertions or skip markers: ${protectedInlineTests.sort().join(", ")}`,
+        `fixer modified co-located test assertions or skip markers: ${inlineOnly.sort().join(", ")}`,
       );
     }
     if (protectedPolicy.length > 0) {

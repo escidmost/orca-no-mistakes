@@ -344,10 +344,6 @@ class FakeOrca implements OrcaOperations {
     this.calls.push(`${disposition}:${worker.dispatchId}`);
   }
 
-  async cancelTaskWorkers(taskId: string): Promise<void> {
-    this.calls.push(`cancel:${taskId}`);
-  }
-
   async removeWorktree(worktreeId: string): Promise<void> {
     this.removedWorktrees.push(worktreeId);
   }
@@ -2031,7 +2027,6 @@ test("CliOrca reuses a fixer through supervised worker-start", async () => {
   const countPath = path.join(temp, "count");
   const blockWaitPath = path.join(temp, "block-wait");
   const failClosePath = path.join(temp, "fail-close");
-  const failAbandonPath = path.join(temp, "fail-abandon");
   const invalidStartPath = path.join(temp, "invalid-start");
   const startCountPath = path.join(temp, "start-count");
   const evidence = path.join(
@@ -2076,16 +2071,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
   out(fs.existsSync(${JSON.stringify(invalidStartPath)})
     ? { dispatchId: 'dispatch-invalid', state: 'failed' }
     : { dispatchId: 'dispatch-' + (count + 1), state: 'ready' })
-} else if (args[0] === 'orchestration' && args[1] === 'worker-list') {
-  out({ workers: [
-    { taskId: 'task-cancel', dispatchId: 'dispatch-cancel', agentTerminalHandle: 'created-fixer', terminalState: 'active', resource: null },
-    { taskId: fs.existsSync(${JSON.stringify(failAbandonPath)}) ? 'task-cancel-fail' : 'task-cancel', dispatchId: 'dispatch-no-terminal', terminalState: 'active', resource: { worktreeId: 'orphan-worktree' } },
-  ] })
 } else if (args[0] === 'orchestration' && args[1] === 'worker-abandon') {
-  if (args.includes('dispatch-no-terminal') && fs.existsSync(${JSON.stringify(failAbandonPath)})) {
-    console.log(JSON.stringify({ ok: false, error: { code: 'abandon_failed', message: 'abandon_failed' } }))
-    process.exit(1)
-  }
   out({ abandoned: true })
 } else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
   if (fs.existsSync(${JSON.stringify(blockWaitPath)})) {
@@ -2210,13 +2196,6 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       Date.now() - blockedAt < 2_000,
       "an aborted attempt must kill its run-mailbox wait promptly",
     );
-    await orca.cancelTaskWorkers("task-cancel");
-    await writeFile(failAbandonPath, "fail\n");
-    await assert.rejects(
-      orca.cancelTaskWorkers("task-cancel-fail"),
-      /worker cleanup failed.*worker abandon.*abandon_failed/i,
-    );
-
     const calls = (await readFile(callsPath, "utf8"))
       .trim()
       .split("\n")
@@ -2238,33 +2217,8 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     const closes = calls.filter(
       (args) => args[0] === "terminal" && args[1] === "close",
     );
-    assert.equal(closes.length, 4);
+    assert.equal(closes.length, 3);
     assert.ok(closes[0].includes("created-fixer"));
-    assert.ok(
-      calls.some(
-        (args) =>
-          args[0] === "orchestration" &&
-          args[1] === "worker-abandon" &&
-          args.includes("dispatch-cancel"),
-      ),
-    );
-    assert.ok(
-      calls.some(
-        (args) =>
-          args[0] === "worktree" &&
-          args[1] === "rm" &&
-          args.includes("id:orphan-worktree"),
-      ),
-      "terminal-less timed-out workers still remove their known worktrees",
-    );
-    assert.ok(
-      calls.some(
-        (args) =>
-          args[0] === "worktree" &&
-          args[1] === "rm" &&
-          args.includes("id:worker-worktree"),
-      ),
-    );
   } finally {
     await rm(temp, { recursive: true, force: true });
     await rm(evidence, { recursive: true, force: true });
@@ -3086,6 +3040,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "[NUnit.Framework.Test]\nvoid Calculates() { NUnit.Framework.Assert.AreEqual(1, Calculate()); }\n",
     );
     await writeFile(
+      path.join(repo, "src/catch2.cpp"),
+      '#include <catch2/catch_test_macros.hpp>\nTEST_CASE("adds") { REQUIRE(1 + 1 == 2); }\n',
+    );
+    await writeFile(
       path.join(repo, "src/inline.js"),
       "test.each(buildCases(seed()))('response', () => {\n  assert.deepEqual(actual, {\n    ok: true,\n  });\n});\n",
     );
@@ -3264,6 +3222,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "src/ParameterizedExample.java",
       "src/NUnitExample.cs",
       "src/Calculator.cs",
+      "src/catch2.cpp",
       "src/math.zig",
       "src/inline.js",
       "src/concurrent.js",
@@ -3422,6 +3381,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(worker, "tslint.build.json"), '{"rules":{}}\n');
     await writeFile(path.join(worker, "tslint.json"), '{"rules":{}}\n');
     await writeFile(path.join(worker, "vitest.config.ts"), "export default { test: { exclude: ['Tests/**'] } };\n");
+    await writeFile(path.join(worker, "vitest.workspace.ts"), "export default [];\n");
     await writeFile(path.join(worker, "yarn.lock"), "# changed lockfile\n");
     await mkdir(path.join(worker, "prompts"));
     await writeFile(path.join(worker, "prompts/fixer.md"), "weaken checks\n");
@@ -3474,6 +3434,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "tslint.build.json",
       "tslint.json",
       "vitest.config.ts",
+      "vitest.workspace.ts",
       "yarn.lock",
     );
     git(
@@ -3487,7 +3448,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "commit", "-m", "weaken validation policy");
     await assert.rejects(
       assertWorkerChangesAllowed(),
-      /unexplained-policy-relaxation:.*\.bazelrc, \.clang-format, \.clang-format-ignore, \.eslintignore, \.markdownlintignore, \.mocharc\.json, \.mvn\/maven\.config, \.mvn\/wrapper\/maven-wrapper\.jar, \.mvn\/wrapper\/maven-wrapper\.properties, \.prettierignore, \.shellcheckrc, \.stylelintignore, BUILD, BUILD\.bazel, CMakeLists\.txt, Cargo\.lock, Directory\.Build\.targets, Directory\.Packages\.props, MODULE\.bazel, Pipfile, WORKSPACE, WORKSPACE\.bazel, build\.gradle, build\.gradle\.kts, cypress\.config\.ts, directory\.build\.props, eslint\.config\.js, go\.work, gradle\.properties, gradle\/wrapper\/gradle-wrapper\.jar, gradle\/wrapper\/gradle-wrapper\.properties, gradlew, mvnw, noxfile\.py, package-lock\.json, package\.json, phpunit\.xml, phpunit\.xml\.dist, pkg\/go\.mod, pnpm-lock\.yaml, pom\.xml, prompts\/fixer\.md, pylintrc, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, yarn\.lock/,
+      /unexplained-policy-relaxation:.*\.bazelrc, \.clang-format, \.clang-format-ignore, \.eslintignore, \.markdownlintignore, \.mocharc\.json, \.mvn\/maven\.config, \.mvn\/wrapper\/maven-wrapper\.jar, \.mvn\/wrapper\/maven-wrapper\.properties, \.prettierignore, \.shellcheckrc, \.stylelintignore, BUILD, BUILD\.bazel, CMakeLists\.txt, Cargo\.lock, Directory\.Build\.targets, Directory\.Packages\.props, MODULE\.bazel, Pipfile, WORKSPACE, WORKSPACE\.bazel, build\.gradle, build\.gradle\.kts, cypress\.config\.ts, directory\.build\.props, eslint\.config\.js, go\.work, gradle\.properties, gradle\/wrapper\/gradle-wrapper\.jar, gradle\/wrapper\/gradle-wrapper\.properties, gradlew, mvnw, noxfile\.py, package-lock\.json, package\.json, phpunit\.xml, phpunit\.xml\.dist, pkg\/go\.mod, pnpm-lock\.yaml, pom\.xml, prompts\/fixer\.md, pylintrc, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, vitest\.workspace\.ts, yarn\.lock/,
     );
 
     git(worker, "reset", "--hard", featureHead);
@@ -3528,6 +3489,18 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await assert.rejects(
       assertWorkerChangesAllowed(),
       /fixer modified co-located test assertions or skip markers: src\/Calculator\.cs/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/catch2.cpp"),
+      '#include <catch2/catch_test_macros.hpp>\nTEST_CASE("adds") { REQUIRE(1 + 1 == 3); }\n',
+    );
+    git(worker, "add", "src/catch2.cpp");
+    git(worker, "commit", "-m", "weaken Catch2 assertion");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified co-located test assertions or skip markers: src\/catch2\.cpp/,
     );
 
     git(worker, "reset", "--hard", featureHead);
@@ -4323,6 +4296,13 @@ test("GitShell bounds rebase fixer changes to upstream and reported conflicts", 
       featureHead,
       rebasedHead,
       policy,
+    );
+    await assert.rejects(
+      shell.assertFixerChangesAllowed(worker, featureHead, rebasedHead, {
+        conflictFiles: ["tests/existing.test.ts"],
+        upstreamHead,
+      }),
+      /rebase conflicts require human review for protected validation files: tests\/existing\.test\.ts/,
     );
 
     const mergeWorker = path.join(temp, "merge-worker-wt");
