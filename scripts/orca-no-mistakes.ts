@@ -3238,6 +3238,15 @@ export class CliOrca implements OrcaOperations {
         }
         worktreeId = created.worktree.id;
         cwd = created.worktree.path;
+        await this.#json([
+          "worktree",
+          "set",
+          "--worktree",
+          `id:${worktreeId}`,
+          "--parent-worktree",
+          `path:${this.#cwd}`,
+          "--json",
+        ]);
         await this.#detachWorkerWorktree(launch, cwd);
       }
       if (fence?.aborted) {
@@ -3928,6 +3937,7 @@ function isTestPath(filePath: string): boolean {
           "__specs__",
           "__snapshots__",
           "__image_snapshots__",
+          "snapshots",
           "__fixtures__",
           "fixtures",
           "golden",
@@ -4052,6 +4062,7 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "makefile",
       "noxfile.py",
       "npm-shrinkwrap.json",
+      ".npmrc",
       "mvnw",
       "mvnw.cmd",
       "package-lock.json",
@@ -4098,9 +4109,11 @@ function containsPathReference(source: string, reference: string): boolean {
   ).test(source);
 }
 
+const ROOT_PATH_PREFIX_PATTERN = String.raw`(?:\$\{\{[^}\n]+\}\}|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\$\(\s*pwd\s*\)|\$\(\s*git\s+rev-parse\s+--show-toplevel\s*\))`;
+
 function normalizeQuotedPathPrefixes(source: string): string {
   return source.replace(
-    /(["'])((?:\$\{\{[^}\n]+\}\}|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?))\1(?=[/\\])/g,
+    new RegExp(`(["'])(${ROOT_PATH_PREFIX_PATTERN})\\1(?=[/\\\\])`, "g"),
     "$2",
   );
 }
@@ -4112,7 +4125,7 @@ function containsPrefixedPathReference(source: string, reference: string): boole
     .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
     .join("[/\\\\]");
   return new RegExp(
-    `(?:\\$\\{\\{[^}\\n]+\\}\\}|\\$\\{?[A-Za-z_][A-Za-z0-9_]*\\}?)[/\\\\]${escaped}(?=$|[^A-Za-z0-9_./\\\\-])`,
+    `${ROOT_PATH_PREFIX_PATTERN}[/\\\\]${escaped}(?=$|[^A-Za-z0-9_./\\\\-])`,
     "m",
   ).test(normalizeQuotedPathPrefixes(source));
 }
@@ -4123,10 +4136,7 @@ function normalizeReferencedDirectory(directory: string): string {
       directory
         .trim()
         .replace(/\\/g, "/")
-        .replace(
-          /^(?:\$\{\{[^}\n]+\}\}|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?)(?:\/|$)/,
-          "",
-        )
+        .replace(new RegExp(`^${ROOT_PATH_PREFIX_PATTERN}(?:/|$)`), "")
         .replace(/^\.\//, ""),
     )
     .replace(/\/+$/, "");
@@ -4155,9 +4165,7 @@ function shellCommandReferencesTarget(
       const rawDirectory =
         changedDirectory[2] ?? changedDirectory[3] ?? changedDirectory[4] ?? "";
       const rootPrefixed =
-        /^(?:\$\{\{[^}\n]+\}\}|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?)(?:\/|$)/.test(
-          rawDirectory,
-        );
+        new RegExp(`^${ROOT_PATH_PREFIX_PATTERN}(?:/|$)`).test(rawDirectory);
       const nextDirectory = normalizeReferencedDirectory(
         rootPrefixed
           ? rawDirectory
@@ -4761,11 +4769,14 @@ export class GitShell implements GitOperations {
       ? []
       : unmerged.stdout.split("\0").filter(Boolean);
     if (conflictFiles.length === 0) {
-      return failureReport(
-        "rebase-conflict",
-        "ask-user",
-        `${rebase.output}\nThe coordinator could not identify a bounded conflict-file set.`,
-      );
+      return {
+        ...failureReport(
+          "rebase-conflict",
+          "ask-user",
+          `${rebase.output}\nThe coordinator could not identify a bounded conflict-file set.`,
+        ),
+        rebaseUpstreamHead: upstreamHead,
+      };
     }
     return {
       findings: conflictFiles.map((file, index) => ({
