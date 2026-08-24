@@ -3693,10 +3693,18 @@ export class CliOrca implements OrcaOperations {
       for (const message of result.messages) {
         let payload: Record<string, unknown>;
         try {
-          payload =
+          const parsed =
             typeof message.payload === "string"
-              ? (JSON.parse(message.payload) as Record<string, unknown>)
+              ? (JSON.parse(message.payload) as unknown)
               : (message.payload ?? {});
+          if (
+            parsed === null ||
+            typeof parsed !== "object" ||
+            Array.isArray(parsed)
+          ) {
+            continue;
+          }
+          payload = parsed as Record<string, unknown>;
         } catch {
           // Unparseable messages cannot be attributed to the active dispatch.
           // Ignore stale delivery noise and keep waiting for a valid message.
@@ -3997,7 +4005,15 @@ function weakensInlineTestValidation(
 ): boolean {
   if (source === expectedSource) return false;
   const protectedValidation = /(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|rstest|(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test)\s*\]|@(?:[A-Za-z_][\w]*\.)*(?:ParameterizedTest|Test|TestMethod|DataTestMethod)\b|\[(?:(?:[A-Za-z_][\w]*\.)*(?:Fact|Test|Theory|TestMethod|DataTestMethod)|(?:[A-Za-z_][\w]*\.)*TestCase(?:\([^\]\n]*\))?)\]|\b(?:describe|context|it|test)(?:\.[A-Za-z_$][\w$]*)*\s*\(|\btest\s+"(?:[^"\\]|\\.)*"\s*\{|(?:^|\n)\s*(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(|(?:^|\n)\s*assert\s+\S|\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\b(?:[A-Za-z_][\w]*\.)*Assert\.[A-Za-z_][\w]*\s*\(|\.should\.(?:deep\.)?(?:equal|eql|match|throw)\s*\(|\b(?:deepStrictEqual|strictEqual|notDeepStrictEqual|notStrictEqual|doesNotReject|doesNotThrow|ifError|rejects|throws)\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|\bassert[A-Z][A-Za-z0-9_$]*\s*\(|\bstd\.testing\.expect[A-Za-z0-9_]*\s*\(|\bexpect\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
-  if (protectedValidation.test(expectedSource)) return true;
+  const nodeAssertImport = /(?:from\s+["'](?:node:)?assert(?:\/strict)?["']|require\s*\(\s*["'](?:node:)?assert(?:\/strict)?["']\s*\))/u;
+  const nodeAssertCall = /\b(?:deepEqual|deepStrictEqual|doesNotMatch|doesNotReject|doesNotThrow|equal|fail|ifError|match|notDeepEqual|notDeepStrictEqual|notEqual|notStrictEqual|ok|rejects|strictEqual|throws)\s*\(/u;
+  if (
+    protectedValidation.test(expectedSource) ||
+    /\.should(?:\.[A-Za-z_$][\w$]*)+/u.test(expectedSource) ||
+    (nodeAssertImport.test(expectedSource) && nodeAssertCall.test(expectedSource))
+  ) {
+    return true;
+  }
   const skipMarker = /(?:#\[(?:ignore|should_panic)\]|\b(?:describe|it|test)(?:\.[A-Za-z_$][\w$]*)*\.(?:only|skip)\s*\(|\bpytest\.mark\.(?:skip|skipif|xfail)\b|@\w*Ignore\b)/giu;
   return (
     (source?.match(skipMarker)?.length ?? 0) >
@@ -4024,8 +4040,6 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "BUILD",
       "BUILD.bazel",
       "CMakeLists.txt",
-      "Directory.Build.props",
-      "Directory.Build.targets",
       "MODULE.bazel",
       "WORKSPACE",
       "WORKSPACE.bazel",
@@ -4062,6 +4076,9 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "composer.lock",
       "composer.json",
       "conftest.py",
+      "directory.build.props",
+      "directory.build.targets",
+      "directory.packages.props",
       ".bazelrc",
       "gemfile",
       "gemfile.lock",
