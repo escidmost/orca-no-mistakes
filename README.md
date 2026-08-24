@@ -19,7 +19,6 @@ npm link
 
 During installation, a default configuration template is automatically copied to `~/.config/orca-no-mistakes/config.yaml` (from [`templates/config.yaml`](templates/config.yaml)) if no configuration exists.
 
-
 ## Run
 
 Direct invocation returns a meaningful process exit status:
@@ -70,4 +69,4 @@ npm test
 npm run typecheck
 ```
 
-GitHub Actions runs both on every pull request and on pushes to `main`.
+GitHub Actions runs on same-repository pull requests and on pushes to `main`; fork pull requests are skipped.
