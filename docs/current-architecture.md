@@ -83,6 +83,7 @@ Each stage and role resolves its own agent from the configuration tiers, and the
 - TypeScript alias resolution accepts BOM-prefixed JSONC and supports `baseUrl` without a `paths` table. POSIX `cd --`, `cd -L`, and `cd -P` transitions participate in composed-command resolution. `*.golden` files are protected assertion data, and `lerna.json` is protected implicit workspace policy.
 - Conventional `integration/`, `integration-test(s)`, and `integration_test(s)` trees are protected test paths. .NET solution manifests (`*.sln` and `*.slnx`) are protected validation policy.
 - Maven Invoker `src/it/` trees are protected test paths, and Ant's implicit `build.xml` is protected validation policy. Every tracked descendant of a referenced non-root local action directory is protected, even when the action manifest does not name that descendant directly.
+- Android/Gradle variant source sets such as `src/testDebug/` and `src/androidTestDebug/` are protected test trees alongside `src/androidTest/`, `src/commonTest/`, and other `*Test` source sets.
 - Jest `<rootDir>` references, local Python imports from protected runners, and shell subshell directory scopes participate in transitive validation-entrypoint resolution. Directory changes made inside `( ... )` are restored before later outer commands are resolved.
 
 - Co-located Vitest/Playwright `expect.soft(...)` and `expect.poll(...)` assertions are protected.

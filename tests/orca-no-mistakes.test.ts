@@ -3010,7 +3010,9 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await mkdir(path.join(repo, "src/button.spec.ts-snapshots"));
     await mkdir(path.join(repo, "src/testFixtures/java"), { recursive: true });
     await mkdir(path.join(repo, "src/androidTest/resources"), { recursive: true });
+    await mkdir(path.join(repo, "src/androidTestDebug/resources"), { recursive: true });
     await mkdir(path.join(repo, "src/commonTest/resources"), { recursive: true });
+    await mkdir(path.join(repo, "src/testDebug/resources"), { recursive: true });
     await mkdir(path.join(repo, "src/it/sample"), { recursive: true });
     await mkdir(path.join(repo, "testdata"));
     await mkdir(path.join(repo, "t"));
@@ -3093,7 +3095,9 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "class Fixture { static int expected() { return 1; } }\n",
     );
     await writeFile(path.join(repo, "src/androidTest/resources/expected.json"), '{"ok":true}\n');
+    await writeFile(path.join(repo, "src/androidTestDebug/resources/expected.json"), '{"ok":true}\n');
     await writeFile(path.join(repo, "src/commonTest/resources/expected.json"), '{"ok":true}\n');
+    await writeFile(path.join(repo, "src/testDebug/resources/expected.json"), '{"ok":true}\n');
     await writeFile(path.join(repo, "src/it/sample/verify.groovy"), "verify_behavior()\n");
     await writeFile(
       path.join(repo, "MyProject.Tests/OrderServiceTests.cs"),
@@ -3433,7 +3437,9 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "src/widget.spec.ts",
       "src/testFixtures/java/Fixture.java",
       "src/androidTest/resources/expected.json",
+      "src/androidTestDebug/resources/expected.json",
       "src/commonTest/resources/expected.json",
+      "src/testDebug/resources/expected.json",
       "src/it/sample/verify.groovy",
       "Tests/branch-regression.ts",
       ".github/actions/check/action.yml",
@@ -3728,12 +3734,21 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
 
     git(worker, "reset", "--hard", featureHead);
     await writeFile(path.join(worker, "src/androidTest/resources/expected.json"), '{"ok":false}\n');
+    await writeFile(path.join(worker, "src/androidTestDebug/resources/expected.json"), '{"ok":false}\n');
     await writeFile(path.join(worker, "src/commonTest/resources/expected.json"), '{"ok":false}\n');
-    git(worker, "add", "src/androidTest/resources/expected.json", "src/commonTest/resources/expected.json");
+    await writeFile(path.join(worker, "src/testDebug/resources/expected.json"), '{"ok":false}\n');
+    git(
+      worker,
+      "add",
+      "src/androidTest/resources/expected.json",
+      "src/androidTestDebug/resources/expected.json",
+      "src/commonTest/resources/expected.json",
+      "src/testDebug/resources/expected.json",
+    );
     git(worker, "commit", "-m", "weaken variant test fixtures");
     await assert.rejects(
       assertWorkerChangesAllowed(),
-      /fixer modified pre-existing test files: src\/androidTest\/resources\/expected\.json, src\/commonTest\/resources\/expected\.json/,
+      /fixer modified pre-existing test files: src\/androidTest\/resources\/expected\.json, src\/androidTestDebug\/resources\/expected\.json, src\/commonTest\/resources\/expected\.json, src\/testDebug\/resources\/expected\.json/,
     );
 
     git(worker, "reset", "--hard", featureHead);

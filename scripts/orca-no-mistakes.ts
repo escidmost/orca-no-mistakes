@@ -3936,7 +3936,7 @@ function isTestPath(filePath: string): boolean {
     (part, index) =>
       index > 0 &&
       parts[index - 1]?.toLowerCase() === "src" &&
-      /^[a-z][A-Za-z0-9]*Test$/.test(part),
+      /^(?:test|[a-z][A-Za-z0-9]*Test)(?:[A-Z0-9][A-Za-z0-9]*)?$/.test(part),
   );
   const mavenInvokerTestSource = parts.some(
     (part, index) =>
