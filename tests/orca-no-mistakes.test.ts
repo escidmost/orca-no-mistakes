@@ -2875,6 +2875,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await mkdir(path.join(repo, "specs"));
     await mkdir(path.join(repo, "src"));
     await mkdir(path.join(repo, "src/__snapshots__"));
+    await mkdir(path.join(repo, "src/button.spec.ts-snapshots"));
     await mkdir(path.join(repo, "testdata"));
     await mkdir(path.join(repo, "t"));
     await mkdir(path.join(repo, "__fixtures__"));
@@ -2973,6 +2974,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       path.join(repo, "src/__snapshots__/Widget.snap"),
       "exports[`Widget 1`] = `expected`;\n",
     );
+    await writeFile(
+      path.join(repo, "src/button.spec.ts-snapshots/button-chromium.png"),
+      "expected pixels\n",
+    );
     await writeFile(path.join(repo, "testdata/expected.json"), '{"ok":true}\n');
     await writeFile(path.join(repo, "t/widget.t"), "ok(1, 'works');\n");
     await writeFile(
@@ -2998,7 +3003,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     await writeFile(
       path.join(repo, ".github/workflows/ci.yml"),
-      "- uses: ./\n- uses: ./.github/actions/check\n- uses: ./ci/check\n- run: ${{ github.workspace }}/scripts/workspace-verify.sh\n- run: ./check.sh\n  working-directory: commands/\n- run: ./lint.sh\n  working-directory: other\n- run: |\n    cd shell-commands\n    ./check.sh\n",
+      "- uses: ./\n- uses: ./.github/actions/check\n- uses: ./ci/check\n- run: ${{ github.workspace }}/scripts/workspace-verify.sh\n- run: .\\scripts\\check.ps1\n- run: ./check.sh\n  working-directory: ${{ github.workspace }}/commands/\n- run: ./lint.sh\n  working-directory: other\n- run: |\n    cd shell-commands\n    ./check.sh\n",
     );
     await writeFile(
       path.join(repo, "action.yml"),
@@ -3044,6 +3049,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(repo, "tools/verify.sh"), "npm test\n");
     await writeFile(path.join(repo, "tools/check.sh"), "export TOOL_CHECK=1\n");
     await writeFile(path.join(repo, "scripts/workspace-verify.sh"), "npm test\n");
+    await writeFile(path.join(repo, "scripts/check.ps1"), "npm test\n");
     for (const moduleName of ["adapters", "config", "ledger", "policy"]) {
       await writeFile(
         path.join(repo, `scripts/${moduleName}.ts`),
@@ -3071,6 +3077,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "scripts/test-runner.ts",
       "scripts/verify-ci.sh",
       "scripts/workspace-verify.sh",
+      "scripts/check.ps1",
       "MyProject.Tests/OrderServiceTests.cs",
       "__specs__/widget.ts",
       "java/TestFoo.java",
@@ -3089,6 +3096,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "src/prefixed.js",
       "src/check.py",
       "src/__snapshots__/Widget.snap",
+      "src/button.spec.ts-snapshots/button-chromium.png",
       "testdata/expected.json",
       "t/widget.t",
       "__fixtures__/response.json",
@@ -3194,6 +3202,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(worker, ".mvn/wrapper/maven-wrapper.properties"), "distributionUrl=https://example.invalid/maven.zip\n");
     await writeFile(path.join(worker, ".mvn/wrapper/maven-wrapper.jar"), "replacement\n");
     await writeFile(path.join(worker, "package.json"), '{"scripts":{"test":"true"}}\n');
+    await writeFile(path.join(worker, "Pipfile"), '[scripts]\ntest = "true"\n');
     await writeFile(path.join(worker, "package-lock.json"), '{"lockfileVersion":3}\n');
     await writeFile(path.join(worker, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
     await writeFile(path.join(worker, "pom.xml"), "<skipTests>true</skipTests>\n");
@@ -3253,6 +3262,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "gradlew",
       "package-lock.json",
       "package.json",
+      "Pipfile",
       "pkg/go.mod",
       "pnpm-lock.yaml",
       "pom.xml",
@@ -3281,7 +3291,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "commit", "-m", "weaken validation policy");
     await assert.rejects(
       assertWorkerChangesAllowed(),
-      /unexplained-policy-relaxation:.*\.bazelrc, \.clang-format, \.clang-format-ignore, \.eslintignore, \.markdownlintignore, \.mocharc\.json, \.mvn\/maven\.config, \.mvn\/wrapper\/maven-wrapper\.jar, \.mvn\/wrapper\/maven-wrapper\.properties, \.prettierignore, \.shellcheckrc, \.stylelintignore, BUILD, BUILD\.bazel, CMakeLists\.txt, Cargo\.lock, MODULE\.bazel, WORKSPACE, WORKSPACE\.bazel, build\.gradle, build\.gradle\.kts, cypress\.config\.ts, eslint\.config\.js, go\.work, gradle\.properties, gradle\/wrapper\/gradle-wrapper\.jar, gradle\/wrapper\/gradle-wrapper\.properties, gradlew, mvnw, package-lock\.json, package\.json, phpunit\.xml, phpunit\.xml\.dist, pkg\/go\.mod, pnpm-lock\.yaml, pom\.xml, prompts\/fixer\.md, pylintrc, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, yarn\.lock/,
+      /unexplained-policy-relaxation:.*\.bazelrc, \.clang-format, \.clang-format-ignore, \.eslintignore, \.markdownlintignore, \.mocharc\.json, \.mvn\/maven\.config, \.mvn\/wrapper\/maven-wrapper\.jar, \.mvn\/wrapper\/maven-wrapper\.properties, \.prettierignore, \.shellcheckrc, \.stylelintignore, BUILD, BUILD\.bazel, CMakeLists\.txt, Cargo\.lock, MODULE\.bazel, Pipfile, WORKSPACE, WORKSPACE\.bazel, build\.gradle, build\.gradle\.kts, cypress\.config\.ts, eslint\.config\.js, go\.work, gradle\.properties, gradle\/wrapper\/gradle-wrapper\.jar, gradle\/wrapper\/gradle-wrapper\.properties, gradlew, mvnw, package-lock\.json, package\.json, phpunit\.xml, phpunit\.xml\.dist, pkg\/go\.mod, pnpm-lock\.yaml, pom\.xml, prompts\/fixer\.md, pylintrc, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, yarn\.lock/,
     );
 
     git(worker, "reset", "--hard", featureHead);
@@ -3401,6 +3411,15 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await assert.rejects(
       assertWorkerChangesAllowed(),
       /protected validation policy files: scripts\/workspace-verify\.sh/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "scripts/check.ps1"), "exit 0\n");
+    git(worker, "add", "scripts/check.ps1");
+    git(worker, "commit", "-m", "disable Windows validation entrypoint");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /protected validation policy files: scripts\/check\.ps1/,
     );
 
     git(worker, "reset", "--hard", featureHead);
@@ -3680,6 +3699,18 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await assert.rejects(
       assertWorkerChangesAllowed(),
       /fixer modified pre-existing test files: src\/__snapshots__\/Widget\.snap/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/button.spec.ts-snapshots/button-chromium.png"),
+      "updated pixels\n",
+    );
+    git(worker, "add", "src/button.spec.ts-snapshots/button-chromium.png");
+    git(worker, "commit", "-m", "weaken Playwright snapshot assertion");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified pre-existing test files: src\/button\.spec\.ts-snapshots\/button-chromium\.png/,
     );
 
     git(worker, "reset", "--hard", featureHead);

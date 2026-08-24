@@ -3871,6 +3871,7 @@ function isTestPath(filePath: string): boolean {
         ].includes(
           part.toLowerCase(),
         ) ||
+        /-snapshots$/i.test(part) ||
         /\.tests?$/i.test(part),
       ) ||
     fileName.toLowerCase().endsWith(".snap") ||
@@ -3969,6 +3970,7 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "package-lock.json",
       "package.json",
       "packages.lock.json",
+      "pipfile",
       "pipfile.lock",
       "pnpm-lock.yaml",
       "pom.xml",
@@ -3991,20 +3993,41 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
 
 function containsPathReference(source: string, reference: string): boolean {
   if (!reference || reference === ".") return false;
-  const escaped = reference.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const escaped = reference
+    .split("/")
+    .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("[/\\\\]");
   return new RegExp(
-    `(?:^|[^A-Za-z0-9_./-])(?:\\./)?${escaped}(?=$|[^A-Za-z0-9_./-])`,
+    `(?:^|[^A-Za-z0-9_./\\\\-])(?:\\.[/\\\\])?${escaped}(?=$|[^A-Za-z0-9_./\\\\-])`,
     "m",
   ).test(source);
 }
 
 function containsPrefixedPathReference(source: string, reference: string): boolean {
   if (!reference || reference === ".") return false;
-  const escaped = reference.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const escaped = reference
+    .split("/")
+    .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("[/\\\\]");
   return new RegExp(
-    `(?:\\$\\{\\{[^}\\n]+\\}\\}|\\$\\{?[A-Za-z_][A-Za-z0-9_]*\\}?)/${escaped}(?=$|[^A-Za-z0-9_./-])`,
+    `(?:\\$\\{\\{[^}\\n]+\\}\\}|\\$\\{?[A-Za-z_][A-Za-z0-9_]*\\}?)[/\\\\]${escaped}(?=$|[^A-Za-z0-9_./\\\\-])`,
     "m",
   ).test(source);
+}
+
+function normalizeReferencedDirectory(directory: string): string {
+  return path.posix
+    .normalize(
+      directory
+        .trim()
+        .replace(/\\\\/g, "/")
+        .replace(
+          /^(?:\$\{\{[^}\n]+\}\}|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?)(?:\/|$)/,
+          "",
+        )
+        .replace(/^\.\//, ""),
+    )
+    .replace(/\/+$/, "");
 }
 
 function shellCommandReferencesTarget(
@@ -4047,9 +4070,7 @@ function containsValidationPathReference(
   ]);
   const basename = path.posix.basename(targetPath);
   const directoryMatches = (directory: string): boolean => {
-    const normalizedDirectory = path.posix
-      .normalize(directory.replace(/^\.\//, ""))
-      .replace(/\/+$/, "");
+    const normalizedDirectory = normalizeReferencedDirectory(directory);
     return normalizedDirectory !== "." && workingDirectories.has(normalizedDirectory);
   };
   const commandMatches = (command: string): boolean =>
