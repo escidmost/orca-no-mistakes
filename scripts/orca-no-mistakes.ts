@@ -3959,6 +3959,11 @@ function isTestPath(filePath: string): boolean {
           "golden",
           "goldens",
           "e2e",
+          "integration",
+          "integration-test",
+          "integration-tests",
+          "integration_test",
+          "integration_tests",
           "t",
           "testdata",
           "test-data",
@@ -4116,6 +4121,8 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "yarn.lock",
     ].includes(fileName) ||
     fileName.endsWith(".csproj") ||
+    fileName.endsWith(".sln") ||
+    fileName.endsWith(".slnx") ||
     (parts.at(-2) === ".mvn" && ["jvm.config", "maven.config"].includes(fileName)) ||
     /^settings\.gradle(?:\.kts)?$/.test(fileName) ||
     (parts[0] !== "docs" && parts.slice(0, -1).includes("prompts")) ||
@@ -4142,7 +4149,7 @@ function containsTypeScriptModuleReference(source: string, reference: string): b
   return new RegExp(`["']${escaped}["']`).test(source);
 }
 
-const ROOT_PATH_PREFIX_PATTERN = String.raw`(?:\$\{\{[^}\n]+\}\}|\$[Ee][Nn][Vv]:[A-Za-z_][A-Za-z0-9_]*|%[A-Za-z_][A-Za-z0-9_]*%|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\$\(\s*pwd\s*\)|\$\(\s*git\s+rev-parse\s+--show-toplevel\s*\))`;
+const ROOT_PATH_PREFIX_PATTERN = String.raw`(?:<rootDir>|\$\{\{[^}\n]+\}\}|\$[Ee][Nn][Vv]:[A-Za-z_][A-Za-z0-9_]*|%[A-Za-z_][A-Za-z0-9_]*%|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\$\(\s*pwd\s*\)|\$\(\s*git\s+rev-parse\s+--show-toplevel\s*\))`;
 
 function normalizeQuotedPathPrefixes(source: string): string {
   return source.replace(
@@ -4295,7 +4302,18 @@ function shellCommandReferencesTarget(
   if (normalizedDirectories.size === 0) return false;
   let currentDirectory = "";
   const directoryStack: string[] = [];
-  for (const statement of normalizedCommand.split(/\r?\n|&&|;/)) {
+  for (const rawStatement of normalizedCommand.split(/\r?\n|&&|;/)) {
+    const leadingGroups = rawStatement.match(/^\s*(\(+)/)?.[1]?.length ?? 0;
+    for (let index = 0; index < leadingGroups; index += 1) {
+      directoryStack.push(currentDirectory);
+    }
+    const trailingGroups = Math.min(
+      rawStatement.match(/(\)+)\s*$/)?.[1]?.length ?? 0,
+      directoryStack.length,
+    );
+    const statement = rawStatement
+      .replace(/^\s*\(+/, "")
+      .replace(/\)+\s*$/, "");
     const changedDirectory = statement.match(
       /\b(cd|pushd|set-location|push-location)\s+(?:-(?:literal)?path\s+)?(?:\/d\s+)?(?:(?:--|-[LPe]+)\s+)*(?:"([^"]+)"|'([^']+)'|([^&|\s]+))/i,
     );
@@ -4312,17 +4330,17 @@ function shellCommandReferencesTarget(
       if (/^(?:pushd|push-location)$/i.test(changedDirectory[1]))
         directoryStack.push(currentDirectory);
       currentDirectory = nextDirectory;
-      continue;
-    }
-    if (/\b(?:popd|pop-location)\b/i.test(statement)) {
+    } else if (/\b(?:popd|pop-location)\b/i.test(statement)) {
       currentDirectory = directoryStack.pop() ?? "";
-      continue;
-    }
-    if (
+    } else if (
       normalizedDirectories.has(currentDirectory) &&
       containsPathReference(statement, basename)
-    )
+    ) {
       return true;
+    }
+    for (let index = 0; index < trailingGroups; index += 1) {
+      currentDirectory = directoryStack.pop() ?? "";
+    }
   }
   return false;
 }
@@ -4379,8 +4397,20 @@ function containsValidationPathReference(
           "m",
         ).test(command),
       );
+    const sourceImportsModules = (command: string, moduleNames: string[]): boolean =>
+      moduleNames.some((moduleName) => {
+        const escaped = moduleName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        return new RegExp(
+          `(?:^|\\n)\\s*(?:from\\s+\\.*${escaped}\\s+import\\b|import\\s+${escaped}(?=\\s|,|$))`,
+          "m",
+        ).test(command);
+      });
     referencesPythonModule = (command, directory) => {
-      if (commandReferencesModules(command, modules)) return true;
+      if (
+        commandReferencesModules(command, modules) ||
+        sourceImportsModules(command, modules)
+      )
+        return true;
       if (directory === undefined) return false;
       const normalizedDirectory = normalizeReferencedDirectory(directory);
       const roots = new Set([
@@ -4398,7 +4428,10 @@ function containsValidationPathReference(
             .replace(/\//g, "."),
         )
         .filter(Boolean);
-      return commandReferencesModules(command, relativeModules);
+      return (
+        commandReferencesModules(command, relativeModules) ||
+        sourceImportsModules(command, relativeModules)
+      );
     };
     if (referencesPythonModule(source)) return true;
   }
