@@ -3007,6 +3007,11 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       path.join(repo, "features/login.feature"),
       "Feature: Login\n  Scenario: works\n    Then access is granted\n",
     );
+    await mkdir(path.join(repo, "acceptance"));
+    await writeFile(
+      path.join(repo, "acceptance/login.robot"),
+      "*** Test Cases ***\nLogin works\n    Should Be Equal    granted    granted\n",
+    );
     await writeFile(path.join(repo, "cli.bats"), "@test 'works' { true; }\n");
     await writeFile(path.join(repo, "docs/test-plan.md"), "# Test plan\n");
     await writeFile(
@@ -3094,7 +3099,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     await writeFile(
       path.join(repo, "src/node_assertions.js"),
-      'import { deepEqual, ok } from "node:assert/strict";\nexport function verify(actual) {\n  ok(actual);\n  deepEqual(actual, true);\n}\n',
+      'import { deepEqual, ok, partialDeepStrictEqual } from "node:assert/strict";\nexport function verify(actual) {\n  ok(actual);\n  deepEqual(actual, true);\n  partialDeepStrictEqual(actual, { ok: true });\n}\n',
     );
     await writeFile(
       path.join(repo, "src/prefixed.js"),
@@ -3218,6 +3223,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       repo,
       "add",
       "feature.ts",
+      "acceptance/login.robot",
       "cli.bats",
       "conftest.py",
       "cypress/e2e/login.cy.ts",
@@ -3375,6 +3381,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(worker, ".mvn/wrapper/maven-wrapper.jar"), "replacement\n");
     await writeFile(path.join(worker, "package.json"), '{"scripts":{"test":"true"}}\n');
     await writeFile(path.join(worker, "Pipfile"), '[scripts]\ntest = "true"\n');
+    await writeFile(
+      path.join(worker, "noxfile.py"),
+      "import nox\n@nox.session\ndef tests(session): pass\n",
+    );
     await writeFile(path.join(worker, "package-lock.json"), '{"lockfileVersion":3}\n');
     await writeFile(path.join(worker, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
     await writeFile(path.join(worker, "pom.xml"), "<skipTests>true</skipTests>\n");
@@ -3435,6 +3445,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "gradle.properties",
       "gradle/wrapper/gradle-wrapper.properties",
       "gradlew",
+      "noxfile.py",
       "package-lock.json",
       "package.json",
       "Pipfile",
@@ -3466,7 +3477,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "commit", "-m", "weaken validation policy");
     await assert.rejects(
       assertWorkerChangesAllowed(),
-      /unexplained-policy-relaxation:.*\.bazelrc, \.clang-format, \.clang-format-ignore, \.eslintignore, \.markdownlintignore, \.mocharc\.json, \.mvn\/maven\.config, \.mvn\/wrapper\/maven-wrapper\.jar, \.mvn\/wrapper\/maven-wrapper\.properties, \.prettierignore, \.shellcheckrc, \.stylelintignore, BUILD, BUILD\.bazel, CMakeLists\.txt, Cargo\.lock, Directory\.Build\.targets, Directory\.Packages\.props, MODULE\.bazel, Pipfile, WORKSPACE, WORKSPACE\.bazel, build\.gradle, build\.gradle\.kts, cypress\.config\.ts, directory\.build\.props, eslint\.config\.js, go\.work, gradle\.properties, gradle\/wrapper\/gradle-wrapper\.jar, gradle\/wrapper\/gradle-wrapper\.properties, gradlew, mvnw, package-lock\.json, package\.json, phpunit\.xml, phpunit\.xml\.dist, pkg\/go\.mod, pnpm-lock\.yaml, pom\.xml, prompts\/fixer\.md, pylintrc, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, yarn\.lock/,
+      /unexplained-policy-relaxation:.*\.bazelrc, \.clang-format, \.clang-format-ignore, \.eslintignore, \.markdownlintignore, \.mocharc\.json, \.mvn\/maven\.config, \.mvn\/wrapper\/maven-wrapper\.jar, \.mvn\/wrapper\/maven-wrapper\.properties, \.prettierignore, \.shellcheckrc, \.stylelintignore, BUILD, BUILD\.bazel, CMakeLists\.txt, Cargo\.lock, Directory\.Build\.targets, Directory\.Packages\.props, MODULE\.bazel, Pipfile, WORKSPACE, WORKSPACE\.bazel, build\.gradle, build\.gradle\.kts, cypress\.config\.ts, directory\.build\.props, eslint\.config\.js, go\.work, gradle\.properties, gradle\/wrapper\/gradle-wrapper\.jar, gradle\/wrapper\/gradle-wrapper\.properties, gradlew, mvnw, noxfile\.py, package-lock\.json, package\.json, phpunit\.xml, phpunit\.xml\.dist, pkg\/go\.mod, pnpm-lock\.yaml, pom\.xml, prompts\/fixer\.md, pylintrc, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, yarn\.lock/,
     );
 
     git(worker, "reset", "--hard", featureHead);
@@ -3905,11 +3916,23 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "Feature: Login\n  Scenario: works\n    Then access is denied\n",
     );
     await writeFile(path.join(worker, "cli.bats"), "@test 'works' { false; }\n");
-    git(worker, "add", "main.tftest.hcl", "features/login.feature", "cli.bats");
+    await writeFile(
+      path.join(worker, "acceptance/login.robot"),
+      "*** Test Cases ***\nLogin works\n    Should Be Equal    denied    granted\n",
+    );
+    git(
+      worker,
+      "add",
+      "main.tftest.hcl",
+      "features/login.feature",
+      "acceptance/login.robot",
+      "cli.bats",
+    );
     git(worker, "commit", "-m", "weaken declarative tests");
     await assert.rejects(assertWorkerChangesAllowed(), (error: unknown) => {
       assert.ok(error instanceof Error);
       assert.match(error.message, /cli\.bats/);
+      assert.match(error.message, /acceptance\/login\.robot/);
       assert.match(error.message, /features\/login\.feature/);
       assert.match(error.message, /main\.tftest\.hcl/);
       return true;

@@ -3989,6 +3989,7 @@ function isTestPath(filePath: string): boolean {
     fileName.toLowerCase().endsWith(".snap") ||
     fileName.toLowerCase().endsWith(".bats") ||
     fileName.toLowerCase().endsWith(".feature") ||
+    fileName.toLowerCase().endsWith(".robot") ||
     fileName.toLowerCase().endsWith(".t") ||
     fileName.toLowerCase().endsWith(".tftest.hcl") ||
     /(?:^|[._-])(?:tests?|specs?|unittests?|cy|e2e)(?=[._]|$)/i.test(fileName) ||
@@ -4006,7 +4007,7 @@ function weakensInlineTestValidation(
   if (source === expectedSource) return false;
   const protectedValidation = /(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|rstest|(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test)\s*\]|@(?:[A-Za-z_][\w]*\.)*(?:ParameterizedTest|Test|TestMethod|DataTestMethod)\b|\[(?:(?:[A-Za-z_][\w]*\.)*(?:Fact|Test|Theory|TestMethod|DataTestMethod)|(?:[A-Za-z_][\w]*\.)*TestCase(?:\([^\]\n]*\))?)\]|\b(?:describe|context|it|test)(?:\.[A-Za-z_$][\w$]*)*\s*\(|\btest\s+"(?:[^"\\]|\\.)*"\s*\{|(?:^|\n)\s*(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(|(?:^|\n)\s*assert\s+\S|\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\b(?:[A-Za-z_][\w]*\.)*Assert\.[A-Za-z_][\w]*\s*\(|\.should\.(?:deep\.)?(?:equal|eql|match|throw)\s*\(|\b(?:deepStrictEqual|strictEqual|notDeepStrictEqual|notStrictEqual|doesNotReject|doesNotThrow|ifError|rejects|throws)\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|\bassert[A-Z][A-Za-z0-9_$]*\s*\(|\bstd\.testing\.expect[A-Za-z0-9_]*\s*\(|\bexpect\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
   const nodeAssertImport = /(?:from\s+["'](?:node:)?assert(?:\/strict)?["']|require\s*\(\s*["'](?:node:)?assert(?:\/strict)?["']\s*\))/u;
-  const nodeAssertCall = /\b(?:deepEqual|deepStrictEqual|doesNotMatch|doesNotReject|doesNotThrow|equal|fail|ifError|match|notDeepEqual|notDeepStrictEqual|notEqual|notStrictEqual|ok|rejects|strictEqual|throws)\s*\(/u;
+  const nodeAssertCall = /\b(?:deepEqual|deepStrictEqual|doesNotMatch|doesNotReject|doesNotThrow|equal|fail|ifError|match|notDeepEqual|notDeepStrictEqual|notEqual|notStrictEqual|ok|partialDeepStrictEqual|rejects|strictEqual|throws)\s*\(/u;
   if (
     protectedValidation.test(expectedSource) ||
     /\.should(?:\.[A-Za-z_$][\w$]*)+/u.test(expectedSource) ||
@@ -4091,6 +4092,7 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "gradlew.bat",
       "justfile",
       "makefile",
+      "noxfile.py",
       "npm-shrinkwrap.json",
       "mvnw",
       "mvnw.cmd",
