@@ -5350,7 +5350,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     const startupCommand = send?.[send.indexOf("--text") + 1] ?? "";
     assert.match(
       startupCommand,
-      /^'codex' '--model' 'gpt-5\.6-luna' '-c' 'model_reasoning_effort="max"' '--dangerously-bypass-approvals-and-sandbox' '--disable' 'hooks' '--disable' 'plugin_hooks' 'Read and follow the complete authenticated task in .*prompt-[^']+\.txt'$/,
+      /^'codex' '--model' 'gpt-5\.6-luna' '-c' 'model_reasoning_effort="max"' '--dangerously-bypass-approvals-and-sandbox' 'Read and follow the complete authenticated task in .*prompt-[^']+\.txt'$/,
     );
     assert.equal(worker.report.summary, "codex reviewed");
   } finally {
