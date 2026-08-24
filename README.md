@@ -19,7 +19,6 @@ npm link
 
 During installation, a default configuration template is automatically copied to `~/.config/orca-no-mistakes/config.yaml` (from [`templates/config.yaml`](templates/config.yaml)) if no configuration exists.
 
-
 ## Run
 
 Direct invocation returns a meaningful process exit status:
