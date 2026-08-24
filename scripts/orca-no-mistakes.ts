@@ -4140,7 +4140,7 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
     (parts.at(-2) === ".mvn" && ["jvm.config", "maven.config"].includes(fileName)) ||
     /^settings\.gradle(?:\.kts)?$/.test(fileName) ||
     (parts[0] !== "docs" && parts.slice(0, -1).includes("prompts")) ||
-    /^(?:(?:vitest|jest|playwright|cypress)\.config\..+|vitest\.workspace\..+|nyc\.config\..+|\.mocharc(?:\..+)?|karma\.conf\..+|phpunit\.xml(?:\.dist)?|eslint\.config\..+|\.eslintrc(?:\..+)?|\.eslintignore|prettier\.config\..+|\.prettierrc(?:\..+)?|\.prettierignore|biome\.jsonc?|deno\.jsonc?|\.coveragerc|\.nycrc(?:\..+)?|\.rspec|\.editorconfig|\.flake8|\.?ruff\.toml|\.?mypy\.ini|\.?pylintrc|pyrightconfig\.json|\.rubocop\.ya?ml|\.?swiftlint\.ya?ml|stylelint\.config\..+|\.stylelintrc(?:\..+)?|\.stylelintignore|\.?markdownlint(?:-cli2)?(?:\..+)?|\.markdownlintignore|\.shellcheckrc|actionlint\.ya?ml|\.golangci\.(?:ya?ml|toml|json)|\.?rustfmt\.toml|\.?clippy\.toml|\.clang-format|\.clang-format-ignore|\.clang-tidy|analysis_options\.yaml|checkstyle\.xml|detekt\.ya?ml|phpcs\.xml(?:\.dist)?|phpstan(?:\.[^.]+)?\.neon(?:\.dist)?|sonar-project\.properties|tsconfig(?:\.[^.]+)*\.json|tslint(?:\.[^.]+)*\.json)$/.test(
+    /^(?:(?:vitest|jest|playwright|cypress)\.config\..+|vitest\.workspace\..+|nyc\.config\..+|\.mocharc(?:\..+)?|karma\.conf\..+|phpunit\.xml(?:\.dist)?|eslint\.config\..+|\.eslintrc(?:\..+)?|\.eslintignore|prettier\.config\..+|\.prettierrc(?:\..+)?|\.prettierignore|biome\.jsonc?|deno\.jsonc?|\.coveragerc|\.nycrc(?:\..+)?|\.rspec|\.yamllint(?:\.ya?ml)?|\.editorconfig|\.flake8|\.?ruff\.toml|\.?mypy\.ini|\.?pylintrc|pyrightconfig\.json|\.rubocop\.ya?ml|\.?swiftlint\.ya?ml|stylelint\.config\..+|\.stylelintrc(?:\..+)?|\.stylelintignore|\.?markdownlint(?:-cli2)?(?:\..+)?|\.markdownlintignore|\.shellcheckrc|actionlint\.ya?ml|\.golangci\.(?:ya?ml|toml|json)|\.?rustfmt\.toml|\.?clippy\.toml|\.clang-format|\.clang-format-ignore|\.clang-tidy|analysis_options\.yaml|checkstyle\.xml|detekt\.ya?ml|phpcs\.xml(?:\.dist)?|phpstan(?:\.[^.]+)?\.neon(?:\.dist)?|sonar-project\.properties|tsconfig(?:\.[^.]+)*\.json|tslint(?:\.[^.]+)*\.json)$/.test(
       fileName,
     )
   );
@@ -4316,6 +4316,8 @@ function shellCommandReferencesTarget(
   if (normalizedDirectories.size === 0) return false;
   let currentDirectory = "";
   const directoryStack: string[] = [];
+  let jenkinsDirectory = "";
+  const jenkinsDirectoryStack: string[] = [];
   for (const rawStatement of normalizedCommand.split(/\r?\n|&&|;/)) {
     const leadingGroups = rawStatement.match(/^\s*(\(+)/)?.[1]?.length ?? 0;
     for (let index = 0; index < leadingGroups; index += 1) {
@@ -4325,13 +4327,40 @@ function shellCommandReferencesTarget(
       rawStatement.match(/(\)+)\s*$/)?.[1]?.length ?? 0,
       directoryStack.length,
     );
+    const trailingJenkinsGroups = rawStatement.match(/(\}+)\s*$/)?.[1]?.length ?? 0;
     const statement = rawStatement
       .replace(/^\s*\(+/, "")
-      .replace(/\)+\s*$/, "");
-    const changedDirectory = statement.match(
+      .replace(/\)+\s*$/, "")
+      .replace(/\}+\s*$/, "");
+    const changedJenkinsDirectory = statement.match(
+      /^\s*dir\(\s*(?:"([^"]+)"|'([^']+)')\s*\)\s*\{?/i,
+    );
+    const changedDirectory = changedJenkinsDirectory
+      ? undefined
+      : statement.match(
       /\b(cd|pushd|set-location|push-location)\s+(?:-(?:literal)?path\s+)?(?:\/d\s+)?(?:(?:--|-[LPe]+)\s+)*(?:"([^"]+)"|'([^']+)'|([^&|\s]+))/i,
     );
-    if (changedDirectory) {
+    if (changedJenkinsDirectory) {
+      const rawDirectory =
+        changedJenkinsDirectory[1] ?? changedJenkinsDirectory[2] ?? "";
+      const rootPrefixed = new RegExp(`^${ROOT_PATH_PREFIX_PATTERN}(?:/|$)`).test(
+        rawDirectory,
+      );
+      jenkinsDirectoryStack.push(jenkinsDirectory);
+      jenkinsDirectory = normalizeReferencedDirectory(
+        rootPrefixed
+          ? rawDirectory
+          : path.posix.join(jenkinsDirectory || ".", rawDirectory),
+      );
+      currentDirectory = jenkinsDirectory;
+      const remaining = statement.slice(changedJenkinsDirectory[0].length).trim();
+      if (
+        normalizedDirectories.has(currentDirectory) &&
+        containsPathReference(remaining, basename)
+      ) {
+        return true;
+      }
+    } else if (changedDirectory) {
       const rawDirectory =
         changedDirectory[2] ?? changedDirectory[3] ?? changedDirectory[4] ?? "";
       const rootPrefixed =
@@ -4354,6 +4383,14 @@ function shellCommandReferencesTarget(
     }
     for (let index = 0; index < trailingGroups; index += 1) {
       currentDirectory = directoryStack.pop() ?? "";
+    }
+    for (
+      let index = 0;
+      index < trailingJenkinsGroups && jenkinsDirectoryStack.length > 0;
+      index += 1
+    ) {
+      jenkinsDirectory = jenkinsDirectoryStack.pop() ?? "";
+      currentDirectory = jenkinsDirectory;
     }
   }
   return false;
@@ -4411,14 +4448,44 @@ function containsValidationPathReference(
           "m",
         ).test(command),
       );
-    const sourceImportsModules = (command: string, moduleNames: string[]): boolean =>
-      moduleNames.some((moduleName) => {
+    const sourceImportsModules = (command: string, moduleNames: string[]): boolean => {
+      const policyModuleDirectory = path.posix
+        .dirname(policyPath)
+        .replace(/^src\//, "")
+        .replace(/\//g, ".");
+      return moduleNames.some((moduleName) => {
         const escaped = moduleName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        return new RegExp(
+        if (
+          new RegExp(
           `(?:^|\\n)\\s*(?:from\\s+\\.*${escaped}\\s+import\\b|import\\s+${escaped}(?=\\s|,|$))`,
           "m",
-        ).test(command);
+          ).test(command)
+        ) {
+          return true;
+        }
+        const separator = moduleName.lastIndexOf(".");
+        if (separator < 0) return false;
+        const parent = moduleName.slice(0, separator);
+        const leaf = moduleName.slice(separator + 1);
+        const escapedParent = parent.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const escapedLeaf = leaf.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const importsLeaf = (fromModule: string): boolean =>
+          new RegExp(
+            `(?:^|\\n)\\s*from\\s+${fromModule}\\s+import\\s+[^\\n#]*\\b${escapedLeaf}\\b`,
+            "m",
+          ).test(command);
+        if (importsLeaf(escapedParent)) return true;
+        if (policyModuleDirectory === ".") return false;
+        if (parent === policyModuleDirectory) return importsLeaf("\\.+");
+        if (parent.startsWith(`${policyModuleDirectory}.`)) {
+          const relativeParent = parent.slice(policyModuleDirectory.length + 1);
+          return importsLeaf(
+            `\\.${relativeParent.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`,
+          );
+        }
+        return false;
       });
+    };
     referencesPythonModule = (command, directory) => {
       if (
         commandReferencesModules(command, modules) ||

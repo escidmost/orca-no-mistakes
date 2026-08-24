@@ -89,6 +89,9 @@ Each stage and role resolves its own agent from the configuration tiers, and the
 - Maven Invoker `src/it/` trees are protected test paths, and Ant's implicit `build.xml` is protected validation policy. Every tracked descendant of a referenced non-root local action directory is protected, even when the action manifest does not name that descendant directly.
 - Android/Gradle variant source sets such as `src/testDebug/` and `src/androidTestDebug/` are protected test trees alongside `src/androidTest/`, `src/commonTest/`, and other `*Test` source sets.
 - Jest `<rootDir>` references, local Python imports from protected runners, and shell subshell directory scopes participate in transitive validation-entrypoint resolution. Directory changes made inside `( ... )` are restored before later outer commands are resolved.
+- Jenkins `dir(...)` scopes, including nested scopes, participate in the same validation-entrypoint resolution without inheriting shell-local `cd` state from separate `sh` blocks.
+- Python `from package import module` and relative `from . import module` statements protect the corresponding tracked validation modules.
+- Yamllint's implicit `.yamllint`, `.yamllint.yml`, and `.yamllint.yaml` files are protected validation policy.
 
 - Co-located Vitest/Playwright `expect.soft(...)` and `expect.poll(...)` assertions are protected.
 - Codex `-c model=...` and `-c model_reasoning_effort=...` pins take precedence over mapped values, normalize whitespace around `=`, and must contain nonempty values. Worker waits ignore stale messages from prior sequential dispatches instead of failing the active worker.

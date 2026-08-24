@@ -3243,7 +3243,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     await writeFile(
       path.join(repo, ".github/workflows/ci.yml"),
-      "- uses: ./\n- uses: ./.github/actions/check\n- uses: ./ci/check/\n- run: ${{ github.workspace }}/scripts/workspace-verify.sh\n- run: '& \"$env:GITHUB_WORKSPACE\\scripts\\powershell-verify.ps1\"'\n- run: 'Set-Location -Path \"$env:GITHUB_WORKSPACE/scripts\"; ./powershell-location.ps1'\n- run: '%GITHUB_WORKSPACE%\\scripts\\cmd-verify.cmd'\n- run: python -m tools.module_check\n- run: py -3 -m tools\n- run: python -m myproj.check\n- run: python scripts/python-check.py\n- run: node scripts/check.ts\n- run: node scripts/alias-check.ts\n- run: \"$(pwd)/scripts/pwd-verify.sh\"\n- run: \"$(git rev-parse --show-toplevel)/scripts/root-verify.sh\"\n- run: .\\scripts\\check.ps1\n- run: ./check.sh\n  working-directory: ${{ github.workspace }}/commands/\n- run: .\\windows-check.ps1\n  working-directory: commands\\\n- run: cd /d commands && cmd-check.cmd\n- run: cd scripts && (cd nested && ./nested-check.sh) && ./outer-check.sh\n- run: ./lint.sh\n  working-directory: other\n- run: |\n    cd shell-commands\n    ./check.sh\n- run: |\n    cd guarded-commands || exit 1\n    set -euo pipefail\n    ./check.sh\n- run: |\n    pushd \"$GITHUB_WORKSPACE/prefixed-commands\"\n    ./verify.sh\n- run: |\n    cd nested-commands\n    cd validation\n    ./check.sh\n",
+      "- uses: ./\n- uses: ./.github/actions/check\n- uses: ./ci/check/\n- run: ${{ github.workspace }}/scripts/workspace-verify.sh\n- run: '& \"$env:GITHUB_WORKSPACE\\scripts\\powershell-verify.ps1\"'\n- run: 'Set-Location -Path \"$env:GITHUB_WORKSPACE/scripts\"; ./powershell-location.ps1'\n- run: '%GITHUB_WORKSPACE%\\scripts\\cmd-verify.cmd'\n- run: python -m tools.module_check\n- run: python -m tools.runner\n- run: py -3 -m tools\n- run: python -m myproj.check\n- run: python scripts/python-check.py\n- run: node scripts/check.ts\n- run: node scripts/alias-check.ts\n- run: \"$(pwd)/scripts/pwd-verify.sh\"\n- run: \"$(git rev-parse --show-toplevel)/scripts/root-verify.sh\"\n- run: .\\scripts\\check.ps1\n- run: ./check.sh\n  working-directory: ${{ github.workspace }}/commands/\n- run: .\\windows-check.ps1\n  working-directory: commands\\\n- run: cd /d commands && cmd-check.cmd\n- run: cd scripts && (cd nested && ./nested-check.sh) && ./outer-check.sh\n- run: ./lint.sh\n  working-directory: other\n- run: |\n    cd shell-commands\n    ./check.sh\n- run: |\n    cd guarded-commands || exit 1\n    set -euo pipefail\n    ./check.sh\n- run: |\n    pushd \"$GITHUB_WORKSPACE/prefixed-commands\"\n    ./verify.sh\n- run: |\n    cd nested-commands\n    cd validation\n    ./check.sh\n",
     );
     await writeFile(
       path.join(repo, "jest.config.ts"),
@@ -3320,6 +3320,15 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(repo, "tools/jenkins-verify.sh"), "npm test\n");
     await writeFile(path.join(repo, "tools/check.sh"), "export TOOL_CHECK=1\n");
     await writeFile(path.join(repo, "tools/module_check.py"), "def main():\n    verify_behavior()\n");
+    await writeFile(
+      path.join(repo, "tools/runner.py"),
+      "from tools import check\nfrom . import relative_check\ncheck.validate()\nrelative_check.validate()\n",
+    );
+    await writeFile(path.join(repo, "tools/check.py"), "def validate():\n    verify_behavior()\n");
+    await writeFile(
+      path.join(repo, "tools/relative_check.py"),
+      "def validate():\n    verify_behavior()\n",
+    );
     await writeFile(path.join(repo, "tools/__main__.py"), "def main():\n    verify_behavior()\n");
     await mkdir(path.join(repo, "src/myproj"), { recursive: true });
     await writeFile(path.join(repo, "src/myproj/check.py"), "def main():\n    verify_behavior()\n");
@@ -3327,9 +3336,12 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(repo, "src/quotedpkg/check.py"), "def main():\n    verify_behavior()\n");
     await mkdir(path.join(repo, "backend/checks"), { recursive: true });
     await writeFile(path.join(repo, "backend/checks/validate.py"), "def main():\n    verify_behavior()\n");
+    await mkdir(path.join(repo, "jenkins-tools/nested"), { recursive: true });
+    await writeFile(path.join(repo, "jenkins-tools/check.sh"), "npm test\n");
+    await writeFile(path.join(repo, "jenkins-tools/nested/nested-check.sh"), "npm test\n");
     await writeFile(
       path.join(repo, "Jenkinsfile"),
-      "pipeline {\n  stages {\n    stage('test') {\n      steps {\n        sh '''\n          cd tools\n          set -euo pipefail\n          ./jenkins-verify.sh\n        '''\n      }\n    }\n  }\n}\n",
+      "pipeline {\n  stages {\n    stage('test') {\n      steps {\n        sh '''\n          cd tools\n          set -euo pipefail\n          ./jenkins-verify.sh\n        '''\n        dir('jenkins-tools') {\n          sh './check.sh'\n          dir('nested') {\n            sh './nested-check.sh'\n          }\n        }\n      }\n    }\n  }\n}\n",
     );
     await writeFile(path.join(repo, "scripts/workspace-verify.sh"), "npm test\n");
     await writeFile(path.join(repo, "scripts/powershell-verify.ps1"), "npm test\n");
@@ -3494,7 +3506,12 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "tools/check.sh",
       "tools/jenkins-verify.sh",
       "tools/module_check.py",
+      "tools/runner.py",
+      "tools/check.py",
+      "tools/relative_check.py",
       "tools/__main__.py",
+      "jenkins-tools/check.sh",
+      "jenkins-tools/nested/nested-check.sh",
       "src/myproj/check.py",
       "src/quotedpkg/check.py",
       "src/rules.ts",
@@ -3561,6 +3578,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(worker, ".shellcheckrc"), "disable=all\n");
     await writeFile(path.join(worker, ".stylelintignore"), "**/*\n");
     await writeFile(path.join(worker, ".swiftlint.yml"), "disabled_rules: [all]\n");
+    await writeFile(path.join(worker, ".yamllint"), "rules: { document-start: disable }\n");
     await writeFile(path.join(worker, ".bazelrc"), "test --test_tag_filters=-critical\n");
     await writeFile(path.join(worker, "BUILD"), "# tests disabled\n");
     await writeFile(path.join(worker, "BUILD.bazel"), "# tests disabled\n");
@@ -3654,6 +3672,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       ".shellcheckrc",
       ".stylelintignore",
       ".swiftlint.yml",
+      ".yamllint",
       ".bazelrc",
       "BUILD",
       "BUILD.bazel",
@@ -3715,7 +3734,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "commit", "-m", "weaken validation policy");
     await assert.rejects(
       assertWorkerChangesAllowed(),
-      /unexplained-policy-relaxation:.*\.bazelrc, \.clang-format, \.clang-format-ignore, \.coveragerc, \.eslintignore, \.github\/actionlint\.yaml, \.justfile, \.markdownlintignore, \.mocharc\.json, \.mvn\/jvm\.config, \.mvn\/maven\.config, \.mvn\/wrapper\/maven-wrapper\.jar, \.mvn\/wrapper\/maven-wrapper\.properties, \.npmrc, \.nycrc, \.prettierignore, \.rspec, \.shellcheckrc, \.stylelintignore, \.swiftlint\.yml, BUILD, BUILD\.bazel, CMakeLists\.txt, Cargo\.lock, Directory\.Build\.targets, Directory\.Packages\.props, GNUmakefile, MODULE\.bazel, Pipfile, Taskfile\.dist\.yaml, Taskfile\.dist\.yml, Taskfile\.yml, WORKSPACE, WORKSPACE\.bazel, build\.gradle, build\.gradle\.kts, build\.xml, cypress\.config\.ts, directory\.build\.props, eslint\.config\.js, go\.work, gradle\.properties, gradle\/wrapper\/gradle-wrapper\.jar, gradle\/wrapper\/gradle-wrapper\.properties, gradlew, lerna\.json, mvnw, noxfile\.py, nyc\.config\.js, package-lock\.json, package\.json, phpunit\.xml, phpunit\.xml\.dist, pkg\/go\.mod, pnpm-lock\.yaml, pnpm-workspace\.yaml, pom\.xml, prompts\/fixer\.md, pylintrc, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, vitest\.workspace\.ts, workspace\.sln, workspace\.slnx, yarn\.lock/,
+      /unexplained-policy-relaxation:.*\.bazelrc, \.clang-format, \.clang-format-ignore, \.coveragerc, \.eslintignore, \.github\/actionlint\.yaml, \.justfile, \.markdownlintignore, \.mocharc\.json, \.mvn\/jvm\.config, \.mvn\/maven\.config, \.mvn\/wrapper\/maven-wrapper\.jar, \.mvn\/wrapper\/maven-wrapper\.properties, \.npmrc, \.nycrc, \.prettierignore, \.rspec, \.shellcheckrc, \.stylelintignore, \.swiftlint\.yml, \.yamllint, BUILD, BUILD\.bazel, CMakeLists\.txt, Cargo\.lock, Directory\.Build\.targets, Directory\.Packages\.props, GNUmakefile, MODULE\.bazel, Pipfile, Taskfile\.dist\.yaml, Taskfile\.dist\.yml, Taskfile\.yml, WORKSPACE, WORKSPACE\.bazel, build\.gradle, build\.gradle\.kts, build\.xml, cypress\.config\.ts, directory\.build\.props, eslint\.config\.js, go\.work, gradle\.properties, gradle\/wrapper\/gradle-wrapper\.jar, gradle\/wrapper\/gradle-wrapper\.properties, gradlew, lerna\.json, mvnw, noxfile\.py, nyc\.config\.js, package-lock\.json, package\.json, phpunit\.xml, phpunit\.xml\.dist, pkg\/go\.mod, pnpm-lock\.yaml, pnpm-workspace\.yaml, pom\.xml, prompts\/fixer\.md, pylintrc, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, vitest\.workspace\.ts, workspace\.sln, workspace\.slnx, yarn\.lock/,
     );
 
     git(worker, "reset", "--hard", featureHead);
@@ -3988,6 +4007,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(worker, "src/base-rules.ts"), "export const skipped = true;\n");
     await writeFile(path.join(worker, "validation/jest.setup.ts"), "export const skipped = true;\n");
     await writeFile(path.join(worker, "scripts/rules.py"), "def validate():\n    pass\n");
+    await writeFile(path.join(worker, "tools/check.py"), "def validate():\n    pass\n");
+    await writeFile(path.join(worker, "tools/relative_check.py"), "def validate():\n    pass\n");
+    await writeFile(path.join(worker, "jenkins-tools/check.sh"), "exit 0\n");
+    await writeFile(path.join(worker, "jenkins-tools/nested/nested-check.sh"), "exit 0\n");
     await writeFile(path.join(worker, "scripts/nested/nested-check.sh"), "exit 0\n");
     await writeFile(path.join(worker, "scripts/outer-check.sh"), "exit 0\n");
     await writeFile(path.join(worker, "cd-options/check.sh"), "exit 0\n");
@@ -4003,6 +4026,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "src/base-rules.ts",
       "validation/jest.setup.ts",
       "scripts/rules.py",
+      "tools/check.py",
+      "tools/relative_check.py",
+      "jenkins-tools/check.sh",
+      "jenkins-tools/nested/nested-check.sh",
       "scripts/nested/nested-check.sh",
       "scripts/outer-check.sh",
       "cd-options/check.sh",
@@ -4024,6 +4051,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       assert.match(error.message, /src\/base-rules\.ts/);
       assert.match(error.message, /validation\/jest\.setup\.ts/);
       assert.match(error.message, /scripts\/rules\.py/);
+      assert.match(error.message, /tools\/check\.py/);
+      assert.match(error.message, /tools\/relative_check\.py/);
+      assert.match(error.message, /jenkins-tools\/check\.sh/);
+      assert.match(error.message, /jenkins-tools\/nested\/nested-check\.sh/);
       assert.match(error.message, /scripts\/nested\/nested-check\.sh/);
       assert.match(error.message, /scripts\/outer-check\.sh/);
       assert.match(error.message, /cd-options\/check\.sh/);
