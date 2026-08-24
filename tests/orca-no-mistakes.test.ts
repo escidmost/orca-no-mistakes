@@ -477,6 +477,7 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
   );
   assert.equal(reviewLaunches.length, 2);
   assert.ok(reviewLaunches.every((launch) => launch.role === "reviewer"));
+  assert.ok(reviewLaunches.every((launch) => launch.acceptFailedReport === true));
   assert.ok(reviewLaunches.every((launch) => launch.worktree === "new-child"));
   assert.notEqual(reviewLaunches[0].name, reviewLaunches[1].name);
   const reviewSpec =
@@ -2338,7 +2339,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       { type: 'heartbeat', body: 'still reviewing', payload: JSON.stringify({ taskId: 'task-review', dispatchId: 'dispatch-review' }) }
     ] })
   } else {
-    out({ deliveryId: 'delivery-review', messages: [{ type: 'worker_done', body: 'Reviewed. Verified. Nothing remains.', payload: JSON.stringify({ taskId: 'task-review', dispatchId: 'dispatch-review', outcome: 'succeeded', reportPath: ${JSON.stringify(reportPath)} }) }] })
+    out({ deliveryId: 'delivery-review', messages: [{ type: 'worker_done', body: 'Review found blocking issues.', payload: JSON.stringify({ taskId: 'task-review', dispatchId: 'dispatch-review', outcome: 'failed', reportPath: ${JSON.stringify(reportPath)} }) }] })
   }
 } else {
   out({ ok: true })
@@ -2350,6 +2351,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     await orca.createRun("adapter test");
 
     const worker = await orca.startWorker("task-review", {
+      acceptFailedReport: true,
       name: "fresh-reviewer",
       prompt: "contains ) and shell syntax",
       role: "reviewer",
@@ -3322,7 +3324,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(repo, "tools/module_check.py"), "def main():\n    verify_behavior()\n");
     await writeFile(
       path.join(repo, "tools/runner.py"),
-      "from tools import check\nfrom . import relative_check\ncheck.validate()\nrelative_check.validate()\n",
+      "from tools import (\n    check,\n)\nfrom . import (\n    relative_check,\n)\ncheck.validate()\nrelative_check.validate()\n",
     );
     await writeFile(path.join(repo, "tools/check.py"), "def validate():\n    verify_behavior()\n");
     await writeFile(
@@ -3341,7 +3343,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(repo, "jenkins-tools/nested/nested-check.sh"), "npm test\n");
     await writeFile(
       path.join(repo, "Jenkinsfile"),
-      "pipeline {\n  stages {\n    stage('test') {\n      steps {\n        sh '''\n          cd tools\n          set -euo pipefail\n          ./jenkins-verify.sh\n        '''\n        dir('jenkins-tools') {\n          sh './check.sh'\n          dir('nested') {\n            sh './nested-check.sh'\n          }\n        }\n      }\n    }\n  }\n}\n",
+      "pipeline {\n  stages {\n    stage('test') {\n      steps {\n        sh '''\n          cd tools\n          set -euo pipefail\n          ./jenkins-verify.sh\n        '''\n        dir('jenkins-tools') {\n          script { echo 'setup' }\n          sh './check.sh'\n          dir('nested') {\n            sh './nested-check.sh'\n          }\n        }\n      }\n    }\n  }\n}\n",
     );
     await writeFile(path.join(repo, "scripts/workspace-verify.sh"), "npm test\n");
     await writeFile(path.join(repo, "scripts/powershell-verify.ps1"), "npm test\n");

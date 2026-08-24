@@ -104,6 +104,7 @@ export type WorkerAgent = AgentProfile & {
 };
 
 export type WorkerLaunch = {
+  acceptFailedReport?: boolean;
   agent?: WorkerAgent;
   /** Commit a new-child worktree must be detached at, pinning the worker to an
    *  immutable snapshot instead of a movable branch checkout. */
@@ -1122,6 +1123,7 @@ async function runReviewer(
     );
     return {
       agent,
+      acceptFailedReport: true,
       commitOid: untrusted.headOid,
       name: `no-mistakes-${stage}-${attempt + 1}`,
       prompt,
@@ -2346,6 +2348,7 @@ export class CliOrca implements OrcaOperations {
         dispatchId,
         terminalHandle,
         launch.reportPath,
+        launch.acceptFailedReport,
         fence,
       );
       deliveryId = result.deliveryId;
@@ -2451,6 +2454,7 @@ export class CliOrca implements OrcaOperations {
         dispatchId,
         terminalHandle,
         launch.reportPath,
+        launch.acceptFailedReport,
         fence,
       );
       deliveryId = result.deliveryId;
@@ -3597,6 +3601,7 @@ export class CliOrca implements OrcaOperations {
     dispatchId: string,
     terminalHandle: string,
     expectedReportPath?: string,
+    acceptFailedReport = false,
     fence?: TimeoutFence,
   ): Promise<{ deliveryId?: string; error?: string; report?: StageReport }> {
     let lastActivityAt = Date.now();
@@ -3715,7 +3720,7 @@ export class CliOrca implements OrcaOperations {
             error: `worker ${dispatchId} reported for the wrong task`,
           };
         }
-        if (payload.outcome !== "succeeded") {
+        if (payload.outcome !== "succeeded" && !acceptFailedReport) {
           return {
             deliveryId: result.deliveryId,
             error: `worker ${dispatchId} failed: ${message.body ?? message.subject ?? ""}`,
@@ -4314,11 +4319,15 @@ function shellCommandReferencesTarget(
     [...directories].map(normalizeReferencedDirectory).filter(Boolean),
   );
   if (normalizedDirectories.size === 0) return false;
+  const jenkins = inspectJenkinsDirectoryBlocks(
+    normalizedCommand,
+    normalizedDirectories,
+    basename,
+  );
+  if (jenkins.matches) return true;
   let currentDirectory = "";
   const directoryStack: string[] = [];
-  let jenkinsDirectory = "";
-  const jenkinsDirectoryStack: string[] = [];
-  for (const rawStatement of normalizedCommand.split(/\r?\n|&&|;/)) {
+  for (const rawStatement of jenkins.shellSource.split(/\r?\n|&&|;/)) {
     const leadingGroups = rawStatement.match(/^\s*(\(+)/)?.[1]?.length ?? 0;
     for (let index = 0; index < leadingGroups; index += 1) {
       directoryStack.push(currentDirectory);
@@ -4327,40 +4336,13 @@ function shellCommandReferencesTarget(
       rawStatement.match(/(\)+)\s*$/)?.[1]?.length ?? 0,
       directoryStack.length,
     );
-    const trailingJenkinsGroups = rawStatement.match(/(\}+)\s*$/)?.[1]?.length ?? 0;
     const statement = rawStatement
       .replace(/^\s*\(+/, "")
-      .replace(/\)+\s*$/, "")
-      .replace(/\}+\s*$/, "");
-    const changedJenkinsDirectory = statement.match(
-      /^\s*dir\(\s*(?:"([^"]+)"|'([^']+)')\s*\)\s*\{?/i,
-    );
-    const changedDirectory = changedJenkinsDirectory
-      ? undefined
-      : statement.match(
+      .replace(/\)+\s*$/, "");
+    const changedDirectory = statement.match(
       /\b(cd|pushd|set-location|push-location)\s+(?:-(?:literal)?path\s+)?(?:\/d\s+)?(?:(?:--|-[LPe]+)\s+)*(?:"([^"]+)"|'([^']+)'|([^&|\s]+))/i,
     );
-    if (changedJenkinsDirectory) {
-      const rawDirectory =
-        changedJenkinsDirectory[1] ?? changedJenkinsDirectory[2] ?? "";
-      const rootPrefixed = new RegExp(`^${ROOT_PATH_PREFIX_PATTERN}(?:/|$)`).test(
-        rawDirectory,
-      );
-      jenkinsDirectoryStack.push(jenkinsDirectory);
-      jenkinsDirectory = normalizeReferencedDirectory(
-        rootPrefixed
-          ? rawDirectory
-          : path.posix.join(jenkinsDirectory || ".", rawDirectory),
-      );
-      currentDirectory = jenkinsDirectory;
-      const remaining = statement.slice(changedJenkinsDirectory[0].length).trim();
-      if (
-        normalizedDirectories.has(currentDirectory) &&
-        containsPathReference(remaining, basename)
-      ) {
-        return true;
-      }
-    } else if (changedDirectory) {
+    if (changedDirectory) {
       const rawDirectory =
         changedDirectory[2] ?? changedDirectory[3] ?? changedDirectory[4] ?? "";
       const rootPrefixed =
@@ -4384,16 +4366,75 @@ function shellCommandReferencesTarget(
     for (let index = 0; index < trailingGroups; index += 1) {
       currentDirectory = directoryStack.pop() ?? "";
     }
-    for (
-      let index = 0;
-      index < trailingJenkinsGroups && jenkinsDirectoryStack.length > 0;
-      index += 1
-    ) {
-      jenkinsDirectory = jenkinsDirectoryStack.pop() ?? "";
-      currentDirectory = jenkinsDirectory;
-    }
   }
   return false;
+}
+
+function inspectJenkinsDirectoryBlocks(
+  source: string,
+  targetDirectories: Set<string>,
+  basename: string,
+): { matches: boolean; shellSource: string } {
+  const ranges: { end: number; start: number }[] = [];
+  const events = /dir\(\s*(?:"([^"]+)"|'([^']+)')\s*\)\s*\{|[{}]/gi;
+  let depth = 0;
+  let activeStart: number | undefined;
+  let cursor = 0;
+  const scopes: { depth: number; directory: string }[] = [];
+  for (const event of source.matchAll(events)) {
+    const currentDirectory = scopes.at(-1)?.directory;
+    if (
+      currentDirectory &&
+      targetDirectories.has(currentDirectory) &&
+      containsPathReference(source.slice(cursor, event.index), basename)
+    ) {
+      return { matches: true, shellSource: source };
+    }
+    if (event[0] === "{") {
+      depth += 1;
+    } else if (event[0] === "}") {
+      if (scopes.at(-1)?.depth === depth) scopes.pop();
+      if (scopes.length === 0 && activeStart !== undefined) {
+        ranges.push({ end: (event.index ?? 0) + 1, start: activeStart });
+        activeStart = undefined;
+      }
+      depth = Math.max(0, depth - 1);
+    } else {
+      const parentDirectory = scopes.at(-1)?.directory ?? "";
+      const rawDirectory = event[1] ?? event[2] ?? "";
+      const rootPrefixed = new RegExp(`^${ROOT_PATH_PREFIX_PATTERN}(?:/|$)`).test(
+        rawDirectory,
+      );
+      if (scopes.length === 0) activeStart = event.index ?? 0;
+      depth += 1;
+      scopes.push({
+        depth,
+        directory: normalizeReferencedDirectory(
+          rootPrefixed
+            ? rawDirectory
+            : path.posix.join(parentDirectory || ".", rawDirectory),
+        ),
+      });
+    }
+    cursor = (event.index ?? 0) + event[0].length;
+  }
+  const currentDirectory = scopes.at(-1)?.directory;
+  if (
+    currentDirectory &&
+    targetDirectories.has(currentDirectory) &&
+    containsPathReference(source.slice(cursor), basename)
+  ) {
+    return { matches: true, shellSource: source };
+  }
+  if (activeStart !== undefined) ranges.push({ end: source.length, start: activeStart });
+  cursor = 0;
+  let masked = "";
+  for (const range of ranges) {
+    masked += source.slice(cursor, range.start);
+    masked += source.slice(range.start, range.end).replace(/[^\r\n]/g, " ");
+    cursor = range.end;
+  }
+  return { matches: false, shellSource: masked + source.slice(cursor) };
 }
 
 function containsValidationPathReference(
@@ -4449,6 +4490,13 @@ function containsValidationPathReference(
         ).test(command),
       );
     const sourceImportsModules = (command: string, moduleNames: string[]): boolean => {
+      const normalizedImports = command
+        .replace(/\\\r?\n\s*/g, " ")
+        .replace(
+          /(from\s+[.\w]+\s+import\s*)\(([\s\S]*?)\)/g,
+          (_match, prefix: string, imports: string) =>
+            `${prefix}${imports.replace(/\s+/g, " ")}`,
+        );
       const policyModuleDirectory = path.posix
         .dirname(policyPath)
         .replace(/^src\//, "")
@@ -4459,7 +4507,7 @@ function containsValidationPathReference(
           new RegExp(
           `(?:^|\\n)\\s*(?:from\\s+\\.*${escaped}\\s+import\\b|import\\s+${escaped}(?=\\s|,|$))`,
           "m",
-          ).test(command)
+          ).test(normalizedImports)
         ) {
           return true;
         }
@@ -4473,7 +4521,7 @@ function containsValidationPathReference(
           new RegExp(
             `(?:^|\\n)\\s*from\\s+${fromModule}\\s+import\\s+[^\\n#]*\\b${escapedLeaf}\\b`,
             "m",
-          ).test(command);
+          ).test(normalizedImports);
         if (importsLeaf(escapedParent)) return true;
         if (policyModuleDirectory === ".") return false;
         if (parent === policyModuleDirectory) return importsLeaf("\\.+");

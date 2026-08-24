@@ -92,6 +92,7 @@ Each stage and role resolves its own agent from the configuration tiers, and the
 - Jenkins `dir(...)` scopes, including nested scopes, participate in the same validation-entrypoint resolution without inheriting shell-local `cd` state from separate `sh` blocks.
 - Python `from package import module` and relative `from . import module` statements protect the corresponding tracked validation modules.
 - Yamllint's implicit `.yamllint`, `.yamllint.yml`, and `.yamllint.yaml` files are protected validation policy.
+- A reviewer `worker_done` outcome may be `failed` when the assigned, path-confined report was still written successfully; reviewer findings, not the transport outcome label, determine whether the stage passes or opens a gate. Fixer workers retain strict successful-outcome handling.
 
 - Co-located Vitest/Playwright `expect.soft(...)` and `expect.poll(...)` assertions are protected.
 - Codex `-c model=...` and `-c model_reasoning_effort=...` pins take precedence over mapped values, normalize whitespace around `=`, and must contain nonempty values. Worker waits ignore stale messages from prior sequential dispatches instead of failing the active worker.
