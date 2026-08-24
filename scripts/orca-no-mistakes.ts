@@ -3973,6 +3973,7 @@ function isTestPath(filePath: string): boolean {
         /\.(?:unit|integration)?tests?$/i.test(part),
       ) ||
     fileName.toLowerCase().endsWith(".snap") ||
+    fileName.toLowerCase().endsWith(".golden") ||
     fileName.toLowerCase().endsWith(".bats") ||
     fileName.toLowerCase().endsWith(".feature") ||
     fileName.toLowerCase().endsWith(".resource") ||
@@ -4079,6 +4080,7 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "gradlew.bat",
       ".justfile",
       "justfile",
+      "lerna.json",
       "gnumakefile",
       "makefile",
       "noxfile.py",
@@ -4135,6 +4137,11 @@ function containsPathReference(source: string, reference: string): boolean {
   ).test(source);
 }
 
+function containsTypeScriptModuleReference(source: string, reference: string): boolean {
+  const escaped = reference.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`["']${escaped}["']`).test(source);
+}
+
 const ROOT_PATH_PREFIX_PATTERN = String.raw`(?:\$\{\{[^}\n]+\}\}|\$[Ee][Nn][Vv]:[A-Za-z_][A-Za-z0-9_]*|%[A-Za-z_][A-Za-z0-9_]*%|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\$\(\s*pwd\s*\)|\$\(\s*git\s+rev-parse\s+--show-toplevel\s*\))`;
 
 function normalizeQuotedPathPrefixes(source: string): string {
@@ -4163,6 +4170,7 @@ type TypeScriptPathAlias = {
 };
 
 function parseJsonConfig(source: string): unknown {
+  source = source.replace(/^\uFEFF/, "");
   let result = "";
   let quoted = false;
   let escaped = false;
@@ -4199,32 +4207,41 @@ function parseJsonConfig(source: string): unknown {
 }
 
 function typeScriptPathAliases(configPath: string, source: string): TypeScriptPathAlias[] {
-  let config: unknown;
-  try {
-    config = parseJsonConfig(source);
-  } catch {
-    return [];
-  }
+  const config = parseJsonConfig(source);
   if (!config || typeof config !== "object" || Array.isArray(config)) return [];
   const compilerOptions = (config as Record<string, unknown>).compilerOptions;
   if (!compilerOptions || typeof compilerOptions !== "object" || Array.isArray(compilerOptions))
     return [];
   const options = compilerOptions as Record<string, unknown>;
   const paths = options.paths;
-  if (!paths || typeof paths !== "object" || Array.isArray(paths)) return [];
-  const baseUrl = typeof options.baseUrl === "string" ? options.baseUrl : ".";
-  return Object.entries(paths as Record<string, unknown>).flatMap(([alias, targets]) =>
-    Array.isArray(targets)
-      ? targets
-          .filter((target): target is string => typeof target === "string")
-          .map((target) => ({
-            alias,
-            configPath,
-            target: path.posix.normalize(
-              path.posix.join(path.posix.dirname(configPath), baseUrl, target),
-            ),
-          }))
-      : [],
+  const hasBaseUrl = typeof options.baseUrl === "string";
+  const baseUrl = hasBaseUrl ? (options.baseUrl as string) : ".";
+  const aliases: TypeScriptPathAlias[] = hasBaseUrl
+    ? [
+        {
+          alias: "*",
+          configPath,
+          target: path.posix.normalize(
+            path.posix.join(path.posix.dirname(configPath), baseUrl, "*"),
+          ),
+        },
+      ]
+    : [];
+  if (!paths || typeof paths !== "object" || Array.isArray(paths)) return aliases;
+  return aliases.concat(
+    Object.entries(paths as Record<string, unknown>).flatMap(([alias, targets]) =>
+      Array.isArray(targets)
+        ? targets
+            .filter((target): target is string => typeof target === "string")
+            .map((target) => ({
+              alias,
+              configPath,
+              target: path.posix.normalize(
+                path.posix.join(path.posix.dirname(configPath), baseUrl, target),
+              ),
+            }))
+        : [],
+    ),
   );
 }
 
@@ -4280,7 +4297,7 @@ function shellCommandReferencesTarget(
   const directoryStack: string[] = [];
   for (const statement of normalizedCommand.split(/\r?\n|&&|;/)) {
     const changedDirectory = statement.match(
-      /\b(cd|pushd|set-location|push-location)\s+(?:-(?:literal)?path\s+)?(?:\/d\s+)?(?:"([^"]+)"|'([^']+)'|([^&|\s]+))/i,
+      /\b(cd|pushd|set-location|push-location)\s+(?:-(?:literal)?path\s+)?(?:\/d\s+)?(?:(?:--|-[LPe]+)\s+)*(?:"([^"]+)"|'([^']+)'|([^&|\s]+))/i,
     );
     if (changedDirectory) {
       const rawDirectory =
@@ -4642,7 +4659,7 @@ export class GitShell implements GitOperations {
       typeScriptAliasReferences(candidatePath, typeScriptAliases).some(
         (alias) =>
           alias.configPath !== policyPath &&
-          containsPathReference(source, alias.reference),
+          containsTypeScriptModuleReference(source, alias.reference),
       );
     let policySourceCount = -1;
     while (policySources.size !== policySourceCount) {

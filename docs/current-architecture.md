@@ -80,6 +80,8 @@ Each stage and role resolves its own agent from the configuration tiers, and the
 
 - Protected `tsconfig*.json` path aliases are resolved when a protected validation source imports the alias. Windows cmd `cd /d` transitions participate in composed-command resolution, and `pnpm-workspace.yaml` is protected implicit validation policy.
 
+- TypeScript alias resolution accepts BOM-prefixed JSONC and supports `baseUrl` without a `paths` table. POSIX `cd --`, `cd -L`, and `cd -P` transitions participate in composed-command resolution. `*.golden` files are protected assertion data, and `lerna.json` is protected implicit workspace policy.
+
 - Co-located Vitest/Playwright `expect.soft(...)` and `expect.poll(...)` assertions are protected.
 - Codex `-c model=...` and `-c model_reasoning_effort=...` pins take precedence over mapped values, normalize whitespace around `=`, and must contain nonempty values. Worker waits ignore stale messages from prior sequential dispatches instead of failing the active worker.
 - Worker waits ignore syntactically malformed or non-object metadata that cannot be attributed to the active dispatch; a valid active completion later in the same delivery still wins, while a delivery with no valid active message is acknowledged and polling continues.
