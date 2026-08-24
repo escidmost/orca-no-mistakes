@@ -1576,6 +1576,30 @@ test("malformed reviewer findings fail closed and still clean up the worker", as
   assert.equal(orca.removedWorktrees.length, 1);
 });
 
+test("a failed reviewer outcome requires actionable findings", async () => {
+  const git = new FakeGit();
+  class FailedOutcomeOrca extends FakeOrca {
+    override async startWorker(
+      taskId: string,
+      launch: WorkerLaunch,
+    ): Promise<WorkerResult> {
+      const worker = await super.startWorker(taskId, launch);
+      if (launch.role === "reviewer") worker.failedOutcome = true;
+      return worker;
+    }
+  }
+  const orca = new FailedOutcomeOrca(git);
+  orca.reports.set("review", [pass("could not complete the review")]);
+
+  await assert.rejects(
+    runPipeline({ intent: "Reject incomplete reviews." }, orca, git),
+    /review worker failed without actionable findings/,
+  );
+
+  assert.ok(orca.calls.some((call) => call.startsWith("release:")));
+  assert.equal(orca.removedWorktrees.length, 1);
+});
+
 test("reviewer acknowledgement failures still remove the worker worktree", async () => {
   const git = new FakeGit();
   class ReviewerAckFailureOrca extends FakeOrca {
@@ -2304,7 +2328,20 @@ test("CliOrca boots a fresh opencode terminal before authenticated dispatch", as
   try {
     git(temp, "init", "-b", "feature");
     await mkdir(evidence, { recursive: true });
-    await writeFile(reportPath, JSON.stringify(pass("reviewed")));
+    await writeFile(
+      reportPath,
+      JSON.stringify({
+        findings: [
+          {
+            id: "review-blocker",
+            severity: "error",
+            action: "auto-fix",
+            description: "The reviewer found a blocking issue.",
+          },
+        ],
+        summary: "reviewed with blockers",
+      }),
+    );
     await writeFile(
       fakeOrca,
       `#!/usr/bin/env node
@@ -2360,6 +2397,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     });
 
     assert.equal(worker.worktreeId, worktreeId);
+    assert.equal(worker.failedOutcome, true);
     const calls = (await readFile(callsPath, "utf8"))
       .trim()
       .split("\n")
@@ -3570,6 +3608,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(worker, ".clang-format"), "DisableFormat: true\n");
     await writeFile(path.join(worker, ".coveragerc"), "[report]\nfail_under = 0\n");
     await writeFile(path.join(worker, ".nycrc"), '{"check-coverage":false}\n');
+    await writeFile(path.join(worker, ".oxlintrc.json"), '{"rules":{}}\n');
     await writeFile(path.join(worker, ".rspec"), "--tag ~focus\n");
     await writeFile(path.join(worker, ".clang-format-ignore"), "**/*\n");
     await writeFile(path.join(worker, ".eslintignore"), "**/*\n");
@@ -3662,6 +3701,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       ".clang-format-ignore",
       ".coveragerc",
       ".nycrc",
+      ".oxlintrc.json",
       ".rspec",
       ".eslintignore",
       ".github/actionlint.yaml",
@@ -3736,7 +3776,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "commit", "-m", "weaken validation policy");
     await assert.rejects(
       assertWorkerChangesAllowed(),
-      /unexplained-policy-relaxation:.*\.bazelrc, \.clang-format, \.clang-format-ignore, \.coveragerc, \.eslintignore, \.github\/actionlint\.yaml, \.justfile, \.markdownlintignore, \.mocharc\.json, \.mvn\/jvm\.config, \.mvn\/maven\.config, \.mvn\/wrapper\/maven-wrapper\.jar, \.mvn\/wrapper\/maven-wrapper\.properties, \.npmrc, \.nycrc, \.prettierignore, \.rspec, \.shellcheckrc, \.stylelintignore, \.swiftlint\.yml, \.yamllint, BUILD, BUILD\.bazel, CMakeLists\.txt, Cargo\.lock, Directory\.Build\.targets, Directory\.Packages\.props, GNUmakefile, MODULE\.bazel, Pipfile, Taskfile\.dist\.yaml, Taskfile\.dist\.yml, Taskfile\.yml, WORKSPACE, WORKSPACE\.bazel, build\.gradle, build\.gradle\.kts, build\.xml, cypress\.config\.ts, directory\.build\.props, eslint\.config\.js, go\.work, gradle\.properties, gradle\/wrapper\/gradle-wrapper\.jar, gradle\/wrapper\/gradle-wrapper\.properties, gradlew, lerna\.json, mvnw, noxfile\.py, nyc\.config\.js, package-lock\.json, package\.json, phpunit\.xml, phpunit\.xml\.dist, pkg\/go\.mod, pnpm-lock\.yaml, pnpm-workspace\.yaml, pom\.xml, prompts\/fixer\.md, pylintrc, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, vitest\.workspace\.ts, workspace\.sln, workspace\.slnx, yarn\.lock/,
+      /unexplained-policy-relaxation:.*\.bazelrc, \.clang-format, \.clang-format-ignore, \.coveragerc, \.eslintignore, \.github\/actionlint\.yaml, \.justfile, \.markdownlintignore, \.mocharc\.json, \.mvn\/jvm\.config, \.mvn\/maven\.config, \.mvn\/wrapper\/maven-wrapper\.jar, \.mvn\/wrapper\/maven-wrapper\.properties, \.npmrc, \.nycrc, \.oxlintrc\.json, \.prettierignore, \.rspec, \.shellcheckrc, \.stylelintignore, \.swiftlint\.yml, \.yamllint, BUILD, BUILD\.bazel, CMakeLists\.txt, Cargo\.lock, Directory\.Build\.targets, Directory\.Packages\.props, GNUmakefile, MODULE\.bazel, Pipfile, Taskfile\.dist\.yaml, Taskfile\.dist\.yml, Taskfile\.yml, WORKSPACE, WORKSPACE\.bazel, build\.gradle, build\.gradle\.kts, build\.xml, cypress\.config\.ts, directory\.build\.props, eslint\.config\.js, go\.work, gradle\.properties, gradle\/wrapper\/gradle-wrapper\.jar, gradle\/wrapper\/gradle-wrapper\.properties, gradlew, lerna\.json, mvnw, noxfile\.py, nyc\.config\.js, package-lock\.json, package\.json, phpunit\.xml, phpunit\.xml\.dist, pkg\/go\.mod, pnpm-lock\.yaml, pnpm-workspace\.yaml, pom\.xml, prompts\/fixer\.md, pylintrc, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, vitest\.workspace\.ts, workspace\.sln, workspace\.slnx, yarn\.lock/,
     );
 
     git(worker, "reset", "--hard", featureHead);

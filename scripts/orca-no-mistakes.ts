@@ -123,6 +123,7 @@ export type WorkerLaunch = {
 export type WorkerResult = {
   deliveryId?: string;
   dispatchId: string;
+  failedOutcome?: boolean;
   report: StageReport;
   taskId: string;
   terminalHandle?: string;
@@ -1150,6 +1151,12 @@ async function runReviewer(
       stage,
       evidenceDir,
     );
+    if (
+      worker.failedOutcome === true &&
+      actionableFindings(validatedReport).length === 0
+    ) {
+      throw new Error(`${stage} worker failed without actionable findings`);
+    }
     return {
       exitCode: exitCodeFor(validatedReport),
       report: validatedReport,
@@ -2355,6 +2362,7 @@ export class CliOrca implements OrcaOperations {
       if (result.error) throw new Error(result.error);
       return {
         deliveryId,
+        failedOutcome: result.failedOutcome,
         report: result.report!,
         taskId,
         dispatchId,
@@ -2461,6 +2469,7 @@ export class CliOrca implements OrcaOperations {
       if (result.error) throw new Error(result.error);
       return {
         deliveryId,
+        failedOutcome: result.failedOutcome,
         report: result.report!,
         taskId,
         dispatchId,
@@ -3603,7 +3612,12 @@ export class CliOrca implements OrcaOperations {
     expectedReportPath?: string,
     acceptFailedReport = false,
     fence?: TimeoutFence,
-  ): Promise<{ deliveryId?: string; error?: string; report?: StageReport }> {
+  ): Promise<{
+    deliveryId?: string;
+    error?: string;
+    failedOutcome?: boolean;
+    report?: StageReport;
+  }> {
     let lastActivityAt = Date.now();
     let lastOutputAt = await this.#workerOutputAt(terminalHandle);
     for (;;) {
@@ -3720,7 +3734,8 @@ export class CliOrca implements OrcaOperations {
             error: `worker ${dispatchId} reported for the wrong task`,
           };
         }
-        if (payload.outcome !== "succeeded" && !acceptFailedReport) {
+        const failedOutcome = payload.outcome !== "succeeded";
+        if (failedOutcome && !acceptFailedReport) {
           return {
             deliveryId: result.deliveryId,
             error: `worker ${dispatchId} failed: ${message.body ?? message.subject ?? ""}`,
@@ -3791,7 +3806,7 @@ export class CliOrca implements OrcaOperations {
               error: `worker ${dispatchId} returned an invalid report`,
             };
           }
-          return { deliveryId: result.deliveryId, report };
+          return { deliveryId: result.deliveryId, failedOutcome, report };
         } catch (error) {
           return {
             deliveryId: result.deliveryId,
@@ -4145,7 +4160,7 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
     (parts.at(-2) === ".mvn" && ["jvm.config", "maven.config"].includes(fileName)) ||
     /^settings\.gradle(?:\.kts)?$/.test(fileName) ||
     (parts[0] !== "docs" && parts.slice(0, -1).includes("prompts")) ||
-    /^(?:(?:vitest|jest|playwright|cypress)\.config\..+|vitest\.workspace\..+|nyc\.config\..+|\.mocharc(?:\..+)?|karma\.conf\..+|phpunit\.xml(?:\.dist)?|eslint\.config\..+|\.eslintrc(?:\..+)?|\.eslintignore|prettier\.config\..+|\.prettierrc(?:\..+)?|\.prettierignore|biome\.jsonc?|deno\.jsonc?|\.coveragerc|\.nycrc(?:\..+)?|\.rspec|\.yamllint(?:\.ya?ml)?|\.editorconfig|\.flake8|\.?ruff\.toml|\.?mypy\.ini|\.?pylintrc|pyrightconfig\.json|\.rubocop\.ya?ml|\.?swiftlint\.ya?ml|stylelint\.config\..+|\.stylelintrc(?:\..+)?|\.stylelintignore|\.?markdownlint(?:-cli2)?(?:\..+)?|\.markdownlintignore|\.shellcheckrc|actionlint\.ya?ml|\.golangci\.(?:ya?ml|toml|json)|\.?rustfmt\.toml|\.?clippy\.toml|\.clang-format|\.clang-format-ignore|\.clang-tidy|analysis_options\.yaml|checkstyle\.xml|detekt\.ya?ml|phpcs\.xml(?:\.dist)?|phpstan(?:\.[^.]+)?\.neon(?:\.dist)?|sonar-project\.properties|tsconfig(?:\.[^.]+)*\.json|tslint(?:\.[^.]+)*\.json)$/.test(
+    /^(?:(?:vitest|jest|playwright|cypress)\.config\..+|vitest\.workspace\..+|nyc\.config\..+|\.mocharc(?:\..+)?|karma\.conf\..+|phpunit\.xml(?:\.dist)?|eslint\.config\..+|\.eslintrc(?:\..+)?|\.eslintignore|\.oxlintrc\.json|prettier\.config\..+|\.prettierrc(?:\..+)?|\.prettierignore|biome\.jsonc?|deno\.jsonc?|\.coveragerc|\.nycrc(?:\..+)?|\.rspec|\.yamllint(?:\.ya?ml)?|\.editorconfig|\.flake8|\.?ruff\.toml|\.?mypy\.ini|\.?pylintrc|pyrightconfig\.json|\.rubocop\.ya?ml|\.?swiftlint\.ya?ml|stylelint\.config\..+|\.stylelintrc(?:\..+)?|\.stylelintignore|\.?markdownlint(?:-cli2)?(?:\..+)?|\.markdownlintignore|\.shellcheckrc|actionlint\.ya?ml|\.golangci\.(?:ya?ml|toml|json)|\.?rustfmt\.toml|\.?clippy\.toml|\.clang-format|\.clang-format-ignore|\.clang-tidy|analysis_options\.yaml|checkstyle\.xml|detekt\.ya?ml|phpcs\.xml(?:\.dist)?|phpstan(?:\.[^.]+)?\.neon(?:\.dist)?|sonar-project\.properties|tsconfig(?:\.[^.]+)*\.json|tslint(?:\.[^.]+)*\.json)$/.test(
       fileName,
     )
   );

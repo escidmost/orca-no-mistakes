@@ -91,8 +91,8 @@ Each stage and role resolves its own agent from the configuration tiers, and the
 - Jest `<rootDir>` references, local Python imports from protected runners, and shell subshell directory scopes participate in transitive validation-entrypoint resolution. Directory changes made inside `( ... )` are restored before later outer commands are resolved.
 - Jenkins `dir(...)` scopes, including nested scopes, participate in the same validation-entrypoint resolution without inheriting shell-local `cd` state from separate `sh` blocks.
 - Python `from package import module` and relative `from . import module` statements protect the corresponding tracked validation modules.
-- Yamllint's implicit `.yamllint`, `.yamllint.yml`, and `.yamllint.yaml` files are protected validation policy.
-- A reviewer `worker_done` outcome may be `failed` when the assigned, path-confined report was still written successfully; reviewer findings, not the transport outcome label, determine whether the stage passes or opens a gate. Fixer workers retain strict successful-outcome handling.
+- Yamllint's implicit `.yamllint`, `.yamllint.yml`, and `.yamllint.yaml` files and Oxlint's `.oxlintrc.json` are protected validation policy.
+- A reviewer `worker_done` outcome may be `failed` when the assigned, path-confined report was still written successfully, but that report is accepted only when canonical validation finds at least one actionable finding. A failed reviewer with an empty or informational-only report remains a worker failure. Fixer workers retain strict successful-outcome handling.
 
 - Co-located Vitest/Playwright `expect.soft(...)` and `expect.poll(...)` assertions are protected.
 - Codex `-c model=...` and `-c model_reasoning_effort=...` pins take precedence over mapped values, normalize whitespace around `=`, and must contain nonempty values. Worker waits ignore stale messages from prior sequential dispatches instead of failing the active worker.
