@@ -2863,6 +2863,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(repo, "checkout", "-b", "feature");
     await writeFile(path.join(repo, "feature.ts"), "export const value = 1;\n");
     await mkdir(path.join(repo, "spec"));
+    await mkdir(path.join(repo, "spec/support"));
     await mkdir(path.join(repo, "cypress/e2e"), { recursive: true });
     await mkdir(path.join(repo, "e2e"));
     await mkdir(path.join(repo, "features"));
@@ -2880,6 +2881,10 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await mkdir(path.join(repo, "t"));
     await mkdir(path.join(repo, "__fixtures__"));
     await writeFile(path.join(repo, "spec/openapi.yaml"), "openapi: 3.1.0\n");
+    await writeFile(
+      path.join(repo, "spec/support/shared_context.rb"),
+      "shared_context 'authenticated' do\n  before { sign_in }\nend\n",
+    );
     await writeFile(
       path.join(repo, "cypress/e2e/login.cy.ts"),
       "expect(true).to.equal(true);\n",
@@ -3003,7 +3008,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     await writeFile(
       path.join(repo, ".github/workflows/ci.yml"),
-      "- uses: ./\n- uses: ./.github/actions/check\n- uses: ./ci/check\n- run: ${{ github.workspace }}/scripts/workspace-verify.sh\n- run: .\\scripts\\check.ps1\n- run: ./check.sh\n  working-directory: ${{ github.workspace }}/commands/\n- run: ./lint.sh\n  working-directory: other\n- run: |\n    cd shell-commands\n    ./check.sh\n",
+      "- uses: ./\n- uses: ./.github/actions/check\n- uses: ./ci/check/\n- run: ${{ github.workspace }}/scripts/workspace-verify.sh\n- run: .\\scripts\\check.ps1\n- run: ./check.sh\n  working-directory: ${{ github.workspace }}/commands/\n- run: .\\windows-check.ps1\n  working-directory: commands\\\n- run: ./lint.sh\n  working-directory: other\n- run: |\n    cd shell-commands\n    ./check.sh\n",
     );
     await writeFile(
       path.join(repo, "action.yml"),
@@ -3033,6 +3038,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "require('child_process').execFileSync('npm', ['test']);\n",
     );
     await writeFile(path.join(repo, "commands/check.sh"), "npm test\n");
+    await writeFile(path.join(repo, "commands/windows-check.ps1"), "npm test\n");
     await writeFile(path.join(repo, "other/check.sh"), "export OTHER_CHECK=1\n");
     await writeFile(path.join(repo, "other/lint.sh"), "npm run lint\n");
     await writeFile(path.join(repo, "shell-commands/check.sh"), "npm test\n");
@@ -3073,6 +3079,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "main.tftest.hcl",
       "package.json",
       "spec/openapi.yaml",
+      "spec/support/shared_context.rb",
       "scripts/test-harness.ts",
       "scripts/test-runner.ts",
       "scripts/verify-ci.sh",
@@ -3112,6 +3119,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "ci/check/sub/action.yml",
       "ci/check/sub/dist/index.js",
       "commands/check.sh",
+      "commands/windows-check.ps1",
       "dist/index.js",
       "gradle/wrapper/gradle-wrapper.properties",
       "gradlew",
@@ -3381,6 +3389,18 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await assertWorkerChangesAllowed();
 
     git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "spec/support/shared_context.rb"),
+      "shared_context 'authenticated' do\nend\n",
+    );
+    git(worker, "add", "spec/support/shared_context.rb");
+    git(worker, "commit", "-m", "weaken RSpec support helper");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified pre-existing test files: spec\/support\/shared_context\.rb/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
     await writeFile(path.join(worker, "action.yml"), "runs: { using: node20, main: dist/noop.js }\n");
     await writeFile(path.join(worker, "dist/index.js"), "process.exit(0);\n");
     git(worker, "add", "action.yml", "dist/index.js");
@@ -3453,6 +3473,15 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await assert.rejects(
       assertWorkerChangesAllowed(),
       /protected validation policy files: commands\/check\.sh/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "commands/windows-check.ps1"), "exit 0\n");
+    git(worker, "add", "commands/windows-check.ps1");
+    git(worker, "commit", "-m", "disable Windows composed validation entrypoint");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /protected validation policy files: commands\/windows-check\.ps1/,
     );
 
     git(worker, "reset", "--hard", featureHead);
@@ -5401,6 +5430,76 @@ if (args[0] === 'worktree' && args[1] === 'create') {
         assert.match(error.message, /acp target gemini-dev failed \(exit 7\)/);
         return true;
       },
+    );
+
+    const callsBeforeAbort = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n").length;
+    const preAbortedController = new AbortController();
+    preAbortedController.abort();
+    await assert.rejects(
+      orca.startWorker(
+        "task-acp-pre-aborted",
+        {
+          agent: { harness: "acp:gemini-dev" },
+          name: "acp-worker-pre-aborted",
+          prompt: "Review now.",
+          role: "reviewer",
+          stage: "review",
+          worktree: "current",
+        },
+        {
+          aborted: true,
+          deadlineSatisfied: false,
+          signal: preAbortedController.signal,
+        },
+      ),
+      /cancelled/,
+    );
+    assert.equal(
+      (await readFile(callsPath, "utf8")).trim().split("\n").length,
+      callsBeforeAbort,
+      "an already-aborted ACP attempt never launches acpx",
+    );
+
+    const blockingAcpx = path.join(temp, "acpx-blocking");
+    await writeFile(
+      blockingAcpx,
+      "#!/usr/bin/env node\nsetInterval(() => {}, 1000)\n",
+    );
+    await chmod(blockingAcpx, 0o755);
+    const blocking = new CliOrca({
+      acpxCommand: blockingAcpx,
+      command: fakeOrca,
+      cwd: temp,
+    });
+    const activeController = new AbortController();
+    const activeFence = {
+      aborted: false,
+      deadlineSatisfied: false,
+      signal: activeController.signal,
+    };
+    const startedAt = Date.now();
+    const activeAttempt = blocking.startWorker(
+      "task-acp-aborted",
+      {
+        agent: { harness: "acp:gemini-dev" },
+        name: "acp-worker-aborted",
+        prompt: "Review now.",
+        role: "reviewer",
+        stage: "review",
+        worktree: "current",
+      },
+      activeFence,
+    );
+    setTimeout(() => {
+      activeFence.aborted = true;
+      activeController.abort();
+    }, 50);
+    await assert.rejects(activeAttempt, /aborted|cancelled/i);
+    assert.ok(
+      Date.now() - startedAt < 2_000,
+      "an in-flight ACP process is aborted promptly",
     );
   } finally {
     await rm(temp, { recursive: true, force: true });

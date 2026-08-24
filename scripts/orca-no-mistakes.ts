@@ -3099,6 +3099,9 @@ export class CliOrca implements OrcaOperations {
     let cwd = this.#cwd;
     let worktreeId: string | undefined;
     try {
+      if (fence?.aborted) {
+        throw new Error(`${launch.stage} worker attempt was cancelled`);
+      }
       if (launch.worktree === "new-child") {
         const branch =
           launch.commitOid ??
@@ -3140,6 +3143,9 @@ export class CliOrca implements OrcaOperations {
         cwd = created.worktree.path;
         await this.#detachWorkerWorktree(launch, cwd);
       }
+      if (fence?.aborted) {
+        throw new Error(`${launch.stage} worker attempt was cancelled`);
+      }
       const invocation = acpRunnerInvocation({
         effort: agent.effort,
         model: agent.model,
@@ -3151,6 +3157,7 @@ export class CliOrca implements OrcaOperations {
       try {
         result = await command(this.#acpxCommand, invocation.args, cwd, {
           allowFailure: true,
+          abortSignal: fence?.signal,
           timeoutMs: agent.timeoutMs ?? WORKER_IDLE_TIMEOUT_MS,
         });
       } catch (error) {
@@ -3847,7 +3854,11 @@ function isTestPath(filePath: string): boolean {
   const parts = filePath.split("/");
   const fileName = parts.at(-1) ?? "";
   const fileStem = fileName.replace(/\.[^.]+$/, "");
+  const singularSpecSource =
+    parts.slice(0, -1).some((part) => part.toLowerCase() === "spec") &&
+    !/\.(?:ya?ml|json|md|txt|toml)$/i.test(fileName);
   return (
+    singularSpecSource ||
     parts
       .slice(0, -1)
       .some((part) =>
@@ -3998,7 +4009,7 @@ function containsPathReference(source: string, reference: string): boolean {
     .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
     .join("[/\\\\]");
   return new RegExp(
-    `(?:^|[^A-Za-z0-9_./\\\\-])(?:\\.[/\\\\])?${escaped}(?=$|[^A-Za-z0-9_./\\\\-])`,
+    `(?:^|[^A-Za-z0-9_./\\\\-])(?:\\.[/\\\\])?${escaped}(?:[/\\\\])?(?=$|[^A-Za-z0-9_./\\\\-])`,
     "m",
   ).test(source);
 }
@@ -4020,7 +4031,7 @@ function normalizeReferencedDirectory(directory: string): string {
     .normalize(
       directory
         .trim()
-        .replace(/\\\\/g, "/")
+        .replace(/\\/g, "/")
         .replace(
           /^(?:\$\{\{[^}\n]+\}\}|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?)(?:\/|$)/,
           "",
@@ -4035,10 +4046,14 @@ function shellCommandReferencesTarget(
   directories: ReadonlySet<string>,
   basename: string,
 ): boolean {
+  const normalizedCommand = command.replace(/\\/g, "/");
   return [...directories].some((directory) => {
     if (!directory || directory === ".") return false;
-    const escaped = directory.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const composed = command.match(
+    const escaped = normalizeReferencedDirectory(directory).replace(
+      /[.*+?^${}()|[\]\\]/g,
+      "\\$&",
+    );
+    const composed = normalizedCommand.match(
       new RegExp(
         `\\bcd\\s+["']?(?:\\./)?${escaped}/?["']?\\s*(?:(?:&&|;)\\s*|\\r?\\n\\s*)[^\\n]*`,
         "m",
