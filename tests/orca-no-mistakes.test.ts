@@ -8267,6 +8267,32 @@ test("StageLog leaves a complete log unmarked", async () => {
   }
 });
 
+test("StageLog restricts artifact directory and log permissions", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-permissions-"));
+  try {
+    const logsDir = path.join(temp, "logs");
+    const logPath = path.join(logsDir, "review_r0.log");
+    await mkdir(logsDir, { recursive: true, mode: 0o755 });
+    await chmod(logsDir, 0o755);
+    await writeFile(logPath, "existing\n", { mode: 0o644 });
+    await chmod(logPath, 0o644);
+
+    const log = new StageLog(logPath, 2_048);
+    await log.append("new output\n");
+    await log.close();
+    const newLogPath = path.join(logsDir, "lint_r0.log");
+    const newLog = new StageLog(newLogPath, 2_048);
+    await newLog.append("new file\n");
+    await newLog.close();
+
+    assert.equal((await stat(logsDir)).mode & 0o777, 0o700);
+    assert.equal((await stat(logPath)).mode & 0o777, 0o600);
+    assert.equal((await stat(newLogPath)).mode & 0o777, 0o600);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test("StageLog holds every worker of a round to one shared cap", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-share-"));
   try {

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdirSync, readFileSync } from 'node:fs'
-import { appendFile, mkdir, stat } from 'node:fs/promises'
+import { appendFile, chmod, mkdir, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -211,7 +211,7 @@ export class StageLog {
     if (pending.length === 0) return
     if (this.#headBytes < this.#keep) {
       const head = pending.subarray(0, this.#keep - this.#headBytes)
-      await appendFile(this.#path, head)
+      await appendFile(this.#path, head, { mode: 0o600 })
       this.#headBytes += head.length
       pending = pending.subarray(head.length)
     }
@@ -236,10 +236,11 @@ export class StageLog {
     if (this.#dropped > 0) {
       await appendFile(
         this.#path,
-        `\n[no-mistakes: log truncated; dropped ${this.#dropped} middle bytes]\n`
+        `\n[no-mistakes: log truncated; dropped ${this.#dropped} middle bytes]\n`,
+        { mode: 0o600 },
       )
     }
-    await appendFile(this.#path, Buffer.concat(this.#tail))
+    await appendFile(this.#path, Buffer.concat(this.#tail), { mode: 0o600 })
     this.#tail = []
   }
 
@@ -248,10 +249,17 @@ export class StageLog {
   async #start(): Promise<void> {
     if (this.#started) return
     this.#started = true
-    await mkdir(path.dirname(this.#path), { recursive: true })
-    const existing = await stat(this.#path)
-      .then((entry) => entry.size)
-      .catch(() => 0)
+    const directory = path.dirname(this.#path)
+    await mkdir(directory, { recursive: true, mode: 0o700 })
+    await chmod(directory, 0o700)
+    let existing = 0
+    try {
+      const entry = await stat(this.#path)
+      existing = entry.size
+      await chmod(this.#path, 0o600)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
     this.#headBytes = existing
     // The same 512 bytes `keep` reserves for one marker are reserved again on
     // reopen, so a second worker's marker cannot push the file over the cap.
