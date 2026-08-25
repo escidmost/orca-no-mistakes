@@ -2662,6 +2662,10 @@ export class CliOrca implements OrcaOperations {
       // Bind before the checks below: this path closes the receipt's terminal
       // in its own catch, so launch and readiness diagnostics from a failed
       // native candidate would otherwise be gone before any drain could run.
+      // ponytail: the handle only exists once the blocking worker-start
+      // returns, so a native worker that prints and then hangs is captured
+      // only if the coordinator survives that call. Binding earlier needs
+      // worker-start to expose its terminal before it waits for readiness.
       if (terminalHandle) await this.#bindStageLog(terminalHandle, launch);
       worktreeId = receipt.worktree?.id ?? receipt.worker?.worktreeId;
       const worktreePath =
@@ -3850,6 +3854,9 @@ export class CliOrca implements OrcaOperations {
       // shared cursor past it, so the new log would never see it.
       await this.#releaseStageLog(terminalHandle);
     }
+    // A new round writes a new file, so the previous round's last line must
+    // not suppress identical text at the start of this one.
+    this.#terminalLastLines.delete(terminalHandle);
     const log = new StageLog(launch.logPath);
     // Draining starts here, not when the coordinator begins waiting for a
     // report: a worker can print startup diagnostics and then hang in
@@ -3967,8 +3974,11 @@ export class CliOrca implements OrcaOperations {
       console.error(
         `warning: could not capture worker output for ${terminalHandle}: ${String(error)}`,
       );
+    } finally {
+      // Every ordinary exit above returns from inside the try, so this only
+      // runs reliably from a finally.
+      if (exhaustive) await this.#captureFinalPartial(terminalHandle, log);
     }
-    if (exhaustive) await this.#captureFinalPartial(terminalHandle, log);
   }
 
   async #readTerminal(

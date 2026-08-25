@@ -346,15 +346,28 @@ export class StageLog {
   }
 
   async #absorb(text: string): Promise<void> {
-    const pending = Buffer.from(text, 'utf8')
+    let pending = Buffer.from(text, 'utf8')
     if (pending.length === 0) return
-    // Everything reaches disk as it arrives. Keeping the tail in memory until
-    // close would mean a coordinator that dies mid-run leaves only the head.
-    await this.#write(pending)
     this.#originalBytes += pending.length
-    this.#fileBytes += pending.length
     this.#hasNewOutput = true
-    if (this.#fileBytes > this.#maxBytes) await this.#compact()
+    // Everything reaches disk as it arrives -- keeping the tail in memory
+    // until close would mean a coordinator that dies mid-run leaves only the
+    // head -- but never more than the cap at a time. One terminal page can
+    // carry a single enormous line, and writing it whole would put an
+    // oversized artifact on disk that a crash then leaves behind.
+    while (pending.length > 0) {
+      const room = Math.max(0, this.#maxBytes - this.#fileBytes)
+      if (room === 0) {
+        const before = this.#fileBytes
+        await this.#compact()
+        if (this.#fileBytes >= before) return
+        continue
+      }
+      const slice = pending.subarray(0, room)
+      await this.#write(slice)
+      this.#fileBytes += slice.length
+      pending = pending.subarray(slice.length)
+    }
   }
 
   /**
@@ -372,6 +385,11 @@ export class StageLog {
    * check could reject it. Unlinking only drops the planted name.
    */
   async #replaceFile(targetPath: string, parts: Buffer[]): Promise<void> {
+    // The chain is checked again on every replacement, not just at open: a
+    // directory validated once can be renamed away and replaced with a link
+    // into the repository before the log is compacted or its sidecar written.
+    const directory = path.dirname(targetPath)
+    await assertNoSymlinkChain(path.dirname(directory), directory)
     const stagingPath = `${targetPath}.staging`
     await rm(stagingPath, { force: true })
     const staging = await open(
