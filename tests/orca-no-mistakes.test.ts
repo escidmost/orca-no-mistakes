@@ -10,6 +10,7 @@ import {
   realpath,
   rm,
   stat,
+  symlink,
   utimes,
   writeFile,
 } from "node:fs/promises";
@@ -8252,10 +8253,30 @@ test("StageLog streams the head to disk and truncates oversized output head-and-
     assert.ok(!written.includes("MIDDLE"));
     assert.match(
       written,
-      /\[no-mistakes: log truncated; dropped \d+ middle bytes\]/,
+      /\[no-mistakes: log truncated; dropped \d+ bytes; original bytes \d+; retained ranges 0-\d+, \d+-\d+\]/,
     );
     assert.equal(written.match(/log truncated/g)?.length, 1);
     assert.ok(Buffer.byteLength(written) <= 2_048);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("StageLog rejects symlinked log paths", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-symlink-"));
+  try {
+    const directory = path.join(temp, "logs");
+    const target = path.join(temp, "outside.log");
+    const logPath = path.join(directory, "review_r0.log");
+    await mkdir(directory, { recursive: true });
+    await writeFile(target, "safe\n");
+    await symlink(target, logPath);
+
+    await assert.rejects(
+      new StageLog(logPath, 2_048).append("must not escape\n"),
+      /ELOOP|symbolic link|too many levels/i,
+    );
+    assert.equal(await readFile(target, "utf8"), "safe\n");
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
@@ -8319,6 +8340,7 @@ test("StageLog holds every worker of a round to one shared cap", async () => {
     assert.ok(Buffer.byteLength(written) <= 2_048);
     // The first worker still owns the head, so the round reads in order.
     assert.ok(written.startsWith("fff"));
+    assert.match(written, /original bytes 6000/);
   } finally {
     await rm(temp, { recursive: true, force: true });
   }

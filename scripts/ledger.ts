@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdirSync, readFileSync } from 'node:fs'
-import { appendFile, chmod, mkdir, stat } from 'node:fs/promises'
+import { O_APPEND, O_CREAT, O_NOFOLLOW, O_RDWR } from 'node:constants'
+import { chmod, mkdir, open } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -168,6 +169,8 @@ export function verifyManifest(manifest: PassedAttestationManifest): void {
 }
 
 export const MAX_LOG_BYTES = 50 * 1024 * 1024
+const TRUNCATION_MARKER_PATTERN =
+  /\[no-mistakes: log truncated; dropped (\d+) bytes; original bytes (\d+); retained ranges [^\]]+\]/g
 
 export function capLog(content: string, maxBytes = MAX_LOG_BYTES): string {
   const source = Buffer.from(content, 'utf8')
@@ -198,6 +201,9 @@ export class StageLog {
   #tail: Buffer[] = []
   #tailBytes = 0
   #tailKeep = 0
+  #file?: Awaited<ReturnType<typeof open>>
+  #originalBytes = 0
+  #hasNewOutput = false
 
   constructor(filePath: string, maxBytes = MAX_LOG_BYTES) {
     this.#path = filePath
@@ -209,9 +215,11 @@ export class StageLog {
     await this.#start()
     let pending = Buffer.from(chunk, 'utf8')
     if (pending.length === 0) return
+    this.#originalBytes += pending.length
+    this.#hasNewOutput = true
     if (this.#headBytes < this.#keep) {
       const head = pending.subarray(0, this.#keep - this.#headBytes)
-      await appendFile(this.#path, head, { mode: 0o600 })
+      await this.#write(head)
       this.#headBytes += head.length
       pending = pending.subarray(head.length)
     }
@@ -228,45 +236,68 @@ export class StageLog {
     }
   }
 
-  /** Flushes the retained tail behind a marker, so a truncated log is never
-   *  mistaken for a complete one. */
   async close(): Promise<void> {
-    if (this.#tail.length === 0) return
-    await this.#start()
-    if (this.#dropped > 0) {
-      await appendFile(
-        this.#path,
-        `\n[no-mistakes: log truncated; dropped ${this.#dropped} middle bytes]\n`,
-        { mode: 0o600 },
-      )
+    try {
+      if (!this.#hasNewOutput) return
+      await this.#start()
+      if (this.#dropped > 0) {
+        await this.#write(this.#truncationMarker())
+      }
+      if (this.#tail.length > 0) {
+        await this.#write(Buffer.concat(this.#tail))
+      }
+      this.#tail = []
+    } finally {
+      const file = this.#file
+      this.#file = undefined
+      if (file) await file.close()
     }
-    await appendFile(this.#path, Buffer.concat(this.#tail), { mode: 0o600 })
-    this.#tail = []
   }
 
-  /** Charges this instance for whatever the round's earlier workers already
-   *  wrote, so both budgets shrink instead of restarting per worker. */
   async #start(): Promise<void> {
     if (this.#started) return
-    this.#started = true
     const directory = path.dirname(this.#path)
     await mkdir(directory, { recursive: true, mode: 0o700 })
     await chmod(directory, 0o700)
-    let existing = 0
-    try {
-      const entry = await stat(this.#path)
-      existing = entry.size
-      await chmod(this.#path, 0o600)
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-    }
-    this.#headBytes = existing
-    // The same 512 bytes `keep` reserves for one marker are reserved again on
-    // reopen, so a second worker's marker cannot push the file over the cap.
-    this.#tailKeep = Math.max(
-      0,
-      Math.min(this.#keep, this.#maxBytes - existing - 512)
+    const file = await open(
+      this.#path,
+      O_APPEND | O_CREAT | O_RDWR | O_NOFOLLOW,
+      0o600,
     )
+    try {
+      const existing = (await file.stat()).size
+      await file.chmod(0o600)
+      const prior = [...(await file.readFile('utf8')).matchAll(TRUNCATION_MARKER_PATTERN)].at(-1)
+      this.#originalBytes = prior ? Number(prior[2]) : existing
+      this.#dropped = prior ? Number(prior[1]) : 0
+      this.#file = file
+      this.#started = true
+      this.#headBytes = existing
+      this.#tailKeep = Math.max(
+        0,
+        Math.min(this.#keep, this.#maxBytes - existing - 512),
+      )
+    } catch (error) {
+      await file.close()
+      throw error
+    }
+  }
+
+  #truncationMarker(): string {
+    const headBytes = Math.min(this.#originalBytes, this.#keep)
+    const ranges = []
+    if (headBytes > 0) ranges.push(`0-${headBytes - 1}`)
+    if (this.#tailBytes > 0) {
+      ranges.push(
+        `${this.#originalBytes - this.#tailBytes}-${this.#originalBytes - 1}`,
+      )
+    }
+    return `\n[no-mistakes: log truncated; dropped ${this.#dropped} bytes; original bytes ${this.#originalBytes}; retained ranges ${ranges.join(", ") || "none"}]\n`
+  }
+
+  async #write(data: string | Buffer): Promise<void> {
+    if (!this.#file) throw new Error('stage log is not open')
+    await this.#file.writeFile(data)
   }
 }
 
