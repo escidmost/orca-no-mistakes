@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdirSync, readFileSync } from 'node:fs'
 import { O_APPEND, O_CREAT, O_NOFOLLOW, O_RDWR } from 'node:constants'
-import { chmod, lstat, mkdir, open, realpath } from 'node:fs/promises'
+import { chmod, lstat, mkdir, open, readFile, realpath, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -171,45 +171,78 @@ export function verifyManifest(manifest: PassedAttestationManifest): void {
 export const MAX_LOG_BYTES = 50 * 1024 * 1024
 const LOG_MARKER_RESERVE_BYTES = 512
 
-function redactKnownSecrets(content: string): string {
-  let redacted = content
-  const secrets = Object.entries(process.env)
+/**
+ * Values of environment variables whose names look like credentials, longest
+ * first so a token containing a shorter one is masked as a whole.
+ */
+function knownSecrets(): string[] {
+  return Object.entries(process.env)
     .flatMap(([name, value]) =>
-      value && value.length >= 8 &&
-      /(?:access[_-]?key|api[_-]?key|auth|credential|password|secret|token)/i.test(name)
+      value &&
+      value.length >= 4 &&
+      /(?:access[_-]?key|api[_-]?key|auth|credential|passphrase|password|private[_-]?key|secret|session|token)/i.test(
+        name,
+      )
         ? [value]
         : [],
     )
     .sort((left, right) => right.length - left.length)
+}
+
+function applyRedaction(content: string, secrets: string[]): string {
+  let redacted = content
   for (const secret of secrets) redacted = redacted.split(secret).join('[REDACTED]')
   return redacted
 }
 
-async function rejectSymlinkPath(rootPath: string, targetPath = rootPath): Promise<void> {
+function redactKnownSecrets(content: string): string {
+  return applyRedaction(content, knownSecrets())
+}
+
+/**
+ * Length of the trailing text that could still turn into a secret once more
+ * arrives. Holding back a fixed window instead would stall ordinary output --
+ * and a transcript that only lands at close is exactly what this log exists to
+ * avoid -- so only a genuine partial match is withheld.
+ */
+function pendingSecretPrefix(text: string, secrets: string[]): number {
+  const longest = secrets[0]?.length ?? 1
+  for (let length = Math.min(text.length, longest - 1); length > 0; length -= 1) {
+    const suffix = text.slice(text.length - length)
+    if (secrets.some((secret) => secret.length > length && secret.startsWith(suffix))) {
+      return length
+    }
+  }
+  return 0
+}
+
+/**
+ * Rejects a symlink anywhere from the artifact root down to `target`, including
+ * the root itself. Checking only the final parent leaves a symlinked component
+ * free to land the log inside the repository once `mkdir -p` follows it; the
+ * walk stops at the first component that does not exist yet, so callers run it
+ * again after creating the directory when the whole chain is present. The log
+ * file itself is left to `O_NOFOLLOW` on open.
+ */
+async function assertNoSymlinkChain(rootPath: string, targetPath: string): Promise<void> {
   const root = path.resolve(rootPath)
   const target = path.resolve(targetPath)
   const relative = path.relative(root, target)
   if (relative.startsWith('..') || path.isAbsolute(relative)) {
     throw new Error('stage log path escapes artifact root')
   }
-  try {
-    if ((await lstat(root)).isSymbolicLink()) {
-      throw new Error('stage log path must not contain symlinks')
-    }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-    return
-  }
   let current = root
-  for (const component of relative.split(path.sep).filter(Boolean)) {
-    current = path.join(current, component)
+  for (const component of ['', ...relative.split(path.sep).filter(Boolean)]) {
+    if (component) current = path.join(current, component)
+    let entry
     try {
-      if ((await lstat(current)).isSymbolicLink()) {
-        throw new Error('stage log path must not contain symlinks')
-      }
+      entry = await lstat(current)
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-      break
+      return
+    }
+    if (entry.isSymbolicLink()) {
+      throw new Error('stage log path must not contain symlinks')
     }
   }
 }
@@ -241,27 +274,76 @@ export class StageLog {
   readonly #path: string
   readonly #keep: number
   readonly #maxBytes: number
-  #dropped = 0
+  #carry = ''
   #headBytes = 0
+  #originalBytes = 0
+  #originalBytesKnown = true
   #started = false
   #tail: Buffer[] = []
   #tailBytes = 0
   #tailKeep = 0
   #file?: Awaited<ReturnType<typeof open>>
-  #originalBytes = 0
-  #originalBytesKnown = true
   #hasNewOutput = false
 
   constructor(filePath: string, maxBytes = MAX_LOG_BYTES) {
     this.#path = filePath
     this.#maxBytes = maxBytes
-    this.#keep = Math.max(0, Math.floor((maxBytes - 512) / 2))
+    this.#keep = Math.max(0, Math.floor((maxBytes - LOG_MARKER_RESERVE_BYTES) / 2))
   }
 
   async append(chunk: string): Promise<void> {
-    let pending = Buffer.from(redactKnownSecrets(chunk), 'utf8')
-    if (pending.length === 0) return
+    if (chunk.length === 0) return
     await this.#start()
+    const secrets = knownSecrets()
+    const redacted = applyRedaction(`${this.#carry}${chunk}`, secrets)
+    // Hold back only a trailing partial secret, so a credential split across two
+    // drain pages is whole the next time redaction runs while ordinary output
+    // still reaches disk immediately. `[REDACTED]` contains no secret, so
+    // re-scanning what is carried stays idempotent.
+    const hold = pendingSecretPrefix(redacted, secrets)
+    this.#carry = redacted.slice(redacted.length - hold)
+    await this.#absorb(redacted.slice(0, redacted.length - hold))
+  }
+
+  async close(): Promise<void> {
+    try {
+      if (this.#carry.length > 0) {
+        const carried = this.#carry
+        this.#carry = ''
+        await this.#start()
+        await this.#absorb(redactKnownSecrets(carried))
+      }
+      // Always open, even with nothing to write: a launch that produced no
+      // output should leave an empty transcript rather than no evidence at all.
+      await this.#start()
+      if (!this.#hasNewOutput) return
+      let marker: Buffer | undefined
+      if (this.#droppedBytes() > 0) {
+        this.#trimTail(
+          Math.max(0, this.#maxBytes - this.#headBytes - LOG_MARKER_RESERVE_BYTES),
+        )
+        const candidate = Buffer.from(this.#truncationMarker(), 'utf8')
+        if (candidate.length <= LOG_MARKER_RESERVE_BYTES) {
+          marker = candidate
+          await this.#write(marker)
+        }
+      }
+      this.#trimTail(
+        Math.max(0, this.#maxBytes - this.#headBytes - (marker?.length ?? 0)),
+      )
+      if (this.#tail.length > 0) await this.#write(Buffer.concat(this.#tail))
+      this.#tail = []
+      await this.#recordOriginalBytes()
+    } finally {
+      const file = this.#file
+      this.#file = undefined
+      if (file) await file.close()
+    }
+  }
+
+  async #absorb(text: string): Promise<void> {
+    let pending = Buffer.from(text, 'utf8')
+    if (pending.length === 0) return
     this.#originalBytes += pending.length
     this.#hasNewOutput = true
     if (this.#headBytes < this.#keep) {
@@ -273,42 +355,7 @@ export class StageLog {
     if (pending.length === 0) return
     this.#tail.push(pending)
     this.#tailBytes += pending.length
-    while (this.#tailBytes > this.#tailKeep) {
-      const oldest = this.#tail[0]!
-      const cut = Math.min(oldest.length, this.#tailBytes - this.#tailKeep)
-      if (cut === oldest.length) this.#tail.shift()
-      else this.#tail[0] = oldest.subarray(cut)
-      this.#tailBytes -= cut
-      this.#dropped += cut
-    }
-  }
-
-  async close(): Promise<void> {
-    try {
-      if (!this.#hasNewOutput) return
-      await this.#start()
-      let marker: Buffer | undefined
-      if (this.#dropped > 0) {
-        this.#trimTail(Math.max(0, this.#maxBytes - this.#headBytes - LOG_MARKER_RESERVE_BYTES))
-        marker = Buffer.from(this.#truncationMarker(), 'utf8')
-        this.#trimTail(Math.max(0, this.#maxBytes - this.#headBytes - marker.length))
-        marker = Buffer.from(this.#truncationMarker(), 'utf8')
-        if (marker.length <= this.#maxBytes - this.#headBytes) {
-          await this.#write(marker)
-        } else {
-          marker = undefined
-        }
-      }
-      this.#trimTail(Math.max(0, this.#maxBytes - this.#headBytes - (marker?.length ?? 0)))
-      if (this.#tail.length > 0) {
-        await this.#write(Buffer.concat(this.#tail))
-      }
-      this.#tail = []
-    } finally {
-      const file = this.#file
-      this.#file = undefined
-      if (file) await file.close()
-    }
+    this.#trimTail(this.#tailKeep)
   }
 
   async #start(): Promise<void> {
@@ -316,59 +363,83 @@ export class StageLog {
     const logPath = path.resolve(this.#path)
     const directory = path.dirname(logPath)
     const artifactRoot = path.dirname(directory)
-    await rejectSymlinkPath(artifactRoot)
+    await assertNoSymlinkChain(artifactRoot, directory)
     await mkdir(directory, { recursive: true, mode: 0o700 })
-    await rejectSymlinkPath(artifactRoot, directory)
+    await assertNoSymlinkChain(artifactRoot, directory)
     const [canonicalRoot, canonicalDirectory] = await Promise.all([
       realpath(artifactRoot),
       realpath(directory),
     ])
-    const canonicalLog = await realpath(logPath).catch((error: unknown) => {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        return path.join(canonicalDirectory, path.basename(logPath))
-      }
-      throw error
-    })
+    const canonicalLog = path.join(canonicalDirectory, path.basename(logPath))
     if (!isWithin(canonicalRoot, canonicalLog)) {
       throw new Error('stage log path escapes artifact root')
     }
     await chmod(directory, 0o700)
-    const file = await open(
-      logPath,
-      O_APPEND | O_CREAT | O_RDWR | O_NOFOLLOW,
-      0o600,
-    )
+    const file = await open(logPath, O_APPEND | O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
     try {
       const existingBytes = (await file.stat()).size
       if (existingBytes > this.#maxBytes) {
         throw new Error('stage log already exceeds its byte cap')
       }
       await file.chmod(0o600)
-      this.#originalBytesKnown = existingBytes === 0
-      this.#file = file
-      this.#started = true
-      this.#headBytes = existingBytes
+      // The first `keep` bytes are the round's head and never change; whatever
+      // follows is the previous worker's marker and tail, which this worker's
+      // output replaces so the file ends with the round's final tail. Nothing
+      // already on disk is parsed back, so worker text cannot forge accounting.
+      const headBytes = Math.min(existingBytes, this.#keep)
+      if (existingBytes > headBytes) await file.truncate(headBytes)
+      const prior = await this.#priorOriginalBytes()
+      this.#originalBytesKnown = existingBytes === 0 || prior !== undefined
+      this.#originalBytes = prior ?? existingBytes
+      this.#headBytes = headBytes
       this.#tailKeep = Math.max(
         0,
-        Math.min(this.#keep, this.#maxBytes - existingBytes - LOG_MARKER_RESERVE_BYTES),
+        Math.min(this.#keep, this.#maxBytes - headBytes - LOG_MARKER_RESERVE_BYTES),
       )
+      this.#file = file
+      this.#started = true
     } catch (error) {
       await file.close()
       throw error
     }
   }
 
+  #metaPath(): string {
+    return `${path.resolve(this.#path)}.meta`
+  }
+
+  /**
+   * The round's byte total carried between workers. It lives beside the log
+   * rather than inside it because a count parsed back out of the log would be
+   * worker-writable, and a worker could forge its own truncation accounting.
+   */
+  async #priorOriginalBytes(): Promise<number | undefined> {
+    try {
+      const parsed = Number.parseInt((await readFile(this.#metaPath(), 'utf8')).trim(), 10)
+      return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+      throw error
+    }
+  }
+
+  async #recordOriginalBytes(): Promise<void> {
+    if (!this.#originalBytesKnown) return
+    await writeFile(this.#metaPath(), String(this.#originalBytes), { mode: 0o600 })
+  }
+
+  #droppedBytes(): number {
+    return Math.max(0, this.#originalBytes - this.#headBytes - this.#tailBytes)
+  }
+
   #truncationMarker(): string {
-    const headBytes = this.#originalBytesKnown
-      ? Math.min(this.#originalBytes, this.#keep)
-      : this.#headBytes
-    const ranges = []
-    if (headBytes > 0) ranges.push(`0-${headBytes - 1}`)
-    if (this.#tailBytes > 0) {
-      ranges.push(`${headBytes}-${headBytes + this.#tailBytes - 1}`)
+    const ranges: string[] = []
+    if (this.#headBytes > 0) ranges.push(`0-${this.#headBytes - 1}`)
+    if (this.#tailBytes > 0 && this.#originalBytesKnown) {
+      ranges.push(`${this.#originalBytes - this.#tailBytes}-${this.#originalBytes - 1}`)
     }
     const originalBytes = this.#originalBytesKnown ? String(this.#originalBytes) : 'unknown'
-    return `\n[no-mistakes: log truncated; dropped ${this.#dropped} bytes; original bytes ${originalBytes}; retained ranges ${ranges.join(", ") || "none"}]\n`
+    return `\n[no-mistakes: log truncated; dropped ${this.#droppedBytes()} bytes; original bytes ${originalBytes}; retained ranges ${ranges.join(', ') || 'none'}]\n`
   }
 
   #trimTail(limit: number): void {
@@ -378,7 +449,6 @@ export class StageLog {
       if (cut === oldest.length) this.#tail.shift()
       else this.#tail[0] = oldest.subarray(cut)
       this.#tailBytes -= cut
-      this.#dropped += cut
     }
   }
 

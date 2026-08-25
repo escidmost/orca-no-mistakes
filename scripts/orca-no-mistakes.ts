@@ -2190,6 +2190,9 @@ export class CliOrca implements OrcaOperations {
   // Terminal handle -> cursor of the last drained stage-log read, so a retained
   // terminal reused across rounds never replays output into the next log.
   readonly #terminalCursors = new Map<string, string>();
+  // Terminal handle -> the stage log bound to it, created the moment the
+  // terminal exists so capture outlives a failed launch.
+  readonly #terminalLogs = new Map<string, StageLog>();
   // Worktree ID -> the branch Orca minted for it, claimed at creation.
   readonly #workerBranches = new Map<string, string>();
   #runId?: string;
@@ -2299,6 +2302,7 @@ export class CliOrca implements OrcaOperations {
         "unclassified",
         "worker preparation returned no terminal handle",
       );
+    this.#bindStageLog(terminalHandle, launch);
     if (fence?.aborted) {
       await this.#cleanupPreparedWorker(prepared);
       throw new Error(`${launch.stage} worker attempt was cancelled`);
@@ -3783,7 +3787,7 @@ export class CliOrca implements OrcaOperations {
     failedOutcome?: boolean;
     report?: StageReport;
   }> {
-    const log = launch.logPath ? new StageLog(launch.logPath) : undefined;
+    const log = this.#bindStageLog(terminalHandle, launch);
     try {
       return await this.#awaitWorkerReport(
         taskId,
@@ -3794,24 +3798,54 @@ export class CliOrca implements OrcaOperations {
         fence,
       );
     } finally {
-      if (log) {
-        // The terminal is still open here; after this the caller closes it and
-        // whatever was not drained is gone for good.
-        await this.#drainWorkerLog(terminalHandle, log);
-        await log.close().catch(() => {});
-      }
+      // The terminal is still open here; after this the caller closes it and
+      // whatever was not drained is gone for good.
+      await this.#releaseStageLog(terminalHandle);
     }
   }
 
   /** Appends new terminal output to the run's stage log. Capturing a worker's
    *  transcript is diagnostic, so every failure here is swallowed rather than
    *  allowed to fail the stage it was recording. */
+  /** ONM-23: binds the log as soon as a terminal exists — before dispatch and
+   *  prompt launch — so a readiness or preflight failure and a coordinator
+   *  crash both still leave whatever the worker printed. StageLog opens lazily,
+   *  so binding early costs nothing when the worker never speaks. */
+  #bindStageLog(
+    terminalHandle: string,
+    launch: WorkerLaunch,
+  ): StageLog | undefined {
+    if (!launch.logPath) return undefined;
+    const bound = this.#terminalLogs.get(terminalHandle);
+    if (bound) return bound;
+    const log = new StageLog(launch.logPath);
+    this.#terminalLogs.set(terminalHandle, log);
+    return log;
+  }
+
+  /** Drains and closes the log bound to a terminal, if any. Safe to call twice,
+   *  and called before the terminal closes on every teardown path. The read
+   *  cursor deliberately outlives it: a retained fixer terminal reuses the same
+   *  handle next round, and resetting would replay this round into that log. */
+  async #releaseStageLog(terminalHandle: string): Promise<void> {
+    const log = this.#terminalLogs.get(terminalHandle);
+    if (!log) return;
+    this.#terminalLogs.delete(terminalHandle);
+    await this.#drainWorkerLog(terminalHandle, log);
+    await log.close().catch(() => {});
+  }
+
   async #drainWorkerLog(terminalHandle: string, log: StageLog): Promise<void> {
     try {
       for (let page = 0; page < WORKER_LOG_MAX_PAGES; page += 1) {
         const cursor = this.#terminalCursors.get(terminalHandle);
         const result = await this.#json<{
-          terminal?: { nextCursor?: number | string; tail?: string[] };
+          terminal?: {
+            nextCursor?: number | string;
+            oldestCursor?: number | string;
+            tail?: string[];
+            truncated?: boolean;
+          };
         }>(
           [
             "terminal",
@@ -3830,6 +3864,25 @@ export class CliOrca implements OrcaOperations {
           result.terminal?.nextCursor === undefined
             ? undefined
             : String(result.terminal.nextCursor);
+        if (cursor === undefined) {
+          // A first read with no cursor returns a bounded tail preview whose
+          // nextCursor is already the latest, so storing it would skip every
+          // retained line before the preview. Restart from oldestCursor and let
+          // the normal paging below walk forward to the end.
+          const oldest =
+            result.terminal?.oldestCursor === undefined
+              ? undefined
+              : String(result.terminal.oldestCursor);
+          if (oldest !== undefined && oldest !== next) {
+            if (result.terminal?.truncated === true) {
+              await log.append(
+                `\n[no-mistakes: terminal output dropped; retained history began at cursor ${oldest}]\n`,
+              );
+            }
+            this.#terminalCursors.set(terminalHandle, oldest);
+            continue;
+          }
+        }
         // A cursor that does not advance means the host re-served output this
         // log already holds; appending it would grow the file on every drain.
         if (cursor !== undefined && next === cursor) return;
@@ -4124,6 +4177,9 @@ export class CliOrca implements OrcaOperations {
       ]);
     }
     if (resources.terminalHandle) {
+      // Capture owns the terminal until the moment it closes, so a launch that
+      // failed before any report still leaves its transcript on disk.
+      await this.#releaseStageLog(resources.terminalHandle);
       await attempt("terminal close", [
         "terminal",
         "close",

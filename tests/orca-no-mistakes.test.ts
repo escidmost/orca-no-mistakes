@@ -7000,7 +7000,10 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     });
 
     assert.equal(worker.report.summary, "review clean");
-    assert.equal(await readFile(heartbeatProbePath, "utf8"), "npm test\nok 12 passed\n");
+    assert.equal(
+      await readFile(heartbeatProbePath, "utf8"),
+      "npm test\nok 12 passed\ndone\n",
+    );
     assert.equal(
       await readFile(logPath, "utf8"),
       "npm test\nok 12 passed\ndone\n",
@@ -7012,13 +7015,22 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       .map((line) => JSON.parse(line) as string[])
       .filter((args) => args[0] === "terminal" && args[1] === "read");
     // Paging resumes from the cursor, so a terminal reused by a later round
-    // never replays output it already recorded.
-    assert.deepEqual(
-      reads.map((args) =>
-        args.includes("--cursor") ? args[args.indexOf("--cursor") + 1] : null,
-      ),
-      [null, "2", "3"],
+    // never replays output it already recorded. The count of reads is not
+    // pinned: teardown may drain once more against an exhausted cursor, which
+    // appends nothing -- the exact-content assertion above is what proves no
+    // output was lost or repeated.
+    const cursors = reads.map((args) =>
+      args.includes("--cursor") ? args[args.indexOf("--cursor") + 1] : null,
     );
+    assert.equal(cursors[0], null);
+    const advanced = cursors.slice(1).map((cursor) => Number(cursor));
+    assert.ok(advanced.every((cursor) => Number.isFinite(cursor)));
+    for (let index = 1; index < advanced.length; index += 1) {
+      assert.ok(
+        advanced[index]! >= advanced[index - 1]!,
+        `cursor went backwards: ${advanced.join(", ")}`,
+      );
+    }
   } finally {
     restoreHomes();
     await rm(temp, { recursive: true, force: true });
@@ -7746,7 +7758,7 @@ test("acp runner timeouts stay execution-phase failures", async () => {
     await mkdir(worktreePath);
     await writeFile(
       fakeAcpx,
-      "#!/usr/bin/env node\nprocess.stdout.write('before-timeout\\n')\nprocess.stderr.write('stderr-before-timeout\\n')\nsetTimeout(() => {}, 60000)\n",
+      "#!/usr/bin/env node\nconst fs = require('node:fs')\nfs.writeSync(1, 'before-timeout\\n')\nfs.writeSync(2, 'stderr-before-timeout\\n')\nsetTimeout(() => {}, 60000)\n",
     );
     await chmod(fakeAcpx, 0o755);
     await writeFile(
@@ -7764,7 +7776,9 @@ out({ worktree: { id: 'wt-timeout', path: ${JSON.stringify(worktreePath)} } })
     });
     await assert.rejects(
       orca.startWorker("task-acp", {
-        agent: { harness: "acp:gemini-dev", timeoutMs: 100 },
+        // Long enough for node to boot and flush before the kill, short enough
+        // that the runner still times out against the fake's 60s sleep.
+        agent: { harness: "acp:gemini-dev", timeoutMs: 1_500 },
         logPath,
         name: "acp-worker",
         prompt: "Review now.",
@@ -8405,8 +8419,34 @@ test("StageLog holds every worker of a round to one shared cap", async () => {
     // The first worker still owns the head, so the round reads in order.
     assert.ok(written.startsWith("aaa"));
     assert.ok(written.includes("[no-mistakes: log truncated;"));
-    assert.doesNotMatch(written, /original bytes 40000/);
+    assert.ok(written.endsWith("t".repeat(768)));
+    assert.match(written, /original bytes 40000/);
+    assert.match(written, /retained ranges 0-767, 39232-39999/);
   } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("StageLog redacts a credential split across two appends", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-split-"));
+  const previous = process.env.ONM_TEST_TOKEN;
+  const secret = "split-worker-token-4567";
+  process.env.ONM_TEST_TOKEN = secret;
+  try {
+    const logPath = path.join(temp, "review_r0.log");
+    const log = new StageLog(logPath, 4_096);
+    // Terminal drain pages and ACP events split at arbitrary boundaries, so a
+    // token can straddle two appends and be whole in neither.
+    await log.append(`worker printed ${secret.slice(0, 9)}`);
+    await log.append(`${secret.slice(9)} and carried on\n`);
+    await log.close();
+    const written = await readFile(logPath, "utf8");
+    assert.doesNotMatch(written, new RegExp(secret));
+    assert.match(written, /\[REDACTED\]/);
+    assert.match(written, /and carried on/);
+  } finally {
+    if (previous === undefined) delete process.env.ONM_TEST_TOKEN;
+    else process.env.ONM_TEST_TOKEN = previous;
     await rm(temp, { recursive: true, force: true });
   }
 });
