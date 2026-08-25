@@ -304,7 +304,11 @@ export class StageLog {
   constructor(filePath: string, maxBytes = MAX_LOG_BYTES) {
     this.#path = filePath
     this.#maxBytes = maxBytes
-    this.#keep = Math.max(0, Math.floor((maxBytes - LOG_MARKER_RESERVE_BYTES) / 2))
+    // A quarter each for the head and the tail, so a compacted log sits at
+    // roughly half the cap. Splitting it in half instead would leave a
+    // compacted file already at the cap, and every later chunk would rewrite
+    // the whole artifact; this way one rewrite buys half a cap of new output.
+    this.#keep = Math.max(0, Math.floor((maxBytes - LOG_MARKER_RESERVE_BYTES) / 4))
   }
 
   async append(chunk: string): Promise<void> {
@@ -391,8 +395,17 @@ export class StageLog {
     // Read from position 0 explicitly: the handle is opened O_APPEND and sits
     // at EOF, so a position-relative read returns nothing.
     const size = (await file.stat()).size
-    const existing = Buffer.allocUnsafe(size)
-    if (size > 0) await file.read(existing, 0, size, 0)
+    // read() may return fewer bytes than asked for, and the buffer is
+    // uninitialized, so a short read would copy unrelated process memory into
+    // the artifact. Fill it, and slice to what actually arrived.
+    const buffer = Buffer.allocUnsafe(size)
+    let filled = 0
+    while (filled < size) {
+      const { bytesRead } = await file.read(buffer, filled, size - filled, filled)
+      if (bytesRead === 0) break
+      filled += bytesRead
+    }
+    const existing = buffer.subarray(0, filled)
     const head = existing.subarray(0, this.#keep)
     const tail = existing.subarray(Math.max(head.length, existing.length - this.#keep))
     const marker = Buffer.from(this.#truncationMarker(head.length, tail.length), 'utf8')

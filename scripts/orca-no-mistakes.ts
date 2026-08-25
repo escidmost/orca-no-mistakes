@@ -2206,6 +2206,7 @@ export class CliOrca implements OrcaOperations {
   // Terminal handle -> the drain currently running for it, so overlapping
   // drains serialize instead of interleaving their appends.
   readonly #draining = new Map<string, Promise<void>>();
+  readonly #terminalLastLines = new Map<string, string>();
   // Worktree ID -> the branch Orca minted for it, claimed at creation.
   readonly #workerBranches = new Map<string, string>();
   #runId?: string;
@@ -3913,73 +3914,129 @@ export class CliOrca implements OrcaOperations {
     log: StageLog,
     exhaustive: boolean,
   ): Promise<void> {
-    const maxPages = exhaustive ? WORKER_LOG_MAX_PAGES * 40 : WORKER_LOG_MAX_PAGES;
+    const maxPages = exhaustive
+      ? WORKER_LOG_MAX_PAGES * 40
+      : WORKER_LOG_MAX_PAGES;
     try {
       for (let page = 0; page < maxPages; page += 1) {
         const cursor = this.#terminalCursors.get(terminalHandle);
-        const result = await this.#json<{
-          terminal?: {
-            nextCursor?: number | string;
-            oldestCursor?: number | string;
-            tail?: string[];
-            truncated?: boolean;
-          };
-        }>(
-          [
-            "terminal",
-            "read",
-            "--terminal",
-            terminalHandle,
-            ...(cursor === undefined ? [] : ["--cursor", cursor]),
-            "--limit",
-            String(WORKER_LOG_READ_LIMIT),
-            "--json",
-          ],
-          true,
-          undefined,
-          WORKER_LOG_READ_TIMEOUT_MS,
-        );
-        const lines = result.terminal?.tail ?? [];
+        const terminal = await this.#readTerminal(terminalHandle, cursor);
+        const lines = terminal.tail ?? [];
         const next =
-          result.terminal?.nextCursor === undefined
+          terminal.nextCursor === undefined
             ? undefined
-            : String(result.terminal.nextCursor);
+            : String(terminal.nextCursor);
+        const latest =
+          terminal.latestCursor === undefined
+            ? undefined
+            : String(terminal.latestCursor);
         if (cursor === undefined) {
-          // A first read with no cursor returns a bounded tail preview whose
-          // nextCursor is already the latest, so storing it would skip every
-          // retained line before the preview. Restart from oldestCursor and let
-          // the normal paging below walk forward to the end.
+          // A read with no cursor is a preview, and its last line may be a
+          // partial one the terminal is still writing. Never persist it:
+          // capture starts from the retained history entry point and pages
+          // forward, and the trailing partial is picked up once at release.
           const oldest =
-            result.terminal?.oldestCursor === undefined
+            terminal.oldestCursor === undefined
               ? undefined
-              : String(result.terminal.oldestCursor);
-          if (oldest !== undefined && oldest !== next) {
-            if (result.terminal?.truncated === true) {
-              await log.append(
-                `\n[no-mistakes: terminal output dropped; retained history began at cursor ${oldest}]\n`,
-              );
-            }
-            this.#terminalCursors.set(terminalHandle, oldest);
-            continue;
+              : String(terminal.oldestCursor);
+          if (terminal.truncated === true && oldest !== undefined) {
+            await log.append(
+              `\n[no-mistakes: terminal output dropped; retained history began at cursor ${oldest}]\n`,
+            );
           }
+          const from = oldest ?? next;
+          if (from === undefined) return;
+          this.#terminalCursors.set(terminalHandle, from);
+          continue;
         }
         // A cursor that does not advance means the host re-served output this
         // log already holds; appending it would grow the file on every drain.
-        if (cursor !== undefined && next === cursor) return;
+        if (next === cursor) return;
         if (next !== undefined) this.#terminalCursors.set(terminalHandle, next);
-        if (lines.length === 0) return;
-        await log.append(`${lines.join("\n")}\n`);
-        if (next === undefined) return;
+        if (lines.length > 0) await this.#appendLines(terminalHandle, log, lines);
+        if (next === undefined || next === latest) return;
       }
-      // The terminal still had more to give. Say so rather than let the drain
-      // end silently, because finalization closes the terminal right after.
-      await log.append(
-        `\n[no-mistakes: terminal output dropped; drain page limit reached]\n`,
-      );
+      // Only a final drain abandons what is left: a periodic one resumes from
+      // its cursor on the next tick and has lost nothing.
+      if (exhaustive) {
+        await log.append(
+          `\n[no-mistakes: terminal output dropped; drain page limit reached]\n`,
+        );
+      }
     } catch (error) {
       console.error(
         `warning: could not capture worker output for ${terminalHandle}: ${String(error)}`,
       );
+    }
+    if (exhaustive) await this.#captureFinalPartial(terminalHandle, log);
+  }
+
+  async #readTerminal(
+    terminalHandle: string,
+    cursor?: string,
+  ): Promise<{
+    latestCursor?: number | string;
+    nextCursor?: number | string;
+    oldestCursor?: number | string;
+    tail?: string[];
+    truncated?: boolean;
+  }> {
+    const result = await this.#json<{
+      terminal?: {
+        latestCursor?: number | string;
+        nextCursor?: number | string;
+        oldestCursor?: number | string;
+        tail?: string[];
+        truncated?: boolean;
+      };
+    }>(
+      [
+        "terminal",
+        "read",
+        "--terminal",
+        terminalHandle,
+        ...(cursor === undefined ? [] : ["--cursor", cursor]),
+        "--limit",
+        String(WORKER_LOG_READ_LIMIT),
+        "--json",
+      ],
+      true,
+      undefined,
+      WORKER_LOG_READ_TIMEOUT_MS,
+    );
+    return result.terminal ?? {};
+  }
+
+  async #appendLines(
+    terminalHandle: string,
+    log: StageLog,
+    lines: string[],
+  ): Promise<void> {
+    this.#terminalLastLines.set(terminalHandle, lines[lines.length - 1] ?? "");
+    await log.append(`${lines.join("\n")}\n`);
+  }
+
+  /**
+   * Records a trailing line the worker never terminated.
+   *
+   * Cursor reads only serve completed lines, so a last line still being
+   * written is invisible to them; the preview holds it. Appending it only
+   * when it differs from the last line already recorded keeps a line that the
+   * worker did finish from landing in the log twice.
+   */
+  async #captureFinalPartial(
+    terminalHandle: string,
+    log: StageLog,
+  ): Promise<void> {
+    try {
+      const terminal = await this.#readTerminal(terminalHandle);
+      const partial = terminal.tail?.at(-1);
+      if (!partial) return;
+      if (partial === this.#terminalLastLines.get(terminalHandle)) return;
+      await this.#appendLines(terminalHandle, log, [partial]);
+    } catch {
+      // A transcript that is missing its last partial line is still a
+      // transcript; capture never fails the stage it records.
     }
   }
 

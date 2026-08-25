@@ -6966,9 +6966,13 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
 } else if (args[0] === 'terminal' && args[1] === 'create') {
   out({ terminal: { handle: 'worker-terminal' } })
 } else if (args[0] === 'terminal' && args[1] === 'read') {
-  if (cursor === undefined) out({ terminal: { tail: ['npm test', 'ok 12 passed'], nextCursor: 2 } })
-  else if (cursor === '2') out({ terminal: { tail: ['done'], nextCursor: 3 } })
-  else out({ terminal: { tail: [], nextCursor: Number(cursor) } })
+  // An uncursored read is a preview: it serves the newest lines only, and its
+  // last line may still be being written. Capture has to page from
+  // oldestCursor instead of persisting it.
+  if (cursor === undefined) out({ terminal: { tail: ['done'], oldestCursor: 0, nextCursor: 3, latestCursor: 3 } })
+  else if (cursor === '0') out({ terminal: { tail: ['npm test', 'ok 12 passed'], nextCursor: 2, latestCursor: 3 } })
+  else if (cursor === '2') out({ terminal: { tail: ['done'], nextCursor: 3, latestCursor: 3 } })
+  else out({ terminal: { tail: [], nextCursor: Number(cursor), latestCursor: Number(cursor) } })
 } else if (args[0] === 'terminal' && args[1] === 'show') {
   out({ terminal: { connected: true, title: 'OpenCode', preview: 'ready', lastOutputAt: 1, worktreeId: 'worker-worktree' } })
 } else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
@@ -8420,9 +8424,9 @@ test("StageLog holds every worker of a round to one shared cap", async () => {
     // The first worker still owns the head, so the round reads in order.
     assert.ok(written.startsWith("aaa"));
     assert.ok(written.includes("[no-mistakes: log truncated;"));
-    assert.ok(written.endsWith("t".repeat(768)));
+    assert.ok(written.endsWith("t".repeat(384)));
     assert.match(written, /original bytes 40000/);
-    assert.match(written, /retained ranges 0-767, 39232-39999/);
+    assert.match(written, /retained ranges 0-383, 39616-39999/);
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
