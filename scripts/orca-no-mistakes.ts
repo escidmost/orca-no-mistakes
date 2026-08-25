@@ -2144,6 +2144,9 @@ export class CliOrca implements OrcaOperations {
   readonly #command: string;
   readonly #cwd: string;
   readonly #notifyHandle?: string;
+  // Orca mints a branch per worker worktree and `worktree rm` leaves it behind,
+  // so the coordinator owns deleting it — the same custody the gate worktree has.
+  readonly #workerBranches = new Map<string, string>();
   #runId?: string;
 
   constructor(options: CliOrcaOptions) {
@@ -2693,7 +2696,7 @@ export class CliOrca implements OrcaOperations {
       ).stdout.trim();
       const repoRoot = path.dirname(path.resolve(this.#cwd, commonGitDir));
       const created = await this.#json<{
-        worktree: { id: string; path: string };
+        worktree: { branch?: string; id: string; path: string };
       }>(
         [
           "worktree",
@@ -2718,6 +2721,7 @@ export class CliOrca implements OrcaOperations {
           "unclassified",
           "worktree create returned an invalid receipt",
         );
+      this.#trackWorkerBranch(worktree.id, created.worktree.branch);
       await this.#json(
         [
           "worktree",
@@ -3261,7 +3265,7 @@ export class CliOrca implements OrcaOperations {
         ).stdout.trim();
         const repoRoot = path.dirname(path.resolve(this.#cwd, commonGitDir));
         const created = await this.#json<{
-          worktree: { id: string; path: string };
+          worktree: { branch?: string; id: string; path: string };
         }>([
           "worktree",
           "create",
@@ -3285,6 +3289,7 @@ export class CliOrca implements OrcaOperations {
         }
         worktreeId = created.worktree.id;
         cwd = created.worktree.path;
+        this.#trackWorkerBranch(worktreeId, created.worktree.branch);
         await this.#json([
           "worktree",
           "set",
@@ -3399,6 +3404,32 @@ export class CliOrca implements OrcaOperations {
     }
   }
 
+  #trackWorkerBranch(worktreeId: string, branch?: string): void {
+    if (branch) {
+      this.#workerBranches.set(
+        worktreeId,
+        branch.replace(/^refs\/heads\//, ""),
+      );
+    }
+  }
+
+  // Worker worktrees are detached before use, so their minted branch is
+  // unreferenced once the worktree is gone. Leaving it exhausts Orca's
+  // name-suffix search and later `worktree create` calls fail outright.
+  async #deleteWorkerBranch(worktreeId: string): Promise<void> {
+    const branch = this.#workerBranches.get(worktreeId);
+    if (!branch) return;
+    this.#workerBranches.delete(worktreeId);
+    const deleted = await command("git", ["branch", "-D", branch], this.#cwd, {
+      allowFailure: true,
+    });
+    if (deleted.code !== 0) {
+      console.error(
+        `warning: removed worker worktree ${worktreeId}, but could not delete branch ${branch}: ${`${deleted.stdout}${deleted.stderr}`.trim()}`,
+      );
+    }
+  }
+
   async removeWorktree(worktreeId: string): Promise<void> {
     await this.#json([
       "worktree",
@@ -3408,6 +3439,7 @@ export class CliOrca implements OrcaOperations {
       "--force",
       "--json",
     ]);
+    await this.#deleteWorkerBranch(worktreeId);
   }
 
   async completeTask(taskId: string, report: StageReport): Promise<void> {
@@ -3918,6 +3950,7 @@ export class CliOrca implements OrcaOperations {
         "--force",
         "--json",
       ]);
+      await this.#deleteWorkerBranch(resources.worktreeId);
     }
     if (resources.deliveryId) {
       await attempt("delivery acknowledgement", [
