@@ -6942,11 +6942,14 @@ test("worker terminal output is drained into the run's stage log", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "onm-worker-log-"));
   const fakeOrca = path.join(temp, "orca");
   const callsPath = path.join(temp, "calls.jsonl");
+  const heartbeatCountPath = path.join(temp, "heartbeat-count");
+  const heartbeatProbePath = path.join(temp, "heartbeat-probe");
   const restoreHomes = isolateHomes(temp);
   try {
     const evidence = path.join(temp, "home", "artifacts", "log-run");
     await mkdir(evidence, { recursive: true });
     const reportPath = path.join(evidence, "review-1.json");
+    const logPath = path.join(evidence, "review_r0.log");
     await writeFile(reportPath, JSON.stringify(pass("review clean")));
     await writeFile(
       fakeOrca,
@@ -6969,7 +6972,14 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
 } else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
   out({ dispatch: { id: 'dispatch-1', status: 'dispatched' }, injected: true, preamble: 'authenticated' })
 } else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
-  out({ deliveryId: 'delivery-1', messages: [{ type: 'worker_done', body: 'Reviewed the change.', payload: JSON.stringify({ taskId: 'task-1', dispatchId: 'dispatch-1', outcome: 'succeeded', reportPath: ${JSON.stringify(reportPath)} }) }] })
+  const count = fs.existsSync(${JSON.stringify(heartbeatCountPath)}) ? Number(fs.readFileSync(${JSON.stringify(heartbeatCountPath)}, 'utf8')) : 0
+  fs.writeFileSync(${JSON.stringify(heartbeatCountPath)}, String(count + 1))
+  if (count === 0) {
+    out({ deliveryId: 'heartbeat-1', messages: [{ type: 'heartbeat', body: 'still reviewing', payload: JSON.stringify({ taskId: 'task-1', dispatchId: 'dispatch-1' }) }] })
+  } else {
+    fs.writeFileSync(${JSON.stringify(heartbeatProbePath)}, fs.existsSync(${JSON.stringify(logPath)}) ? fs.readFileSync(${JSON.stringify(logPath)}, 'utf8') : '')
+    out({ deliveryId: 'delivery-1', messages: [{ type: 'worker_done', body: 'Reviewed the change.', payload: JSON.stringify({ taskId: 'task-1', dispatchId: 'dispatch-1', outcome: 'succeeded', reportPath: ${JSON.stringify(reportPath)} }) }] })
+  }
 } else {
   out({ ok: true })
 }
@@ -6979,7 +6989,6 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     const orca = new CliOrca({ command: fakeOrca, cwd: temp });
     await orca.createRun("stage log capture");
 
-    const logPath = path.join(evidence, "review_r0.log");
     const worker = await orca.startWorker("task-1", {
       logPath,
       name: "no-mistakes-review-1",
@@ -6990,6 +6999,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     });
 
     assert.equal(worker.report.summary, "review clean");
+    assert.equal(await readFile(heartbeatProbePath, "utf8"), "npm test\nok 12 passed\n");
     assert.equal(
       await readFile(logPath, "utf8"),
       "npm test\nok 12 passed\ndone\n",

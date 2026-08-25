@@ -3945,6 +3945,7 @@ export class CliOrca implements OrcaOperations {
             };
           }
           lastActivityAt = Date.now();
+          if (log) await this.#drainWorkerLog(terminalHandle, log);
           continue;
         }
         heartbeatOnly = false;
