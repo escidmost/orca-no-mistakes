@@ -2197,7 +2197,10 @@ export class CliOrca implements OrcaOperations {
   readonly #terminalCursors = new Map<string, string>();
   // Terminal handle -> the stage log bound to it, created the moment the
   // terminal exists so capture outlives a failed launch.
-  readonly #terminalLogs = new Map<string, StageLog>();
+  readonly #terminalLogs = new Map<
+    string,
+    { log: StageLog; path: string; ticker: NodeJS.Timeout }
+  >();
   // Terminal handle -> the drain currently running for it, so overlapping
   // drains serialize instead of interleaving their appends.
   readonly #draining = new Map<string, Promise<void>>();
@@ -3461,6 +3464,10 @@ export class CliOrca implements OrcaOperations {
     disposition: "release" | "retain",
   ): Promise<void> {
     if (disposition === "release" && worker.terminalHandle) {
+      // Capture stays attached until the terminal actually goes away, so
+      // output emitted after worker_done -- a command finishing, a TUI
+      // settling -- is still recorded.
+      await this.#releaseStageLog(worker.terminalHandle);
       await this.#json([
         "terminal",
         "close",
@@ -3801,31 +3808,14 @@ export class CliOrca implements OrcaOperations {
     report?: StageReport;
   }> {
     const log = this.#bindStageLog(terminalHandle, launch);
-    // The orchestration check below blocks for as long as 900s. Draining only
-    // when it returns makes this periodic collection, not a stream: anything
-    // printed inside that window would be lost if the coordinator died. A timer
-    // keeps the transcript landing on disk regardless of delivery timing.
-    const ticker = log
-      ? setInterval(() => {
-          void this.#drainWorkerLog(terminalHandle, log);
-        }, WORKER_LOG_DRAIN_INTERVAL_MS)
-      : undefined;
-    ticker?.unref();
-    try {
-      return await this.#awaitWorkerReport(
+    return await this.#awaitWorkerReport(
         taskId,
         dispatchId,
         terminalHandle,
         launch,
-        log,
-        fence,
-      );
-    } finally {
-      if (ticker) clearInterval(ticker);
-      // The terminal is still open here; after this the caller closes it and
-      // whatever was not drained is gone for good.
-      await this.#releaseStageLog(terminalHandle);
-    }
+      log,
+      fence,
+    );
   }
 
   /** Appends new terminal output to the run's stage log. Capturing a worker's
@@ -3841,25 +3831,38 @@ export class CliOrca implements OrcaOperations {
   ): StageLog | undefined {
     if (!launch.logPath) return undefined;
     const bound = this.#terminalLogs.get(terminalHandle);
-    if (bound) return bound;
+    if (bound) {
+      if (bound.path === launch.logPath) return bound.log;
+      // A retained terminal moving to the next round: close out the previous
+      // round's log before capture points at the new one, so its trailing
+      // output is not consumed into the next round's file.
+      void this.#releaseStageLog(terminalHandle);
+    }
     const log = new StageLog(launch.logPath);
-    this.#terminalLogs.set(terminalHandle, log);
+    // Draining starts here, not when the coordinator begins waiting for a
+    // report: a worker can print startup diagnostics and then hang in
+    // readiness, and that transcript is exactly what explains the hang.
+    const ticker = setInterval(() => {
+      void this.#drainWorkerLog(terminalHandle, log);
+    }, WORKER_LOG_DRAIN_INTERVAL_MS);
+    ticker.unref();
+    this.#terminalLogs.set(terminalHandle, { log, path: launch.logPath, ticker });
     return log;
   }
 
   /** Drains and closes the log bound to a terminal, if any. Safe to call twice,
-   *  and called before the terminal closes on every teardown path. The read
-   *  cursor deliberately outlives it: a retained fixer terminal reuses the same
-   *  handle next round, and resetting would replay this round into that log. */
+   *  and called on every path that closes the terminal. The read cursor
+   *  deliberately outlives it: a retained terminal reuses the same handle next
+   *  round, and resetting would replay this round into that log. */
   async #releaseStageLog(terminalHandle: string): Promise<void> {
-    const log = this.#terminalLogs.get(terminalHandle);
-    if (!log) return;
+    const bound = this.#terminalLogs.get(terminalHandle);
+    if (!bound) return;
     this.#terminalLogs.delete(terminalHandle);
-    // Output is stable now that the worker is done, so take everything rather
-    // than stopping at the live-drain page ceiling: what is left at the end is
-    // the final tail the cap exists to preserve.
-    await this.#drainWorkerLog(terminalHandle, log, true);
-    await log.close().catch(() => {});
+    clearInterval(bound.ticker);
+    // Output is stable now, so take everything rather than stopping at the
+    // live-drain page ceiling: what is left is the final tail.
+    await this.#drainWorkerLog(terminalHandle, bound.log, true);
+    await bound.log.close().catch(() => {});
   }
 
   async #drainWorkerLog(

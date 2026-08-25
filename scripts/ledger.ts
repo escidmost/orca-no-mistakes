@@ -275,13 +275,10 @@ export class StageLog {
   readonly #keep: number
   readonly #maxBytes: number
   #carry = ''
-  #headBytes = 0
+  #fileBytes = 0
   #originalBytes = 0
   #originalBytesKnown = true
   #started = false
-  #tail: Buffer[] = []
-  #tailBytes = 0
-  #tailKeep = 0
   #file?: Awaited<ReturnType<typeof open>>
   #hasNewOutput = false
 
@@ -313,27 +310,9 @@ export class StageLog {
         await this.#start()
         await this.#absorb(redactKnownSecrets(carried))
       }
-      // A silent instance must not open the log. #start truncates a shared
-      // round log back to its head, so opening here would discard the previous
-      // worker's tail and marker on behalf of a worker that wrote nothing.
+      // A silent instance never opens the log, so a worker that printed
+      // nothing cannot disturb what the round already recorded.
       if (!this.#hasNewOutput) return
-      await this.#start()
-      let marker: Buffer | undefined
-      if (this.#droppedBytes() > 0) {
-        this.#trimTail(
-          Math.max(0, this.#maxBytes - this.#headBytes - LOG_MARKER_RESERVE_BYTES),
-        )
-        const candidate = Buffer.from(this.#truncationMarker(), 'utf8')
-        if (candidate.length <= LOG_MARKER_RESERVE_BYTES) {
-          marker = candidate
-          await this.#write(marker)
-        }
-      }
-      this.#trimTail(
-        Math.max(0, this.#maxBytes - this.#headBytes - (marker?.length ?? 0)),
-      )
-      if (this.#tail.length > 0) await this.#write(Buffer.concat(this.#tail))
-      this.#tail = []
       await this.#recordOriginalBytes()
     } finally {
       const file = this.#file
@@ -343,20 +322,42 @@ export class StageLog {
   }
 
   async #absorb(text: string): Promise<void> {
-    let pending = Buffer.from(text, 'utf8')
+    const pending = Buffer.from(text, 'utf8')
     if (pending.length === 0) return
+    // Everything reaches disk as it arrives. Keeping the tail in memory until
+    // close would mean a coordinator that dies mid-run leaves only the head.
+    await this.#write(pending)
     this.#originalBytes += pending.length
+    this.#fileBytes += pending.length
     this.#hasNewOutput = true
-    if (this.#headBytes < this.#keep) {
-      const head = pending.subarray(0, this.#keep - this.#headBytes)
-      await this.#write(head)
-      this.#headBytes += head.length
-      pending = pending.subarray(head.length)
+    if (this.#fileBytes > this.#maxBytes) await this.#compact()
+  }
+
+  /**
+   * Rewrites an over-cap log as head + marker + tail. Runs only once the file
+   * actually exceeds the cap, so a round whose combined output still fits keeps
+   * every byte, and the bytes are sliced positionally -- nothing in the file is
+   * parsed, so worker output cannot influence the result.
+   */
+  async #compact(): Promise<void> {
+    const file = this.#file
+    if (!file) return
+    // Read from position 0 explicitly: the handle is opened O_APPEND and sits
+    // at EOF, so a position-relative read returns nothing.
+    const size = (await file.stat()).size
+    const existing = Buffer.allocUnsafe(size)
+    if (size > 0) await file.read(existing, 0, size, 0)
+    const head = existing.subarray(0, this.#keep)
+    const tail = existing.subarray(Math.max(head.length, existing.length - this.#keep))
+    const marker = Buffer.from(this.#truncationMarker(head.length, tail.length), 'utf8')
+    await file.truncate(0)
+    this.#fileBytes = 0
+    for (const part of [head, marker, tail]) {
+      if (part.length > 0) {
+        await this.#write(part)
+        this.#fileBytes += part.length
+      }
     }
-    if (pending.length === 0) return
-    this.#tail.push(pending)
-    this.#tailBytes += pending.length
-    this.#trimTail(this.#tailKeep)
   }
 
   async #start(): Promise<void> {
@@ -387,16 +388,10 @@ export class StageLog {
       // follows is the previous worker's marker and tail, which this worker's
       // output replaces so the file ends with the round's final tail. Nothing
       // already on disk is parsed back, so worker text cannot forge accounting.
-      const headBytes = Math.min(existingBytes, this.#keep)
-      if (existingBytes > headBytes) await file.truncate(headBytes)
       const prior = await this.#priorOriginalBytes()
       this.#originalBytesKnown = existingBytes === 0 || prior !== undefined
       this.#originalBytes = prior ?? existingBytes
-      this.#headBytes = headBytes
-      this.#tailKeep = Math.max(
-        0,
-        Math.min(this.#keep, this.#maxBytes - headBytes - LOG_MARKER_RESERVE_BYTES),
-      )
+      this.#fileBytes = existingBytes
       this.#file = file
       this.#started = true
     } catch (error) {
@@ -459,28 +454,15 @@ export class StageLog {
     }
   }
 
-  #droppedBytes(): number {
-    return Math.max(0, this.#originalBytes - this.#headBytes - this.#tailBytes)
-  }
-
-  #truncationMarker(): string {
+  #truncationMarker(headBytes: number, tailBytes: number): string {
+    const dropped = Math.max(0, this.#originalBytes - headBytes - tailBytes)
     const ranges: string[] = []
-    if (this.#headBytes > 0) ranges.push(`0-${this.#headBytes - 1}`)
-    if (this.#tailBytes > 0 && this.#originalBytesKnown) {
-      ranges.push(`${this.#originalBytes - this.#tailBytes}-${this.#originalBytes - 1}`)
+    if (headBytes > 0) ranges.push(`0-${headBytes - 1}`)
+    if (tailBytes > 0 && this.#originalBytesKnown) {
+      ranges.push(`${this.#originalBytes - tailBytes}-${this.#originalBytes - 1}`)
     }
     const originalBytes = this.#originalBytesKnown ? String(this.#originalBytes) : 'unknown'
-    return `\n[no-mistakes: log truncated; dropped ${this.#droppedBytes()} bytes; original bytes ${originalBytes}; retained ranges ${ranges.join(', ') || 'none'}]\n`
-  }
-
-  #trimTail(limit: number): void {
-    while (this.#tailBytes > limit) {
-      const oldest = this.#tail[0]!
-      const cut = Math.min(oldest.length, this.#tailBytes - limit)
-      if (cut === oldest.length) this.#tail.shift()
-      else this.#tail[0] = oldest.subarray(cut)
-      this.#tailBytes -= cut
-    }
+    return `\n[no-mistakes: log truncated; dropped ${dropped} bytes; original bytes ${originalBytes}; retained ranges ${ranges.join(', ') || 'none'}]\n`
   }
 
   async #write(data: string | Buffer): Promise<void> {
