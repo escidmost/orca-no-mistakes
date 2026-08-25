@@ -10,6 +10,7 @@ import {
   realpath,
   rm,
   stat,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
@@ -20,6 +21,7 @@ import test from "node:test";
 import {
   CliOrca,
   DomainLedger,
+  FixerPolicyViolationError,
   GitShell,
   PIPELINE_STEPS,
   PostMutationCustodyError,
@@ -47,10 +49,13 @@ import {
   PreflightError,
   buildCliCommand,
   classifyPreflightFailure,
+  shellQuote,
 } from "../scripts/adapters.ts";
 import { artifactsRoot } from "../scripts/ledger.ts";
 import { loadUserConfig } from "../scripts/config.ts";
 import { effectivePolicyHash } from "../scripts/policy.ts";
+
+process.env.WORKER_SHELL_STARTUP_DELAY_MS ??= "0";
 
 const pass = (summary = "passed"): StageReport => ({ findings: [], summary });
 
@@ -68,7 +73,10 @@ class FakeGit implements GitOperations {
   failRecoveryAnchor = false;
   failHeadAfterAnchor = false;
   failRebase = false;
-  rebaseConflict = false;
+  fixerCreatesCommit = true;
+  fixerChangesTree = true;
+  protectedTestMutation?: string;
+  rebaseConflicts: string[] = [];
   diffOutput = "";
   #agentsMdAtHead?: string;
   readonly #agentsMdOids = new Set<string>();
@@ -117,6 +125,22 @@ class FakeGit implements GitOperations {
     this.calls.push("assert-clean");
   }
 
+  async assertFixerChangesAllowed(
+    sourcePath: string,
+    expectedHead: string,
+    _expectedSourceHead: string,
+  ): Promise<boolean> {
+    this.calls.push(`guard:${sourcePath}:${expectedHead}`);
+    if (this.protectedTestMutation) {
+      const mutation = this.protectedTestMutation;
+      this.protectedTestMutation = undefined;
+      throw new FixerPolicyViolationError(
+        `fixer modified pre-existing test files: ${mutation}`,
+      );
+    }
+    return this.fixerChangesTree;
+  }
+
   async head(): Promise<string> {
     if (this.#headReadBroken)
       throw new Error(`could not read HEAD in ${this.#root}`);
@@ -130,12 +154,19 @@ class FakeGit implements GitOperations {
 
   async headOf(worktreePath: string): Promise<string> {
     this.calls.push(`headof:${worktreePath}`);
-    let oid = this.#workerHeads.get(worktreePath);
-    if (!oid) {
-      oid = FakeGit.#oid(++this.#counter);
-      this.#workerHeads.set(worktreePath, oid);
-    }
+    const oid = this.fixerCreatesCommit
+      ? FakeGit.#oid(++this.#counter)
+      : this.#currentHead();
+    this.#workerHeads.set(worktreePath, oid);
     return oid;
+  }
+
+  async worktreeIsReusable(
+    worktreePath: string,
+    expectedHead: string,
+  ): Promise<boolean> {
+    this.calls.push(`worktree-reusable:${worktreePath}:${expectedHead}`);
+    return this.#workerHeads.get(worktreePath) === expectedHead;
   }
 
   async resolveRefSha(ref: string): Promise<string | undefined> {
@@ -170,23 +201,28 @@ class FakeGit implements GitOperations {
     this.calls.push(`rebase:${base}`);
     if (this.failRebase) throw new Error("rebase stage could not run");
     this.#baseOid = "b".repeat(40);
-    if (this.rebaseConflict) {
-      // one-shot: the next rebase models the fixer having resolved the conflict
-      this.rebaseConflict = false;
+    const conflictFile = this.rebaseConflicts.shift();
+    if (conflictFile) {
       return {
         findings: [
           {
             id: "rebase-conflict",
             severity: "error",
-            action: "auto-fix",
+            action: "ask-user",
             description: "conflict; rebase aborted",
+            file: conflictFile,
           },
         ],
+        rebaseUpstreamHead: this.#baseOid,
         summary: "rebase aborted",
       };
     }
     this.#head = FakeGit.#oid(++this.#counter);
-    return pass("rebased");
+    return {
+      findings: [],
+      rebaseUpstreamHead: this.#baseOid,
+      summary: "rebased",
+    };
   }
 
   async policySha256(): Promise<string> {
@@ -202,6 +238,7 @@ class FakeGit implements GitOperations {
   async applyWorktreeCommits(
     sourcePath: string,
     expectedHead: string,
+    expectedSourceHead: string,
     fence?: { readonly aborted: boolean },
   ): Promise<boolean> {
     this.calls.push(
@@ -215,7 +252,9 @@ class FakeGit implements GitOperations {
       );
     if (this.dirtyDelivery) return false;
     if (this.#head !== expectedHead || fence?.aborted) return false;
-    this.advanceHead();
+    const sourceHead = this.#workerHeads.get(sourcePath) ?? expectedSourceHead;
+    if (sourceHead !== expectedSourceHead) return false;
+    this.#head = sourceHead;
     return true;
   }
 
@@ -357,7 +396,10 @@ const allowReviewAutoFix = (git: FakeGit) => {
 
 test("runs the six-stage local adversarial pipeline with fixes, gates, and isolation", async () => {
   const git = new FakeGit();
-  allowReviewAutoFix(git);
+  git.baseFiles.set(
+    "origin/main:.orca/no-mistakes.yaml",
+    "auto_fix:\n  allow_review_autofix: true\nstages:\n  review:\n    fixer:\n      agent: [claude, grok]\n  lint:\n    fixer:\n      agent: [grok, claude]\n",
+  );
   const orca = new FakeOrca(git);
   const ledger = new DomainLedger(":memory:");
   const autoFix: Finding = {
@@ -374,7 +416,17 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
   };
   orca.reports.set("review", [
     { findings: [autoFix], summary: "one defect" },
-    pass("clean rereview"),
+    {
+      findings: [
+        {
+          id: "review-1",
+          verdict: "confirmed, should change",
+          resolution: "Applied the requested repair.",
+        },
+      ] as unknown as Finding[],
+      summary: "repair committed",
+      tested: ["node --test tests/regression.test.ts"],
+    },
   ]);
   orca.reports.set("document", [
     { findings: [askUser], summary: "decision needed" },
@@ -425,6 +477,7 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
   );
   assert.equal(reviewLaunches.length, 2);
   assert.ok(reviewLaunches.every((launch) => launch.role === "reviewer"));
+  assert.ok(reviewLaunches.every((launch) => launch.acceptFailedReport === true));
   assert.ok(reviewLaunches.every((launch) => launch.worktree === "new-child"));
   assert.notEqual(reviewLaunches[0].name, reviewLaunches[1].name);
   const reviewSpec =
@@ -467,17 +520,31 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
     (launch) => launch.role === "fixer",
   );
   assert.equal(fixerLaunches.length, 2);
-  assert.ok(fixerLaunches.every((launch) => launch.worktree === "new-child"));
-  assert.ok(fixerLaunches.every((launch) => launch.terminal === undefined));
+  assert.equal(fixerLaunches[0].worktree, "new-child");
+  assert.equal(fixerLaunches[0].terminal, undefined);
+  assert.equal(fixerLaunches[0].agent?.harness, "claude");
+  assert.equal(fixerLaunches[1].worktree, "new-child");
+  assert.equal(fixerLaunches[1].terminal, undefined);
+  assert.equal(fixerLaunches[1].agent?.harness, "grok");
   assert.ok(
     orca.fixerDispatches.every((dispatchId) =>
-      orca.calls.includes(`release:${dispatchId}`),
+      orca.calls.includes(`retain:${dispatchId}`),
     ),
-    "every fixer dispatch is released",
+    "every fixer dispatch retains the durable fixer terminal",
   );
+  assert.ok(orca.calls.includes(`release:${orca.fixerDispatches.at(-1)}`));
   assert.equal(
     git.calls.filter((call) => call.startsWith("apply:/worktrees/")).length,
     2,
+  );
+  assert.equal(
+    new Set(
+      git.calls
+        .filter((call) => call.startsWith("apply:/worktrees/"))
+        .map((call) => call.split(":", 2)[1]),
+    ).size,
+    2,
+    "changing the primary fixer candidate starts a fresh session",
   );
   assert.ok(
     orca.calls.some(
@@ -546,7 +613,12 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
   assert.match(
     orca.tasks.find((task) => task.spec.startsWith("[review fix 1]"))?.spec ??
       "",
-    /Do NOT modify existing test assertions/,
+    /Do NOT modify or delete pre-existing test files/,
+  );
+  assert.match(
+    orca.tasks.find((task) => task.spec.startsWith("[review fix 1]"))?.spec ??
+      "",
+    /implementation source code and new regression test files only/,
   );
   assert.match(
     orca.tasks.find((task) => task.spec.startsWith("[lint fix 1]"))?.spec ?? "",
@@ -581,6 +653,622 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
     orca.calls.at(-1),
     `status:completed:no-mistakes passed all ${PIPELINE_STEPS.length} stages`,
   );
+});
+
+test("fix rounds reuse one durable fixer terminal and worktree", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  const orca = new FakeOrca(git);
+  const finding: Finding = {
+    id: "review-1",
+    severity: "error",
+    action: "auto-fix",
+    description: "The defect remains after the first repair.",
+  };
+  orca.reports.set("review", [
+    { findings: [finding], summary: "first failure" },
+    pass("first fix"),
+    { findings: [finding], summary: "second failure" },
+    pass("second fix"),
+    pass("clean rereview"),
+  ]);
+
+  await runPipeline({ intent: "Repair the persistent defect." }, orca, git);
+
+  const fixers = orca.launches.filter((launch) => launch.role === "fixer");
+  assert.equal(fixers.length, 2);
+  assert.equal(fixers[0].terminal, undefined);
+  assert.equal(fixers[0].worktree, "new-child");
+  assert.equal(fixers[1].terminal, "term-fixer");
+  assert.equal(fixers[1].worktree, "current");
+  assert.ok(orca.calls.includes(`release:${orca.fixerDispatches.at(-1)}`));
+});
+
+test("a failed retain acknowledgement discards the fixer session", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  class RetainFailureOrca extends FakeOrca {
+    #failed = false;
+
+    override async finishWorker(
+      worker: WorkerResult,
+      disposition: "release" | "retain",
+    ): Promise<void> {
+      await super.finishWorker(worker, disposition);
+      if (
+        disposition === "retain" &&
+        this.fixerDispatches.includes(worker.dispatchId) &&
+        !this.#failed
+      ) {
+        this.#failed = true;
+        throw new Error("stale_delivery");
+      }
+    }
+  }
+  const orca = new RetainFailureOrca(git);
+  const finding: Finding = {
+    id: "review-1",
+    severity: "error",
+    action: "auto-fix",
+    description: "The defect remains after the first repair.",
+  };
+  orca.reports.set("review", [
+    { findings: [finding], summary: "first failure" },
+    pass("first fix"),
+    { findings: [finding], summary: "second failure" },
+    pass("second fix"),
+    pass("clean rereview"),
+  ]);
+
+  await runPipeline({ intent: "Discard stale retained deliveries." }, orca, git);
+
+  const fixers = orca.launches.filter((launch) => launch.role === "fixer");
+  assert.deepEqual(
+    fixers.map((launch) => [launch.terminal, launch.worktree]),
+    [
+      [undefined, "new-child"],
+      [undefined, "new-child"],
+    ],
+  );
+  assert.ok(orca.calls.includes(`release:${orca.fixerDispatches[0]}`));
+});
+
+test("a failed retain acknowledgement remains fail-closed when release also fails", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  class RetainAndReleaseFailureOrca extends FakeOrca {
+    override async finishWorker(
+      worker: WorkerResult,
+      disposition: "release" | "retain",
+    ): Promise<void> {
+      await super.finishWorker(worker, disposition);
+      if (!this.fixerDispatches.includes(worker.dispatchId)) return;
+      if (disposition === "retain") throw new Error("stale_delivery");
+      throw new Error("failed-retain worker release failed");
+    }
+  }
+  const orca = new RetainAndReleaseFailureOrca(git);
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Repair the defect.",
+        },
+      ],
+      summary: "failure",
+    },
+    pass("fix"),
+  ]);
+
+  await assert.rejects(
+    runPipeline({ intent: "Fail closed on failed retain cleanup." }, orca, git),
+    /failed-retain worker release failed/,
+  );
+  assert.equal(orca.gates.length, 0);
+  assert.ok(orca.removedWorktrees.length > 0);
+});
+
+test("a successful fallback fixer is retained while its candidate chain is unchanged", async () => {
+  const git = new FakeGit();
+  git.baseFiles.set(
+    "origin/main:.orca/no-mistakes.yaml",
+    "auto_fix:\n  allow_review_autofix: true\nstages:\n  review:\n    fixer:\n      agent: [claude, grok]\n",
+  );
+  class FallbackFixerOrca extends FakeOrca {
+    #primaryFailed = false;
+
+    override async startWorker(
+      taskId: string,
+      launch: WorkerLaunch,
+    ): Promise<WorkerResult> {
+      if (
+        launch.role === "fixer" &&
+        launch.agent?.harness === "claude" &&
+        !this.#primaryFailed
+      ) {
+        this.#primaryFailed = true;
+        this.launches.push(launch);
+        throw new PreflightError("quota", "Claude quota exhausted");
+      }
+      return super.startWorker(taskId, launch);
+    }
+  }
+  const orca = new FallbackFixerOrca(git);
+  const finding: Finding = {
+    id: "review-1",
+    severity: "error",
+    action: "auto-fix",
+    description: "The defect remains after the first repair.",
+  };
+  orca.reports.set("review", [
+    { findings: [finding], summary: "first failure" },
+    pass("first fix"),
+    { findings: [finding], summary: "second failure" },
+    pass("second fix"),
+    pass("clean rereview"),
+  ]);
+
+  await runPipeline({ intent: "Reuse the healthy fallback fixer." }, orca, git);
+
+  assert.deepEqual(
+    orca.launches
+      .filter((launch) => launch.role === "fixer")
+      .map((launch) => [launch.agent?.harness, launch.terminal]),
+    [
+      ["claude", undefined],
+      ["grok", undefined],
+      ["grok", "term-fixer"],
+    ],
+  );
+});
+
+test("a stale retained fixer retries through the fresh fallback chain", async () => {
+  const git = new FakeGit();
+  git.baseFiles.set(
+    "origin/main:.orca/no-mistakes.yaml",
+    "auto_fix:\n  allow_review_autofix: true\nstages:\n  review:\n    fixer:\n      agent: [claude, grok]\n",
+  );
+  class StaleFixerOrca extends FakeOrca {
+    #fixerAttempt = 0;
+
+    override async startWorker(
+      taskId: string,
+      launch: WorkerLaunch,
+    ): Promise<WorkerResult> {
+      if (launch.role === "fixer") {
+        this.#fixerAttempt += 1;
+        if (this.#fixerAttempt === 2 || this.#fixerAttempt === 3) {
+          this.launches.push(launch);
+          throw new PreflightError(
+            this.#fixerAttempt === 2 ? "readiness-timeout" : "quota",
+            this.#fixerAttempt === 2
+              ? "retained Claude terminal disconnected"
+              : "fresh Claude quota exhausted",
+          );
+        }
+      }
+      return super.startWorker(taskId, launch);
+    }
+  }
+  const orca = new StaleFixerOrca(git);
+  const finding: Finding = {
+    id: "review-1",
+    severity: "error",
+    action: "auto-fix",
+    description: "The defect remains after the first repair.",
+  };
+  orca.reports.set("review", [
+    { findings: [finding], summary: "first failure" },
+    pass("first fix"),
+    { findings: [finding], summary: "second failure" },
+    pass("fallback fix"),
+    pass("clean rereview"),
+  ]);
+
+  await runPipeline({ intent: "Recover a stale fixer session." }, orca, git);
+
+  const fixers = orca.launches.filter((launch) => launch.role === "fixer");
+  assert.deepEqual(
+    fixers.map((launch) => [
+      launch.agent?.harness,
+      launch.terminal,
+      launch.worktree,
+    ]),
+    [
+      ["claude", undefined, "new-child"],
+      ["claude", "term-fixer", "current"],
+      ["claude", undefined, "new-child"],
+      ["grok", undefined, "new-child"],
+    ],
+  );
+  assert.ok(orca.calls.includes(`release:${orca.fixerDispatches[0]}`));
+});
+
+test("retained fixer release failures prevent replacement and fallback", async () => {
+  const finding: Finding = {
+    id: "review-1",
+    severity: "error",
+    action: "auto-fix",
+    description: "The defect remains.",
+  };
+  for (const scenario of [
+    { name: "stale", retainedStartFails: true, fixerLaunches: 2 },
+    { name: "non-reusable", retainedStartFails: false, fixerLaunches: 1 },
+  ]) {
+    class ScenarioGit extends FakeGit {
+      override async worktreeIsReusable(
+        worktreePath: string,
+        expectedHead: string,
+      ): Promise<boolean> {
+        return scenario.retainedStartFails
+          ? super.worktreeIsReusable(worktreePath, expectedHead)
+          : false;
+      }
+    }
+    class ScenarioOrca extends FakeOrca {
+      #fixerAttempt = 0;
+
+      override async startWorker(
+        taskId: string,
+        launch: WorkerLaunch,
+      ): Promise<WorkerResult> {
+        if (
+          scenario.retainedStartFails &&
+          launch.role === "fixer" &&
+          ++this.#fixerAttempt === 2
+        ) {
+          this.launches.push(launch);
+          throw new PreflightError(
+            "readiness-timeout",
+            "retained fixer stopped responding",
+          );
+        }
+        return super.startWorker(taskId, launch);
+      }
+
+      override async finishWorker(
+        worker: WorkerResult,
+        disposition: "release" | "retain",
+      ): Promise<void> {
+        await super.finishWorker(worker, disposition);
+        if (
+          disposition === "release" &&
+          this.fixerDispatches.includes(worker.dispatchId)
+        ) {
+          throw new Error(`${scenario.name} fixer release failed`);
+        }
+      }
+    }
+    const git = new ScenarioGit();
+    allowReviewAutoFix(git);
+    const orca = new ScenarioOrca(git);
+    orca.reports.set("review", [
+      { findings: [finding], summary: "first failure" },
+      pass("first fix"),
+      { findings: [finding], summary: "second failure" },
+    ]);
+
+    await assert.rejects(
+      runPipeline({ intent: "Fail closed on retained cleanup." }, orca, git),
+      new RegExp(`${scenario.name} fixer release failed`),
+    );
+    assert.equal(
+      orca.launches.filter((launch) => launch.role === "fixer").length,
+      scenario.fixerLaunches,
+      "cleanup failure must stop before a replacement or fresh fallback launch",
+    );
+  }
+});
+
+test("protected fixer commits are rejected at a resumable human gate", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  git.protectedTestMutation = "tests/existing.test.ts";
+  const orca = new FakeOrca(git);
+  orca.gateResolution = "fix review-1";
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Repair the implementation.",
+        },
+        {
+          id: "review-2",
+          severity: "warning",
+          action: "ask-user",
+          description: "Confirm the compatibility behavior.",
+        },
+      ],
+      summary: "one defect",
+    },
+    pass("fix attempted"),
+    pass("safe retry"),
+    pass("clean rereview"),
+  ]);
+
+  await runPipeline({ intent: "Protect existing assertions." }, orca, git);
+
+  assert.equal(orca.gates.length, 2);
+  assert.match(orca.gates[1].question, /fixer-policy-violation/);
+  assert.match(
+    orca.gates[1].question,
+    /fixer modified pre-existing test files: tests\/existing\.test\.ts/,
+  );
+  assert.match(orca.gates[1].question, /"id":"review-2"/);
+  assert.equal(
+    orca.launches.filter((launch) => launch.role === "fixer").length,
+    2,
+  );
+  const retry = orca.launches.filter((launch) => launch.role === "fixer")[1];
+  assert.match(retry.prompt, /"id":"review-1"/);
+  assert.ok(git.calls.some((call) => call.startsWith("guard:/worktrees/")));
+  assert.equal(
+    git.calls.filter((call) => call.startsWith("apply:/worktrees/")).length,
+    1,
+  );
+});
+
+test("a policy-violation approval waives the evidence shown at its gate", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  git.protectedTestMutation = "tests/existing.test.ts";
+  const runId = `policy-evidence-${randomUUID()}`;
+  const orca = new FakeOrca(git, runId);
+  orca.gateResolution = "approve";
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Repair the implementation.",
+        },
+      ],
+      artifacts: [],
+      summary: "one defect",
+      tested: ["npm test"],
+    },
+    pass("fix attempted"),
+  ]);
+
+  const result = await runPipeline(
+    { intent: "Record protected-path rejections." },
+    orca,
+    git,
+  );
+
+  const policyEvidence = result.attestation?.stageEvidence.find(
+    (entry) => entry.summary === "review fixer commit rejected by protected-path policy",
+  );
+  assert.equal(policyEvidence?.workerIdentity, "coordinator:fixer-policy");
+  assert.equal(policyEvidence?.exitCode, 1);
+  assert.equal(policyEvidence?.waiverOrApproval?.decision, "approve");
+  const logsDir = path.join(artifactsRoot(), runId, "logs");
+  const policyLog = (
+    await Promise.all(
+      (await readdir(logsDir)).map(async (fileName) =>
+        JSON.parse(await readFile(path.join(logsDir, fileName), "utf8")),
+      ),
+    )
+  ).find(
+    (entry) =>
+      entry.summary === "review fixer commit rejected by protected-path policy",
+  );
+  assert.deepEqual(policyLog?.artifacts, []);
+  assert.deepEqual(policyLog?.tested, ["npm test"]);
+  await rm(path.join(artifactsRoot(), runId), { recursive: true, force: true });
+});
+
+test("a rejected fixer fails closed when its cleanup fails", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  git.protectedTestMutation = "tests/existing.test.ts";
+  class CleanupFailureOrca extends FakeOrca {
+    override async finishWorker(
+      worker: WorkerResult,
+      disposition: "release" | "retain",
+    ): Promise<void> {
+      await super.finishWorker(worker, disposition);
+      if (disposition === "release" && this.fixerDispatches.includes(worker.dispatchId)) {
+        throw new Error("rejected fixer cleanup failed");
+      }
+    }
+  }
+  const orca = new CleanupFailureOrca(git);
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Repair the implementation.",
+        },
+      ],
+      summary: "one defect",
+    },
+    pass("fix attempted"),
+  ]);
+
+  await assert.rejects(
+    runPipeline({ intent: "Clean rejected fixer resources." }, orca, git),
+    /rejected fixer cleanup failed/,
+  );
+  assert.equal(orca.gates.length, 0);
+  assert.ok(orca.removedWorktrees.length > 0);
+});
+
+test("an invalid fixer report preserves its error when cleanup also fails", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  class CleanupFailureOrca extends FakeOrca {
+    override async finishWorker(
+      worker: WorkerResult,
+      disposition: "release" | "retain",
+    ): Promise<void> {
+      await super.finishWorker(worker, disposition);
+      if (
+        disposition === "release" &&
+        this.fixerDispatches.includes(worker.dispatchId)
+      ) {
+        throw new Error("invalid fixer cleanup failed");
+      }
+    }
+  }
+  const orca = new CleanupFailureOrca(git);
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Repair the implementation.",
+        },
+      ],
+      summary: "one defect",
+    },
+    { findings: [], summary: "" },
+  ]);
+
+  await assert.rejects(
+    runPipeline({ intent: "Preserve fixer and cleanup failures." }, orca, git),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /review fixer cleanup failed.*invalid fixer cleanup failed/);
+      assert.ok(error.cause instanceof Error);
+      assert.match(error.cause.message, /review worker returned an invalid report/);
+      return true;
+    },
+  );
+});
+
+test("a passing run fails closed when retained fixer cleanup fails", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  class CleanupFailureOrca extends FakeOrca {
+    override async finishWorker(
+      worker: WorkerResult,
+      disposition: "release" | "retain",
+    ): Promise<void> {
+      await super.finishWorker(worker, disposition);
+      if (
+        disposition === "release" &&
+        this.fixerDispatches.includes(worker.dispatchId)
+      ) {
+        throw new Error("retained fixer cleanup failed");
+      }
+    }
+  }
+  const orca = new CleanupFailureOrca(git);
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Repair the implementation.",
+        },
+      ],
+      summary: "one defect",
+    },
+    pass("fix committed"),
+    pass("clean rereview"),
+  ]);
+
+  await assert.rejects(
+    runPipeline({ intent: "Require fixer cleanup." }, orca, git),
+    /retained fixer cleanup failed/,
+  );
+});
+
+test("a failed run surfaces retained fixer cleanup failure with the stage error as cause", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  class CleanupFailureOrca extends FakeOrca {
+    override async finishWorker(
+      worker: WorkerResult,
+      disposition: "release" | "retain",
+    ): Promise<void> {
+      await super.finishWorker(worker, disposition);
+      if (
+        disposition === "release" &&
+        this.fixerDispatches.includes(worker.dispatchId)
+      ) {
+        throw new Error("failed-run retained fixer cleanup failed");
+      }
+    }
+  }
+  const orca = new CleanupFailureOrca(git);
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Repair the implementation.",
+        },
+      ],
+      summary: "one defect",
+    },
+    pass("fix committed"),
+    pass("clean rereview"),
+  ]);
+  orca.reports.set("test", [{ findings: [], summary: "" }]);
+
+  await assert.rejects(
+    runPipeline({ intent: "Preserve stage and cleanup failures." }, orca, git),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /failed-run retained fixer cleanup failed/);
+      assert.ok(error.cause instanceof Error);
+      assert.match(error.cause.message, /test worker returned an invalid report/);
+      return true;
+    },
+  );
+});
+
+test("fixer rounds without tree changes open a human gate", async () => {
+  for (const createsCommit of [false, true]) {
+    const git = new FakeGit();
+    allowReviewAutoFix(git);
+    git.fixerCreatesCommit = createsCommit;
+    git.fixerChangesTree = !createsCommit;
+    const orca = new FakeOrca(git);
+    orca.reports.set("review", [
+      {
+        findings: [
+          {
+            id: "review-1",
+            severity: "error",
+            action: "auto-fix",
+            description: "Repair the implementation.",
+          },
+        ],
+        summary: "one defect",
+      },
+      pass("no committed fix"),
+    ]);
+
+    await runPipeline({ intent: "Require committed fixes." }, orca, git);
+    assert.equal(orca.gates.length, 1);
+    assert.match(orca.gates[0]?.question ?? "", /review-1/);
+    assert.match(orca.gates[0]?.question ?? "", /fixer-no-change/);
+    assert.match(orca.gates[0]?.question ?? "", /no committed fix/);
+    assert.equal(
+      git.calls.some((call) => call.startsWith("apply:/worktrees/")),
+      false,
+    );
+  }
 });
 
 test("a passing gate transfers final custody to the unchanged initiating worktree", async () => {
@@ -888,6 +1576,69 @@ test("malformed reviewer findings fail closed and still clean up the worker", as
   assert.equal(orca.removedWorktrees.length, 1);
 });
 
+test("a failed reviewer outcome cannot complete the stage", async () => {
+  const git = new FakeGit();
+  class FailedOutcomeOrca extends FakeOrca {
+    override async startWorker(
+      taskId: string,
+      launch: WorkerLaunch,
+    ): Promise<WorkerResult> {
+      const worker = await super.startWorker(taskId, launch);
+      if (launch.role === "reviewer") worker.failedOutcome = true;
+      return worker;
+    }
+  }
+  const orca = new FailedOutcomeOrca(git);
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "partial-review-blocker",
+          severity: "error",
+          action: "auto-fix",
+          description: "The reviewer stopped after finding this blocker.",
+        },
+      ],
+      summary: "could not complete the review",
+    },
+  ]);
+
+  await assert.rejects(
+    runPipeline({ intent: "Reject incomplete reviews." }, orca, git),
+    /review worker failed after writing report: could not complete the review/,
+  );
+
+  assert.equal(orca.gates.length, 0);
+  assert.ok(orca.calls.some((call) => call.startsWith("release:")));
+  assert.equal(orca.removedWorktrees.length, 1);
+});
+
+test("reviewer acknowledgement failures still remove the worker worktree", async () => {
+  const git = new FakeGit();
+  class ReviewerAckFailureOrca extends FakeOrca {
+    #failed = false;
+
+    override async finishWorker(
+      worker: WorkerResult,
+      disposition: "release" | "retain",
+    ): Promise<void> {
+      await super.finishWorker(worker, disposition);
+      if (disposition === "release" && !this.#failed) {
+        this.#failed = true;
+        throw new Error("reviewer acknowledgement failed");
+      }
+    }
+  }
+  const orca = new ReviewerAckFailureOrca(git);
+
+  await assert.rejects(
+    runPipeline({ intent: "Require reviewer cleanup." }, orca, git),
+    /reviewer acknowledgement failed/,
+  );
+
+  assert.equal(orca.removedWorktrees.length, 1);
+});
+
 test("reviewer title/message findings receive canonical descriptions and IDs", async () => {
   const git = new FakeGit();
   allowReviewAutoFix(git);
@@ -1077,6 +1828,9 @@ console.log(JSON.stringify({ result }))
     const worktreeCreate = calls.find(
       (args) => args[0] === "worktree" && args[1] === "create",
     );
+    const worktreeSet = calls.find(
+      (args) => args[0] === "worktree" && args[1] === "set",
+    );
     const terminalSend = calls.find(
       (args) => args[0] === "terminal" && args[1] === "send",
     );
@@ -1099,6 +1853,10 @@ console.log(JSON.stringify({ result }))
     );
     assert.equal(
       worktreeCreate?.[worktreeCreate.indexOf("--parent-worktree") + 1],
+      `path:${canonicalRepo}`,
+    );
+    assert.equal(
+      worktreeSet?.[worktreeSet.indexOf("--parent-worktree") + 1],
       `path:${canonicalRepo}`,
     );
     assert.equal(
@@ -1247,11 +2005,12 @@ console.log(JSON.stringify({ result }))
   }
 });
 
-test("CliOrca applies gate responses through the bound coordinator", async () => {
+test("CliOrca processes a complete gate-response delivery before acknowledgement", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-gate-response-"));
   const fakeOrca = path.join(temp, "orca");
   const callsPath = path.join(temp, "calls.jsonl");
   const resolvedPath = path.join(temp, "resolved");
+  const failAckPath = path.join(temp, "fail-ack");
   const previousHandle = process.env.ORCA_TERMINAL_HANDLE;
   process.env.ORCA_TERMINAL_HANDLE = "coordinator-opencode";
   try {
@@ -1267,12 +2026,28 @@ if (args[1] === 'run-create') {
 } else if (args[1] === 'gate-create') {
   out({ gate: { id: 'gate-review' } })
 } else if (args[1] === 'gate-list') {
-  out({ gates: [{ id: 'gate-review', status: fs.existsSync(${JSON.stringify(resolvedPath)}) ? 'resolved' : 'pending', resolution: 'fix: verified' }] })
-} else if (args[1] === 'check' && args.includes('--types')) {
-  out({ messages: [{ id: 'response-message', from_handle: 'originating-opencode', subject: 'no-mistakes gate response', body: JSON.stringify({ gateId: 'gate-review', resolution: 'fix: verified' }) }] })
+  out({ gates: [
+    { id: 'gate-review', status: fs.existsSync(${JSON.stringify(resolvedPath)}) ? 'resolved' : 'pending', resolution: 'fix: verified' },
+    { id: 'gate-other', status: 'pending' }
+  ] })
+} else if (args[1] === 'check' && args.includes('--unread')) {
+  out({ deliveryId: 'gate-delivery', messages: [
+    { id: 'response-message', type: 'question', from_handle: 'originating-opencode', subject: 'no-mistakes gate response', body: JSON.stringify({ gateId: 'gate-review', resolution: 'fix: verified' }) },
+    { id: 'duplicate-response', type: 'question', from_handle: 'originating-opencode', subject: 'no-mistakes gate response', body: JSON.stringify({ gateId: 'gate-review', resolution: 'approve' }) },
+    { id: 'other-response', type: 'question', from_handle: 'originating-opencode', subject: 'no-mistakes gate response', body: JSON.stringify({ gateId: 'gate-other', resolution: 'approve' }) },
+    { id: 'stale-response', type: 'question', from_handle: 'originating-opencode', subject: 'no-mistakes gate response', body: JSON.stringify({ gateId: 'gate-stale', resolution: 'approve' }) },
+    { id: 'straggler-heartbeat', type: 'heartbeat', from_handle: 'worker', subject: 'heartbeat', body: '{}' }
+  ] })
 } else if (args[1] === 'gate-resolve') {
-  fs.writeFileSync(${JSON.stringify(resolvedPath)}, 'yes')
-  out({ gate: { id: 'gate-review', status: 'resolved' } })
+  const id = args[args.indexOf('--id') + 1]
+  if (id === 'gate-review') fs.writeFileSync(${JSON.stringify(resolvedPath)}, 'yes')
+  out({ gate: { id, status: 'resolved' } })
+} else if (args[1] === 'check' && args.includes('--ack')) {
+  if (fs.existsSync(${JSON.stringify(failAckPath)})) {
+    console.error(JSON.stringify({ error: { code: 'stale_delivery', message: 'Delivery does not belong to this Run.' } }))
+    process.exit(1)
+  }
+  out({ acknowledged: 'gate-delivery' })
 } else {
   out({ ok: true })
 }
@@ -1290,16 +2065,53 @@ if (args[1] === 'run-create') {
       await orca.createGate("task-review", "Choose a review action."),
       "gate-review",
     );
-    assert.equal(await orca.waitForGate("gate-review"), "fix: verified");
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...values) => warnings.push(values.join(" "));
+    try {
+      assert.equal(await orca.waitForGate("gate-review"), "fix: verified");
+    } finally {
+      console.warn = originalWarn;
+    }
+    assert.ok(warnings.some((warning) => warning.includes("gate-stale")));
 
     const calls = (await readFile(callsPath, "utf8"))
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line) as string[]);
-    const resolved = calls.find((args) => args[1] === "gate-resolve");
-    assert.ok(resolved?.includes("fix: verified"));
+    const resolved = calls.filter((args) => args[1] === "gate-resolve");
+    assert.equal(resolved.length, 2);
+    assert.ok(resolved.some((args) => args.includes("gate-review")));
+    assert.equal(
+      resolved.filter((args) => args.includes("gate-review")).length,
+      1,
+    );
+    assert.ok(resolved.some((args) => args.includes("gate-other")));
+    assert.ok(!resolved.some((args) => args.includes("gate-stale")));
+    const acknowledgedIndex = calls.findIndex(
+      (args) => args[1] === "check" && args.includes("--ack"),
+    );
+    const acknowledged = calls[acknowledgedIndex];
+    assert.ok(acknowledged?.includes("gate-delivery"));
+    assert.ok(!acknowledged?.includes("response-message"));
     assert.ok(
-      calls.some((args) => args[1] === "check" && args.includes("--ack")),
+      acknowledgedIndex >
+        calls.findLastIndex((args) => args[1] === "gate-resolve"),
+    );
+    assert.ok(!calls.some((args) => args.includes("--types")));
+
+    await rm(resolvedPath, { force: true });
+    await writeFile(failAckPath, "fail\n");
+    const failingOrca = new CliOrca({
+      command: fakeOrca,
+      cwd: temp,
+      notifyHandle: "originating-opencode",
+    });
+    await failingOrca.createRun("gate response acknowledgement failure");
+    await failingOrca.createGate("task-review", "Choose a review action.");
+    await assert.rejects(
+      failingOrca.waitForGate("gate-review"),
+      /stale_delivery|Delivery does not belong/,
     );
   } finally {
     if (previousHandle === undefined) delete process.env.ORCA_TERMINAL_HANDLE;
@@ -1308,11 +2120,14 @@ if (args[1] === 'run-create') {
   }
 });
 
-test("CliOrca creates a fixer once and reuses its terminal without creation flags", async () => {
+test("CliOrca reuses a fixer through supervised worker-start", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-cli-"));
   const fakeOrca = path.join(temp, "orca");
   const callsPath = path.join(temp, "calls.jsonl");
   const countPath = path.join(temp, "count");
+  const blockWaitPath = path.join(temp, "block-wait");
+  const failClosePath = path.join(temp, "fail-close");
+  const invalidStartPath = path.join(temp, "invalid-start");
   const startCountPath = path.join(temp, "start-count");
   const evidence = path.join(
     homedir(),
@@ -1341,19 +2156,34 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
   out({ terminal: { handle: 'created-fixer' } })
 } else if (args[0] === 'terminal' && args[1] === 'send') {
   out({ accepted: true })
+} else if (args[0] === 'terminal' && args[1] === 'close' && fs.existsSync(${JSON.stringify(failClosePath)})) {
+  console.log(JSON.stringify({ ok: false, error: { code: 'terminal_close_failed', message: 'terminal_close_failed' } }))
+  process.exit(1)
 } else if (args[0] === 'terminal' && args[1] === 'show') {
-  out({ terminal: { connected: true, title: 'OpenCode', preview: 'ready' } })
+  out({ terminal: { connected: true, title: 'OpenCode', preview: 'ready', worktreeId: 'worker-worktree' } })
 } else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
   const count = fs.existsSync(${JSON.stringify(startCountPath)}) ? Number(fs.readFileSync(${JSON.stringify(startCountPath)}, 'utf8')) : 0
   fs.writeFileSync(${JSON.stringify(startCountPath)}, String(count + 1))
   out({ dispatch: { id: 'dispatch-' + (count + 1), status: 'dispatched' }, injected: true, preamble: 'authenticated' })
+} else if (args[0] === 'orchestration' && args[1] === 'worker-start') {
+  const count = fs.existsSync(${JSON.stringify(startCountPath)}) ? Number(fs.readFileSync(${JSON.stringify(startCountPath)}, 'utf8')) : 0
+  fs.writeFileSync(${JSON.stringify(startCountPath)}, String(count + 1))
+  out(fs.existsSync(${JSON.stringify(invalidStartPath)})
+    ? { dispatchId: 'dispatch-invalid', state: 'failed' }
+    : { dispatchId: 'dispatch-' + (count + 1), state: 'ready' })
+} else if (args[0] === 'orchestration' && args[1] === 'worker-abandon') {
+  out({ abandoned: true })
 } else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
+  if (fs.existsSync(${JSON.stringify(blockWaitPath)})) {
+    setInterval(() => {}, 1000)
+  } else {
   const count = fs.existsSync(${JSON.stringify(countPath)}) ? Number(fs.readFileSync(${JSON.stringify(countPath)}, 'utf8')) : 0
   fs.writeFileSync(${JSON.stringify(countPath)}, String(count + 1))
   const dispatchId = 'dispatch-' + (count + 1)
   const taskId = 'task-' + (count + 1)
   const reportPath = count === 0 ? ${JSON.stringify(reportOne)} : count === 1 ? ${JSON.stringify(reportTwo)} : ${JSON.stringify(reportThree)}
   out({ deliveryId: 'delivery-' + count, messages: [{ type: 'worker_done', body: 'Fixed the issue. Verified the change. Nothing remains.', payload: JSON.stringify({ taskId, dispatchId, outcome: 'succeeded', reportPath }) }] })
+  }
 } else {
   out({ ok: true })
 }
@@ -1380,6 +2210,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       prompt: "second",
       role: "fixer",
       stage: "lint",
+      retainedWorktreeId: "worker-worktree",
       terminal: first.terminalHandle,
       worktree: "current",
     });
@@ -1389,24 +2220,104 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       prompt: "third",
       role: "fixer",
       stage: "test",
+      retainedWorktreeId: "worker-worktree",
       terminal: second.terminalHandle,
       worktree: "current",
     });
     await orca.finishWorker(third, "release");
 
+    await writeFile(invalidStartPath, "fail\n");
+    const callsBeforeInvalidStart = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n").length;
+    await assert.rejects(
+      orca.startWorker("task-invalid-retained", {
+        name: "invalid-retained-fixer",
+        prompt: "invalid retained receipt",
+        role: "fixer",
+        stage: "review",
+        retainedWorktreeId: "worker-worktree",
+        terminal: first.terminalHandle,
+        worktree: "current",
+      }),
+      /invalid retained-worker receipt/,
+    );
+    const invalidStartCalls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .slice(callsBeforeInvalidStart)
+      .map((line) => JSON.parse(line) as string[]);
+    assert.ok(
+      invalidStartCalls.some(
+        (args) =>
+          args[0] === "orchestration" &&
+          args[1] === "worker-abandon" &&
+          args.includes("dispatch-invalid"),
+      ),
+      "a dispatch from a non-ready retained receipt is abandoned before fallback",
+    );
+    await rm(invalidStartPath, { force: true });
+    await writeFile(failClosePath, "fail\n");
+    await assert.rejects(
+      orca.finishWorker({ ...third, deliveryId: undefined }, "release"),
+      /terminal_close_failed/,
+    );
+    await rm(failClosePath);
+    await writeFile(blockWaitPath, "block");
+    const abortController = new AbortController();
+    const fence = {
+      aborted: false,
+      deadlineSatisfied: false,
+      signal: abortController.signal,
+    };
+    const abortTimer = setTimeout(() => {
+      fence.aborted = true;
+      abortController.abort();
+    }, 50);
+    const blockedAt = Date.now();
+    await assert.rejects(
+      orca.startWorker(
+        "task-blocked",
+        {
+          name: "blocked-fixer",
+          prompt: "blocked",
+          role: "fixer",
+          stage: "test",
+          retainedWorktreeId: "worker-worktree",
+          terminal: third.terminalHandle,
+          worktree: "current",
+        },
+        fence,
+      ),
+      /aborted|cancelled/i,
+    );
+    clearTimeout(abortTimer);
+    assert.ok(
+      Date.now() - blockedAt < 2_000,
+      "an aborted attempt must kill its run-mailbox wait promptly",
+    );
     const calls = (await readFile(callsPath, "utf8"))
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line) as string[]);
-    const starts = calls.filter((args) => args[1] === "dispatch");
-    assert.equal(starts.length, 3);
+    assert.equal(calls.filter((args) => args[1] === "dispatch").length, 1);
+    const retainedStarts = calls.filter((args) => args[1] === "worker-start");
+    assert.equal(retainedStarts.length, 4);
+    assert.ok(
+      retainedStarts.every(
+        (args) =>
+          args.includes("--terminal") &&
+          args.includes("created-fixer") &&
+          args.includes("id:worker-worktree"),
+      ),
+    );
     assert.equal(first.terminalHandle, "created-fixer");
     assert.equal(second.terminalHandle, "created-fixer");
     assert.equal(third.terminalHandle, "created-fixer");
     const closes = calls.filter(
       (args) => args[0] === "terminal" && args[1] === "close",
     );
-    assert.equal(closes.length, 1);
+    assert.equal(closes.length, 3);
     assert.ok(closes[0].includes("created-fixer"));
   } finally {
     await rm(temp, { recursive: true, force: true });
@@ -1430,7 +2341,20 @@ test("CliOrca boots a fresh opencode terminal before authenticated dispatch", as
   try {
     git(temp, "init", "-b", "feature");
     await mkdir(evidence, { recursive: true });
-    await writeFile(reportPath, JSON.stringify(pass("reviewed")));
+    await writeFile(
+      reportPath,
+      JSON.stringify({
+        findings: [
+          {
+            id: "review-blocker",
+            severity: "error",
+            action: "auto-fix",
+            description: "The reviewer found a blocking issue.",
+          },
+        ],
+        summary: "reviewed with blockers",
+      }),
+    );
     await writeFile(
       fakeOrca,
       `#!/usr/bin/env node
@@ -1458,9 +2382,14 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     console.log(JSON.stringify({ _keepalive: true, _heartbeat: true, elapsedMs: 15000, deadlineMs: 900000 }))
     process.exitCode = 1
   } else if (count === 1) {
-    out({ deliveryId: 'delivery-heartbeat', messages: [{ type: 'heartbeat', body: 'still reviewing', payload: JSON.stringify({ taskId: 'task-review', dispatchId: 'dispatch-review' }) }] })
+    out({ deliveryId: 'delivery-heartbeat', messages: [
+      { type: 'heartbeat', body: 'malformed stale heartbeat', payload: '{not-json' },
+      { type: 'heartbeat', body: 'non-object stale heartbeat', payload: 'null' },
+      { type: 'heartbeat', body: 'stale fixer heartbeat', payload: JSON.stringify({ taskId: 'task-stale', dispatchId: 'dispatch-stale' }) },
+      { type: 'heartbeat', body: 'still reviewing', payload: JSON.stringify({ taskId: 'task-review', dispatchId: 'dispatch-review' }) }
+    ] })
   } else {
-    out({ deliveryId: 'delivery-review', messages: [{ type: 'worker_done', body: 'Reviewed. Verified. Nothing remains.', payload: JSON.stringify({ taskId: 'task-review', dispatchId: 'dispatch-review', outcome: 'succeeded', reportPath: ${JSON.stringify(reportPath)} }) }] })
+    out({ deliveryId: 'delivery-review', messages: [{ type: 'worker_done', body: 'Review found blocking issues.', payload: JSON.stringify({ taskId: 'task-review', dispatchId: 'dispatch-review', outcome: 'failed', reportPath: ${JSON.stringify(reportPath)} }) }] })
   }
 } else {
   out({ ok: true })
@@ -1472,6 +2401,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     await orca.createRun("adapter test");
 
     const worker = await orca.startWorker("task-review", {
+      acceptFailedReport: true,
       name: "fresh-reviewer",
       prompt: "contains ) and shell syntax",
       role: "reviewer",
@@ -1480,12 +2410,16 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     });
 
     assert.equal(worker.worktreeId, worktreeId);
+    assert.equal(worker.failedOutcome, true);
     const calls = (await readFile(callsPath, "utf8"))
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line) as string[]);
     const worktreeCreate = calls.find(
       (args) => args[0] === "worktree" && args[1] === "create",
+    );
+    const worktreeSet = calls.find(
+      (args) => args[0] === "worktree" && args[1] === "set",
     );
     const terminalSend = calls.find(
       (args) => args[0] === "terminal" && args[1] === "send",
@@ -1495,6 +2429,14 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     );
     assert.ok(worktreeCreate?.includes("--base-branch"));
     assert.ok(worktreeCreate?.includes("feature"));
+    assert.equal(
+      worktreeSet?.[worktreeSet.indexOf("--worktree") + 1],
+      `id:${worktreeId}`,
+    );
+    assert.equal(
+      worktreeSet?.[worktreeSet.indexOf("--parent-worktree") + 1],
+      `path:${temp}`,
+    );
     assert.deepEqual(terminalSend?.slice(0, 6), [
       "terminal",
       "send",
@@ -1517,6 +2459,16 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
           args.includes("--wait"),
       ).length,
       3,
+    );
+    assert.ok(
+      calls
+        .filter(
+          (args) =>
+            args[0] === "orchestration" &&
+            args[1] === "check" &&
+            args.includes("--wait"),
+        )
+        .every((args) => args.includes("--unread")),
     );
     assert.ok(
       calls.some(
@@ -1722,7 +2674,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     );
 
     const workerPromise = orca.startWorker("task-review", {
-      agent: { harness: "agy" },
+      agent: { harness: "AGY" },
       name: "agy-reviewer",
       prompt: "review",
       role: "reviewer",
@@ -1765,9 +2717,10 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     assert.equal(sends.length, 1);
     assert.match(
       launchCommand,
-      /^'agy' '--dangerously-skip-permissions' --prompt-interactive "\$\(cat -- /,
+      /^'agy' '--dangerously-skip-permissions' --prompt-interactive 'Read and follow the complete authenticated task in /,
     );
-    assert.ok(!launchCommand.includes("authenticated"));
+    assert.match(launchCommand, /prompt-[^']+\.txt'$/);
+    assert.ok(!launchCommand.includes("$(cat"));
     assert.deepEqual(
       calls.find((args) => args[0] === "prompt-content"),
       ["prompt-content", "authenticated"],
@@ -1797,6 +2750,20 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       worktree: "new-child",
     });
     await orca.finishWorker(recoveredWorker, "release");
+    await assert.rejects(stat(lockPath), { code: "ENOENT" });
+
+    await mkdir(lockPath);
+    const old = new Date(Date.now() - 2_000);
+    await utimes(lockPath, old, old);
+    const ownerlessWorker = await orca.startWorker("task-review", {
+      agent: { harness: "agy" },
+      name: "agy-reviewer-ownerless-lock",
+      prompt: "review",
+      role: "reviewer",
+      stage: "review",
+      worktree: "new-child",
+    });
+    await orca.finishWorker(ownerlessWorker, "release");
     await assert.rejects(stat(lockPath), { code: "ENOENT" });
   } finally {
     if (previousHome === undefined) delete process.env.HOME;
@@ -1868,7 +2835,10 @@ test("GitShell applies append-only commits and adopts rewritten history behind a
     const terminal = git(gate, "rev-parse", "HEAD");
 
     const shell = new GitShell({ repo });
-    assert.equal(await shell.applyWorktreeCommits(gate, submission), true);
+    assert.equal(
+      await shell.applyWorktreeCommits(gate, submission, terminal),
+      true,
+    );
     assert.equal(git(repo, "rev-parse", "HEAD"), terminal);
     assert.equal(
       await readFile(path.join(repo, "feature.txt"), "utf8"),
@@ -1879,7 +2849,10 @@ test("GitShell applies append-only commits and adopts rewritten history behind a
     git(gate, "add", "feature.txt");
     git(gate, "commit", "--amend", "--no-edit");
     const rewritten = git(gate, "rev-parse", "HEAD");
-    assert.equal(await shell.applyWorktreeCommits(gate, terminal), true);
+    assert.equal(
+      await shell.applyWorktreeCommits(gate, terminal, rewritten),
+      true,
+    );
     assert.equal(git(repo, "rev-parse", "HEAD"), rewritten);
     assert.equal(
       await readFile(path.join(repo, "feature.txt"), "utf8"),
@@ -1897,8 +2870,11 @@ test("GitShell applies append-only commits and adopts rewritten history behind a
     await writeFile(path.join(fencedWt, "feature.txt"), "fenced\n");
     git(fencedWt, "add", "feature.txt");
     git(fencedWt, "commit", "-m", "fenced change");
+    const fencedHead = git(fencedWt, "rev-parse", "HEAD");
     assert.equal(
-      await shell.applyWorktreeCommits(fencedWt, terminal, { aborted: true }),
+      await shell.applyWorktreeCommits(fencedWt, terminal, fencedHead, {
+        aborted: true,
+      }),
       false,
     );
     assert.equal(git(repo, "rev-parse", "HEAD"), rewritten);
@@ -1933,7 +2909,10 @@ test("three-way containment advances clean checkouts and preserves diverged ones
     git(repo, "commit", "-m", "author edit");
     const divergedHead = git(repo, "rev-parse", "HEAD");
     assert.notEqual(divergedHead, submission);
-    assert.equal(await shell.applyWorktreeCommits(gate, submission), false);
+    assert.equal(
+      await shell.applyWorktreeCommits(gate, submission, terminal),
+      false,
+    );
     assert.equal(git(repo, "rev-parse", "HEAD"), divergedHead);
     await shell.anchorRecoveryRef("run-containment", terminal);
     assert.equal(
@@ -1945,7 +2924,10 @@ test("three-way containment advances clean checkouts and preserves diverged ones
     // operator's uncommitted work are left untouched.
     git(repo, "reset", "--hard", submission);
     await writeFile(path.join(repo, "feature.txt"), "operator edit\n");
-    assert.equal(await shell.applyWorktreeCommits(gate, submission), false);
+    assert.equal(
+      await shell.applyWorktreeCommits(gate, submission, terminal),
+      false,
+    );
     assert.equal(git(repo, "rev-parse", "HEAD"), submission);
     assert.equal(
       await readFile(path.join(repo, "feature.txt"), "utf8"),
@@ -1954,7 +2936,10 @@ test("three-way containment advances clean checkouts and preserves diverged ones
 
     // Clean checkout (C_op == C_sub): custody returns via fast-forward.
     git(repo, "reset", "--hard", submission);
-    assert.equal(await shell.applyWorktreeCommits(gate, submission), true);
+    assert.equal(
+      await shell.applyWorktreeCommits(gate, submission, terminal),
+      true,
+    );
     assert.equal(git(repo, "rev-parse", "HEAD"), terminal);
     assert.equal(
       await readFile(path.join(repo, "feature.txt"), "utf8"),
@@ -2036,6 +3021,1862 @@ test("GitShell.diffBase falls back to a local base branch when origin lacks it",
   }
 });
 
+test("GitShell rejects protected fixer changes but permits new test files", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-git-fixer-guard-"));
+  const repo = path.join(temp, "repo");
+  const worker = path.join(temp, "worker");
+  const coordinatorSource = await readFile(
+    new URL("../scripts/orca-no-mistakes.ts", import.meta.url),
+    "utf8",
+  );
+  const entrypointSource = await readFile(
+    new URL("../bin/orca-no-mistakes", import.meta.url),
+    "utf8",
+  );
+  try {
+    git(temp, "init", "-b", "main", repo);
+    git(repo, "config", "user.email", "test@example.com");
+    git(repo, "config", "user.name", "Test User");
+    await mkdir(path.join(repo, "Tests"));
+    await writeFile(
+      path.join(repo, "Tests/existing.ts"),
+      'assert.equal(value, "expected");\n',
+    );
+    git(repo, "add", "Tests/existing.ts");
+    git(repo, "commit", "-m", "base test");
+    git(repo, "checkout", "-b", "feature");
+    await writeFile(path.join(repo, "feature.ts"), "export const value = 1;\n");
+    await mkdir(path.join(repo, "spec"));
+    await mkdir(path.join(repo, "spec/support"));
+    await mkdir(path.join(repo, "cypress/e2e"), { recursive: true });
+    await mkdir(path.join(repo, "cypress/snapshots"), { recursive: true });
+    await mkdir(path.join(repo, "e2e"));
+    await mkdir(path.join(repo, "integration"));
+    await mkdir(path.join(repo, "features/support"), { recursive: true });
+    await mkdir(path.join(repo, "packages/web/features/support"), { recursive: true });
+    await mkdir(path.join(repo, "MyProject.Tests"));
+    await mkdir(path.join(repo, "Shop.UnitTests"));
+    await mkdir(path.join(repo, "__specs__"));
+    await mkdir(path.join(repo, "java"));
+    await mkdir(path.join(repo, "cpp"));
+    await mkdir(path.join(repo, "docs"));
+    await mkdir(path.join(repo, "scripts"));
+    await mkdir(path.join(repo, "specs"));
+    await mkdir(path.join(repo, "src"));
+    await mkdir(path.join(repo, "src/__image_snapshots__"));
+    await mkdir(path.join(repo, "src/__mocks__"));
+    await mkdir(path.join(repo, "src/__snapshots__"));
+    await mkdir(path.join(repo, "src/button.spec.ts-snapshots"));
+    await mkdir(path.join(repo, "src/testFixtures/java"), { recursive: true });
+    await mkdir(path.join(repo, "src/androidTest/resources"), { recursive: true });
+    await mkdir(path.join(repo, "src/androidTestDebug/resources"), { recursive: true });
+    await mkdir(path.join(repo, "src/commonTest/resources"), { recursive: true });
+    await mkdir(path.join(repo, "src/testDebug/resources"), { recursive: true });
+    await mkdir(path.join(repo, "src/it/sample"), { recursive: true });
+    await mkdir(path.join(repo, "testdata"));
+    await mkdir(path.join(repo, "t"));
+    await mkdir(path.join(repo, "__fixtures__"));
+    await writeFile(path.join(repo, "spec/openapi.yaml"), "openapi: 3.1.0\n");
+    await writeFile(
+      path.join(repo, "spec/support/shared_context.rb"),
+      "shared_context 'authenticated' do\n  before { sign_in }\nend\n",
+    );
+    await writeFile(
+      path.join(repo, "cypress/e2e/login.cy.ts"),
+      "expect(true).to.equal(true);\n",
+    );
+    await writeFile(
+      path.join(repo, "cypress/snapshots/login.png"),
+      "expected cypress image\n",
+    );
+    await writeFile(
+      path.join(repo, "src/__mocks__/api.ts"),
+      "export const response = { ok: true };\n",
+    );
+    await writeFile(
+      path.join(repo, "e2e/checkout.e2e.ts"),
+      "expect(true).toBe(true);\n",
+    );
+    await writeFile(
+      path.join(repo, "e2e/login.ts"),
+      "export const expected = { ok: true };\n",
+    );
+    await writeFile(
+      path.join(repo, "integration/login.ts"),
+      "export const expected = { ok: true };\n",
+    );
+    await writeFile(path.join(repo, "conftest.py"), "assert True\n");
+    await writeFile(
+      path.join(repo, "main.tftest.hcl"),
+      'run "works" { assert { condition = true } }\n',
+    );
+    await writeFile(
+      path.join(repo, "features/login.feature"),
+      "Feature: Login\n  Scenario: works\n    Then access is granted\n",
+    );
+    await writeFile(
+      path.join(repo, "features/support/env.rb"),
+      "Before do\n  prepare_scenario\nend\n",
+    );
+    await writeFile(
+      path.join(repo, "packages/web/features/support/env.rb"),
+      "Before do\n  prepare_package_scenario\nend\n",
+    );
+    await mkdir(path.join(repo, "acceptance"));
+    await writeFile(
+      path.join(repo, "acceptance/login.robot"),
+      "*** Test Cases ***\nLogin works\n    Should Be Equal    granted    granted\n",
+    );
+    await writeFile(
+      path.join(repo, "acceptance/common.resource"),
+      "*** Keywords ***\nVerify access\n    Should Be Equal    granted    granted\n",
+    );
+    await writeFile(path.join(repo, "testfoo.py"), "def testfoo():\n    verify_behavior()\n");
+    await writeFile(path.join(repo, "cli.bats"), "@test 'works' { true; }\n");
+    await writeFile(path.join(repo, "docs/test-plan.md"), "# Test plan\n");
+    await writeFile(
+      path.join(repo, "package.json"),
+      '{"scripts":{"test":"sh scripts/verify-ci.sh"}}\n',
+    );
+    await writeFile(
+      path.join(repo, "scripts/test-harness.ts"),
+      "export const harness = 1;\n",
+    );
+    await writeFile(
+      path.join(repo, "scripts/test-runner.ts"),
+      "export const runner = 1;\n",
+    );
+    await writeFile(path.join(repo, "scripts/verify-ci.sh"), "npm test\n");
+    await writeFile(path.join(repo, "scripts/pwd-verify.sh"), "npm test\n");
+    await writeFile(path.join(repo, "scripts/root-verify.sh"), "npm test\n");
+    await writeFile(
+      path.join(repo, "src/spec-parser.ts"),
+      "export const parser = 1;\n",
+    );
+    await writeFile(
+      path.join(repo, "src/widget.spec.ts"),
+      "assert.ok(true);\n",
+    );
+    await writeFile(
+      path.join(repo, "src/testFixtures/java/Fixture.java"),
+      "class Fixture { static int expected() { return 1; } }\n",
+    );
+    await writeFile(path.join(repo, "src/androidTest/resources/expected.json"), '{"ok":true}\n');
+    await writeFile(path.join(repo, "src/androidTestDebug/resources/expected.json"), '{"ok":true}\n');
+    await writeFile(path.join(repo, "src/commonTest/resources/expected.json"), '{"ok":true}\n');
+    await writeFile(path.join(repo, "src/testDebug/resources/expected.json"), '{"ok":true}\n');
+    await writeFile(path.join(repo, "src/it/sample/verify.groovy"), "verify_behavior()\n");
+    await writeFile(
+      path.join(repo, "MyProject.Tests/OrderServiceTests.cs"),
+      "Assert.True(true);\n",
+    );
+    await writeFile(
+      path.join(repo, "Shop.UnitTests/Assertions.cs"),
+      "class Assertions { static int Expected() => 1; }\n",
+    );
+    await writeFile(path.join(repo, "__specs__/widget.ts"), "assert(true);\n");
+    await writeFile(path.join(repo, "java/TestFoo.java"), "assert true;\n");
+    await writeFile(
+      path.join(repo, "cpp/foo_unittest.cc"),
+      "TEST(Foo, Works) { EXPECT_EQ(value(), 1); }\n",
+    );
+    await writeFile(path.join(repo, "specs/widget.ts"), "assert(true);\n");
+    await writeFile(
+      path.join(repo, "src/OrderServiceTest.java"),
+      "assertTrue(true);\n",
+    );
+    await writeFile(
+      path.join(repo, "src/WidgetSpec.kt"),
+      "assertTrue(true)\n",
+    );
+    await writeFile(path.join(repo, "src/foo-test.ts"), "assert(true);\n");
+    await writeFile(path.join(repo, "src/test-foo.ts"), "assert(true);\n");
+    await writeFile(path.join(repo, "src/testFoo.ts"), "assert(true);\n");
+    await writeFile(
+      path.join(repo, "src/lib.rs"),
+      "pub fn value() -> i32 { 1 }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn value_is_one() { assert_eq!(super::value(), 1); }\n}\n",
+    );
+    await writeFile(
+      path.join(repo, "src/async_runtime.rs"),
+      "#[tokio::test]\nasync fn smoke() -> Result<(), Box<dyn std::error::Error>> {\n    run().await?;\n    Ok(())\n}\n",
+    );
+    await writeFile(
+      path.join(repo, "src/registered_cases.rs"),
+      "#[rstest]\nfn smoke(case: i32) { verify(case); }\n",
+    );
+    await writeFile(
+      path.join(repo, "src/ParameterizedExample.java"),
+      "@ParameterizedTest\nvoid works() { verify(); }\n",
+    );
+    await writeFile(
+      path.join(repo, "src/NUnitExample.cs"),
+      "[TestCase(1)]\nvoid Works(int value) { Verify(value); }\n",
+    );
+    await writeFile(
+      path.join(repo, "src/Calculator.cs"),
+      "[NUnit.Framework.Test]\nvoid Calculates() { NUnit.Framework.Assert.AreEqual(1, Calculate()); }\n",
+    );
+    await writeFile(
+      path.join(repo, "src/catch2.cpp"),
+      '#include <catch2/catch_test_macros.hpp>\nTEST_CASE("adds") { REQUIRE(1 + 1 == 2); }\n',
+    );
+    await writeFile(
+      path.join(repo, "src/inline.js"),
+      "test.each(buildCases(seed()))('response', () => {\n  assert.deepEqual(actual, {\n    ok: true,\n  });\n});\n",
+    );
+    await writeFile(
+      path.join(repo, "src/concurrent.js"),
+      "test.concurrent('works', async () => { expect(await value()).toBe(1); });\n",
+    );
+    await writeFile(
+      path.join(repo, "src/assertions.js"),
+      "export function verify(actual) {\n  assert.deepEqual(actual, { ok: true });\n}\n",
+    );
+    await writeFile(
+      path.join(repo, "src/chai_assertions.js"),
+      "export function verify(result) {\n  result.should.not.equal(false);\n  result.should.be.true;\n}\n",
+    );
+    await writeFile(
+      path.join(repo, "src/node_assertions.js"),
+      'import { deepEqual, ok, partialDeepStrictEqual } from "node:assert/strict";\nexport function verify(actual) {\n  ok(actual);\n  deepEqual(actual, true);\n  partialDeepStrictEqual(actual, { ok: true });\n}\n',
+    );
+    await writeFile(
+      path.join(repo, "src/node_alias.js"),
+      'import { strictEqual as eq } from "node:assert/strict";\nexport function verify(actual) {\n  eq(actual, true);\n}\n',
+    );
+    await writeFile(
+      path.join(repo, "src/aliased_playwright.ts"),
+      'import { expect as verify } from "@playwright/test";\nexport function check(page) {\n  verify(page).toHaveTitle("ok");\n}\n',
+    );
+    await writeFile(
+      path.join(repo, "src/reexported_assertion.ts"),
+      'export { expect as verify } from "vitest";\n',
+    );
+    await writeFile(
+      path.join(repo, "src/default_expect_reexport.ts"),
+      'export { default as expect } from "expect";\n',
+    );
+    await writeFile(
+      path.join(repo, "src/wildcard_expect_reexport.ts"),
+      'export * from "expect";\n',
+    );
+    await writeFile(
+      path.join(repo, "src/playwright_types.ts"),
+      'import type { Page } from "@playwright/test";\nexport type BrowserPage = Page;\nexport const browser = 1;\n',
+    );
+    await writeFile(
+      path.join(repo, "src/prefixed.js"),
+      'if (import.meta.vitest) test("works", () => expect(value()).toBe(1));\n',
+    );
+    await writeFile(
+      path.join(repo, "src/soft_expect.ts"),
+      "export function verify(value) { expect.soft(value).toBe(true); }\n",
+    );
+    await writeFile(
+      path.join(repo, "src/check.py"),
+      "def test_value():\n    assert value == 1\n",
+    );
+    await writeFile(
+      path.join(repo, "src/math.zig"),
+      'const std = @import("std");\ntest "value" { try std.testing.expectEqual(@as(i32, 1), value()); }\n',
+    );
+    await writeFile(
+      path.join(repo, "src/__image_snapshots__/widget-snap.png"),
+      "expected image\n",
+    );
+    await writeFile(
+      path.join(repo, "src/__snapshots__/Widget.snap"),
+      "exports[`Widget 1`] = `expected`;\n",
+    );
+    await writeFile(
+      path.join(repo, "src/button.spec.ts-snapshots/button-chromium.png"),
+      "expected pixels\n",
+    );
+    await writeFile(path.join(repo, "testdata/expected.json"), '{"ok":true}\n');
+    await writeFile(path.join(repo, "expected.golden"), "expected output\n");
+    await writeFile(path.join(repo, "t/widget.t"), "ok(1, 'works');\n");
+    await writeFile(
+      path.join(repo, "__fixtures__/response.json"),
+      '{"status":"expected"}\n',
+    );
+    await mkdir(path.join(repo, "bin"));
+    await mkdir(path.join(repo, ".github/workflows"), { recursive: true });
+    await mkdir(path.join(repo, ".github/actions/check"), { recursive: true });
+    await mkdir(path.join(repo, "ci/check"), { recursive: true });
+    await mkdir(path.join(repo, "ci/check/sub/dist"), { recursive: true });
+    await mkdir(path.join(repo, "ci/check/cmd/check"), { recursive: true });
+    await mkdir(path.join(repo, "cmd/check"), { recursive: true });
+    await mkdir(path.join(repo, "cd-options"));
+    await mkdir(path.join(repo, "commands"));
+    await mkdir(path.join(repo, "dist"));
+    await mkdir(path.join(repo, "guarded-commands"));
+    await mkdir(path.join(repo, "gradle/wrapper"), { recursive: true });
+    await mkdir(path.join(repo, ".mvn/wrapper"), { recursive: true });
+    await mkdir(path.join(repo, "other"));
+    await mkdir(path.join(repo, "physical-commands"));
+    await mkdir(path.join(repo, "nested-commands/validation"), { recursive: true });
+    await mkdir(path.join(repo, "shell-commands"));
+    await mkdir(path.join(repo, "scripts/nested"), { recursive: true });
+    await mkdir(path.join(repo, "validation"));
+    await mkdir(path.join(repo, "tools"));
+    await writeFile(path.join(repo, "bin/orca-no-mistakes"), entrypointSource);
+    await writeFile(
+      path.join(repo, "scripts/orca-no-mistakes.ts"),
+      `${coordinatorSource}\nexport const integrationFixture = 1;\n`,
+    );
+    await writeFile(
+      path.join(repo, ".github/workflows/ci.yml"),
+      "- uses: ./\n- uses: ./.github/actions/check\n- uses: ./ci/check/\n- run: ${{ github.workspace }}/scripts/workspace-verify.sh\n- run: '& \"$env:GITHUB_WORKSPACE\\scripts\\powershell-verify.ps1\"'\n- run: 'Set-Location -Path \"$env:GITHUB_WORKSPACE/scripts\"; ./powershell-location.ps1'\n- run: '%GITHUB_WORKSPACE%\\scripts\\cmd-verify.cmd'\n- run: python -m tools.module_check\n- run: python -m tools.runner\n- run: py -3 -m tools\n- run: python -m myproj.check\n- run: python scripts/python-check.py\n- run: node scripts/check.ts\n- run: node scripts/alias-check.ts\n- run: \"$(pwd)/scripts/pwd-verify.sh\"\n- run: \"$(git rev-parse --show-toplevel)/scripts/root-verify.sh\"\n- run: .\\scripts\\check.ps1\n- run: ./check.sh\n  working-directory: ${{ github.workspace }}/commands/\n- run: .\\windows-check.ps1\n  working-directory: commands\\\n- run: cd /d commands && cmd-check.cmd\n- run: cd scripts && (cd nested && ./nested-check.sh) && ./outer-check.sh\n- run: ./lint.sh\n  working-directory: other\n- run: |\n    cd shell-commands\n    ./check.sh\n- run: |\n    cd guarded-commands || exit 1\n    set -euo pipefail\n    ./check.sh\n- run: |\n    pushd \"$GITHUB_WORKSPACE/prefixed-commands\"\n    ./verify.sh\n- run: |\n    cd nested-commands\n    cd validation\n    ./check.sh\n",
+    );
+    await writeFile(
+      path.join(repo, "jest.config.ts"),
+      'export default { setupFilesAfterEnv: ["<rootDir>/validation/jest.setup.ts"] };\n',
+    );
+    await writeFile(path.join(repo, "validation/jest.setup.ts"), "verify_behavior();\n");
+    await writeFile(
+      path.join(repo, ".github/workflows/python.yml"),
+      '- run: python -X dev -m "quotedpkg.check"\n',
+    );
+    await writeFile(
+      path.join(repo, ".github/workflows/python-working.yml"),
+      "defaults:\n  run:\n    working-directory: backend\nsteps:\n  - run: python -m checks.validate\n",
+    );
+    await writeFile(
+      path.join(repo, ".github/workflows/resolver.yml"),
+      "steps:\n  - run: node scripts/baseurl-check.ts\n  - run: cd -- cd-options && ./check.sh\n  - run: cd -P physical-commands && ./check.sh\n",
+    );
+    await writeFile(
+      path.join(repo, ".github/workflows/new-entrypoint.yml"),
+      "steps:\n  - run: ./scripts/new-validation.sh\n",
+    );
+    await writeFile(
+      path.join(repo, "action.yml"),
+      "runs:\n  using: composite\n  steps:\n    - shell: bash\n      run: node ./dist/index.js\n    - shell: bash\n      run: go run ./cmd/check\n",
+    );
+    await writeFile(path.join(repo, "dist/index.js"), "require('child_process').execFileSync('npm', ['test']);\n");
+    await writeFile(path.join(repo, "cmd/check/main.go"), "package main\nfunc main() { verifyBehavior() }\n");
+    await writeFile(
+      path.join(repo, ".github/actions/check/action.yml"),
+      "runs:\n  using: node20\n  main: dist/index.js\n",
+    );
+    await mkdir(path.join(repo, ".github/actions/check/dist"), { recursive: true });
+    await writeFile(
+      path.join(repo, ".github/actions/check/dist/index.js"),
+      "process.exit(require('child_process').spawnSync('npm', ['test'], { stdio: 'inherit' }).status ?? 1);\n",
+    );
+    await writeFile(
+      path.join(repo, "ci/check/action.yml"),
+      "runs:\n  using: composite\n  steps:\n    - uses: ./ci/check/sub\n    - shell: bash\n      run: ./run.sh\n",
+    );
+    await writeFile(path.join(repo, "ci/check/run.sh"), "npm test\n");
+    await writeFile(path.join(repo, "ci/check/cmd/check/main.go"), "package main\nfunc main() { verifyBehavior() }\n");
+    await writeFile(
+      path.join(repo, "ci/check/sub/action.yml"),
+      "runs:\n  using: node20\n  main: dist/index.js\n",
+    );
+    await writeFile(
+      path.join(repo, "ci/check/sub/dist/index.js"),
+      "require('child_process').execFileSync('npm', ['test']);\n",
+    );
+    await writeFile(path.join(repo, "commands/check.sh"), "npm test\n");
+    await writeFile(path.join(repo, "cd-options/check.sh"), "npm test\n");
+    await writeFile(path.join(repo, "commands/cmd-check.cmd"), "npm test\n");
+    await writeFile(path.join(repo, "commands/windows-check.ps1"), "npm test\n");
+    await writeFile(path.join(repo, "guarded-commands/check.sh"), "npm test\n");
+    await writeFile(path.join(repo, "other/check.sh"), "export OTHER_CHECK=1\n");
+    await writeFile(path.join(repo, "other/lint.sh"), "npm run lint\n");
+    await writeFile(path.join(repo, "physical-commands/check.sh"), "npm test\n");
+    await writeFile(path.join(repo, "nested-commands/validation/check.sh"), "npm test\n");
+    await mkdir(path.join(repo, "prefixed-commands"));
+    await writeFile(path.join(repo, "prefixed-commands/verify.sh"), "npm test\n");
+    await writeFile(path.join(repo, "shell-commands/check.sh"), "npm test\n");
+    await writeFile(path.join(repo, "gradlew"), "#!/bin/sh\nexec java -jar gradle/wrapper/gradle-wrapper.jar\n");
+    await writeFile(path.join(repo, "gradle/wrapper/gradle-wrapper.properties"), "distributionUrl=https://services.gradle.org/distributions/gradle.zip\n");
+    await writeFile(path.join(repo, "gradle/wrapper/gradle-wrapper.jar"), "gradle wrapper\n");
+    await writeFile(path.join(repo, "mvnw"), "#!/bin/sh\nexec java -jar .mvn/wrapper/maven-wrapper.jar\n");
+    await writeFile(path.join(repo, ".mvn/wrapper/maven-wrapper.properties"), "distributionUrl=https://repo.maven.apache.org/wrapper.zip\n");
+    await writeFile(path.join(repo, ".mvn/wrapper/maven-wrapper.jar"), "maven wrapper\n");
+    await writeFile(
+      path.join(repo, "tools/package.json"),
+      '{"scripts":{"test":"./verify.sh"}}\n',
+    );
+    await writeFile(path.join(repo, "tools/verify.sh"), "npm test\n");
+    await writeFile(path.join(repo, "tools/jenkins-verify.sh"), "npm test\n");
+    await writeFile(path.join(repo, "tools/check.sh"), "export TOOL_CHECK=1\n");
+    await writeFile(path.join(repo, "tools/module_check.py"), "def main():\n    verify_behavior()\n");
+    await writeFile(
+      path.join(repo, "tools/runner.py"),
+      "from tools import (\n    check,\n)\nfrom . import (\n    relative_check,\n)\ncheck.validate()\nrelative_check.validate()\n",
+    );
+    await writeFile(path.join(repo, "tools/check.py"), "def validate():\n    verify_behavior()\n");
+    await writeFile(
+      path.join(repo, "tools/relative_check.py"),
+      "def validate():\n    verify_behavior()\n",
+    );
+    await writeFile(path.join(repo, "tools/__main__.py"), "def main():\n    verify_behavior()\n");
+    await mkdir(path.join(repo, "src/myproj"), { recursive: true });
+    await writeFile(path.join(repo, "src/myproj/check.py"), "def main():\n    verify_behavior()\n");
+    await mkdir(path.join(repo, "src/quotedpkg"), { recursive: true });
+    await writeFile(path.join(repo, "src/quotedpkg/check.py"), "def main():\n    verify_behavior()\n");
+    await mkdir(path.join(repo, "backend/checks"), { recursive: true });
+    await writeFile(path.join(repo, "backend/checks/validate.py"), "def main():\n    verify_behavior()\n");
+    await mkdir(path.join(repo, "jenkins-tools/nested"), { recursive: true });
+    await writeFile(path.join(repo, "jenkins-tools/check.sh"), "npm test\n");
+    await writeFile(path.join(repo, "jenkins-tools/nested/nested-check.sh"), "npm test\n");
+    await writeFile(
+      path.join(repo, "Jenkinsfile"),
+      "pipeline {\n  stages {\n    stage('test') {\n      steps {\n        sh '''\n          cd tools\n          set -euo pipefail\n          ./jenkins-verify.sh\n        '''\n        dir('jenkins-tools') {\n          script { echo 'setup' }\n          sh './check.sh'\n          dir('nested') {\n            sh './nested-check.sh'\n          }\n        }\n      }\n    }\n  }\n}\n",
+    );
+    await writeFile(path.join(repo, "scripts/workspace-verify.sh"), "npm test\n");
+    await writeFile(path.join(repo, "scripts/powershell-verify.ps1"), "npm test\n");
+    await writeFile(path.join(repo, "scripts/powershell-location.ps1"), "npm test\n");
+    await writeFile(path.join(repo, "scripts/cmd-verify.cmd"), "npm test\n");
+    await writeFile(path.join(repo, "scripts/check.ps1"), "npm test\n");
+    await writeFile(path.join(repo, "scripts/check.ts"), 'import "./assertions";\n');
+    await writeFile(path.join(repo, "scripts/assertions.ts"), "verify_behavior();\n");
+    await writeFile(
+      path.join(repo, "scripts/python-check.py"),
+      "from rules import validate\nvalidate()\n",
+    );
+    await writeFile(
+      path.join(repo, "scripts/rules.py"),
+      "def validate():\n    verify_behavior()\n",
+    );
+    await writeFile(path.join(repo, "scripts/nested/nested-check.sh"), "npm test\n");
+    await writeFile(path.join(repo, "scripts/outer-check.sh"), "npm test\n");
+    await writeFile(path.join(repo, "scripts/alias-check.ts"), 'import "@/rules";\n');
+    await writeFile(path.join(repo, "src/rules.ts"), "verify_behavior();\n");
+    await writeFile(path.join(repo, "scripts/baseurl-check.ts"), 'import "base-rules";\n');
+    await writeFile(path.join(repo, "src/base-rules.ts"), "verify_behavior();\n");
+    await writeFile(
+      path.join(repo, "tsconfig.json"),
+      '{"compilerOptions":{"baseUrl":".","paths":{"@/*":["src/*"]}}}\n',
+    );
+    await writeFile(
+      path.join(repo, "tsconfig.baseurl.json"),
+      '\uFEFF{\n  // baseUrl-only aliases are valid JSONC\n  "compilerOptions": { "baseUrl": "src", },\n}\n',
+    );
+    for (const moduleName of ["adapters", "config", "ledger", "policy"]) {
+      await writeFile(
+        path.join(repo, `scripts/${moduleName}.ts`),
+        `export const ${moduleName} = true;\n`,
+      );
+    }
+    await writeFile(
+      path.join(repo, "Tests/branch-regression.ts"),
+      'assert.equal(value, 1);\n',
+    );
+    git(
+      repo,
+      "add",
+      "feature.ts",
+      "acceptance/common.resource",
+      "acceptance/login.robot",
+      "testfoo.py",
+      "cli.bats",
+      "conftest.py",
+      "cypress/e2e/login.cy.ts",
+      "cypress/snapshots/login.png",
+      "docs/test-plan.md",
+      "e2e/checkout.e2e.ts",
+      "e2e/login.ts",
+      "integration/login.ts",
+      "features/login.feature",
+      "features/support/env.rb",
+      "packages/web/features/support/env.rb",
+      "main.tftest.hcl",
+      "package.json",
+      "spec/openapi.yaml",
+      "spec/support/shared_context.rb",
+      "scripts/test-harness.ts",
+      "scripts/test-runner.ts",
+      "scripts/verify-ci.sh",
+      "scripts/pwd-verify.sh",
+      "scripts/root-verify.sh",
+      "scripts/workspace-verify.sh",
+      "scripts/powershell-verify.ps1",
+      "scripts/powershell-location.ps1",
+      "scripts/cmd-verify.cmd",
+      "scripts/check.ps1",
+      "scripts/check.ts",
+      "scripts/assertions.ts",
+      "scripts/python-check.py",
+      "scripts/rules.py",
+      "scripts/nested/nested-check.sh",
+      "scripts/outer-check.sh",
+      "MyProject.Tests/OrderServiceTests.cs",
+      "Shop.UnitTests/Assertions.cs",
+      "__specs__/widget.ts",
+      "java/TestFoo.java",
+      "cpp/foo_unittest.cc",
+      "specs/widget.ts",
+      "src/OrderServiceTest.java",
+      "src/WidgetSpec.kt",
+      "src/__mocks__/api.ts",
+      "src/foo-test.ts",
+      "src/test-foo.ts",
+      "src/testFoo.ts",
+      "src/lib.rs",
+      "src/async_runtime.rs",
+      "src/registered_cases.rs",
+      "src/ParameterizedExample.java",
+      "src/NUnitExample.cs",
+      "src/Calculator.cs",
+      "src/catch2.cpp",
+      "src/math.zig",
+      "src/inline.js",
+      "src/concurrent.js",
+      "src/assertions.js",
+      "src/chai_assertions.js",
+      "src/node_assertions.js",
+      "src/node_alias.js",
+      "src/aliased_playwright.ts",
+      "src/reexported_assertion.ts",
+      "src/default_expect_reexport.ts",
+      "src/wildcard_expect_reexport.ts",
+      "src/playwright_types.ts",
+      "src/prefixed.js",
+      "src/soft_expect.ts",
+      "src/check.py",
+      "src/__image_snapshots__/widget-snap.png",
+      "src/__snapshots__/Widget.snap",
+      "src/button.spec.ts-snapshots/button-chromium.png",
+      "testdata/expected.json",
+      "expected.golden",
+      "t/widget.t",
+      "__fixtures__/response.json",
+      "src/spec-parser.ts",
+      "src/widget.spec.ts",
+      "src/testFixtures/java/Fixture.java",
+      "src/androidTest/resources/expected.json",
+      "src/androidTestDebug/resources/expected.json",
+      "src/commonTest/resources/expected.json",
+      "src/testDebug/resources/expected.json",
+      "src/it/sample/verify.groovy",
+      "Tests/branch-regression.ts",
+      ".github/actions/check/action.yml",
+      ".github/actions/check/dist/index.js",
+      ".github/workflows/ci.yml",
+      ".github/workflows/new-entrypoint.yml",
+      ".github/workflows/python.yml",
+      ".github/workflows/python-working.yml",
+      ".github/workflows/resolver.yml",
+      "jest.config.ts",
+      "validation/jest.setup.ts",
+      "action.yml",
+      "cmd/check/main.go",
+      "ci/check/action.yml",
+      "ci/check/run.sh",
+      "ci/check/cmd/check/main.go",
+      "ci/check/sub/action.yml",
+      "ci/check/sub/dist/index.js",
+      "commands/check.sh",
+      "commands/cmd-check.cmd",
+      "commands/windows-check.ps1",
+      "cd-options/check.sh",
+      "dist/index.js",
+      "guarded-commands/check.sh",
+      "gradle/wrapper/gradle-wrapper.properties",
+      "gradlew",
+      ".mvn/wrapper/maven-wrapper.properties",
+      "mvnw",
+      "other/check.sh",
+      "other/lint.sh",
+      "physical-commands/check.sh",
+      "nested-commands/validation/check.sh",
+      "prefixed-commands/verify.sh",
+      "shell-commands/check.sh",
+      "bin/orca-no-mistakes",
+      "scripts/adapters.ts",
+      "scripts/alias-check.ts",
+      "scripts/baseurl-check.ts",
+      "scripts/config.ts",
+      "scripts/ledger.ts",
+      "scripts/orca-no-mistakes.ts",
+      "scripts/policy.ts",
+      "tools/package.json",
+      "tools/check.sh",
+      "tools/jenkins-verify.sh",
+      "tools/module_check.py",
+      "tools/runner.py",
+      "tools/check.py",
+      "tools/relative_check.py",
+      "tools/__main__.py",
+      "jenkins-tools/check.sh",
+      "jenkins-tools/nested/nested-check.sh",
+      "src/myproj/check.py",
+      "src/quotedpkg/check.py",
+      "src/rules.ts",
+      "src/base-rules.ts",
+      "backend/checks/validate.py",
+      "tools/verify.sh",
+      "Jenkinsfile",
+      "tsconfig.json",
+      "tsconfig.baseurl.json",
+    );
+    git(
+      repo,
+      "add",
+      "-f",
+      "gradle/wrapper/gradle-wrapper.jar",
+      ".mvn/wrapper/maven-wrapper.jar",
+    );
+    git(repo, "commit", "-m", "feature");
+    const featureHead = git(repo, "rev-parse", "HEAD");
+    git(repo, "worktree", "add", "--detach", worker, featureHead);
+    const shell = new GitShell({ repo });
+    const assertWorkerChangesAllowed = () =>
+      shell.assertFixerChangesAllowed(
+        worker,
+        featureHead,
+        git(worker, "rev-parse", "HEAD"),
+      );
+    assert.equal(await shell.worktreeIsReusable(worker, featureHead), true);
+    await writeFile(path.join(worker, "feature.ts"), "export const value = 2;\n");
+    assert.equal(await shell.worktreeIsReusable(worker, featureHead), false);
+    git(worker, "reset", "--hard", featureHead);
+
+    await writeFile(
+      path.join(worker, "Tests/existing.ts"),
+      'assert.ok(value);\n',
+    );
+    git(worker, "add", "Tests/existing.ts");
+    git(worker, "commit", "-m", "weaken test");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified pre-existing test files: Tests\/existing\.ts/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    git(worker, "rm", "Tests/branch-regression.ts");
+    git(worker, "commit", "-m", "remove branch regression test");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified pre-existing test files: Tests\/branch-regression\.ts/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "eslint.config.js"), "export default [];\n");
+    await writeFile(path.join(worker, ".clang-format"), "DisableFormat: true\n");
+    await writeFile(path.join(worker, ".coveragerc"), "[report]\nfail_under = 0\n");
+    await writeFile(path.join(worker, ".nycrc"), '{"check-coverage":false}\n');
+    await writeFile(path.join(worker, ".oxlintrc.json"), '{"rules":{}}\n');
+    await writeFile(path.join(worker, ".lintstagedrc.json"), '{}\n');
+    await writeFile(path.join(worker, "lint-staged.config.js"), "export default {};\n");
+    await writeFile(path.join(worker, ".rspec"), "--tag ~focus\n");
+    await writeFile(path.join(worker, ".clang-format-ignore"), "**/*\n");
+    await writeFile(path.join(worker, ".eslintignore"), "**/*\n");
+    await writeFile(path.join(worker, ".github/actionlint.yaml"), "self-hosted-runner:\n  labels: []\n");
+    await mkdir(path.join(worker, ".husky"));
+    await writeFile(path.join(worker, ".husky/pre-commit"), "true\n");
+    await writeFile(path.join(worker, ".markdownlintignore"), "**/*\n");
+    await writeFile(path.join(worker, ".npmrc"), "ignore-scripts=true\n");
+    await writeFile(path.join(worker, ".prettierignore"), "**/*\n");
+    await writeFile(path.join(worker, ".shellcheckrc"), "disable=all\n");
+    await writeFile(path.join(worker, ".stylelintignore"), "**/*\n");
+    await writeFile(path.join(worker, ".swiftlint.yml"), "disabled_rules: [all]\n");
+    await writeFile(path.join(worker, ".yamllint"), "rules: { document-start: disable }\n");
+    await writeFile(path.join(worker, ".bazelrc"), "test --test_tag_filters=-critical\n");
+    await writeFile(path.join(worker, "BUILD"), "# tests disabled\n");
+    await writeFile(path.join(worker, "BUILD.bazel"), "# tests disabled\n");
+    await writeFile(path.join(worker, "CMakeLists.txt"), "# enable_testing removed\n");
+    await writeFile(path.join(worker, "CMakePresets.json"), '{"testPresets":[]}\n');
+    await writeFile(path.join(worker, "CMakeUserPresets.json"), '{"testPresets":[]}\n');
+    await writeFile(path.join(worker, "build.xml"), "<project><target name=\"test\" /></project>\n");
+    await writeFile(path.join(worker, "directory.build.props"), "<Project><PropertyGroup><IsTestProject>false</IsTestProject></PropertyGroup></Project>\n");
+    await writeFile(path.join(worker, "Directory.Build.targets"), "<Project><Target Name=\"SkipTests\" /></Project>\n");
+    await writeFile(path.join(worker, "Directory.Packages.props"), "<Project><ItemGroup /></Project>\n");
+    await writeFile(path.join(worker, "MODULE.bazel"), "# tests disabled\n");
+    await writeFile(path.join(worker, "WORKSPACE"), "# tests disabled\n");
+    await writeFile(path.join(worker, "WORKSPACE.bazel"), "# tests disabled\n");
+    await writeFile(path.join(worker, ".mocharc.json"), '{"spec":[]}\n');
+    await writeFile(path.join(worker, "Cargo.lock"), "# changed lockfile\n");
+    await mkdir(path.join(worker, "pkg"));
+    await writeFile(path.join(worker, "pkg/go.mod"), "module example.com/nested\n");
+    await writeFile(path.join(worker, "go.work"), "go 1.24\nuse ./pkg\n");
+    await writeFile(path.join(worker, "build.gradle"), "test { enabled = false }\n");
+    await writeFile(path.join(worker, "build.gradle.kts"), "tasks.test { enabled = false }\n");
+    await writeFile(path.join(worker, "gradle.properties"), "org.gradle.test=false\n");
+    await writeFile(path.join(worker, "gradlew"), "#!/bin/sh\nexit 0\n");
+    await writeFile(path.join(worker, "gradle/wrapper/gradle-wrapper.properties"), "distributionUrl=https://example.invalid/gradle.zip\n");
+    await writeFile(path.join(worker, "gradle/wrapper/gradle-wrapper.jar"), "replacement\n");
+    await writeFile(path.join(worker, "mvnw"), "#!/bin/sh\nexit 0\n");
+    await writeFile(path.join(worker, ".mvn/wrapper/maven-wrapper.properties"), "distributionUrl=https://example.invalid/maven.zip\n");
+    await writeFile(path.join(worker, ".mvn/wrapper/maven-wrapper.jar"), "replacement\n");
+    await writeFile(path.join(worker, "package.json"), '{"scripts":{"test":"true"}}\n');
+    await writeFile(path.join(worker, "workspace.sln"), "Microsoft Visual Studio Solution File\n");
+    await writeFile(path.join(worker, "workspace.slnx"), "<Solution />\n");
+    await writeFile(path.join(worker, "lerna.json"), '{"packages":[]}\n');
+    await writeFile(path.join(worker, "meson.build"), "# tests removed\n");
+    await writeFile(path.join(worker, "meson.options"), "option('tests', type: 'boolean', value: false)\n");
+    await writeFile(path.join(worker, "meson_options.txt"), "option('tests', type: 'boolean', value: false)\n");
+    await writeFile(path.join(worker, "Pipfile"), '[scripts]\ntest = "true"\n');
+    await writeFile(path.join(worker, "Taskfile.yml"), "tasks:\n  test:\n    cmds: [true]\n");
+    await writeFile(path.join(worker, "Taskfile.dist.yml"), "tasks:\n  test:\n    cmds: [true]\n");
+    await writeFile(path.join(worker, "Taskfile.dist.yaml"), "tasks:\n  test:\n    cmds: [true]\n");
+    await writeFile(path.join(worker, "GNUmakefile"), "test:\n\ttrue\n");
+    await writeFile(path.join(worker, ".justfile"), "test:\n    true\n");
+    await writeFile(
+      path.join(worker, "noxfile.py"),
+      "import nox\n@nox.session\ndef tests(session): pass\n",
+    );
+    await writeFile(path.join(worker, "nyc.config.js"), "module.exports = { checkCoverage: false };\n");
+    await writeFile(path.join(worker, "package-lock.json"), '{"lockfileVersion":3}\n');
+    await writeFile(path.join(worker, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
+    await writeFile(path.join(worker, "pnpm-workspace.yaml"), "packages: []\n");
+    await writeFile(path.join(worker, "pom.xml"), "<skipTests>true</skipTests>\n");
+    await writeFile(path.join(worker, "phpunit.xml"), '<phpunit><testsuites/></phpunit>\n');
+    await writeFile(
+      path.join(worker, "phpunit.xml.dist"),
+      '<phpunit><testsuites/></phpunit>\n',
+    );
+    await writeFile(path.join(worker, "pylintrc"), "[MESSAGES CONTROL]\ndisable=all\n");
+    await mkdir(path.join(worker, ".mvn"), { recursive: true });
+    await writeFile(path.join(worker, ".mvn/maven.config"), "-DskipTests\n");
+    await writeFile(path.join(worker, ".mvn/jvm.config"), "-DskipTests\n");
+    await writeFile(
+      path.join(worker, "settings.gradle"),
+      "gradle.startParameter.excludedTaskNames.add('test')\n",
+    );
+    await writeFile(
+      path.join(worker, "settings.gradle.kts"),
+      "gradle.startParameter.excludedTaskNames.add(\"test\")\n",
+    );
+    await writeFile(path.join(worker, "pytest.ini"), "[pytest]\naddopts = --ignore=Tests\n");
+    await writeFile(
+      path.join(worker, "cypress.config.ts"),
+      "export default { e2e: { excludeSpecPattern: ['**/*'] } };\n",
+    );
+    await writeFile(path.join(worker, "tslint.build.json"), '{"rules":{}}\n');
+    await writeFile(path.join(worker, "tslint.json"), '{"rules":{}}\n');
+    await writeFile(path.join(worker, "vitest.config.ts"), "export default { test: { exclude: ['Tests/**'] } };\n");
+    await writeFile(path.join(worker, "vitest.workspace.ts"), "export default [];\n");
+    await writeFile(path.join(worker, "yarn.lock"), "# changed lockfile\n");
+    await mkdir(path.join(worker, "prompts"));
+    await writeFile(path.join(worker, "prompts/fixer.md"), "weaken checks\n");
+    git(
+      worker,
+      "add",
+      ".mocharc.json",
+      ".clang-format",
+      ".clang-format-ignore",
+      ".coveragerc",
+      ".nycrc",
+      ".oxlintrc.json",
+      ".rspec",
+      ".eslintignore",
+      ".github/actionlint.yaml",
+      ".husky/pre-commit",
+      ".justfile",
+      ".lintstagedrc.json",
+      ".markdownlintignore",
+      ".mvn/maven.config",
+      ".mvn/jvm.config",
+      ".npmrc",
+      ".prettierignore",
+      ".shellcheckrc",
+      ".stylelintignore",
+      ".swiftlint.yml",
+      ".yamllint",
+      ".bazelrc",
+      "BUILD",
+      "BUILD.bazel",
+      "CMakeLists.txt",
+      "CMakePresets.json",
+      "CMakeUserPresets.json",
+      "build.xml",
+      "directory.build.props",
+      "Directory.Build.targets",
+      "Directory.Packages.props",
+      "GNUmakefile",
+      "Cargo.lock",
+      "MODULE.bazel",
+      "WORKSPACE",
+      "WORKSPACE.bazel",
+      "build.gradle",
+      "build.gradle.kts",
+      "cypress.config.ts",
+      "eslint.config.js",
+      "gradle.properties",
+      "gradle/wrapper/gradle-wrapper.properties",
+      "gradlew",
+      "lerna.json",
+      "meson.build",
+      "meson.options",
+      "meson_options.txt",
+      "lint-staged.config.js",
+      "noxfile.py",
+      "nyc.config.js",
+      "package-lock.json",
+      "package.json",
+      "workspace.sln",
+      "workspace.slnx",
+      "Pipfile",
+      "Taskfile.dist.yaml",
+      "Taskfile.dist.yml",
+      "Taskfile.yml",
+      "pkg/go.mod",
+      "pnpm-lock.yaml",
+      "pnpm-workspace.yaml",
+      "pom.xml",
+      "phpunit.xml",
+      "phpunit.xml.dist",
+      "prompts/fixer.md",
+      "pylintrc",
+      "pytest.ini",
+      "settings.gradle",
+      "settings.gradle.kts",
+      ".mvn/wrapper/maven-wrapper.properties",
+      "mvnw",
+      "tslint.build.json",
+      "tslint.json",
+      "vitest.config.ts",
+      "vitest.workspace.ts",
+      "yarn.lock",
+    );
+    git(
+      worker,
+      "add",
+      "-f",
+      "gradle/wrapper/gradle-wrapper.jar",
+      ".mvn/wrapper/maven-wrapper.jar",
+    );
+    git(worker, "add", "-f", "go.work");
+    git(worker, "commit", "-m", "weaken validation policy");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /unexplained-policy-relaxation:.*\.bazelrc, \.clang-format, \.clang-format-ignore, \.coveragerc, \.eslintignore, \.github\/actionlint\.yaml, \.husky\/pre-commit, \.justfile, \.lintstagedrc\.json, \.markdownlintignore, \.mocharc\.json, \.mvn\/jvm\.config, \.mvn\/maven\.config, \.mvn\/wrapper\/maven-wrapper\.jar, \.mvn\/wrapper\/maven-wrapper\.properties, \.npmrc, \.nycrc, \.oxlintrc\.json, \.prettierignore, \.rspec, \.shellcheckrc, \.stylelintignore, \.swiftlint\.yml, \.yamllint, BUILD, BUILD\.bazel, CMakeLists\.txt, CMakePresets\.json, CMakeUserPresets\.json, Cargo\.lock, Directory\.Build\.targets, Directory\.Packages\.props, GNUmakefile, MODULE\.bazel, Pipfile, Taskfile\.dist\.yaml, Taskfile\.dist\.yml, Taskfile\.yml, WORKSPACE, WORKSPACE\.bazel, build\.gradle, build\.gradle\.kts, build\.xml, cypress\.config\.ts, directory\.build\.props, eslint\.config\.js, go\.work, gradle\.properties, gradle\/wrapper\/gradle-wrapper\.jar, gradle\/wrapper\/gradle-wrapper\.properties, gradlew, lerna\.json, lint-staged\.config\.js, meson\.build, meson\.options, meson_options\.txt, mvnw, noxfile\.py, nyc\.config\.js, package-lock\.json, package\.json, phpunit\.xml, phpunit\.xml\.dist, pkg\/go\.mod, pnpm-lock\.yaml, pnpm-workspace\.yaml, pom\.xml, prompts\/fixer\.md, pylintrc, pytest\.ini, settings\.gradle, settings\.gradle\.kts, tslint\.build\.json, tslint\.json, vitest\.config\.ts, vitest\.workspace\.ts, workspace\.sln, workspace\.slnx, yarn\.lock/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/testFixtures/java/Fixture.java"),
+      "class Fixture { static int expected() { return 0; } }\n",
+    );
+    git(worker, "add", "src/testFixtures/java/Fixture.java");
+    git(worker, "commit", "-m", "weaken Gradle test fixture");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified pre-existing test files: src\/testFixtures\/java\/Fixture\.java/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "Shop.UnitTests/Assertions.cs"),
+      "class Assertions { static int Expected() => 0; }\n",
+    );
+    git(worker, "add", "Shop.UnitTests/Assertions.cs");
+    git(worker, "commit", "-m", "weaken dotnet unit test helper");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified pre-existing test files: Shop\.UnitTests\/Assertions\.cs/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "src/androidTest/resources/expected.json"), '{"ok":false}\n');
+    await writeFile(path.join(worker, "src/androidTestDebug/resources/expected.json"), '{"ok":false}\n');
+    await writeFile(path.join(worker, "src/commonTest/resources/expected.json"), '{"ok":false}\n');
+    await writeFile(path.join(worker, "src/testDebug/resources/expected.json"), '{"ok":false}\n');
+    git(
+      worker,
+      "add",
+      "src/androidTest/resources/expected.json",
+      "src/androidTestDebug/resources/expected.json",
+      "src/commonTest/resources/expected.json",
+      "src/testDebug/resources/expected.json",
+    );
+    git(worker, "commit", "-m", "weaken variant test fixtures");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified pre-existing test files: src\/androidTest\/resources\/expected\.json, src\/androidTestDebug\/resources\/expected\.json, src\/commonTest\/resources\/expected\.json, src\/testDebug\/resources\/expected\.json/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "src/it/sample/verify.groovy"), "return true\n");
+    git(worker, "add", "src/it/sample/verify.groovy");
+    git(worker, "commit", "-m", "weaken Maven Invoker test");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified pre-existing test files: src\/it\/sample\/verify\.groovy/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    const canonicalManifests = [
+      "Package.swift",
+      "Package.resolved",
+      "app.csproj",
+      "build.boot",
+      "build.sbt",
+      "build.zig",
+      "composer.json",
+      "deps.edn",
+      "Gemfile",
+      "mix.exs",
+      "mix.lock",
+      "pubspec.lock",
+      "pubspec.yaml",
+      "project.clj",
+      "Rakefile",
+    ];
+    for (const filePath of canonicalManifests) {
+      await writeFile(path.join(worker, filePath), "tests disabled\n");
+    }
+    git(worker, "add", ...canonicalManifests);
+    git(worker, "commit", "-m", "disable canonical package tests");
+    await assert.rejects(assertWorkerChangesAllowed(), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      for (const filePath of canonicalManifests) {
+        assert.ok(error.message.includes(filePath));
+      }
+      return true;
+    });
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/Calculator.cs"),
+      "[NUnit.Framework.Test]\nvoid Calculates() { NUnit.Framework.Assert.AreEqual(2, Calculate()); }\n",
+    );
+    git(worker, "add", "src/Calculator.cs");
+    git(worker, "commit", "-m", "weaken qualified C sharp inline test");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified co-located test assertions or skip markers: src\/Calculator\.cs/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/catch2.cpp"),
+      '#include <catch2/catch_test_macros.hpp>\nTEST_CASE("adds") { REQUIRE(1 + 1 == 3); }\n',
+    );
+    git(worker, "add", "src/catch2.cpp");
+    git(worker, "commit", "-m", "weaken Catch2 assertion");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified co-located test assertions or skip markers: src\/catch2\.cpp/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    const ciPolicyPaths = [
+      ".buildkite/pipeline.yml",
+      ".circleci/config.yml",
+      ".forgejo/workflows/ci.yml",
+      ".github/actions/check/action.yml",
+      ".github/actions/check/dist/index.js",
+      ".github/workflows/ci.yml",
+      ".gitlab-ci.yml",
+      ".travis.yml",
+      "Jenkinsfile",
+      "appveyor.yml",
+      "azure-pipelines.yml",
+      "bitbucket-pipelines.yml",
+    ];
+    for (const filePath of ciPolicyPaths) {
+      await mkdir(path.dirname(path.join(worker, filePath)), { recursive: true });
+      await writeFile(path.join(worker, filePath), "disabled\n");
+    }
+    await mkdir(path.join(worker, "tests/sub"), { recursive: true });
+    await writeFile(
+      path.join(worker, "tests/sub/conftest.py"),
+      "collect_ignore_glob = ['*']\n",
+    );
+    for (const moduleName of ["adapters", "config", "ledger", "policy"]) {
+      await writeFile(
+        path.join(worker, `scripts/${moduleName}.ts`),
+        `export const ${moduleName} = false;\n`,
+      );
+    }
+    git(
+      worker,
+      "add",
+      ...ciPolicyPaths,
+      "scripts/adapters.ts",
+      "scripts/config.ts",
+      "scripts/ledger.ts",
+      "scripts/policy.ts",
+    );
+    git(worker, "add", "-f", "tests/sub/conftest.py");
+    git(worker, "commit", "-m", "weaken coordinator validation policy");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        for (const filePath of ciPolicyPaths) {
+          assert.ok(error.message.includes(filePath));
+        }
+        assert.match(error.message, /scripts\/config\.ts/);
+        assert.match(error.message, /scripts\/policy\.ts/);
+        assert.match(error.message, /tests\/sub\/conftest\.py/i);
+        return true;
+      },
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "spec/openapi.yaml"), "openapi: 3.1.1\n");
+    await writeFile(path.join(worker, "docs/test-plan.md"), "# Updated test plan\n");
+    await writeFile(
+      path.join(worker, "src/spec-parser.ts"),
+      "export const parser = 2;\n",
+    );
+    await writeFile(
+      path.join(worker, "src/playwright_types.ts"),
+      'import type { Page } from "@playwright/test";\nexport type BrowserPage = Page;\nexport const browser = 2;\n',
+    );
+    await writeFile(
+      path.join(worker, "scripts/test-harness.ts"),
+      "export const harness = 2;\n",
+    );
+    await writeFile(
+      path.join(worker, "scripts/test-runner.ts"),
+      "export const runner = 2;\n",
+    );
+    await writeFile(path.join(worker, "tools/check.sh"), "export TOOL_CHECK=2\n");
+    await writeFile(path.join(worker, "other/check.sh"), "export OTHER_CHECK=2\n");
+    git(
+      worker,
+      "add",
+      "spec/openapi.yaml",
+      "docs/test-plan.md",
+      "scripts/test-harness.ts",
+      "scripts/test-runner.ts",
+      "src/playwright_types.ts",
+      "src/spec-parser.ts",
+      "other/check.sh",
+      "tools/check.sh",
+    );
+    git(worker, "commit", "-m", "repair specification tooling");
+    await assertWorkerChangesAllowed();
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "scripts/new-validation.sh"), "exit 0\n");
+    git(worker, "add", "scripts/new-validation.sh");
+    git(worker, "commit", "-m", "add disabled validation entrypoint");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /protected validation policy files: scripts\/new-validation\.sh/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "spec/support/shared_context.rb"),
+      "shared_context 'authenticated' do\nend\n",
+    );
+    git(worker, "add", "spec/support/shared_context.rb");
+    git(worker, "commit", "-m", "weaken RSpec support helper");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified pre-existing test files: spec\/support\/shared_context\.rb/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "action.yml"), "runs: { using: node20, main: dist/noop.js }\n");
+    await writeFile(path.join(worker, "dist/index.js"), "process.exit(0);\n");
+    await writeFile(path.join(worker, "cmd/check/main.go"), "package main\nfunc main() {}\n");
+    git(worker, "add", "action.yml", "dist/index.js", "cmd/check/main.go");
+    git(worker, "commit", "-m", "disable referenced root action");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /action\.yml/);
+        assert.match(error.message, /dist\/index\.js/);
+        assert.match(error.message, /cmd\/check\/main\.go/);
+        return true;
+      },
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "scripts/verify-ci.sh"), "exit 0\n");
+    git(worker, "add", "scripts/verify-ci.sh");
+    git(worker, "commit", "-m", "disable referenced validation entrypoint");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /protected validation policy files: scripts\/verify-ci\.sh/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "scripts/workspace-verify.sh"), "exit 0\n");
+    git(worker, "add", "scripts/workspace-verify.sh");
+    git(worker, "commit", "-m", "disable prefixed validation entrypoint");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /protected validation policy files: scripts\/workspace-verify\.sh/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "scripts/powershell-verify.ps1"), "exit 0\n");
+    git(worker, "add", "scripts/powershell-verify.ps1");
+    git(worker, "commit", "-m", "disable PowerShell-prefixed validation entrypoint");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /protected validation policy files: scripts\/powershell-verify\.ps1/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "scripts/powershell-location.ps1"), "exit 0\n");
+    await writeFile(path.join(worker, "scripts/cmd-verify.cmd"), "exit 0\n");
+    await writeFile(path.join(worker, "commands/cmd-check.cmd"), "exit 0\n");
+    await writeFile(path.join(worker, "tools/module_check.py"), "def main():\n    pass\n");
+    await writeFile(path.join(worker, "tools/__main__.py"), "def main():\n    pass\n");
+    await writeFile(path.join(worker, "src/myproj/check.py"), "def main():\n    pass\n");
+    await writeFile(path.join(worker, "src/quotedpkg/check.py"), "def main():\n    pass\n");
+    await writeFile(path.join(worker, "backend/checks/validate.py"), "def main():\n    pass\n");
+    await writeFile(path.join(worker, "scripts/assertions.ts"), "export const skipped = true;\n");
+    await writeFile(path.join(worker, "src/rules.ts"), "export const skipped = true;\n");
+    await writeFile(path.join(worker, "src/base-rules.ts"), "export const skipped = true;\n");
+    await writeFile(path.join(worker, "validation/jest.setup.ts"), "export const skipped = true;\n");
+    await writeFile(path.join(worker, "scripts/rules.py"), "def validate():\n    pass\n");
+    await writeFile(path.join(worker, "tools/check.py"), "def validate():\n    pass\n");
+    await writeFile(path.join(worker, "tools/relative_check.py"), "def validate():\n    pass\n");
+    await writeFile(path.join(worker, "jenkins-tools/check.sh"), "exit 0\n");
+    await writeFile(path.join(worker, "jenkins-tools/nested/nested-check.sh"), "exit 0\n");
+    await writeFile(path.join(worker, "scripts/nested/nested-check.sh"), "exit 0\n");
+    await writeFile(path.join(worker, "scripts/outer-check.sh"), "exit 0\n");
+    await writeFile(path.join(worker, "cd-options/check.sh"), "exit 0\n");
+    await writeFile(path.join(worker, "physical-commands/check.sh"), "exit 0\n");
+    git(
+      worker,
+      "add",
+      "scripts/powershell-location.ps1",
+      "scripts/cmd-verify.cmd",
+      "commands/cmd-check.cmd",
+      "scripts/assertions.ts",
+      "src/rules.ts",
+      "src/base-rules.ts",
+      "validation/jest.setup.ts",
+      "scripts/rules.py",
+      "tools/check.py",
+      "tools/relative_check.py",
+      "jenkins-tools/check.sh",
+      "jenkins-tools/nested/nested-check.sh",
+      "scripts/nested/nested-check.sh",
+      "scripts/outer-check.sh",
+      "cd-options/check.sh",
+      "physical-commands/check.sh",
+      "tools/module_check.py",
+      "tools/__main__.py",
+      "src/myproj/check.py",
+      "src/quotedpkg/check.py",
+      "backend/checks/validate.py",
+    );
+    git(worker, "commit", "-m", "disable platform validation entrypoints");
+    await assert.rejects(assertWorkerChangesAllowed(), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /scripts\/cmd-verify\.cmd/);
+      assert.match(error.message, /commands\/cmd-check\.cmd/);
+      assert.match(error.message, /scripts\/powershell-location\.ps1/);
+      assert.match(error.message, /scripts\/assertions\.ts/);
+      assert.match(error.message, /src\/rules\.ts/);
+      assert.match(error.message, /src\/base-rules\.ts/);
+      assert.match(error.message, /validation\/jest\.setup\.ts/);
+      assert.match(error.message, /scripts\/rules\.py/);
+      assert.match(error.message, /tools\/check\.py/);
+      assert.match(error.message, /tools\/relative_check\.py/);
+      assert.match(error.message, /jenkins-tools\/check\.sh/);
+      assert.match(error.message, /jenkins-tools\/nested\/nested-check\.sh/);
+      assert.match(error.message, /scripts\/nested\/nested-check\.sh/);
+      assert.match(error.message, /scripts\/outer-check\.sh/);
+      assert.match(error.message, /cd-options\/check\.sh/);
+      assert.match(error.message, /physical-commands\/check\.sh/);
+      assert.match(error.message, /tools\/__main__\.py/);
+      assert.match(error.message, /tools\/module_check\.py/);
+      assert.match(error.message, /src\/myproj\/check\.py/);
+      assert.match(error.message, /src\/quotedpkg\/check\.py/);
+      assert.match(error.message, /backend\/checks\/validate\.py/);
+      return true;
+    });
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "scripts/pwd-verify.sh"), "exit 0\n");
+    await writeFile(path.join(worker, "scripts/root-verify.sh"), "exit 0\n");
+    git(worker, "add", "scripts/pwd-verify.sh", "scripts/root-verify.sh");
+    git(worker, "commit", "-m", "disable command-substitution validation entrypoints");
+    await assert.rejects(assertWorkerChangesAllowed(), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /scripts\/pwd-verify\.sh/);
+      assert.match(error.message, /scripts\/root-verify\.sh/);
+      return true;
+    });
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "scripts/check.ps1"), "exit 0\n");
+    git(worker, "add", "scripts/check.ps1");
+    git(worker, "commit", "-m", "disable Windows validation entrypoint");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /protected validation policy files: scripts\/check\.ps1/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "ci/check/action.yml"), "runs: { using: composite, steps: [] }\n");
+    await writeFile(path.join(worker, "ci/check/run.sh"), "exit 0\n");
+    git(worker, "add", "ci/check/action.yml", "ci/check/run.sh");
+    git(worker, "commit", "-m", "disable referenced local action");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /ci\/check\/action\.yml/);
+        assert.match(error.message, /ci\/check\/run\.sh/);
+        return true;
+      },
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "tools/verify.sh"), "exit 0\n");
+    git(worker, "add", "tools/verify.sh");
+    git(worker, "commit", "-m", "disable manifest-relative validation entrypoint");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /protected validation policy files: tools\/verify\.sh/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "tools/jenkins-verify.sh"), "exit 0\n");
+    git(worker, "add", "tools/jenkins-verify.sh");
+    git(worker, "commit", "-m", "disable Jenkins validation entrypoint");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /protected validation policy files: tools\/jenkins-verify\.sh/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "commands/check.sh"), "exit 0\n");
+    git(worker, "add", "commands/check.sh");
+    git(worker, "commit", "-m", "disable working-directory validation entrypoint");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /protected validation policy files: commands\/check\.sh/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "commands/windows-check.ps1"), "exit 0\n");
+    git(worker, "add", "commands/windows-check.ps1");
+    git(worker, "commit", "-m", "disable Windows composed validation entrypoint");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /protected validation policy files: commands\/windows-check\.ps1/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "shell-commands/check.sh"), "exit 0\n");
+    git(worker, "add", "shell-commands/check.sh");
+    git(worker, "commit", "-m", "disable shell-composed validation entrypoint");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /protected validation policy files: shell-commands\/check\.sh/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "guarded-commands/check.sh"), "exit 0\n");
+    git(worker, "add", "guarded-commands/check.sh");
+    git(worker, "commit", "-m", "disable guarded shell validation entrypoint");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /protected validation policy files: guarded-commands\/check\.sh/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "nested-commands/validation/check.sh"), "exit 0\n");
+    git(worker, "add", "nested-commands/validation/check.sh");
+    git(worker, "commit", "-m", "disable nested-directory validation entrypoint");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /protected validation policy files: nested-commands\/validation\/check\.sh/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "prefixed-commands/verify.sh"), "exit 0\n");
+    git(worker, "add", "prefixed-commands/verify.sh");
+    git(worker, "commit", "-m", "disable prefixed shell validation entrypoint");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /protected validation policy files: prefixed-commands\/verify\.sh/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "ci/check/sub/dist/index.js"), "process.exit(0);\n");
+    await writeFile(path.join(worker, "ci/check/cmd/check/main.go"), "package main\nfunc main() {}\n");
+    git(worker, "add", "ci/check/sub/dist/index.js", "ci/check/cmd/check/main.go");
+    git(worker, "commit", "-m", "disable nested local action");
+    await assert.rejects(assertWorkerChangesAllowed(), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /ci\/check\/cmd\/check\/main\.go/);
+      assert.match(error.message, /ci\/check\/sub\/dist\/index\.js/);
+      return true;
+    });
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "cypress/e2e/login.cy.ts"),
+      "expect(true).to.equal(false);\n",
+    );
+    await writeFile(
+      path.join(worker, "e2e/checkout.e2e.ts"),
+      "expect(true).toBe(false);\n",
+    );
+    await writeFile(path.join(worker, "e2e/login.ts"), "export const expected = { ok: false };\n");
+    await writeFile(
+      path.join(worker, "integration/login.ts"),
+      "export const expected = { ok: false };\n",
+    );
+    await writeFile(path.join(worker, "conftest.py"), "assert False\n");
+    git(
+      worker,
+      "add",
+      "conftest.py",
+      "cypress/e2e/login.cy.ts",
+      "e2e/checkout.e2e.ts",
+      "e2e/login.ts",
+      "integration/login.ts",
+    );
+    git(worker, "commit", "-m", "weaken end-to-end tests");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /cypress\/e2e\/login\.cy\.ts/);
+        assert.match(error.message, /e2e\/checkout\.e2e\.ts/);
+        assert.match(error.message, /e2e\/login\.ts/);
+        assert.match(error.message, /integration\/login\.ts/);
+        return true;
+      },
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/widget.spec.ts"),
+      "assert.ok(false);\n",
+    );
+    git(worker, "add", "src/widget.spec.ts");
+    git(worker, "commit", "-m", "weaken filename test");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified pre-existing test files: src\/widget\.spec\.ts/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/lib.rs"),
+      "pub fn value() -> i32 { 1 }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    #[ignore]\n    fn value_is_one() { assert_eq!(super::value(), 2); }\n}\n",
+    );
+    git(worker, "add", "src/lib.rs");
+    git(worker, "commit", "-m", "weaken inline Rust test");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified co-located test assertions or skip markers: src\/lib\.rs/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/async_runtime.rs"),
+      "#[tokio::test]\nasync fn smoke() -> Result<(), Box<dyn std::error::Error>> {\n    Ok(())\n}\n",
+    );
+    git(worker, "add", "src/async_runtime.rs");
+    git(worker, "commit", "-m", "neutralize async Rust test");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified co-located test assertions or skip markers: src\/async_runtime\.rs/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/registered_cases.rs"),
+      "#[rstest]\nfn smoke(case: i32) { verify(0); }\n",
+    );
+    await writeFile(
+      path.join(worker, "src/ParameterizedExample.java"),
+      "@ParameterizedTest\nvoid works() { verifyDisabled(); }\n",
+    );
+    await writeFile(
+      path.join(worker, "src/NUnitExample.cs"),
+      "[TestCase(2)]\nvoid Works(int value) { VerifyDisabled(value); }\n",
+    );
+    git(
+      worker,
+      "add",
+      "src/registered_cases.rs",
+      "src/ParameterizedExample.java",
+      "src/NUnitExample.cs",
+    );
+    git(worker, "commit", "-m", "weaken helper-based inline test cases");
+    await assert.rejects(assertWorkerChangesAllowed(), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /src\/NUnitExample\.cs/);
+      assert.match(error.message, /src\/ParameterizedExample\.java/);
+      assert.match(error.message, /src\/registered_cases\.rs/);
+      return true;
+    });
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/inline.js"),
+      "test.each(buildCases(seed()))('response', () => {\n  assert.deepEqual(actual, {\n    ok: false,\n  });\n});\n",
+    );
+    git(worker, "add", "src/inline.js");
+    git(worker, "commit", "-m", "weaken multiline inline assertion");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified co-located test assertions or skip markers: src\/inline\.js/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/prefixed.js"),
+      'if (import.meta.vitest) test("works", () => expect(value()).toBe(2));\n',
+    );
+    git(worker, "add", "src/prefixed.js");
+    git(worker, "commit", "-m", "weaken prefixed inline assertion");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified co-located test assertions or skip markers: src\/prefixed\.js/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/check.py"),
+      "def test_value():\n    assert value == 2\n",
+    );
+    git(worker, "add", "src/check.py");
+    git(worker, "commit", "-m", "weaken Python inline assertion");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified co-located test assertions or skip markers: src\/check\.py/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/math.zig"),
+      'const std = @import("std");\ntest "value" { try std.testing.expectEqual(@as(i32, 2), value()); }\n',
+    );
+    git(worker, "add", "src/math.zig");
+    git(worker, "commit", "-m", "weaken Zig inline assertion");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified co-located test assertions or skip markers: src\/math\.zig/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "t/widget.t"), "ok(0, 'works');\n");
+    git(worker, "add", "t/widget.t");
+    git(worker, "commit", "-m", "weaken Perl test");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified pre-existing test files: t\/widget\.t/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "main.tftest.hcl"),
+      'run "works" { assert { condition = false } }\n',
+    );
+    await writeFile(
+      path.join(worker, "features/login.feature"),
+      "Feature: Login\n  Scenario: works\n    Then access is denied\n",
+    );
+    await writeFile(path.join(worker, "cli.bats"), "@test 'works' { false; }\n");
+    await writeFile(
+      path.join(worker, "acceptance/login.robot"),
+      "*** Test Cases ***\nLogin works\n    Should Be Equal    denied    granted\n",
+    );
+    await writeFile(
+      path.join(worker, "acceptance/common.resource"),
+      "*** Keywords ***\nVerify access\n    Should Be Equal    denied    granted\n",
+    );
+    await writeFile(path.join(worker, "testfoo.py"), "def testfoo():\n    pass\n");
+    git(
+      worker,
+      "add",
+      "main.tftest.hcl",
+      "features/login.feature",
+      "acceptance/common.resource",
+      "acceptance/login.robot",
+      "cli.bats",
+      "testfoo.py",
+    );
+    git(worker, "commit", "-m", "weaken declarative tests");
+    await assert.rejects(assertWorkerChangesAllowed(), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /cli\.bats/);
+      assert.match(error.message, /acceptance\/common\.resource/);
+      assert.match(error.message, /acceptance\/login\.robot/);
+      assert.match(error.message, /features\/login\.feature/);
+      assert.match(error.message, /main\.tftest\.hcl/);
+      assert.match(error.message, /testfoo\.py/);
+      return true;
+    });
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/concurrent.js"),
+      "test.concurrent.skip('works', async () => { expect(await value()).toBe(1); });\n",
+    );
+    git(worker, "add", "src/concurrent.js");
+    git(worker, "commit", "-m", "skip chained inline test");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified co-located test assertions or skip markers: src\/concurrent\.js/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/assertions.js"),
+      "export function verify(_actual) {}\n",
+    );
+    await writeFile(path.join(worker, ".gitattributes"), "src/assertions.js -diff\n");
+    git(worker, "add", ".gitattributes", "src/assertions.js");
+    git(worker, "commit", "-m", "remove common assertion");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified co-located test assertions or skip markers: src\/assertions\.js/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/soft_expect.ts"),
+      "export function verify(_value) {}\n",
+    );
+    git(worker, "add", "src/soft_expect.ts");
+    git(worker, "commit", "-m", "remove chained expect assertion");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified co-located test assertions or skip markers: src\/soft_expect\.ts/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/chai_assertions.js"),
+      "export function verify(_result) {}\n",
+    );
+    await writeFile(
+      path.join(worker, "src/node_assertions.js"),
+      "export function verify(_actual) {}\n",
+    );
+    git(worker, "add", "src/chai_assertions.js", "src/node_assertions.js");
+    git(worker, "commit", "-m", "remove should and strict assertions");
+    await assert.rejects(assertWorkerChangesAllowed(), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /src\/chai_assertions\.js/);
+      assert.match(error.message, /src\/node_assertions\.js/);
+      return true;
+    });
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/node_alias.js"),
+      'import { strictEqual as eq } from "node:assert/strict";\nexport function verify(_actual) {}\n',
+    );
+    git(worker, "add", "src/node_alias.js");
+    git(worker, "commit", "-m", "remove aliased Node assertion");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified co-located test assertions or skip markers: src\/node_alias\.js/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/aliased_playwright.ts"),
+      'import { expect as verify } from "@playwright/test";\nexport function check(_page) {}\n',
+    );
+    git(worker, "add", "src/aliased_playwright.ts");
+    git(worker, "commit", "-m", "remove aliased framework assertion");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified co-located test assertions or skip markers: src\/aliased_playwright\.ts/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/reexported_assertion.ts"),
+      "export function verify() {}\n",
+    );
+    git(worker, "add", "src/reexported_assertion.ts");
+    git(worker, "commit", "-m", "replace re-exported assertion");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified co-located test assertions or skip markers: src\/reexported_assertion\.ts/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/default_expect_reexport.ts"),
+      "export function expect() { return { toBe() {} }; }\n",
+    );
+    git(worker, "add", "src/default_expect_reexport.ts");
+    git(worker, "commit", "-m", "replace default assertion re-export");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified co-located test assertions or skip markers: src\/default_expect_reexport\.ts/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/wildcard_expect_reexport.ts"),
+      "export function expect() { return { toBe() {} }; }\n",
+    );
+    git(worker, "add", "src/wildcard_expect_reexport.ts");
+    git(worker, "commit", "-m", "replace wildcard assertion re-export");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified co-located test assertions or skip markers: src\/wildcard_expect_reexport\.ts/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "features/support/env.rb"),
+      "Before do\n  skip_this_scenario\nend\n",
+    );
+    git(worker, "add", "features/support/env.rb");
+    git(worker, "commit", "-m", "weaken Gherkin support hook");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified pre-existing test files: features\/support\/env\.rb/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "packages/web/features/support/env.rb"),
+      "Before do\n  skip_package_scenario\nend\n",
+    );
+    git(worker, "add", "packages/web/features/support/env.rb");
+    git(worker, "commit", "-m", "weaken nested Gherkin support hook");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified pre-existing test files: packages\/web\/features\/support\/env\.rb/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "cpp/foo_unittest.cc"),
+      "TEST(Foo, Works) { EXPECT_EQ(value(), 2); }\n",
+    );
+    git(worker, "add", "cpp/foo_unittest.cc");
+    git(worker, "commit", "-m", "weaken C++ unit test");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified pre-existing test files: cpp\/foo_unittest\.cc/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "MyProject.Tests/OrderServiceTests.cs"),
+      "Assert.True(false);\n",
+    );
+    await writeFile(
+      path.join(worker, "src/OrderServiceTest.java"),
+      "assertTrue(false);\n",
+    );
+    await writeFile(
+      path.join(worker, "src/WidgetSpec.kt"),
+      "assertTrue(false)\n",
+    );
+    await writeFile(path.join(worker, "__specs__/widget.ts"), "assert(false);\n");
+    await writeFile(path.join(worker, "java/TestFoo.java"), "assert false;\n");
+    await writeFile(path.join(worker, "specs/widget.ts"), "assert(false);\n");
+    await writeFile(path.join(worker, "src/foo-test.ts"), "assert(false);\n");
+    await writeFile(path.join(worker, "src/test-foo.ts"), "assert(false);\n");
+    await writeFile(path.join(worker, "src/testFoo.ts"), "assert(false);\n");
+    git(
+      worker,
+      "add",
+      "MyProject.Tests/OrderServiceTests.cs",
+      "__specs__/widget.ts",
+      "java/TestFoo.java",
+      "specs/widget.ts",
+      "src/OrderServiceTest.java",
+      "src/WidgetSpec.kt",
+      "src/foo-test.ts",
+      "src/test-foo.ts",
+      "src/testFoo.ts",
+    );
+    git(worker, "commit", "-m", "weaken suffix-convention tests");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /MyProject\.Tests\/OrderServiceTests\.cs/);
+        assert.match(error.message, /__specs__\/widget\.ts/);
+        assert.match(error.message, /java\/TestFoo\.java/);
+        assert.match(error.message, /specs\/widget\.ts/);
+        assert.match(error.message, /src\/OrderServiceTest\.java/);
+        assert.match(error.message, /src\/WidgetSpec\.kt/);
+        assert.match(error.message, /src\/foo-test\.ts/);
+        assert.match(error.message, /src\/test-foo\.ts/);
+        assert.match(error.message, /src\/testFoo\.ts/);
+        return true;
+      },
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/__snapshots__/Widget.snap"),
+      "exports[`Widget 1`] = `weakened`;\n",
+    );
+    git(worker, "add", "src/__snapshots__/Widget.snap");
+    git(worker, "commit", "-m", "weaken snapshot assertion");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified pre-existing test files: src\/__snapshots__\/Widget\.snap/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "cypress/snapshots/login.png"),
+      "updated cypress image\n",
+    );
+    git(worker, "add", "cypress/snapshots/login.png");
+    git(worker, "commit", "-m", "weaken plain snapshot assertion");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified pre-existing test files: cypress\/snapshots\/login\.png/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/__image_snapshots__/widget-snap.png"),
+      "updated image\n",
+    );
+    git(worker, "add", "src/__image_snapshots__/widget-snap.png");
+    git(worker, "commit", "-m", "weaken Jest image snapshot assertion");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified pre-existing test files: src\/__image_snapshots__\/widget-snap\.png/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/__mocks__/api.ts"),
+      "export const response = { ok: false };\n",
+    );
+    git(worker, "add", "src/__mocks__/api.ts");
+    git(worker, "commit", "-m", "weaken Jest manual mock");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified pre-existing test files: src\/__mocks__\/api\.ts/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "src/button.spec.ts-snapshots/button-chromium.png"),
+      "updated pixels\n",
+    );
+    git(worker, "add", "src/button.spec.ts-snapshots/button-chromium.png");
+    git(worker, "commit", "-m", "weaken Playwright snapshot assertion");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified pre-existing test files: src\/button\.spec\.ts-snapshots\/button-chromium\.png/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "testdata/expected.json"), '{"ok":false}\n');
+    await writeFile(
+      path.join(worker, "__fixtures__/response.json"),
+      '{"status":"weakened"}\n',
+    );
+    await writeFile(path.join(worker, "expected.golden"), "weakened output\n");
+    git(
+      worker,
+      "add",
+      "testdata/expected.json",
+      "__fixtures__/response.json",
+      "expected.golden",
+    );
+    git(worker, "commit", "-m", "weaken fixture assertions");
+    await assert.rejects(assertWorkerChangesAllowed(), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /__fixtures__\/response\.json/);
+      assert.match(error.message, /testdata\/expected\.json/);
+      assert.match(error.message, /expected\.golden/);
+      return true;
+    });
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "bin/orca-no-mistakes"),
+      entrypointSource.replace(
+        "../scripts/orca-no-mistakes.ts",
+        "../scripts/unchecked.ts",
+      ),
+    );
+    git(worker, "add", "bin/orca-no-mistakes");
+    git(worker, "commit", "-m", "bypass coordinator entrypoint");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /protected validation policy files: bin\/orca-no-mistakes/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await mkdir(path.join(worker, "docs/agents"), { recursive: true });
+    await writeFile(
+      path.join(worker, "docs/agents/prompt-templates.md"),
+      "Document application prompt templates.\n",
+    );
+    git(worker, "add", "docs/agents/prompt-templates.md");
+    git(worker, "commit", "-m", "document prompt templates");
+    await assertWorkerChangesAllowed();
+
+    git(worker, "reset", "--hard", featureHead);
+    await mkdir(path.join(worker, "docs/prompts"), { recursive: true });
+    await writeFile(
+      path.join(worker, "docs/prompts/reviewer.md"),
+      "Document reviewer prompts.\n",
+    );
+    git(worker, "add", "docs/prompts/reviewer.md");
+    git(worker, "commit", "-m", "document reviewer prompts");
+    await assertWorkerChangesAllowed();
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "scripts/orca-no-mistakes.ts"),
+      `${coordinatorSource}\nexport const integrationFixture = 2;\n`,
+    );
+    git(worker, "add", "scripts/orca-no-mistakes.ts");
+    git(worker, "commit", "-m", "repair implementation");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /protected validation policy files: scripts\/orca-no-mistakes\.ts/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "feature.ts"), "export const value = 99;\n");
+    git(worker, "add", "feature.ts");
+    const rewrittenTree = git(worker, "write-tree");
+    const rewrittenHead = git(
+      worker,
+      "commit-tree",
+      rewrittenTree,
+      "-p",
+      `${featureHead}^`,
+      "-m",
+      "rewrite implementation history",
+    );
+    git(worker, "reset", "--hard", rewrittenHead);
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /ordinary fixer commit rewrote history instead of descending from the pre-round head/,
+    );
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "Tests/new-regression.ts"),
+      'assert.equal(value, 1);\n',
+    );
+    git(worker, "add", "Tests/new-regression.ts");
+    git(worker, "commit", "-m", "add regression test");
+    const checkedWorkerHead = git(worker, "rev-parse", "HEAD");
+    await shell.assertFixerChangesAllowed(worker, featureHead, checkedWorkerHead);
+    await writeFile(path.join(worker, "feature.ts"), "export const value = 3;\n");
+    git(worker, "add", "feature.ts");
+    git(worker, "commit", "-m", "advance after policy check");
+    assert.equal(
+      await shell.applyWorktreeCommits(worker, featureHead, checkedWorkerHead),
+      false,
+    );
+    assert.equal(git(repo, "rev-parse", "HEAD"), featureHead);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test("GitShell.applyWorktreeCommits adopts rewritten rebase history behind a backup ref", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-git-rewrite-"));
   const origin = path.join(temp, "origin.git");
@@ -2067,10 +4908,14 @@ test("GitShell.applyWorktreeCommits adopts rewritten rebase history behind a bac
     const worker = path.join(temp, "worker-wt");
     git(operator, "worktree", "add", "--detach", worker, pinnedHead);
     git(worker, "rebase", "origin/main");
-    assert.notEqual(git(worker, "rev-parse", "HEAD"), pinnedHead);
+    const rebasedHead = git(worker, "rev-parse", "HEAD");
+    assert.notEqual(rebasedHead, pinnedHead);
 
     const shell = new GitShell({ repo: operator });
-    assert.equal(await shell.applyWorktreeCommits(worker, pinnedHead), true);
+    assert.equal(
+      await shell.applyWorktreeCommits(worker, pinnedHead, rebasedHead),
+      true,
+    );
     assert.equal(
       git(operator, "rev-parse", "HEAD"),
       git(worker, "rev-parse", "HEAD"),
@@ -2083,6 +4928,73 @@ test("GitShell.applyWorktreeCommits adopts rewritten rebase history behind a bac
         `refs/no-mistakes/backup/${pinnedHead}`,
       ),
       pinnedHead,
+    );
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("GitShell binds rebase conflicts to the fetched upstream snapshot", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-rebase-guard-"));
+  const origin = path.join(temp, "origin.git");
+  const seed = path.join(temp, "seed");
+  const operator = path.join(temp, "operator");
+  const upstream = path.join(temp, "upstream");
+  try {
+    git(temp, "init", "--bare", "-b", "main", origin);
+    git(temp, "clone", origin, seed);
+    git(seed, "config", "user.email", "test@example.com");
+    git(seed, "config", "user.name", "Test User");
+    await mkdir(path.join(seed, "tests"));
+    await writeFile(path.join(seed, "f.txt"), "base\n");
+    git(seed, "add", ".");
+    git(seed, "commit", "-m", "base");
+    git(seed, "push", "origin", "main");
+
+    git(temp, "clone", origin, operator);
+    git(operator, "config", "user.email", "test@example.com");
+    git(operator, "config", "user.name", "Test User");
+    git(operator, "checkout", "-b", "feature");
+    await writeFile(path.join(operator, "f.txt"), "feature\n");
+    git(operator, "add", "f.txt");
+    git(operator, "commit", "-m", "feature");
+    const featureHead = git(operator, "rev-parse", "HEAD");
+
+    git(temp, "clone", origin, upstream);
+    git(upstream, "config", "user.email", "test@example.com");
+    git(upstream, "config", "user.name", "Test User");
+    await writeFile(path.join(upstream, "f.txt"), "upstream\n");
+    git(upstream, "add", ".");
+    git(upstream, "commit", "-m", "upstream");
+    git(upstream, "push", "origin", "main");
+
+    const shell = new GitShell({ repo: operator });
+    const report = await shell.rebase("main");
+    assert.deepEqual(report.findings.map((finding) => finding.file), ["f.txt"]);
+    assert.ok(report.findings.every((finding) => finding.action === "ask-user"));
+    assert.equal(git(operator, "status", "--porcelain"), "");
+    const upstreamHead = git(operator, "rev-parse", "origin/main");
+    assert.equal(report.rebaseUpstreamHead, upstreamHead);
+
+    await writeFile(path.join(upstream, "later.txt"), "later\n");
+    git(upstream, "add", "later.txt");
+    git(upstream, "commit", "-m", "later upstream");
+    git(upstream, "push", "origin", "main");
+    assert.equal(
+      report.rebaseUpstreamHead,
+      upstreamHead,
+      "the conflict report remains bound to the upstream fetched by that attempt",
+    );
+
+    const laterUpstreamHead = git(upstream, "rev-parse", "HEAD");
+    const preRebaseHook = path.join(operator, ".git/hooks/pre-rebase");
+    await writeFile(preRebaseHook, "#!/bin/sh\nexit 1\n");
+    await chmod(preRebaseHook, 0o755);
+    const hookFailure = await shell.rebase("main");
+    assert.equal(hookFailure.rebaseUpstreamHead, laterUpstreamHead);
+    assert.ok(
+      hookFailure.findings.some((finding) => finding.id === "rebase-conflict"),
+      "a non-conflict rebase failure is still bound to the fetched upstream",
     );
   } finally {
     await rm(temp, { recursive: true, force: true });
@@ -2111,7 +5023,7 @@ test("a failed fixer leaves its worktree commits anchored for recovery", async (
   ]);
   await assert.rejects(
     runPipeline({ intent: "Fix it." }, orca, git, ledger),
-    /review worker returned an invalid report/,
+    /review fixer returned an invalid report/,
   );
   assert.ok(
     git.calls.some((call) => call.startsWith("headof:/worktrees/dispatch-")),
@@ -2185,16 +5097,51 @@ test("rewritten-history adoption never clobbers a concurrently advanced branch",
     git(worker, "rebase", "origin/main");
     const rewritten = git(worker, "rev-parse", "HEAD");
 
-    // Concurrent advance: the feature branch moves while the checkout stays
-    // detached at the submission commit.
-    git(operator, "checkout", "--detach", pinnedHead);
-    git(operator, "branch", "-f", "feature", "origin/main");
-    const advancedBranch = git(operator, "rev-parse", "feature");
+    const concurrentWorktree = path.join(temp, "concurrent-wt");
+    git(operator, "worktree", "add", "--detach", concurrentWorktree, pinnedHead);
+    await writeFile(path.join(concurrentWorktree, "concurrent.txt"), "preserve me\n");
+    git(concurrentWorktree, "add", "concurrent.txt");
+    git(concurrentWorktree, "commit", "-m", "concurrent branch advance");
+    const advancedBranch = git(concurrentWorktree, "rev-parse", "HEAD");
+
+    const wrapperDir = path.join(temp, "bin");
+    const wrapper = path.join(wrapperDir, "git");
+    const realGit = execFileSync("sh", ["-c", "command -v git"], {
+      encoding: "utf8",
+    }).trim();
+    const advancedFlag = path.join(temp, "advanced");
+    await mkdir(wrapperDir);
+    await writeFile(
+      wrapper,
+      `#!/bin/sh
+${shellQuote(realGit)} "$@"
+status=$?
+if [ "$status" -eq 0 ] && [ "$1" = "-C" ] && [ "$2" = ${shellQuote(operator)} ] && [ "$3" = "update-ref" ] && [ "$4" = "refs/heads/feature" ] && [ "$5" = ${shellQuote(rewritten)} ] && [ ! -e ${shellQuote(advancedFlag)} ]; then
+  touch ${shellQuote(advancedFlag)}
+  ${shellQuote(realGit)} -C ${shellQuote(operator)} update-ref refs/heads/feature ${shellQuote(advancedBranch)} ${shellQuote(rewritten)}
+fi
+exit "$status"
+`,
+    );
+    await chmod(wrapper, 0o755);
 
     const shell = new GitShell({ repo: operator });
-    assert.equal(await shell.applyWorktreeCommits(worker, pinnedHead), true);
-    assert.equal(git(operator, "rev-parse", "HEAD"), rewritten);
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${wrapperDir}:${previousPath ?? ""}`;
+    try {
+      assert.equal(
+        await shell.applyWorktreeCommits(worker, pinnedHead, rewritten),
+        false,
+      );
+    } finally {
+      process.env.PATH = previousPath;
+    }
+    assert.equal(git(operator, "rev-parse", "HEAD"), advancedBranch);
     assert.equal(git(operator, "rev-parse", "feature"), advancedBranch);
+    assert.equal(
+      await readFile(path.join(operator, "concurrent.txt"), "utf8"),
+      "preserve me\n",
+    );
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
@@ -2663,10 +5610,674 @@ test("local config bypass taints the run as uncertified", async () => {
   }
 });
 
+test("CliOrca waits for a hidden fish shell before launching Claude", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-claude-shell-"));
+  const fakeOrca = path.join(temp, "orca");
+  const callsPath = path.join(temp, "calls.jsonl");
+  const delayedCreatePath = path.join(temp, "delay-create");
+  const delayedDispatchPath = path.join(temp, "delay-dispatch");
+  const delayedRetainedStartPath = path.join(temp, "delay-retained-start");
+  const shellReturnedPath = path.join(temp, "shell-returned");
+  const evidence = path.join(
+    temp,
+    ".orca-no-mistakes",
+    "artifacts",
+    "claude-shell-run",
+  );
+  const reportPath = path.join(evidence, "review.json");
+  const previousDelay = process.env.WORKER_SHELL_STARTUP_DELAY_MS;
+  const previousHome = process.env.HOME;
+  process.env.WORKER_SHELL_STARTUP_DELAY_MS = "80";
+  process.env.HOME = temp;
+  try {
+    git(temp, "init", "-b", "feature");
+    await mkdir(evidence, { recursive: true });
+    await writeFile(reportPath, JSON.stringify(pass("claude reviewed")));
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify({ args, at: Date.now() }) + '\\n')
+const out = (result) => console.log(JSON.stringify({ result }))
+if (args[0] === 'orchestration' && args[1] === 'run-create') {
+  out({ run: { id: 'claude-shell-run' } })
+} else if (args[0] === 'terminal' && args[1] === 'create') {
+  if (fs.existsSync(${JSON.stringify(delayedCreatePath)})) {
+    const deadline = Date.now() + 150
+    while (Date.now() < deadline) {}
+  }
+  out({ terminal: { handle: 'claude-shell' } })
+} else if (args[0] === 'terminal' && args[1] === 'send') {
+  out({ accepted: true })
+} else if (args[0] === 'terminal' && args[1] === 'show') {
+  out(fs.existsSync(${JSON.stringify(shellReturnedPath)})
+    ? { terminal: { connected: true, title: 'Claude CLI', preview: '$', writable: true, worktreeId: 'claude-worktree' } }
+    : { terminal: { connected: true, title: 'Claude CLI', preview: 'ready', writable: true, worktreeId: 'claude-worktree' } })
+} else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
+  if (fs.existsSync(${JSON.stringify(delayedDispatchPath)})) {
+    const deadline = Date.now() + 150
+    while (Date.now() < deadline) {}
+  }
+  out({ dispatch: { id: 'dispatch-claude', status: 'dispatched' }, injected: false, preamble: 'authenticated' })
+} else if (args[0] === 'orchestration' && args[1] === 'worker-start') {
+  if (fs.existsSync(${JSON.stringify(delayedRetainedStartPath)})) {
+    const deadline = Date.now() + 150
+    while (Date.now() < deadline) {}
+  }
+  if (fs.existsSync(${JSON.stringify(shellReturnedPath)})) {
+    console.error(JSON.stringify({ error: { code: 'agent_unconfigured', message: 'Terminal is not running a recognized agent.' } }))
+    process.exit(1)
+  }
+  out({ dispatchId: 'dispatch-claude-retained', state: 'ready' })
+} else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
+  out({ deliveryId: 'delivery-claude', messages: [{ type: 'worker_done', body: 'Reviewed. Verified. Clear.', payload: JSON.stringify({ taskId: 'task-claude', dispatchId: 'dispatch-claude', outcome: 'succeeded', reportPath: ${JSON.stringify(reportPath)} }) }] })
+} else {
+  out({ ok: true })
+}
+`,
+    );
+    await chmod(fakeOrca, 0o755);
+    const orca = new CliOrca({ command: fakeOrca, cwd: temp });
+    await orca.createRun("claude shell delay test");
+    const waitForCall = async (matches: (args: string[]) => boolean) => {
+      const deadline = Date.now() + 2_000;
+      while (Date.now() < deadline) {
+        const found = (await readFile(callsPath, "utf8"))
+          .trim()
+          .split("\n")
+          .map((line) => (JSON.parse(line) as { args: string[] }).args)
+          .some(matches);
+        if (found) return;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.fail("timed out waiting for the expected Orca call");
+    };
+
+    const worker = await orca.startWorker("task-claude", {
+      agent: { effort: "high", harness: "claude", model: "opus[1m]" },
+      name: "claude-reviewer",
+      prompt: "review instructions",
+      role: "reviewer",
+      stage: "review",
+      worktree: "current",
+    });
+
+    const calls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map(
+        (line) =>
+          JSON.parse(line) as { args: string[]; at: number },
+      );
+    const created = calls.find(
+      ({ args }) => args[0] === "terminal" && args[1] === "create",
+    );
+    const sends = calls.filter(
+      ({ args }) => args[0] === "terminal" && args[1] === "send",
+    );
+    const dispatch = calls.find(
+      ({ args }) => args[0] === "orchestration" && args[1] === "dispatch",
+    );
+    const sent = sends[0];
+    assert.ok(created && dispatch && sent);
+    assert.ok(dispatch.at < sent.at, "dispatch preamble is created before launch");
+    assert.ok(sent.at - created.at >= 70, "worker starts after the shell delay");
+    const startupCommand = sent.args[sent.args.indexOf("--text") + 1];
+    assert.ok(
+      startupCommand.startsWith(
+        "'claude' '--model' 'opus[1m]' '--effort' 'high' '--dangerously-skip-permissions' 'Read and follow the complete authenticated task in ",
+      ),
+    );
+    assert.match(startupCommand, /prompt-[^']+\.txt'$/);
+    assert.ok(!startupCommand.includes("$(cat"));
+    assert.equal(sends.length, 1);
+    assert.equal(
+      calls.find(({ args }) => args[1] === "worker-start"),
+      undefined,
+    );
+    assert.ok(dispatch && !dispatch.args.includes("--inject"));
+    assert.equal(worker.report.summary, "claude reviewed");
+
+    await writeFile(delayedCreatePath, "delay\n");
+    const createController = new AbortController();
+    const createFence = {
+      aborted: false,
+      deadlineSatisfied: false,
+      signal: createController.signal,
+    };
+    const callsBeforeCreateTimeout = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n").length;
+    const createAttempt = orca.startWorker(
+      "task-claude-create-timeout",
+      {
+        agent: { effort: "high", harness: "claude", model: "opus[1m]" },
+        name: "claude-create-timeout-reviewer",
+        prompt: "review instructions",
+        role: "reviewer",
+        stage: "review",
+        worktree: "current",
+      },
+      createFence,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    createFence.aborted = true;
+    createController.abort();
+    await assert.rejects(createAttempt, /cancelled/i);
+    const createTimeoutCalls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .slice(callsBeforeCreateTimeout)
+      .map((line) => (JSON.parse(line) as { args: string[] }).args);
+    assert.ok(
+      createTimeoutCalls.some(
+        (args) => args[0] === "terminal" && args[1] === "close",
+      ),
+      "a terminal created after the deadline is closed from its settled receipt",
+    );
+    assert.equal(
+      createTimeoutCalls.filter(
+        (args) => args[0] === "orchestration" && args[1] === "dispatch",
+      ).length,
+      0,
+      "an expired attempt does not dispatch after resource creation settles",
+    );
+    await rm(delayedCreatePath, { force: true });
+
+    await writeFile(delayedDispatchPath, "delay\n");
+    const dispatchController = new AbortController();
+    const dispatchFence = {
+      aborted: false,
+      deadlineSatisfied: false,
+      signal: dispatchController.signal,
+    };
+    const callsBeforeDispatchTimeout = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n").length;
+    const dispatchAttempt = orca.startWorker(
+      "task-claude-dispatch-timeout",
+      {
+        agent: { effort: "high", harness: "claude", model: "opus[1m]" },
+        name: "claude-dispatch-timeout-reviewer",
+        prompt: "review instructions",
+        role: "reviewer",
+        stage: "review",
+        worktree: "current",
+      },
+      dispatchFence,
+    );
+    await waitForCall(
+      (args) =>
+        args[0] === "orchestration" &&
+        args[1] === "dispatch" &&
+        args.includes("task-claude-dispatch-timeout"),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    dispatchFence.aborted = true;
+    dispatchController.abort();
+    await assert.rejects(dispatchAttempt, /cancelled/i);
+    const dispatchTimeoutCalls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .slice(callsBeforeDispatchTimeout)
+      .map((line) => (JSON.parse(line) as { args: string[] }).args);
+    assert.ok(
+      dispatchTimeoutCalls.some(
+        (args) =>
+          args[0] === "orchestration" &&
+          args[1] === "worker-abandon" &&
+          args.includes("dispatch-claude"),
+      ),
+      "a dispatch created at the deadline is abandoned from its settled receipt",
+    );
+    assert.equal(
+      dispatchTimeoutCalls.filter(
+        (args) => args[0] === "terminal" && args[1] === "send",
+      ).length,
+      0,
+      "an expired attempt does not launch after dispatch creation settles",
+    );
+    await rm(delayedDispatchPath, { force: true });
+
+    await writeFile(delayedRetainedStartPath, "delay\n");
+    const retainedController = new AbortController();
+    const retainedFence = {
+      aborted: false,
+      deadlineSatisfied: false,
+      signal: retainedController.signal,
+    };
+    const callsBeforeRetainedTimeout = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n").length;
+    const retainedAttempt = orca.startWorker(
+      "task-claude-retained-timeout",
+      {
+        agent: { effort: "high", harness: "claude", model: "opus[1m]" },
+        name: "claude-retained-timeout-reviewer",
+        prompt: "follow-up review instructions",
+        role: "reviewer",
+        stage: "review",
+        retainedWorktreeId: "claude-worktree",
+        terminal: worker.terminalHandle,
+        worktree: "current",
+      },
+      retainedFence,
+    );
+    await waitForCall(
+      (args) =>
+        args[0] === "orchestration" &&
+        args[1] === "worker-start" &&
+        args.includes("task-claude-retained-timeout"),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    retainedFence.aborted = true;
+    retainedController.abort();
+    await assert.rejects(retainedAttempt, /cancelled/i);
+    const retainedTimeoutCalls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .slice(callsBeforeRetainedTimeout)
+      .map((line) => (JSON.parse(line) as { args: string[] }).args);
+    assert.ok(
+      retainedTimeoutCalls.some(
+        (args) =>
+          args[0] === "orchestration" &&
+          args[1] === "worker-abandon" &&
+          args.includes("dispatch-claude-retained"),
+      ),
+      "a retained dispatch created at the deadline is abandoned from its settled receipt",
+    );
+    await rm(delayedRetainedStartPath, { force: true });
+
+    process.env.WORKER_SHELL_STARTUP_DELAY_MS = "5000";
+    const timeoutController = new AbortController();
+    const timeoutFence = {
+      aborted: false,
+      deadlineSatisfied: false,
+      signal: timeoutController.signal,
+    };
+    const callsBeforeTimeout = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n").length;
+    const timeoutStartedAt = Date.now();
+    const timedOutLaunch = orca.startWorker(
+      "task-claude-timeout",
+      {
+        agent: { effort: "high", harness: "claude", model: "opus[1m]" },
+        name: "claude-timeout-reviewer",
+        prompt: "review instructions",
+        role: "reviewer",
+        stage: "review",
+        worktree: "current",
+      },
+      timeoutFence,
+    );
+    await waitForCall(
+      (args) =>
+        args[0] === "orchestration" &&
+        args[1] === "dispatch" &&
+        args.includes("task-claude-timeout"),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    timeoutFence.aborted = true;
+    timeoutController.abort();
+    await assert.rejects(timedOutLaunch, /aborted|cancelled/i);
+    assert.ok(
+      Date.now() - timeoutStartedAt < 2_000,
+      "a timeout interrupts the shell startup delay",
+    );
+    const timeoutCalls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .slice(callsBeforeTimeout)
+      .map((line) => (JSON.parse(line) as { args: string[] }).args);
+    assert.equal(
+      timeoutCalls.filter(
+        (args) => args[0] === "terminal" && args[1] === "send",
+      ).length,
+      0,
+      "an expired attempt never sends the delayed startup command",
+    );
+    assert.ok(
+      timeoutCalls.some(
+        (args) =>
+          args[0] === "orchestration" && args[1] === "worker-abandon",
+      ),
+    );
+    process.env.WORKER_SHELL_STARTUP_DELAY_MS = "80";
+
+    await writeFile(shellReturnedPath, "shell\n");
+    const callsBeforeLivenessCheck = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n").length;
+    await assert.rejects(
+      orca.startWorker("task-claude-shell", {
+        agent: { effort: "high", harness: "claude", model: "opus[1m]" },
+        name: "claude-reviewer",
+        prompt: "follow-up review instructions",
+        role: "reviewer",
+        stage: "review",
+        retainedWorktreeId: "claude-worktree",
+        terminal: worker.terminalHandle,
+        worktree: "current",
+      }),
+      (error: unknown) =>
+        error instanceof PreflightError &&
+        error.message.includes("retained worker start failed") &&
+        error.message.includes("agent_unconfigured"),
+    );
+    const livenessCalls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .slice(callsBeforeLivenessCheck)
+      .map((line) => (JSON.parse(line) as { args: string[] }).args);
+    assert.deepEqual(
+      livenessCalls.map((args) => args.slice(0, 2)),
+      [["orchestration", "worker-start"]],
+      "stale retained agents fail before dispatch or terminal input",
+    );
+    assert.ok(
+      !(await readdir(evidence)).some((name) => name.startsWith("prompt-")),
+    );
+    await assert.rejects(
+      readFile(
+        path.join(temp, ".gemini", "antigravity-cli", "settings.json"),
+        "utf8",
+      ),
+      { code: "ENOENT" },
+    );
+  } finally {
+    if (previousDelay === undefined)
+      delete process.env.WORKER_SHELL_STARTUP_DELAY_MS;
+    else process.env.WORKER_SHELL_STARTUP_DELAY_MS = previousDelay;
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("CliOrca launches Codex locally with its protected task artifact", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-codex-shell-"));
+  const fakeOrca = path.join(temp, "orca");
+  const callsPath = path.join(temp, "calls.jsonl");
+  const previousHome = process.env.HOME;
+  const evidence = path.join(
+    temp,
+    ".orca-no-mistakes",
+    "artifacts",
+    "codex-shell-run",
+  );
+  const reportPath = path.join(evidence, "review.json");
+  process.env.HOME = temp;
+  try {
+    git(temp, "init", "-b", "feature");
+    await mkdir(evidence, { recursive: true });
+    await writeFile(reportPath, JSON.stringify(pass("stale report")));
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+const out = (result) => console.log(JSON.stringify({ result }))
+if (args[0] === 'orchestration' && args[1] === 'run-create') {
+  out({ run: { id: 'codex-shell-run' } })
+} else if (args[0] === 'terminal' && args[1] === 'create') {
+  out({ terminal: { handle: 'codex-shell' } })
+} else if (args[0] === 'terminal' && args[1] === 'send') {
+  out({ accepted: true })
+} else if (args[0] === 'terminal' && args[1] === 'show') {
+  out({ terminal: { connected: true, title: '⠇ no-mistakes-review-1', preview: '• Working (44s • esc to interrupt)\\n› Find and fix a bug in @filename  gpt-5.6-luna max' } })
+} else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
+  if (fs.existsSync(${JSON.stringify(reportPath)})) {
+    process.stderr.write('stale report was not removed')
+    process.exit(1)
+  }
+  out({ dispatch: { id: 'dispatch-codex', status: 'dispatched' }, injected: false, preamble: 'authenticated' })
+} else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
+  fs.writeFileSync(${JSON.stringify(reportPath)}, JSON.stringify({ findings: [], summary: 'codex reviewed' }))
+  out({ deliveryId: 'delivery-codex', messages: [{ type: 'worker_done', body: 'Reviewed. Verified. Clear.', payload: JSON.stringify({ taskId: 'task-codex', dispatchId: 'dispatch-codex', outcome: 'succeeded' }) }] })
+} else {
+  out({ ok: true })
+}
+`,
+    );
+    await chmod(fakeOrca, 0o755);
+    const orca = new CliOrca({ command: fakeOrca, cwd: temp });
+    await orca.createRun("codex local launch test");
+
+    const worker = await orca.startWorker("task-codex", {
+      agent: { effort: "max", harness: "codex", model: "gpt-5.6-luna" },
+      name: "codex-reviewer",
+      prompt: "review instructions",
+      reportPath,
+      role: "reviewer",
+      stage: "review",
+      worktree: "current",
+    });
+
+    const calls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    assert.equal(calls.find((args) => args[1] === "worker-start"), undefined);
+    const dispatch = calls.find((args) => args[1] === "dispatch");
+    assert.ok(dispatch && !dispatch.includes("--inject"));
+    const send = calls.find(
+      (args) => args[0] === "terminal" && args[1] === "send",
+    );
+    const startupCommand = send?.[send.indexOf("--text") + 1] ?? "";
+    assert.match(
+      startupCommand,
+      /^'codex' '--model' 'gpt-5\.6-luna' '-c' 'model_reasoning_effort="max"' '--dangerously-bypass-approvals-and-sandbox' 'Read and follow the complete authenticated task in .*prompt-[^']+\.txt'$/,
+    );
+    assert.equal(worker.report.summary, "codex reviewed");
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("CliOrca launches Kimi interactively and submits its protected task after readiness", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-kimi-shell-"));
+  const fakeOrca = path.join(temp, "orca");
+  const callsPath = path.join(temp, "calls.jsonl");
+  const previousHome = process.env.HOME;
+  const previousKimiCodeHome = process.env.KIMI_CODE_HOME;
+  const kimiCodeHome = path.join(temp, ".kimi-code");
+  const trustDir = path.join(kimiCodeHome, "workspace-trust");
+  const evidence = path.join(
+    temp,
+    ".orca-no-mistakes",
+    "artifacts",
+    "kimi-shell-run",
+  );
+  const reportPath = path.join(evidence, "test.json");
+  process.env.HOME = temp;
+  process.env.KIMI_CODE_HOME = kimiCodeHome;
+  try {
+    await mkdir(evidence, { recursive: true });
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+const out = (result) => console.log(JSON.stringify({ result }))
+if (args[0] === 'orchestration' && args[1] === 'run-create') {
+  out({ run: { id: 'kimi-shell-run' } })
+} else if (args[0] === 'terminal' && args[1] === 'create') {
+  out({ terminal: { handle: 'kimi-shell' } })
+} else if (args[0] === 'terminal' && args[1] === 'send') {
+  const text = args[args.indexOf('--text') + 1] || ''
+  if (text.includes("'kimi'")) {
+    const trustDir = ${JSON.stringify(trustDir)}
+    const trusted = fs.existsSync(trustDir) && fs.readdirSync(trustDir).some((name) => {
+      const value = JSON.parse(fs.readFileSync(trustDir + '/' + name, 'utf8'))
+      return value.root === ${JSON.stringify(temp)}
+    })
+    if (!trusted) {
+      process.stderr.write('Kimi workspace was not trusted before startup')
+      process.exit(1)
+    }
+  }
+  out({ accepted: true })
+} else if (args[0] === 'terminal' && args[1] === 'show') {
+  out({ terminal: { connected: true, lastOutputAt: 1, title: 'Kimi Code', preview: 'Ready' } })
+} else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
+  if (args.includes('--inject')) {
+    process.stderr.write('Kimi dispatch must not use Orca prompt injection')
+    process.exit(1)
+  }
+  out({ dispatch: { id: 'dispatch-kimi', status: 'dispatched' }, injected: false, preamble: 'authenticated' })
+} else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
+  fs.writeFileSync(${JSON.stringify(reportPath)}, JSON.stringify({ findings: [], summary: 'kimi tested' }))
+  out({ deliveryId: 'delivery-kimi', messages: [{ type: 'worker_done', body: 'Tested.', payload: JSON.stringify({ taskId: 'task-kimi', dispatchId: 'dispatch-kimi', outcome: 'succeeded' }) }] })
+} else {
+  out({ ok: true })
+}
+`,
+    );
+    await chmod(fakeOrca, 0o755);
+    const orca = new CliOrca({ command: fakeOrca, cwd: temp });
+    await orca.createRun("kimi local launch test");
+
+    const worker = await orca.startWorker("task-kimi", {
+      agent: { harness: "Kimi", model: "kimi-k2.5" },
+      name: "kimi-tester",
+      prompt: "test instructions",
+      reportPath,
+      role: "reviewer",
+      stage: "test",
+      worktree: "current",
+    });
+
+    const calls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    const dispatch = calls.find((args) => args[1] === "dispatch");
+    assert.ok(dispatch && !dispatch.includes("--inject"));
+    const showIndexes = calls.flatMap((args, index) =>
+      args[0] === "terminal" && args[1] === "show" ? [index] : [],
+    );
+    assert.ok(showIndexes.length >= 2);
+    const sends = calls.filter(
+      (args) => args[0] === "terminal" && args[1] === "send",
+    );
+    assert.equal(sends.length, 2);
+    const startupCommand = sends[0]?.[sends[0].indexOf("--text") + 1] ?? "";
+    assert.equal(startupCommand, "'kimi' '--model' 'kimi-k2.5' '--auto'");
+    const promptInstruction = sends[1]?.[sends[1].indexOf("--text") + 1] ?? "";
+    assert.ok(
+      calls.indexOf(sends[1]) > showIndexes[1],
+      "Kimi receives its task only after stable TUI readiness",
+    );
+    assert.match(
+      promptInstruction,
+      /^Read and follow the complete authenticated task in .*prompt-[^ ]+\.txt$/,
+    );
+    assert.equal(worker.report.summary, "kimi tested");
+    assert.deepEqual(await readdir(trustDir), []);
+
+    await writeFile(path.join(temp, ".mcp.json"), '{"mcpServers":{}}\n');
+    const sendsBeforeBlockedLaunch = sends.length;
+    await assert.rejects(
+      orca.startWorker("task-kimi-mcp", {
+        agent: { harness: "kimi", model: "kimi-k2.5" },
+        name: "kimi-mcp-tester",
+        prompt: "test instructions",
+        reportPath: path.join(evidence, "mcp.json"),
+        role: "reviewer",
+        stage: "test",
+        worktree: "current",
+      }),
+      /Kimi project MCP configuration requires explicit trust/,
+    );
+    const callsAfterBlockedLaunch = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    assert.equal(
+      callsAfterBlockedLaunch.filter(
+        (args) => args[0] === "terminal" && args[1] === "send",
+      ).length,
+      sendsBeforeBlockedLaunch,
+      "Kimi must not start when project MCP configuration requires trust",
+    );
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousKimiCodeHome === undefined) delete process.env.KIMI_CODE_HOME;
+    else process.env.KIMI_CODE_HOME = previousKimiCodeHome;
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("CliOrca preserves initial dispatch failures and closes the terminal", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-dispatch-failure-"));
+  const fakeOrca = path.join(temp, "orca");
+  const callsPath = path.join(temp, "calls.jsonl");
+  try {
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+const out = (result) => console.log(JSON.stringify({ result }))
+if (args[0] === 'terminal' && args[1] === 'create') {
+  out({ terminal: { handle: 'dispatch-failure-terminal' } })
+} else if (args[0] === 'terminal' && args[1] === 'send') {
+  out({ accepted: true })
+} else if (args[0] === 'terminal' && args[1] === 'show') {
+  out({ terminal: { connected: true, title: 'OpenCode', preview: 'ready' } })
+} else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
+  console.log(JSON.stringify({ ok: false, error: { code: 'agent_prompt_stalled', message: 'agent_prompt_stalled' } }))
+  process.exitCode = 1
+} else {
+  out({ ok: true })
+}
+`,
+    );
+    await chmod(fakeOrca, 0o755);
+    const orca = new CliOrca({ command: fakeOrca, cwd: temp });
+
+    await assert.rejects(
+      orca.startWorker("task-dispatch-failure", {
+        name: "dispatch-failure-reviewer",
+        prompt: "review instructions",
+        role: "reviewer",
+        stage: "review",
+        worktree: "current",
+      }),
+      /initial dispatch failed: .*agent_prompt_stalled/,
+    );
+
+    const calls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    assert.ok(
+      calls.some(
+        (args) =>
+          args[0] === "terminal" &&
+          args[1] === "close" &&
+          args.includes("dispatch-failure-terminal"),
+      ),
+    );
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test("CliOrca starts native workers through orchestration worker-start", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-native-"));
   const fakeOrca = path.join(temp, "orca");
   const callsPath = path.join(temp, "calls.jsonl");
+  const delayedStartPath = path.join(temp, "delay-worker-start");
   const evidence = path.join(
     homedir(),
     ".orca-no-mistakes",
@@ -2688,6 +6299,10 @@ const out = (result) => console.log(JSON.stringify({ result }))
 if (args[0] === 'orchestration' && args[1] === 'run-create') {
   out({ run: { id: 'native-run' } })
 } else if (args[0] === 'orchestration' && args[1] === 'worker-start') {
+  if (fs.existsSync(${JSON.stringify(delayedStartPath)})) {
+    const deadline = Date.now() + 150
+    while (Date.now() < deadline) {}
+  }
   out({ terminal: { handle: 'native-worker' }, worktree: { id: 'wt-native', path: '/worktrees/native' } })
 } else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
   out({ dispatch: { id: 'dispatch-nat', status: 'dispatched' }, injected: true, preamble: 'authenticated' })
@@ -2703,7 +6318,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     await orca.createRun("native test");
 
     const worker = await orca.startWorker("task-nat", {
-      agent: { effort: "high", harness: "claude", model: "claude-opus-4" },
+      agent: { effort: "high", harness: "cursor", model: "gpt-5.6" },
       name: "nm-review",
       prompt: "review instructions",
       role: "reviewer",
@@ -2720,9 +6335,9 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       .map((line) => JSON.parse(line) as string[]);
     const workerStart = calls.find((args) => args[1] === "worker-start");
     assert.ok(workerStart?.includes("--agent"));
-    assert.ok(workerStart?.includes("claude"));
+    assert.ok(workerStart?.includes("cursor"));
     assert.ok(workerStart?.includes("--model"));
-    assert.ok(workerStart?.includes("claude-opus-4"));
+    assert.ok(workerStart?.includes("gpt-5.6"));
     assert.ok(workerStart?.includes("--effort"));
     assert.ok(workerStart?.includes("--worktree"));
     assert.ok(workerStart?.includes("new-child"));
@@ -2734,6 +6349,63 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     const dispatch = calls.find((args) => args[1] === "dispatch");
     assert.ok(dispatch?.includes("native-worker"));
     assert.equal(reportPath && worker.report.summary, "native reviewed");
+
+    await writeFile(delayedStartPath, "delay\n");
+    const timeoutController = new AbortController();
+    const timeoutFence = {
+      aborted: false,
+      deadlineSatisfied: false,
+      signal: timeoutController.signal,
+    };
+    const callsBeforeTimeout = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n").length;
+    const timedOutWorker = orca.startWorker(
+      "task-native-timeout",
+      {
+        agent: { effort: "high", harness: "cursor", model: "gpt-5.6" },
+        name: "nm-review-timeout",
+        prompt: "review instructions",
+        role: "reviewer",
+        stage: "review",
+        worktree: "new-child",
+      },
+      timeoutFence,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    timeoutFence.aborted = true;
+    timeoutController.abort();
+    await assert.rejects(timedOutWorker, /cancelled/i);
+    const timeoutCalls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .slice(callsBeforeTimeout)
+      .map((line) => JSON.parse(line) as string[]);
+    assert.ok(
+      timeoutCalls.some(
+        (args) =>
+          args[0] === "terminal" &&
+          args[1] === "close" &&
+          args.includes("native-worker"),
+      ),
+      "a native terminal created at the deadline is closed from its receipt",
+    );
+    assert.ok(
+      timeoutCalls.some(
+        (args) =>
+          args[0] === "worktree" &&
+          args[1] === "rm" &&
+          args.includes("id:wt-native"),
+      ),
+      "a native worktree created at the deadline is removed from its receipt",
+    );
+    assert.equal(
+      timeoutCalls.filter(
+        (args) => args[0] === "orchestration" && args[1] === "dispatch",
+      ).length,
+      0,
+    );
+    await rm(delayedStartPath, { force: true });
 
     await orca.finishWorker(worker, "release");
     const postReleaseCalls = (await readFile(callsPath, "utf8"))
@@ -2782,7 +6454,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     await orca.createRun("native pin test");
     await assert.rejects(
       orca.startWorker("task-nat", {
-        agent: { harness: "claude" },
+        agent: { harness: "cursor" },
         commitOid: "a".repeat(40),
         name: "nm-review",
         prompt: "review instructions",
@@ -2843,7 +6515,7 @@ if (args[0] === 'orchestration' && args[1] === 'worker-start') {
 
     await assert.rejects(
       orca.startWorker("task-residual", {
-        agent: { harness: "claude" },
+        agent: { harness: "cursor" },
         name: "nm-review",
         prompt: "review instructions",
         role: "reviewer",
@@ -2908,7 +6580,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
 
     await assert.rejects(
       orca.startWorker("task-fail", {
-        agent: { harness: "claude", model: "claude-opus-4" },
+        agent: { harness: "cursor", model: "gpt-5.6" },
         name: "nm-review",
         prompt: "review instructions",
         role: "reviewer",
@@ -3036,6 +6708,16 @@ if (args[0] === 'worktree' && args[1] === 'create') {
     assert.ok(
       orcaCalls.some((args) => args[0] === "worktree" && args[1] === "create"),
     );
+    assert.ok(
+      orcaCalls.some(
+        (args) =>
+          args[0] === "worktree" &&
+          args[1] === "set" &&
+          args.includes("id:wt-acp") &&
+          args.includes(`path:${temp}`),
+      ),
+      "ACP child worktrees reassert their coordinator parent",
+    );
 
     const failing = new CliOrca({
       acpxCommand: failingAcpx,
@@ -3094,6 +6776,76 @@ if (args[0] === 'worktree' && args[1] === 'create') {
         assert.match(error.message, /acp target gemini-dev failed \(exit 7\)/);
         return true;
       },
+    );
+
+    const callsBeforeAbort = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n").length;
+    const preAbortedController = new AbortController();
+    preAbortedController.abort();
+    await assert.rejects(
+      orca.startWorker(
+        "task-acp-pre-aborted",
+        {
+          agent: { harness: "acp:gemini-dev" },
+          name: "acp-worker-pre-aborted",
+          prompt: "Review now.",
+          role: "reviewer",
+          stage: "review",
+          worktree: "current",
+        },
+        {
+          aborted: true,
+          deadlineSatisfied: false,
+          signal: preAbortedController.signal,
+        },
+      ),
+      /cancelled/,
+    );
+    assert.equal(
+      (await readFile(callsPath, "utf8")).trim().split("\n").length,
+      callsBeforeAbort,
+      "an already-aborted ACP attempt never launches acpx",
+    );
+
+    const blockingAcpx = path.join(temp, "acpx-blocking");
+    await writeFile(
+      blockingAcpx,
+      "#!/usr/bin/env node\nsetInterval(() => {}, 1000)\n",
+    );
+    await chmod(blockingAcpx, 0o755);
+    const blocking = new CliOrca({
+      acpxCommand: blockingAcpx,
+      command: fakeOrca,
+      cwd: temp,
+    });
+    const activeController = new AbortController();
+    const activeFence = {
+      aborted: false,
+      deadlineSatisfied: false,
+      signal: activeController.signal,
+    };
+    const startedAt = Date.now();
+    const activeAttempt = blocking.startWorker(
+      "task-acp-aborted",
+      {
+        agent: { harness: "acp:gemini-dev" },
+        name: "acp-worker-aborted",
+        prompt: "Review now.",
+        role: "reviewer",
+        stage: "review",
+        worktree: "current",
+      },
+      activeFence,
+    );
+    setTimeout(() => {
+      activeFence.aborted = true;
+      activeController.abort();
+    }, 50);
+    await assert.rejects(activeAttempt, /aborted|cancelled/i);
+    assert.ok(
+      Date.now() - startedAt < 2_000,
+      "an in-flight ACP process is aborted promptly",
     );
   } finally {
     await rm(temp, { recursive: true, force: true });
@@ -3283,7 +7035,7 @@ if (args[0] === 'terminal' && args[1] === 'create') {
       (error: unknown) => {
         assert.ok(error instanceof PreflightError);
         assert.equal(error.failureClass, "binary-missing");
-        assert.match(error.message, /worker agent opencode is not installed/);
+        assert.match(error.message, /command not found: opencode/);
         return true;
       },
     );
@@ -3506,6 +7258,7 @@ test("fallback chains settle each failed candidate before the next launch", asyn
   const temp = await mkdtemp(path.join(tmpdir(), "orca-fallback-settle-"));
   const fakeOrca = path.join(temp, "orca");
   const callsPath = path.join(temp, "calls.jsonl");
+  const failClosePath = path.join(temp, "fail-close");
   const evidence = path.join(
     homedir(),
     ".orca-no-mistakes",
@@ -3546,6 +7299,9 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
   } else {
     out({ terminal: { connected: true, title: 'Claude CLI', preview: 'ready' } })
   }
+} else if (args[0] === 'terminal' && args[1] === 'close' && args.includes('stuck-terminal') && fs.existsSync(${JSON.stringify(failClosePath)})) {
+  console.error('terminal_close_failed')
+  process.exit(1)
 } else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
   out({ dispatch: { id: 'dispatch-claude', status: 'dispatched' }, injected: true, preamble: 'ok' })
 } else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
@@ -3561,7 +7317,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       max_rounds: 0,
       allow_review_autofix: false,
     };
-    const [grok, claude] = ["grok", "claude"].map(
+    const [grok, cursor] = ["grok", "cursor"].map(
       (harness) => launchAgent({ auto_fix: roleConfig, agent: harness })![0],
     );
     const launches: WorkerLaunch[] = [
@@ -3574,7 +7330,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
         worktree: "current",
       },
       {
-        agent: claude,
+        agent: cursor,
         name: "second",
         prompt: "instructions",
         role: "reviewer",
@@ -3591,7 +7347,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       launches,
     );
 
-    assert.equal(outcome.resolvedAgent, "claude");
+    assert.equal(outcome.resolvedAgent, "cursor");
     assert.deepEqual(
       outcome.attempts.map((attempt) => [attempt.agent, attempt.failureClass]),
       [["grok", "readiness-timeout"]],
@@ -3621,6 +7377,34 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     assert.ok(
       closeIndex < nextLaunchIndex,
       "the failed candidate's terminal closes before the next candidate starts",
+    );
+
+    await writeFile(failClosePath, "fail\n");
+    await writeFile(callsPath, "");
+    await assert.rejects(
+      startWorkerWithFallback(
+        orca,
+        () => Promise.resolve("task-chain-cleanup-failure"),
+        launches,
+      ),
+      /worker cleanup failed.*terminal close/s,
+    );
+    const failedCleanupCalls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    assert.equal(
+      failedCleanupCalls.filter(
+        (args) => args[0] === "terminal" && args[1] === "create",
+      ).length,
+      1,
+    );
+    assert.equal(
+      failedCleanupCalls.filter(
+        (args) => args[0] === "orchestration" && args[1] === "worker-start",
+      ).length,
+      0,
+      "cleanup failure prevents the next fallback candidate from starting",
     );
   } finally {
     if (previousTimeout === undefined)
@@ -4594,11 +8378,26 @@ test("the attestation keeps the policy digest captured at run start", async () =
   verifyManifest(result.attestation);
 });
 
-test("a rebase conflict fixes forward and rebases evidence onto the resolved base", async () => {
+test("rebase conflicts require manual resolution and retry", async () => {
   const git = new FakeGit();
-  git.rebaseConflict = true;
+  allowReviewAutoFix(git);
+  git.rebaseConflicts = ["src/a.ts", "src/b.ts"];
   const orca = new FakeOrca(git);
-  orca.gateResolution = "approve";
+  orca.gateResolution = "fix";
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Repair after the rebase.",
+        },
+      ],
+      summary: "one defect",
+    },
+    pass("clean rereview"),
+  ]);
 
   const result = await runPipeline(
     { intent: "Fix past a rebase conflict." },
@@ -4607,17 +8406,33 @@ test("a rebase conflict fixes forward and rebases evidence onto the resolved bas
   );
 
   assert.ok(result.attestation);
-  assert.ok(
-    orca.launches.some(
-      (launch) => launch.role === "fixer" && launch.stage === "rebase",
-    ),
-    "expected a rebase fixer to run",
+  const rebaseFixer = orca.launches.find(
+    (launch) => launch.role === "fixer" && launch.stage === "rebase",
   );
-  const failedAttempt = result.attestation.stageEvidence.find(
+  assert.equal(rebaseFixer, undefined, "rebase conflicts are never agent-fixed");
+  const reviewFixer = orca.launches.find(
+    (launch) => launch.role === "fixer" && launch.stage === "review",
+  );
+  assert.ok(reviewFixer, "expected a review fixer to run");
+  assert.equal(
+    git.calls.filter((call) => call.startsWith("guard:")).length,
+    1,
+    "only the post-rebase review fixer uses commit enforcement",
+  );
+  const failedAttempts = result.attestation.stageEvidence.filter(
     (entry) => entry.summary === "rebase aborted",
   );
-  assert.ok(failedAttempt, "expected the conflicted attempt in evidence");
-  assert.equal(failedAttempt.baseCommitOid, "0".repeat(40));
+  assert.equal(failedAttempts.length, 2);
+  assert.ok(
+    failedAttempts.every((entry) => entry.baseCommitOid === "b".repeat(40)),
+  );
+  assert.equal(orca.gates.length, 2);
+  assert.ok(
+    orca.gates.every(
+      (gate) =>
+        JSON.stringify(gate.options) === JSON.stringify(["fix", "stop"]),
+    ),
+  );
   const rebased = result.attestation.stageEvidence.filter(
     (entry) => entry.stage !== "intent" && entry.summary !== "rebase aborted",
   );
@@ -4921,14 +8736,25 @@ test("per-stage auto_fix.max_rounds budgets gate before any automatic round", as
 test("a fixer timeout during commit application leaves the branch unchanged", async () => {
   class SlowApplyGit extends FakeGit {
     headAtApply = "";
+    settled = false;
     async applyWorktreeCommits(
       sourcePath: string,
       expectedHead: string,
+      expectedSourceHead: string,
       fence?: { readonly aborted: boolean },
     ): Promise<boolean> {
       this.headAtApply = await this.head();
-      await new Promise((resolve) => setTimeout(resolve, 75));
-      return super.applyWorktreeCommits(sourcePath, expectedHead, fence);
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 75));
+        return super.applyWorktreeCommits(
+          sourcePath,
+          expectedHead,
+          expectedSourceHead,
+          fence,
+        );
+      } finally {
+        this.settled = true;
+      }
     }
   }
   const git = new SlowApplyGit();
@@ -4961,8 +8787,8 @@ test("a fixer timeout during commit application leaves the branch unchanged", as
     ),
     /review fixer exceeded its 10ms execution timeout/,
   );
-  await new Promise((resolve) => setTimeout(resolve, 150));
 
+  assert.equal(git.settled, true, "timeout waits for fenced application cleanup");
   assert.ok(
     git.calls.some((call) => call.endsWith(":fenced")),
     "the late application attempt was observed and fenced",
@@ -4971,6 +8797,192 @@ test("a fixer timeout during commit application leaves the branch unchanged", as
     await git.head(),
     git.headAtApply,
     "no commit landed after the stage timed out",
+  );
+});
+
+test("a fixer timeout waits for strict worker cleanup failures", async () => {
+  class SlowApplyGit extends FakeGit {
+    async applyWorktreeCommits(
+      sourcePath: string,
+      expectedHead: string,
+      expectedSourceHead: string,
+      fence?: { readonly aborted: boolean },
+    ): Promise<boolean> {
+      await new Promise((resolve) => setTimeout(resolve, 75));
+      return super.applyWorktreeCommits(
+        sourcePath,
+        expectedHead,
+        expectedSourceHead,
+        fence,
+      );
+    }
+  }
+  const git = new SlowApplyGit();
+  allowReviewAutoFix(git);
+  class SlowCleanupOrca extends FakeOrca {
+    cleanupSettled = false;
+
+    override async finishWorker(
+      worker: WorkerResult,
+      disposition: "release" | "retain",
+    ): Promise<void> {
+      await super.finishWorker(worker, disposition);
+      if (
+        disposition === "release" &&
+        this.fixerDispatches.includes(worker.dispatchId)
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        this.cleanupSettled = true;
+        throw new Error("timeout cleanup failed");
+      }
+    }
+  }
+  const orca = new SlowCleanupOrca(git);
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Null input crashes the command",
+        },
+      ],
+      summary: "one defect",
+    },
+  ]);
+
+  await assert.rejects(
+    runPipeline(
+      {
+        intent: "Wait for timed-out fixer cleanup.",
+        cliFlags: { fixer: { timeout_ms: 10 } } as never,
+      },
+      orca,
+      git,
+    ),
+    /review fixer cleanup failed.*timeout cleanup failed/,
+  );
+  assert.equal(
+    orca.cleanupSettled,
+    true,
+    "the timeout does not settle before the owning fixer cleanup",
+  );
+});
+
+test("a fixer applied within its timeout may finish coordinator verification", async () => {
+  class SlowVerificationGit extends FakeGit {
+    #delayNextHead = false;
+
+    async applyWorktreeCommits(
+      sourcePath: string,
+      expectedHead: string,
+      expectedSourceHead: string,
+      fence?: { readonly aborted: boolean },
+    ): Promise<boolean> {
+      const applied = await super.applyWorktreeCommits(
+        sourcePath,
+        expectedHead,
+        expectedSourceHead,
+        fence,
+      );
+      this.#delayNextHead = applied;
+      return applied;
+    }
+
+    async head(): Promise<string> {
+      if (this.#delayNextHead) {
+        this.#delayNextHead = false;
+        await new Promise((resolve) => setTimeout(resolve, 75));
+      }
+      return super.head();
+    }
+  }
+
+  const git = new SlowVerificationGit();
+  allowReviewAutoFix(git);
+  const orca = new FakeOrca(git);
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Null input crashes the command",
+        },
+      ],
+      summary: "one defect",
+    },
+    pass("clean rereview"),
+  ]);
+
+  await runPipeline(
+    {
+      intent: "Finish verification after timely custody transfer.",
+      cliFlags: { fixer: { timeout_ms: 10 } } as never,
+    },
+    orca,
+    git,
+  );
+
+  assert.ok(orca.launches.some((launch) => launch.role === "fixer"));
+  assert.equal(orca.gates.length, 0);
+});
+
+test("a concurrent post-transfer commit fails fixer custody verification", async () => {
+  class ConcurrentPostTransferGit extends FakeGit {
+    #returnConcurrentHead = false;
+
+    async applyWorktreeCommits(
+      sourcePath: string,
+      expectedHead: string,
+      expectedSourceHead: string,
+      fence?: { readonly aborted: boolean },
+    ): Promise<boolean> {
+      const applied = await super.applyWorktreeCommits(
+        sourcePath,
+        expectedHead,
+        expectedSourceHead,
+        fence,
+      );
+      this.#returnConcurrentHead = applied;
+      return applied;
+    }
+
+    async head(): Promise<string> {
+      if (this.#returnConcurrentHead) {
+        this.#returnConcurrentHead = false;
+        return "f".repeat(40);
+      }
+      return super.head();
+    }
+  }
+
+  const git = new ConcurrentPostTransferGit();
+  allowReviewAutoFix(git);
+  const orca = new FakeOrca(git);
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Null input crashes the command",
+        },
+      ],
+      summary: "one defect",
+    },
+  ]);
+
+  await assert.rejects(
+    runPipeline(
+      { intent: "Bind custody to the validated fixer commit." },
+      orca,
+      git,
+    ),
+    /fixer custody ended at unexpected HEAD/,
   );
 });
 
@@ -5041,6 +9053,15 @@ test("resolved role timeout_ms bounds reviewer execution", async () => {
   );
   assert.equal(ledger.listRuns().length, 1);
   assert.equal(ledger.runStatus(ledger.listRuns()[0].run_id), "failed");
+  assert.equal(
+    orca.calls.some((call) => call.startsWith("cancel:task-")),
+    false,
+    "the active reviewer operation owns timeout cleanup",
+  );
+  assert.ok(
+    orca.calls.some((call) => call.startsWith("release:dispatch-")),
+    "the run waits for reviewer cleanup before failing",
+  );
 });
 
 test("a timed-out fixer never applies commits after the run fails", async () => {
@@ -5085,7 +9106,15 @@ test("a timed-out fixer never applies commits after the run fails", async () => 
     ),
     /review fixer exceeded its 10ms execution timeout/,
   );
-  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(
+    orca.calls.some((call) => call.startsWith("cancel:task-")),
+    false,
+    "the active fixer operation owns timeout cleanup",
+  );
+  assert.ok(
+    orca.calls.some((call) => call.startsWith("release:dispatch-")),
+    "the run waits for fixer cleanup before failing",
+  );
   assert.equal(
     git.calls.filter((call) => call.startsWith("apply:")).length,
     0,

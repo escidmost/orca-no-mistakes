@@ -17,19 +17,23 @@ import {
 } from '../scripts/adapters.ts'
 
 test('classifyHarness routes native, CLI, and ACP harnesses', () => {
-  assert.equal(classifyHarness('claude'), 'native')
-  assert.equal(classifyHarness('codex'), 'native')
+  assert.equal(classifyHarness('claude'), 'cli')
+  assert.equal(classifyHarness('codex'), 'cli')
   assert.equal(classifyHarness('cursor'), 'native')
+  assert.equal(classifyHarness('Cursor'), 'native')
   assert.equal(classifyHarness('opencode'), 'cli')
   assert.equal(classifyHarness('grok'), 'cli')
   assert.equal(classifyHarness('gemini'), 'cli')
+  assert.equal(classifyHarness('Kimi'), 'cli')
   assert.equal(classifyHarness('future-cli-agent'), 'cli')
   assert.equal(classifyHarness('acp:gemini-dev'), 'acp')
+  assert.equal(classifyHarness('ACP:gemini-dev'), 'acp')
 })
 
 test('parseAcpTarget extracts valid targets and rejects malformed harnesses', () => {
   assert.equal(parseAcpTarget('acp:claude-code'), 'claude-code')
   assert.equal(parseAcpTarget('acp:gemini_2-dev'), 'gemini_2-dev')
+  assert.equal(parseAcpTarget('ACP:gemini_2-dev'), 'gemini_2-dev')
   assert.throws(() => parseAcpTarget('acp:'), /invalid ACP harness 'acp:'/)
   assert.throws(() => parseAcpTarget('acp:bad target!'), /invalid ACP harness/)
   assert.throws(() => parseAcpTarget('opencode'), /invalid ACP harness/)
@@ -75,7 +79,7 @@ test('nativeWorkerStartArgs maps model, effort, timeout, and worktree placement'
   ])
 
   const fixer = nativeWorkerStartArgs({
-    agent: 'codex',
+    agent: 'Cursor',
     effort: 'high',
     model: 'gpt-5.6',
     name: 'ignored-for-current',
@@ -89,6 +93,7 @@ test('nativeWorkerStartArgs maps model, effort, timeout, and worktree placement'
   assert.ok(!fixer.includes('--base-branch'))
   assert.ok(fixer.includes('--worktree'))
   assert.ok(fixer.includes('current'))
+  assert.ok(fixer.includes('cursor'))
 
   // Effort requires a model per the Orca worker-start contract.
   assert.throws(
@@ -110,6 +115,121 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
   // Variant is opencode-specific.
   assert.equal(buildCliCommand('grok', { model: 'grok-4', variant: 'high' }), `'grok' '--model' 'grok-4'`)
   assert.equal(buildCliCommand('gemini', { model: 'gemini-3-pro' }), `'gemini' '--model' 'gemini-3-pro'`)
+  assert.equal(
+    buildCliCommand('Kimi', { model: 'kimi-k2.5' }),
+    `'kimi' '--model' 'kimi-k2.5' '--auto'`
+  )
+  assert.equal(
+    buildCliCommand('claude', { effort: 'high', model: 'opus[1m]' }),
+    `'claude' '--model' 'opus[1m]' '--effort' 'high' '--dangerously-skip-permissions'`
+  )
+  assert.equal(
+    buildCliCommand('Claude', { effort: 'high', model: 'opus[1m]' }),
+    `'claude' '--model' 'opus[1m]' '--effort' 'high' '--dangerously-skip-permissions'`
+  )
+  assert.equal(
+    buildCliCommand('claude', {
+      agentArgsOverride: { Claude: ['--verbose'] } as never,
+    }),
+    `'claude' '--dangerously-skip-permissions' '--verbose'`
+  )
+  assert.throws(
+    () =>
+      buildCliCommand('claude', {
+        agentArgsOverride: { claude: ['--one'], Claude: ['--two'] } as never,
+      }),
+    /duplicate harness keys 'claude' and 'Claude'/
+  )
+  assert.equal(
+    buildCliCommand('Codex', { effort: 'max', model: 'gpt-5.6-luna' }),
+    `'codex' '--model' 'gpt-5.6-luna' '-c' 'model_reasoning_effort="max"' '--dangerously-bypass-approvals-and-sandbox'`
+  )
+  assert.equal(
+    buildCliCommand('codex', {
+      agentArgsOverride: { codex: ['-c', 'model_reasoning_effort="low"'] } as never,
+      effort: 'max'
+    }),
+    `'codex' '--dangerously-bypass-approvals-and-sandbox' '-c' 'model_reasoning_effort="low"'`
+  )
+  assert.equal(
+    buildCliCommand('codex', {
+      agentArgsOverride: { codex: ['-c', 'model="raw"'] } as never,
+      model: 'mapped'
+    }),
+    `'codex' '--dangerously-bypass-approvals-and-sandbox' '-c' 'model="raw"'`
+  )
+  assert.equal(
+    buildCliCommand('codex', {
+      agentArgsOverride: {
+        codex: ['-c', 'model = "raw"', '-c', 'model_reasoning_effort = "low"']
+      } as never,
+      effort: 'max',
+      model: 'mapped'
+    }),
+    `'codex' '--dangerously-bypass-approvals-and-sandbox' '-c' 'model = "raw"' '-c' 'model_reasoning_effort = "low"'`
+  )
+  assert.equal(
+    buildCliCommand('codex', {
+      agentArgsOverride: { codex: ['-cmodel="raw"', '-cmodel_reasoning_effort="low"'] } as never,
+      effort: 'max',
+      model: 'mapped'
+    }),
+    `'codex' '--dangerously-bypass-approvals-and-sandbox' '-cmodel="raw"' '-cmodel_reasoning_effort="low"'`
+  )
+  assert.equal(
+    buildCliCommand('codex', {
+      agentArgsOverride: {
+        codex: ['--', '-c', 'model_reasoning_effort="low"', '--model', 'raw']
+      } as never,
+      effort: 'max',
+      model: 'mapped'
+    }),
+    `'codex' '--model' 'mapped' '-c' 'model_reasoning_effort="max"' '--dangerously-bypass-approvals-and-sandbox' '--' '-c' 'model_reasoning_effort="low"' '--model' 'raw'`
+  )
+  assert.throws(
+    () =>
+      buildCliCommand('codex', {
+        agentArgsOverride: { codex: ['-c', 'model_reasoning_effort='] } as never,
+        effort: 'max'
+      }),
+    /model_reasoning_effort requires a nonempty value/
+  )
+  assert.throws(
+    () =>
+      buildCliCommand('codex', {
+        agentArgsOverride: { codex: ['--dangerously-bypass-approvals-and-sandbox'] } as never
+      }),
+    /reserved argument/
+  )
+  for (const [harness, args] of [
+    ['agy', ['--sandbox']],
+    ['claude', ['--permission-mode', 'manual']],
+    ['codex', ['--sandbox', 'read-only']],
+    ['codex', ['--ask-for-approval', 'on-request']],
+    ['codex', ['-c', 'sandbox_mode="read-only"']],
+    ['codex', ['-sread-only']],
+    ['codex', ['-aon-request']],
+    ['codex', ['-pdefault']],
+    ['codex', ['-csandbox_mode="read-only"']],
+    ['kimi', ['--prompt', 'raw']],
+  ] as const) {
+    assert.throws(
+      () =>
+        buildCliCommand(harness, {
+          agentArgsOverride: { [harness]: [...args] } as never,
+        }),
+      /reserved (?:argument|config)/,
+    )
+  }
+  for (const [harness, required] of [
+    ['claude', '--dangerously-skip-permissions'],
+    ['codex', '--dangerously-bypass-approvals-and-sandbox']
+  ]) {
+    const command = buildCliCommand(harness, {
+      agentArgsOverride: { [harness]: ['--', 'prompt'] } as never
+    })
+    assert.ok(command.indexOf(required) < command.indexOf("'--'"))
+  }
   // Effort maps per harness through one table.
   assert.equal(
     buildCliCommand('grok', { effort: 'high', model: 'grok-4' }),
@@ -227,6 +347,26 @@ test('readinessMatcher matches per-harness terminal titles and rejects interrupt
   assert.equal(agy({ title: 'Antigravity', preview: 'ready' }), true)
   assert.equal(agy({ title: 'agy', preview: 'esc interrupt' }), false)
   assert.equal(agy({ title: 'notagy', preview: 'ready' }), false)
+
+  const codex = readinessMatcher('codex')
+  assert.equal(
+    codex({
+      title: '⠇ no-mistakes-review-1',
+      preview: '• Working (44s • esc to interrupt)\n› Find and fix a bug in @filename  gpt-5.6-luna max'
+    }),
+    true
+  )
+  assert.equal(
+    codex({
+      title: '⠇ no-mistakes-review-1',
+      preview: '• Working (2s • esc to interrupt)\n› Audit the change  gpt-5.6-luna ultra'
+    }),
+    true
+  )
+  assert.equal(
+    codex({ title: 'no-mistakes-review-1', preview: '•Working(44s)' }),
+    false
+  )
 })
 
 test('workerAgentReadyTimeoutMs honors the environment override with a safe default', () => {
@@ -326,7 +466,7 @@ test('buildCliCommand always sends the agy reserved flag and rejects reserved ov
   })
   assert.equal(
     overridden,
-    `'agy' '--mode' 'accept-edits' '--dangerously-skip-permissions'`
+    `'agy' '--dangerously-skip-permissions' '--mode' 'accept-edits'`
   )
   const envOverride = buildCliCommand('agy', {
     agentArgsOverride: { agy: { AGY_EFFORT: 'high' } } as never,
@@ -347,6 +487,10 @@ test('buildCliCommand always sends the agy reserved flag and rejects reserved ov
         error.message === `agent agy: reserved argument '${flag}' cannot be overridden`
     )
   }
+  assert.throws(
+    () => buildCliCommand('agy', { agentArgsOverride: { agy: ['--'] } } as never),
+    /option terminator '--' cannot precede the managed prompt carrier/
+  )
   // Other harnesses keep plain passthrough overrides.
   assert.equal(
     buildCliCommand('grok', { agentArgsOverride: { grok: ['-q'] } as never }),

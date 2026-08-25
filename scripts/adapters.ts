@@ -2,15 +2,27 @@ import type { AgentArgsOverride } from './config.ts'
 
 export type LaunchMode = 'acp' | 'cli' | 'native'
 
-export const NATIVE_HARNESSES = ['claude', 'codex', 'cursor'] as const
-export const CLI_HARNESSES = ['gemini', 'grok', 'opencode'] as const
+export const NATIVE_HARNESSES = ['cursor'] as const
+export const CLI_HARNESSES = ['claude', 'codex', 'gemini', 'grok', 'kimi', 'opencode'] as const
+const KNOWN_HARNESSES = new Set<string>([
+  ...NATIVE_HARNESSES,
+  ...CLI_HARNESSES,
+  'agy',
+  'pi'
+])
 
 const INTERRUPT_MARKER = 'esc interrupt'
-const ACP_TARGET_PATTERN = /^acp:([a-zA-Z0-9_-]+)$/
+const ACP_TARGET_PATTERN = /^acp:([a-zA-Z0-9_-]+)$/i
+
+function normalizeKnownHarness(harness: string): string {
+  const normalized = harness.toLowerCase()
+  return KNOWN_HARNESSES.has(normalized) ? normalized : harness
+}
 
 export function classifyHarness(harness: string): LaunchMode {
-  if (harness.startsWith('acp:')) return 'acp'
-  if ((NATIVE_HARNESSES as readonly string[]).includes(harness)) return 'native'
+  const normalized = harness.toLowerCase()
+  if (normalized.startsWith('acp:')) return 'acp'
+  if ((NATIVE_HARNESSES as readonly string[]).includes(normalized)) return 'native'
   return 'cli'
 }
 
@@ -34,6 +46,7 @@ export type NativeWorkerStartOptions = {
 }
 
 export function nativeWorkerStartArgs(options: NativeWorkerStartOptions): string[] {
+  const agent = normalizeKnownHarness(options.agent)
   // Orca rejects creation flags (--name/--repo/--base-branch) for current/existing worktrees.
   const createsWorktree = options.worktree === 'new-child'
   const args = [
@@ -42,13 +55,13 @@ export function nativeWorkerStartArgs(options: NativeWorkerStartOptions): string
     '--task',
     options.taskId,
     '--agent',
-    options.agent,
+    agent,
     '--worktree',
     options.worktree ?? 'new-child'
   ]
   if (options.effort && !options.model) {
     throw new Error(
-      `agent ${options.agent}: effort requires a model; set a model alongside effort or drop the effort setting`
+      `agent ${agent}: effort requires a model; set a model alongside effort or drop the effort setting`
     )
   }
   if (options.model) args.push('--model', options.model)
@@ -71,11 +84,13 @@ export type AgentProfile = {
 
 // One table: how each terminal-launched harness expresses reasoning effort,
 // and which harnesses expose no mechanism at all. Model is uniformly --model
-// where a harness accepts it. Native harnesses (claude/codex/cursor) bypass
+// where a harness accepts it. Native harnesses (cursor) bypass
 // this table: Orca worker-start owns their per-harness flags; acp:<target>
 // rides acpx's own --model and exposes no effort surface.
 const EFFORT_KNOBS: Record<string, { flag: string; requiresModel?: boolean }> = {
   agy: { flag: '--effort' },
+  claude: { flag: '--effort' },
+  codex: { flag: '-c' },
   grok: { flag: '--reasoning-effort' },
   opencode: { flag: '--variant', requiresModel: true },
   pi: { flag: '--thinking' },
@@ -89,15 +104,19 @@ const EFFORT_PIN_FLAGS = ['--effort', '--reasoning-effort', '--thinking']
 // A reserved flag stays reserved when joined to its value as --flag=value.
 function flagName(arg: string): string {
   const equals = arg.indexOf('=')
-  return equals < 0 ? arg : arg.slice(0, equals)
+  if (equals >= 0) return arg.slice(0, equals)
+  return /^-[A-Za-z].+/.test(arg) && !arg.startsWith('--') ? arg.slice(0, 2) : arg
 }
 
 function pinsAnyFlag(args: string[], flags: string[]): boolean {
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]
+    if (arg === '--') break
     for (const flag of flags) {
       if (arg.startsWith(`${flag}=`)) {
         if (arg.length > flag.length + 1) return true
+      } else if (flag.length === 2 && arg.startsWith(flag) && arg.length > 2) {
+        return true
       } else if (arg === flag) {
         if (i + 1 < args.length && args[i + 1] !== '') return true
       }
@@ -106,14 +125,76 @@ function pinsAnyFlag(args: string[], flags: string[]): boolean {
   return false
 }
 
+function pinsConfigKey(args: string[], key: string): boolean {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]
+    if (arg === '--') break
+    const config = configOverride(args, i)
+    if (config?.key !== key) continue
+    const value = config.value
+    if (!value || value === '""' || value === "''") {
+      throw new Error(`agent codex: config override ${key} requires a nonempty value`)
+    }
+    return true
+  }
+  return false
+}
+
+function configOverride(
+  args: string[],
+  index: number
+): { key: string; value: string } | undefined {
+  const arg = args[index]
+  const assignment =
+    arg === '-c' || arg === '--config'
+    ? args[index + 1]
+    : arg.startsWith('-c') && arg.length > 2
+      ? arg.slice(2).replace(/^=/, '')
+      : arg.startsWith('--config=')
+        ? arg.slice(9)
+        : undefined
+  const equals = assignment?.indexOf('=') ?? -1
+  if (!assignment || equals < 0) return undefined
+  return {
+    key: assignment.slice(0, equals).trim(),
+    value: assignment.slice(equals + 1).trim(),
+  }
+}
+
 // Flags no-mistakes manages itself for a harness. agent_args_override entries
 // may not supply them; always-present flags are appended after override args so
 // they cannot be dropped or reordered away.
 const RESERVED_HARNESS_ARGS: Record<string, ReadonlySet<string>> = {
-  agy: new Set(['--dangerously-skip-permissions', '--prompt-interactive', '-i']),
+  agy: new Set([
+    '--dangerously-skip-permissions',
+    '--prompt-interactive',
+    '--sandbox',
+    '-i',
+  ]),
+  claude: new Set([
+    '--allow-dangerously-skip-permissions',
+    '--dangerously-skip-permissions',
+    '--permission-mode',
+  ]),
+  codex: new Set([
+    '--ask-for-approval',
+    '--dangerously-bypass-approvals-and-sandbox',
+    '--profile',
+    '--sandbox',
+    '-a',
+    '-p',
+    '-s',
+  ]),
+  kimi: new Set(['--auto', '--plan', '--prompt', '--yolo', '-p']),
+}
+const RESERVED_CONFIG_KEYS: Record<string, ReadonlySet<string>> = {
+  codex: new Set(['approval_policy', 'sandbox_mode', 'sandbox_permissions']),
 }
 const REQUIRED_HARNESS_ARGS: Record<string, readonly string[]> = {
   agy: ['--dangerously-skip-permissions'],
+  claude: ['--dangerously-skip-permissions'],
+  codex: ['--dangerously-bypass-approvals-and-sandbox'],
+  kimi: ['--auto'],
 }
 
 const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
@@ -123,25 +204,58 @@ export type CliAgentCommandOptions = AgentProfile & {
   variant?: string
 }
 
+function agentArgsOverrideForHarness(
+  overrides: AgentArgsOverride | undefined,
+  harness: string
+): AgentArgsOverride[string] | undefined {
+  let match: AgentArgsOverride[string] | undefined
+  const keys = new Map<string, string>()
+  for (const [key, value] of Object.entries(overrides ?? {})) {
+    const normalizedKey = key.toLowerCase()
+    const existing = keys.get(normalizedKey)
+    if (existing) {
+      throw new Error(
+        `agent_args_override contains duplicate harness keys '${existing}' and '${key}'`
+      )
+    }
+    keys.set(normalizedKey, key)
+    if (normalizedKey === harness.toLowerCase()) match = value
+  }
+  return match
+}
+
 export function buildCliCommand(harness: string, options: CliAgentCommandOptions = {}): string {
+  const normalizedHarness = normalizeKnownHarness(harness)
   const env: string[] = []
-  const parts: string[] = [harness]
-  const override = options.agentArgsOverride?.[harness]
+  const parts: string[] = [normalizedHarness]
+  const override = agentArgsOverrideForHarness(options.agentArgsOverride, normalizedHarness)
   if (override && !Array.isArray(override)) {
     for (const [key, value] of Object.entries(override)) {
       if (!ENV_NAME_PATTERN.test(key)) {
         throw new Error(
-          `agent ${harness}: invalid environment variable name '${key}' in agent_args_override`
+          `agent ${normalizedHarness}: invalid environment variable name '${key}' in agent_args_override`
         )
       }
       env.push(`${key}=${shellQuote(value)}`)
     }
   }
   const raw = Array.isArray(override) ? override : []
-  const effortKnob = EFFORT_KNOBS[harness]
+  if (normalizedHarness === 'agy' && raw.includes('--')) {
+    throw new Error(
+      `agent ${normalizedHarness}: option terminator '--' cannot precede the managed prompt carrier`
+    )
+  }
+  const effortKnob = EFFORT_KNOBS[normalizedHarness]
+  const modelPinned =
+    pinsAnyFlag(raw, MODEL_PIN_FLAGS) ||
+    (normalizedHarness === 'codex' && pinsConfigKey(raw, 'model'))
+  const effortPinned =
+    normalizedHarness === 'codex'
+      ? pinsConfigKey(raw, 'model_reasoning_effort')
+      : pinsAnyFlag(raw, EFFORT_PIN_FLAGS)
   if (options.effort && !effortKnob) {
     throw new Error(
-      `agent ${harness}: cannot express effort; no verified reasoning-effort flag exists for it (use agent_args_override.${harness} if your build accepts one)`
+      `agent ${normalizedHarness}: cannot express effort; no verified reasoning-effort flag exists for it (use agent_args_override.${normalizedHarness} if your build accepts one)`
     )
   }
   // Model-scoped effort carriers (--variant) need their model, supplied either
@@ -151,30 +265,44 @@ export function buildCliCommand(harness: string, options: CliAgentCommandOptions
     options.effort &&
     effortKnob?.requiresModel &&
     !options.model &&
-    !pinsAnyFlag(raw, MODEL_PIN_FLAGS) &&
+    !modelPinned &&
     !options.variant
   ) {
     throw new Error(
-      `agent ${harness}: cannot express effort without a model; ${effortKnob.flag} selects a model-scoped variant`
+      `agent ${normalizedHarness}: cannot express effort without a model; ${effortKnob.flag} selects a model-scoped variant`
     )
   }
-  if (options.model && !pinsAnyFlag(raw, MODEL_PIN_FLAGS)) parts.push('--model', options.model)
+  if (options.model && !modelPinned) parts.push('--model', options.model)
   if (effortKnob?.requiresModel) {
     const variant = options.variant ?? options.effort
     if (variant && !pinsAnyFlag(raw, [effortKnob.flag])) parts.push(effortKnob.flag, variant)
-  } else if (effortKnob && options.effort && !pinsAnyFlag(raw, EFFORT_PIN_FLAGS)) {
-    parts.push(effortKnob.flag, options.effort)
+  } else if (effortKnob && options.effort && !effortPinned) {
+    const effort =
+      normalizedHarness === 'codex'
+        ? `model_reasoning_effort=${JSON.stringify(options.effort)}`
+        : options.effort
+    parts.push(effortKnob.flag, effort)
   }
-  const reserved = RESERVED_HARNESS_ARGS[harness]
+  const reserved = RESERVED_HARNESS_ARGS[normalizedHarness]
+  const reservedConfig = RESERVED_CONFIG_KEYS[normalizedHarness]
   if (reserved) {
-    for (const arg of raw) {
+    for (let index = 0; index < raw.length; index++) {
+      const arg = raw[index]
+      if (arg === '--') break
       if (reserved.has(flagName(arg))) {
-        throw new Error(`agent ${harness}: reserved argument '${arg}' cannot be overridden`)
+        throw new Error(`agent ${normalizedHarness}: reserved argument '${arg}' cannot be overridden`)
+      }
+      const config = configOverride(raw, index)
+      const configKey = config?.key
+      if (configKey && reservedConfig?.has(configKey)) {
+        throw new Error(
+          `agent ${normalizedHarness}: reserved config '${configKey}' cannot be overridden`
+        )
       }
     }
   }
+  parts.push(...(REQUIRED_HARNESS_ARGS[normalizedHarness] ?? []))
   parts.push(...raw)
-  parts.push(...(REQUIRED_HARNESS_ARGS[harness] ?? []))
   // Environment assignments stay unquoted as a prefix; arguments are shell-quoted individually.
   return [...env, ...parts.map(shellQuote)].join(' ')
 }
@@ -196,8 +324,16 @@ export function harnessTitleMatcher(harness: string): (title?: string | null) =>
 export function readinessMatcher(
   harness: string
 ): (terminal: TerminalView) => boolean {
+  const normalizedHarness = harness.toLowerCase()
   const titleTaken = harnessTitleMatcher(harness)
-  return ({ preview, title }) => titleTaken(title) && !(preview ?? '').includes(INTERRUPT_MARKER)
+  return ({ preview, title }) => {
+    const output = preview ?? ''
+    const codexActive =
+      normalizedHarness === 'codex' &&
+      /\bWorking\s*\(\s*\d+\s*s\b/.test(output) &&
+      /›[\s\S]{0,500}\s[^\s·]+\s+(?:minimal|low|medium|high|xhigh|max|ultra)\s*(?:·|$)/i.test(output)
+    return (titleTaken(title) || codexActive) && !output.includes(INTERRUPT_MARKER)
+  }
 }
 
 function escapeRegExp(value: string): string {
