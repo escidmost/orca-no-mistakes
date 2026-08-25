@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdirSync, readFileSync } from 'node:fs'
+import { appendFile, mkdir, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -174,6 +175,91 @@ export function capLog(content: string, maxBytes = MAX_LOG_BYTES): string {
   const keep = Math.max(0, Math.floor((maxBytes - 512) / 2))
   const marker = `\n[no-mistakes: log truncated; retained first and last ${keep} of ${source.length} bytes]\n`
   return `${source.subarray(0, keep).toString('utf8')}${marker}${source.subarray(source.length - keep).toString('utf8')}`
+}
+
+/**
+ * Appends streamed stage output to one capped log file outside the repository.
+ *
+ * The head is written straight to disk so a crashed run still keeps its opening
+ * diagnostics; once the head budget is spent the tail is retained in memory and
+ * flushed by `close`, so the middle is what a runaway worker loses.
+ *
+ * The budget belongs to the file, not the instance: the workers of one stage
+ * round open it in turn, and each reads what is already there so their combined
+ * output still lands under `maxBytes`.
+ */
+export class StageLog {
+  readonly #path: string
+  readonly #keep: number
+  readonly #maxBytes: number
+  #dropped = 0
+  #headBytes = 0
+  #started = false
+  #tail: Buffer[] = []
+  #tailBytes = 0
+  #tailKeep = 0
+
+  constructor(filePath: string, maxBytes = MAX_LOG_BYTES) {
+    this.#path = filePath
+    this.#maxBytes = maxBytes
+    this.#keep = Math.max(0, Math.floor((maxBytes - 512) / 2))
+  }
+
+  async append(chunk: string): Promise<void> {
+    await this.#start()
+    let pending = Buffer.from(chunk, 'utf8')
+    if (pending.length === 0) return
+    if (this.#headBytes < this.#keep) {
+      const head = pending.subarray(0, this.#keep - this.#headBytes)
+      await appendFile(this.#path, head)
+      this.#headBytes += head.length
+      pending = pending.subarray(head.length)
+    }
+    if (pending.length === 0) return
+    this.#tail.push(pending)
+    this.#tailBytes += pending.length
+    while (this.#tailBytes > this.#tailKeep) {
+      const oldest = this.#tail[0]!
+      const cut = Math.min(oldest.length, this.#tailBytes - this.#tailKeep)
+      if (cut === oldest.length) this.#tail.shift()
+      else this.#tail[0] = oldest.subarray(cut)
+      this.#tailBytes -= cut
+      this.#dropped += cut
+    }
+  }
+
+  /** Flushes the retained tail behind a marker, so a truncated log is never
+   *  mistaken for a complete one. */
+  async close(): Promise<void> {
+    if (this.#tail.length === 0) return
+    await this.#start()
+    if (this.#dropped > 0) {
+      await appendFile(
+        this.#path,
+        `\n[no-mistakes: log truncated; dropped ${this.#dropped} middle bytes]\n`
+      )
+    }
+    await appendFile(this.#path, Buffer.concat(this.#tail))
+    this.#tail = []
+  }
+
+  /** Charges this instance for whatever the round's earlier workers already
+   *  wrote, so both budgets shrink instead of restarting per worker. */
+  async #start(): Promise<void> {
+    if (this.#started) return
+    this.#started = true
+    await mkdir(path.dirname(this.#path), { recursive: true })
+    const existing = await stat(this.#path)
+      .then((entry) => entry.size)
+      .catch(() => 0)
+    this.#headBytes = existing
+    // The same 512 bytes `keep` reserves for one marker are reserved again on
+    // reopen, so a second worker's marker cannot push the file over the cap.
+    this.#tailKeep = Math.max(
+      0,
+      Math.min(this.#keep, this.#maxBytes - existing - 512)
+    )
+  }
 }
 
 export function noMistakesHome(): string {

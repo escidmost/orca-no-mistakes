@@ -122,7 +122,9 @@ Human decision gates have no coordinator-imposed deadline, and the pipeline has 
 
 ## Evidence
 
-Worker JSON reports, coordinator stage logs, and declared artifacts are confined to `~/.orca-no-mistakes/artifacts/<run-id>/`. The coordinator validates report shape and prevents report or artifact paths from escaping that directory. Coordinator-written logs larger than 50 MB are capped to head + tail with an explicit truncation marker.
+Worker JSON reports, coordinator stage logs, and declared artifacts are confined to `~/.orca-no-mistakes/artifacts/<run-id>/`. The coordinator validates report shape and prevents report or artifact paths from escaping that directory. Nothing a stage produces is written inside the repository worktree.
+
+Raw worker output — agent transcripts, the test and lint commands they run, and ACP stdout/stderr — streams to `~/.orca-no-mistakes/artifacts/<run-id>/<stage>_r<round>.log` while the worker runs, so a transcript survives a coordinator that dies before the terminal is closed. Terminal reads resume from a per-terminal cursor, so a session retained across rounds never replays recorded output into the next round's log. Capturing a transcript is diagnostic and never fails the stage it records. Both the streamed logs and coordinator-written stage logs are capped at 50 MB: the head is kept on disk as it arrives, the tail is retained and flushed on close, and the dropped middle is reported by an explicit truncation marker.
 
 Each stage execution produces a `stage_evidence` row whose SHA-256 digest covers stage, round, candidate commit OID, base commit OID, worker identity, exit code, and summary. Each run also writes `manifest.json` beside its reports, recording `base_ref`, `base_ref_sha`, `local_bypass`, the effective policy configuration snapshot with resolved CLI overrides, and its `effective_policy_hash` (SHA-256 over key-sorted canonical JSON).
 

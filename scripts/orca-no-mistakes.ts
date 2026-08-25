@@ -57,6 +57,7 @@ import {
 import {
   DomainLedger,
   RUN_ID_PATTERN,
+  StageLog,
   artifactsRoot,
   buildAttestation,
   capLog,
@@ -109,6 +110,9 @@ export type WorkerLaunch = {
   /** Commit a new-child worktree must be detached at, pinning the worker to an
    *  immutable snapshot instead of a movable branch checkout. */
   commitOid?: string;
+  /** Run-artifact file this worker's raw output is streamed to, outside the
+   *  repository. Absent only when no run is bound. */
+  logPath?: string;
   name: string;
   prompt: string;
   reportPath?: string;
@@ -526,6 +530,7 @@ export async function runPipeline(
         const execution = await executeStage(
           stage,
           attempt++,
+          round,
           taskId,
           intent,
           artifactsDir,
@@ -1058,6 +1063,7 @@ type StageExecution = {
 async function executeStage(
   stage: StageName,
   attempt: number,
+  round: number,
   taskId: string,
   intent: string,
   evidenceDir: string,
@@ -1091,6 +1097,7 @@ async function executeStage(
     runReviewer(
       stage,
       attempt,
+      round,
       taskId,
       intent,
       evidenceDir,
@@ -1103,6 +1110,16 @@ async function executeStage(
   );
 }
 
+/** ONM-23: every raw transcript for a stage round lands in one run-artifact
+ *  log outside the repository, so the worktree stays clean. */
+function stageLogPath(
+  artifactsDir: string,
+  stage: StageName,
+  round: number,
+): string {
+  return path.join(artifactsDir, `${stage}_r${round}.log`);
+}
+
 function exitCodeFor(report: StageReport): number {
   return report.findings.length > 0 ? 1 : 0;
 }
@@ -1110,6 +1127,7 @@ function exitCodeFor(report: StageReport): number {
 async function runReviewer(
   stage: StageName,
   attempt: number,
+  round: number,
   parentTask: string,
   intent: string,
   evidenceDir: string,
@@ -1120,6 +1138,7 @@ async function runReviewer(
   fence: TimeoutFence,
 ): Promise<StageExecution> {
   const reportPath = path.join(evidenceDir, `${stage}-${attempt + 1}.json`);
+  const logPath = stageLogPath(evidenceDir, stage, round);
   const untrusted = await untrustedBranchContext(git, repo.base);
   const launches = launchCandidates(role).map((agent): WorkerLaunch => {
     const prompt = checkerPrompt(
@@ -1134,6 +1153,7 @@ async function runReviewer(
       agent,
       acceptFailedReport: true,
       commitOid: untrusted.headOid,
+      logPath,
       name: `no-mistakes-${stage}-${attempt + 1}`,
       prompt,
       reportPath,
@@ -1286,6 +1306,7 @@ async function runFixer(
     return {
       agent,
       commitOid: before,
+      logPath: stageLogPath(path.dirname(reportPath), stage, round),
       name: `no-mistakes-fixer-${stage}-${round}`,
       prompt,
       reportPath,
@@ -2097,6 +2118,10 @@ function acpReportFrom(parsed: unknown): StageReport | undefined {
 
 const DEFAULT_WORKER_AGENT = "opencode";
 const WORKER_IDLE_TIMEOUT_MS = 1_800_000;
+// Terminal rows requested per stage-log drain, and the page ceiling that stops
+// one drain from monopolising the poll loop when a worker floods its terminal.
+const WORKER_LOG_READ_LIMIT = 2_000;
+const WORKER_LOG_MAX_PAGES = 50;
 const NATIVE_WORKER_CREATE_SLACK_MS = 120_000;
 const FISH_SHELL_STARTUP_DELAY_MS = 20_000;
 
@@ -2144,6 +2169,9 @@ export class CliOrca implements OrcaOperations {
   readonly #command: string;
   readonly #cwd: string;
   readonly #notifyHandle?: string;
+  // Terminal handle -> cursor of the last drained stage-log read, so a retained
+  // terminal reused across rounds never replays output into the next log.
+  readonly #terminalCursors = new Map<string, string>();
   // Worktree ID -> the branch Orca minted for it, claimed at creation.
   readonly #workerBranches = new Map<string, string>();
   #runId?: string;
@@ -2373,8 +2401,7 @@ export class CliOrca implements OrcaOperations {
         taskId,
         dispatchId,
         terminalHandle,
-        launch.reportPath,
-        launch.acceptFailedReport,
+        launch,
         fence,
       );
       deliveryId = result.deliveryId;
@@ -2480,8 +2507,7 @@ export class CliOrca implements OrcaOperations {
         taskId,
         dispatchId,
         terminalHandle,
-        launch.reportPath,
-        launch.acceptFailedReport,
+        launch,
         fence,
       );
       deliveryId = result.deliveryId;
@@ -3332,6 +3358,17 @@ export class CliOrca implements OrcaOperations {
           { cause: error },
         );
       }
+      if (launch.logPath) {
+        try {
+          const log = new StageLog(launch.logPath);
+          await log.append(`${result.stdout}${result.stderr}`);
+          await log.close();
+        } catch (error) {
+          console.error(
+            `warning: could not capture acp worker output: ${String(error)}`,
+          );
+        }
+      }
       if (fence?.aborted) {
         throw new Error(`${launch.stage} worker attempt was cancelled`);
       }
@@ -3718,8 +3755,87 @@ export class CliOrca implements OrcaOperations {
     taskId: string,
     dispatchId: string,
     terminalHandle: string,
-    expectedReportPath?: string,
-    acceptFailedReport = false,
+    launch: WorkerLaunch,
+    fence?: TimeoutFence,
+  ): Promise<{
+    deliveryId?: string;
+    error?: string;
+    failedOutcome?: boolean;
+    report?: StageReport;
+  }> {
+    const log = launch.logPath ? new StageLog(launch.logPath) : undefined;
+    try {
+      return await this.#awaitWorkerReport(
+        taskId,
+        dispatchId,
+        terminalHandle,
+        launch,
+        log,
+        fence,
+      );
+    } finally {
+      if (log) {
+        // The terminal is still open here; after this the caller closes it and
+        // whatever was not drained is gone for good.
+        await this.#drainWorkerLog(terminalHandle, log);
+        await log.close().catch(() => {});
+      }
+    }
+  }
+
+  /** Appends new terminal output to the run's stage log. Capturing a worker's
+   *  transcript is diagnostic, so every failure here is swallowed rather than
+   *  allowed to fail the stage it was recording. */
+  async #drainWorkerLog(terminalHandle: string, log: StageLog): Promise<void> {
+    try {
+      for (let page = 0; page < WORKER_LOG_MAX_PAGES; page += 1) {
+        const cursor = this.#terminalCursors.get(terminalHandle);
+        const result = await this.#json<{
+          terminal?: { nextCursor?: number | string; tail?: string[] };
+        }>(
+          [
+            "terminal",
+            "read",
+            "--terminal",
+            terminalHandle,
+            ...(cursor === undefined ? [] : ["--cursor", cursor]),
+            "--limit",
+            String(WORKER_LOG_READ_LIMIT),
+            "--json",
+          ],
+          true,
+        );
+        const lines = result.terminal?.tail ?? [];
+        const next =
+          result.terminal?.nextCursor === undefined
+            ? undefined
+            : String(result.terminal.nextCursor);
+        // A cursor that does not advance means the host re-served output this
+        // log already holds; appending it would grow the file on every drain.
+        if (cursor !== undefined && next === cursor) return;
+        if (next !== undefined) this.#terminalCursors.set(terminalHandle, next);
+        if (lines.length === 0) return;
+        await log.append(`${lines.join("\n")}\n`);
+        if (next === undefined) return;
+      }
+      // The terminal still had more to give. Say so rather than let the drain
+      // end silently, because finalization closes the terminal right after.
+      await log.append(
+        `\n[no-mistakes: terminal output dropped; drain page limit reached]\n`,
+      );
+    } catch (error) {
+      console.error(
+        `warning: could not capture worker output for ${terminalHandle}: ${String(error)}`,
+      );
+    }
+  }
+
+  async #awaitWorkerReport(
+    taskId: string,
+    dispatchId: string,
+    terminalHandle: string,
+    launch: WorkerLaunch,
+    log: StageLog | undefined,
     fence?: TimeoutFence,
   ): Promise<{
     deliveryId?: string;
@@ -3770,6 +3886,7 @@ export class CliOrca implements OrcaOperations {
         if (lastOutputAt === undefined || outputAt > lastOutputAt) {
           lastOutputAt = outputAt;
           lastActivityAt = Date.now();
+          if (log) await this.#drainWorkerLog(terminalHandle, log);
         }
         if (Date.now() - lastActivityAt >= WORKER_IDLE_TIMEOUT_MS) {
           return {
@@ -3844,7 +3961,7 @@ export class CliOrca implements OrcaOperations {
           };
         }
         const failedOutcome = payload.outcome !== "succeeded";
-        if (failedOutcome && !acceptFailedReport) {
+        if (failedOutcome && launch.acceptFailedReport !== true) {
           return {
             deliveryId: result.deliveryId,
             error: `worker ${dispatchId} failed: ${message.body ?? message.subject ?? ""}`,
@@ -3853,7 +3970,7 @@ export class CliOrca implements OrcaOperations {
         const reportPath =
           typeof payload.reportPath === "string"
             ? payload.reportPath
-            : expectedReportPath;
+            : launch.reportPath;
         if (reportPath === undefined) {
           return {
             deliveryId: result.deliveryId,
@@ -3862,8 +3979,8 @@ export class CliOrca implements OrcaOperations {
         }
         const requestedReportPath = path.resolve(reportPath);
         if (
-          expectedReportPath !== undefined &&
-          requestedReportPath !== path.resolve(expectedReportPath)
+          launch.reportPath !== undefined &&
+          requestedReportPath !== path.resolve(launch.reportPath)
         ) {
           return {
             deliveryId: result.deliveryId,

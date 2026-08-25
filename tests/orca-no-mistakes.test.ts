@@ -51,7 +51,7 @@ import {
   classifyPreflightFailure,
   shellQuote,
 } from "../scripts/adapters.ts";
-import { artifactsRoot } from "../scripts/ledger.ts";
+import { StageLog, artifactsRoot } from "../scripts/ledger.ts";
 import { loadUserConfig } from "../scripts/config.ts";
 import { effectivePolicyHash } from "../scripts/policy.ts";
 
@@ -6938,6 +6938,82 @@ function isolateHomes(temp: string): () => void {
   };
 }
 
+test("worker terminal output is drained into the run's stage log", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-worker-log-"));
+  const fakeOrca = path.join(temp, "orca");
+  const callsPath = path.join(temp, "calls.jsonl");
+  const restoreHomes = isolateHomes(temp);
+  try {
+    const evidence = path.join(temp, "home", "artifacts", "log-run");
+    await mkdir(evidence, { recursive: true });
+    const reportPath = path.join(evidence, "review-1.json");
+    await writeFile(reportPath, JSON.stringify(pass("review clean")));
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+const out = (result) => console.log(JSON.stringify({ result }))
+const cursor = args.includes('--cursor') ? args[args.indexOf('--cursor') + 1] : undefined
+if (args[0] === 'orchestration' && args[1] === 'run-create') {
+  out({ run: { id: 'log-run' } })
+} else if (args[0] === 'terminal' && args[1] === 'create') {
+  out({ terminal: { handle: 'worker-terminal' } })
+} else if (args[0] === 'terminal' && args[1] === 'read') {
+  if (cursor === undefined) out({ terminal: { tail: ['npm test', 'ok 12 passed'], nextCursor: 2 } })
+  else if (cursor === '2') out({ terminal: { tail: ['done'], nextCursor: 3 } })
+  else out({ terminal: { tail: [], nextCursor: Number(cursor) } })
+} else if (args[0] === 'terminal' && args[1] === 'show') {
+  out({ terminal: { connected: true, title: 'OpenCode', preview: 'ready', lastOutputAt: 1, worktreeId: 'worker-worktree' } })
+} else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
+  out({ dispatch: { id: 'dispatch-1', status: 'dispatched' }, injected: true, preamble: 'authenticated' })
+} else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
+  out({ deliveryId: 'delivery-1', messages: [{ type: 'worker_done', body: 'Reviewed the change.', payload: JSON.stringify({ taskId: 'task-1', dispatchId: 'dispatch-1', outcome: 'succeeded', reportPath: ${JSON.stringify(reportPath)} }) }] })
+} else {
+  out({ ok: true })
+}
+`,
+    );
+    await chmod(fakeOrca, 0o755);
+    const orca = new CliOrca({ command: fakeOrca, cwd: temp });
+    await orca.createRun("stage log capture");
+
+    const logPath = path.join(evidence, "review_r0.log");
+    const worker = await orca.startWorker("task-1", {
+      logPath,
+      name: "no-mistakes-review-1",
+      prompt: "Review now.",
+      role: "reviewer",
+      stage: "review",
+      worktree: "current",
+    });
+
+    assert.equal(worker.report.summary, "review clean");
+    assert.equal(
+      await readFile(logPath, "utf8"),
+      "npm test\nok 12 passed\ndone\n",
+    );
+
+    const reads = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[])
+      .filter((args) => args[0] === "terminal" && args[1] === "read");
+    // Paging resumes from the cursor, so a terminal reused by a later round
+    // never replays output it already recorded.
+    assert.deepEqual(
+      reads.map((args) =>
+        args.includes("--cursor") ? args[args.indexOf("--cursor") + 1] : null,
+      ),
+      [null, "2", "3"],
+    );
+  } finally {
+    restoreHomes();
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test("WORKER_AGENT_READY_TIMEOUT_MS tears down an unready CLI agent terminal", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-ready-timeout-"));
   const fakeOrca = path.join(temp, "orca");
@@ -8145,6 +8221,127 @@ test("capLog preserves head and tail of oversized logs", () => {
   assert.ok(capped.startsWith("aaaa"));
   assert.ok(capped.endsWith("bbbb"));
   assert.ok(!capped.includes("MIDDLE"));
+});
+
+test("StageLog streams the head to disk and truncates oversized output head-and-tail", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-"));
+  try {
+    const logPath = path.join(temp, "logs", "review_r0.log");
+    const log = new StageLog(logPath, 2_048);
+    await log.append(`${"a".repeat(1_000)}\n`);
+    // The head is already durable before close, so a coordinator that dies
+    // mid-run still leaves the opening diagnostics behind.
+    assert.ok((await readFile(logPath, "utf8")).startsWith("aaa"));
+    await log.append(`MIDDLE${"m".repeat(4_000)}`);
+    await log.append("b".repeat(700));
+    await log.close();
+
+    const written = await readFile(logPath, "utf8");
+    assert.ok(written.startsWith("aaa"));
+    assert.ok(written.endsWith("bbb"));
+    assert.ok(!written.includes("MIDDLE"));
+    assert.match(
+      written,
+      /\[no-mistakes: log truncated; dropped \d+ middle bytes\]/,
+    );
+    assert.equal(written.match(/log truncated/g)?.length, 1);
+    assert.ok(Buffer.byteLength(written) <= 2_048);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("StageLog leaves a complete log unmarked", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-whole-"));
+  try {
+    const logPath = path.join(temp, "lint_r0.log");
+    const log = new StageLog(logPath, 2_048);
+    await log.append("everything fits\n");
+    await log.close();
+
+    const written = await readFile(logPath, "utf8");
+    assert.equal(written, "everything fits\n");
+    assert.ok(!written.includes("truncated"));
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("StageLog holds every worker of a round to one shared cap", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-share-"));
+  try {
+    const logPath = path.join(temp, "review_r1.log");
+    for (const worker of ["f", "r", "s"]) {
+      const log = new StageLog(logPath, 2_048);
+      await log.append(worker.repeat(2_000));
+      await log.close();
+    }
+
+    const written = await readFile(logPath, "utf8");
+    // A per-instance cap would let each of the three add its own head or tail
+    // block and carry the round's log past the limit.
+    assert.ok(Buffer.byteLength(written) <= 2_048);
+    // The first worker still owns the head, so the round reads in order.
+    assert.ok(written.startsWith("fff"));
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("every worker launch streams its raw output to the run artifact directory", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  const orca = new FakeOrca(git);
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Null input crashes the command",
+        },
+      ],
+      summary: "one defect",
+    },
+    pass("repair committed"),
+  ]);
+
+  const result = await runPipeline(
+    { intent: "Keep every transcript outside the repository." },
+    orca,
+    git,
+  );
+
+  const runArtifacts = path.join(artifactsRoot(), result.runId);
+  assert.ok(orca.launches.length > 0);
+  for (const launch of orca.launches) {
+    // Criterion: the transcript lands in the run's artifact directory, never
+    // anywhere inside the checked-out repository.
+    assert.equal(path.dirname(launch.logPath!), runArtifacts);
+    assert.match(
+      path.basename(launch.logPath!),
+      new RegExp(`^${launch.stage}_r\\d+\\.log$`),
+    );
+    assert.ok(!launch.logPath!.startsWith("/repo/"));
+  }
+
+  const reviewLaunches = orca.launches.filter(
+    (launch) => launch.stage === "review",
+  );
+  assert.deepEqual(
+    reviewLaunches.map((launch) => [
+      launch.role,
+      path.basename(launch.logPath!),
+    ]),
+    [
+      ["reviewer", "review_r0.log"],
+      ["fixer", "review_r1.log"],
+      ["reviewer", "review_r1.log"],
+    ],
+  );
+
+  await rm(runArtifacts, { recursive: true, force: true });
 });
 
 test("prune removes completed runs with their evidence while retaining in-progress runs", async () => {
