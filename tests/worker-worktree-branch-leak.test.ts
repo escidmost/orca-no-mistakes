@@ -77,3 +77,56 @@ if (args[0] === 'worktree' && args[1] === 'create') {
     await rm(temp, { force: true, recursive: true });
   }
 });
+
+test("a worker branch that outlives its worktree surfaces as a cleanup failure", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-worker-branch-stuck-"));
+  const repo = path.join(temp, "repo");
+  const pinned = path.join(temp, "pinned");
+  const fakeOrca = path.join(temp, "orca");
+  const workerBranch = "evs/no-mistakes-review-1-8";
+  try {
+    git(temp, "-c", "init.templateDir=", "init", "-b", "feature", "repo");
+    git(repo, "config", "user.email", "test@example.com");
+    git(repo, "config", "user.name", "Test User");
+    git(repo, "config", "commit.gpgsign", "false");
+    await writeFile(path.join(repo, "README.md"), "seed\n");
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "seed");
+    // Checking the branch out elsewhere makes `git branch -D` refuse it, so the
+    // branch genuinely survives its worktree instead of merely being absent.
+    git(repo, "worktree", "add", "-b", workerBranch, pinned);
+
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+const out = (result) => console.log(JSON.stringify({ result }))
+if (args[0] === 'worktree' && args[1] === 'create') {
+  out({ worktree: { id: 'repo::/worker', path: ${JSON.stringify(path.join(temp, "worker"))}, branch: 'refs/heads/${workerBranch}' } })
+} else if (args[0] === 'terminal' && args[1] === 'list') {
+  out({ terminals: [] })
+} else if (args[0] === 'terminal' && args[1] === 'create') {
+  out({})
+} else {
+  out({ ok: true })
+}
+`,
+    );
+    await chmod(fakeOrca, 0o755);
+
+    const orca = new CliOrca({ command: fakeOrca, cwd: repo });
+    await assert.rejects(
+      orca.startWorker("task-review", {
+        name: "no-mistakes-review-1",
+        prompt: "review",
+        role: "reviewer",
+        stage: "review",
+        worktree: "new-child",
+      }),
+      /outlived worktree/,
+    );
+  } finally {
+    await rm(temp, { force: true, recursive: true });
+  }
+});

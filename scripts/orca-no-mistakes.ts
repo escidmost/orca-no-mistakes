@@ -2578,8 +2578,9 @@ export class CliOrca implements OrcaOperations {
         dispatch?: { terminalHandle?: string };
         residualResources?: unknown;
         terminal?: { handle?: string };
-        worktree?: { id?: string; path?: string };
+        worktree?: { branch?: string; id?: string; path?: string };
         worker?: {
+          branch?: string;
           terminalHandle?: string;
           worktreeId?: string;
           worktreePath?: string;
@@ -2598,6 +2599,11 @@ export class CliOrca implements OrcaOperations {
       worktreeId = receipt.worktree?.id ?? receipt.worker?.worktreeId;
       const worktreePath =
         receipt.worktree?.path ?? receipt.worker?.worktreePath;
+      if (worktreeId)
+        this.#trackWorkerBranch(
+          worktreeId,
+          receipt.worktree?.branch ?? receipt.worker?.branch,
+        );
       const reported = collectResidualResources(receipt.residualResources);
       residual.terminalHandles.push(...reported.terminalHandles);
       residual.worktreeIds.push(...reported.worktreeIds);
@@ -3416,18 +3422,26 @@ export class CliOrca implements OrcaOperations {
   // Worker worktrees are detached before use, so their minted branch is
   // unreferenced once the worktree is gone. Leaving it exhausts Orca's
   // name-suffix search and later `worktree create` calls fail outright.
-  async #deleteWorkerBranch(worktreeId: string): Promise<void> {
+  // Returns a failure description when the branch outlives its worktree.
+  // `git branch -D` also exits nonzero for a branch that was never there, so
+  // survival — not the exit code — decides whether custody actually failed.
+  async #deleteWorkerBranch(worktreeId: string): Promise<string | undefined> {
     const branch = this.#workerBranches.get(worktreeId);
-    if (!branch) return;
-    this.#workerBranches.delete(worktreeId);
+    if (!branch) return undefined;
     const deleted = await command("git", ["branch", "-D", branch], this.#cwd, {
       allowFailure: true,
     });
-    if (deleted.code !== 0) {
-      console.error(
-        `warning: removed worker worktree ${worktreeId}, but could not delete branch ${branch}: ${`${deleted.stdout}${deleted.stderr}`.trim()}`,
-      );
+    const survived = await command(
+      "git",
+      ["branch", "--list", branch],
+      this.#cwd,
+      { allowFailure: true },
+    );
+    if (survived.stdout.trim()) {
+      return `worker branch ${branch} outlived worktree ${worktreeId}: ${`${deleted.stdout}${deleted.stderr}`.trim()}`;
     }
+    this.#workerBranches.delete(worktreeId);
+    return undefined;
   }
 
   async removeWorktree(worktreeId: string): Promise<void> {
@@ -3439,7 +3453,8 @@ export class CliOrca implements OrcaOperations {
       "--force",
       "--json",
     ]);
-    await this.#deleteWorkerBranch(worktreeId);
+    const leaked = await this.#deleteWorkerBranch(worktreeId);
+    if (leaked) throw new WorkerCleanupError(`worker cleanup failed: ${leaked}`);
   }
 
   async completeTask(taskId: string, report: StageReport): Promise<void> {
@@ -3950,7 +3965,8 @@ export class CliOrca implements OrcaOperations {
         "--force",
         "--json",
       ]);
-      await this.#deleteWorkerBranch(resources.worktreeId);
+      const leaked = await this.#deleteWorkerBranch(resources.worktreeId);
+      if (leaked) failures.push(`worker branch removal: ${leaked}`);
     }
     if (resources.deliveryId) {
       await attempt("delivery acknowledgement", [
