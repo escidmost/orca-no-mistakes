@@ -618,6 +618,14 @@ export async function runPipeline(
             runId,
             stageId: stage,
           });
+          if (
+            decision.action !== "unknown" &&
+            !gateOptions.includes(decision.action)
+          ) {
+            throw new Error(
+              `${stage} gate resolution selected "${decision.action}", which was not offered (${gateOptions.join(", ")}): ${resolution}`,
+            );
+          }
           if (decision.action === "approve" || decision.action === "skip") {
             const waived = latestEntryByStage.get(stage);
             if (waived && !waived.waiverOrApproval) {
@@ -2136,6 +2144,8 @@ export class CliOrca implements OrcaOperations {
   readonly #command: string;
   readonly #cwd: string;
   readonly #notifyHandle?: string;
+  // Worktree ID -> the branch Orca minted for it, claimed at creation.
+  readonly #workerBranches = new Map<string, string>();
   #runId?: string;
 
   constructor(options: CliOrcaOptions) {
@@ -2590,6 +2600,12 @@ export class CliOrca implements OrcaOperations {
       const reported = collectResidualResources(receipt.residualResources);
       residual.terminalHandles.push(...reported.terminalHandles);
       residual.worktreeIds.push(...reported.worktreeIds);
+      for (const id of new Set(
+        [worktreeId, ...residual.worktreeIds].filter(
+          (value): value is string => Boolean(value),
+        ),
+      ))
+        await this.#claimWorkerBranch(id);
       if (started.code !== 0) {
         const detail =
           started.stdout.trim() || started.stderr.trim() || "no output";
@@ -2705,6 +2721,7 @@ export class CliOrca implements OrcaOperations {
         false,
       );
       worktree = created.worktree;
+      if (worktree?.id) await this.#claimWorkerBranch(worktree.id);
       if (!worktree?.id || !worktree.path)
         throw new PreflightError(
           "unclassified",
@@ -3277,6 +3294,7 @@ export class CliOrca implements OrcaOperations {
         }
         worktreeId = created.worktree.id;
         cwd = created.worktree.path;
+        await this.#claimWorkerBranch(worktreeId);
         await this.#json([
           "worktree",
           "set",
@@ -3391,15 +3409,91 @@ export class CliOrca implements OrcaOperations {
     }
   }
 
+  // The worktree is the only link back to the branch Orca minted for it, so
+  // custody must be resolved before removal — receipts do not carry it on
+  // every creation path, and residual worktree IDs carry nothing at all.
+  async #worktreeEntry(
+    worktreeId: string,
+  ): Promise<{ branch?: string; id?: string } | undefined> {
+    const listed = await this.#json<{
+      worktrees?: { branch?: string; id?: string }[];
+    }>(["worktree", "list", "--json"]);
+    return listed?.worktrees?.find((worktree) => worktree.id === worktreeId);
+  }
+
+  async #workerBranchFor(worktreeId: string): Promise<string | undefined> {
+    const branch = (await this.#worktreeEntry(worktreeId))?.branch;
+    return branch?.replace(/^refs\/heads\//, "");
+  }
+
+  // Removing a worktree that is already gone is success, not failure: its
+  // branch still needs releasing, and cleanup runs from `finally` blocks that
+  // must converge rather than fail permanently on a retry.
+  async #removeWorktreeIfPresent(
+    worktreeId: string,
+  ): Promise<string | undefined> {
+    try {
+      await this.#json([
+        "worktree",
+        "rm",
+        "--worktree",
+        `id:${worktreeId}`,
+        "--force",
+        "--json",
+      ]);
+      return undefined;
+    } catch (error) {
+      return (await this.#worktreeEntry(worktreeId)) ? String(error) : undefined;
+    }
+  }
+
+  // Custody must be claimed before #detachWorkerWorktree runs: a detached
+  // worktree reports no branch, so the minted ref would become unreachable.
+  async #claimWorkerBranch(worktreeId: string): Promise<void> {
+    const branch = await this.#workerBranchFor(worktreeId);
+    if (branch) this.#workerBranches.set(worktreeId, branch);
+  }
+
+  // Worker worktrees are detached before use, so their minted branch is
+  // unreferenced once the worktree is gone. Leaving it exhausts Orca's
+  // name-suffix search and later `worktree create` calls fail outright.
+  // Returns a failure description when custody cannot be proven released:
+  // `git branch -D` also exits nonzero for a branch that was never there, so
+  // only a successful probe showing no ref clears the branch.
+  async #deleteWorkerBranch(worktreeId: string): Promise<string | undefined> {
+    const branch = this.#workerBranches.get(worktreeId);
+    if (!branch) return undefined;
+    const deleted = await command("git", ["branch", "-D", branch], this.#cwd, {
+      allowFailure: true,
+    });
+    const probe = await command(
+      "git",
+      ["branch", "--list", branch],
+      this.#cwd,
+      { allowFailure: true },
+    );
+    const detail = `${deleted.stdout}${deleted.stderr}${probe.stderr}`.trim();
+    if (probe.code !== 0)
+      return `could not confirm removal of worker branch ${branch}: ${detail}`;
+    if (probe.stdout.trim())
+      return `worker branch ${branch} outlived its worktree: ${detail}`;
+    this.#workerBranches.delete(worktreeId);
+    return undefined;
+  }
+
   async removeWorktree(worktreeId: string): Promise<void> {
-    await this.#json([
-      "worktree",
-      "rm",
-      "--worktree",
-      `id:${worktreeId}`,
-      "--force",
-      "--json",
-    ]);
+    const failures: string[] = [];
+    const removal = await this.#removeWorktreeIfPresent(worktreeId);
+    if (removal) failures.push(`worktree removal: ${removal}`);
+    // Attempted even when removal failed: a surviving worktree is detached, so
+    // it does not hold the branch, and one that does makes `git branch -D`
+    // refuse, which retains custody for the next attempt.
+    const leaked = await this.#deleteWorkerBranch(worktreeId);
+    if (leaked) failures.push(`worker branch removal: ${leaked}`);
+    if (failures.length > 0)
+      throw new WorkerCleanupError(
+        `worker cleanup failed: ${failures.join("; ")}`,
+      );
   }
 
   async completeTask(taskId: string, report: StageReport): Promise<void> {
@@ -3902,14 +3996,10 @@ export class CliOrca implements OrcaOperations {
       ]);
     }
     if (resources.worktreeId) {
-      await attempt("worktree removal", [
-        "worktree",
-        "rm",
-        "--worktree",
-        `id:${resources.worktreeId}`,
-        "--force",
-        "--json",
-      ]);
+      const removal = await this.#removeWorktreeIfPresent(resources.worktreeId);
+      if (removal) failures.push(`worktree removal: ${removal}`);
+      const leaked = await this.#deleteWorkerBranch(resources.worktreeId);
+      if (leaked) failures.push(`worker branch removal: ${leaked}`);
     }
     if (resources.deliveryId) {
       await attempt("delivery acknowledgement", [
