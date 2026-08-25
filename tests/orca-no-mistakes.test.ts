@@ -6083,6 +6083,9 @@ test("CliOrca launches Kimi interactively and submits its protected task after r
   const fakeOrca = path.join(temp, "orca");
   const callsPath = path.join(temp, "calls.jsonl");
   const previousHome = process.env.HOME;
+  const previousKimiCodeHome = process.env.KIMI_CODE_HOME;
+  const kimiCodeHome = path.join(temp, ".kimi-code");
+  const trustDir = path.join(kimiCodeHome, "workspace-trust");
   const evidence = path.join(
     temp,
     ".orca-no-mistakes",
@@ -6091,6 +6094,7 @@ test("CliOrca launches Kimi interactively and submits its protected task after r
   );
   const reportPath = path.join(evidence, "test.json");
   process.env.HOME = temp;
+  process.env.KIMI_CODE_HOME = kimiCodeHome;
   try {
     await mkdir(evidence, { recursive: true });
     await writeFile(
@@ -6105,6 +6109,18 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
 } else if (args[0] === 'terminal' && args[1] === 'create') {
   out({ terminal: { handle: 'kimi-shell' } })
 } else if (args[0] === 'terminal' && args[1] === 'send') {
+  const text = args[args.indexOf('--text') + 1] || ''
+  if (text.includes("'kimi'")) {
+    const trustDir = ${JSON.stringify(trustDir)}
+    const trusted = fs.existsSync(trustDir) && fs.readdirSync(trustDir).some((name) => {
+      const value = JSON.parse(fs.readFileSync(trustDir + '/' + name, 'utf8'))
+      return value.root === ${JSON.stringify(temp)}
+    })
+    if (!trusted) {
+      process.stderr.write('Kimi workspace was not trusted before startup')
+      process.exit(1)
+    }
+  }
   out({ accepted: true })
 } else if (args[0] === 'terminal' && args[1] === 'show') {
   out({ terminal: { connected: true, lastOutputAt: 1, title: 'Kimi Code', preview: 'Ready' } })
@@ -6162,9 +6178,38 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       /^Read and follow the complete authenticated task in .*prompt-[^ ]+\.txt$/,
     );
     assert.equal(worker.report.summary, "kimi tested");
+    assert.deepEqual(await readdir(trustDir), []);
+
+    await writeFile(path.join(temp, ".mcp.json"), '{"mcpServers":{}}\n');
+    const sendsBeforeBlockedLaunch = sends.length;
+    await assert.rejects(
+      orca.startWorker("task-kimi-mcp", {
+        agent: { harness: "kimi", model: "kimi-k2.5" },
+        name: "kimi-mcp-tester",
+        prompt: "test instructions",
+        reportPath: path.join(evidence, "mcp.json"),
+        role: "reviewer",
+        stage: "test",
+        worktree: "current",
+      }),
+      /Kimi project MCP configuration requires explicit trust/,
+    );
+    const callsAfterBlockedLaunch = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    assert.equal(
+      callsAfterBlockedLaunch.filter(
+        (args) => args[0] === "terminal" && args[1] === "send",
+      ).length,
+      sendsBeforeBlockedLaunch,
+      "Kimi must not start when project MCP configuration requires trust",
+    );
   } finally {
     if (previousHome === undefined) delete process.env.HOME;
     else process.env.HOME = previousHome;
+    if (previousKimiCodeHome === undefined) delete process.env.KIMI_CODE_HOME;
+    else process.env.KIMI_CODE_HOME = previousKimiCodeHome;
     await rm(temp, { recursive: true, force: true });
   }
 });

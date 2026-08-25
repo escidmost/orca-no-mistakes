@@ -2323,15 +2323,26 @@ export class CliOrca implements OrcaOperations {
     }
     let promptPath: string | undefined;
     if (directPreamble) {
+      let kimiTrustPath: string | undefined;
       try {
+        if (harness === "kimi") {
+          kimiTrustPath = await this.#trustKimiWorkspace(
+            prepared.worktreePath ?? this.#cwd,
+          );
+        }
         promptPath = await this.#launchWorkerAgent(
           terminalHandle,
           launch,
           preamble,
           fence,
         );
+        if (kimiTrustPath) {
+          await rm(kimiTrustPath);
+          kimiTrustPath = undefined;
+        }
       } catch (error) {
         if (promptPath) await rm(promptPath, { force: true });
+        if (kimiTrustPath) await rm(kimiTrustPath, { force: true }).catch(() => {});
         await this.#cleanupFailedWorker(
           dispatchId,
           terminalHandle,
@@ -2901,6 +2912,64 @@ export class CliOrca implements OrcaOperations {
     const promptPath = path.join(promptDir, `prompt-${randomUUID()}.txt`);
     await writeFile(promptPath, prompt, { mode: 0o600 });
     return promptPath;
+  }
+
+  async #trustKimiWorkspace(worktreePath: string): Promise<string | undefined> {
+    const workspace = path.resolve(worktreePath);
+    for (const mcpPath of [
+      path.join(workspace, ".mcp.json"),
+      path.join(workspace, ".kimi-code", "mcp.json"),
+    ]) {
+      try {
+        await stat(mcpPath);
+        throw new PreflightError(
+          "unclassified",
+          `Kimi project MCP configuration requires explicit trust: ${mcpPath}`,
+        );
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    }
+
+    const normalized = workspace.replace(/\\/g, "/").replace(/\/+$/, "");
+    const name = path.basename(normalized);
+    const slug =
+      name
+        .toLowerCase()
+        .replace(/[^a-z0-9._-]+/g, "-")
+        .replace(/^-+|-+$/g, "")
+        .slice(0, 40)
+        .replace(/^-+|-+$/g, "") || "workspace";
+    const key = `wd_${slug}_${createHash("sha256").update(normalized).digest("hex").slice(0, 12)}`;
+    const trustPath = path.join(
+      process.env.KIMI_CODE_HOME ?? path.join(homedir(), ".kimi-code"),
+      "workspace-trust",
+      key,
+    );
+    try {
+      const existing: unknown = JSON.parse(await readFile(trustPath, "utf8"));
+      if (
+        existing &&
+        typeof existing === "object" &&
+        (existing as { root?: unknown }).root === normalized
+      ) {
+        return undefined;
+      }
+      throw new Error(`Kimi workspace trust record does not match ${normalized}`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+
+    await mkdir(path.dirname(trustPath), { recursive: true, mode: 0o700 });
+    const tempPath = `${trustPath}.${randomUUID()}.tmp`;
+    await writeFile(
+      tempPath,
+      `${JSON.stringify({ root: normalized, trustedAt: Date.now() })}\n`,
+      { flag: "wx", mode: 0o600 },
+    );
+    await rename(tempPath, trustPath);
+    await chmod(trustPath, 0o600);
+    return trustPath;
   }
 
   async #trustAgyWorkspace(worktreePath: string): Promise<void> {
