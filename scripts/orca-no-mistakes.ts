@@ -2143,6 +2143,8 @@ const WORKER_LOG_MAX_PAGES = 50;
 // How often output is pulled to disk while a worker runs, independent of when
 // the blocking orchestration check happens to return.
 const WORKER_LOG_DRAIN_INTERVAL_MS = 5_000;
+// A capture read is diagnostic and must never outlast the work it records.
+const WORKER_LOG_READ_TIMEOUT_MS = 30_000;
 const NATIVE_WORKER_CREATE_SLACK_MS = 120_000;
 const FISH_SHELL_STARTUP_DELAY_MS = 20_000;
 
@@ -3865,11 +3867,15 @@ export class CliOrca implements OrcaOperations {
     log: StageLog,
     exhaustive = false,
   ): Promise<void> {
-    // Timer-driven and wait-driven drains overlap, so they queue behind each
-    // other: two concurrent drains would interleave appends out of order, and
-    // skipping the second would let finalization miss the tail.
+    // Timer-driven and wait-driven drains overlap. A periodic drain skips when
+    // one is already running -- it would only repeat work, and queueing every
+    // tick behind a slow read builds an unbounded backlog. Finalization must
+    // not skip, so it waits its turn instead.
     const inflight = this.#draining.get(terminalHandle);
-    if (inflight) await inflight.catch(() => {});
+    if (inflight) {
+      if (!exhaustive) return;
+      await inflight.catch(() => {});
+    }
     const run = this.#drainNow(terminalHandle, log, exhaustive);
     this.#draining.set(terminalHandle, run);
     try {
@@ -3909,6 +3915,8 @@ export class CliOrca implements OrcaOperations {
             "--json",
           ],
           true,
+          undefined,
+          WORKER_LOG_READ_TIMEOUT_MS,
         );
         const lines = result.terminal?.tail ?? [];
         const next =
