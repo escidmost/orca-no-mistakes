@@ -5106,7 +5106,9 @@ test("rewritten-history adoption never clobbers a concurrently advanced branch",
 
     const wrapperDir = path.join(temp, "bin");
     const wrapper = path.join(wrapperDir, "git");
-    const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+    const realGit = execFileSync("sh", ["-c", "command -v git"], {
+      encoding: "utf8",
+    }).trim();
     const advancedFlag = path.join(temp, "advanced");
     await mkdir(wrapperDir);
     await writeFile(
