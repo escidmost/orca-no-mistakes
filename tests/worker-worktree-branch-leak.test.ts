@@ -40,6 +40,7 @@ async function seedWorker(
     fakeOrca,
     `#!/usr/bin/env node
 import { execFileSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
 const args = process.argv.slice(2)
 const out = (result) => console.log(JSON.stringify({ result }))
 const repo = ${JSON.stringify(repo)}
@@ -48,12 +49,20 @@ if (args[0] === 'worktree' && args[1] === 'create') {
   execFileSync('git', ['worktree', 'add', '-b', ${JSON.stringify(branch)}, worker], { cwd: repo })
   out({ worktree: { id: ${JSON.stringify(WORKTREE_ID)}, path: worker } })
 } else if (args[0] === 'worktree' && args[1] === 'list') {
-  let branch = ''
-  try {
-    branch = execFileSync('git', ['symbolic-ref', '--quiet', 'HEAD'], { cwd: worker, encoding: 'utf8' }).trim()
-  } catch {}
-  out({ worktrees: [{ id: ${JSON.stringify(WORKTREE_ID)}, branch }] })
+  if (!existsSync(worker)) {
+    out({ worktrees: [] })
+  } else {
+    let branch = ''
+    try {
+      branch = execFileSync('git', ['symbolic-ref', '--quiet', 'HEAD'], { cwd: worker, encoding: 'utf8' }).trim()
+    } catch {}
+    out({ worktrees: [{ id: ${JSON.stringify(WORKTREE_ID)}, branch }] })
+  }
 } else if (args[0] === 'worktree' && args[1] === 'rm') {
+  if (!existsSync(worker)) {
+    console.error('no such worktree')
+    process.exit(1)
+  }
   ${adopts ? `try { execFileSync('git', ['worktree', 'add', ${JSON.stringify(path.join(temp, "pinned"))}, ${JSON.stringify(branch)}], { cwd: repo }) } catch {}` : ''}
   try { execFileSync('git', ['worktree', 'remove', '--force', worker], { cwd: repo }) } catch {}
   out({ ok: true })
@@ -131,6 +140,35 @@ test("an unreadable branch list fails cleanup instead of assuming removal", asyn
     await assert.rejects(
       orca.removeWorktree(WORKTREE_ID),
       /could not confirm removal/,
+    );
+  } finally {
+    await rm(temp, { force: true, recursive: true });
+  }
+});
+
+test("a branch its first release could not free is freed on retry", async () => {
+  const branch = "evs/no-mistakes-review-1-10";
+  const { orca, repo, start, temp } = await seedWorker(
+    "orca-worker-branch-retry-",
+    branch,
+    { adopts: true },
+  );
+  try {
+    await assert.rejects(start());
+    // Another checkout adopted the branch during teardown, so the first
+    // release cannot free it and must keep custody instead of clearing it.
+    await assert.rejects(
+      orca.removeWorktree(WORKTREE_ID),
+      /outlived its worktree/,
+    );
+    git(repo, "worktree", "remove", "--force", path.join(temp, "pinned"));
+    // The worktree is already gone, so removal now errors. Cleanup that
+    // treated that as fatal would skip the branch and leak it permanently.
+    await orca.removeWorktree(WORKTREE_ID);
+    assert.equal(
+      git(repo, "branch", "--list", branch),
+      "",
+      "a retried release must free the branch its first attempt could not",
     );
   } finally {
     await rm(temp, { force: true, recursive: true });

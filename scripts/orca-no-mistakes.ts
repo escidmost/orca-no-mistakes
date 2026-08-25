@@ -3412,14 +3412,39 @@ export class CliOrca implements OrcaOperations {
   // The worktree is the only link back to the branch Orca minted for it, so
   // custody must be resolved before removal — receipts do not carry it on
   // every creation path, and residual worktree IDs carry nothing at all.
-  async #workerBranchFor(worktreeId: string): Promise<string | undefined> {
+  async #worktreeEntry(
+    worktreeId: string,
+  ): Promise<{ branch?: string; id?: string } | undefined> {
     const listed = await this.#json<{
       worktrees?: { branch?: string; id?: string }[];
     }>(["worktree", "list", "--json"]);
-    const branch = listed?.worktrees?.find(
-      (worktree) => worktree.id === worktreeId,
-    )?.branch;
+    return listed?.worktrees?.find((worktree) => worktree.id === worktreeId);
+  }
+
+  async #workerBranchFor(worktreeId: string): Promise<string | undefined> {
+    const branch = (await this.#worktreeEntry(worktreeId))?.branch;
     return branch?.replace(/^refs\/heads\//, "");
+  }
+
+  // Removing a worktree that is already gone is success, not failure: its
+  // branch still needs releasing, and cleanup runs from `finally` blocks that
+  // must converge rather than fail permanently on a retry.
+  async #removeWorktreeIfPresent(
+    worktreeId: string,
+  ): Promise<string | undefined> {
+    try {
+      await this.#json([
+        "worktree",
+        "rm",
+        "--worktree",
+        `id:${worktreeId}`,
+        "--force",
+        "--json",
+      ]);
+      return undefined;
+    } catch (error) {
+      return (await this.#worktreeEntry(worktreeId)) ? String(error) : undefined;
+    }
   }
 
   // Custody must be claimed before #detachWorkerWorktree runs: a detached
@@ -3457,16 +3482,18 @@ export class CliOrca implements OrcaOperations {
   }
 
   async removeWorktree(worktreeId: string): Promise<void> {
-    await this.#json([
-      "worktree",
-      "rm",
-      "--worktree",
-      `id:${worktreeId}`,
-      "--force",
-      "--json",
-    ]);
+    const failures: string[] = [];
+    const removal = await this.#removeWorktreeIfPresent(worktreeId);
+    if (removal) failures.push(`worktree removal: ${removal}`);
+    // Attempted even when removal failed: a surviving worktree is detached, so
+    // it does not hold the branch, and one that does makes `git branch -D`
+    // refuse, which retains custody for the next attempt.
     const leaked = await this.#deleteWorkerBranch(worktreeId);
-    if (leaked) throw new WorkerCleanupError(`worker cleanup failed: ${leaked}`);
+    if (leaked) failures.push(`worker branch removal: ${leaked}`);
+    if (failures.length > 0)
+      throw new WorkerCleanupError(
+        `worker cleanup failed: ${failures.join("; ")}`,
+      );
   }
 
   async completeTask(taskId: string, report: StageReport): Promise<void> {
@@ -3969,14 +3996,8 @@ export class CliOrca implements OrcaOperations {
       ]);
     }
     if (resources.worktreeId) {
-      await attempt("worktree removal", [
-        "worktree",
-        "rm",
-        "--worktree",
-        `id:${resources.worktreeId}`,
-        "--force",
-        "--json",
-      ]);
+      const removal = await this.#removeWorktreeIfPresent(resources.worktreeId);
+      if (removal) failures.push(`worktree removal: ${removal}`);
       const leaked = await this.#deleteWorkerBranch(resources.worktreeId);
       if (leaked) failures.push(`worker branch removal: ${leaked}`);
     }
