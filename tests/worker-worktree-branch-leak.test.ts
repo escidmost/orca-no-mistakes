@@ -1,42 +1,41 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { PreflightError } from "../scripts/adapters.ts";
 import { CliOrca } from "../scripts/orca-no-mistakes.ts";
+
+const WORKTREE_ID = "repo::/worker";
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 }
 
-test("worker worktree teardown deletes the branch Orca minted for it", async () => {
-  const temp = await mkdtemp(path.join(tmpdir(), "orca-worker-branch-"));
+// A worker worktree whose creation succeeds but whose terminal never appears:
+// the prepare-failure path tears the worktree down, which must also release
+// the branch Orca minted for it.
+async function seedWorker(prefix: string, branch: string) {
+  const temp = await mkdtemp(path.join(tmpdir(), prefix));
   const repo = path.join(temp, "repo");
   const fakeOrca = path.join(temp, "orca");
-  const callsPath = path.join(temp, "calls.jsonl");
-  const workerBranch = "evs/no-mistakes-review-1-7";
-  try {
-    git(temp, "-c", "init.templateDir=", "init", "-b", "feature", "repo");
-    git(repo, "config", "user.email", "test@example.com");
-    git(repo, "config", "user.name", "Test User");
-    git(repo, "config", "commit.gpgsign", "false");
-    await writeFile(path.join(repo, "README.md"), "seed\n");
-    git(repo, "add", ".");
-    git(repo, "commit", "-m", "seed");
-    git(repo, "branch", workerBranch);
-
-    await writeFile(
-      fakeOrca,
-      `#!/usr/bin/env node
-import fs from 'node:fs'
+  git(temp, "-c", "init.templateDir=", "init", "-b", "feature", "repo");
+  git(repo, "config", "user.email", "test@example.com");
+  git(repo, "config", "user.name", "Test User");
+  git(repo, "config", "commit.gpgsign", "false");
+  await writeFile(path.join(repo, "README.md"), "seed\n");
+  git(repo, "add", ".");
+  git(repo, "commit", "-m", "seed");
+  await writeFile(
+    fakeOrca,
+    `#!/usr/bin/env node
 const args = process.argv.slice(2)
-fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
 const out = (result) => console.log(JSON.stringify({ result }))
 if (args[0] === 'worktree' && args[1] === 'create') {
-  out({ worktree: { id: 'repo::/worker', path: ${JSON.stringify(path.join(temp, "worker"))}, branch: 'refs/heads/${workerBranch}' } })
+  out({ worktree: { id: ${JSON.stringify(WORKTREE_ID)}, path: ${JSON.stringify(path.join(temp, "worker"))} } })
+} else if (args[0] === 'worktree' && args[1] === 'list') {
+  out({ worktrees: [{ id: ${JSON.stringify(WORKTREE_ID)}, branch: 'refs/heads/${branch}' }] })
 } else if (args[0] === 'terminal' && args[1] === 'list') {
   out({ terminals: [] })
 } else if (args[0] === 'terminal' && args[1] === 'create') {
@@ -45,31 +44,27 @@ if (args[0] === 'worktree' && args[1] === 'create') {
   out({ ok: true })
 }
 `,
-    );
-    await chmod(fakeOrca, 0o755);
+  );
+  await chmod(fakeOrca, 0o755);
+  const start = () =>
+    new CliOrca({ command: fakeOrca, cwd: repo }).startWorker("task-review", {
+      name: "no-mistakes-review-1",
+      prompt: "review",
+      role: "reviewer",
+      stage: "review",
+      worktree: "new-child",
+    });
+  return { repo, start, temp };
+}
 
-    const orca = new CliOrca({ command: fakeOrca, cwd: repo });
-    await assert.rejects(
-      orca.startWorker("task-review", {
-        name: "no-mistakes-review-1",
-        prompt: "review",
-        role: "reviewer",
-        stage: "review",
-        worktree: "new-child",
-      }),
-      (error: unknown) => error instanceof PreflightError,
-    );
-
-    const calls = (await readFile(callsPath, "utf8"))
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line) as string[]);
-    assert.ok(
-      calls.some((args) => args[0] === "worktree" && args[1] === "rm"),
-      "expected the leaked worker worktree to be removed",
-    );
+test("worker worktree teardown deletes the branch Orca minted for it", async () => {
+  const branch = "evs/no-mistakes-review-1-7";
+  const { repo, start, temp } = await seedWorker("orca-worker-branch-", branch);
+  try {
+    git(repo, "branch", branch);
+    await assert.rejects(start());
     assert.equal(
-      git(repo, "branch", "--list", workerBranch),
+      git(repo, "branch", "--list", branch),
       "",
       "worker branch must not outlive its worktree",
     );
@@ -78,54 +73,35 @@ if (args[0] === 'worktree' && args[1] === 'create') {
   }
 });
 
-test("a worker branch that outlives its worktree surfaces as a cleanup failure", async () => {
-  const temp = await mkdtemp(path.join(tmpdir(), "orca-worker-branch-stuck-"));
-  const repo = path.join(temp, "repo");
-  const pinned = path.join(temp, "pinned");
-  const fakeOrca = path.join(temp, "orca");
-  const workerBranch = "evs/no-mistakes-review-1-8";
+test("a worker branch that outlives its worktree fails cleanup", async () => {
+  const branch = "evs/no-mistakes-review-1-8";
+  const { repo, start, temp } = await seedWorker(
+    "orca-worker-branch-stuck-",
+    branch,
+  );
   try {
-    git(temp, "-c", "init.templateDir=", "init", "-b", "feature", "repo");
-    git(repo, "config", "user.email", "test@example.com");
-    git(repo, "config", "user.name", "Test User");
-    git(repo, "config", "commit.gpgsign", "false");
-    await writeFile(path.join(repo, "README.md"), "seed\n");
-    git(repo, "add", ".");
-    git(repo, "commit", "-m", "seed");
     // Checking the branch out elsewhere makes `git branch -D` refuse it, so the
-    // branch genuinely survives its worktree instead of merely being absent.
-    git(repo, "worktree", "add", "-b", workerBranch, pinned);
+    // branch genuinely survives instead of merely being absent.
+    git(repo, "worktree", "add", "-b", branch, path.join(temp, "pinned"));
+    await assert.rejects(start(), /outlived its worktree/);
+  } finally {
+    await rm(temp, { force: true, recursive: true });
+  }
+});
 
-    await writeFile(
-      fakeOrca,
-      `#!/usr/bin/env node
-import fs from 'node:fs'
-const args = process.argv.slice(2)
-const out = (result) => console.log(JSON.stringify({ result }))
-if (args[0] === 'worktree' && args[1] === 'create') {
-  out({ worktree: { id: 'repo::/worker', path: ${JSON.stringify(path.join(temp, "worker"))}, branch: 'refs/heads/${workerBranch}' } })
-} else if (args[0] === 'terminal' && args[1] === 'list') {
-  out({ terminals: [] })
-} else if (args[0] === 'terminal' && args[1] === 'create') {
-  out({})
-} else {
-  out({ ok: true })
-}
-`,
-    );
-    await chmod(fakeOrca, 0o755);
-
-    const orca = new CliOrca({ command: fakeOrca, cwd: repo });
-    await assert.rejects(
-      orca.startWorker("task-review", {
-        name: "no-mistakes-review-1",
-        prompt: "review",
-        role: "reviewer",
-        stage: "review",
-        worktree: "new-child",
-      }),
-      /outlived worktree/,
-    );
+test("an unreadable branch list fails cleanup instead of assuming removal", async () => {
+  const branch = "evs/no-mistakes-review-1-9";
+  const { repo, start, temp } = await seedWorker(
+    "orca-worker-branch-probe-",
+    branch,
+  );
+  try {
+    git(repo, "branch", branch);
+    // Breaks `git branch --list` (exit 128, empty stdout) without hiding the ref.
+    git(repo, "config", "branch.sort", "bogus");
+    // Deletion may well have worked; without a readable probe cleanup cannot
+    // prove it, and an unprovable release is reported rather than assumed.
+    await assert.rejects(start(), /could not confirm removal/);
   } finally {
     await rm(temp, { force: true, recursive: true });
   }
