@@ -2023,6 +2023,7 @@ export function parseGateResolution(
 }
 
 type CommandResult = { code: number; stderr: string; stdout: string };
+type CommandOutput = (chunk: string) => void | Promise<void>;
 
 async function command(
   executable: string,
@@ -2031,6 +2032,7 @@ async function command(
   options: {
     abortSignal?: AbortSignal;
     allowFailure?: boolean;
+    onOutput?: CommandOutput;
     timeoutMs?: number | null;
   } = {},
 ): Promise<CommandResult> {
@@ -2054,40 +2056,56 @@ async function command(
           }, timeoutMs);
     let stdout = "";
     let stderr = "";
+    let outputChain = Promise.resolve();
+    let spawnError: Error | undefined;
+    const capture = (chunk: string, target: "stdout" | "stderr") => {
+      if (target === "stdout") stdout += chunk;
+      else stderr += chunk;
+      if (options.onOutput) {
+        outputChain = outputChain
+          .then(() => options.onOutput!(chunk))
+          .catch(() => {});
+      }
+    };
     child.stdout.setEncoding("utf8").on("data", (chunk: string) => {
-      stdout += chunk;
+      capture(chunk, "stdout");
     });
     child.stderr.setEncoding("utf8").on("data", (chunk: string) => {
-      stderr += chunk;
+      capture(chunk, "stderr");
     });
     child.on("error", (error) => {
-      if (timer) clearTimeout(timer);
-      reject(error);
+      spawnError = error;
     });
     child.on("close", (code) => {
       if (timer) clearTimeout(timer);
-      if (timedOut) {
-        const message = `${executable} ${args.slice(0, 2).join(" ")} timed out after ${timeoutMs}ms`;
-        if (options.allowFailure) {
-          resolve({
-            code: 124,
-            stdout,
-            stderr: `${stderr}${stderr ? "\n" : ""}${message}`,
-          });
-        } else {
-          reject(new Error(message));
+      void outputChain.then(() => {
+        if (spawnError) {
+          reject(spawnError);
+          return;
         }
-        return;
-      }
-      if (code === 0 || options.allowFailure) {
-        resolve({ code: code ?? 1, stdout, stderr });
-      } else {
-        reject(
-          new Error(
-            `${executable} ${args.join(" ")} failed (${code}): ${stderr || stdout}`,
-          ),
-        );
-      }
+        if (timedOut) {
+          const message = `${executable} ${args.slice(0, 2).join(" ")} timed out after ${timeoutMs}ms`;
+          if (options.allowFailure) {
+            resolve({
+              code: 124,
+              stdout,
+              stderr: `${stderr}${stderr ? "\n" : ""}${message}`,
+            });
+          } else {
+            reject(new Error(message));
+          }
+          return;
+        }
+        if (code === 0 || options.allowFailure) {
+          resolve({ code: code ?? 1, stdout, stderr });
+        } else {
+          reject(
+            new Error(
+              `${executable} ${args.join(" ")} failed (${code}): ${stderr || stdout}`,
+            ),
+          );
+        }
+      });
     });
   });
 }
@@ -3342,11 +3360,13 @@ export class CliOrca implements OrcaOperations {
         target,
         timeoutMs: agent.timeoutMs,
       });
-      let result: { code: number; stderr: string; stdout: string };
+      const log = launch.logPath ? new StageLog(launch.logPath) : undefined;
+      let result: { code: number; stderr: string; stdout: string } | undefined;
       try {
         result = await command(this.#acpxCommand, invocation.args, cwd, {
           allowFailure: true,
           abortSignal: fence?.signal,
+          onOutput: log ? (chunk) => log.append(chunk) : undefined,
           timeoutMs: agent.timeoutMs ?? WORKER_IDLE_TIMEOUT_MS,
         });
       } catch (error) {
@@ -3357,17 +3377,17 @@ export class CliOrca implements OrcaOperations {
           `acp target ${target} could not start: ${String(error)}`,
           { cause: error },
         );
-      }
-      if (launch.logPath) {
-        try {
-          const log = new StageLog(launch.logPath);
-          await log.append(`${result.stdout}${result.stderr}`);
-          await log.close();
-        } catch (error) {
-          console.error(
-            `warning: could not capture acp worker output: ${String(error)}`,
-          );
+      } finally {
+        if (log) {
+          await log.close().catch((error) => {
+            console.error(
+              `warning: could not capture acp worker output: ${String(error)}`,
+            );
+          });
         }
+      }
+      if (result === undefined) {
+        throw new Error(`acp target ${target} produced no result`);
       }
       if (fence?.aborted) {
         throw new Error(`${launch.stage} worker attempt was cancelled`);

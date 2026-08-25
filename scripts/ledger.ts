@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdirSync, readFileSync } from 'node:fs'
 import { O_APPEND, O_CREAT, O_NOFOLLOW, O_RDWR } from 'node:constants'
-import { chmod, lstat, mkdir, open } from 'node:fs/promises'
+import { chmod, lstat, mkdir, open, realpath } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -169,8 +169,55 @@ export function verifyManifest(manifest: PassedAttestationManifest): void {
 }
 
 export const MAX_LOG_BYTES = 50 * 1024 * 1024
-const TRUNCATION_MARKER_PATTERN =
-  /^\n\[no-mistakes: log truncated; dropped (\d+) bytes; original bytes (\d+); retained ranges ([^\]]+)\]\n/
+const LOG_MARKER_RESERVE_BYTES = 512
+
+function redactKnownSecrets(content: string): string {
+  let redacted = content
+  const secrets = Object.entries(process.env)
+    .flatMap(([name, value]) =>
+      value && value.length >= 8 &&
+      /(?:access[_-]?key|api[_-]?key|auth|credential|password|secret|token)/i.test(name)
+        ? [value]
+        : [],
+    )
+    .sort((left, right) => right.length - left.length)
+  for (const secret of secrets) redacted = redacted.split(secret).join('[REDACTED]')
+  return redacted
+}
+
+async function rejectSymlinkPath(rootPath: string, targetPath = rootPath): Promise<void> {
+  const root = path.resolve(rootPath)
+  const target = path.resolve(targetPath)
+  const relative = path.relative(root, target)
+  if (relative.startsWith('..') || path.isAbsolute(relative)) {
+    throw new Error('stage log path escapes artifact root')
+  }
+  try {
+    if ((await lstat(root)).isSymbolicLink()) {
+      throw new Error('stage log path must not contain symlinks')
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    return
+  }
+  let current = root
+  for (const component of relative.split(path.sep).filter(Boolean)) {
+    current = path.join(current, component)
+    try {
+      if ((await lstat(current)).isSymbolicLink()) {
+        throw new Error('stage log path must not contain symlinks')
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      break
+    }
+  }
+}
+
+function isWithin(root: string, target: string): boolean {
+  const relative = path.relative(path.resolve(root), path.resolve(target))
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))
+}
 
 export function capLog(content: string, maxBytes = MAX_LOG_BYTES): string {
   const source = Buffer.from(content, 'utf8')
@@ -187,9 +234,8 @@ export function capLog(content: string, maxBytes = MAX_LOG_BYTES): string {
  * diagnostics; once the head budget is spent the tail is retained in memory and
  * flushed by `close`, so the middle is what a runaway worker loses.
  *
- * The budget belongs to the file, not the instance: the workers of one stage
- * round open it in turn, and each reads what is already there so their combined
- * output still lands under `maxBytes`.
+ * The budget belongs to the file, not the instance: workers of one stage round
+ * append to the same bounded artifact without rewriting prior output.
  */
 export class StageLog {
   readonly #path: string
@@ -203,6 +249,7 @@ export class StageLog {
   #tailKeep = 0
   #file?: Awaited<ReturnType<typeof open>>
   #originalBytes = 0
+  #originalBytesKnown = true
   #hasNewOutput = false
 
   constructor(filePath: string, maxBytes = MAX_LOG_BYTES) {
@@ -212,9 +259,9 @@ export class StageLog {
   }
 
   async append(chunk: string): Promise<void> {
-    await this.#start()
-    let pending = Buffer.from(chunk, 'utf8')
+    let pending = Buffer.from(redactKnownSecrets(chunk), 'utf8')
     if (pending.length === 0) return
+    await this.#start()
     this.#originalBytes += pending.length
     this.#hasNewOutput = true
     if (this.#headBytes < this.#keep) {
@@ -240,9 +287,19 @@ export class StageLog {
     try {
       if (!this.#hasNewOutput) return
       await this.#start()
+      let marker: Buffer | undefined
       if (this.#dropped > 0) {
-        await this.#write(this.#truncationMarker())
+        this.#trimTail(Math.max(0, this.#maxBytes - this.#headBytes - LOG_MARKER_RESERVE_BYTES))
+        marker = Buffer.from(this.#truncationMarker(), 'utf8')
+        this.#trimTail(Math.max(0, this.#maxBytes - this.#headBytes - marker.length))
+        marker = Buffer.from(this.#truncationMarker(), 'utf8')
+        if (marker.length <= this.#maxBytes - this.#headBytes) {
+          await this.#write(marker)
+        } else {
+          marker = undefined
+        }
       }
+      this.#trimTail(Math.max(0, this.#maxBytes - this.#headBytes - (marker?.length ?? 0)))
       if (this.#tail.length > 0) {
         await this.#write(Buffer.concat(this.#tail))
       }
@@ -256,54 +313,44 @@ export class StageLog {
 
   async #start(): Promise<void> {
     if (this.#started) return
-    const directory = path.dirname(this.#path)
+    const logPath = path.resolve(this.#path)
+    const directory = path.dirname(logPath)
+    const artifactRoot = path.dirname(directory)
+    await rejectSymlinkPath(artifactRoot)
     await mkdir(directory, { recursive: true, mode: 0o700 })
-    if ((await lstat(directory)).isSymbolicLink()) {
-      throw new Error('stage log directory must not contain symlinks')
+    await rejectSymlinkPath(artifactRoot, directory)
+    const [canonicalRoot, canonicalDirectory] = await Promise.all([
+      realpath(artifactRoot),
+      realpath(directory),
+    ])
+    const canonicalLog = await realpath(logPath).catch((error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return path.join(canonicalDirectory, path.basename(logPath))
+      }
+      throw error
+    })
+    if (!isWithin(canonicalRoot, canonicalLog)) {
+      throw new Error('stage log path escapes artifact root')
     }
     await chmod(directory, 0o700)
     const file = await open(
-      this.#path,
+      logPath,
       O_APPEND | O_CREAT | O_RDWR | O_NOFOLLOW,
       0o600,
     )
     try {
-      const existing = await file.readFile()
-      const headBytes = Math.min(existing.length, this.#keep)
-      const afterHead = existing.subarray(headBytes)
-      const priorMatch = afterHead
-        .toString('utf8')
-        .match(TRUNCATION_MARKER_PATTERN)
-      const priorOriginal = priorMatch ? Number(priorMatch[2]) : 0
-      const priorDropped = priorMatch ? Number(priorMatch[1]) : 0
-      const markerBytes = priorMatch ? Buffer.byteLength(priorMatch[0]) : 0
-      const tailBytes = afterHead.length - markerBytes
-      const ranges = priorMatch?.[3].split(', ') ?? []
-      const expectedRanges = [
-        ...(headBytes > 0 ? [`0-${headBytes - 1}`] : []),
-        ...(tailBytes > 0
-          ? [`${priorOriginal - tailBytes}-${priorOriginal - 1}`]
-          : []),
-      ]
-      const prior =
-        priorMatch &&
-        Number.isSafeInteger(priorOriginal) &&
-        Number.isSafeInteger(priorDropped) &&
-        priorOriginal >= headBytes + tailBytes &&
-        priorDropped === priorOriginal - headBytes - tailBytes &&
-        ranges.join(', ') === expectedRanges.join(', ')
-          ? priorMatch
-          : undefined
+      const existingBytes = (await file.stat()).size
+      if (existingBytes > this.#maxBytes) {
+        throw new Error('stage log already exceeds its byte cap')
+      }
       await file.chmod(0o600)
-      this.#originalBytes = prior ? priorOriginal : existing.length
-      this.#dropped = Math.max(0, this.#originalBytes - headBytes)
-      await file.truncate(headBytes)
+      this.#originalBytesKnown = existingBytes === 0
       this.#file = file
       this.#started = true
-      this.#headBytes = headBytes
+      this.#headBytes = existingBytes
       this.#tailKeep = Math.max(
         0,
-        Math.min(this.#keep, this.#maxBytes - headBytes - 512),
+        Math.min(this.#keep, this.#maxBytes - existingBytes - LOG_MARKER_RESERVE_BYTES),
       )
     } catch (error) {
       await file.close()
@@ -312,15 +359,27 @@ export class StageLog {
   }
 
   #truncationMarker(): string {
-    const headBytes = Math.min(this.#originalBytes, this.#keep)
+    const headBytes = this.#originalBytesKnown
+      ? Math.min(this.#originalBytes, this.#keep)
+      : this.#headBytes
     const ranges = []
     if (headBytes > 0) ranges.push(`0-${headBytes - 1}`)
     if (this.#tailBytes > 0) {
-      ranges.push(
-        `${this.#originalBytes - this.#tailBytes}-${this.#originalBytes - 1}`,
-      )
+      ranges.push(`${headBytes}-${headBytes + this.#tailBytes - 1}`)
     }
-    return `\n[no-mistakes: log truncated; dropped ${this.#dropped} bytes; original bytes ${this.#originalBytes}; retained ranges ${ranges.join(", ") || "none"}]\n`
+    const originalBytes = this.#originalBytesKnown ? String(this.#originalBytes) : 'unknown'
+    return `\n[no-mistakes: log truncated; dropped ${this.#dropped} bytes; original bytes ${originalBytes}; retained ranges ${ranges.join(", ") || "none"}]\n`
+  }
+
+  #trimTail(limit: number): void {
+    while (this.#tailBytes > limit) {
+      const oldest = this.#tail[0]!
+      const cut = Math.min(oldest.length, this.#tailBytes - limit)
+      if (cut === oldest.length) this.#tail.shift()
+      else this.#tail[0] = oldest.subarray(cut)
+      this.#tailBytes -= cut
+      this.#dropped += cut
+    }
   }
 
   async #write(data: string | Buffer): Promise<void> {

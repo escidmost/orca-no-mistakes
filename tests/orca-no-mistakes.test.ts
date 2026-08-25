@@ -7296,6 +7296,7 @@ test("CliOrca extracts acp reports wrapped in closed JSON fences", async () => {
   const fakeAcpx = path.join(temp, "acpx");
   const fakeOrca = path.join(temp, "orca");
   const worktreePath = path.join(temp, "acp-fence-wt");
+  const logPath = path.join(temp, "acp-fence.log");
   try {
     git(temp, "init", "-b", "feature");
     await mkdir(worktreePath);
@@ -7303,7 +7304,11 @@ test("CliOrca extracts acp reports wrapped in closed JSON fences", async () => {
       fakeAcpx,
       `#!/usr/bin/env node
 const fence = ${JSON.stringify("```")}
-console.log('Review notes:\\n' + fence + 'json\\n' + JSON.stringify({ findings: [], summary: 'fenced done' }) + '\\n' + fence)
+process.stdout.write('stdout-first\\n')
+setTimeout(() => {
+  process.stderr.write('stderr-second\\n')
+  process.stdout.write('Review notes:\\n' + fence + 'json\\n' + JSON.stringify({ findings: [], summary: 'fenced done' }) + '\\n' + fence + '\\n')
+}, 10)
 `,
     );
     await chmod(fakeAcpx, 0o755);
@@ -7328,6 +7333,7 @@ if (args[0] === 'worktree' && args[1] === 'create') {
     });
     const worker = await orca.startWorker("task-acp-fence", {
       agent: { harness: "acp:gemini-dev" },
+      logPath,
       name: "acp-worker",
       prompt: "Review now.",
       role: "reviewer",
@@ -7335,6 +7341,10 @@ if (args[0] === 'worktree' && args[1] === 'create') {
       worktree: "new-child",
     });
     assert.equal(worker.report.summary, "fenced done");
+    assert.equal(
+      await readFile(logPath, "utf8"),
+      "stdout-first\nstderr-second\nReview notes:\n```json\n{\"findings\":[],\"summary\":\"fenced done\"}\n```\n",
+    );
     await orca.finishWorker(worker, "release");
   } finally {
     await rm(temp, { recursive: true, force: true });
@@ -7730,12 +7740,13 @@ test("acp runner timeouts stay execution-phase failures", async () => {
   const fakeAcpx = path.join(temp, "acpx");
   const fakeOrca = path.join(temp, "orca");
   const worktreePath = path.join(temp, "acp-wt");
+  const logPath = path.join(temp, "acp-timeout.log");
   try {
     git(temp, "init", "-b", "feature");
     await mkdir(worktreePath);
     await writeFile(
       fakeAcpx,
-      "#!/usr/bin/env node\nsetTimeout(() => {}, 60000)\n",
+      "#!/usr/bin/env node\nprocess.stdout.write('before-timeout\\n')\nprocess.stderr.write('stderr-before-timeout\\n')\nsetTimeout(() => {}, 60000)\n",
     );
     await chmod(fakeAcpx, 0o755);
     await writeFile(
@@ -7754,6 +7765,7 @@ out({ worktree: { id: 'wt-timeout', path: ${JSON.stringify(worktreePath)} } })
     await assert.rejects(
       orca.startWorker("task-acp", {
         agent: { harness: "acp:gemini-dev", timeoutMs: 100 },
+        logPath,
         name: "acp-worker",
         prompt: "Review now.",
         role: "reviewer",
@@ -7765,6 +7777,10 @@ out({ worktree: { id: 'wt-timeout', path: ${JSON.stringify(worktreePath)} } })
         assert.match((error as Error).message, /exit 124/);
         return true;
       },
+    );
+    assert.equal(
+      await readFile(logPath, "utf8"),
+      "before-timeout\nstderr-before-timeout\n",
     );
   } finally {
     await rm(temp, { recursive: true, force: true });
@@ -8285,17 +8301,18 @@ test("StageLog rejects symlinked log paths", async () => {
 test("StageLog rejects symlinked artifact directories", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-parent-symlink-"));
   try {
-    const outside = path.join(temp, "outside");
-    const directory = path.join(temp, "artifacts");
+    const outside = path.join(temp, "repository");
+    const artifacts = path.join(temp, "artifacts");
+    const directory = path.join(artifacts, "run");
     const logPath = path.join(directory, "review_r0.log");
     await mkdir(outside, { recursive: true });
-    await symlink(outside, directory);
+    await symlink(outside, artifacts);
 
     await assert.rejects(
       new StageLog(logPath, 2_048).append("must not escape\n"),
       /symlink/i,
     );
-    await assert.rejects(stat(path.join(outside, "review_r0.log")), /ENOENT/);
+    await assert.rejects(stat(path.join(outside, "run", "review_r0.log")), /ENOENT/);
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
@@ -8312,6 +8329,11 @@ test("StageLog leaves a complete log unmarked", async () => {
     const written = await readFile(logPath, "utf8");
     assert.equal(written, "everything fits\n");
     assert.ok(!written.includes("truncated"));
+
+    const reopened = new StageLog(logPath, 2_048);
+    await reopened.append("next worker\n");
+    await reopened.close();
+    assert.equal(await readFile(logPath, "utf8"), "everything fits\nnext worker\n");
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
@@ -8382,10 +8404,29 @@ test("StageLog holds every worker of a round to one shared cap", async () => {
     assert.ok(Buffer.byteLength(written) <= 2_048);
     // The first worker still owns the head, so the round reads in order.
     assert.ok(written.startsWith("aaa"));
-    assert.ok(written.endsWith("t".repeat(768)));
-    assert.match(written, /original bytes 40000/);
-    assert.match(written, /retained ranges 0-767, 39232-39999/);
+    assert.ok(written.includes("[no-mistakes: log truncated;"));
+    assert.doesNotMatch(written, /original bytes 40000/);
   } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("StageLog redacts known credentials before persistence", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-redaction-"));
+  const previous = process.env.ONM_TEST_TOKEN;
+  const secret = "known-worker-token-123";
+  process.env.ONM_TEST_TOKEN = secret;
+  try {
+    const logPath = path.join(temp, "review_r0.log");
+    const log = new StageLog(logPath, 2_048);
+    await log.append(`worker printed ${secret}\n`);
+    await log.close();
+    const written = await readFile(logPath, "utf8");
+    assert.doesNotMatch(written, new RegExp(secret));
+    assert.match(written, /\[REDACTED\]/);
+  } finally {
+    if (previous === undefined) delete process.env.ONM_TEST_TOKEN;
+    else process.env.ONM_TEST_TOKEN = previous;
     await rm(temp, { recursive: true, force: true });
   }
 });
