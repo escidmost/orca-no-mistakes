@@ -8468,6 +8468,28 @@ test("StageLog will not append through a hard link to another file", async () =>
   }
 });
 
+test("StageLog refreshes the marker when a compacted round gets more output", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-refresh-"));
+  try {
+    const logPath = path.join(temp, "review_r0.log");
+    const first = new StageLog(logPath, 2_048);
+    await first.append("h".repeat(3_000));
+    await first.close();
+    const second = new StageLog(logPath, 2_048);
+    await second.append("later\n");
+    await second.close();
+    const written = await readFile(logPath, "utf8");
+    // The file is back under the cap, so nothing forces a recompaction -- but
+    // the marker from the first worker would still describe its tail and its
+    // byte total, neither of which is true any more.
+    assert.ok(written.endsWith("later\n"));
+    assert.match(written, /original bytes 3006/);
+    assert.doesNotMatch(written, /original bytes 3000/);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test("StageLog repairs an over-cap log left by an interrupted run", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-repair-"));
   try {

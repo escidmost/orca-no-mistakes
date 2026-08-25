@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdirSync, readFileSync } from 'node:fs'
-import { O_APPEND, O_CREAT, O_NOFOLLOW, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY } from 'node:constants'
-import { chmod, lstat, mkdir, open, realpath, rename } from 'node:fs/promises'
+import { O_APPEND, O_CREAT, O_EXCL, O_NOFOLLOW, O_RDONLY, O_RDWR, O_WRONLY } from 'node:constants'
+import { chmod, lstat, mkdir, open, realpath, rename, rm } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -299,6 +299,7 @@ export class StageLog {
   #started = false
   #file?: Awaited<ReturnType<typeof open>>
   #hasNewOutput = false
+  #compacted = false
 
   constructor(filePath: string, maxBytes = MAX_LOG_BYTES) {
     this.#path = filePath
@@ -331,6 +332,7 @@ export class StageLog {
       // A silent instance never opens the log, so a worker that printed
       // nothing cannot disturb what the round already recorded.
       if (!this.#hasNewOutput) return
+      if (this.#compacted) await this.#compact()
       await this.#recordOriginalBytes()
     } finally {
       const file = this.#file
@@ -357,6 +359,32 @@ export class StageLog {
    * every byte, and the bytes are sliced positionally -- nothing in the file is
    * parsed, so worker output cannot influence the result.
    */
+  /**
+   * Replaces a file with fresh content through a staging file and a rename.
+   *
+   * The staging path is unlinked and created exclusively rather than
+   * truncated: a worker that pre-creates it as a hard link to a tracked file
+   * would otherwise have that inode truncated by the open itself, before any
+   * check could reject it. Unlinking only drops the planted name.
+   */
+  async #replaceFile(targetPath: string, parts: Buffer[]): Promise<void> {
+    const stagingPath = `${targetPath}.staging`
+    await rm(stagingPath, { force: true })
+    const staging = await open(
+      stagingPath,
+      O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW,
+      0o600,
+    )
+    try {
+      await assertPrivateRegularFile(staging)
+      for (const part of parts) await staging.writeFile(part)
+      await staging.sync()
+    } finally {
+      await staging.close()
+    }
+    await rename(stagingPath, targetPath)
+  }
+
   async #compact(): Promise<void> {
     const file = this.#file
     if (!file) return
@@ -374,20 +402,7 @@ export class StageLog {
     // the live artifact first would mean a crash mid-rewrite destroys the head
     // and tail that were already durable; a rename leaves either the whole old
     // file or the whole new one.
-    const stagingPath = `${path.resolve(this.#path)}.compacting`
-    const staging = await open(
-      stagingPath,
-      O_CREAT | O_WRONLY | O_TRUNC | O_NOFOLLOW,
-      0o600,
-    )
-    try {
-      await assertPrivateRegularFile(staging)
-      for (const part of parts) await staging.writeFile(part)
-      await staging.sync()
-    } finally {
-      await staging.close()
-    }
-    await rename(stagingPath, path.resolve(this.#path))
+    await this.#replaceFile(path.resolve(this.#path), parts)
 
     // The handle still refers to the replaced inode, so reopen on the new one.
     await file.close()
@@ -399,6 +414,7 @@ export class StageLog {
     await assertPrivateRegularFile(reopened)
     this.#file = reopened
     this.#fileBytes = parts.reduce((total, part) => total + part.length, 0)
+    this.#compacted = true
   }
 
   async #start(): Promise<void> {
@@ -430,6 +446,10 @@ export class StageLog {
       const prior = await this.#priorOriginalBytes()
       this.#originalBytesKnown = existingBytes === 0 || prior !== undefined
       this.#originalBytes = prior ?? existingBytes
+    // A prior total larger than the file means the round already compacted:
+    // its marker describes the old tail, so close() has to rewrite it even
+    // though the physical file is back under the cap.
+    this.#compacted = prior !== undefined && prior > existingBytes
       this.#fileBytes = existingBytes
       this.#file = file
       this.#started = true
@@ -479,24 +499,16 @@ export class StageLog {
     if (!this.#originalBytesKnown) return
     // O_NOFOLLOW so a symlink planted at the sidecar path cannot redirect this
     // write onto an arbitrary file, matching how the log itself is opened.
-    let file
     try {
-      file = await open(
-        this.#metaPath(),
-        O_CREAT | O_WRONLY | O_TRUNC | O_NOFOLLOW,
-        0o600,
-      )
+      await this.#replaceFile(this.#metaPath(), [
+        Buffer.from(String(this.#originalBytes), 'utf8'),
+      ])
     } catch (error) {
-      // A symlink planted at the sidecar path costs the round its byte total,
-      // which the marker then reports as unknown. The transcript itself is
-      // worth more than the counter, so this never fails the log.
+      // A symlink or foreign inode planted at the sidecar path costs the round
+      // its byte total, which the marker then reports as unknown. The
+      // transcript is worth more than the counter, so this never fails the log.
       if ((error as NodeJS.ErrnoException).code === 'ELOOP') return
       throw error
-    }
-    try {
-      await file.writeFile(String(this.#originalBytes))
-    } finally {
-      await file.close()
     }
   }
 

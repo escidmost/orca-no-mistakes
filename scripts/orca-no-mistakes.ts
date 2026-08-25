@@ -3469,11 +3469,15 @@ export class CliOrca implements OrcaOperations {
     worker: WorkerResult,
     disposition: "release" | "retain",
   ): Promise<void> {
-    if (disposition === "release" && worker.terminalHandle) {
-      // Capture stays attached until the terminal actually goes away, so
-      // output emitted after worker_done -- a command finishing, a TUI
-      // settling -- is still recorded.
+    if (worker.terminalHandle) {
+      // Capture stays attached until the worker is done, so output emitted
+      // after worker_done -- a command finishing, a TUI settling -- is still
+      // recorded. A retained worker releases its log too: its terminal and
+      // read cursor survive for the next round, but two open logs on one
+      // round file would race each other's compaction and byte totals.
       await this.#releaseStageLog(worker.terminalHandle);
+    }
+    if (disposition === "release" && worker.terminalHandle) {
       await this.#json([
         "terminal",
         "close",
