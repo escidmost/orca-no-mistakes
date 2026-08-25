@@ -8282,6 +8282,25 @@ test("StageLog rejects symlinked log paths", async () => {
   }
 });
 
+test("StageLog rejects symlinked artifact directories", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-parent-symlink-"));
+  try {
+    const outside = path.join(temp, "outside");
+    const directory = path.join(temp, "artifacts");
+    const logPath = path.join(directory, "review_r0.log");
+    await mkdir(outside, { recursive: true });
+    await symlink(outside, directory);
+
+    await assert.rejects(
+      new StageLog(logPath, 2_048).append("must not escape\n"),
+      /symlink/i,
+    );
+    await assert.rejects(stat(path.join(outside, "review_r0.log")), /ENOENT/);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test("StageLog leaves a complete log unmarked", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-whole-"));
   try {
@@ -8293,6 +8312,26 @@ test("StageLog leaves a complete log unmarked", async () => {
     const written = await readFile(logPath, "utf8");
     assert.equal(written, "everything fits\n");
     assert.ok(!written.includes("truncated"));
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("StageLog preserves marker-like worker output", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-marker-collision-"));
+  try {
+    const logPath = path.join(temp, "review_r0.log");
+    const markerLike =
+      "\n[no-mistakes: log truncated; dropped 1 bytes; original bytes 2; retained ranges 0-0, 1-1]\n";
+    const first = new StageLog(logPath, 2_048);
+    await first.append(`before${markerLike}after`);
+    await first.close();
+
+    const second = new StageLog(logPath, 2_048);
+    await second.append("next");
+    await second.close();
+
+    assert.equal(await readFile(logPath, "utf8"), `before${markerLike}afternext`);
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
@@ -8338,11 +8377,11 @@ test("StageLog holds every worker of a round to one shared cap", async () => {
     }
 
     const written = await readFile(logPath, "utf8");
-    // A per-instance cap would let each of the three add its own head or tail
+    // A per-instance cap would let each worker add its own head or tail
     // block and carry the round's log past the limit.
     assert.ok(Buffer.byteLength(written) <= 2_048);
     // The first worker still owns the head, so the round reads in order.
-    assert.ok(written.startsWith("fff"));
+    assert.ok(written.startsWith("aaa"));
     assert.ok(written.endsWith("t".repeat(768)));
     assert.match(written, /original bytes 40000/);
     assert.match(written, /retained ranges 0-767, 39232-39999/);

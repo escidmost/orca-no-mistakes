@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdirSync, readFileSync } from 'node:fs'
 import { O_APPEND, O_CREAT, O_NOFOLLOW, O_RDWR } from 'node:constants'
-import { chmod, mkdir, open } from 'node:fs/promises'
+import { chmod, lstat, mkdir, open } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -170,7 +170,7 @@ export function verifyManifest(manifest: PassedAttestationManifest): void {
 
 export const MAX_LOG_BYTES = 50 * 1024 * 1024
 const TRUNCATION_MARKER_PATTERN =
-  /\n\[no-mistakes: log truncated; dropped (\d+) bytes; original bytes (\d+); retained ranges [^\]]+\]\n/g
+  /^\n\[no-mistakes: log truncated; dropped (\d+) bytes; original bytes (\d+); retained ranges ([^\]]+)\]\n/
 
 export function capLog(content: string, maxBytes = MAX_LOG_BYTES): string {
   const source = Buffer.from(content, 'utf8')
@@ -258,6 +258,9 @@ export class StageLog {
     if (this.#started) return
     const directory = path.dirname(this.#path)
     await mkdir(directory, { recursive: true, mode: 0o700 })
+    if ((await lstat(directory)).isSymbolicLink()) {
+      throw new Error('stage log directory must not contain symlinks')
+    }
     await chmod(directory, 0o700)
     const file = await open(
       this.#path,
@@ -266,13 +269,33 @@ export class StageLog {
     )
     try {
       const existing = await file.readFile()
-      const existingText = existing.toString('utf8')
-      const prior = [...existingText.matchAll(TRUNCATION_MARKER_PATTERN)].at(-1)
-      const headBytes = prior
-        ? Buffer.byteLength(existingText.slice(0, prior.index ?? 0))
-        : Math.min(existing.length, this.#keep)
+      const headBytes = Math.min(existing.length, this.#keep)
+      const afterHead = existing.subarray(headBytes)
+      const priorMatch = afterHead
+        .toString('utf8')
+        .match(TRUNCATION_MARKER_PATTERN)
+      const priorOriginal = priorMatch ? Number(priorMatch[2]) : 0
+      const priorDropped = priorMatch ? Number(priorMatch[1]) : 0
+      const markerBytes = priorMatch ? Buffer.byteLength(priorMatch[0]) : 0
+      const tailBytes = afterHead.length - markerBytes
+      const ranges = priorMatch?.[3].split(', ') ?? []
+      const expectedRanges = [
+        ...(headBytes > 0 ? [`0-${headBytes - 1}`] : []),
+        ...(tailBytes > 0
+          ? [`${priorOriginal - tailBytes}-${priorOriginal - 1}`]
+          : []),
+      ]
+      const prior =
+        priorMatch &&
+        Number.isSafeInteger(priorOriginal) &&
+        Number.isSafeInteger(priorDropped) &&
+        priorOriginal >= headBytes + tailBytes &&
+        priorDropped === priorOriginal - headBytes - tailBytes &&
+        ranges.join(', ') === expectedRanges.join(', ')
+          ? priorMatch
+          : undefined
       await file.chmod(0o600)
-      this.#originalBytes = prior ? Number(prior[2]) : existing.length
+      this.#originalBytes = prior ? priorOriginal : existing.length
       this.#dropped = Math.max(0, this.#originalBytes - headBytes)
       await file.truncate(headBytes)
       this.#file = file
