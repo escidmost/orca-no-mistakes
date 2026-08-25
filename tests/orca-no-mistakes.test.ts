@@ -8328,7 +8328,10 @@ test("StageLog holds every worker of a round to one shared cap", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-share-"));
   try {
     const logPath = path.join(temp, "review_r1.log");
-    for (const worker of ["f", "r", "s"]) {
+    const workers = Array.from({ length: 20 }, (_, index) =>
+      String.fromCharCode(97 + index),
+    );
+    for (const worker of workers) {
       const log = new StageLog(logPath, 2_048);
       await log.append(worker.repeat(2_000));
       await log.close();
@@ -8340,7 +8343,9 @@ test("StageLog holds every worker of a round to one shared cap", async () => {
     assert.ok(Buffer.byteLength(written) <= 2_048);
     // The first worker still owns the head, so the round reads in order.
     assert.ok(written.startsWith("fff"));
-    assert.match(written, /original bytes 6000/);
+    assert.ok(written.endsWith("t".repeat(768)));
+    assert.match(written, /original bytes 40000/);
+    assert.match(written, /retained ranges 0-767, 39232-39999/);
   } finally {
     await rm(temp, { recursive: true, force: true });
   }

@@ -170,7 +170,7 @@ export function verifyManifest(manifest: PassedAttestationManifest): void {
 
 export const MAX_LOG_BYTES = 50 * 1024 * 1024
 const TRUNCATION_MARKER_PATTERN =
-  /\[no-mistakes: log truncated; dropped (\d+) bytes; original bytes (\d+); retained ranges [^\]]+\]/g
+  /\n\[no-mistakes: log truncated; dropped (\d+) bytes; original bytes (\d+); retained ranges [^\]]+\]\n/g
 
 export function capLog(content: string, maxBytes = MAX_LOG_BYTES): string {
   const source = Buffer.from(content, 'utf8')
@@ -265,17 +265,22 @@ export class StageLog {
       0o600,
     )
     try {
-      const existing = (await file.stat()).size
+      const existing = await file.readFile()
+      const existingText = existing.toString('utf8')
+      const prior = [...existingText.matchAll(TRUNCATION_MARKER_PATTERN)].at(-1)
+      const headBytes = prior
+        ? Buffer.byteLength(existingText.slice(0, prior.index ?? 0))
+        : Math.min(existing.length, this.#keep)
       await file.chmod(0o600)
-      const prior = [...(await file.readFile('utf8')).matchAll(TRUNCATION_MARKER_PATTERN)].at(-1)
-      this.#originalBytes = prior ? Number(prior[2]) : existing
-      this.#dropped = prior ? Number(prior[1]) : 0
+      this.#originalBytes = prior ? Number(prior[2]) : existing.length
+      this.#dropped = Math.max(0, this.#originalBytes - headBytes)
+      await file.truncate(headBytes)
       this.#file = file
       this.#started = true
-      this.#headBytes = existing
+      this.#headBytes = headBytes
       this.#tailKeep = Math.max(
         0,
-        Math.min(this.#keep, this.#maxBytes - existing - 512),
+        Math.min(this.#keep, this.#maxBytes - headBytes - 512),
       )
     } catch (error) {
       await file.close()
