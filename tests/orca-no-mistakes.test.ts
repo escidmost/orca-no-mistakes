@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   chmod,
+  link,
   mkdir,
   mkdtemp,
   readdir,
@@ -8442,6 +8443,46 @@ test("StageLog leaves the round's log alone when a worker is silent", async () =
     const silent = new StageLog(logPath, 2_048);
     await silent.close();
     assert.equal(await readFile(logPath, "utf8"), before);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("StageLog will not append through a hard link to another file", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-link-"));
+  try {
+    const tracked = path.join(temp, "tracked.ts");
+    await writeFile(tracked, "source\n");
+    const logPath = path.join(temp, "review_r0.log");
+    // O_NOFOLLOW rejects a symlink but opens a hard link happily, and the
+    // opened inode would then be appended to, chmod'd and truncated.
+    await link(tracked, logPath);
+    const log = new StageLog(logPath, 2_048);
+    await assert.rejects(
+      log.append("worker output\n").then(() => log.close()),
+      /private regular file/,
+    );
+    assert.equal(await readFile(tracked, "utf8"), "source\n");
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("StageLog repairs an over-cap log left by an interrupted run", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-repair-"));
+  try {
+    const logPath = path.join(temp, "review_r0.log");
+    await writeFile(logPath, `${"a".repeat(3_000)}${"z".repeat(3_000)}`);
+    const log = new StageLog(logPath, 2_048);
+    await log.append("more\n");
+    await log.close();
+    const written = await readFile(logPath, "utf8");
+    // Reopening repairs the artifact instead of refusing it: the head and the
+    // latest tail survive, and the file is back under its cap.
+    assert.ok(Buffer.byteLength(written) <= 2_048);
+    assert.ok(written.startsWith("aaa"));
+    assert.ok(written.endsWith("more\n"));
+    assert.match(written, /log truncated/);
   } finally {
     await rm(temp, { recursive: true, force: true });
   }

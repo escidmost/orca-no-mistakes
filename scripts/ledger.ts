@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdirSync, readFileSync } from 'node:fs'
 import { O_APPEND, O_CREAT, O_NOFOLLOW, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY } from 'node:constants'
-import { chmod, lstat, mkdir, open, realpath } from 'node:fs/promises'
+import { chmod, lstat, mkdir, open, realpath, rename } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -224,6 +224,20 @@ function pendingSecretPrefix(text: string, secrets: string[]): number {
  * again after creating the directory when the whole chain is present. The log
  * file itself is left to `O_NOFOLLOW` on open.
  */
+/**
+ * O_NOFOLLOW rejects a symlink but happily opens a hard link to a tracked file,
+ * so an inode reached that way would be appended to, chmod'd, or truncated.
+ * A stage artifact is always a fresh, singly linked regular file.
+ */
+async function assertPrivateRegularFile(
+  file: Awaited<ReturnType<typeof open>>,
+): Promise<void> {
+  const info = await file.stat()
+  if (!info.isFile() || info.nlink !== 1) {
+    throw new Error('stage log path must be a private regular file')
+  }
+}
+
 async function assertNoSymlinkChain(rootPath: string, targetPath: string): Promise<void> {
   const root = path.resolve(rootPath)
   const target = path.resolve(targetPath)
@@ -263,12 +277,16 @@ export function capLog(content: string, maxBytes = MAX_LOG_BYTES): string {
 /**
  * Appends streamed stage output to one capped log file outside the repository.
  *
- * The head is written straight to disk so a crashed run still keeps its opening
- * diagnostics; once the head budget is spent the tail is retained in memory and
- * flushed by `close`, so the middle is what a runaway worker loses.
+ * Every chunk is written as it arrives, so a coordinator that dies mid-run
+ * leaves the transcript up to that point on disk. Only once the file exceeds
+ * its cap is it rewritten as head, truncation marker and tail -- through a
+ * staging file and a rename, so an interrupted compaction leaves either the
+ * whole old log or the whole capped one. The middle is what a runaway worker
+ * loses.
  *
- * The budget belongs to the file, not the instance: workers of one stage round
- * append to the same bounded artifact without rewriting prior output.
+ * The budget belongs to the file, not the instance: the workers of one stage
+ * round share a single bounded artifact, and a round whose combined output
+ * still fits keeps every byte of it.
  */
 export class StageLog {
   readonly #path: string
@@ -350,14 +368,37 @@ export class StageLog {
     const head = existing.subarray(0, this.#keep)
     const tail = existing.subarray(Math.max(head.length, existing.length - this.#keep))
     const marker = Buffer.from(this.#truncationMarker(head.length, tail.length), 'utf8')
-    await file.truncate(0)
-    this.#fileBytes = 0
-    for (const part of [head, marker, tail]) {
-      if (part.length > 0) {
-        await this.#write(part)
-        this.#fileBytes += part.length
-      }
+    const parts = [head, marker, tail].filter((part) => part.length > 0)
+
+    // Build the capped form beside the log and rename it into place. Truncating
+    // the live artifact first would mean a crash mid-rewrite destroys the head
+    // and tail that were already durable; a rename leaves either the whole old
+    // file or the whole new one.
+    const stagingPath = `${path.resolve(this.#path)}.compacting`
+    const staging = await open(
+      stagingPath,
+      O_CREAT | O_WRONLY | O_TRUNC | O_NOFOLLOW,
+      0o600,
+    )
+    try {
+      await assertPrivateRegularFile(staging)
+      for (const part of parts) await staging.writeFile(part)
+      await staging.sync()
+    } finally {
+      await staging.close()
     }
+    await rename(stagingPath, path.resolve(this.#path))
+
+    // The handle still refers to the replaced inode, so reopen on the new one.
+    await file.close()
+    const reopened = await open(
+      path.resolve(this.#path),
+      O_APPEND | O_CREAT | O_RDWR | O_NOFOLLOW,
+      0o600,
+    )
+    await assertPrivateRegularFile(reopened)
+    this.#file = reopened
+    this.#fileBytes = parts.reduce((total, part) => total + part.length, 0)
   }
 
   async #start(): Promise<void> {
@@ -379,10 +420,8 @@ export class StageLog {
     await chmod(directory, 0o700)
     const file = await open(logPath, O_APPEND | O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
     try {
-      const existingBytes = (await file.stat()).size
-      if (existingBytes > this.#maxBytes) {
-        throw new Error('stage log already exceeds its byte cap')
-      }
+      await assertPrivateRegularFile(file)
+      let existingBytes = (await file.stat()).size
       await file.chmod(0o600)
       // The first `keep` bytes are the round's head and never change; whatever
       // follows is the previous worker's marker and tail, which this worker's
@@ -394,6 +433,13 @@ export class StageLog {
       this.#fileBytes = existingBytes
       this.#file = file
       this.#started = true
+      // A crash during compaction can leave the artifact over its cap. Repair
+      // it here rather than refusing to open, so an interrupted run neither
+      // loses its transcript nor keeps growing past the bound.
+      if (existingBytes > this.#maxBytes) {
+        await this.#compact()
+        existingBytes = this.#fileBytes
+      }
     } catch (error) {
       await file.close()
       throw error

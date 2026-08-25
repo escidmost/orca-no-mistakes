@@ -2145,6 +2145,8 @@ const WORKER_LOG_MAX_PAGES = 50;
 const WORKER_LOG_DRAIN_INTERVAL_MS = 5_000;
 // A capture read is diagnostic and must never outlast the work it records.
 const WORKER_LOG_READ_TIMEOUT_MS = 30_000;
+// Grace period after worker_done for a final response or TUI repaint to land.
+const WORKER_LOG_SETTLE_MS = 750;
 const NATIVE_WORKER_CREATE_SLACK_MS = 120_000;
 const FISH_SHELL_STARTUP_DELAY_MS = 20_000;
 
@@ -2313,7 +2315,7 @@ export class CliOrca implements OrcaOperations {
         "unclassified",
         "worker preparation returned no terminal handle",
       );
-    this.#bindStageLog(terminalHandle, launch);
+    await this.#bindStageLog(terminalHandle, launch);
     if (fence?.aborted) {
       await this.#cleanupPreparedWorker(prepared);
       throw new Error(`${launch.stage} worker attempt was cancelled`);
@@ -2470,7 +2472,7 @@ export class CliOrca implements OrcaOperations {
     const terminalHandle = launch.terminal!;
     // Bound before worker-start so a retained preflight failure still records
     // whatever the reused terminal had to say.
-    this.#bindStageLog(terminalHandle, launch);
+    await this.#bindStageLog(terminalHandle, launch);
     const worktreeId = launch.retainedWorktreeId;
     if (!worktreeId) {
       throw new PreflightError(
@@ -2656,6 +2658,10 @@ export class CliOrca implements OrcaOperations {
         receipt.worker?.terminalHandle ??
         receipt.dispatch?.terminalHandle ??
         "";
+      // Bind before the checks below: this path closes the receipt's terminal
+      // in its own catch, so launch and readiness diagnostics from a failed
+      // native candidate would otherwise be gone before any drain could run.
+      if (terminalHandle) await this.#bindStageLog(terminalHandle, launch);
       worktreeId = receipt.worktree?.id ?? receipt.worker?.worktreeId;
       const worktreePath =
         receipt.worktree?.path ?? receipt.worker?.worktreePath;
@@ -2845,7 +2851,7 @@ export class CliOrca implements OrcaOperations {
           "unclassified",
           "terminal create returned an invalid receipt",
         );
-      this.#bindStageLog(terminalHandle, launch);
+      await this.#bindStageLog(terminalHandle, launch);
 
       if (!launchesWithPreamble(launch.agent?.harness.toLowerCase()))
         await this.#launchWorkerAgent(terminalHandle, launch, undefined, fence);
@@ -2888,7 +2894,7 @@ export class CliOrca implements OrcaOperations {
         );
       if (fence?.aborted)
         throw new Error(`${launch.stage} worker attempt was cancelled`);
-      this.#bindStageLog(prepared.terminalHandle, launch);
+      await this.#bindStageLog(prepared.terminalHandle, launch);
       if (!launchesWithPreamble(launch.agent?.harness.toLowerCase()))
         await this.#launchWorkerAgent(
           prepared.terminalHandle,
@@ -3807,7 +3813,7 @@ export class CliOrca implements OrcaOperations {
     failedOutcome?: boolean;
     report?: StageReport;
   }> {
-    const log = this.#bindStageLog(terminalHandle, launch);
+    const log = await this.#bindStageLog(terminalHandle, launch);
     return await this.#awaitWorkerReport(
         taskId,
         dispatchId,
@@ -3825,18 +3831,19 @@ export class CliOrca implements OrcaOperations {
    *  prompt launch — so a readiness or preflight failure and a coordinator
    *  crash both still leave whatever the worker printed. StageLog opens lazily,
    *  so binding early costs nothing when the worker never speaks. */
-  #bindStageLog(
+  async #bindStageLog(
     terminalHandle: string,
     launch: WorkerLaunch,
-  ): StageLog | undefined {
+  ): Promise<StageLog | undefined> {
     if (!launch.logPath) return undefined;
     const bound = this.#terminalLogs.get(terminalHandle);
     if (bound) {
       if (bound.path === launch.logPath) return bound.log;
-      // A retained terminal moving to the next round: close out the previous
-      // round's log before capture points at the new one, so its trailing
-      // output is not consumed into the next round's file.
-      void this.#releaseStageLog(terminalHandle);
+      // A retained terminal moving to the next round: the previous round's log
+      // must finish draining before the next one binds. Racing them would let
+      // the old exhaustive drain swallow new-round output and advance the
+      // shared cursor past it, so the new log would never see it.
+      await this.#releaseStageLog(terminalHandle);
     }
     const log = new StageLog(launch.logPath);
     // Draining starts here, not when the coordinator begins waiting for a
@@ -3861,6 +3868,13 @@ export class CliOrca implements OrcaOperations {
     clearInterval(bound.ticker);
     // Output is stable now, so take everything rather than stopping at the
     // live-drain page ceiling: what is left is the final tail.
+    await this.#drainWorkerLog(terminalHandle, bound.log, true);
+    // worker_done can arrive while the agent is still printing its closing
+    // response or the TUI is settling. One short pause and a second pass costs
+    // a moment per worker and catches what lands in that window.
+    await new Promise((resolve) =>
+      setTimeout(resolve, WORKER_LOG_SETTLE_MS),
+    );
     await this.#drainWorkerLog(terminalHandle, bound.log, true);
     await bound.log.close().catch(() => {});
   }
