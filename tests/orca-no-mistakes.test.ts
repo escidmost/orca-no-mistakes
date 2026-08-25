@@ -9160,3 +9160,23 @@ test("stage evidence binds effective policy provenance into artifacts and the le
   assert.match(evidenceShape, /effective_policy_hash TEXT/);
   assert.match(evidenceShape, /base_ref_sha TEXT/);
 });
+
+test("a gate resolution outside the offered options fails closed", async () => {
+  const git = new FakeGit();
+  git.rebaseConflicts = ["src/a.ts"];
+  const orca = new FakeOrca(git);
+  orca.gateResolution = "approve";
+  const ledger = new DomainLedger(":memory:");
+
+  await assert.rejects(
+    runPipeline({ intent: "Waive a rebase conflict." }, orca, git, ledger),
+    /gate resolution selected "approve", which was not offered \(fix, stop\)/,
+  );
+
+  assert.deepEqual(orca.gates[0].options, ["fix", "stop"]);
+  const runId = ledger.listRuns()[0].run_id;
+  const audits = ledger.listGateAudit(runId);
+  assert.equal(audits.length, 1);
+  assert.equal(audits[0].decision, "approve");
+  assert.equal(ledger.runStatus(runId), "failed");
+});

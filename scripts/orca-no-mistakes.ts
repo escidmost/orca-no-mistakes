@@ -618,6 +618,14 @@ export async function runPipeline(
             runId,
             stageId: stage,
           });
+          if (
+            decision.action !== "unknown" &&
+            !gateOptions.includes(decision.action)
+          ) {
+            throw new Error(
+              `${stage} gate resolution selected "${decision.action}", which was not offered (${gateOptions.join(", ")}): ${resolution}`,
+            );
+          }
           if (decision.action === "approve" || decision.action === "skip") {
             const waived = latestEntryByStage.get(stage);
             if (waived && !waived.waiverOrApproval) {
