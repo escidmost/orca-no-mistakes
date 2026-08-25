@@ -31,9 +31,11 @@ test("quote-split workspace validation paths remain protected", async () => {
   try {
     await mkdir(path.join(repo, ".github/workflows"), { recursive: true });
     await mkdir(path.join(repo, "scripts"));
-    git(repo, "init", "-b", "feature");
+    git(repo, "-c", "init.templateDir=", "init", "-b", "feature");
     git(repo, "config", "user.email", "test@example.com");
     git(repo, "config", "user.name", "Test User");
+    git(repo, "config", "core.hooksPath", "/dev/null");
+    git(repo, "config", "commit.gpgsign", "false");
     await writeFile(
       path.join(repo, ".github/workflows/ci.yml"),
       `steps:
@@ -92,7 +94,9 @@ test("each rebase attempt records its reported upstream", async () => {
       };
     },
     async assertClean() {},
-    async assertFixerChangesAllowed() {},
+    async assertFixerChangesAllowed() {
+      return true;
+    },
     async head() {
       return head;
     },

@@ -128,6 +128,19 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
     `'claude' '--model' 'opus[1m]' '--effort' 'high' '--dangerously-skip-permissions'`
   )
   assert.equal(
+    buildCliCommand('claude', {
+      agentArgsOverride: { Claude: ['--verbose'] } as never,
+    }),
+    `'claude' '--dangerously-skip-permissions' '--verbose'`
+  )
+  assert.throws(
+    () =>
+      buildCliCommand('claude', {
+        agentArgsOverride: { claude: ['--one'], Claude: ['--two'] } as never,
+      }),
+    /duplicate harness keys 'claude' and 'Claude'/
+  )
+  assert.equal(
     buildCliCommand('Codex', { effort: 'max', model: 'gpt-5.6-luna' }),
     `'codex' '--model' 'gpt-5.6-luna' '-c' 'model_reasoning_effort="max"' '--dangerously-bypass-approvals-and-sandbox'`
   )

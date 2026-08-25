@@ -204,12 +204,31 @@ export type CliAgentCommandOptions = AgentProfile & {
   variant?: string
 }
 
+function agentArgsOverrideForHarness(
+  overrides: AgentArgsOverride | undefined,
+  harness: string
+): AgentArgsOverride[string] | undefined {
+  let match: AgentArgsOverride[string] | undefined
+  const keys = new Map<string, string>()
+  for (const [key, value] of Object.entries(overrides ?? {})) {
+    const normalizedKey = key.toLowerCase()
+    const existing = keys.get(normalizedKey)
+    if (existing) {
+      throw new Error(
+        `agent_args_override contains duplicate harness keys '${existing}' and '${key}'`
+      )
+    }
+    keys.set(normalizedKey, key)
+    if (normalizedKey === harness.toLowerCase()) match = value
+  }
+  return match
+}
+
 export function buildCliCommand(harness: string, options: CliAgentCommandOptions = {}): string {
   const normalizedHarness = normalizeKnownHarness(harness)
   const env: string[] = []
   const parts: string[] = [normalizedHarness]
-  const override =
-    options.agentArgsOverride?.[normalizedHarness] ?? options.agentArgsOverride?.[harness]
+  const override = agentArgsOverrideForHarness(options.agentArgsOverride, normalizedHarness)
   if (override && !Array.isArray(override)) {
     for (const [key, value] of Object.entries(override)) {
       if (!ENV_NAME_PATTERN.test(key)) {

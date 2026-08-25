@@ -20,9 +20,11 @@ function quote(value: string): string {
 }
 
 async function initialize(repo: string): Promise<void> {
-  git(path.dirname(repo), "init", "-b", "feature", repo);
+  git(path.dirname(repo), "-c", "init.templateDir=", "init", "-b", "feature", repo);
   git(repo, "config", "user.email", "test@example.com");
   git(repo, "config", "user.name", "Test User");
+  git(repo, "config", "core.hooksPath", "/dev/null");
+  git(repo, "config", "commit.gpgsign", "false");
 }
 
 test("validation policy references are protected transitively", async () => {
@@ -86,7 +88,9 @@ test("custody preserves edits started during transfer", async () => {
 
     const wrapperDir = path.join(temp, "bin");
     const wrapper = path.join(wrapperDir, "git");
-    const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+    const realGit = execFileSync("sh", ["-c", "command -v git"], {
+      encoding: "utf8",
+    }).trim();
     await mkdir(wrapperDir);
     await writeFile(
       wrapper,
