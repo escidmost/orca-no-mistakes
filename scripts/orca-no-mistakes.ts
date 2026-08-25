@@ -2140,6 +2140,9 @@ const WORKER_IDLE_TIMEOUT_MS = 1_800_000;
 // one drain from monopolising the poll loop when a worker floods its terminal.
 const WORKER_LOG_READ_LIMIT = 2_000;
 const WORKER_LOG_MAX_PAGES = 50;
+// How often output is pulled to disk while a worker runs, independent of when
+// the blocking orchestration check happens to return.
+const WORKER_LOG_DRAIN_INTERVAL_MS = 5_000;
 const NATIVE_WORKER_CREATE_SLACK_MS = 120_000;
 const FISH_SHELL_STARTUP_DELAY_MS = 20_000;
 
@@ -2193,6 +2196,9 @@ export class CliOrca implements OrcaOperations {
   // Terminal handle -> the stage log bound to it, created the moment the
   // terminal exists so capture outlives a failed launch.
   readonly #terminalLogs = new Map<string, StageLog>();
+  // Terminal handle -> the drain currently running for it, so overlapping
+  // drains serialize instead of interleaving their appends.
+  readonly #draining = new Map<string, Promise<void>>();
   // Worktree ID -> the branch Orca minted for it, claimed at creation.
   readonly #workerBranches = new Map<string, string>();
   #runId?: string;
@@ -2457,6 +2463,9 @@ export class CliOrca implements OrcaOperations {
     fence?: TimeoutFence,
   ): Promise<WorkerResult> {
     const terminalHandle = launch.terminal!;
+    // Bound before worker-start so a retained preflight failure still records
+    // whatever the reused terminal had to say.
+    this.#bindStageLog(terminalHandle, launch);
     const worktreeId = launch.retainedWorktreeId;
     if (!worktreeId) {
       throw new PreflightError(
@@ -2831,6 +2840,7 @@ export class CliOrca implements OrcaOperations {
           "unclassified",
           "terminal create returned an invalid receipt",
         );
+      this.#bindStageLog(terminalHandle, launch);
 
       if (!launchesWithPreamble(launch.agent?.harness.toLowerCase()))
         await this.#launchWorkerAgent(terminalHandle, launch, undefined, fence);
@@ -2873,6 +2883,7 @@ export class CliOrca implements OrcaOperations {
         );
       if (fence?.aborted)
         throw new Error(`${launch.stage} worker attempt was cancelled`);
+      this.#bindStageLog(prepared.terminalHandle, launch);
       if (!launchesWithPreamble(launch.agent?.harness.toLowerCase()))
         await this.#launchWorkerAgent(
           prepared.terminalHandle,
@@ -3788,6 +3799,16 @@ export class CliOrca implements OrcaOperations {
     report?: StageReport;
   }> {
     const log = this.#bindStageLog(terminalHandle, launch);
+    // The orchestration check below blocks for as long as 900s. Draining only
+    // when it returns makes this periodic collection, not a stream: anything
+    // printed inside that window would be lost if the coordinator died. A timer
+    // keeps the transcript landing on disk regardless of delivery timing.
+    const ticker = log
+      ? setInterval(() => {
+          void this.#drainWorkerLog(terminalHandle, log);
+        }, WORKER_LOG_DRAIN_INTERVAL_MS)
+      : undefined;
+    ticker?.unref();
     try {
       return await this.#awaitWorkerReport(
         taskId,
@@ -3798,6 +3819,7 @@ export class CliOrca implements OrcaOperations {
         fence,
       );
     } finally {
+      if (ticker) clearInterval(ticker);
       // The terminal is still open here; after this the caller closes it and
       // whatever was not drained is gone for good.
       await this.#releaseStageLog(terminalHandle);
@@ -3831,13 +3853,42 @@ export class CliOrca implements OrcaOperations {
     const log = this.#terminalLogs.get(terminalHandle);
     if (!log) return;
     this.#terminalLogs.delete(terminalHandle);
-    await this.#drainWorkerLog(terminalHandle, log);
+    // Output is stable now that the worker is done, so take everything rather
+    // than stopping at the live-drain page ceiling: what is left at the end is
+    // the final tail the cap exists to preserve.
+    await this.#drainWorkerLog(terminalHandle, log, true);
     await log.close().catch(() => {});
   }
 
-  async #drainWorkerLog(terminalHandle: string, log: StageLog): Promise<void> {
+  async #drainWorkerLog(
+    terminalHandle: string,
+    log: StageLog,
+    exhaustive = false,
+  ): Promise<void> {
+    // Timer-driven and wait-driven drains overlap, so they queue behind each
+    // other: two concurrent drains would interleave appends out of order, and
+    // skipping the second would let finalization miss the tail.
+    const inflight = this.#draining.get(terminalHandle);
+    if (inflight) await inflight.catch(() => {});
+    const run = this.#drainNow(terminalHandle, log, exhaustive);
+    this.#draining.set(terminalHandle, run);
     try {
-      for (let page = 0; page < WORKER_LOG_MAX_PAGES; page += 1) {
+      await run;
+    } finally {
+      if (this.#draining.get(terminalHandle) === run) {
+        this.#draining.delete(terminalHandle);
+      }
+    }
+  }
+
+  async #drainNow(
+    terminalHandle: string,
+    log: StageLog,
+    exhaustive: boolean,
+  ): Promise<void> {
+    const maxPages = exhaustive ? WORKER_LOG_MAX_PAGES * 40 : WORKER_LOG_MAX_PAGES;
+    try {
+      for (let page = 0; page < maxPages; page += 1) {
         const cursor = this.#terminalCursors.get(terminalHandle);
         const result = await this.#json<{
           terminal?: {

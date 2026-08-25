@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdirSync, readFileSync } from 'node:fs'
-import { O_APPEND, O_CREAT, O_NOFOLLOW, O_RDWR } from 'node:constants'
-import { chmod, lstat, mkdir, open, readFile, realpath, writeFile } from 'node:fs/promises'
+import { O_APPEND, O_CREAT, O_NOFOLLOW, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY } from 'node:constants'
+import { chmod, lstat, mkdir, open, realpath } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -313,10 +313,11 @@ export class StageLog {
         await this.#start()
         await this.#absorb(redactKnownSecrets(carried))
       }
-      // Always open, even with nothing to write: a launch that produced no
-      // output should leave an empty transcript rather than no evidence at all.
-      await this.#start()
+      // A silent instance must not open the log. #start truncates a shared
+      // round log back to its head, so opening here would discard the previous
+      // worker's tail and marker on behalf of a worker that wrote nothing.
       if (!this.#hasNewOutput) return
+      await this.#start()
       let marker: Buffer | undefined
       if (this.#droppedBytes() > 0) {
         this.#trimTail(
@@ -414,18 +415,48 @@ export class StageLog {
    * worker-writable, and a worker could forge its own truncation accounting.
    */
   async #priorOriginalBytes(): Promise<number | undefined> {
+    let file
     try {
-      const parsed = Number.parseInt((await readFile(this.#metaPath(), 'utf8')).trim(), 10)
-      return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined
+      file = await open(this.#metaPath(), O_RDONLY | O_NOFOLLOW)
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+      const code = (error as NodeJS.ErrnoException).code
+      // ELOOP means something replaced the sidecar with a symlink. Treat a
+      // tampered count as absent rather than trusting it.
+      if (code === 'ENOENT' || code === 'ELOOP') return undefined
       throw error
+    }
+    try {
+      if (!(await file.stat()).isFile()) return undefined
+      const parsed = Number.parseInt((await file.readFile('utf8')).trim(), 10)
+      return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined
+    } finally {
+      await file.close()
     }
   }
 
   async #recordOriginalBytes(): Promise<void> {
     if (!this.#originalBytesKnown) return
-    await writeFile(this.#metaPath(), String(this.#originalBytes), { mode: 0o600 })
+    // O_NOFOLLOW so a symlink planted at the sidecar path cannot redirect this
+    // write onto an arbitrary file, matching how the log itself is opened.
+    let file
+    try {
+      file = await open(
+        this.#metaPath(),
+        O_CREAT | O_WRONLY | O_TRUNC | O_NOFOLLOW,
+        0o600,
+      )
+    } catch (error) {
+      // A symlink planted at the sidecar path costs the round its byte total,
+      // which the marker then reports as unknown. The transcript itself is
+      // worth more than the counter, so this never fails the log.
+      if ((error as NodeJS.ErrnoException).code === 'ELOOP') return
+      throw error
+    }
+    try {
+      await file.writeFile(String(this.#originalBytes))
+    } finally {
+      await file.close()
+    }
   }
 
   #droppedBytes(): number {

@@ -8427,6 +8427,43 @@ test("StageLog holds every worker of a round to one shared cap", async () => {
   }
 });
 
+test("StageLog leaves the round's log alone when a worker is silent", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-silent-"));
+  try {
+    const logPath = path.join(temp, "review_r0.log");
+    const first = new StageLog(logPath, 2_048);
+    await first.append("w".repeat(3_000));
+    await first.close();
+    const before = await readFile(logPath, "utf8");
+
+    // Reopening truncates back to the head to make room for a new tail, so a
+    // worker that printed nothing must not open the log at all -- otherwise it
+    // discards the previous worker's tail and truncation marker on its way out.
+    const silent = new StageLog(logPath, 2_048);
+    await silent.close();
+    assert.equal(await readFile(logPath, "utf8"), before);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("StageLog will not write byte totals through a symlinked sidecar", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-meta-"));
+  try {
+    const logPath = path.join(temp, "review_r0.log");
+    const outside = path.join(temp, "outside.txt");
+    await writeFile(outside, "untouched");
+    await symlink(outside, `${logPath}.meta`);
+    const log = new StageLog(logPath, 2_048);
+    await log.append("hello\n");
+    await log.close();
+    assert.equal(await readFile(outside, "utf8"), "untouched");
+    assert.equal(await readFile(logPath, "utf8"), "hello\n");
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test("StageLog redacts a credential split across two appends", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-split-"));
   const previous = process.env.ONM_TEST_TOKEN;
