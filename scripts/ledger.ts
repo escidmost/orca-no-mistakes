@@ -256,7 +256,28 @@ export function verifyManifest(manifest: PassedAttestationManifest): void {
   if (!Array.isArray(manifest.stageEvidence)) {
     throw new Error('attestation stage evidence is not an array')
   }
-  for (const entry of manifest.stageEvidence) {
+  for (const [index, entry] of manifest.stageEvidence.entries()) {
+    if (
+      !entry ||
+      typeof entry !== 'object' ||
+      typeof entry.stage !== 'string' ||
+      entry.stage.trim() === '' ||
+      !Number.isInteger(entry.round) ||
+      entry.round < 0 ||
+      typeof entry.candidateCommitOid !== 'string' ||
+      typeof entry.baseCommitOid !== 'string' ||
+      !COMMIT_OID.test(entry.candidateCommitOid) ||
+      !COMMIT_OID.test(entry.baseCommitOid) ||
+      typeof entry.workerIdentity !== 'string' ||
+      entry.workerIdentity.trim() === '' ||
+      !Number.isInteger(entry.exitCode) ||
+      typeof entry.artifactSha256 !== 'string' ||
+      typeof entry.evidenceSha256 !== 'string' ||
+      typeof entry.summary !== 'string' ||
+      entry.summary.trim() === ''
+    ) {
+      throw new Error(`attestation stage evidence entry ${index} has invalid required fields`)
+    }
     if (!HEX_64.test(entry.evidenceSha256)) {
       throw new Error(`stage ${entry.stage} evidence hash is not a SHA-256`)
     }
