@@ -2136,6 +2136,11 @@ function acpReportFrom(parsed: unknown): StageReport | undefined {
 
 const DEFAULT_WORKER_AGENT = "opencode";
 const WORKER_IDLE_TIMEOUT_MS = 1_800_000;
+// Overridable so the watchdog can be exercised without waiting half an hour.
+function workerIdleTimeoutMs(): number {
+  const raw = Number(process.env.WORKER_IDLE_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : WORKER_IDLE_TIMEOUT_MS;
+}
 // Terminal rows requested per stage-log drain, and the page ceiling that stops
 // one drain from monopolising the poll loop when a worker floods its terminal.
 const WORKER_LOG_READ_LIMIT = 2_000;
@@ -2143,6 +2148,11 @@ const WORKER_LOG_MAX_PAGES = 50;
 // How often output is pulled to disk while a worker runs, independent of when
 // the blocking orchestration check happens to return.
 const WORKER_LOG_DRAIN_INTERVAL_MS = 5_000;
+// How often the worker watchdog samples terminal activity, independent of
+// whether the orchestration delivery channel is still answering.
+function workerWatchdogIntervalMs(): number {
+  return Math.max(50, Math.min(60_000, Math.floor(workerIdleTimeoutMs() / 4)));
+}
 // A capture read is diagnostic and must never outlast the work it records.
 const WORKER_LOG_READ_TIMEOUT_MS = 30_000;
 // Grace period after worker_done for a final response or TUI repaint to land.
@@ -3823,14 +3833,47 @@ export class CliOrca implements OrcaOperations {
     report?: StageReport;
   }> {
     const log = await this.#bindStageLog(terminalHandle, launch);
-    return await this.#awaitWorkerReport(
-        taskId,
-        dispatchId,
-        terminalHandle,
-        launch,
-      log,
-      fence,
-    );
+    let watchdog: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        this.#awaitWorkerReport(
+          taskId,
+          dispatchId,
+          terminalHandle,
+          launch,
+          log,
+          fence,
+        ),
+        // The inactivity check inside the wait loop only runs when a delivery
+        // or keepalive returns, so a delivery channel that goes quiet takes
+        // the whole run with it -- a coordinator sitting at zero CPU for
+        // hours with its worker long finished. This watchdog samples the
+        // terminal on its own clock, so it fails the attempt whether the
+        // silence is the worker's or the channel's.
+        new Promise<{ error?: string }>((resolve) => {
+          let idleSince = Date.now();
+          let lastOutputAt: number | undefined;
+          watchdog = setInterval(() => {
+            void this.#workerOutputAt(terminalHandle)
+              .then((outputAt) => {
+                if (outputAt !== lastOutputAt) {
+                  lastOutputAt = outputAt;
+                  idleSince = Date.now();
+                  return;
+                }
+                if (Date.now() - idleSince < workerIdleTimeoutMs()) return;
+                resolve({
+                  error: `worker ${dispatchId} produced no output for ${workerIdleTimeoutMs()}ms`,
+                });
+              })
+              .catch(() => {});
+          }, workerWatchdogIntervalMs());
+          watchdog.unref();
+        }),
+      ]);
+    } finally {
+      if (watchdog) clearInterval(watchdog);
+    }
   }
 
   /** Appends new terminal output to the run's stage log. Capturing a worker's
@@ -4108,10 +4151,10 @@ export class CliOrca implements OrcaOperations {
           lastActivityAt = Date.now();
           if (log) await this.#drainWorkerLog(terminalHandle, log);
         }
-        if (Date.now() - lastActivityAt >= WORKER_IDLE_TIMEOUT_MS) {
+        if (Date.now() - lastActivityAt >= workerIdleTimeoutMs()) {
           return {
             deliveryId: result.deliveryId,
-            error: `worker ${dispatchId} was inactive for ${WORKER_IDLE_TIMEOUT_MS}ms`,
+            error: `worker ${dispatchId} was inactive for ${workerIdleTimeoutMs()}ms`,
           };
         }
         await new Promise((resolve) => setTimeout(resolve, 250));

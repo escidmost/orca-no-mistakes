@@ -6940,6 +6940,60 @@ function isolateHomes(temp: string): () => void {
   };
 }
 
+test("a silent delivery channel fails the worker instead of hanging the run", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-worker-watchdog-"));
+  const fakeOrca = path.join(temp, "orca");
+  const restoreHomes = isolateHomes(temp);
+  const previousIdle = process.env.WORKER_IDLE_TIMEOUT_MS;
+  process.env.WORKER_IDLE_TIMEOUT_MS = "600";
+  try {
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+const args = process.argv.slice(2)
+const out = (result) => console.log(JSON.stringify({ result }))
+if (args[0] === 'orchestration' && args[1] === 'run-create') {
+  out({ run: { id: 'watchdog-run' } })
+} else if (args[0] === 'terminal' && args[1] === 'create') {
+  out({ terminal: { handle: 'worker-terminal' } })
+} else if (args[0] === 'terminal' && args[1] === 'read') {
+  out({ terminal: { tail: [], oldestCursor: 0, nextCursor: 0, latestCursor: 0 } })
+} else if (args[0] === 'terminal' && args[1] === 'show') {
+  // The terminal never produces anything new, so activity never advances.
+  out({ terminal: { connected: true, title: 'OpenCode', preview: 'ready', lastOutputAt: 1, worktreeId: 'worker-worktree' } })
+} else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
+  out({ dispatch: { id: 'dispatch-1', status: 'dispatched' }, injected: true, preamble: 'authenticated' })
+} else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
+  // The delivery channel goes silent: no keepalive, no heartbeat, no answer.
+  // Nothing inside the wait loop can notice, because the loop never ticks.
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 4000)
+  out({ _keepalive: true })
+} else {
+  out({ ok: true })
+}
+`,
+    );
+    await chmod(fakeOrca, 0o755);
+    const orca = new CliOrca({ command: fakeOrca, cwd: temp });
+    await orca.createRun("watchdog");
+    await assert.rejects(
+      orca.startWorker("task-1", {
+        name: "no-mistakes-review-1",
+        prompt: "Review now.",
+        role: "reviewer",
+        stage: "review",
+        worktree: "current",
+      }),
+      /produced no output/,
+    );
+  } finally {
+    if (previousIdle === undefined) delete process.env.WORKER_IDLE_TIMEOUT_MS;
+    else process.env.WORKER_IDLE_TIMEOUT_MS = previousIdle;
+    restoreHomes();
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test("worker terminal output is drained into the run's stage log", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "onm-worker-log-"));
   const fakeOrca = path.join(temp, "orca");
