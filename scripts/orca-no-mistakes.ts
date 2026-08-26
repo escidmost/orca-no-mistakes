@@ -3494,14 +3494,22 @@ export class CliOrca implements OrcaOperations {
       await this.#releaseStageLog(worker.terminalHandle);
     }
     if (disposition === "release" && worker.terminalHandle) {
-      await this.#json([
-        "terminal",
-        "close",
-        "--terminal",
-        worker.terminalHandle,
-        "--tab",
-        "--json",
-      ]);
+      try {
+        await this.#json([
+          "terminal",
+          "close",
+          "--terminal",
+          worker.terminalHandle,
+          "--tab",
+          "--json",
+        ]);
+      } catch (error) {
+        // A terminal that is already gone is the outcome this asks for, so a
+        // missing tab must not fail the run during cleanup.
+        if (!/tab_not_found|terminal_handle_stale/u.test(String(error))) {
+          throw error;
+        }
+      }
     }
     if (worker.deliveryId) {
       await this.#json([
@@ -4539,8 +4547,6 @@ function weakensInlineTestValidation(
   // ONM-55: without a test declaration the file is ordinary runtime code that
   // happens to assert, so an edit only weakens validation when it drops or
   // rewrites one of the asserting lines. The rest of the file stays fixable.
-  const validationLines = (text: string): string[] =>
-    text.split("\n").filter((line) => inlineAssertion.test(line));
   const hasUnclosedParenthesis = (text: string): boolean => {
     let depth = 0;
     let quote: string | undefined;
@@ -4566,23 +4572,28 @@ function weakensInlineTestValidation(
     }
     return depth > 0;
   };
-  const expectedLines = expectedSource.split("\n");
-  if (
-    expectedLines.some((line, index) => {
-      const assertion = inlineAssertion.exec(line);
-      if (!assertion) return false;
-      const nextLine = expectedLines[index + 1] ?? "";
-      return (
-        hasUnclosedParenthesis(line.slice(assertion.index)) ||
-        (assertion[0].endsWith("(") &&
-          !/\)\s*;?\s*(?:(?:\/\/|#).*)?$/u.test(line.slice(assertion.index))) ||
-        /\\\s*$/u.test(line) ||
-        /^\s*\??\./u.test(nextLine)
-      );
-    })
-  ) {
-    return true;
-  }
+  // An assertion that spans lines is compared as one unit, so mutating a
+  // continuation line is still caught without freezing the whole file.
+  const validationLines = (text: string): string[] => {
+    const lines = text.split("\n");
+    const units: string[] = [];
+    for (let index = 0; index < lines.length; index += 1) {
+      const assertion = inlineAssertion.exec(lines[index]);
+      if (!assertion) continue;
+      let unit = lines[index];
+      while (
+        index + 1 < lines.length &&
+        (hasUnclosedParenthesis(unit.slice(assertion.index)) ||
+          /\\\s*$/u.test(lines[index]) ||
+          /^\s*\??\./u.test(lines[index + 1] ?? ""))
+      ) {
+        index += 1;
+        unit += `\n${lines[index]}`;
+      }
+      units.push(unit);
+    }
+    return units;
+  };
   const remaining = validationLines(source ?? "");
   for (const line of validationLines(expectedSource)) {
     const index = remaining.indexOf(line);
