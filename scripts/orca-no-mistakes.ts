@@ -17,6 +17,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 import YAML from "yaml";
 
 import {
@@ -461,8 +462,9 @@ export async function runPipeline(
           2,
         ),
       );
-      await writeFile(artifactPath, logContent);
-      const artifactSha256 = sha256(logContent);
+      const artifactBytes = Buffer.from(logContent);
+      await writeFile(artifactPath, artifactBytes);
+      const artifactSha256 = sha256(artifactBytes);
       const entry: StageEvidenceManifestEntry = {
         stage,
         round,
@@ -477,6 +479,7 @@ export async function runPipeline(
           candidateCommitOid: candidate,
           exitCode,
           round,
+          runId,
           stage,
           summary: report.summary,
           workerIdentity,
@@ -485,6 +488,8 @@ export async function runPipeline(
       };
       ledger.recordEvidence({
         artifactPath,
+        artifactSha256,
+        findingsJson: JSON.stringify(report.findings),
         baseCommitOid: evidenceBaseCommitOid,
         candidateCommitOid: candidate,
         evidenceSha256: entry.evidenceSha256,
@@ -6436,15 +6441,16 @@ async function runAttestationCommand(
       manifest = await ledger.getAttestation(ref);
     }
     verifyManifest(manifest);
-    let stored: PassedAttestationManifest | undefined;
-    try {
-      stored = await ledger.getAttestation(manifest.runId);
-    } catch {
-      stored = undefined;
-    }
-    if (stored && stored.merkleRoot !== manifest.merkleRoot) {
+    const stored = ledger.getAttestation(manifest.runId);
+    if (!isDeepStrictEqual(stored, manifest)) {
       throw new Error(
         "manifest does not match the attestation recorded in the domain ledger",
+      );
+    }
+    const problems = ledger.verifyEvidence(manifest);
+    if (problems.length > 0) {
+      throw new Error(
+        `stage evidence verification failed:\n  ${problems.join("\n  ")}`,
       );
     }
     console.log(
