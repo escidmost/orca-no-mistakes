@@ -459,6 +459,25 @@ class TamperedEvidenceLedger extends DomainLedger {
   }
 }
 
+class DeletedEvidenceLedger extends DomainLedger {
+  override recordEvidence(
+    input: Parameters<DomainLedger["recordEvidence"]>[0],
+  ): string {
+    const evidenceId = super.recordEvidence(input);
+    if (input.stageId === "review") {
+      const database = new DatabaseSync(this.path);
+      try {
+        database
+          .prepare("DELETE FROM stage_evidence WHERE evidence_id = ?")
+          .run(evidenceId);
+      } finally {
+        database.close();
+      }
+    }
+    return evidenceId;
+  }
+}
+
 // Seeds a trusted-base policy that explicitly authorizes review auto-fix,
 // opting these scenarios out of the ADR-0007 default gate.
 const allowReviewAutoFix = (git: FakeGit) => {
@@ -1436,6 +1455,24 @@ test("edited evidence fields cannot bypass passed attestation", async () => {
     await assert.rejects(
       runPipeline({ intent: "Reject edited evidence fields." }, orca, git, ledger),
       /this run cannot be attested: review round 0: evidence digest does not match its recorded fields/,
+    );
+    const runId = ledger.listRuns()[0].run_id;
+    assert.equal(ledger.runStatus(runId), "failed");
+  } finally {
+    ledger.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("missing evidence cannot bypass passed attestation", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  const home = await mkdtemp(path.join(tmpdir(), "no-mistakes-missing-evidence-"));
+  const ledger = new DeletedEvidenceLedger(path.join(home, "ledger.db"));
+  try {
+    await assert.rejects(
+      runPipeline({ intent: "Reject missing durable evidence." }, orca, git, ledger),
+      /this run cannot be attested: review round 0: the attested evidence row is missing from the ledger/,
     );
     const runId = ledger.listRuns()[0].run_id;
     assert.equal(ledger.runStatus(runId), "failed");

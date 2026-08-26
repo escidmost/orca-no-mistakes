@@ -1132,8 +1132,17 @@ export class DomainLedger {
     // listEvidence orders by (stage_id, round_index, rowid), so the last row
     // written for a stage is the one left in the map.
     const latest = new Map<string, StageEvidenceRow>()
-    for (const row of this.listEvidence(runId)) latest.set(row.stage_id, row)
+    const rows = this.listEvidence(runId)
+    const durable = new Set(rows.map((row) => row.evidence_sha256))
     const blockers: string[] = []
+    for (const entry of entries) {
+      if (!durable.has(entry.evidenceSha256)) {
+        blockers.push(
+          `${entry.stage} round ${entry.round}: the attested evidence row is missing from the ledger`
+        )
+      }
+    }
+    for (const row of rows) latest.set(row.stage_id, row)
     for (const [stage, row] of latest) {
       const label = `${stage} round ${row.round_index}`
       if (!attested.has(row.evidence_sha256)) {
