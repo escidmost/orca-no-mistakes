@@ -1027,16 +1027,23 @@ export class DomainLedger {
   verifyEvidence(manifest: PassedAttestationManifest): string[] {
     const problems: string[] = []
     const rows = this.listEvidence(manifest.runId)
-    const recorded = rows.map((row) => row.evidence_sha256)
+    const unmatched = [...rows]
     for (const entry of manifest.stageEvidence) {
-      const index = recorded.indexOf(entry.evidenceSha256)
+      const index = unmatched.findIndex(
+        (row) => row.evidence_sha256 === entry.evidenceSha256
+      )
       if (index === -1) {
         problems.push(
           `${entry.stage} round ${entry.round}: the attested evidence row is missing from the ledger`
         )
       } else {
-        recorded.splice(index, 1)
+        unmatched.splice(index, 1)
       }
+    }
+    for (const row of unmatched) {
+      problems.push(
+        `${row.stage_id} round ${row.round_index}: the ledger evidence row is absent from the attestation`
+      )
     }
     for (const row of rows) {
       const label = `${row.stage_id} round ${row.round_index}`

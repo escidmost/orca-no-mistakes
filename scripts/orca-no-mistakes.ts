@@ -17,6 +17,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 import YAML from "yaml";
 
 import {
@@ -6441,7 +6442,7 @@ async function runAttestationCommand(
     }
     verifyManifest(manifest);
     const stored = ledger.getAttestation(manifest.runId);
-    if (stored.merkleRoot !== manifest.merkleRoot) {
+    if (!isDeepStrictEqual(stored, manifest)) {
       throw new Error(
         "manifest does not match the attestation recorded in the domain ledger",
       );
