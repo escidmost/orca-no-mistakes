@@ -4521,15 +4521,27 @@ function weakensInlineTestValidation(
   source: string | undefined,
 ): boolean {
   if (source === expectedSource) return false;
-  const protectedValidation = /(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|rstest|(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test)\s*\]|@(?:[A-Za-z_][\w]*\.)*(?:ParameterizedTest|Test|TestMethod|DataTestMethod)\b|\[(?:(?:[A-Za-z_][\w]*\.)*(?:Fact|Test|Theory|TestMethod|DataTestMethod)|(?:[A-Za-z_][\w]*\.)*TestCase(?:\([^\]\n]*\))?)\]|\b(?:describe|context|it|test)(?:\.[A-Za-z_$][\w$]*)*\s*\(|\b(?:SCENARIO|TEMPLATE_TEST_CASE|TEST_CASE)\s*\(|\btest\s+"(?:[^"\\]|\\.)*"\s*\{|(?:^|\n)\s*(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(|(?:^|\n)\s*assert\s+\S|\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\b(?:CHECK|REQUIRE)(?:_[A-Z0-9_]+)?\s*\(|\b(?:[A-Za-z_][\w]*\.)*Assert\.[A-Za-z_][\w]*\s*\(|\.should\.(?:deep\.)?(?:equal|eql|match|throw)\s*\(|\b(?:deepStrictEqual|strictEqual|notDeepStrictEqual|notStrictEqual|doesNotReject|doesNotThrow|ifError|rejects|throws)\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|\bassert[A-Z][A-Za-z0-9_$]*\s*\(|\bstd\.testing\.expect[A-Za-z0-9_]*\s*\(|\bexpect(?:\.(?:poll|soft))?\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
+  const testDeclaration = /(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|rstest|(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test)\s*\]|@(?:[A-Za-z_][\w]*\.)*(?:ParameterizedTest|Test|TestMethod|DataTestMethod)\b|\[(?:(?:[A-Za-z_][\w]*\.)*(?:Fact|Test|Theory|TestMethod|DataTestMethod)|(?:[A-Za-z_][\w]*\.)*TestCase(?:\([^\]\n]*\))?)\]|(?<![.\w$])(?:describe|context|it|test)(?:\.[A-Za-z_$][\w$]*)*\s*\(|\b(?:SCENARIO|TEMPLATE_TEST_CASE|TEST_CASE)\s*\(|\btest\s+"(?:[^"\\]|\\.)*"\s*\{|(?:^|\n)\s*(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(|\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b)/iu;
+  const inlineAssertion = /(?:(?:^|\n)\s*assert\s+\S|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\b(?:CHECK|REQUIRE)(?:_[A-Z0-9_]+)?\s*\(|\b(?:[A-Za-z_][\w]*\.)*Assert\.[A-Za-z_][\w]*\s*\(|\.should\.(?:deep\.)?(?:equal|eql|match|throw)\s*\(|\b(?:deepStrictEqual|strictEqual|notDeepStrictEqual|notStrictEqual|doesNotReject|doesNotThrow|ifError|rejects|throws)\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|\bassert[A-Z][A-Za-z0-9_$]*\s*\(|\bstd\.testing\.expect[A-Za-z0-9_]*\s*\(|\bexpect(?:\.(?:poll|soft))?\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
   const nodeAssertImport = /(?:from\s+["'](?:node:)?assert(?:\/strict)?["']|require\s*\(\s*["'](?:node:)?assert(?:\/strict)?["']\s*\))/u;
   if (
-    protectedValidation.test(expectedSource) ||
+    testDeclaration.test(expectedSource) ||
     /\.should(?:\.[A-Za-z_$][\w$]*)+/u.test(expectedSource) ||
     nodeAssertImport.test(expectedSource) ||
     importsAssertionFrameworkApi(expectedSource)
   ) {
     return true;
+  }
+  // ONM-55: without a test declaration the file is ordinary runtime code that
+  // happens to assert, so an edit only weakens validation when it drops or
+  // rewrites one of the asserting lines. The rest of the file stays fixable.
+  const validationLines = (text: string): string[] =>
+    text.split("\n").filter((line) => inlineAssertion.test(line));
+  const remaining = validationLines(source ?? "");
+  for (const line of validationLines(expectedSource)) {
+    const index = remaining.indexOf(line);
+    if (index < 0) return true;
+    remaining.splice(index, 1);
   }
   const skipMarker = /(?:#\[(?:ignore|should_panic)\]|\b(?:describe|it|test)(?:\.[A-Za-z_$][\w$]*)*\.(?:only|skip)\s*\(|\bpytest\.mark\.(?:skip|skipif|xfail)\b|@\w*Ignore\b)/giu;
   return (
@@ -4596,14 +4608,6 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
   const fileName = parts.at(-1) ?? "";
   return (
     normalized === ".orca/no-mistakes.yaml" ||
-    normalized === "bin/orca-no-mistakes" ||
-    [
-      "scripts/adapters.ts",
-      "scripts/config.ts",
-      "scripts/ledger.ts",
-      "scripts/orca-no-mistakes.ts",
-      "scripts/policy.ts",
-    ].includes(normalized) ||
     [
       "BUILD",
       "BUILD.bazel",
@@ -5400,6 +5404,15 @@ export class GitShell implements GitOperations {
         if (/^action\.ya?ml$/i.test(path.posix.basename(candidatePath))) {
           const actionDirectory = path.posix.dirname(candidatePath);
           if (actionDirectory !== ".") targets.push(actionDirectory);
+        }
+        // ONM-55: only policy configuration binds further entrypoints. A source
+        // file a policy names is protected, but its own imports are not, so the
+        // closure stops at the command instead of swallowing the import graph.
+        if (
+          !isProtectedValidationPolicyPath(candidatePath) &&
+          !/^action\.ya?ml$/i.test(path.posix.basename(candidatePath))
+        ) {
+          continue;
         }
         if (
           ![...policySources].some(([policyPath, source]) =>
