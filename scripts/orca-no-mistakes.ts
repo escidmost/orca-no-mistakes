@@ -805,6 +805,16 @@ export async function runPipeline(
     }
 
     const terminalCommitOid = await git.head();
+    // Fail closed before the manifest exists: a stage whose recorded findings
+    // were never addressed, and never waived at a gate, must not be attested.
+    // The check reads the durable evidence rows rather than the stage loop's
+    // own bookkeeping, so it still holds if that control flow ever lets an
+    // unresolved stage through.
+    const blockers = ledger.attestationBlockers(runId, stageEntries);
+    if (blockers.length > 0) {
+      throw new Error(`this run cannot be attested: ${blockers.join("; ")}`);
+    }
+
     // Anchor custody before the containment decision: in gate mode the gate
     // worktree is removed after the run, so the terminal commit must be
     // referenced in the delivery repo before any HEAD-advancing merge is
@@ -843,16 +853,6 @@ export async function runPipeline(
             recoveryInstructions(recoverRef)
           : "operator checkout diverged or carries uncommitted changes; " +
             recoveryInstructions(recoverRef);
-    }
-
-    // Fail closed before the manifest exists: a stage whose recorded findings
-    // were never addressed, and never waived at a gate, must not be attested.
-    // The check reads the durable evidence rows rather than the stage loop's
-    // own bookkeeping, so it still holds if that control flow ever lets an
-    // unresolved stage through.
-    const blockers = ledger.attestationBlockers(runId, stageEntries);
-    if (blockers.length > 0) {
-      throw new Error(`this run cannot be attested: ${blockers.join("; ")}`);
     }
 
     const attestation = buildAttestation(stageEntries, {

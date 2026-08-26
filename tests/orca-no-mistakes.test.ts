@@ -389,6 +389,35 @@ class FakeOrca implements OrcaOperations {
   }
 }
 
+class LateFindingLedger extends DomainLedger {
+  #injected = false;
+
+  override recordEvidence(
+    input: Parameters<DomainLedger["recordEvidence"]>[0],
+  ): string {
+    const evidenceId = super.recordEvidence(input);
+    if (input.stageId === "lint" && !this.#injected) {
+      this.#injected = true;
+      super.recordEvidence({
+        ...input,
+        evidenceSha256: sha256("late-unresolved-finding"),
+        findingsJson: JSON.stringify([
+          {
+            action: "ask-user",
+            description: "A durable finding was added after stage execution.",
+            id: "late-finding",
+            severity: "error",
+          },
+        ]),
+        roundIndex: 99,
+        stageId: "review",
+        summary: "late unresolved finding",
+      });
+    }
+    return evidenceId;
+  }
+}
+
 // Seeds a trusted-base policy that explicitly authorizes review auto-fix,
 // opting these scenarios out of the ADR-0007 default gate.
 const allowReviewAutoFix = (git: FakeGit) => {
@@ -1296,6 +1325,33 @@ test("a passing gate transfers final custody to the unchanged initiating worktre
   assert.ok(deliveryGit.calls.some((call) => call.startsWith("recover:")));
   assert.ok(!gateGit.calls.some((call) => call.startsWith("recover:")));
   assert.match(result.custodyNote ?? "", /advanced branch feature/);
+});
+
+test("blocks unresolved durable findings before transferring gate custody", async () => {
+  const gateGit = new FakeGit("/gate", "no-mistakes-gate-test");
+  const deliveryGit = new FakeGit("/origin", "feature");
+  const orca = new FakeOrca(gateGit);
+  const ledger = new LateFindingLedger(":memory:");
+
+  await assert.rejects(
+    runPipeline(
+      {
+        deliveryGit,
+        intent: "Reject durable findings before attestation.",
+      },
+      orca,
+      gateGit,
+      ledger,
+    ),
+    /this run cannot be attested: review round 99: 1 unaddressed finding\(s\)/,
+  );
+
+  assert.equal(
+    deliveryGit.calls.some((call) => call.startsWith("apply:")),
+    false,
+  );
+  const runId = ledger.listRuns()[0].run_id;
+  assert.equal(ledger.runStatus(runId), "failed");
 });
 
 test("opens an exhaustion gate when automatic fix limit is reached and stops on stop decision", async () => {
@@ -10085,7 +10141,7 @@ test("a stage whose findings were never addressed cannot be attested", async () 
   assert.deepEqual(ledger.attestationBlockers(result.runId, entries), []);
 
   let round = 0;
-  const recordReviewRound = (findingsJson: string) => {
+  const recordReviewRound = (findingsJson?: string) => {
     round += 1;
     ledger.recordEvidence({
       artifactPath: "/dev/null",
@@ -10145,5 +10201,10 @@ test("a stage whose findings were never addressed cannot be attested", async () 
   recordReviewRound("not json");
   assert.deepEqual(ledger.attestationBlockers(result.runId, entries), [
     "review round 3: recorded findings are unreadable",
+  ]);
+
+  recordReviewRound();
+  assert.deepEqual(ledger.attestationBlockers(result.runId, entries), [
+    "review round 4: recorded findings are unreadable",
   ]);
 });

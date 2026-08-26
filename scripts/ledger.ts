@@ -1135,9 +1135,13 @@ export class DomainLedger {
     const blockers: string[] = []
     for (const [stage, row] of latest) {
       if (waived.has(row.evidence_sha256)) continue
+      if (row.findings_json === null) {
+        blockers.push(`${stage} round ${row.round_index}: recorded findings are unreadable`)
+        continue
+      }
       let unresolved: number
       try {
-        unresolved = (JSON.parse(row.findings_json ?? '[]') as { action?: string }[]).filter(
+        unresolved = (JSON.parse(row.findings_json) as { action?: string }[]).filter(
           (finding) => finding?.action !== 'no-op'
         ).length
       } catch {
