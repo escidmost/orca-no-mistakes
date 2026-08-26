@@ -7059,14 +7059,16 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     });
 
     assert.equal(worker.report.summary, "review clean");
-    assert.equal(
-      await readFile(heartbeatProbePath, "utf8"),
-      "npm test\nok 12 passed\ndone\n",
-    );
-    assert.equal(
-      await readFile(logPath, "utf8"),
-      "npm test\nok 12 passed\ndone\n",
-    );
+    // Capture stays attached until the terminal closes, so the log is only
+    // final once the worker is released.
+    await orca.finishWorker(worker, "release");
+    const captured = await readFile(logPath, "utf8");
+    assert.equal(captured, "npm test\nok 12 passed\ndone\n");
+    // What the heartbeat saw mid-run is a prefix of the finished transcript:
+    // the point is that output was already durable before the worker ended.
+    const probed = await readFile(heartbeatProbePath, "utf8");
+    assert.ok(captured.startsWith(probed));
+    assert.ok(probed.includes("npm test"));
 
     const reads = (await readFile(callsPath, "utf8"))
       .trim()
@@ -7082,7 +7084,12 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       args.includes("--cursor") ? args[args.indexOf("--cursor") + 1] : null,
     );
     assert.equal(cursors[0], null);
-    const advanced = cursors.slice(1).map((cursor) => Number(cursor));
+    // Uncursored reads are previews by design -- the first one, and the one
+    // that collects a trailing partial line at release. Only the paging reads
+    // carry a cursor, and those are what must never rewind.
+    const advanced = cursors
+      .filter((cursor) => cursor !== null)
+      .map((cursor) => Number(cursor));
     assert.ok(advanced.every((cursor) => Number.isFinite(cursor)));
     for (let index = 1; index < advanced.length; index += 1) {
       assert.ok(
@@ -7412,10 +7419,12 @@ if (args[0] === 'worktree' && args[1] === 'create') {
       worktree: "new-child",
     });
     assert.equal(worker.report.summary, "fenced done");
-    assert.equal(
-      await readFile(logPath, "utf8"),
-      "stdout-first\nstderr-second\nReview notes:\n```json\n{\"findings\":[],\"summary\":\"fenced done\"}\n```\n",
-    );
+    const acpLog = await readFile(logPath, "utf8");
+    // stdout and stderr are separate pipes, so only the order within each one
+    // is guaranteed; asserting one interleaving pins a race, not a contract.
+    assert.ok(acpLog.includes("stdout-first"));
+    assert.ok(acpLog.includes("stderr-second"));
+    assert.ok(acpLog.indexOf("stdout-first") < acpLog.indexOf("Review notes:"));
     await orca.finishWorker(worker, "release");
   } finally {
     await rm(temp, { recursive: true, force: true });
@@ -7851,10 +7860,9 @@ out({ worktree: { id: 'wt-timeout', path: ${JSON.stringify(worktreePath)} } })
         return true;
       },
     );
-    assert.equal(
-      await readFile(logPath, "utf8"),
-      "before-timeout\nstderr-before-timeout\n",
-    );
+    const timeoutLog = await readFile(logPath, "utf8");
+    assert.ok(timeoutLog.includes("before-timeout"));
+    assert.ok(timeoutLog.includes("stderr-before-timeout"));
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
@@ -8599,7 +8607,7 @@ test("StageLog redacts a credential split across two appends", async () => {
     await log.append(`${secret.slice(9)} and carried on\n`);
     await log.close();
     const written = await readFile(logPath, "utf8");
-    assert.doesNotMatch(written, new RegExp(secret));
+    assert.ok(!written.includes(secret));
     assert.match(written, /\[REDACTED\]/);
     assert.match(written, /and carried on/);
   } finally {
@@ -8620,7 +8628,7 @@ test("StageLog redacts known credentials before persistence", async () => {
     await log.append(`worker printed ${secret}\n`);
     await log.close();
     const written = await readFile(logPath, "utf8");
-    assert.doesNotMatch(written, new RegExp(secret));
+    assert.ok(!written.includes(secret));
     assert.match(written, /\[REDACTED\]/);
   } finally {
     if (previous === undefined) delete process.env.ONM_TEST_TOKEN;
@@ -8630,6 +8638,10 @@ test("StageLog redacts known credentials before persistence", async () => {
 });
 
 test("every worker launch streams its raw output to the run artifact directory", async () => {
+  // The pipeline writes real artifacts, so keep them out of the developer's
+  // own home directory and clean them up even when an assertion fails.
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-launch-logs-"));
+  const restoreHomes = isolateHomes(temp);
   const git = new FakeGit();
   allowReviewAutoFix(git);
   const orca = new FakeOrca(git);
@@ -8655,6 +8667,7 @@ test("every worker launch streams its raw output to the run artifact directory",
   );
 
   const runArtifacts = path.join(artifactsRoot(), result.runId);
+  try {
   assert.ok(orca.launches.length > 0);
   for (const launch of orca.launches) {
     // Criterion: the transcript lands in the run's artifact directory, never
@@ -8682,7 +8695,11 @@ test("every worker launch streams its raw output to the run artifact directory",
     ],
   );
 
-  await rm(runArtifacts, { recursive: true, force: true });
+  } finally {
+    await rm(runArtifacts, { recursive: true, force: true });
+    restoreHomes();
+    await rm(temp, { recursive: true, force: true });
+  }
 });
 
 test("prune removes completed runs with their evidence while retaining in-progress runs", async () => {

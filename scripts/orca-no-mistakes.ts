@@ -57,6 +57,7 @@ import {
 import {
   DomainLedger,
   RUN_ID_PATTERN,
+  isWithin,
   StageLog,
   artifactsRoot,
   buildAttestation,
@@ -2672,10 +2673,10 @@ export class CliOrca implements OrcaOperations {
       // Bind before the checks below: this path closes the receipt's terminal
       // in its own catch, so launch and readiness diagnostics from a failed
       // native candidate would otherwise be gone before any drain could run.
-      // ponytail: the handle only exists once the blocking worker-start
-      // returns, so a native worker that prints and then hangs is captured
-      // only if the coordinator survives that call. Binding earlier needs
-      // worker-start to expose its terminal before it waits for readiness.
+      // ONM-56: the handle only exists once the blocking worker-start returns,
+      // so a native worker that prints and then hangs is captured only if the
+      // coordinator survives that call. Binding earlier needs worker-start to
+      // expose its terminal before it waits for readiness.
       if (terminalHandle) await this.#bindStageLog(terminalHandle, launch);
       worktreeId = receipt.worktree?.id ?? receipt.worker?.worktreeId;
       const worktreePath =
@@ -3876,9 +3877,6 @@ export class CliOrca implements OrcaOperations {
     }
   }
 
-  /** Appends new terminal output to the run's stage log. Capturing a worker's
-   *  transcript is diagnostic, so every failure here is swallowed rather than
-   *  allowed to fail the stage it was recording. */
   /** ONM-23: binds the log as soon as a terminal exists — before dispatch and
    *  prompt launch — so a readiness or preflight failure and a coordinator
    *  crash both still leave whatever the worker printed. StageLog opens lazily,
@@ -3934,6 +3932,9 @@ export class CliOrca implements OrcaOperations {
     await bound.log.close().catch(() => {});
   }
 
+  /** Appends new terminal output to the run's stage log. Capturing a worker's
+   *  transcript is diagnostic, so every failure here is swallowed rather than
+   *  allowed to fail the stage it was recording. */
   async #drainWorkerLog(
     terminalHandle: string,
     log: StageLog,
@@ -4002,8 +4003,11 @@ export class CliOrca implements OrcaOperations {
         // A cursor that does not advance means the host re-served output this
         // log already holds; appending it would grow the file on every drain.
         if (next === cursor) return;
-        if (next !== undefined) this.#terminalCursors.set(terminalHandle, next);
+        // The cursor moves only once the append it describes has landed, so a
+        // failed write leaves the next drain to retry the same lines instead
+        // of skipping past them.
         if (lines.length > 0) await this.#appendLines(terminalHandle, log, lines);
+        if (next !== undefined) this.#terminalCursors.set(terminalHandle, next);
         if (next === undefined || next === latest) return;
       }
       // Only a final drain abandons what is left: a periodic one resumes from
@@ -4427,14 +4431,6 @@ export class CliOrca implements OrcaOperations {
       );
     }
   }
-}
-
-function isWithin(root: string, target: string): boolean {
-  const relative = path.relative(path.resolve(root), path.resolve(target));
-  return (
-    relative === "" ||
-    (!relative.startsWith("..") && !path.isAbsolute(relative))
-  );
 }
 
 function isTestPath(filePath: string): boolean {

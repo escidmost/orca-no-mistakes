@@ -1,10 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdirSync, readFileSync } from 'node:fs'
-import { O_APPEND, O_CREAT, O_EXCL, O_NOFOLLOW, O_RDONLY, O_RDWR, O_WRONLY } from 'node:constants'
+import { constants, mkdirSync, readFileSync } from 'node:fs'
 import { chmod, lstat, mkdir, open, realpath, rename, rm } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+
+const { O_APPEND, O_CREAT, O_EXCL, O_NOFOLLOW, O_RDONLY, O_RDWR, O_WRONLY } = constants
 
 export type RunStatus = 'in-progress' | 'passed' | 'failed' | 'cancelled'
 
@@ -217,14 +218,6 @@ function pendingSecretPrefix(text: string, secrets: string[]): number {
 }
 
 /**
- * Rejects a symlink anywhere from the artifact root down to `target`, including
- * the root itself. Checking only the final parent leaves a symlinked component
- * free to land the log inside the repository once `mkdir -p` follows it; the
- * walk stops at the first component that does not exist yet, so callers run it
- * again after creating the directory when the whole chain is present. The log
- * file itself is left to `O_NOFOLLOW` on open.
- */
-/**
  * O_NOFOLLOW rejects a symlink but happily opens a hard link to a tracked file,
  * so an inode reached that way would be appended to, chmod'd, or truncated.
  * A stage artifact is always a fresh, singly linked regular file.
@@ -238,6 +231,14 @@ async function assertPrivateRegularFile(
   }
 }
 
+/**
+ * Rejects a symlink anywhere from the artifact root down to `target`, including
+ * the root itself. Checking only the final parent leaves a symlinked component
+ * free to land the log inside the repository once `mkdir -p` follows it; the
+ * walk stops at the first component that does not exist yet, so callers run it
+ * again after creating the directory when the whole chain is present. The log
+ * file itself is left to `O_NOFOLLOW` on open.
+ */
 async function assertNoSymlinkChain(rootPath: string, targetPath: string): Promise<void> {
   const root = path.resolve(rootPath)
   const target = path.resolve(targetPath)
@@ -261,7 +262,7 @@ async function assertNoSymlinkChain(rootPath: string, targetPath: string): Promi
   }
 }
 
-function isWithin(root: string, target: string): boolean {
+export function isWithin(root: string, target: string): boolean {
   const relative = path.relative(path.resolve(root), path.resolve(target))
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))
 }
@@ -371,12 +372,6 @@ export class StageLog {
   }
 
   /**
-   * Rewrites an over-cap log as head + marker + tail. Runs only once the file
-   * actually exceeds the cap, so a round whose combined output still fits keeps
-   * every byte, and the bytes are sliced positionally -- nothing in the file is
-   * parsed, so worker output cannot influence the result.
-   */
-  /**
    * Replaces a file with fresh content through a staging file and a rename.
    *
    * The staging path is unlinked and created exclusively rather than
@@ -407,6 +402,12 @@ export class StageLog {
     await rename(stagingPath, targetPath)
   }
 
+  /**
+   * Rewrites an over-cap log as head + marker + tail. Runs only once the file
+   * actually exceeds the cap, so a round whose combined output still fits keeps
+   * every byte, and the bytes are sliced positionally -- nothing in the file is
+   * parsed, so worker output cannot influence the result.
+   */
   async #compact(): Promise<void> {
     const file = this.#file
     if (!file) return
@@ -414,8 +415,9 @@ export class StageLog {
     // at EOF, so a position-relative read returns nothing.
     const size = (await file.stat()).size
     // read() may return fewer bytes than asked for, and the buffer is
-    // uninitialized, so a short read would copy unrelated process memory into
-    // the artifact. Fill it, and slice to what actually arrived.
+    // uninitialized, so what makes this safe is that only the bytes actually
+    // read are ever used: the slice below bounds the artifact, whether or not
+    // the loop managed to fill the buffer.
     const buffer = Buffer.allocUnsafe(size)
     let filled = 0
     while (filled < size) {
@@ -534,12 +536,11 @@ export class StageLog {
       await this.#replaceFile(this.#metaPath(), [
         Buffer.from(String(this.#originalBytes), 'utf8'),
       ])
-    } catch (error) {
-      // A symlink or foreign inode planted at the sidecar path costs the round
-      // its byte total, which the marker then reports as unknown. The
-      // transcript is worth more than the counter, so this never fails the log.
-      if ((error as NodeJS.ErrnoException).code === 'ELOOP') return
-      throw error
+    } catch {
+      // The sidecar is an optimisation: losing it costs the round its byte
+      // total, which the marker then reports as unknown. A planted symlink, a
+      // foreign inode, a read-only directory -- none of them are worth failing
+      // the transcript over, so every failure here is swallowed.
     }
   }
 
