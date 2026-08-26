@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { constants, mkdirSync, readFileSync } from 'node:fs'
+import { constants, mkdirSync, readFileSync, statSync } from 'node:fs'
 import { chmod, lstat, mkdir, open, realpath, rename, rm } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
@@ -114,6 +114,22 @@ export function evidenceSha256(input: {
   )
 }
 
+/**
+ * Whether a stage evidence row's `findings_json` still matches the findings
+ * inside its attested artifact. A truncated or unparseable artifact carries no
+ * findings to compare against -- its bytes already matched the recorded digest,
+ * so there is nothing to contradict -- and is accepted.
+ */
+function findingsMatchArtifact(artifact: Buffer, findingsJson: string): boolean {
+  let findings: unknown
+  try {
+    findings = (JSON.parse(artifact.toString('utf8')) as { findings?: unknown }).findings
+  } catch {
+    return true
+  }
+  return findings === undefined || JSON.stringify(findings) === findingsJson
+}
+
 export function canonicalEntry(entry: StageEvidenceManifestEntry): string {
   return JSON.stringify({
     artifactSha256: entry.artifactSha256,
@@ -197,6 +213,9 @@ export function verifyManifest(manifest: PassedAttestationManifest): void {
   for (const entry of manifest.stageEvidence) {
     if (!HEX_64.test(entry.evidenceSha256)) {
       throw new Error(`stage ${entry.stage} evidence hash is not a SHA-256`)
+    }
+    if (!HEX_64.test(entry.artifactSha256)) {
+      throw new Error(`stage ${entry.stage} artifact hash is not a SHA-256`)
     }
     if (evidenceSha256({ ...entry, runId: manifest.runId }) !== entry.evidenceSha256) {
       throw new Error(`stage ${entry.stage} evidence hash does not match its recorded fields`)
@@ -1051,15 +1070,31 @@ export class DomainLedger {
         problems.push(`${label}: no artifact digest was recorded`)
         continue
       }
-      let artifactSha256: string
+      let artifact: Buffer
       try {
-        artifactSha256 = sha256(readFileSync(row.artifact_path))
+        // A stage artifact is a regular file no larger than the log cap. Reading
+        // whatever the recorded path names would let a hand-edited row aim
+        // verification at a FIFO or a device and hang it, so the shape and size
+        // are checked from metadata before any bytes are read.
+        const info = statSync(row.artifact_path)
+        if (!info.isFile()) throw new Error('not a regular file')
+        if (info.size > MAX_LOG_BYTES) throw new Error('larger than the log cap')
+        artifact = readFileSync(row.artifact_path)
       } catch {
         problems.push(`${label}: artifact ${row.artifact_path} is missing or unreadable`)
         continue
       }
+      const artifactSha256 = sha256(artifact)
       if (artifactSha256 !== row.artifact_sha256) {
         problems.push(`${label}: artifact ${row.artifact_path} does not match its recorded digest`)
+        continue
+      }
+      // The row's findings are a query-side copy of what the artifact records.
+      // The artifact itself is bound by the digest just checked, so comparing
+      // the copy against it catches a findings_json edited in the ledger
+      // without adding anything to the evidence preimage.
+      if (row.findings_json !== null && !findingsMatchArtifact(artifact, row.findings_json)) {
+        problems.push(`${label}: recorded findings do not match the attested artifact`)
         continue
       }
       const expected = evidenceSha256({
