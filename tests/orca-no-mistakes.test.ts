@@ -9867,6 +9867,7 @@ test("legacy gate_audit ledgers are rebuilt with durable gate columns", async ()
       guidance TEXT,
       resolved_at TEXT NOT NULL
     );
+    CREATE INDEX idx_gate_audit_run ON gate_audit(run_id);
     INSERT INTO runs (run_id) VALUES ('legacy-run');
     INSERT INTO gate_audit VALUES
       ('gate-legacy', 'legacy-run', 'review', 1, 'q', '["approve"]', 'approve', 'approve', NULL, '2026-01-01T00:00:00.000Z');`);
@@ -9880,6 +9881,22 @@ test("legacy gate_audit ledgers are rebuilt with durable gate columns", async ()
     assert.equal(audits[0].gate_kind, "finding");
     assert.equal(audits[0].resolved_at, "2026-01-01T00:00:00.000Z");
     assert.match(ledger.tableDefinition("gate_audit") ?? "", /gate_kind TEXT/);
+    // The rebuild drops the renamed table, taking its index with it; the
+    // schema replay that follows has to put the index back on the new table.
+    const reader = new DatabaseSync(dbPath);
+    try {
+      assert.deepEqual(
+        reader
+          .prepare(
+            "SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name = 'idx_gate_audit_run'",
+          )
+          .all()
+          .map((row) => (row as { tbl_name: string }).tbl_name),
+        ["gate_audit"],
+      );
+    } finally {
+      reader.close();
+    }
   } finally {
     ledger.close();
     await rm(dir, { recursive: true, force: true });
