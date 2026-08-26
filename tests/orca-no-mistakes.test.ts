@@ -10202,9 +10202,17 @@ test("a stage whose findings were never addressed cannot be attested", async () 
   assert.deepEqual(ledger.attestationBlockers(result.runId, entries), [
     "review round 3: recorded findings are unreadable",
   ]);
+  assert.deepEqual(
+    ledger.attestationBlockers(result.runId, withWaiver(sha256("round-3"))),
+    ["review round 3: recorded findings are unreadable"],
+  );
 
   recordReviewRound();
   assert.deepEqual(ledger.attestationBlockers(result.runId, entries), [
     "review round 4: recorded findings are unreadable",
   ]);
+  assert.deepEqual(
+    ledger.attestationBlockers(result.runId, withWaiver(sha256("round-4"))),
+    ["review round 4: recorded findings are unreadable"],
+  );
 });

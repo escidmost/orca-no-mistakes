@@ -1134,7 +1134,6 @@ export class DomainLedger {
     for (const row of this.listEvidence(runId)) latest.set(row.stage_id, row)
     const blockers: string[] = []
     for (const [stage, row] of latest) {
-      if (waived.has(row.evidence_sha256)) continue
       if (row.findings_json === null) {
         blockers.push(`${stage} round ${row.round_index}: recorded findings are unreadable`)
         continue
@@ -1148,6 +1147,7 @@ export class DomainLedger {
         blockers.push(`${stage} round ${row.round_index}: recorded findings are unreadable`)
         continue
       }
+      if (waived.has(row.evidence_sha256)) continue
       if (unresolved > 0) {
         blockers.push(
           `${stage} round ${row.round_index}: ${unresolved} unaddressed finding(s) ` +
