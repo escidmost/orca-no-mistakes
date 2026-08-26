@@ -18,6 +18,7 @@ export type GateAuditRow = {
   guidance: string | null
   resolution: string
   resolved_at: string | null
+  stage_id: string
 }
 
 export type StageEvidenceRow = {
@@ -112,22 +113,6 @@ export function evidenceSha256(input: {
       workerIdentity: input.workerIdentity
     })
   )
-}
-
-/**
- * Whether a stage evidence row's `findings_json` still matches the findings
- * inside its attested artifact. A truncated or unparseable artifact carries no
- * findings to compare against -- its bytes already matched the recorded digest,
- * so there is nothing to contradict -- and is accepted.
- */
-function findingsMatchArtifact(artifact: Buffer, findingsJson: string): boolean {
-  let findings: unknown
-  try {
-    findings = (JSON.parse(artifact.toString('utf8')) as { findings?: unknown }).findings
-  } catch {
-    return true
-  }
-  return findings === undefined || JSON.stringify(findings) === findingsJson
 }
 
 export function canonicalEntry(entry: StageEvidenceManifestEntry): string {
@@ -1044,10 +1029,17 @@ export class DomainLedger {
    * a caller can report them all at once.
    */
   verifyEvidence(manifest: PassedAttestationManifest): string[] {
+    return this.#verifyEvidence(manifest.runId, manifest.stageEvidence).problems
+  }
+
+  #verifyEvidence(runId: string, entries: StageEvidenceManifestEntry[]): {
+    problems: string[]
+    rows: StageEvidenceRow[]
+  } {
     const problems: string[] = []
-    const rows = this.listEvidence(manifest.runId)
+    const rows = this.listEvidence(runId)
     const unmatched = [...rows]
-    for (const entry of manifest.stageEvidence) {
+    for (const entry of entries) {
       const index = unmatched.findIndex(
         (row) => row.evidence_sha256 === entry.evidenceSha256
       )
@@ -1089,98 +1081,22 @@ export class DomainLedger {
         problems.push(`${label}: artifact ${row.artifact_path} does not match its recorded digest`)
         continue
       }
-      // The row's findings are a query-side copy of what the artifact records.
-      // The artifact itself is bound by the digest just checked, so comparing
-      // the copy against it catches a findings_json edited in the ledger
-      // without adding anything to the evidence preimage.
-      if (row.findings_json !== null && !findingsMatchArtifact(artifact, row.findings_json)) {
-        problems.push(`${label}: recorded findings do not match the attested artifact`)
-        continue
-      }
-      const expected = evidenceSha256({
-        artifactSha256,
-        baseCommitOid: row.base_commit_oid,
-        candidateCommitOid: row.candidate_commit_oid,
-        exitCode: Number(row.exit_code),
-        round: Number(row.round_index),
-        runId: manifest.runId,
-        stage: row.stage_id,
-        summary: row.summary,
-        workerIdentity: row.worker_identity
-      })
-      if (expected !== row.evidence_sha256) {
-        problems.push(`${label}: evidence digest does not match its recorded fields`)
-      }
-    }
-    return problems
-  }
-
-  /**
-   * Stages that must not be attested: the latest recorded round still carries a
-   * finding nobody addressed, and no gate decision waived it. Findings come from
-   * the durable evidence rows, so this holds independently of whatever the
-   * coordinator's stage loop believed about the run. Unreadable findings block
-   * too -- an unresolved stage and an unreadable one are equally unattestable.
-   */
-  attestationBlockers(runId: string, entries: StageEvidenceManifestEntry[]): string[] {
-    // Keyed by the exact evidence digest the decision was recorded against, so a
-    // waiver never carries over to a later round of the same stage.
-    const auditsByGateId = new Map(
-      this.listGateAudit(runId).map((audit) => [audit.gate_id, audit])
-    )
-    const waived = new Set(
-      entries
-        .filter((entry) => {
-          const waiver = entry.waiverOrApproval
-          if (!waiver) return false
-          const audit = auditsByGateId.get(waiver.gateId)
-          return audit?.decision === waiver.decision && audit.resolved_at !== null
-        })
-        .map((entry) => entry.evidenceSha256)
-    )
-    const attested = new Set(entries.map((entry) => entry.evidenceSha256))
-    // listEvidence orders by (stage_id, round_index, rowid), so the last row
-    // written for a stage is the one left in the map.
-    const latest = new Map<string, StageEvidenceRow>()
-    const rows = this.listEvidence(runId)
-    const durable = new Set(rows.map((row) => row.evidence_sha256))
-    const blockers: string[] = []
-    for (const entry of entries) {
-      if (!durable.has(entry.evidenceSha256)) {
-        blockers.push(
-          `${entry.stage} round ${entry.round}: the attested evidence row is missing from the ledger`
-        )
-      }
-    }
-    for (const row of rows) latest.set(row.stage_id, row)
-    for (const [stage, row] of latest) {
-      const label = `${stage} round ${row.round_index}`
-      if (!attested.has(row.evidence_sha256)) {
-        blockers.push(`${label}: the ledger evidence row is absent from the attestation`)
-        continue
-      }
-      if (row.findings_json === null) {
-        blockers.push(`${label}: recorded findings are unreadable`)
-        continue
-      }
-      if (!row.artifact_sha256) {
-        blockers.push(`${label}: no artifact digest was recorded`)
-        continue
-      }
-      let artifact: Buffer
-      try {
-        const info = statSync(row.artifact_path)
-        if (!info.isFile()) throw new Error('not a regular file')
-        if (info.size > MAX_LOG_BYTES) throw new Error('larger than the log cap')
-        artifact = readFileSync(row.artifact_path)
-      } catch {
-        blockers.push(`${label}: artifact ${row.artifact_path} is missing or unreadable`)
-        continue
-      }
-      const artifactSha256 = sha256(artifact)
-      if (artifactSha256 !== row.artifact_sha256) {
-        blockers.push(`${label}: artifact ${row.artifact_path} does not match its recorded digest`)
-        continue
+      if (row.findings_json !== null) {
+        let artifactFindings: unknown
+        try {
+          const parsed = JSON.parse(artifact.toString('utf8')) as { findings?: unknown } | null
+          if (!parsed || typeof parsed !== 'object' || !Object.hasOwn(parsed, 'findings')) {
+            throw new Error('artifact findings are unreadable')
+          }
+          artifactFindings = parsed.findings
+        } catch {
+          problems.push(`${label}: artifact findings are unreadable`)
+          continue
+        }
+        if (JSON.stringify(artifactFindings) !== row.findings_json) {
+          problems.push(`${label}: recorded findings do not match the attested artifact`)
+          continue
+        }
       }
       const expected = evidenceSha256({
         artifactSha256,
@@ -1194,22 +1110,51 @@ export class DomainLedger {
         workerIdentity: row.worker_identity
       })
       if (expected !== row.evidence_sha256) {
-        blockers.push(`${label}: evidence digest does not match its recorded fields`)
-        continue
+        problems.push(`${label}: evidence digest does not match its recorded fields`)
       }
-      let artifactFindings: unknown
-      try {
-        const parsed = JSON.parse(artifact.toString('utf8')) as { findings?: unknown } | null
-        if (!parsed || typeof parsed !== 'object' || !Object.hasOwn(parsed, 'findings')) {
-          throw new Error('artifact findings are unreadable')
-        }
-        artifactFindings = parsed.findings
-      } catch {
-        blockers.push(`${label}: artifact findings are unreadable`)
-        continue
-      }
-      if (JSON.stringify(artifactFindings) !== row.findings_json) {
-        blockers.push(`${label}: recorded findings do not match the attested artifact`)
+    }
+    return { problems, rows }
+  }
+
+  /**
+   * Stages that must not be attested: the latest recorded round still carries a
+   * finding nobody addressed, and no gate decision waived it. Findings come from
+   * the durable evidence rows, so this holds independently of whatever the
+   * coordinator's stage loop believed about the run. Unreadable findings block
+   * too -- an unresolved stage and an unreadable one are equally unattestable.
+   */
+  attestationBlockers(runId: string, entries: StageEvidenceManifestEntry[]): string[] {
+    const evidence = this.#verifyEvidence(runId, entries)
+    if (evidence.problems.length > 0) return evidence.problems
+
+    // Keyed by the exact evidence digest the decision was recorded against, so a
+    // waiver never carries over to a later round of the same stage.
+    const auditsByGateId = new Map(
+      this.listGateAudit(runId).map((audit) => [audit.gate_id, audit])
+    )
+    const waived = new Set(
+      entries
+        .filter((entry) => {
+          const waiver = entry.waiverOrApproval
+          if (!waiver) return false
+          const audit = auditsByGateId.get(waiver.gateId)
+          return (
+            audit?.stage_id === entry.stage &&
+            audit.decision === waiver.decision &&
+            audit.resolved_at !== null
+          )
+        })
+        .map((entry) => entry.evidenceSha256)
+    )
+    // listEvidence orders by (stage_id, round_index, rowid), so the last row
+    // written for a stage is the one left in the map.
+    const latest = new Map<string, StageEvidenceRow>()
+    for (const row of evidence.rows) latest.set(row.stage_id, row)
+    const blockers: string[] = []
+    for (const [stage, row] of latest) {
+      const label = `${stage} round ${row.round_index}`
+      if (row.findings_json === null) {
+        blockers.push(`${label}: recorded findings are unreadable`)
         continue
       }
       let unresolved: number
@@ -1405,7 +1350,7 @@ export class DomainLedger {
   listGateAudit(runId: string): GateAuditRow[] {
     return this.#db
       .prepare(
-        `SELECT decision, gate_id, gate_kind, guidance, resolution, resolved_at
+        `SELECT decision, gate_id, stage_id, gate_kind, guidance, resolution, resolved_at
          FROM gate_audit WHERE run_id = ? ORDER BY opened_at, rowid`
       )
       .all(runId) as GateAuditRow[]

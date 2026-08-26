@@ -10320,9 +10320,13 @@ test("a stage whose findings were never addressed cannot be attested", async () 
   let round = 0;
   const recordReviewRound = async (findingsJson?: string) => {
     round += 1;
-    const artifactPath = ledger
+    const initialArtifactPath = ledger
       .listEvidence(result.runId)
       .find((row) => row.stage_id === "review")!.artifact_path;
+    const artifactPath = path.join(
+      path.dirname(initialArtifactPath),
+      `manual-review-r${round}.json`,
+    );
     const artifactBytes = Buffer.from(
       findingsJson === "not json"
         ? "{"
@@ -10370,20 +10374,19 @@ test("a stage whose findings were never addressed cannot be attested", async () 
     "review round 1: 1 unaddressed finding(s) and no recorded waiver or approval",
   ]);
 
-  const withWaiver = (evidenceSha256: string) => {
-    const reviewEntry = entries.find((entry) => entry.stage === "review")!;
-    return [
-      ...entries,
-      {
-        ...reviewEntry,
-        evidenceSha256,
-        waiverOrApproval: {
-          decision: "approve" as const,
-          gateId: "gate-1",
-          resolvedAt: new Date().toISOString(),
-        },
-      },
-    ];
+  const withWaiver = (evidenceSha256: string, gateId = "gate-1") => {
+    return entries.map((entry) =>
+      entry.evidenceSha256 === evidenceSha256
+        ? {
+            ...entry,
+            waiverOrApproval: {
+              decision: "approve" as const,
+              gateId,
+              resolvedAt: new Date().toISOString(),
+            },
+          }
+        : entry,
+    );
   };
   const evidenceForRound = (roundIndex: number) =>
     ledger
@@ -10401,6 +10404,16 @@ test("a stage whose findings were never addressed cannot be attested", async () 
     runId: result.runId,
     stageId: "review",
   });
+  ledger.recordGateAudit({
+    decision: "approve",
+    gateId: "gate-2",
+    optionsJson: '["approve"]',
+    question: "q",
+    resolution: "approve",
+    roundIndex: 1,
+    runId: result.runId,
+    stageId: "document",
+  });
 
   // A waiver recorded against an earlier round does not carry over to this one.
   const staleWaiver = withWaiver(
@@ -10409,6 +10422,16 @@ test("a stage whose findings were never addressed cannot be attested", async () 
   assert.deepEqual(ledger.attestationBlockers(result.runId, staleWaiver), [
     "review round 1: 1 unaddressed finding(s) and no recorded waiver or approval",
   ]);
+
+  assert.deepEqual(
+    ledger.attestationBlockers(
+      result.runId,
+      withWaiver(evidenceForRound(1), "gate-2"),
+    ),
+    [
+      "review round 1: 1 unaddressed finding(s) and no recorded waiver or approval",
+    ],
+  );
 
   // A gate decision on this round's evidence waives what is left open.
   assert.deepEqual(
@@ -10419,22 +10442,31 @@ test("a stage whose findings were never addressed cannot be attested", async () 
   // Informational findings are not something to address.
   await recordReviewRound('[{"id":"note","action":"no-op"}]');
   assert.deepEqual(ledger.attestationBlockers(result.runId, entries), []);
-
-  await recordReviewRound("not json");
-  assert.deepEqual(ledger.attestationBlockers(result.runId, entries), [
-    "review round 3: artifact findings are unreadable",
-  ]);
   assert.deepEqual(
-    ledger.attestationBlockers(result.runId, withWaiver(evidenceForRound(3))),
-    ["review round 3: artifact findings are unreadable"],
+    ledger.attestationBlockers(
+      result.runId,
+      entries.filter(
+        (entry) => !(entry.stage === "review" && entry.round === 1),
+      ),
+    ),
+    ["review round 1: the ledger evidence row is absent from the attestation"],
   );
 
   await recordReviewRound();
   assert.deepEqual(ledger.attestationBlockers(result.runId, entries), [
-    "review round 4: recorded findings are unreadable",
+    "review round 3: recorded findings are unreadable",
+  ]);
+  assert.deepEqual(
+    ledger.attestationBlockers(result.runId, withWaiver(evidenceForRound(3))),
+    ["review round 3: recorded findings are unreadable"],
+  );
+
+  await recordReviewRound("not json");
+  assert.deepEqual(ledger.attestationBlockers(result.runId, entries), [
+    "review round 4: artifact findings are unreadable",
   ]);
   assert.deepEqual(
     ledger.attestationBlockers(result.runId, withWaiver(evidenceForRound(4))),
-    ["review round 4: recorded findings are unreadable"],
+    ["review round 4: artifact findings are unreadable"],
   );
 });
