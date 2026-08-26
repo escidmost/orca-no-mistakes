@@ -1125,8 +1125,18 @@ export class DomainLedger {
   attestationBlockers(runId: string, entries: StageEvidenceManifestEntry[]): string[] {
     // Keyed by the exact evidence digest the decision was recorded against, so a
     // waiver never carries over to a later round of the same stage.
+    const auditsByGateId = new Map(
+      this.listGateAudit(runId).map((audit) => [audit.gate_id, audit])
+    )
     const waived = new Set(
-      entries.filter((entry) => entry.waiverOrApproval).map((entry) => entry.evidenceSha256)
+      entries
+        .filter((entry) => {
+          const waiver = entry.waiverOrApproval
+          if (!waiver) return false
+          const audit = auditsByGateId.get(waiver.gateId)
+          return audit?.decision === waiver.decision && audit.resolved_at !== null
+        })
+        .map((entry) => entry.evidenceSha256)
     )
     const attested = new Set(entries.map((entry) => entry.evidenceSha256))
     // listEvidence orders by (stage_id, round_index, rowid), so the last row

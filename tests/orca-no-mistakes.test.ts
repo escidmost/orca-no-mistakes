@@ -478,6 +478,22 @@ class DeletedEvidenceLedger extends DomainLedger {
   }
 }
 
+class DeletedGateAuditLedger extends DomainLedger {
+  override recordGateAudit(
+    input: Parameters<DomainLedger["recordGateAudit"]>[0],
+  ): void {
+    super.recordGateAudit(input);
+    const database = new DatabaseSync(this.path);
+    try {
+      database
+        .prepare("DELETE FROM gate_audit WHERE gate_id = ?")
+        .run(input.gateId);
+    } finally {
+      database.close();
+    }
+  }
+}
+
 // Seeds a trusted-base policy that explicitly authorizes review auto-fix,
 // opting these scenarios out of the ADR-0007 default gate.
 const allowReviewAutoFix = (git: FakeGit) => {
@@ -8223,6 +8239,39 @@ test("gate approvals are audited and bound into the attestation as a waiver", as
   );
 });
 
+test("missing durable gate audit cannot waive findings", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  orca.gateResolution = "approve";
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-finding",
+          severity: "error",
+          action: "ask-user",
+          description: "Needs durable approval.",
+        },
+      ],
+      summary: "decision needed",
+    },
+  ]);
+  const dir = await mkdtemp(path.join(tmpdir(), "onm-missing-gate-audit-"));
+  const ledger = new DeletedGateAuditLedger(path.join(dir, "ledger.db"));
+  try {
+    await assert.rejects(
+      runPipeline({ intent: "Require durable gate approvals." }, orca, git, ledger),
+      /this run cannot be attested: review round 0: 1 unaddressed finding\(s\) and no recorded waiver or approval/,
+    );
+    const runId = ledger.listRuns()[0].run_id;
+    assert.equal(ledger.listGateAudit(runId).length, 0);
+    assert.equal(ledger.runStatus(runId), "failed");
+  } finally {
+    ledger.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("attestation verification detects tampering", async () => {
   const git = new FakeGit();
   const orca = new FakeOrca(git);
@@ -10341,6 +10390,17 @@ test("a stage whose findings were never addressed cannot be attested", async () 
       .listEvidence(result.runId)
       .find((row) => row.stage_id === "review" && row.round_index === roundIndex)!
       .evidence_sha256;
+
+  ledger.recordGateAudit({
+    decision: "approve",
+    gateId: "gate-1",
+    optionsJson: '["approve"]',
+    question: "q",
+    resolution: "approve",
+    roundIndex: 1,
+    runId: result.runId,
+    stageId: "review",
+  });
 
   // A waiver recorded against an earlier round does not carry over to this one.
   const staleWaiver = withWaiver(
