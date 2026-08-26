@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   chmod,
+  link,
   mkdir,
   mkdtemp,
   readdir,
@@ -10,6 +11,7 @@ import {
   realpath,
   rm,
   stat,
+  symlink,
   utimes,
   writeFile,
 } from "node:fs/promises";
@@ -51,7 +53,7 @@ import {
   classifyPreflightFailure,
   shellQuote,
 } from "../scripts/adapters.ts";
-import { artifactsRoot } from "../scripts/ledger.ts";
+import { StageLog, artifactsRoot } from "../scripts/ledger.ts";
 import { loadUserConfig } from "../scripts/config.ts";
 import { effectivePolicyHash } from "../scripts/policy.ts";
 
@@ -6938,6 +6940,169 @@ function isolateHomes(temp: string): () => void {
   };
 }
 
+test("a silent delivery channel fails the worker instead of hanging the run", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-worker-watchdog-"));
+  const fakeOrca = path.join(temp, "orca");
+  const restoreHomes = isolateHomes(temp);
+  const previousIdle = process.env.WORKER_IDLE_TIMEOUT_MS;
+  process.env.WORKER_IDLE_TIMEOUT_MS = "600";
+  try {
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+const args = process.argv.slice(2)
+const out = (result) => console.log(JSON.stringify({ result }))
+if (args[0] === 'orchestration' && args[1] === 'run-create') {
+  out({ run: { id: 'watchdog-run' } })
+} else if (args[0] === 'terminal' && args[1] === 'create') {
+  out({ terminal: { handle: 'worker-terminal' } })
+} else if (args[0] === 'terminal' && args[1] === 'read') {
+  out({ terminal: { tail: [], oldestCursor: 0, nextCursor: 0, latestCursor: 0 } })
+} else if (args[0] === 'terminal' && args[1] === 'show') {
+  // The terminal never produces anything new, so activity never advances.
+  out({ terminal: { connected: true, title: 'OpenCode', preview: 'ready', lastOutputAt: 1, worktreeId: 'worker-worktree' } })
+} else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
+  out({ dispatch: { id: 'dispatch-1', status: 'dispatched' }, injected: true, preamble: 'authenticated' })
+} else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
+  // The delivery channel goes silent: no keepalive, no heartbeat, no answer.
+  // Nothing inside the wait loop can notice, because the loop never ticks.
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 4000)
+  out({ _keepalive: true })
+} else {
+  out({ ok: true })
+}
+`,
+    );
+    await chmod(fakeOrca, 0o755);
+    const orca = new CliOrca({ command: fakeOrca, cwd: temp });
+    await orca.createRun("watchdog");
+    await assert.rejects(
+      orca.startWorker("task-1", {
+        name: "no-mistakes-review-1",
+        prompt: "Review now.",
+        role: "reviewer",
+        stage: "review",
+        worktree: "current",
+      }),
+      /produced no output/,
+    );
+  } finally {
+    if (previousIdle === undefined) delete process.env.WORKER_IDLE_TIMEOUT_MS;
+    else process.env.WORKER_IDLE_TIMEOUT_MS = previousIdle;
+    restoreHomes();
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("worker terminal output is drained into the run's stage log", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-worker-log-"));
+  const fakeOrca = path.join(temp, "orca");
+  const callsPath = path.join(temp, "calls.jsonl");
+  const heartbeatCountPath = path.join(temp, "heartbeat-count");
+  const heartbeatProbePath = path.join(temp, "heartbeat-probe");
+  const restoreHomes = isolateHomes(temp);
+  try {
+    const evidence = path.join(temp, "home", "artifacts", "log-run");
+    await mkdir(evidence, { recursive: true });
+    const reportPath = path.join(evidence, "review-1.json");
+    const logPath = path.join(evidence, "review_r0.log");
+    await writeFile(reportPath, JSON.stringify(pass("review clean")));
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+const out = (result) => console.log(JSON.stringify({ result }))
+const cursor = args.includes('--cursor') ? args[args.indexOf('--cursor') + 1] : undefined
+if (args[0] === 'orchestration' && args[1] === 'run-create') {
+  out({ run: { id: 'log-run' } })
+} else if (args[0] === 'terminal' && args[1] === 'create') {
+  out({ terminal: { handle: 'worker-terminal' } })
+} else if (args[0] === 'terminal' && args[1] === 'read') {
+  // An uncursored read is a preview: it serves the newest lines only, and its
+  // last line may still be being written. Capture has to page from
+  // oldestCursor instead of persisting it.
+  if (cursor === undefined) out({ terminal: { tail: ['done'], oldestCursor: 0, nextCursor: 3, latestCursor: 3 } })
+  else if (cursor === '0') out({ terminal: { tail: ['npm test', 'ok 12 passed'], nextCursor: 2, latestCursor: 3 } })
+  else if (cursor === '2') out({ terminal: { tail: ['done'], nextCursor: 3, latestCursor: 3 } })
+  else out({ terminal: { tail: [], nextCursor: Number(cursor), latestCursor: Number(cursor) } })
+} else if (args[0] === 'terminal' && args[1] === 'show') {
+  out({ terminal: { connected: true, title: 'OpenCode', preview: 'ready', lastOutputAt: 1, worktreeId: 'worker-worktree' } })
+} else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
+  out({ dispatch: { id: 'dispatch-1', status: 'dispatched' }, injected: true, preamble: 'authenticated' })
+} else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
+  const count = fs.existsSync(${JSON.stringify(heartbeatCountPath)}) ? Number(fs.readFileSync(${JSON.stringify(heartbeatCountPath)}, 'utf8')) : 0
+  fs.writeFileSync(${JSON.stringify(heartbeatCountPath)}, String(count + 1))
+  if (count === 0) {
+    out({ deliveryId: 'heartbeat-1', messages: [{ type: 'heartbeat', body: 'still reviewing', payload: JSON.stringify({ taskId: 'task-1', dispatchId: 'dispatch-1' }) }] })
+  } else {
+    fs.writeFileSync(${JSON.stringify(heartbeatProbePath)}, fs.existsSync(${JSON.stringify(logPath)}) ? fs.readFileSync(${JSON.stringify(logPath)}, 'utf8') : '')
+    out({ deliveryId: 'delivery-1', messages: [{ type: 'worker_done', body: 'Reviewed the change.', payload: JSON.stringify({ taskId: 'task-1', dispatchId: 'dispatch-1', outcome: 'succeeded', reportPath: ${JSON.stringify(reportPath)} }) }] })
+  }
+} else {
+  out({ ok: true })
+}
+`,
+    );
+    await chmod(fakeOrca, 0o755);
+    const orca = new CliOrca({ command: fakeOrca, cwd: temp });
+    await orca.createRun("stage log capture");
+
+    const worker = await orca.startWorker("task-1", {
+      logPath,
+      name: "no-mistakes-review-1",
+      prompt: "Review now.",
+      role: "reviewer",
+      stage: "review",
+      worktree: "current",
+    });
+
+    assert.equal(worker.report.summary, "review clean");
+    // Capture stays attached until the terminal closes, so the log is only
+    // final once the worker is released.
+    await orca.finishWorker(worker, "release");
+    const captured = await readFile(logPath, "utf8");
+    assert.equal(captured, "npm test\nok 12 passed\ndone\n");
+    // What the heartbeat saw mid-run is a prefix of the finished transcript:
+    // the point is that output was already durable before the worker ended.
+    const probed = await readFile(heartbeatProbePath, "utf8");
+    assert.ok(captured.startsWith(probed));
+    assert.ok(probed.includes("npm test"));
+
+    const reads = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[])
+      .filter((args) => args[0] === "terminal" && args[1] === "read");
+    // Paging resumes from the cursor, so a terminal reused by a later round
+    // never replays output it already recorded. The count of reads is not
+    // pinned: teardown may drain once more against an exhausted cursor, which
+    // appends nothing -- the exact-content assertion above is what proves no
+    // output was lost or repeated.
+    const cursors = reads.map((args) =>
+      args.includes("--cursor") ? args[args.indexOf("--cursor") + 1] : null,
+    );
+    assert.equal(cursors[0], null);
+    // Uncursored reads are previews by design -- the first one, and the one
+    // that collects a trailing partial line at release. Only the paging reads
+    // carry a cursor, and those are what must never rewind.
+    const advanced = cursors
+      .filter((cursor) => cursor !== null)
+      .map((cursor) => Number(cursor));
+    assert.ok(advanced.every((cursor) => Number.isFinite(cursor)));
+    for (let index = 1; index < advanced.length; index += 1) {
+      assert.ok(
+        advanced[index]! >= advanced[index - 1]!,
+        `cursor went backwards: ${advanced.join(", ")}`,
+      );
+    }
+  } finally {
+    restoreHomes();
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test("WORKER_AGENT_READY_TIMEOUT_MS tears down an unready CLI agent terminal", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-ready-timeout-"));
   const fakeOrca = path.join(temp, "orca");
@@ -7209,6 +7374,7 @@ test("CliOrca extracts acp reports wrapped in closed JSON fences", async () => {
   const fakeAcpx = path.join(temp, "acpx");
   const fakeOrca = path.join(temp, "orca");
   const worktreePath = path.join(temp, "acp-fence-wt");
+  const logPath = path.join(temp, "acp-fence.log");
   try {
     git(temp, "init", "-b", "feature");
     await mkdir(worktreePath);
@@ -7216,7 +7382,11 @@ test("CliOrca extracts acp reports wrapped in closed JSON fences", async () => {
       fakeAcpx,
       `#!/usr/bin/env node
 const fence = ${JSON.stringify("```")}
-console.log('Review notes:\\n' + fence + 'json\\n' + JSON.stringify({ findings: [], summary: 'fenced done' }) + '\\n' + fence)
+process.stdout.write('stdout-first\\n')
+setTimeout(() => {
+  process.stderr.write('stderr-second\\n')
+  process.stdout.write('Review notes:\\n' + fence + 'json\\n' + JSON.stringify({ findings: [], summary: 'fenced done' }) + '\\n' + fence + '\\n')
+}, 10)
 `,
     );
     await chmod(fakeAcpx, 0o755);
@@ -7241,6 +7411,7 @@ if (args[0] === 'worktree' && args[1] === 'create') {
     });
     const worker = await orca.startWorker("task-acp-fence", {
       agent: { harness: "acp:gemini-dev" },
+      logPath,
       name: "acp-worker",
       prompt: "Review now.",
       role: "reviewer",
@@ -7248,6 +7419,12 @@ if (args[0] === 'worktree' && args[1] === 'create') {
       worktree: "new-child",
     });
     assert.equal(worker.report.summary, "fenced done");
+    const acpLog = await readFile(logPath, "utf8");
+    // stdout and stderr are separate pipes, so only the order within each one
+    // is guaranteed; asserting one interleaving pins a race, not a contract.
+    assert.ok(acpLog.includes("stdout-first"));
+    assert.ok(acpLog.includes("stderr-second"));
+    assert.ok(acpLog.indexOf("stdout-first") < acpLog.indexOf("Review notes:"));
     await orca.finishWorker(worker, "release");
   } finally {
     await rm(temp, { recursive: true, force: true });
@@ -7643,12 +7820,13 @@ test("acp runner timeouts stay execution-phase failures", async () => {
   const fakeAcpx = path.join(temp, "acpx");
   const fakeOrca = path.join(temp, "orca");
   const worktreePath = path.join(temp, "acp-wt");
+  const logPath = path.join(temp, "acp-timeout.log");
   try {
     git(temp, "init", "-b", "feature");
     await mkdir(worktreePath);
     await writeFile(
       fakeAcpx,
-      "#!/usr/bin/env node\nsetTimeout(() => {}, 60000)\n",
+      "#!/usr/bin/env node\nconst fs = require('node:fs')\nfs.writeSync(1, 'before-timeout\\n')\nfs.writeSync(2, 'stderr-before-timeout\\n')\nsetTimeout(() => {}, 60000)\n",
     );
     await chmod(fakeAcpx, 0o755);
     await writeFile(
@@ -7666,7 +7844,10 @@ out({ worktree: { id: 'wt-timeout', path: ${JSON.stringify(worktreePath)} } })
     });
     await assert.rejects(
       orca.startWorker("task-acp", {
-        agent: { harness: "acp:gemini-dev", timeoutMs: 100 },
+        // Long enough for node to boot and flush before the kill, short enough
+        // that the runner still times out against the fake's 60s sleep.
+        agent: { harness: "acp:gemini-dev", timeoutMs: 1_500 },
+        logPath,
         name: "acp-worker",
         prompt: "Review now.",
         role: "reviewer",
@@ -7679,6 +7860,9 @@ out({ worktree: { id: 'wt-timeout', path: ${JSON.stringify(worktreePath)} } })
         return true;
       },
     );
+    const timeoutLog = await readFile(logPath, "utf8");
+    assert.ok(timeoutLog.includes("before-timeout"));
+    assert.ok(timeoutLog.includes("stderr-before-timeout"));
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
@@ -8145,6 +8329,377 @@ test("capLog preserves head and tail of oversized logs", () => {
   assert.ok(capped.startsWith("aaaa"));
   assert.ok(capped.endsWith("bbbb"));
   assert.ok(!capped.includes("MIDDLE"));
+});
+
+test("StageLog streams the head to disk and truncates oversized output head-and-tail", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-"));
+  try {
+    const logPath = path.join(temp, "logs", "review_r0.log");
+    const log = new StageLog(logPath, 2_048);
+    await log.append(`${"a".repeat(1_000)}\n`);
+    // The head is already durable before close, so a coordinator that dies
+    // mid-run still leaves the opening diagnostics behind.
+    assert.ok((await readFile(logPath, "utf8")).startsWith("aaa"));
+    await log.append(`MIDDLE${"m".repeat(4_000)}`);
+    await log.append("b".repeat(700));
+    await log.close();
+
+    const written = await readFile(logPath, "utf8");
+    assert.ok(written.startsWith("aaa"));
+    assert.ok(written.endsWith("bbb"));
+    assert.ok(!written.includes("MIDDLE"));
+    assert.match(
+      written,
+      /\[no-mistakes: log truncated; dropped \d+ bytes; original bytes \d+; retained ranges 0-\d+, \d+-\d+\]/,
+    );
+    assert.equal(written.match(/log truncated/g)?.length, 1);
+    assert.ok(Buffer.byteLength(written) <= 2_048);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("StageLog rejects symlinked log paths", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-symlink-"));
+  try {
+    const directory = path.join(temp, "logs");
+    const target = path.join(temp, "outside.log");
+    const logPath = path.join(directory, "review_r0.log");
+    await mkdir(directory, { recursive: true });
+    await writeFile(target, "safe\n");
+    await symlink(target, logPath);
+
+    await assert.rejects(
+      new StageLog(logPath, 2_048).append("must not escape\n"),
+      /ELOOP|symbolic link|too many levels/i,
+    );
+    assert.equal(await readFile(target, "utf8"), "safe\n");
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("StageLog rejects symlinked artifact directories", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-parent-symlink-"));
+  try {
+    const outside = path.join(temp, "repository");
+    const artifacts = path.join(temp, "artifacts");
+    const directory = path.join(artifacts, "run");
+    const logPath = path.join(directory, "review_r0.log");
+    await mkdir(outside, { recursive: true });
+    await symlink(outside, artifacts);
+
+    await assert.rejects(
+      new StageLog(logPath, 2_048).append("must not escape\n"),
+      /symlink/i,
+    );
+    await assert.rejects(stat(path.join(outside, "run", "review_r0.log")), /ENOENT/);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("StageLog leaves a complete log unmarked", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-whole-"));
+  try {
+    const logPath = path.join(temp, "lint_r0.log");
+    const log = new StageLog(logPath, 2_048);
+    await log.append("everything fits\n");
+    await log.close();
+
+    const written = await readFile(logPath, "utf8");
+    assert.equal(written, "everything fits\n");
+    assert.ok(!written.includes("truncated"));
+
+    const reopened = new StageLog(logPath, 2_048);
+    await reopened.append("next worker\n");
+    await reopened.close();
+    assert.equal(await readFile(logPath, "utf8"), "everything fits\nnext worker\n");
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("StageLog preserves marker-like worker output", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-marker-collision-"));
+  try {
+    const logPath = path.join(temp, "review_r0.log");
+    const markerLike =
+      "\n[no-mistakes: log truncated; dropped 1 bytes; original bytes 2; retained ranges 0-0, 1-1]\n";
+    const first = new StageLog(logPath, 2_048);
+    await first.append(`before${markerLike}after`);
+    await first.close();
+
+    const second = new StageLog(logPath, 2_048);
+    await second.append("next");
+    await second.close();
+
+    assert.equal(await readFile(logPath, "utf8"), `before${markerLike}afternext`);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("StageLog restricts artifact directory and log permissions", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-permissions-"));
+  try {
+    const logsDir = path.join(temp, "logs");
+    const logPath = path.join(logsDir, "review_r0.log");
+    await mkdir(logsDir, { recursive: true, mode: 0o755 });
+    await chmod(logsDir, 0o755);
+    await writeFile(logPath, "existing\n", { mode: 0o644 });
+    await chmod(logPath, 0o644);
+
+    const log = new StageLog(logPath, 2_048);
+    await log.append("new output\n");
+    await log.close();
+    const newLogPath = path.join(logsDir, "lint_r0.log");
+    const newLog = new StageLog(newLogPath, 2_048);
+    await newLog.append("new file\n");
+    await newLog.close();
+
+    assert.equal((await stat(logsDir)).mode & 0o777, 0o700);
+    assert.equal((await stat(logPath)).mode & 0o777, 0o600);
+    assert.equal((await stat(newLogPath)).mode & 0o777, 0o600);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("StageLog holds every worker of a round to one shared cap", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-share-"));
+  try {
+    const logPath = path.join(temp, "review_r1.log");
+    const workers = Array.from({ length: 20 }, (_, index) =>
+      String.fromCharCode(97 + index),
+    );
+    for (const worker of workers) {
+      const log = new StageLog(logPath, 2_048);
+      await log.append(worker.repeat(2_000));
+      await log.close();
+    }
+
+    const written = await readFile(logPath, "utf8");
+    // A per-instance cap would let each worker add its own head or tail
+    // block and carry the round's log past the limit.
+    assert.ok(Buffer.byteLength(written) <= 2_048);
+    // The first worker still owns the head, so the round reads in order.
+    assert.ok(written.startsWith("aaa"));
+    assert.ok(written.includes("[no-mistakes: log truncated;"));
+    assert.ok(written.endsWith("t".repeat(384)));
+    assert.match(written, /original bytes 40000/);
+    assert.match(written, /retained ranges 0-383, 39616-39999/);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("StageLog leaves the round's log alone when a worker is silent", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-silent-"));
+  try {
+    const logPath = path.join(temp, "review_r0.log");
+    const first = new StageLog(logPath, 2_048);
+    await first.append("w".repeat(3_000));
+    await first.close();
+    const before = await readFile(logPath, "utf8");
+
+    // Reopening truncates back to the head to make room for a new tail, so a
+    // worker that printed nothing must not open the log at all -- otherwise it
+    // discards the previous worker's tail and truncation marker on its way out.
+    const silent = new StageLog(logPath, 2_048);
+    await silent.close();
+    assert.equal(await readFile(logPath, "utf8"), before);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("StageLog will not append through a hard link to another file", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-link-"));
+  try {
+    const tracked = path.join(temp, "tracked.ts");
+    await writeFile(tracked, "source\n");
+    const logPath = path.join(temp, "review_r0.log");
+    // O_NOFOLLOW rejects a symlink but opens a hard link happily, and the
+    // opened inode would then be appended to, chmod'd and truncated.
+    await link(tracked, logPath);
+    const log = new StageLog(logPath, 2_048);
+    await assert.rejects(
+      log.append("worker output\n").then(() => log.close()),
+      /private regular file/,
+    );
+    assert.equal(await readFile(tracked, "utf8"), "source\n");
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("StageLog refreshes the marker when a compacted round gets more output", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-refresh-"));
+  try {
+    const logPath = path.join(temp, "review_r0.log");
+    const first = new StageLog(logPath, 2_048);
+    await first.append("h".repeat(3_000));
+    await first.close();
+    const second = new StageLog(logPath, 2_048);
+    await second.append("later\n");
+    await second.close();
+    const written = await readFile(logPath, "utf8");
+    // The file is back under the cap, so nothing forces a recompaction -- but
+    // the marker from the first worker would still describe its tail and its
+    // byte total, neither of which is true any more.
+    assert.ok(written.endsWith("later\n"));
+    assert.match(written, /original bytes 3006/);
+    assert.doesNotMatch(written, /original bytes 3000/);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("StageLog repairs an over-cap log left by an interrupted run", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-repair-"));
+  try {
+    const logPath = path.join(temp, "review_r0.log");
+    await writeFile(logPath, `${"a".repeat(3_000)}${"z".repeat(3_000)}`);
+    const log = new StageLog(logPath, 2_048);
+    await log.append("more\n");
+    await log.close();
+    const written = await readFile(logPath, "utf8");
+    // Reopening repairs the artifact instead of refusing it: the head and the
+    // latest tail survive, and the file is back under its cap.
+    assert.ok(Buffer.byteLength(written) <= 2_048);
+    assert.ok(written.startsWith("aaa"));
+    assert.ok(written.endsWith("more\n"));
+    assert.match(written, /log truncated/);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("StageLog will not write byte totals through a symlinked sidecar", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-meta-"));
+  try {
+    const logPath = path.join(temp, "review_r0.log");
+    const outside = path.join(temp, "outside.txt");
+    await writeFile(outside, "untouched");
+    await symlink(outside, `${logPath}.meta`);
+    const log = new StageLog(logPath, 2_048);
+    await log.append("hello\n");
+    await log.close();
+    assert.equal(await readFile(outside, "utf8"), "untouched");
+    assert.equal(await readFile(logPath, "utf8"), "hello\n");
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("StageLog redacts a credential split across two appends", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-split-"));
+  const previous = process.env.ONM_TEST_TOKEN;
+  const secret = "split-worker-token-4567";
+  process.env.ONM_TEST_TOKEN = secret;
+  try {
+    const logPath = path.join(temp, "review_r0.log");
+    const log = new StageLog(logPath, 4_096);
+    // Terminal drain pages and ACP events split at arbitrary boundaries, so a
+    // token can straddle two appends and be whole in neither.
+    await log.append(`worker printed ${secret.slice(0, 9)}`);
+    await log.append(`${secret.slice(9)} and carried on\n`);
+    await log.close();
+    const written = await readFile(logPath, "utf8");
+    assert.ok(!written.includes(secret));
+    assert.match(written, /\[REDACTED\]/);
+    assert.match(written, /and carried on/);
+  } finally {
+    if (previous === undefined) delete process.env.ONM_TEST_TOKEN;
+    else process.env.ONM_TEST_TOKEN = previous;
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("StageLog redacts known credentials before persistence", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-redaction-"));
+  const previous = process.env.ONM_TEST_TOKEN;
+  const secret = "known-worker-token-123";
+  process.env.ONM_TEST_TOKEN = secret;
+  try {
+    const logPath = path.join(temp, "review_r0.log");
+    const log = new StageLog(logPath, 2_048);
+    await log.append(`worker printed ${secret}\n`);
+    await log.close();
+    const written = await readFile(logPath, "utf8");
+    assert.ok(!written.includes(secret));
+    assert.match(written, /\[REDACTED\]/);
+  } finally {
+    if (previous === undefined) delete process.env.ONM_TEST_TOKEN;
+    else process.env.ONM_TEST_TOKEN = previous;
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("every worker launch streams its raw output to the run artifact directory", async () => {
+  // The pipeline writes real artifacts, so keep them out of the developer's
+  // own home directory and clean them up even when an assertion fails.
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-launch-logs-"));
+  const restoreHomes = isolateHomes(temp);
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  const orca = new FakeOrca(git);
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Null input crashes the command",
+        },
+      ],
+      summary: "one defect",
+    },
+    pass("repair committed"),
+  ]);
+
+  const result = await runPipeline(
+    { intent: "Keep every transcript outside the repository." },
+    orca,
+    git,
+  );
+
+  const runArtifacts = path.join(artifactsRoot(), result.runId);
+  try {
+  assert.ok(orca.launches.length > 0);
+  for (const launch of orca.launches) {
+    // Criterion: the transcript lands in the run's artifact directory, never
+    // anywhere inside the checked-out repository.
+    assert.equal(path.dirname(launch.logPath!), runArtifacts);
+    assert.match(
+      path.basename(launch.logPath!),
+      new RegExp(`^${launch.stage}_r\\d+\\.log$`),
+    );
+    assert.ok(!launch.logPath!.startsWith("/repo/"));
+  }
+
+  const reviewLaunches = orca.launches.filter(
+    (launch) => launch.stage === "review",
+  );
+  assert.deepEqual(
+    reviewLaunches.map((launch) => [
+      launch.role,
+      path.basename(launch.logPath!),
+    ]),
+    [
+      ["reviewer", "review_r0.log"],
+      ["fixer", "review_r1.log"],
+      ["reviewer", "review_r1.log"],
+    ],
+  );
+
+  } finally {
+    await rm(runArtifacts, { recursive: true, force: true });
+    restoreHomes();
+    await rm(temp, { recursive: true, force: true });
+  }
 });
 
 test("prune removes completed runs with their evidence while retaining in-progress runs", async () => {
