@@ -83,6 +83,12 @@ const HEX_64 = /^[0-9a-f]{64}$/
 export const RUN_ID_PATTERN = /^[A-Za-z0-9._-]+$/
 const COMMIT_OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
 
+function isCanonicalTimestamp(value: unknown): value is string {
+  if (typeof value !== 'string') return false
+  const date = new Date(value)
+  return !Number.isNaN(date.getTime()) && date.toISOString() === value
+}
+
 /**
  * Binds an evidence digest to the exact execution that produced it:
  * (run_id, stage_id, round_index, candidate_commit_oid, base_commit_oid,
@@ -226,12 +232,7 @@ export function verifyManifest(manifest: PassedAttestationManifest): void {
   ) {
     throw new Error('attestation coordinator version is invalid')
   }
-  const createdAt = new Date(manifest.createdAt)
-  if (
-    typeof manifest.createdAt !== 'string' ||
-    Number.isNaN(createdAt.getTime()) ||
-    createdAt.toISOString() !== manifest.createdAt
-  ) {
+  if (!isCanonicalTimestamp(manifest.createdAt)) {
     throw new Error('attestation creation timestamp is invalid')
   }
   if (
@@ -277,6 +278,19 @@ export function verifyManifest(manifest: PassedAttestationManifest): void {
       entry.summary.trim() === ''
     ) {
       throw new Error(`attestation stage evidence entry ${index} has invalid required fields`)
+    }
+    if (entry.waiverOrApproval !== undefined) {
+      const waiver = entry.waiverOrApproval
+      if (
+        !waiver ||
+        typeof waiver !== 'object' ||
+        (waiver.decision !== 'approve' && waiver.decision !== 'skip') ||
+        typeof waiver.gateId !== 'string' ||
+        waiver.gateId.trim() === '' ||
+        !isCanonicalTimestamp(waiver.resolvedAt)
+      ) {
+        throw new Error(`attestation stage evidence entry ${index} has an invalid waiver`)
+      }
     }
     if (!HEX_64.test(entry.evidenceSha256)) {
       throw new Error(`stage ${entry.stage} evidence hash is not a SHA-256`)

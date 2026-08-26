@@ -863,9 +863,9 @@ export async function runPipeline(
       policySha256: policySha256Value,
       runId,
     });
-    ledger.recordAttestation(attestation);
     ledger.finishRun(runId, "passed", terminalCommitOid);
     ledger.releaseLease(runId);
+    ledger.recordAttestation(attestation);
     await orca
       .setWorktreeStatus(
         `${statusPrefix}no-mistakes passed all ${PIPELINE_STEPS.length} stages`,
@@ -6416,6 +6416,18 @@ Run options:
   }
 }
 
+function assertStoredAttestationPassed(
+  ledger: DomainLedger,
+  manifest: PassedAttestationManifest,
+): void {
+  const status = ledger.runStatus(manifest.runId);
+  if (status !== "passed") {
+    throw new Error(
+      `run ${manifest.runId} has a stored attestation but status is ${status ?? "absent"}`,
+    );
+  }
+}
+
 async function runAttestationCommand(
   positionals: string[],
   flags: RawCliFlags,
@@ -6433,6 +6445,7 @@ async function runAttestationCommand(
     if (action === "export") {
       const manifest = ledger.getAttestation(ref);
       verifyManifest(manifest);
+      assertStoredAttestationPassed(ledger, manifest);
       const output = `${JSON.stringify(manifest, null, 2)}\n`;
       const outPath = stringFlag(flags, "out");
       if (outPath) {
@@ -6485,6 +6498,7 @@ async function runAttestationCommand(
         "manifest does not match the attestation recorded in the domain ledger",
       );
     }
+    assertStoredAttestationPassed(ledger, manifest);
     const problems = ledger.verifyEvidence(manifest);
     if (problems.length > 0) {
       throw new Error(
