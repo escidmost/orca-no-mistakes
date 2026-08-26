@@ -4521,10 +4521,12 @@ function weakensInlineTestValidation(
   source: string | undefined,
 ): boolean {
   if (source === expectedSource) return false;
+  const qualifiedTestDeclaration = /(?<![.\w$])(?:Deno|vitest)\.test(?:\.[A-Za-z_$][\w$]*)*\s*\(/u;
   const testDeclaration = /(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|rstest|(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test)\s*\]|@(?:[A-Za-z_][\w]*\.)*(?:ParameterizedTest|Test|TestMethod|DataTestMethod)\b|\[(?:(?:[A-Za-z_][\w]*\.)*(?:Fact|Test|Theory|TestMethod|DataTestMethod)|(?:[A-Za-z_][\w]*\.)*TestCase(?:\([^\]\n]*\))?)\]|(?<![.\w$])(?:describe|context|it|test)(?:\.[A-Za-z_$][\w$]*)*\s*\(|\b(?:SCENARIO|TEMPLATE_TEST_CASE|TEST_CASE)\s*\(|\btest\s+"(?:[^"\\]|\\.)*"\s*\{|(?:^|\n)\s*(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(|\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b)/iu;
   const inlineAssertion = /(?:(?:^|\n)\s*assert\s+\S|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\b(?:CHECK|REQUIRE)(?:_[A-Z0-9_]+)?\s*\(|\b(?:[A-Za-z_][\w]*\.)*Assert\.[A-Za-z_][\w]*\s*\(|\.should\.(?:deep\.)?(?:equal|eql|match|throw)\s*\(|\b(?:deepStrictEqual|strictEqual|notDeepStrictEqual|notStrictEqual|doesNotReject|doesNotThrow|ifError|rejects|throws)\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|\bassert[A-Z][A-Za-z0-9_$]*\s*\(|\bstd\.testing\.expect[A-Za-z0-9_]*\s*\(|\bexpect(?:\.(?:poll|soft))?\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
   const nodeAssertImport = /(?:from\s+["'](?:node:)?assert(?:\/strict)?["']|require\s*\(\s*["'](?:node:)?assert(?:\/strict)?["']\s*\))/u;
   if (
+    qualifiedTestDeclaration.test(expectedSource) ||
     testDeclaration.test(expectedSource) ||
     /\.should(?:\.[A-Za-z_$][\w$]*)+/u.test(expectedSource) ||
     nodeAssertImport.test(expectedSource) ||
@@ -4537,6 +4539,22 @@ function weakensInlineTestValidation(
   // rewrites one of the asserting lines. The rest of the file stays fixable.
   const validationLines = (text: string): string[] =>
     text.split("\n").filter((line) => inlineAssertion.test(line));
+  const expectedLines = expectedSource.split("\n");
+  if (
+    expectedLines.some((line, index) => {
+      const assertion = inlineAssertion.exec(line);
+      if (!assertion) return false;
+      const nextLine = expectedLines[index + 1] ?? "";
+      return (
+        (assertion[0].endsWith("(") &&
+          !/\)\s*;?\s*(?:(?:\/\/|#).*)?$/u.test(line.slice(assertion.index))) ||
+        /\\\s*$/u.test(line) ||
+        /^\s*\??\./u.test(nextLine)
+      );
+    })
+  ) {
+    return true;
+  }
   const remaining = validationLines(source ?? "");
   for (const line of validationLines(expectedSource)) {
     const index = remaining.indexOf(line);
