@@ -6432,6 +6432,7 @@ async function runAttestationCommand(
   try {
     if (action === "export") {
       const manifest = ledger.getAttestation(ref);
+      verifyManifest(manifest);
       const output = `${JSON.stringify(manifest, null, 2)}\n`;
       const outPath = stringFlag(flags, "out");
       if (outPath) {
