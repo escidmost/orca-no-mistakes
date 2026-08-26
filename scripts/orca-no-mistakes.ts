@@ -611,6 +611,17 @@ export async function runPipeline(
             exhausted ? stageAutoFix.max_rounds : undefined,
           );
           const gateId = await orca.createGate(taskId, question, gateOptions);
+          // Durable before the block: an interrupted run still shows why the
+          // gate opened and that nobody has resolved it yet.
+          ledger.openGateAudit({
+            gateId,
+            gateKind: exhausted ? "exhaustion" : "finding",
+            optionsJson: JSON.stringify(gateOptions),
+            question,
+            roundIndex: round,
+            runId,
+            stageId: stage,
+          });
           const resolution = (await orca.waitForGate(gateId)).trim();
           const decision = parseGateResolution(resolution, actionable);
           ledger.recordGateAudit({

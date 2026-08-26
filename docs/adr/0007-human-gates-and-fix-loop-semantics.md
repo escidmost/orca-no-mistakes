@@ -19,4 +19,4 @@ Human decisions must distinguish adjudication from bypass, and failed delivery m
 
 ## Consequences
 
-Gate decisions are durable evidence with gate ID, selected option, actor, time, and affected findings. Current implementation differences, including automatic all-auto-fix repairs and immediate failure on exhaustion, are documented in [`docs/current-architecture.md`](../current-architecture.md).
+Gate decisions are durable evidence with gate ID, selected option, actor, time, and affected findings. Gates are recorded when they open and updated when they resolve, so an interrupted run leaves a `pending` gate rather than no evidence. Current implementation differences, including automatic all-auto-fix repairs, are documented in [`docs/current-architecture.md`](../current-architecture.md).

@@ -9,6 +9,17 @@ const { O_APPEND, O_CREAT, O_EXCL, O_NOFOLLOW, O_RDONLY, O_RDWR, O_WRONLY } = co
 
 export type RunStatus = 'in-progress' | 'passed' | 'failed' | 'cancelled'
 
+export type GateKind = 'exhaustion' | 'finding'
+
+export type GateAuditRow = {
+  decision: string
+  gate_id: string
+  gate_kind: GateKind
+  guidance: string | null
+  resolution: string
+  resolved_at: string | null
+}
+
 export type GateDecisionRecord = {
   decision: 'approve' | 'skip'
   gateId: string
@@ -638,12 +649,14 @@ CREATE TABLE IF NOT EXISTS gate_audit (
   run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
   stage_id TEXT NOT NULL,
   round_index INTEGER NOT NULL,
+  gate_kind TEXT NOT NULL DEFAULT 'finding',
   question TEXT NOT NULL,
   options_json TEXT NOT NULL,
   resolution TEXT NOT NULL,
   decision TEXT NOT NULL,
   guidance TEXT,
-  resolved_at TEXT NOT NULL
+  opened_at TEXT NOT NULL,
+  resolved_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_stage_checkpoints_run ON stage_checkpoints(run_id);
@@ -699,6 +712,31 @@ export class DomainLedger {
         this.#db.exec('DROP TABLE passed_attestations_legacy')
         this.#db.exec('COMMIT')
         console.error('no-mistakes: rebuilt passed_attestations onto the per-run key; existing rows preserved')
+      } catch (error) {
+        this.#db.exec('ROLLBACK')
+        throw error
+      }
+    }
+    // ponytail: pre-release rebuild — legacy ledgers recorded a gate only once it
+    // resolved, so a run interrupted at a blocking gate left no durable event.
+    const legacyGateAudit = this.#db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'gate_audit'")
+      .get() as { sql: string } | undefined
+    if (legacyGateAudit && !legacyGateAudit.sql.includes('gate_kind')) {
+      this.#db.exec('BEGIN IMMEDIATE')
+      try {
+        this.#db.exec('ALTER TABLE gate_audit RENAME TO gate_audit_legacy')
+        this.#db.exec(SCHEMA)
+        this.#db.exec(`INSERT INTO gate_audit (
+            gate_id, run_id, stage_id, round_index, question, options_json,
+            resolution, decision, guidance, opened_at, resolved_at
+          )
+          SELECT gate_id, run_id, stage_id, round_index, question, options_json,
+                 resolution, decision, guidance, resolved_at, resolved_at
+          FROM gate_audit_legacy`)
+        this.#db.exec('DROP TABLE gate_audit_legacy')
+        this.#db.exec('COMMIT')
+        console.error('no-mistakes: rebuilt gate_audit with durable gate events; existing rows preserved')
       } catch (error) {
         this.#db.exec('ROLLBACK')
         throw error
@@ -923,6 +961,40 @@ export class DomainLedger {
     return evidenceId
   }
 
+  /**
+   * Records a decision gate the moment it opens, before the coordinator blocks
+   * on a human. A run interrupted mid-gate therefore still leaves the gate
+   * event — including its exhaustion origin — in the ledger as `pending`.
+   */
+  openGateAudit(input: {
+    gateId: string
+    gateKind: GateKind
+    optionsJson: string
+    question: string
+    roundIndex: number
+    runId: string
+    stageId: string
+  }): void {
+    this.#db
+      .prepare(
+        `INSERT INTO gate_audit (
+           gate_id, run_id, stage_id, round_index, gate_kind, question, options_json,
+           resolution, decision, guidance, opened_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, '', 'pending', NULL, ?)
+         ON CONFLICT(gate_id) DO NOTHING`
+      )
+      .run(
+        input.gateId,
+        input.runId,
+        input.stageId,
+        input.roundIndex,
+        input.gateKind,
+        input.question,
+        input.optionsJson,
+        new Date().toISOString()
+      )
+  }
+
   recordGateAudit(input: {
     decision: string
     gateId: string
@@ -934,11 +1006,13 @@ export class DomainLedger {
     runId: string
     stageId: string
   }): void {
+    const now = new Date().toISOString()
     this.#db
       .prepare(
         `INSERT INTO gate_audit (
-           gate_id, run_id, stage_id, round_index, question, options_json, resolution, decision, guidance, resolved_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           gate_id, run_id, stage_id, round_index, question, options_json,
+           resolution, decision, guidance, opened_at, resolved_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(gate_id) DO UPDATE SET
            resolution = excluded.resolution,
            decision = excluded.decision,
@@ -955,7 +1029,8 @@ export class DomainLedger {
         input.resolution,
         input.decision,
         input.guidance ?? null,
-        new Date().toISOString()
+        now,
+        now
       )
   }
 
@@ -1056,12 +1131,13 @@ export class DomainLedger {
       .all(runId) as { input_commit_oid: string; output_commit_oid: string; round_index: number; stage_id: string }[]
   }
 
-  listGateAudit(
-    runId: string
-  ): { decision: string; gate_id: string; guidance: string | null; resolution: string }[] {
+  listGateAudit(runId: string): GateAuditRow[] {
     return this.#db
-      .prepare('SELECT decision, gate_id, guidance, resolution FROM gate_audit WHERE run_id = ? ORDER BY resolved_at')
-      .all(runId) as { decision: string; gate_id: string; guidance: string | null; resolution: string }[]
+      .prepare(
+        `SELECT decision, gate_id, gate_kind, guidance, resolution, resolved_at
+         FROM gate_audit WHERE run_id = ? ORDER BY opened_at, rowid`
+      )
+      .all(runId) as GateAuditRow[]
   }
 
   close(): void {
