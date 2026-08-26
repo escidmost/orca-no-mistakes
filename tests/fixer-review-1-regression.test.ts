@@ -27,7 +27,7 @@ async function initialize(repo: string): Promise<void> {
   git(repo, "config", "commit.gpgsign", "false");
 }
 
-test("validation policy references are protected transitively", async () => {
+test("validation policy protects named entrypoints but not their imports", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-policy-closure-"));
   const repo = path.join(temp, "repo");
   try {
@@ -35,9 +35,10 @@ test("validation policy references are protected transitively", async () => {
     await mkdir(path.join(repo, ".github/workflows"), { recursive: true });
     await mkdir(path.join(repo, "tools/check"), { recursive: true });
     await mkdir(path.join(repo, "scripts"));
+    await mkdir(path.join(repo, "tests"));
     await writeFile(
       path.join(repo, ".github/workflows/ci.yml"),
-      "jobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: ./tools/check\n",
+      "jobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: ./tools/check\n      - run: node --test tests/suite.test.js\n",
     );
     await writeFile(
       path.join(repo, "tools/check/action.yml"),
@@ -45,25 +46,46 @@ test("validation policy references are protected transitively", async () => {
     );
     await writeFile(path.join(repo, "scripts/check.sh"), "./run-suite.sh\n");
     await writeFile(path.join(repo, "scripts/run-suite.sh"), "exit 1\n");
+    await writeFile(path.join(repo, "tests/suite.test.js"), "assert.equal(1, 2);\n");
     git(repo, "add", ".");
     git(repo, "commit", "-m", "validation chain");
     const expectedHead = git(repo, "rev-parse", "HEAD");
 
     const worker = path.join(temp, "worker");
     git(repo, "worktree", "add", "--detach", worker, expectedHead);
-    await writeFile(path.join(worker, "scripts/run-suite.sh"), "exit 0\n");
-    git(worker, "add", "scripts/run-suite.sh");
-    git(worker, "commit", "-m", "weaken validation");
-
     const shell = new GitShell({ repo });
-    await assert.rejects(
+    const assertWorkerChangesAllowed = () =>
       shell.assertFixerChangesAllowed(
         worker,
         expectedHead,
         git(worker, "rev-parse", "HEAD"),
-      ),
-      /protected validation policy files: scripts\/run-suite\.sh/,
+      );
+
+    // A file the action manifest names is a validation entrypoint.
+    await writeFile(path.join(worker, "scripts/check.sh"), "exit 0\n");
+    git(worker, "add", "scripts/check.sh");
+    git(worker, "commit", "-m", "weaken named entrypoint");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /protected validation policy files: scripts\/check\.sh/,
     );
+
+    // A test file a validation command names stays protected as a test.
+    git(worker, "reset", "--hard", expectedHead);
+    await writeFile(path.join(worker, "tests/suite.test.js"), "assert.equal(1, 1);\n");
+    git(worker, "add", "tests/suite.test.js");
+    git(worker, "commit", "-m", "weaken named test");
+    await assert.rejects(
+      assertWorkerChangesAllowed(),
+      /fixer modified pre-existing test files: tests\/suite\.test\.js/,
+    );
+
+    // ONM-55: a source file only an entrypoint's own body reaches is fixable.
+    git(worker, "reset", "--hard", expectedHead);
+    await writeFile(path.join(worker, "scripts/run-suite.sh"), "exit 0\n");
+    git(worker, "add", "scripts/run-suite.sh");
+    git(worker, "commit", "-m", "repair indirectly referenced source");
+    assert.equal(await assertWorkerChangesAllowed(), true);
   } finally {
     await rm(temp, { recursive: true, force: true });
   }

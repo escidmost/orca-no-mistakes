@@ -3494,14 +3494,22 @@ export class CliOrca implements OrcaOperations {
       await this.#releaseStageLog(worker.terminalHandle);
     }
     if (disposition === "release" && worker.terminalHandle) {
-      await this.#json([
-        "terminal",
-        "close",
-        "--terminal",
-        worker.terminalHandle,
-        "--tab",
-        "--json",
-      ]);
+      try {
+        await this.#json([
+          "terminal",
+          "close",
+          "--terminal",
+          worker.terminalHandle,
+          "--tab",
+          "--json",
+        ]);
+      } catch (error) {
+        // A terminal that is already gone is the outcome this asks for, so a
+        // missing tab must not fail the run during cleanup.
+        if (!/tab_not_found|terminal_handle_stale/u.test(String(error))) {
+          throw error;
+        }
+      }
     }
     if (worker.deliveryId) {
       await this.#json([
@@ -4521,15 +4529,81 @@ function weakensInlineTestValidation(
   source: string | undefined,
 ): boolean {
   if (source === expectedSource) return false;
-  const protectedValidation = /(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|rstest|(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test)\s*\]|@(?:[A-Za-z_][\w]*\.)*(?:ParameterizedTest|Test|TestMethod|DataTestMethod)\b|\[(?:(?:[A-Za-z_][\w]*\.)*(?:Fact|Test|Theory|TestMethod|DataTestMethod)|(?:[A-Za-z_][\w]*\.)*TestCase(?:\([^\]\n]*\))?)\]|\b(?:describe|context|it|test)(?:\.[A-Za-z_$][\w$]*)*\s*\(|\b(?:SCENARIO|TEMPLATE_TEST_CASE|TEST_CASE)\s*\(|\btest\s+"(?:[^"\\]|\\.)*"\s*\{|(?:^|\n)\s*(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(|(?:^|\n)\s*assert\s+\S|\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\b(?:CHECK|REQUIRE)(?:_[A-Z0-9_]+)?\s*\(|\b(?:[A-Za-z_][\w]*\.)*Assert\.[A-Za-z_][\w]*\s*\(|\.should\.(?:deep\.)?(?:equal|eql|match|throw)\s*\(|\b(?:deepStrictEqual|strictEqual|notDeepStrictEqual|notStrictEqual|doesNotReject|doesNotThrow|ifError|rejects|throws)\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|\bassert[A-Z][A-Za-z0-9_$]*\s*\(|\bstd\.testing\.expect[A-Za-z0-9_]*\s*\(|\bexpect(?:\.(?:poll|soft))?\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
+  const qualifiedTestDeclaration = /(?<![.\w$])(?:Deno|vitest)\.test(?:\.[A-Za-z_$][\w$]*)*\s*\(/u;
+  const testDeclaration = /(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|rstest|(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test)\s*\]|@(?:[A-Za-z_][\w]*\.)*(?:ParameterizedTest|Test|TestMethod|DataTestMethod)\b|\[(?:(?:[A-Za-z_][\w]*\.)*(?:Fact|Test|Theory|TestMethod|DataTestMethod)|(?:[A-Za-z_][\w]*\.)*TestCase(?:\([^\]\n]*\))?)\]|(?<![.\w$])(?:describe|context|it|test)(?:\.[A-Za-z_$][\w$]*)*\s*\(|\b(?:SCENARIO|TEMPLATE_TEST_CASE|TEST_CASE)\s*\(|\btest\s+"(?:[^"\\]|\\.)*"\s*\{|(?:^|\n)\s*(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(|\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b)/iu;
+  const inlineAssertion = /(?:(?:^|\n)\s*assert\s+\S|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\b(?:CHECK|REQUIRE)(?:_[A-Z0-9_]+)?\s*\(|\b(?:[A-Za-z_][\w]*\.)*Assert\.[A-Za-z_][\w]*\s*\(|\.should\.(?:deep\.)?(?:equal|eql|match|throw)\s*\(|\b(?:deepStrictEqual|strictEqual|notDeepStrictEqual|notStrictEqual|doesNotReject|doesNotThrow|ifError|rejects|throws)\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|\bassert[A-Z][A-Za-z0-9_$]*\s*\(|\bstd\.testing\.expect[A-Za-z0-9_]*\s*\(|\bexpect(?:\.(?:poll|soft))?\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
+  const doctestPrompt = /^\s*>>>/u;
   const nodeAssertImport = /(?:from\s+["'](?:node:)?assert(?:\/strict)?["']|require\s*\(\s*["'](?:node:)?assert(?:\/strict)?["']\s*\))/u;
   if (
-    protectedValidation.test(expectedSource) ||
+    qualifiedTestDeclaration.test(expectedSource) ||
+    testDeclaration.test(expectedSource) ||
     /\.should(?:\.[A-Za-z_$][\w$]*)+/u.test(expectedSource) ||
     nodeAssertImport.test(expectedSource) ||
     importsAssertionFrameworkApi(expectedSource)
   ) {
     return true;
+  }
+  // ONM-55: without a test declaration the file is ordinary runtime code that
+  // happens to assert, so an edit only weakens validation when it drops or
+  // rewrites one of the asserting lines. The rest of the file stays fixable.
+  const hasUnclosedParenthesis = (text: string): boolean => {
+    let depth = 0;
+    let quote: string | undefined;
+    for (let index = 0; index < text.length; index += 1) {
+      const char = text[index];
+      if (quote) {
+        if (char === "\\") index += 1;
+        else if (char === quote) quote = undefined;
+        continue;
+      }
+      if (char === '"' || char === "'" || char === "`") {
+        quote = char;
+      } else if (
+        char === "#" ||
+        (char === "/" && (text[index + 1] === "/" || text[index + 1] === "*"))
+      ) {
+        break;
+      } else if (char === "(") {
+        depth += 1;
+      } else if (char === ")" && depth > 0) {
+        depth -= 1;
+      }
+    }
+    return depth > 0;
+  };
+  // An assertion that spans lines is compared as one unit, so mutating a
+  // continuation line is still caught without freezing the whole file.
+  const validationLines = (text: string): string[] => {
+    const lines = text.split("\n");
+    const units: string[] = [];
+    for (let index = 0; index < lines.length; index += 1) {
+      const assertion = inlineAssertion.exec(lines[index]);
+      if (!assertion) continue;
+      let unit = lines[index];
+      const doctestUnit = doctestPrompt.test(lines[index]);
+      while (
+        index + 1 < lines.length &&
+        (doctestUnit
+          ? // The expected output below a prompt is the assertion, so it stays
+            // in the same unit up to the blank line or the docstring end.
+            /\S/u.test(lines[index + 1]) &&
+            !/^\s*(?:>>>|["']{3})/u.test(lines[index + 1])
+          : hasUnclosedParenthesis(unit.slice(assertion.index)) ||
+            /\\\s*$/u.test(lines[index]) ||
+            /^\s*\??\./u.test(lines[index + 1] ?? ""))
+      ) {
+        index += 1;
+        unit += `\n${lines[index]}`;
+      }
+      units.push(unit);
+    }
+    return units;
+  };
+  const remaining = validationLines(source ?? "");
+  for (const line of validationLines(expectedSource)) {
+    const index = remaining.indexOf(line);
+    if (index < 0) return true;
+    remaining.splice(index, 1);
   }
   const skipMarker = /(?:#\[(?:ignore|should_panic)\]|\b(?:describe|it|test)(?:\.[A-Za-z_$][\w$]*)*\.(?:only|skip)\s*\(|\bpytest\.mark\.(?:skip|skipif|xfail)\b|@\w*Ignore\b)/giu;
   return (
@@ -4596,14 +4670,6 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
   const fileName = parts.at(-1) ?? "";
   return (
     normalized === ".orca/no-mistakes.yaml" ||
-    normalized === "bin/orca-no-mistakes" ||
-    [
-      "scripts/adapters.ts",
-      "scripts/config.ts",
-      "scripts/ledger.ts",
-      "scripts/orca-no-mistakes.ts",
-      "scripts/policy.ts",
-    ].includes(normalized) ||
     [
       "BUILD",
       "BUILD.bazel",
@@ -5400,6 +5466,15 @@ export class GitShell implements GitOperations {
         if (/^action\.ya?ml$/i.test(path.posix.basename(candidatePath))) {
           const actionDirectory = path.posix.dirname(candidatePath);
           if (actionDirectory !== ".") targets.push(actionDirectory);
+        }
+        // ONM-55: only policy configuration binds further entrypoints. A source
+        // file a policy names is protected, but its own imports are not, so the
+        // closure stops at the command instead of swallowing the import graph.
+        if (
+          !isProtectedValidationPolicyPath(candidatePath) &&
+          !/^action\.ya?ml$/i.test(path.posix.basename(candidatePath))
+        ) {
+          continue;
         }
         if (
           ![...policySources].some(([policyPath, source]) =>

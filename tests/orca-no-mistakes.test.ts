@@ -3138,7 +3138,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(repo, "docs/test-plan.md"), "# Test plan\n");
     await writeFile(
       path.join(repo, "package.json"),
-      '{"scripts":{"test":"sh scripts/verify-ci.sh"}}\n',
+      '{"bin":{"orca-no-mistakes":"bin/orca-no-mistakes"},"scripts":{"test":"sh scripts/verify-ci.sh"}}\n',
     );
     await writeFile(
       path.join(repo, "scripts/test-harness.ts"),
@@ -3981,21 +3981,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       path.join(worker, "tests/sub/conftest.py"),
       "collect_ignore_glob = ['*']\n",
     );
-    for (const moduleName of ["adapters", "config", "ledger", "policy"]) {
-      await writeFile(
-        path.join(worker, `scripts/${moduleName}.ts`),
-        `export const ${moduleName} = false;\n`,
-      );
-    }
-    git(
-      worker,
-      "add",
-      ...ciPolicyPaths,
-      "scripts/adapters.ts",
-      "scripts/config.ts",
-      "scripts/ledger.ts",
-      "scripts/policy.ts",
-    );
+    git(worker, "add", ...ciPolicyPaths);
     git(worker, "add", "-f", "tests/sub/conftest.py");
     git(worker, "commit", "-m", "weaken coordinator validation policy");
     await assert.rejects(
@@ -4005,12 +3991,30 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
         for (const filePath of ciPolicyPaths) {
           assert.ok(error.message.includes(filePath));
         }
-        assert.match(error.message, /scripts\/config\.ts/);
-        assert.match(error.message, /scripts\/policy\.ts/);
         assert.match(error.message, /tests\/sub\/conftest\.py/i);
         return true;
       },
     );
+
+    // ONM-55: coordinator source is only reachable through the entrypoint's
+    // import graph, so the fixer may repair it.
+    git(worker, "reset", "--hard", featureHead);
+    for (const moduleName of ["adapters", "config", "ledger", "policy"]) {
+      await writeFile(
+        path.join(worker, `scripts/${moduleName}.ts`),
+        `export const ${moduleName} = false;\n`,
+      );
+    }
+    git(
+      worker,
+      "add",
+      "scripts/adapters.ts",
+      "scripts/config.ts",
+      "scripts/ledger.ts",
+      "scripts/policy.ts",
+    );
+    git(worker, "commit", "-m", "repair coordinator modules");
+    await assertWorkerChangesAllowed();
 
     git(worker, "reset", "--hard", featureHead);
     await writeFile(path.join(worker, "spec/openapi.yaml"), "openapi: 3.1.1\n");
@@ -4122,13 +4126,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await writeFile(path.join(worker, "src/myproj/check.py"), "def main():\n    pass\n");
     await writeFile(path.join(worker, "src/quotedpkg/check.py"), "def main():\n    pass\n");
     await writeFile(path.join(worker, "backend/checks/validate.py"), "def main():\n    pass\n");
-    await writeFile(path.join(worker, "scripts/assertions.ts"), "export const skipped = true;\n");
-    await writeFile(path.join(worker, "src/rules.ts"), "export const skipped = true;\n");
-    await writeFile(path.join(worker, "src/base-rules.ts"), "export const skipped = true;\n");
     await writeFile(path.join(worker, "validation/jest.setup.ts"), "export const skipped = true;\n");
-    await writeFile(path.join(worker, "scripts/rules.py"), "def validate():\n    pass\n");
-    await writeFile(path.join(worker, "tools/check.py"), "def validate():\n    pass\n");
-    await writeFile(path.join(worker, "tools/relative_check.py"), "def validate():\n    pass\n");
     await writeFile(path.join(worker, "jenkins-tools/check.sh"), "exit 0\n");
     await writeFile(path.join(worker, "jenkins-tools/nested/nested-check.sh"), "exit 0\n");
     await writeFile(path.join(worker, "scripts/nested/nested-check.sh"), "exit 0\n");
@@ -4141,13 +4139,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       "scripts/powershell-location.ps1",
       "scripts/cmd-verify.cmd",
       "commands/cmd-check.cmd",
-      "scripts/assertions.ts",
-      "src/rules.ts",
-      "src/base-rules.ts",
       "validation/jest.setup.ts",
-      "scripts/rules.py",
-      "tools/check.py",
-      "tools/relative_check.py",
       "jenkins-tools/check.sh",
       "jenkins-tools/nested/nested-check.sh",
       "scripts/nested/nested-check.sh",
@@ -4166,13 +4158,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       assert.match(error.message, /scripts\/cmd-verify\.cmd/);
       assert.match(error.message, /commands\/cmd-check\.cmd/);
       assert.match(error.message, /scripts\/powershell-location\.ps1/);
-      assert.match(error.message, /scripts\/assertions\.ts/);
-      assert.match(error.message, /src\/rules\.ts/);
-      assert.match(error.message, /src\/base-rules\.ts/);
       assert.match(error.message, /validation\/jest\.setup\.ts/);
-      assert.match(error.message, /scripts\/rules\.py/);
-      assert.match(error.message, /tools\/check\.py/);
-      assert.match(error.message, /tools\/relative_check\.py/);
       assert.match(error.message, /jenkins-tools\/check\.sh/);
       assert.match(error.message, /jenkins-tools\/nested\/nested-check\.sh/);
       assert.match(error.message, /scripts\/nested\/nested-check\.sh/);
@@ -4186,6 +4172,28 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
       assert.match(error.message, /backend\/checks\/validate\.py/);
       return true;
     });
+
+    // ONM-55: modules a validation entrypoint imports are not themselves
+    // policy, so the fixer may repair them.
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(path.join(worker, "scripts/assertions.ts"), "export const skipped = true;\n");
+    await writeFile(path.join(worker, "src/rules.ts"), "export const skipped = true;\n");
+    await writeFile(path.join(worker, "src/base-rules.ts"), "export const skipped = true;\n");
+    await writeFile(path.join(worker, "scripts/rules.py"), "def validate():\n    pass\n");
+    await writeFile(path.join(worker, "tools/check.py"), "def validate():\n    pass\n");
+    await writeFile(path.join(worker, "tools/relative_check.py"), "def validate():\n    pass\n");
+    git(
+      worker,
+      "add",
+      "scripts/assertions.ts",
+      "src/rules.ts",
+      "src/base-rules.ts",
+      "scripts/rules.py",
+      "tools/check.py",
+      "tools/relative_check.py",
+    );
+    git(worker, "commit", "-m", "repair imported validation modules");
+    await assertWorkerChangesAllowed();
 
     git(worker, "reset", "--hard", featureHead);
     await writeFile(path.join(worker, "scripts/pwd-verify.sh"), "exit 0\n");
@@ -4826,6 +4834,8 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     git(worker, "commit", "-m", "document reviewer prompts");
     await assertWorkerChangesAllowed();
 
+    // ONM-55: the coordinator entrypoint stays protected, but the source it
+    // imports is under review and must remain fixable.
     git(worker, "reset", "--hard", featureHead);
     await writeFile(
       path.join(worker, "scripts/orca-no-mistakes.ts"),
@@ -4833,10 +4843,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     git(worker, "add", "scripts/orca-no-mistakes.ts");
     git(worker, "commit", "-m", "repair implementation");
-    await assert.rejects(
-      assertWorkerChangesAllowed(),
-      /protected validation policy files: scripts\/orca-no-mistakes\.ts/,
-    );
+    await assertWorkerChangesAllowed();
 
     git(worker, "reset", "--hard", featureHead);
     await writeFile(path.join(worker, "feature.ts"), "export const value = 99;\n");
