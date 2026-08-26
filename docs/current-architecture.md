@@ -134,6 +134,8 @@ On success the coordinator evaluates the three-way containment proof between the
 
 ## Outcome
 
+Before the manifest is assembled, the coordinator re-reads the run's durable evidence rows: if the latest round of any stage still records a finding that is not `no-op` and no gate decision was recorded against that exact evidence digest, the run fails as unattestable instead of producing a Passed attestation. The check reads the ledger rather than the stage loop's own bookkeeping, so it holds independently of that control flow.
+
 An attached run prints `{"runId":...,"steps":[...],"attestation":{...}}` after completion; the attestation manifest carries the run ID, candidate/base commit OIDs, trusted-policy hash, intent + intent hash, ordered stage-evidence entries (including waivers), Merkle root, and coordinator version. On failure the coordinator anchors the terminal gate head, appends the same recovery instructions to the terminal summary whenever the operator head differs from that anchored commit, throws, marks the run `failed` (or `cancelled` for a `stop` resolution), releases the lease, sets a nonzero exit status, and attempts to mark the worktree in review. If recovery anchoring fails, the gate and lease are retained instead of deleting the only reachable copy. Worktree-status update failures are logged as warnings rather than changing the pipeline result.
 
 Not yet implemented from the target architecture: remote push/PR/CI stages, crash resumption of interrupted runs, canonical signatures over manifests, forge-side delivery verification, and guarded merge transitions. See ADRs 0003, 0004, 0006, 0007, and 0010.

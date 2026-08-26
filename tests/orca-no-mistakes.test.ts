@@ -389,6 +389,111 @@ class FakeOrca implements OrcaOperations {
   }
 }
 
+class LateFindingLedger extends DomainLedger {
+  #injected = false;
+
+  override recordEvidence(
+    input: Parameters<DomainLedger["recordEvidence"]>[0],
+  ): string {
+    const evidenceId = super.recordEvidence(input);
+    if (input.stageId === "lint" && !this.#injected) {
+      this.#injected = true;
+      super.recordEvidence({
+        ...input,
+        evidenceSha256: evidenceSha256({
+          artifactSha256: input.artifactSha256,
+          baseCommitOid: input.baseCommitOid,
+          candidateCommitOid: input.candidateCommitOid,
+          exitCode: input.exitCode,
+          round: 99,
+          runId: input.runId,
+          stage: "review",
+          summary: "late clean review",
+          workerIdentity: input.workerIdentity,
+        }),
+        findingsJson: "[]",
+        roundIndex: 99,
+        stageId: "review",
+        summary: "late clean review",
+      });
+    }
+    return evidenceId;
+  }
+}
+
+class TamperedFindingsLedger extends DomainLedger {
+  override recordEvidence(
+    input: Parameters<DomainLedger["recordEvidence"]>[0],
+  ): string {
+    const evidenceId = super.recordEvidence(input);
+    if (input.stageId === "review") {
+      const database = new DatabaseSync(this.path);
+      try {
+        database
+          .prepare("UPDATE stage_evidence SET findings_json = '[]' WHERE evidence_id = ?")
+          .run(evidenceId);
+      } finally {
+        database.close();
+      }
+    }
+    return evidenceId;
+  }
+}
+
+class TamperedEvidenceLedger extends DomainLedger {
+  override recordEvidence(
+    input: Parameters<DomainLedger["recordEvidence"]>[0],
+  ): string {
+    const evidenceId = super.recordEvidence(input);
+    if (input.stageId === "review") {
+      const database = new DatabaseSync(this.path);
+      try {
+        database
+          .prepare("UPDATE stage_evidence SET summary = 'edited summary' WHERE evidence_id = ?")
+          .run(evidenceId);
+      } finally {
+        database.close();
+      }
+    }
+    return evidenceId;
+  }
+}
+
+class DeletedEvidenceLedger extends DomainLedger {
+  override recordEvidence(
+    input: Parameters<DomainLedger["recordEvidence"]>[0],
+  ): string {
+    const evidenceId = super.recordEvidence(input);
+    if (input.stageId === "review") {
+      const database = new DatabaseSync(this.path);
+      try {
+        database
+          .prepare("DELETE FROM stage_evidence WHERE evidence_id = ?")
+          .run(evidenceId);
+      } finally {
+        database.close();
+      }
+    }
+    return evidenceId;
+  }
+}
+
+class DeletedGateAuditLedger extends DomainLedger {
+  override recordGateAudit(
+    input: Parameters<DomainLedger["recordGateAudit"]>[0],
+  ): void {
+    super.recordGateAudit(input);
+    const database = new DatabaseSync(this.path);
+    try {
+      database
+        .prepare("DELETE FROM gate_audit WHERE gate_id = ?")
+        .run(input.gateId);
+    } finally {
+      database.close();
+    }
+  }
+}
+
 // Seeds a trusted-base policy that explicitly authorizes review auto-fix,
 // opting these scenarios out of the ADR-0007 default gate.
 const allowReviewAutoFix = (git: FakeGit) => {
@@ -1296,6 +1401,101 @@ test("a passing gate transfers final custody to the unchanged initiating worktre
   assert.ok(deliveryGit.calls.some((call) => call.startsWith("recover:")));
   assert.ok(!gateGit.calls.some((call) => call.startsWith("recover:")));
   assert.match(result.custodyNote ?? "", /advanced branch feature/);
+});
+
+test("blocks unresolved durable findings before transferring gate custody", async () => {
+  const gateGit = new FakeGit("/gate", "no-mistakes-gate-test");
+  const deliveryGit = new FakeGit("/origin", "feature");
+  const orca = new FakeOrca(gateGit);
+  const ledger = new LateFindingLedger(":memory:");
+
+  await assert.rejects(
+    runPipeline(
+      {
+        deliveryGit,
+        intent: "Reject durable findings before attestation.",
+      },
+      orca,
+      gateGit,
+      ledger,
+    ),
+    /this run cannot be attested: review round 99:/,
+  );
+
+  assert.equal(
+    deliveryGit.calls.some((call) => call.startsWith("apply:")),
+    false,
+  );
+  const runId = ledger.listRuns()[0].run_id;
+  assert.equal(ledger.runStatus(runId), "failed");
+});
+
+test("edited findings cannot bypass passed attestation", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  orca.gateResolution = "approve";
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          action: "ask-user",
+          description: "The review finding requires approval.",
+          id: "review-finding",
+          severity: "error",
+        },
+      ],
+      summary: "review finding",
+    },
+  ]);
+  const home = await mkdtemp(path.join(tmpdir(), "no-mistakes-tampered-findings-"));
+  const ledger = new TamperedFindingsLedger(path.join(home, "ledger.db"));
+  try {
+    await assert.rejects(
+      runPipeline({ intent: "Reject edited durable findings." }, orca, git, ledger),
+      /this run cannot be attested: review round 0: recorded findings do not match the attested artifact/,
+    );
+    const runId = ledger.listRuns()[0].run_id;
+    assert.equal(ledger.runStatus(runId), "failed");
+  } finally {
+    ledger.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("edited evidence fields cannot bypass passed attestation", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  const home = await mkdtemp(path.join(tmpdir(), "no-mistakes-tampered-evidence-"));
+  const ledger = new TamperedEvidenceLedger(path.join(home, "ledger.db"));
+  try {
+    await assert.rejects(
+      runPipeline({ intent: "Reject edited evidence fields." }, orca, git, ledger),
+      /this run cannot be attested: review round 0: evidence digest does not match its recorded fields/,
+    );
+    const runId = ledger.listRuns()[0].run_id;
+    assert.equal(ledger.runStatus(runId), "failed");
+  } finally {
+    ledger.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("missing evidence cannot bypass passed attestation", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  const home = await mkdtemp(path.join(tmpdir(), "no-mistakes-missing-evidence-"));
+  const ledger = new DeletedEvidenceLedger(path.join(home, "ledger.db"));
+  try {
+    await assert.rejects(
+      runPipeline({ intent: "Reject missing durable evidence." }, orca, git, ledger),
+      /this run cannot be attested: review round 0: the attested evidence row is missing from the ledger/,
+    );
+    const runId = ledger.listRuns()[0].run_id;
+    assert.equal(ledger.runStatus(runId), "failed");
+  } finally {
+    ledger.close();
+    await rm(home, { recursive: true, force: true });
+  }
 });
 
 test("opens an exhaustion gate when automatic fix limit is reached and stops on stop decision", async () => {
@@ -8039,6 +8239,39 @@ test("gate approvals are audited and bound into the attestation as a waiver", as
   );
 });
 
+test("missing durable gate audit cannot waive findings", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  orca.gateResolution = "approve";
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-finding",
+          severity: "error",
+          action: "ask-user",
+          description: "Needs durable approval.",
+        },
+      ],
+      summary: "decision needed",
+    },
+  ]);
+  const dir = await mkdtemp(path.join(tmpdir(), "onm-missing-gate-audit-"));
+  const ledger = new DeletedGateAuditLedger(path.join(dir, "ledger.db"));
+  try {
+    await assert.rejects(
+      runPipeline({ intent: "Require durable gate approvals." }, orca, git, ledger),
+      /this run cannot be attested: review round 0: 1 unaddressed finding\(s\) and no recorded waiver or approval/,
+    );
+    const runId = ledger.listRuns()[0].run_id;
+    assert.equal(ledger.listGateAudit(runId).length, 0);
+    assert.equal(ledger.runStatus(runId), "failed");
+  } finally {
+    ledger.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("attestation verification detects tampering", async () => {
   const git = new FakeGit();
   const orca = new FakeOrca(git);
@@ -10067,4 +10300,199 @@ test("legacy gate_audit ledgers are rebuilt with durable gate columns", async ()
     ledger.close();
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("a stage whose findings were never addressed cannot be attested", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  const orca = new FakeOrca(git);
+  const ledger = new DomainLedger(":memory:");
+
+  const result = await runPipeline(
+    { intent: "Block unresolved findings." },
+    orca,
+    git,
+    ledger,
+  );
+  const entries = result.attestation!.stageEvidence;
+  assert.deepEqual(ledger.attestationBlockers(result.runId, entries), []);
+
+  let round = 0;
+  const recordReviewRound = async (findingsJson?: string) => {
+    round += 1;
+    const initialArtifactPath = ledger
+      .listEvidence(result.runId)
+      .find((row) => row.stage_id === "review")!.artifact_path;
+    const artifactPath = path.join(
+      path.dirname(initialArtifactPath),
+      `manual-review-r${round}.json`,
+    );
+    const artifactBytes = Buffer.from(
+      findingsJson === "not json"
+        ? "{"
+        : JSON.stringify({ findings: findingsJson ? JSON.parse(findingsJson) : [] }),
+    );
+    await writeFile(artifactPath, artifactBytes);
+    const artifactSha256Value = sha256(artifactBytes);
+    const evidenceSha256Value = evidenceSha256({
+      artifactSha256: artifactSha256Value,
+      baseCommitOid: "b".repeat(40),
+      candidateCommitOid: "c".repeat(40),
+      exitCode: 1,
+      round,
+      runId: result.runId,
+      stage: "review",
+      summary: "unresolved",
+      workerIdentity: "reviewer",
+    });
+    ledger.recordEvidence({
+      artifactPath,
+      artifactSha256: artifactSha256Value,
+      baseCommitOid: "b".repeat(40),
+      candidateCommitOid: "c".repeat(40),
+      evidenceSha256: evidenceSha256Value,
+      exitCode: 1,
+      findingsJson,
+      roundIndex: round,
+      runId: result.runId,
+      stageId: "review",
+      summary: "unresolved",
+      workerIdentity: "reviewer",
+    });
+    entries.push({
+      ...entries.find((entry) => entry.stage === "review")!,
+      artifactSha256: artifactSha256Value,
+      evidenceSha256: evidenceSha256Value,
+      exitCode: 1,
+      round,
+      summary: "unresolved",
+    });
+  };
+
+  await recordReviewRound('[{"id":"open","action":"ask-user"}]');
+  assert.deepEqual(ledger.attestationBlockers(result.runId, entries), [
+    "review round 1: 1 unaddressed finding(s) and no recorded waiver or approval",
+  ]);
+
+  const withWaiver = (evidenceSha256: string, gateId = "gate-1") => {
+    return entries.map((entry) =>
+      entry.evidenceSha256 === evidenceSha256
+        ? {
+            ...entry,
+            waiverOrApproval: {
+              decision: "approve" as const,
+              gateId,
+              resolvedAt: new Date().toISOString(),
+            },
+          }
+        : entry,
+    );
+  };
+  const evidenceForRound = (roundIndex: number) =>
+    ledger
+      .listEvidence(result.runId)
+      .find((row) => row.stage_id === "review" && row.round_index === roundIndex)!
+      .evidence_sha256;
+
+  ledger.recordGateAudit({
+    decision: "approve",
+    gateId: "gate-1",
+    optionsJson: '["approve"]',
+    question: "q",
+    resolution: "approve",
+    roundIndex: 1,
+    runId: result.runId,
+    stageId: "review",
+  });
+  ledger.recordGateAudit({
+    decision: "approve",
+    gateId: "gate-2",
+    optionsJson: '["approve"]',
+    question: "q",
+    resolution: "approve",
+    roundIndex: 1,
+    runId: result.runId,
+    stageId: "document",
+  });
+
+  // A waiver recorded against an earlier round does not carry over to this one.
+  const staleWaiver = withWaiver(
+    entries.find((entry) => entry.stage === "review")!.evidenceSha256,
+  );
+  assert.deepEqual(ledger.attestationBlockers(result.runId, staleWaiver), [
+    "review round 1: 1 unaddressed finding(s) and no recorded waiver or approval",
+  ]);
+
+  assert.deepEqual(
+    ledger.attestationBlockers(
+      result.runId,
+      withWaiver(evidenceForRound(1), "gate-2"),
+    ),
+    [
+      "review round 1: 1 unaddressed finding(s) and no recorded waiver or approval",
+    ],
+  );
+
+  // A gate decision on this round's evidence waives what is left open.
+  assert.deepEqual(
+    ledger.attestationBlockers(result.runId, withWaiver(evidenceForRound(1))),
+    [],
+  );
+
+  // A gate opened for an earlier round cannot waive a later round's evidence.
+  await recordReviewRound('[{"id":"still-open","action":"ask-user"}]');
+  assert.deepEqual(
+    ledger.attestationBlockers(result.runId, withWaiver(evidenceForRound(2))),
+    [
+      "review round 2: 1 unaddressed finding(s) and no recorded waiver or approval",
+    ],
+  );
+  ledger.recordGateAudit({
+    decision: "approve",
+    gateId: "gate-3",
+    optionsJson: '["approve"]',
+    question: "q",
+    resolution: "approve",
+    roundIndex: 2,
+    runId: result.runId,
+    stageId: "review",
+  });
+  assert.deepEqual(
+    ledger.attestationBlockers(
+      result.runId,
+      withWaiver(evidenceForRound(2), "gate-3"),
+    ),
+    [],
+  );
+
+  // Informational findings are not something to address.
+  await recordReviewRound('[{"id":"note","action":"no-op"}]');
+  assert.deepEqual(ledger.attestationBlockers(result.runId, entries), []);
+  assert.deepEqual(
+    ledger.attestationBlockers(
+      result.runId,
+      entries.filter(
+        (entry) => !(entry.stage === "review" && entry.round === 1),
+      ),
+    ),
+    ["review round 1: the ledger evidence row is absent from the attestation"],
+  );
+
+  await recordReviewRound();
+  assert.deepEqual(ledger.attestationBlockers(result.runId, entries), [
+    "review round 4: recorded findings are unreadable",
+  ]);
+  assert.deepEqual(
+    ledger.attestationBlockers(result.runId, withWaiver(evidenceForRound(4))),
+    ["review round 4: recorded findings are unreadable"],
+  );
+
+  await recordReviewRound("not json");
+  assert.deepEqual(ledger.attestationBlockers(result.runId, entries), [
+    "review round 5: artifact findings are unreadable",
+  ]);
+  assert.deepEqual(
+    ledger.attestationBlockers(result.runId, withWaiver(evidenceForRound(5))),
+    ["review round 5: artifact findings are unreadable"],
+  );
 });
