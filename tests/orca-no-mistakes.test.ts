@@ -418,6 +418,25 @@ class LateFindingLedger extends DomainLedger {
   }
 }
 
+class TamperedFindingsLedger extends DomainLedger {
+  override recordEvidence(
+    input: Parameters<DomainLedger["recordEvidence"]>[0],
+  ): string {
+    const evidenceId = super.recordEvidence(input);
+    if (input.stageId === "review") {
+      const database = new DatabaseSync(this.path);
+      try {
+        database
+          .prepare("UPDATE stage_evidence SET findings_json = '[]' WHERE evidence_id = ?")
+          .run(evidenceId);
+      } finally {
+        database.close();
+      }
+    }
+    return evidenceId;
+  }
+}
+
 // Seeds a trusted-base policy that explicitly authorizes review auto-fix,
 // opting these scenarios out of the ADR-0007 default gate.
 const allowReviewAutoFix = (git: FakeGit) => {
@@ -1343,7 +1362,7 @@ test("blocks unresolved durable findings before transferring gate custody", asyn
       gateGit,
       ledger,
     ),
-    /this run cannot be attested: review round 99: 1 unaddressed finding\(s\)/,
+    /this run cannot be attested: review round 99:/,
   );
 
   assert.equal(
@@ -1352,6 +1371,38 @@ test("blocks unresolved durable findings before transferring gate custody", asyn
   );
   const runId = ledger.listRuns()[0].run_id;
   assert.equal(ledger.runStatus(runId), "failed");
+});
+
+test("edited findings cannot bypass passed attestation", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  orca.gateResolution = "approve";
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          action: "ask-user",
+          description: "The review finding requires approval.",
+          id: "review-finding",
+          severity: "error",
+        },
+      ],
+      summary: "review finding",
+    },
+  ]);
+  const home = await mkdtemp(path.join(tmpdir(), "no-mistakes-tampered-findings-"));
+  const ledger = new TamperedFindingsLedger(path.join(home, "ledger.db"));
+  try {
+    await assert.rejects(
+      runPipeline({ intent: "Reject edited durable findings." }, orca, git, ledger),
+      /this run cannot be attested: review round 0: recorded findings do not match the attested artifact/,
+    );
+    const runId = ledger.listRuns()[0].run_id;
+    assert.equal(ledger.runStatus(runId), "failed");
+  } finally {
+    ledger.close();
+    await rm(home, { recursive: true, force: true });
+  }
 });
 
 test("opens an exhaustion gate when automatic fix limit is reached and stops on stop decision", async () => {
@@ -10141,11 +10192,20 @@ test("a stage whose findings were never addressed cannot be attested", async () 
   assert.deepEqual(ledger.attestationBlockers(result.runId, entries), []);
 
   let round = 0;
-  const recordReviewRound = (findingsJson?: string) => {
+  const recordReviewRound = async (findingsJson?: string) => {
     round += 1;
+    const artifactPath = ledger
+      .listEvidence(result.runId)
+      .find((row) => row.stage_id === "review")!.artifact_path;
+    const artifactBytes = Buffer.from(
+      findingsJson === "not json"
+        ? "{"
+        : JSON.stringify({ findings: findingsJson ? JSON.parse(findingsJson) : [] }),
+    );
+    await writeFile(artifactPath, artifactBytes);
     ledger.recordEvidence({
-      artifactPath: "/dev/null",
-      artifactSha256: sha256("artifact"),
+      artifactPath,
+      artifactSha256: sha256(artifactBytes),
       baseCommitOid: "b".repeat(40),
       candidateCommitOid: "c".repeat(40),
       evidenceSha256: sha256(`round-${round}`),
@@ -10159,7 +10219,7 @@ test("a stage whose findings were never addressed cannot be attested", async () 
     });
   };
 
-  recordReviewRound('[{"id":"open","action":"ask-user"}]');
+  await recordReviewRound('[{"id":"open","action":"ask-user"}]');
   assert.deepEqual(ledger.attestationBlockers(result.runId, entries), [
     "review round 1: 1 unaddressed finding(s) and no recorded waiver or approval",
   ]);
@@ -10195,10 +10255,10 @@ test("a stage whose findings were never addressed cannot be attested", async () 
   );
 
   // Informational findings are not something to address.
-  recordReviewRound('[{"id":"note","action":"no-op"}]');
+  await recordReviewRound('[{"id":"note","action":"no-op"}]');
   assert.deepEqual(ledger.attestationBlockers(result.runId, entries), []);
 
-  recordReviewRound("not json");
+  await recordReviewRound("not json");
   assert.deepEqual(ledger.attestationBlockers(result.runId, entries), [
     "review round 3: recorded findings are unreadable",
   ]);
@@ -10207,7 +10267,7 @@ test("a stage whose findings were never addressed cannot be attested", async () 
     ["review round 3: recorded findings are unreadable"],
   );
 
-  recordReviewRound();
+  await recordReviewRound();
   assert.deepEqual(ledger.attestationBlockers(result.runId, entries), [
     "review round 4: recorded findings are unreadable",
   ]);

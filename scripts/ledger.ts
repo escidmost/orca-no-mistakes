@@ -1138,6 +1138,29 @@ export class DomainLedger {
         blockers.push(`${stage} round ${row.round_index}: recorded findings are unreadable`)
         continue
       }
+      const label = `${stage} round ${row.round_index}`
+      if (!row.artifact_sha256) {
+        blockers.push(`${label}: no artifact digest was recorded`)
+        continue
+      }
+      let artifact: Buffer
+      try {
+        const info = statSync(row.artifact_path)
+        if (!info.isFile()) throw new Error('not a regular file')
+        if (info.size > MAX_LOG_BYTES) throw new Error('larger than the log cap')
+        artifact = readFileSync(row.artifact_path)
+      } catch {
+        blockers.push(`${label}: artifact ${row.artifact_path} is missing or unreadable`)
+        continue
+      }
+      if (sha256(artifact) !== row.artifact_sha256) {
+        blockers.push(`${label}: artifact ${row.artifact_path} does not match its recorded digest`)
+        continue
+      }
+      if (!findingsMatchArtifact(artifact, row.findings_json)) {
+        blockers.push(`${label}: recorded findings do not match the attested artifact`)
+        continue
+      }
       let unresolved: number
       try {
         unresolved = (JSON.parse(row.findings_json) as { action?: string }[]).filter(
