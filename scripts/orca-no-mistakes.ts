@@ -4532,12 +4532,11 @@ function weakensInlineTestValidation(
   const qualifiedTestDeclaration = /(?<![.\w$])(?:Deno|vitest)\.test(?:\.[A-Za-z_$][\w$]*)*\s*\(/u;
   const testDeclaration = /(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|rstest|(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test)\s*\]|@(?:[A-Za-z_][\w]*\.)*(?:ParameterizedTest|Test|TestMethod|DataTestMethod)\b|\[(?:(?:[A-Za-z_][\w]*\.)*(?:Fact|Test|Theory|TestMethod|DataTestMethod)|(?:[A-Za-z_][\w]*\.)*TestCase(?:\([^\]\n]*\))?)\]|(?<![.\w$])(?:describe|context|it|test)(?:\.[A-Za-z_$][\w$]*)*\s*\(|\b(?:SCENARIO|TEMPLATE_TEST_CASE|TEST_CASE)\s*\(|\btest\s+"(?:[^"\\]|\\.)*"\s*\{|(?:^|\n)\s*(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(|\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b)/iu;
   const inlineAssertion = /(?:(?:^|\n)\s*assert\s+\S|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\b(?:CHECK|REQUIRE)(?:_[A-Z0-9_]+)?\s*\(|\b(?:[A-Za-z_][\w]*\.)*Assert\.[A-Za-z_][\w]*\s*\(|\.should\.(?:deep\.)?(?:equal|eql|match|throw)\s*\(|\b(?:deepStrictEqual|strictEqual|notDeepStrictEqual|notStrictEqual|doesNotReject|doesNotThrow|ifError|rejects|throws)\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|\bassert[A-Z][A-Za-z0-9_$]*\s*\(|\bstd\.testing\.expect[A-Za-z0-9_]*\s*\(|\bexpect(?:\.(?:poll|soft))?\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
-  const doctest = /(?:^|\n)\s*>>>/u;
+  const doctestPrompt = /^\s*>>>/u;
   const nodeAssertImport = /(?:from\s+["'](?:node:)?assert(?:\/strict)?["']|require\s*\(\s*["'](?:node:)?assert(?:\/strict)?["']\s*\))/u;
   if (
     qualifiedTestDeclaration.test(expectedSource) ||
     testDeclaration.test(expectedSource) ||
-    doctest.test(expectedSource) ||
     /\.should(?:\.[A-Za-z_$][\w$]*)+/u.test(expectedSource) ||
     nodeAssertImport.test(expectedSource) ||
     importsAssertionFrameworkApi(expectedSource)
@@ -4581,11 +4580,17 @@ function weakensInlineTestValidation(
       const assertion = inlineAssertion.exec(lines[index]);
       if (!assertion) continue;
       let unit = lines[index];
+      const doctestUnit = doctestPrompt.test(lines[index]);
       while (
         index + 1 < lines.length &&
-        (hasUnclosedParenthesis(unit.slice(assertion.index)) ||
-          /\\\s*$/u.test(lines[index]) ||
-          /^\s*\??\./u.test(lines[index + 1] ?? ""))
+        (doctestUnit
+          ? // The expected output below a prompt is the assertion, so it stays
+            // in the same unit up to the blank line or the docstring end.
+            /\S/u.test(lines[index + 1]) &&
+            !/^\s*(?:>>>|["']{3})/u.test(lines[index + 1])
+          : hasUnclosedParenthesis(unit.slice(assertion.index)) ||
+            /\\\s*$/u.test(lines[index]) ||
+            /^\s*\??\./u.test(lines[index + 1] ?? ""))
       ) {
         index += 1;
         unit += `\n${lines[index]}`;
