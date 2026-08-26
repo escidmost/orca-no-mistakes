@@ -54,7 +54,7 @@ orca-no-mistakes attestation verify <manifest-file|run-id|commit-sha>
 orca-no-mistakes prune [--before <date>] [--repo <name-substring>]
 ```
 
-`verify` recomputes every stage-evidence hash, rebuilds the Merkle root, and cross-checks the intent hash — any tampering fails loudly. Evidence is retained indefinitely until you explicitly `prune` it.
+`verify` recomputes every stage-evidence hash, re-reads each retained stage log and recomputes its artifact digest, rebuilds the Merkle root, and cross-checks the intent hash — any tampering fails loudly. Evidence is retained indefinitely until you explicitly `prune` it.
 
 ## Gates and outcomes
 

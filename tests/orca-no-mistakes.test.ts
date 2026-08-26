@@ -53,7 +53,7 @@ import {
   classifyPreflightFailure,
   shellQuote,
 } from "../scripts/adapters.ts";
-import { StageLog, artifactsRoot } from "../scripts/ledger.ts";
+import { StageLog, artifactsRoot, evidenceSha256 } from "../scripts/ledger.ts";
 import { loadUserConfig } from "../scripts/config.ts";
 import { effectivePolicyHash } from "../scripts/policy.ts";
 
@@ -9127,7 +9127,7 @@ test("attestations stay resolvable per run when candidate commits repeat, and co
         submissionCommitOid: "a".repeat(40),
       });
       const manifest = {
-        version: "1.0.0" as const,
+        version: "1.1.0" as const,
         runId,
         candidateCommitOid: candidate,
         baseCommitOid: "b".repeat(40),
@@ -9723,6 +9723,89 @@ test("stage evidence binds effective policy provenance into artifacts and the le
   const evidenceShape = ledger.tableDefinition("stage_evidence") ?? "";
   assert.match(evidenceShape, /effective_policy_hash TEXT/);
   assert.match(evidenceShape, /base_ref_sha TEXT/);
+});
+
+test("tampering with a stage log invalidates its evidence", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  const orca = new FakeOrca(git);
+  const ledger = new DomainLedger(":memory:");
+
+  const result = await runPipeline({ intent: "Detect tampering." }, orca, git, ledger);
+  const attestation = result.attestation!;
+
+  assert.deepEqual(ledger.verifyEvidence(attestation), []);
+
+  const rows = ledger.listEvidence(result.runId);
+  const review = rows.find((row) => row.stage_id === "review");
+  assert.ok(review, "the review stage records evidence");
+  assert.match(review!.artifact_sha256 ?? "", /^[0-9a-f]{64}$/);
+  assert.deepEqual(JSON.parse(review!.findings_json ?? "null"), []);
+
+  await writeFile(review!.artifact_path, '{"exitCode":0,"summary":"clean"}');
+  assert.deepEqual(ledger.verifyEvidence(attestation), [
+    `review round ${review!.round_index}: artifact ${review!.artifact_path} does not match its recorded digest`,
+  ]);
+});
+
+test("deleting an attested evidence row invalidates verification", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  const orca = new FakeOrca(git);
+  const home = await mkdtemp(path.join(tmpdir(), "no-mistakes-evidence-"));
+  const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
+  process.env.ORCA_NO_MISTAKES_HOME = home;
+  const ledger = new DomainLedger(path.join(home, "ledger.db"));
+  try {
+    const result = await runPipeline({ intent: "Detect deletion." }, orca, git, ledger);
+    const attestation = result.attestation!;
+    assert.deepEqual(ledger.verifyEvidence(attestation), []);
+
+    const review = ledger
+      .listEvidence(result.runId)
+      .find((row) => row.stage_id === "review")!;
+    const raw = new DatabaseSync(ledger.path);
+    raw.exec(`DELETE FROM stage_evidence WHERE evidence_id = '${review.evidence_id}'`);
+    raw.close();
+
+    assert.deepEqual(ledger.verifyEvidence(attestation), [
+      `review round ${review.round_index}: the attested evidence row is missing from the ledger`,
+    ]);
+  } finally {
+    ledger.close();
+    if (previousHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME;
+    else process.env.ORCA_NO_MISTAKES_HOME = previousHome;
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("an evidence digest is bound to its run and its commit OIDs", () => {
+  const base = {
+    artifactSha256: sha256("artifact"),
+    baseCommitOid: "b".repeat(40),
+    candidateCommitOid: "c".repeat(40),
+    exitCode: 0,
+    round: 0,
+    runId: "run-a",
+    stage: "review",
+    summary: "clean",
+    workerIdentity: "reviewer",
+  };
+  const digest = evidenceSha256(base);
+  for (const change of [
+    { runId: "run-b" },
+    { candidateCommitOid: "d".repeat(40) },
+    { baseCommitOid: "e".repeat(40) },
+    { workerIdentity: "other" },
+    { exitCode: 1 },
+    { round: 1 },
+  ]) {
+    assert.notEqual(
+      evidenceSha256({ ...base, ...change }),
+      digest,
+      `${Object.keys(change)[0]} must be bound into the digest`,
+    );
+  }
 });
 
 test("a gate resolution outside the offered options fails closed", async () => {

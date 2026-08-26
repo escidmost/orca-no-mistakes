@@ -477,6 +477,7 @@ export async function runPipeline(
           candidateCommitOid: candidate,
           exitCode,
           round,
+          runId,
           stage,
           summary: report.summary,
           workerIdentity,
@@ -485,6 +486,8 @@ export async function runPipeline(
       };
       ledger.recordEvidence({
         artifactPath,
+        artifactSha256,
+        findingsJson: JSON.stringify(report.findings),
         baseCommitOid: evidenceBaseCommitOid,
         candidateCommitOid: candidate,
         evidenceSha256: entry.evidenceSha256,
@@ -6446,6 +6449,14 @@ async function runAttestationCommand(
       throw new Error(
         "manifest does not match the attestation recorded in the domain ledger",
       );
+    }
+    if (stored) {
+      const problems = ledger.verifyEvidence(manifest);
+      if (problems.length > 0) {
+        throw new Error(
+          `stage evidence verification failed:\n  ${problems.join("\n  ")}`,
+        );
+      }
     }
     console.log(
       `Attestation verified for candidate ${manifest.candidateCommitOid} (merkle root ${manifest.merkleRoot})`,

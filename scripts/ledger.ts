@@ -20,6 +20,22 @@ export type GateAuditRow = {
   resolved_at: string | null
 }
 
+export type StageEvidenceRow = {
+  artifact_path: string
+  artifact_sha256: string | null
+  base_commit_oid: string
+  candidate_commit_oid: string
+  evidence_id: string
+  evidence_sha256: string
+  exit_code: number
+  findings_json: string | null
+  round_index: number
+  run_id: string
+  stage_id: string
+  summary: string
+  worker_identity: string
+}
+
 export type GateDecisionRecord = {
   decision: 'approve' | 'skip'
   gateId: string
@@ -40,7 +56,7 @@ export type StageEvidenceManifestEntry = {
 }
 
 export type PassedAttestationManifest = {
-  version: '1.0.0'
+  version: '1.1.0'
   runId: string
   candidateCommitOid: string
   baseCommitOid: string
@@ -65,12 +81,20 @@ const HEX_64 = /^[0-9a-f]{64}$/
 export const RUN_ID_PATTERN = /^[A-Za-z0-9._-]+$/
 const COMMIT_OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
 
+/**
+ * Binds an evidence digest to the exact execution that produced it:
+ * (run_id, stage_id, round_index, candidate_commit_oid, base_commit_oid,
+ * worker_identity) plus the exit code, summary and artifact digest. The run ID
+ * is part of the tuple so an entry cannot be lifted out of one run's ledger and
+ * replayed as another run's evidence.
+ */
 export function evidenceSha256(input: {
   artifactSha256: string
   baseCommitOid: string
   candidateCommitOid: string
   exitCode: number
   round: number
+  runId: string
   stage: string
   summary: string
   workerIdentity: string
@@ -82,6 +106,7 @@ export function evidenceSha256(input: {
       candidateCommitOid: input.candidateCommitOid,
       exitCode: input.exitCode,
       round: input.round,
+      runId: input.runId,
       stage: input.stage,
       summary: input.summary,
       workerIdentity: input.workerIdentity
@@ -139,7 +164,7 @@ export function buildAttestation(
   }
 ): PassedAttestationManifest {
   const manifest: PassedAttestationManifest = {
-    version: '1.0.0',
+    version: '1.1.0',
     runId: meta.runId,
     candidateCommitOid: meta.candidateCommitOid,
     baseCommitOid: meta.baseCommitOid,
@@ -156,8 +181,11 @@ export function buildAttestation(
 }
 
 export function verifyManifest(manifest: PassedAttestationManifest): void {
-  if (!manifest || manifest.version !== '1.0.0') {
-    throw new Error('attestation version is not 1.0.0')
+  // Bumped when the run ID entered the evidence preimage: a 1.0.0 manifest's
+  // digests are computed over a different tuple, so it has to be rejected as an
+  // unsupported version rather than misreported as tampering.
+  if (!manifest || manifest.version !== '1.1.0') {
+    throw new Error('attestation version is not 1.1.0')
   }
   if (!COMMIT_OID.test(manifest.candidateCommitOid) || !COMMIT_OID.test(manifest.baseCommitOid)) {
     throw new Error('attestation commit OIDs are not 40- or 64-character hex values')
@@ -170,7 +198,7 @@ export function verifyManifest(manifest: PassedAttestationManifest): void {
     if (!HEX_64.test(entry.evidenceSha256)) {
       throw new Error(`stage ${entry.stage} evidence hash is not a SHA-256`)
     }
-    if (evidenceSha256(entry) !== entry.evidenceSha256) {
+    if (evidenceSha256({ ...entry, runId: manifest.runId }) !== entry.evidenceSha256) {
       throw new Error(`stage ${entry.stage} evidence hash does not match its recorded fields`)
     }
   }
@@ -638,7 +666,9 @@ CREATE TABLE IF NOT EXISTS stage_evidence (
   exit_code INTEGER NOT NULL,
   evidence_sha256 TEXT NOT NULL,
   artifact_path TEXT NOT NULL,
+  artifact_sha256 TEXT,
   summary TEXT NOT NULL,
+  findings_json TEXT,
   effective_policy_hash TEXT,
   base_ref_sha TEXT,
   created_at TEXT NOT NULL
@@ -661,6 +691,8 @@ CREATE TABLE IF NOT EXISTS gate_audit (
 
 CREATE INDEX IF NOT EXISTS idx_stage_checkpoints_run ON stage_checkpoints(run_id);
 CREATE INDEX IF NOT EXISTS idx_stage_evidence_run ON stage_evidence(run_id);
+CREATE INDEX IF NOT EXISTS idx_stage_evidence_stage
+  ON stage_evidence(run_id, stage_id, round_index);
 CREATE INDEX IF NOT EXISTS idx_gate_audit_run ON gate_audit(run_id);
 
 CREATE TABLE IF NOT EXISTS passed_attestations (
@@ -746,7 +778,12 @@ export class DomainLedger {
     // ponytail: nullable provenance columns added post-release; ALTER is the
     // idempotent path for ledgers created before ONM-40. Only the expected
     // duplicate-column failure is tolerated — anything else fails startup.
-    for (const column of ['effective_policy_hash TEXT', 'base_ref_sha TEXT']) {
+    for (const column of [
+      'effective_policy_hash TEXT',
+      'base_ref_sha TEXT',
+      'artifact_sha256 TEXT',
+      'findings_json TEXT'
+    ]) {
       try {
         this.#db.exec(`ALTER TABLE stage_evidence ADD COLUMN ${column}`)
       } catch (error) {
@@ -921,10 +958,12 @@ export class DomainLedger {
 
   recordEvidence(input: {
     artifactPath: string
+    artifactSha256: string
     baseCommitOid: string
     candidateCommitOid: string
     evidenceSha256: string
     exitCode: number
+    findingsJson?: string
     roundIndex: number
     runId: string
     stageId: string
@@ -938,9 +977,9 @@ export class DomainLedger {
       .prepare(
         `INSERT INTO stage_evidence (
            evidence_id, run_id, stage_id, round_index, candidate_commit_oid, base_commit_oid,
-           worker_identity, exit_code, evidence_sha256, artifact_path, summary,
-           effective_policy_hash, base_ref_sha, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           worker_identity, exit_code, evidence_sha256, artifact_path, artifact_sha256, summary,
+           findings_json, effective_policy_hash, base_ref_sha, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         evidenceId,
@@ -953,12 +992,82 @@ export class DomainLedger {
         input.exitCode,
         input.evidenceSha256,
         input.artifactPath,
+        input.artifactSha256,
         input.summary,
+        input.findingsJson ?? null,
         input.effectivePolicyHash ?? null,
         input.baseRefSha ?? null,
         new Date().toISOString()
       )
     return evidenceId
+  }
+
+  listEvidence(runId: string): StageEvidenceRow[] {
+    return this.#db
+      .prepare(
+        `SELECT evidence_id, run_id, stage_id, round_index, candidate_commit_oid, base_commit_oid,
+                worker_identity, exit_code, evidence_sha256, artifact_path, artifact_sha256,
+                summary, findings_json
+         FROM stage_evidence WHERE run_id = ? ORDER BY stage_id, round_index, rowid`
+      )
+      .all(runId) as StageEvidenceRow[]
+  }
+
+  /**
+   * Re-derives every stage evidence digest a manifest attests to, from what is
+   * on disk.
+   *
+   * Three tampering routes are covered: editing a stage log changes the
+   * artifact digest, editing any bound field of a row -- commit OIDs, worker
+   * identity, exit code, summary, round -- changes the evidence digest, and
+   * deleting the row outright would otherwise leave nothing to check, so every
+   * manifest entry must still find its row. Returns one message per failure so
+   * a caller can report them all at once.
+   */
+  verifyEvidence(manifest: PassedAttestationManifest): string[] {
+    const problems: string[] = []
+    const rows = this.listEvidence(manifest.runId)
+    const recorded = new Set(rows.map((row) => row.evidence_sha256))
+    for (const entry of manifest.stageEvidence) {
+      if (!recorded.has(entry.evidenceSha256)) {
+        problems.push(
+          `${entry.stage} round ${entry.round}: the attested evidence row is missing from the ledger`
+        )
+      }
+    }
+    for (const row of rows) {
+      const label = `${row.stage_id} round ${row.round_index}`
+      if (!row.artifact_sha256) {
+        problems.push(`${label}: no artifact digest was recorded`)
+        continue
+      }
+      let artifactSha256: string
+      try {
+        artifactSha256 = sha256(readFileSync(row.artifact_path, 'utf8'))
+      } catch {
+        problems.push(`${label}: artifact ${row.artifact_path} is missing or unreadable`)
+        continue
+      }
+      if (artifactSha256 !== row.artifact_sha256) {
+        problems.push(`${label}: artifact ${row.artifact_path} does not match its recorded digest`)
+        continue
+      }
+      const expected = evidenceSha256({
+        artifactSha256,
+        baseCommitOid: row.base_commit_oid,
+        candidateCommitOid: row.candidate_commit_oid,
+        exitCode: Number(row.exit_code),
+        round: Number(row.round_index),
+        runId: manifest.runId,
+        stage: row.stage_id,
+        summary: row.summary,
+        workerIdentity: row.worker_identity
+      })
+      if (expected !== row.evidence_sha256) {
+        problems.push(`${label}: evidence digest does not match its recorded fields`)
+      }
+    }
+    return problems
   }
 
   /**
