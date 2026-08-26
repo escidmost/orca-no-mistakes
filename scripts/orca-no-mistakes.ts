@@ -461,8 +461,9 @@ export async function runPipeline(
           2,
         ),
       );
-      await writeFile(artifactPath, logContent);
-      const artifactSha256 = sha256(logContent);
+      const artifactBytes = Buffer.from(logContent);
+      await writeFile(artifactPath, artifactBytes);
+      const artifactSha256 = sha256(artifactBytes);
       const entry: StageEvidenceManifestEntry = {
         stage,
         round,
@@ -6439,24 +6440,17 @@ async function runAttestationCommand(
       manifest = await ledger.getAttestation(ref);
     }
     verifyManifest(manifest);
-    let stored: PassedAttestationManifest | undefined;
-    try {
-      stored = await ledger.getAttestation(manifest.runId);
-    } catch {
-      stored = undefined;
-    }
-    if (stored && stored.merkleRoot !== manifest.merkleRoot) {
+    const stored = ledger.getAttestation(manifest.runId);
+    if (stored.merkleRoot !== manifest.merkleRoot) {
       throw new Error(
         "manifest does not match the attestation recorded in the domain ledger",
       );
     }
-    if (stored) {
-      const problems = ledger.verifyEvidence(manifest);
-      if (problems.length > 0) {
-        throw new Error(
-          `stage evidence verification failed:\n  ${problems.join("\n  ")}`,
-        );
-      }
+    const problems = ledger.verifyEvidence(manifest);
+    if (problems.length > 0) {
+      throw new Error(
+        `stage evidence verification failed:\n  ${problems.join("\n  ")}`,
+      );
     }
     console.log(
       `Attestation verified for candidate ${manifest.candidateCommitOid} (merkle root ${manifest.merkleRoot})`,

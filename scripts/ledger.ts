@@ -69,7 +69,7 @@ export type PassedAttestationManifest = {
   createdAt: string
 }
 
-export function sha256(value: string): string {
+export function sha256(value: string | Buffer): string {
   return createHash('sha256').update(value).digest('hex')
 }
 
@@ -1027,12 +1027,15 @@ export class DomainLedger {
   verifyEvidence(manifest: PassedAttestationManifest): string[] {
     const problems: string[] = []
     const rows = this.listEvidence(manifest.runId)
-    const recorded = new Set(rows.map((row) => row.evidence_sha256))
+    const recorded = rows.map((row) => row.evidence_sha256)
     for (const entry of manifest.stageEvidence) {
-      if (!recorded.has(entry.evidenceSha256)) {
+      const index = recorded.indexOf(entry.evidenceSha256)
+      if (index === -1) {
         problems.push(
           `${entry.stage} round ${entry.round}: the attested evidence row is missing from the ledger`
         )
+      } else {
+        recorded.splice(index, 1)
       }
     }
     for (const row of rows) {
@@ -1043,7 +1046,7 @@ export class DomainLedger {
       }
       let artifactSha256: string
       try {
-        artifactSha256 = sha256(readFileSync(row.artifact_path, 'utf8'))
+        artifactSha256 = sha256(readFileSync(row.artifact_path))
       } catch {
         problems.push(`${label}: artifact ${row.artifact_path} is missing or unreadable`)
         continue
