@@ -161,6 +161,7 @@ export interface OrcaOperations {
     taskId: string,
     question: string,
     options?: string[],
+    onCreated?: (gateId: string) => void,
   ): Promise<string>;
   waitForGate(gateId: string): Promise<string>;
   setWorktreeStatus(comment: string, status?: string): Promise<void>;
@@ -610,7 +611,28 @@ export async function runPipeline(
             gateOptions,
             exhausted ? stageAutoFix.max_rounds : undefined,
           );
-          const gateId = await orca.createGate(taskId, question, gateOptions);
+          // Durable before the block: an interrupted run still shows why the
+          // gate opened and that nobody has resolved it yet.
+          let gateAudited = false;
+          const openGateAudit = (gateId: string) => {
+            ledger.openGateAudit({
+              gateId,
+              gateKind: exhausted ? "exhaustion" : "finding",
+              optionsJson: JSON.stringify(gateOptions),
+              question,
+              roundIndex: round,
+              runId,
+              stageId: stage,
+            });
+            gateAudited = true;
+          };
+          const gateId = await orca.createGate(
+            taskId,
+            question,
+            gateOptions,
+            openGateAudit,
+          );
+          if (!gateAudited) openGateAudit(gateId);
           const resolution = (await orca.waitForGate(gateId)).trim();
           const decision = parseGateResolution(resolution, actionable);
           ledger.recordGateAudit({
@@ -3630,6 +3652,7 @@ export class CliOrca implements OrcaOperations {
     taskId: string,
     question: string,
     options = ["approve", "fix", "skip", "stop"],
+    onCreated?: (gateId: string) => void,
   ): Promise<string> {
     const result = await this.#json<{ gate: { id: string } }>([
       "orchestration",
@@ -3642,6 +3665,7 @@ export class CliOrca implements OrcaOperations {
       JSON.stringify(options),
       "--json",
     ]);
+    onCreated?.(result.gate.id);
     if (
       this.#notifyHandle &&
       this.#notifyHandle !== process.env.ORCA_TERMINAL_HANDLE

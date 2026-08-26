@@ -288,6 +288,7 @@ class FakeOrca implements OrcaOperations {
   readonly reports = new Map<string, StageReport[]>();
   readonly launchFailures: Error[] = [];
   gateResolution = "approve";
+  onGateWait?: (gateId: string) => void | Promise<void>;
   #taskNumber = 0;
   #dispatchNumber = 0;
   #runId: string;
@@ -379,6 +380,7 @@ class FakeOrca implements OrcaOperations {
 
   async waitForGate(gateId: string): Promise<string> {
     this.calls.push(`wait-gate:${gateId}`);
+    if (this.onGateWait) await this.onGateWait(gateId);
     return this.gateResolution;
   }
 
@@ -9741,4 +9743,162 @@ test("a gate resolution outside the offered options fails closed", async () => {
   assert.equal(audits.length, 1);
   assert.equal(audits[0].decision, "approve");
   assert.equal(ledger.runStatus(runId), "failed");
+});
+
+test("an exhaustion gate is recorded before the coordinator blocks on a human", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  const orca = new FakeOrca(git);
+  const ledger = new DomainLedger(":memory:");
+  const finding: Finding = {
+    id: "persistent",
+    severity: "error",
+    action: "auto-fix",
+    description: "The same defect remains.",
+  };
+  orca.reports.set("review", [
+    { findings: [finding], summary: "first failure" },
+    pass("fix committed"),
+    { findings: [finding], summary: "still failing" },
+  ]);
+  // Stands in for a coordinator killed while the operator deliberates.
+  orca.onGateWait = () => {
+    throw new Error("coordinator interrupted at the gate");
+  };
+
+  await assert.rejects(
+    runPipeline(
+      { intent: "Bound automatic repairs.", maxFixRounds: 1 },
+      orca,
+      git,
+      ledger,
+    ),
+    /coordinator interrupted at the gate/,
+  );
+
+  const runId = ledger.listRuns()[0].run_id;
+  const audits = ledger.listGateAudit(runId);
+  assert.equal(audits.length, 1);
+  assert.equal(audits[0].gate_kind, "exhaustion");
+  assert.equal(audits[0].decision, "pending");
+  assert.equal(audits[0].resolved_at, null);
+});
+
+test("exhaustion gate decisions replace the pending event without duplicating it", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  const orca = new FakeOrca(git);
+  const ledger = new DomainLedger(":memory:");
+  orca.gateResolution = "fix: persistent: try alternative fix";
+  const finding: Finding = {
+    id: "persistent",
+    severity: "error",
+    action: "auto-fix",
+    description: "The same defect remains.",
+  };
+  orca.reports.set("review", [
+    { findings: [finding], summary: "first failure" },
+    pass("fix committed"),
+    { findings: [finding], summary: "still failing" },
+    pass("clean rereview after exhaustion fix"),
+  ]);
+
+  const result = await runPipeline(
+    { intent: "Exhaustion fix test", maxFixRounds: 1 },
+    orca,
+    git,
+    ledger,
+  );
+
+  const audits = ledger.listGateAudit(result.runId);
+  assert.equal(audits.length, 1);
+  assert.equal(audits[0].gate_kind, "exhaustion");
+  assert.equal(audits[0].decision, "fix");
+  assert.equal(audits[0].guidance, "try alternative fix");
+  assert.ok(audits[0].resolved_at);
+});
+
+test("an ask-user gate inside the fix budget is audited as a finding gate", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  const ledger = new DomainLedger(":memory:");
+  orca.gateResolution = "approve";
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "docs-1",
+          severity: "warning",
+          action: "ask-user",
+          description: "Needs a product decision",
+        },
+      ],
+      summary: "decision needed",
+    },
+  ]);
+
+  const result = await runPipeline(
+    { intent: "Ship the approved change." },
+    orca,
+    git,
+    ledger,
+  );
+
+  const audits = ledger.listGateAudit(result.runId);
+  assert.equal(audits.length, 1);
+  assert.equal(audits[0].gate_kind, "finding");
+  assert.equal(audits[0].decision, "approve");
+});
+
+test("legacy gate_audit ledgers are rebuilt with durable gate columns", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "onm-gate-audit-"));
+  const dbPath = path.join(dir, "ledger.db");
+  const legacy = new DatabaseSync(dbPath);
+  legacy.exec(`CREATE TABLE runs (run_id TEXT PRIMARY KEY);
+    CREATE TABLE gate_audit (
+      gate_id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+      stage_id TEXT NOT NULL,
+      round_index INTEGER NOT NULL,
+      question TEXT NOT NULL,
+      options_json TEXT NOT NULL,
+      resolution TEXT NOT NULL,
+      decision TEXT NOT NULL,
+      guidance TEXT,
+      resolved_at TEXT NOT NULL
+    );
+    CREATE INDEX idx_gate_audit_run ON gate_audit(run_id);
+    INSERT INTO runs (run_id) VALUES ('legacy-run');
+    INSERT INTO gate_audit VALUES
+      ('gate-legacy', 'legacy-run', 'review', 1, 'q', '["approve"]', 'approve', 'approve', NULL, '2026-01-01T00:00:00.000Z');`);
+  legacy.close();
+
+  const ledger = new DomainLedger(dbPath);
+  try {
+    const audits = ledger.listGateAudit("legacy-run");
+    assert.equal(audits.length, 1);
+    assert.equal(audits[0].decision, "approve");
+    assert.equal(audits[0].gate_kind, "finding");
+    assert.equal(audits[0].resolved_at, "2026-01-01T00:00:00.000Z");
+    assert.match(ledger.tableDefinition("gate_audit") ?? "", /gate_kind TEXT/);
+    // The rebuild drops the renamed table, taking its index with it; the
+    // schema replay that follows has to put the index back on the new table.
+    const reader = new DatabaseSync(dbPath);
+    try {
+      assert.deepEqual(
+        reader
+          .prepare(
+            "SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name = 'idx_gate_audit_run'",
+          )
+          .all()
+          .map((row) => (row as { tbl_name: string }).tbl_name),
+        ["gate_audit"],
+      );
+    } finally {
+      reader.close();
+    }
+  } finally {
+    ledger.close();
+    await rm(dir, { recursive: true, force: true });
+  }
 });
