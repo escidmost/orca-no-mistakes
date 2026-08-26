@@ -18,6 +18,7 @@ export type GateAuditRow = {
   guidance: string | null
   resolution: string
   resolved_at: string | null
+  round_index: number
   stage_id: string
 }
 
@@ -1140,6 +1141,7 @@ export class DomainLedger {
           const audit = auditsByGateId.get(waiver.gateId)
           return (
             audit?.stage_id === entry.stage &&
+            audit.round_index === entry.round &&
             audit.decision === waiver.decision &&
             audit.resolved_at !== null
           )
@@ -1151,8 +1153,8 @@ export class DomainLedger {
     const latest = new Map<string, StageEvidenceRow>()
     for (const row of evidence.rows) latest.set(row.stage_id, row)
     const blockers: string[] = []
-    for (const [stage, row] of latest) {
-      const label = `${stage} round ${row.round_index}`
+    for (const row of latest.values()) {
+      const label = `${row.stage_id} round ${row.round_index}`
       if (row.findings_json === null) {
         blockers.push(`${label}: recorded findings are unreadable`)
         continue
@@ -1163,13 +1165,13 @@ export class DomainLedger {
           (finding) => finding?.action !== 'no-op'
         ).length
       } catch {
-        blockers.push(`${stage} round ${row.round_index}: recorded findings are unreadable`)
+        blockers.push(`${label}: recorded findings are unreadable`)
         continue
       }
       if (waived.has(row.evidence_sha256)) continue
       if (unresolved > 0) {
         blockers.push(
-          `${stage} round ${row.round_index}: ${unresolved} unaddressed finding(s) ` +
+          `${label}: ${unresolved} unaddressed finding(s) ` +
             'and no recorded waiver or approval'
         )
       }
@@ -1350,7 +1352,7 @@ export class DomainLedger {
   listGateAudit(runId: string): GateAuditRow[] {
     return this.#db
       .prepare(
-        `SELECT decision, gate_id, stage_id, gate_kind, guidance, resolution, resolved_at
+        `SELECT decision, gate_id, stage_id, round_index, gate_kind, guidance, resolution, resolved_at
          FROM gate_audit WHERE run_id = ? ORDER BY opened_at, rowid`
       )
       .all(runId) as GateAuditRow[]

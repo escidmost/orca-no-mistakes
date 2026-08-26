@@ -10439,6 +10439,32 @@ test("a stage whose findings were never addressed cannot be attested", async () 
     [],
   );
 
+  // A gate opened for an earlier round cannot waive a later round's evidence.
+  await recordReviewRound('[{"id":"still-open","action":"ask-user"}]');
+  assert.deepEqual(
+    ledger.attestationBlockers(result.runId, withWaiver(evidenceForRound(2))),
+    [
+      "review round 2: 1 unaddressed finding(s) and no recorded waiver or approval",
+    ],
+  );
+  ledger.recordGateAudit({
+    decision: "approve",
+    gateId: "gate-3",
+    optionsJson: '["approve"]',
+    question: "q",
+    resolution: "approve",
+    roundIndex: 2,
+    runId: result.runId,
+    stageId: "review",
+  });
+  assert.deepEqual(
+    ledger.attestationBlockers(
+      result.runId,
+      withWaiver(evidenceForRound(2), "gate-3"),
+    ),
+    [],
+  );
+
   // Informational findings are not something to address.
   await recordReviewRound('[{"id":"note","action":"no-op"}]');
   assert.deepEqual(ledger.attestationBlockers(result.runId, entries), []);
@@ -10454,19 +10480,19 @@ test("a stage whose findings were never addressed cannot be attested", async () 
 
   await recordReviewRound();
   assert.deepEqual(ledger.attestationBlockers(result.runId, entries), [
-    "review round 3: recorded findings are unreadable",
+    "review round 4: recorded findings are unreadable",
   ]);
   assert.deepEqual(
-    ledger.attestationBlockers(result.runId, withWaiver(evidenceForRound(3))),
-    ["review round 3: recorded findings are unreadable"],
+    ledger.attestationBlockers(result.runId, withWaiver(evidenceForRound(4))),
+    ["review round 4: recorded findings are unreadable"],
   );
 
   await recordReviewRound("not json");
   assert.deepEqual(ledger.attestationBlockers(result.runId, entries), [
-    "review round 4: artifact findings are unreadable",
+    "review round 5: artifact findings are unreadable",
   ]);
   assert.deepEqual(
-    ledger.attestationBlockers(result.runId, withWaiver(evidenceForRound(4))),
-    ["review round 4: artifact findings are unreadable"],
+    ledger.attestationBlockers(result.runId, withWaiver(evidenceForRound(5))),
+    ["review round 5: artifact findings are unreadable"],
   );
 });
