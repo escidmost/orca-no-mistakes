@@ -54,7 +54,7 @@ orca-no-mistakes attestation verify <manifest-file|run-id|commit-sha>
 orca-no-mistakes prune [--before <date>] [--repo <name-substring>]
 ```
 
-`verify` recomputes every stage-evidence hash, rebuilds the Merkle root over the manifest header and every stage digest, and cross-checks the intent hash — rewriting a stage hash, a commit SHA, the policy hash, or the run ID fails loudly and exits non-zero. An exported manifest is self-verifying, so it can be carried to a machine that never ran the pipeline and checked there; where the local ledger does hold the run, `verify` additionally requires the stored record to match and re-reads each retained stage log to recompute its artifact digest. Evidence is retained indefinitely until you explicitly `prune` it.
+`verify` recomputes every stage-evidence hash, rebuilds the Merkle root over the manifest header and every stage digest, and cross-checks the intent hash — rewriting a stage hash, a commit SHA, the policy hash, or the run ID fails loudly and exits non-zero. An exported manifest is self-verifying, so it can be carried to a machine that never ran the pipeline and checked there — it is tamper-evident, not signed, so that check proves internal integrity rather than authorship; where the local ledger does hold the run, `verify` additionally requires the stored record to match and re-reads each retained stage log to recompute its artifact digest. Evidence is retained indefinitely until you explicitly `prune` it.
 
 ## Gates and outcomes
 

@@ -6460,14 +6460,16 @@ async function runAttestationCommand(
     verifyManifest(manifest);
     // The manifest is self-verifying: the Merkle root covers its header and
     // every stage digest, so a manifest carried to a machine that never ran the
-    // pipeline still proves its own integrity. Where the ledger does hold the
-    // run, that weaker offline claim is not enough -- the stored record and the
-    // retained artifacts have to agree with it too.
+    // pipeline still proves its own integrity. It is tamper-evident, not
+    // signed, so that alone never establishes who issued it. Where the ledger
+    // does hold the run, the weaker offline claim is not enough -- the stored
+    // record and the retained artifacts have to agree with it too.
     const stored = ledger.findAttestation(manifest.runId);
     if (!stored) {
       console.log(
-        `Attestation verified offline for candidate ${manifest.candidateCommitOid} (merkle root ${manifest.merkleRoot}); ` +
-          `run ${manifest.runId} is absent from this ledger, so retained stage artifacts were not re-checked`,
+        `Attestation self-consistent offline for candidate ${manifest.candidateCommitOid} (merkle root ${manifest.merkleRoot}); ` +
+          `run ${manifest.runId} is absent from this ledger, so retained stage artifacts were not re-checked. ` +
+          "A manifest is tamper-evident, not signed: this proves internal integrity, not that this coordinator issued it.",
       );
       return;
     }
