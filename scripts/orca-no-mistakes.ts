@@ -6467,6 +6467,12 @@ async function runAttestationCommand(
     // record and the retained artifacts have to agree with it too.
     const stored = ledger.findAttestation(manifest.runId);
     if (!stored) {
+      const localRunStatus = ledger.runStatus(manifest.runId);
+      if (localRunStatus) {
+        throw new Error(
+          `run ${manifest.runId} has no passed attestation (status: ${localRunStatus})`,
+        );
+      }
       console.log(
         `Attestation self-consistent offline for candidate ${manifest.candidateCommitOid} (merkle root ${manifest.merkleRoot}); ` +
           `run ${manifest.runId} is absent from this ledger, so retained stage artifacts were not re-checked. ` +

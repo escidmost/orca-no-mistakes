@@ -9201,6 +9201,45 @@ test("an exported manifest verifies offline against a ledger that never ran it",
   }
 });
 
+test("verification fails closed when the local run has no passed attestation", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-attest-local-run-"));
+  const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
+  process.env.ORCA_NO_MISTAKES_HOME = temp;
+  const manifestPath = path.join(temp, "manifest.json");
+  try {
+    const ledger = new DomainLedger();
+    ledger.startRun({
+      baseBranch: "main",
+      branch: "feature",
+      intent: "A failed local run.",
+      policySha256: "f".repeat(64),
+      repoRoot: "/repo",
+      runId: "run-local",
+      submissionCommitOid: "a".repeat(40),
+    });
+    ledger.finishRun("run-local", "failed");
+    ledger.close();
+
+    const manifest = buildAttestation([], {
+      baseCommitOid: "b".repeat(40),
+      candidateCommitOid: "c".repeat(40),
+      intent: "A failed local run.",
+      policySha256: "f".repeat(64),
+      runId: "run-local",
+    });
+    await writeFile(manifestPath, JSON.stringify(manifest));
+
+    await assert.rejects(
+      main(["attestation", "verify", manifestPath]),
+      /run run-local has no passed attestation/,
+    );
+  } finally {
+    if (previousHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME;
+    else process.env.ORCA_NO_MISTAKES_HOME = previousHome;
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test("the attestation binds the base commit fetched by the rebase stage", async () => {
   const git = new FakeGit();
   const orca = new FakeOrca(git);
