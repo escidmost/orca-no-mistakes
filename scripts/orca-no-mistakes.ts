@@ -74,6 +74,7 @@ export {
   buildAttestation,
   canonicalEntry,
   capLog,
+  manifestLeaves,
   merkleRoot,
   sha256,
   verifyManifest,
@@ -6430,7 +6431,7 @@ async function runAttestationCommand(
   const ledger = new DomainLedger();
   try {
     if (action === "export") {
-      const manifest = await ledger.getAttestation(ref);
+      const manifest = ledger.getAttestation(ref);
       const output = `${JSON.stringify(manifest, null, 2)}\n`;
       const outPath = stringFlag(flags, "out");
       if (outPath) {
@@ -6442,16 +6443,34 @@ async function runAttestationCommand(
       }
       return;
     }
-    let manifest: PassedAttestationManifest;
+    // A readable path is always a manifest file; only an unreadable one falls
+    // through to a ledger lookup. Parsing a file that exists but is not JSON
+    // must report the parse failure rather than silently re-reading the path as
+    // a run ID and blaming a missing ledger record.
+    let raw: string | undefined;
     try {
-      manifest = JSON.parse(
-        await readFile(ref, "utf8"),
-      ) as PassedAttestationManifest;
+      raw = await readFile(ref, "utf8");
     } catch {
-      manifest = await ledger.getAttestation(ref);
+      raw = undefined;
     }
+    const manifest =
+      raw === undefined
+        ? ledger.getAttestation(ref)
+        : (JSON.parse(raw) as PassedAttestationManifest);
     verifyManifest(manifest);
-    const stored = ledger.getAttestation(manifest.runId);
+    // The manifest is self-verifying: the Merkle root covers its header and
+    // every stage digest, so a manifest carried to a machine that never ran the
+    // pipeline still proves its own integrity. Where the ledger does hold the
+    // run, that weaker offline claim is not enough -- the stored record and the
+    // retained artifacts have to agree with it too.
+    const stored = ledger.findAttestation(manifest.runId);
+    if (!stored) {
+      console.log(
+        `Attestation verified offline for candidate ${manifest.candidateCommitOid} (merkle root ${manifest.merkleRoot}); ` +
+          `run ${manifest.runId} is absent from this ledger, so retained stage artifacts were not re-checked`,
+      );
+      return;
+    }
     if (!isDeepStrictEqual(stored, manifest)) {
       throw new Error(
         "manifest does not match the attestation recorded in the domain ledger",

@@ -58,7 +58,7 @@ export type StageEvidenceManifestEntry = {
 }
 
 export type PassedAttestationManifest = {
-  version: '1.1.0'
+  version: '1.2.0'
   runId: string
   candidateCommitOid: string
   baseCommitOid: string
@@ -131,6 +131,32 @@ export function canonicalEntry(entry: StageEvidenceManifestEntry): string {
   })
 }
 
+/**
+ * The manifest fields that sit outside the stage evidence. They form a Merkle
+ * leaf of their own, so rewriting the run ID, either commit OID, the policy
+ * digest, or the intent hash on an otherwise intact manifest changes the root.
+ * Without that leaf those fields belong to no digest at all.
+ */
+export function canonicalHeader(manifest: PassedAttestationManifest): string {
+  return JSON.stringify({
+    baseCommitOid: manifest.baseCommitOid,
+    candidateCommitOid: manifest.candidateCommitOid,
+    coordinatorVersion: manifest.coordinatorVersion,
+    createdAt: manifest.createdAt,
+    intentHash: manifest.intentHash,
+    policySha256: manifest.policySha256,
+    runId: manifest.runId,
+    version: manifest.version
+  })
+}
+
+export function manifestLeaves(manifest: PassedAttestationManifest): string[] {
+  return [
+    sha256(canonicalHeader(manifest)),
+    ...manifest.stageEvidence.map((entry) => sha256(canonicalEntry(entry)))
+  ]
+}
+
 export function merkleRoot(hashes: string[]): string {
   let level = [...hashes]
   if (level.length === 0) level = [sha256('')]
@@ -166,7 +192,7 @@ export function buildAttestation(
   }
 ): PassedAttestationManifest {
   const manifest: PassedAttestationManifest = {
-    version: '1.1.0',
+    version: '1.2.0',
     runId: meta.runId,
     candidateCommitOid: meta.candidateCommitOid,
     baseCommitOid: meta.baseCommitOid,
@@ -174,20 +200,22 @@ export function buildAttestation(
     intent: meta.intent,
     intentHash: intentHash(meta.intent),
     stageEvidence: entries,
-    merkleRoot: merkleRoot(entries.map((entry) => sha256(canonicalEntry(entry)))),
+    merkleRoot: '',
     coordinatorVersion: COORDINATOR_VERSION,
     createdAt: new Date().toISOString()
   }
+  manifest.merkleRoot = merkleRoot(manifestLeaves(manifest))
   verifyManifest(manifest)
   return manifest
 }
 
 export function verifyManifest(manifest: PassedAttestationManifest): void {
-  // Bumped when the run ID entered the evidence preimage: a 1.0.0 manifest's
-  // digests are computed over a different tuple, so it has to be rejected as an
-  // unsupported version rather than misreported as tampering.
-  if (!manifest || manifest.version !== '1.1.0') {
-    throw new Error('attestation version is not 1.1.0')
+  // Bumped whenever the digest preimages change: 1.0.0 predates the run ID in
+  // the evidence preimage and 1.1.0 predates the header leaf in the Merkle
+  // tree, so both compute over a different tuple and have to be rejected as
+  // unsupported versions rather than misreported as tampering.
+  if (!manifest || manifest.version !== '1.2.0') {
+    throw new Error('attestation version is not 1.2.0')
   }
   if (!COMMIT_OID.test(manifest.candidateCommitOid) || !COMMIT_OID.test(manifest.baseCommitOid)) {
     throw new Error('attestation commit OIDs are not 40- or 64-character hex values')
@@ -207,9 +235,11 @@ export function verifyManifest(manifest: PassedAttestationManifest): void {
       throw new Error(`stage ${entry.stage} evidence hash does not match its recorded fields`)
     }
   }
-  const root = merkleRoot(manifest.stageEvidence.map((entry) => sha256(canonicalEntry(entry))))
-  if (root !== manifest.merkleRoot) {
-    throw new Error('attestation Merkle root does not match its stage evidence')
+  if (merkleRoot(manifestLeaves(manifest)) !== manifest.merkleRoot) {
+    throw new Error(
+      'attestation Merkle root does not match its header ' +
+        '(run ID, commit OIDs, policy hash, intent hash) or its stage evidence'
+    )
   }
 }
 
@@ -1275,6 +1305,19 @@ export class DomainLedger {
   }
 
   getAttestation(ref: string): PassedAttestationManifest {
+    const manifest = this.findAttestation(ref)
+    if (!manifest) throw new Error(`no passed attestation found for ${ref}`)
+    return manifest
+  }
+
+  /**
+   * The stored manifest for a run ID or candidate commit, or undefined when the
+   * ledger simply has no such record -- the case offline verification expects
+   * on a machine that never ran the pipeline. A record that is present but
+   * disagrees with its own indexed Merkle root still throws: that is tampering,
+   * not absence.
+   */
+  findAttestation(ref: string): PassedAttestationManifest | undefined {
     const row = (this.#db
       .prepare('SELECT manifest_json, merkle_root FROM passed_attestations WHERE run_id = ?')
       .get(ref)
@@ -1283,7 +1326,7 @@ export class DomainLedger {
           'SELECT manifest_json, merkle_root FROM passed_attestations WHERE candidate_commit_oid = ? ORDER BY created_at DESC, rowid DESC LIMIT 1'
         )
         .get(ref)) as { manifest_json: string; merkle_root: string } | undefined
-    if (!row) throw new Error(`no passed attestation found for ${ref}`)
+    if (!row) return undefined
     const manifest = JSON.parse(row.manifest_json) as PassedAttestationManifest
     if (manifest.merkleRoot !== row.merkle_root) {
       throw new Error('stored attestation manifest does not match the ledger Merkle root')
