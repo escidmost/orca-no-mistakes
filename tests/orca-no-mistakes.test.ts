@@ -10068,3 +10068,82 @@ test("legacy gate_audit ledgers are rebuilt with durable gate columns", async ()
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("a stage whose findings were never addressed cannot be attested", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  const orca = new FakeOrca(git);
+  const ledger = new DomainLedger(":memory:");
+
+  const result = await runPipeline(
+    { intent: "Block unresolved findings." },
+    orca,
+    git,
+    ledger,
+  );
+  const entries = result.attestation!.stageEvidence;
+  assert.deepEqual(ledger.attestationBlockers(result.runId, entries), []);
+
+  let round = 0;
+  const recordReviewRound = (findingsJson: string) => {
+    round += 1;
+    ledger.recordEvidence({
+      artifactPath: "/dev/null",
+      artifactSha256: sha256("artifact"),
+      baseCommitOid: "b".repeat(40),
+      candidateCommitOid: "c".repeat(40),
+      evidenceSha256: sha256(`round-${round}`),
+      exitCode: 1,
+      findingsJson,
+      roundIndex: round,
+      runId: result.runId,
+      stageId: "review",
+      summary: "unresolved",
+      workerIdentity: "reviewer",
+    });
+  };
+
+  recordReviewRound('[{"id":"open","action":"ask-user"}]');
+  assert.deepEqual(ledger.attestationBlockers(result.runId, entries), [
+    "review round 1: 1 unaddressed finding(s) and no recorded waiver or approval",
+  ]);
+
+  const withWaiver = (evidenceSha256: string) => {
+    const reviewEntry = entries.find((entry) => entry.stage === "review")!;
+    return [
+      ...entries,
+      {
+        ...reviewEntry,
+        evidenceSha256,
+        waiverOrApproval: {
+          decision: "approve" as const,
+          gateId: "gate-1",
+          resolvedAt: new Date().toISOString(),
+        },
+      },
+    ];
+  };
+
+  // A waiver recorded against an earlier round does not carry over to this one.
+  const staleWaiver = withWaiver(
+    entries.find((entry) => entry.stage === "review")!.evidenceSha256,
+  );
+  assert.deepEqual(ledger.attestationBlockers(result.runId, staleWaiver), [
+    "review round 1: 1 unaddressed finding(s) and no recorded waiver or approval",
+  ]);
+
+  // A gate decision on this round's evidence waives what is left open.
+  assert.deepEqual(
+    ledger.attestationBlockers(result.runId, withWaiver(sha256("round-1"))),
+    [],
+  );
+
+  // Informational findings are not something to address.
+  recordReviewRound('[{"id":"note","action":"no-op"}]');
+  assert.deepEqual(ledger.attestationBlockers(result.runId, entries), []);
+
+  recordReviewRound("not json");
+  assert.deepEqual(ledger.attestationBlockers(result.runId, entries), [
+    "review round 3: recorded findings are unreadable",
+  ]);
+});

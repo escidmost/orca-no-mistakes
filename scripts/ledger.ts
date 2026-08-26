@@ -1116,6 +1116,45 @@ export class DomainLedger {
   }
 
   /**
+   * Stages that must not be attested: the latest recorded round still carries a
+   * finding nobody addressed, and no gate decision waived it. Findings come from
+   * the durable evidence rows, so this holds independently of whatever the
+   * coordinator's stage loop believed about the run. Unreadable findings block
+   * too -- an unresolved stage and an unreadable one are equally unattestable.
+   */
+  attestationBlockers(runId: string, entries: StageEvidenceManifestEntry[]): string[] {
+    // Keyed by the exact evidence digest the decision was recorded against, so a
+    // waiver never carries over to a later round of the same stage.
+    const waived = new Set(
+      entries.filter((entry) => entry.waiverOrApproval).map((entry) => entry.evidenceSha256)
+    )
+    // listEvidence orders by (stage_id, round_index, rowid), so the last row
+    // written for a stage is the one left in the map.
+    const latest = new Map<string, StageEvidenceRow>()
+    for (const row of this.listEvidence(runId)) latest.set(row.stage_id, row)
+    const blockers: string[] = []
+    for (const [stage, row] of latest) {
+      if (waived.has(row.evidence_sha256)) continue
+      let unresolved: number
+      try {
+        unresolved = (JSON.parse(row.findings_json ?? '[]') as { action?: string }[]).filter(
+          (finding) => finding?.action !== 'no-op'
+        ).length
+      } catch {
+        blockers.push(`${stage} round ${row.round_index}: recorded findings are unreadable`)
+        continue
+      }
+      if (unresolved > 0) {
+        blockers.push(
+          `${stage} round ${row.round_index}: ${unresolved} unaddressed finding(s) ` +
+            'and no recorded waiver or approval'
+        )
+      }
+    }
+    return blockers
+  }
+
+  /**
    * Records a decision gate the moment it opens, before the coordinator blocks
    * on a human. A run interrupted mid-gate therefore still leaves the gate
    * event — including its exhaustion origin — in the ledger as `pending`.
