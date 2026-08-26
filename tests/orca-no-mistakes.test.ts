@@ -400,18 +400,21 @@ class LateFindingLedger extends DomainLedger {
       this.#injected = true;
       super.recordEvidence({
         ...input,
-        evidenceSha256: sha256("late-unresolved-finding"),
-        findingsJson: JSON.stringify([
-          {
-            action: "ask-user",
-            description: "A durable finding was added after stage execution.",
-            id: "late-finding",
-            severity: "error",
-          },
-        ]),
+        evidenceSha256: evidenceSha256({
+          artifactSha256: input.artifactSha256,
+          baseCommitOid: input.baseCommitOid,
+          candidateCommitOid: input.candidateCommitOid,
+          exitCode: input.exitCode,
+          round: 99,
+          runId: input.runId,
+          stage: "review",
+          summary: "late clean review",
+          workerIdentity: input.workerIdentity,
+        }),
+        findingsJson: "[]",
         roundIndex: 99,
         stageId: "review",
-        summary: "late unresolved finding",
+        summary: "late clean review",
       });
     }
     return evidenceId;
@@ -428,6 +431,25 @@ class TamperedFindingsLedger extends DomainLedger {
       try {
         database
           .prepare("UPDATE stage_evidence SET findings_json = '[]' WHERE evidence_id = ?")
+          .run(evidenceId);
+      } finally {
+        database.close();
+      }
+    }
+    return evidenceId;
+  }
+}
+
+class TamperedEvidenceLedger extends DomainLedger {
+  override recordEvidence(
+    input: Parameters<DomainLedger["recordEvidence"]>[0],
+  ): string {
+    const evidenceId = super.recordEvidence(input);
+    if (input.stageId === "review") {
+      const database = new DatabaseSync(this.path);
+      try {
+        database
+          .prepare("UPDATE stage_evidence SET summary = 'edited summary' WHERE evidence_id = ?")
           .run(evidenceId);
       } finally {
         database.close();
@@ -1396,6 +1418,24 @@ test("edited findings cannot bypass passed attestation", async () => {
     await assert.rejects(
       runPipeline({ intent: "Reject edited durable findings." }, orca, git, ledger),
       /this run cannot be attested: review round 0: recorded findings do not match the attested artifact/,
+    );
+    const runId = ledger.listRuns()[0].run_id;
+    assert.equal(ledger.runStatus(runId), "failed");
+  } finally {
+    ledger.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("edited evidence fields cannot bypass passed attestation", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  const home = await mkdtemp(path.join(tmpdir(), "no-mistakes-tampered-evidence-"));
+  const ledger = new TamperedEvidenceLedger(path.join(home, "ledger.db"));
+  try {
+    await assert.rejects(
+      runPipeline({ intent: "Reject edited evidence fields." }, orca, git, ledger),
+      /this run cannot be attested: review round 0: evidence digest does not match its recorded fields/,
     );
     const runId = ledger.listRuns()[0].run_id;
     assert.equal(ledger.runStatus(runId), "failed");
@@ -10203,12 +10243,24 @@ test("a stage whose findings were never addressed cannot be attested", async () 
         : JSON.stringify({ findings: findingsJson ? JSON.parse(findingsJson) : [] }),
     );
     await writeFile(artifactPath, artifactBytes);
-    ledger.recordEvidence({
-      artifactPath,
-      artifactSha256: sha256(artifactBytes),
+    const artifactSha256Value = sha256(artifactBytes);
+    const evidenceSha256Value = evidenceSha256({
+      artifactSha256: artifactSha256Value,
       baseCommitOid: "b".repeat(40),
       candidateCommitOid: "c".repeat(40),
-      evidenceSha256: sha256(`round-${round}`),
+      exitCode: 1,
+      round,
+      runId: result.runId,
+      stage: "review",
+      summary: "unresolved",
+      workerIdentity: "reviewer",
+    });
+    ledger.recordEvidence({
+      artifactPath,
+      artifactSha256: artifactSha256Value,
+      baseCommitOid: "b".repeat(40),
+      candidateCommitOid: "c".repeat(40),
+      evidenceSha256: evidenceSha256Value,
       exitCode: 1,
       findingsJson,
       roundIndex: round,
@@ -10216,6 +10268,14 @@ test("a stage whose findings were never addressed cannot be attested", async () 
       stageId: "review",
       summary: "unresolved",
       workerIdentity: "reviewer",
+    });
+    entries.push({
+      ...entries.find((entry) => entry.stage === "review")!,
+      artifactSha256: artifactSha256Value,
+      evidenceSha256: evidenceSha256Value,
+      exitCode: 1,
+      round,
+      summary: "unresolved",
     });
   };
 
@@ -10239,6 +10299,11 @@ test("a stage whose findings were never addressed cannot be attested", async () 
       },
     ];
   };
+  const evidenceForRound = (roundIndex: number) =>
+    ledger
+      .listEvidence(result.runId)
+      .find((row) => row.stage_id === "review" && row.round_index === roundIndex)!
+      .evidence_sha256;
 
   // A waiver recorded against an earlier round does not carry over to this one.
   const staleWaiver = withWaiver(
@@ -10250,7 +10315,7 @@ test("a stage whose findings were never addressed cannot be attested", async () 
 
   // A gate decision on this round's evidence waives what is left open.
   assert.deepEqual(
-    ledger.attestationBlockers(result.runId, withWaiver(sha256("round-1"))),
+    ledger.attestationBlockers(result.runId, withWaiver(evidenceForRound(1))),
     [],
   );
 
@@ -10260,11 +10325,11 @@ test("a stage whose findings were never addressed cannot be attested", async () 
 
   await recordReviewRound("not json");
   assert.deepEqual(ledger.attestationBlockers(result.runId, entries), [
-    "review round 3: recorded findings are unreadable",
+    "review round 3: artifact findings are unreadable",
   ]);
   assert.deepEqual(
-    ledger.attestationBlockers(result.runId, withWaiver(sha256("round-3"))),
-    ["review round 3: recorded findings are unreadable"],
+    ledger.attestationBlockers(result.runId, withWaiver(evidenceForRound(3))),
+    ["review round 3: artifact findings are unreadable"],
   );
 
   await recordReviewRound();
@@ -10272,7 +10337,7 @@ test("a stage whose findings were never addressed cannot be attested", async () 
     "review round 4: recorded findings are unreadable",
   ]);
   assert.deepEqual(
-    ledger.attestationBlockers(result.runId, withWaiver(sha256("round-4"))),
+    ledger.attestationBlockers(result.runId, withWaiver(evidenceForRound(4))),
     ["review round 4: recorded findings are unreadable"],
   );
 });

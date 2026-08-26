@@ -1128,17 +1128,22 @@ export class DomainLedger {
     const waived = new Set(
       entries.filter((entry) => entry.waiverOrApproval).map((entry) => entry.evidenceSha256)
     )
+    const attested = new Set(entries.map((entry) => entry.evidenceSha256))
     // listEvidence orders by (stage_id, round_index, rowid), so the last row
     // written for a stage is the one left in the map.
     const latest = new Map<string, StageEvidenceRow>()
     for (const row of this.listEvidence(runId)) latest.set(row.stage_id, row)
     const blockers: string[] = []
     for (const [stage, row] of latest) {
-      if (row.findings_json === null) {
-        blockers.push(`${stage} round ${row.round_index}: recorded findings are unreadable`)
+      const label = `${stage} round ${row.round_index}`
+      if (!attested.has(row.evidence_sha256)) {
+        blockers.push(`${label}: the ledger evidence row is absent from the attestation`)
         continue
       }
-      const label = `${stage} round ${row.round_index}`
+      if (row.findings_json === null) {
+        blockers.push(`${label}: recorded findings are unreadable`)
+        continue
+      }
       if (!row.artifact_sha256) {
         blockers.push(`${label}: no artifact digest was recorded`)
         continue
@@ -1153,11 +1158,38 @@ export class DomainLedger {
         blockers.push(`${label}: artifact ${row.artifact_path} is missing or unreadable`)
         continue
       }
-      if (sha256(artifact) !== row.artifact_sha256) {
+      const artifactSha256 = sha256(artifact)
+      if (artifactSha256 !== row.artifact_sha256) {
         blockers.push(`${label}: artifact ${row.artifact_path} does not match its recorded digest`)
         continue
       }
-      if (!findingsMatchArtifact(artifact, row.findings_json)) {
+      const expected = evidenceSha256({
+        artifactSha256,
+        baseCommitOid: row.base_commit_oid,
+        candidateCommitOid: row.candidate_commit_oid,
+        exitCode: Number(row.exit_code),
+        round: Number(row.round_index),
+        runId,
+        stage: row.stage_id,
+        summary: row.summary,
+        workerIdentity: row.worker_identity
+      })
+      if (expected !== row.evidence_sha256) {
+        blockers.push(`${label}: evidence digest does not match its recorded fields`)
+        continue
+      }
+      let artifactFindings: unknown
+      try {
+        const parsed = JSON.parse(artifact.toString('utf8')) as { findings?: unknown } | null
+        if (!parsed || typeof parsed !== 'object' || !Object.hasOwn(parsed, 'findings')) {
+          throw new Error('artifact findings are unreadable')
+        }
+        artifactFindings = parsed.findings
+      } catch {
+        blockers.push(`${label}: artifact findings are unreadable`)
+        continue
+      }
+      if (JSON.stringify(artifactFindings) !== row.findings_json) {
         blockers.push(`${label}: recorded findings do not match the attested artifact`)
         continue
       }
