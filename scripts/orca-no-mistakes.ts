@@ -6297,6 +6297,26 @@ async function canonicalPath(value: string): Promise<string> {
   return realpath(absolute).catch(() => absolute);
 }
 
+async function canonicalPathFromExistingAncestor(value: string): Promise<string> {
+  const absolute = path.resolve(value);
+  let ancestor = absolute;
+  while (!existsSync(ancestor)) ancestor = path.dirname(ancestor);
+  return path.join(await realpath(ancestor), path.relative(ancestor, absolute));
+}
+
+function configuredRunPath(root: string, runId: string): string {
+  const canonicalRoot = path.resolve(root);
+  const runPath = path.resolve(canonicalRoot, runId);
+  if (
+    !RUN_ID_PATTERN.test(runId) ||
+    path.dirname(runPath) !== canonicalRoot ||
+    path.basename(runPath) !== runId
+  ) {
+    throw new Error("orchestration run-create returned an invalid run ID");
+  }
+  return runPath;
+}
+
 async function configuredWorktreeRoot(
   repoRoot: string,
   roots: Record<string, string> | undefined,
@@ -6311,8 +6331,7 @@ async function configuredWorktreeRoot(
         `configured worktree root must be outside repository ${canonicalRepo}`,
       );
     }
-    await mkdir(root, { recursive: true });
-    const canonicalRoot = await canonicalPath(root);
+    const canonicalRoot = await canonicalPathFromExistingAncestor(requestedRoot);
     if (
       canonicalRoot === canonicalRepo ||
       isWithin(canonicalRepo, canonicalRoot)
@@ -6321,40 +6340,20 @@ async function configuredWorktreeRoot(
         `configured worktree root must be outside repository ${canonicalRepo}`,
       );
     }
-    return canonicalRoot;
+    await mkdir(canonicalRoot, { recursive: true });
+    return await canonicalPath(canonicalRoot);
   }
   return undefined;
 }
 
 async function createGateWorktree(
   repo: RepoSnapshot,
-  worktreeRoots: Record<string, string> | undefined,
   orcaCommand: string,
-  objective: string,
+  configured?: { root: string; runId: string },
 ): Promise<GateWorktree> {
   const gateName = `no-mistakes-gate-${randomUUID().slice(0, 8)}`;
-  const root = await configuredWorktreeRoot(repo.root, worktreeRoots);
-  if (root) {
-    const runReceipt = unwrapJson<{ run: { id: string } }>(
-      (
-        await command(
-          orcaCommand,
-          [
-            "orchestration",
-            "run-create",
-            "--objective",
-            objective,
-            "--json",
-          ],
-          repo.root,
-        )
-      ).stdout,
-    );
-    const runId = runReceipt.run?.id;
-    if (!runId || !RUN_ID_PATTERN.test(runId)) {
-      throw new Error("orchestration run-create returned an invalid run ID");
-    }
-    const gatePath = path.join(root, runId);
+  if (configured) {
+    const gatePath = configuredRunPath(configured.root, configured.runId);
     await command(
       "git",
       ["-C", repo.root, "worktree", "add", "-b", gateName, gatePath, repo.head],
@@ -6364,8 +6363,8 @@ async function createGateWorktree(
       branch: gateName,
       kind: "configured",
       path: gatePath,
-      root,
-      runId,
+      root: configured.root,
+      runId: configured.runId,
     };
   }
   const gateReceipt = unwrapJson<{
@@ -6419,11 +6418,15 @@ async function removeGateWorktree(
   } else {
     const root = await canonicalPath(gate.root);
     const parent = await canonicalPath(path.dirname(gate.path));
+    let expectedPath = "";
+    try {
+      expectedPath = configuredRunPath(root, gate.runId);
+    } catch {}
     if (
       parent !== root ||
+      gate.path !== expectedPath ||
       !gate.branch.startsWith("no-mistakes-gate-") ||
       !RUN_ID_PATTERN.test(gate.branch) ||
-      !RUN_ID_PATTERN.test(gate.runId) ||
       path.basename(gate.path) !== gate.runId
     ) {
       console.error(
@@ -6464,13 +6467,77 @@ async function launchDetachedRun(
   userGlobalConfig: OrcaNoMistakesConfig,
 ): Promise<string> {
   const orcaCommand = resolveOrcaCommand();
-  const gate = await createGateWorktree(
-    repo,
+  const root = await configuredWorktreeRoot(
+    repo.root,
     userGlobalConfig.worktree_roots,
-    orcaCommand,
-    stringFlag(flags, "intent")!,
   );
   let terminalHandle = "";
+  let gate: GateWorktree;
+  if (root) {
+    try {
+      const created = unwrapJson<{ terminal: { handle: string } }>(
+        (
+          await command(
+            orcaCommand,
+            [
+              "terminal",
+              "create",
+              "--worktree",
+              `path:${repo.root}`,
+              "--title",
+              "no-mistakes",
+              "--json",
+            ],
+            repo.root,
+          )
+        ).stdout,
+      );
+      terminalHandle = created?.terminal?.handle ?? "";
+      if (!terminalHandle) {
+        throw new Error("terminal create returned an invalid receipt");
+      }
+      const runReceipt = unwrapJson<{ run: { id: string } }>(
+        (
+          await command(
+            orcaCommand,
+            [
+              "orchestration",
+              "run-create",
+              "--objective",
+              stringFlag(flags, "intent")!,
+              "--from",
+              terminalHandle,
+              "--json",
+            ],
+            repo.root,
+          )
+        ).stdout,
+      );
+      gate = await createGateWorktree(repo, orcaCommand, {
+        root,
+        runId: runReceipt.run?.id ?? "",
+      });
+    } catch (error) {
+      if (terminalHandle) {
+        await command(
+          orcaCommand,
+          [
+            "terminal",
+            "close",
+            "--terminal",
+            terminalHandle,
+            "--tab",
+            "--json",
+          ],
+          repo.root,
+          { allowFailure: true },
+        );
+      }
+      throw error;
+    }
+  } else {
+    gate = await createGateWorktree(repo, orcaCommand);
+  }
   try {
     if (gate.kind === "orca") {
       await command(
