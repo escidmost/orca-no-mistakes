@@ -1,3 +1,4 @@
+import { fullStageEvidence } from './attestation-fixture.ts'
 import assert from 'node:assert/strict'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -25,7 +26,7 @@ test('offline verification rejects a manifest for a failed local run', async () 
   process.env.ORCA_NO_MISTAKES_HOME = home
   try {
     const runId = 'failed-offline-run'
-    const manifest = buildAttestation([], {
+    const manifest = buildAttestation(fullStageEvidence({ baseCommitOid: commit, candidateCommitOid: commit, runId }), {
       baseCommitOid: commit,
       candidateCommitOid: commit,
       intent: 'Reject contradictory offline evidence.',
@@ -49,7 +50,7 @@ test('offline verification rejects a manifest for a failed local run', async () 
 
     await assert.rejects(
       main(['attestation', 'verify', manifestPath]),
-      /exists in this ledger with status failed/
+      /has no passed attestation \(status: failed\)/
     )
   } finally {
     if (previousHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME

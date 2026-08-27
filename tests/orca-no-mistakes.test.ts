@@ -1,3 +1,4 @@
+import { fullStageEvidence } from './attestation-fixture.ts'
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -9176,7 +9177,12 @@ test("a manifest missing a declared field is rejected before it is hashed", () =
 
   // Dropping a header field shortens the hashed preimage, so recomputing the
   // root over the shorter manifest would otherwise verify clean.
-  for (const field of ["createdAt", "coordinatorVersion", "runId"] as const) {
+  const headerCases = [
+    ["createdAt", /creation timestamp is invalid/],
+    ["coordinatorVersion", /coordinator version is invalid/],
+    ["runId", /run ID is invalid/],
+  ] as const;
+  for (const [field, expected] of headerCases) {
     const stripped = structuredClone(good) as Record<string, unknown>;
     delete stripped[field];
     stripped.merkleRoot = merkleRoot(
@@ -9184,7 +9190,7 @@ test("a manifest missing a declared field is rejected before it is hashed", () =
     );
     assert.throws(
       () => verifyManifest(stripped as unknown as PassedAttestationManifest),
-      new RegExp(`missing its ${field}`),
+      expected,
     );
   }
 
@@ -9193,22 +9199,17 @@ test("a manifest missing a declared field is rejected before it is hashed", () =
   delete noEvidence.stageEvidence;
   assert.throws(
     () => verifyManifest(noEvidence as unknown as PassedAttestationManifest),
-    /missing its stage evidence/,
+    /stage evidence is not an array/,
   );
 
-  const noSummary = structuredClone(good);
-  delete (noSummary.stageEvidence[0] as Record<string, unknown>).summary;
-  assert.throws(
-    () => verifyManifest(noSummary),
-    /stage evidence entry 0 is missing its summary/,
-  );
-
-  const noRound = structuredClone(good);
-  delete (noRound.stageEvidence[0] as Record<string, unknown>).round;
-  assert.throws(
-    () => verifyManifest(noRound),
-    /stage evidence entry 0 is missing its round/,
-  );
+  for (const field of ["summary", "round"] as const) {
+    const stripped = structuredClone(good);
+    delete (stripped.stageEvidence[0] as Record<string, unknown>)[field];
+    assert.throws(
+      () => verifyManifest(stripped),
+      /stage evidence entry 0 has invalid required fields/,
+    );
+  }
 });
 
 test("an exported manifest verifies offline against a ledger that never ran it", async () => {
@@ -9283,7 +9284,7 @@ test("verification fails closed when the local run has no passed attestation", a
     ledger.finishRun("run-local", "failed");
     ledger.close();
 
-    const manifest = buildAttestation([], {
+    const manifest = buildAttestation(fullStageEvidence({ baseCommitOid: "b".repeat(40), candidateCommitOid: "c".repeat(40), runId: "run-local" }), {
       baseCommitOid: "b".repeat(40),
       candidateCommitOid: "c".repeat(40),
       intent: "A failed local run.",

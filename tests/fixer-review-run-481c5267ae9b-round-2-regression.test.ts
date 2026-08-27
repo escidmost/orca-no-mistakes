@@ -1,3 +1,4 @@
+import { fullStageEvidence } from './attestation-fixture.ts'
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -93,7 +94,7 @@ test("manifest-file verification rejects a forged manifest for a recorded run", 
   process.env.ORCA_NO_MISTAKES_HOME = home;
   try {
     const runId = "complete-manifest-run";
-    const manifest = buildAttestation([], {
+    const manifest = buildAttestation(fullStageEvidence({ baseCommitOid: commit, candidateCommitOid: commit, runId }), {
       baseCommitOid: commit,
       candidateCommitOid: commit,
       intent: "Verify evidence.",
@@ -106,7 +107,7 @@ test("manifest-file verification rejects a forged manifest for a recorded run", 
     ledger.close();
     // Internally valid — rebuilt from scratch, so its Merkle root covers the
     // forged candidate commit — but not the manifest this run recorded.
-    const forged = buildAttestation([], {
+    const forged = buildAttestation(fullStageEvidence({ baseCommitOid: commit, candidateCommitOid: otherCommit, runId }), {
       baseCommitOid: commit,
       candidateCommitOid: otherCommit,
       intent: "Verify evidence.",

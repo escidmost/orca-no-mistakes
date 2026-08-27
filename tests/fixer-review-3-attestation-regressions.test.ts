@@ -1,3 +1,4 @@
+import { fullStageEvidence } from './attestation-fixture.ts'
 import assert from 'node:assert/strict'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -28,7 +29,7 @@ test('stored attestations require a passed run for verify and export', async () 
       process.env.ORCA_NO_MISTAKES_HOME = home
       try {
         const runId = `${status}-attestation`
-        const manifest = buildAttestation([], {
+        const manifest = buildAttestation(fullStageEvidence({ baseCommitOid: commit, candidateCommitOid: commit, runId }), {
           baseCommitOid: commit,
           candidateCommitOid: commit,
           intent: 'Reject attestations for runs that did not pass.',

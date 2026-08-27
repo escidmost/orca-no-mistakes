@@ -1,3 +1,4 @@
+import { fullStageEvidence } from './attestation-fixture.ts'
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -69,7 +70,7 @@ test("manifest-file verification verifies offline, then requires an intact store
   const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
   process.env.ORCA_NO_MISTAKES_HOME = home;
   try {
-    const manifest = buildAttestation([], {
+    const manifest = buildAttestation(fullStageEvidence({ baseCommitOid: commit, candidateCommitOid: commit, runId: "missing-run" }), {
       baseCommitOid: commit,
       candidateCommitOid: commit,
       intent: "Verify evidence.",
