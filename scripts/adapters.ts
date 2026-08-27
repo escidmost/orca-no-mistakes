@@ -194,7 +194,9 @@ const RESERVED_HARNESS_ARGS: Record<string, ReadonlySet<string>> = {
   kimi: new Set(['--auto', '--plan', '--prompt', '--yolo', '-p']),
   pi: new Set([
     '--continue',
+    '--export',
     '--fork',
+    '--list-models',
     '--mode',
     '--no-session',
     '--print',

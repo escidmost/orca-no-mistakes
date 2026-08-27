@@ -513,7 +513,9 @@ test('buildCliCommand always sends the agy reserved flag and rejects reserved ov
 test('buildCliCommand reserves pi conversation and interactive-mode controls', () => {
   for (const flag of [
     '--continue',
+    '--export=/tmp/pi-session.html',
     '--fork=session-id',
+    '--list-models=claude',
     '--mode=json',
     '--no-session',
     '--print',
