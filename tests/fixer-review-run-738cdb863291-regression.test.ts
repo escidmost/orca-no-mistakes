@@ -136,6 +136,44 @@ test("missing repositories require an exact --repo assertion", async () => {
   }
 });
 
+test("a feature branch deleted after merge still prunes against its base", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-prune-gone-branch-"));
+  const home = path.join(temp, "home");
+  const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
+  process.env.ORCA_NO_MISTAKES_HOME = home;
+  try {
+    const { feature, repo } = await repository(temp);
+    const runId = "run-merged-branch";
+    completedRun(repo, runId);
+    git(repo, "update-ref", `refs/no-mistakes/recover/${runId}`, feature);
+    // The pull request merged: the feature commits reached the base and the
+    // branch itself was deleted, which is the ordinary end state for a run.
+    git(repo, "checkout", "main");
+    git(repo, "merge", "--ff-only", feature);
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD");
+    git(repo, "branch", "-D", "feature");
+    const artifacts = path.join(home, "artifacts", runId);
+    await mkdir(artifacts, { recursive: true });
+
+    await main(["prune", "--before=2999-01-01"]);
+
+    const ledger = new DomainLedger();
+    assert.equal(ledger.runStatus(runId), undefined);
+    ledger.close();
+    assert.equal(existsSync(artifacts), false);
+    // Preserved commits outlive the pruned run: prune reclaims ledger rows and
+    // artifact logs, never Git history.
+    assert.equal(
+      git(repo, "rev-parse", `refs/no-mistakes/recover/${runId}`),
+      feature,
+    );
+  } finally {
+    if (previousHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME;
+    else process.env.ORCA_NO_MISTAKES_HOME = previousHome;
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test("recovery ref inspection exits 124 and 128 abort prune", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "onm-prune-git-failure-"));
   const home = path.join(temp, "home");

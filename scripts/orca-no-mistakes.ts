@@ -6285,11 +6285,25 @@ async function recoveryHeadState(
       run.base_branch,
       `origin/${run.base_branch}`,
     ]) {
+      // A container that no longer resolves -- most often a feature branch
+      // deleted once its pull request merged -- cannot witness containment,
+      // but it is not an inspection failure either: skip it and try the next.
+      // Resolving it first also keeps `merge-base` exit 1 meaning "not an
+      // ancestor" rather than "bad revision".
+      const containerOid = await git([
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        `${container}^{commit}`,
+      ]);
+      if (containerOid.code === 1) continue;
+      if (containerOid.code !== 0)
+        throw failedInspection("rev-parse", containerOid);
       const contained = await git([
         "merge-base",
         "--is-ancestor",
         oid,
-        `${container}^{commit}`,
+        containerOid.stdout.trim(),
       ]);
       if (contained.code === 0) {
         isContained = true;

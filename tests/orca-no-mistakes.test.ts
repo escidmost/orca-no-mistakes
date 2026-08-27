@@ -9132,15 +9132,18 @@ test("prune drops merged runs with their artifacts and retains unmerged recovery
 
     const reopened = new DomainLedger();
     assert.equal(reopened.runStatus("run-merged"), undefined);
-    assert.equal(reopened.runStatus("run-gone"), undefined);
+    // A repository root that is gone is not proof that nothing was preserved:
+    // it is retained until --repo names that exact root.
+    assert.equal(reopened.runStatus("run-gone"), "failed");
     assert.equal(reopened.runStatus("run-unmerged"), "failed");
     reopened.close();
     assert.equal(existsSync(path.join(home, "artifacts", "run-merged")), false);
     assert.equal(existsSync(path.join(home, "artifacts", "run-unmerged")), true);
-    // The merged run's ref would otherwise pin its objects forever; the
-    // unmerged one is the operator's only handle on the preserved commits.
-    assert.throws(() =>
-      git(repo, "rev-parse", "--verify", "refs/no-mistakes/recover/run-merged"),
+    // Prune reclaims ledger rows and artifact logs, never Git history: both
+    // recovery refs survive the runs they belonged to.
+    assert.equal(
+      git(repo, "rev-parse", "refs/no-mistakes/recover/run-merged"),
+      merged,
     );
     assert.equal(
       git(repo, "rev-parse", "refs/no-mistakes/recover/run-unmerged"),
@@ -9287,7 +9290,9 @@ test("CLI exports, verifies, and prunes attestations through the domain ledger",
       /(ENOENT|no passed attestation)/,
     );
 
-    await main(["prune", "--before=2999-01-01"]);
+    // The fake repo root never existed on disk, so prune needs the operator's
+    // explicit assertion that the checkout is gone.
+    await main(["prune", "--before=2999-01-01", "--repo=/repo"]);
     const reopened = new DomainLedger();
     assert.throws(
       () => reopened.getAttestation(result.runId),
