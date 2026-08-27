@@ -2091,8 +2091,7 @@ export function selectedFindingIdsForGate(
   if (!options.includes(decision.action)) return undefined;
   if (
     decision.action === "approve" ||
-    decision.action === "skip" ||
-    decision.action === "stop"
+    decision.action === "skip"
   ) {
     return [];
   }
@@ -7089,9 +7088,9 @@ Run options:
         ? "cancelled"
         : "failed";
     const message = error instanceof Error ? error.message : String(error);
-    if (gate?.kind === "configured" && gate.intentTaskId) {
+    if (gate?.kind === "configured") {
       await orca
-        .failTask(gate.intentTaskId, `Coordinator preflight failed: ${message}`)
+        .failRun(`Configured coordinator failed: ${message}`)
         .catch(() => {});
     }
     const recoverRef = (error as CustodyTaggedError).recoverRef;
