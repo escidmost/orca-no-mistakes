@@ -64,6 +64,7 @@ import {
   buildAttestation,
   capLog,
   evidenceSha256,
+  normalizeIntent,
   sha256,
   verifyManifest,
   type PassedAttestationManifest,
@@ -76,6 +77,7 @@ export {
   capLog,
   manifestLeaves,
   merkleRoot,
+  normalizeIntent,
   sha256,
   verifyManifest,
   type PassedAttestationManifest,
@@ -289,21 +291,7 @@ export async function runPipeline(
   git: GitOperations,
   ledger: DomainLedger = new DomainLedger(":memory:"),
 ): Promise<PipelineResult> {
-  const intent = options.intent.trim();
-  if (!intent) {
-    throw new Error("--intent is required");
-  }
-  if (
-    intent.includes("<untrusted_instruction>") ||
-    intent.includes("</untrusted_instruction>")
-  ) {
-    throw new Error(
-      "--intent must not contain untrusted_instruction delimiters",
-    );
-  }
-  if (intent.includes("\n") || intent.includes("\0")) {
-    throw new Error("--intent must be a single line");
-  }
+  const intent = normalizeIntent(options.intent);
   const maxFixRounds = options.maxFixRounds;
   if (
     maxFixRounds !== undefined &&
@@ -863,9 +851,8 @@ export async function runPipeline(
       policySha256: policySha256Value,
       runId,
     });
-    ledger.finishRun(runId, "passed", terminalCommitOid);
-    ledger.releaseLease(runId);
-    ledger.recordAttestation(attestation);
+    verifyManifest(attestation, PIPELINE_STEPS);
+    ledger.finalizePassedRun(attestation, terminalCommitOid);
     await orca
       .setWorktreeStatus(
         `${statusPrefix}no-mistakes passed all ${PIPELINE_STEPS.length} stages`,
@@ -6444,7 +6431,7 @@ async function runAttestationCommand(
   try {
     if (action === "export") {
       const manifest = ledger.getAttestation(ref);
-      verifyManifest(manifest);
+      verifyManifest(manifest, PIPELINE_STEPS);
       assertStoredAttestationPassed(ledger, manifest);
       const output = `${JSON.stringify(manifest, null, 2)}\n`;
       const outPath = stringFlag(flags, "out");
@@ -6471,7 +6458,7 @@ async function runAttestationCommand(
       raw === undefined
         ? ledger.getAttestation(ref)
         : (JSON.parse(raw) as PassedAttestationManifest);
-    verifyManifest(manifest);
+    verifyManifest(manifest, PIPELINE_STEPS);
     // The manifest is self-verifying: the Merkle root covers its header and
     // every stage digest, so a manifest carried to a machine that never ran the
     // pipeline still proves its own integrity. It is tamper-evident, not

@@ -79,6 +79,21 @@ export function intentHash(intent: string): string {
   return sha256(intent)
 }
 
+export function normalizeIntent(value: unknown): string {
+  const intent = typeof value === 'string' ? value.trim() : ''
+  if (!intent) throw new Error('--intent is required')
+  if (
+    intent.includes('<untrusted_instruction>') ||
+    intent.includes('</untrusted_instruction>')
+  ) {
+    throw new Error('--intent must not contain untrusted_instruction delimiters')
+  }
+  if (intent.includes('\n') || intent.includes('\0')) {
+    throw new Error('--intent must be a single line')
+  }
+  return intent
+}
+
 const HEX_64 = /^[0-9a-f]{64}$/
 export const RUN_ID_PATTERN = /^[A-Za-z0-9._-]+$/
 const COMMIT_OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
@@ -215,7 +230,10 @@ export function buildAttestation(
   return manifest
 }
 
-export function verifyManifest(manifest: PassedAttestationManifest): void {
+export function verifyManifest(
+  manifest: PassedAttestationManifest,
+  requiredStages: readonly string[] = []
+): void {
   // Bumped whenever the digest preimages change: 1.0.0 predates the run ID in
   // the evidence preimage and 1.1.0 predates the header leaf in the Merkle
   // tree, so both compute over a different tuple and have to be rejected as
@@ -246,8 +264,16 @@ export function verifyManifest(manifest: PassedAttestationManifest): void {
   if (typeof manifest.policySha256 !== 'string' || !HEX_64.test(manifest.policySha256)) {
     throw new Error('attestation policy hash is not a SHA-256')
   }
+  let normalizedIntent: string
+  try {
+    normalizedIntent = normalizeIntent(manifest.intent)
+  } catch {
+    throw new Error('attestation intent is invalid')
+  }
+  if (normalizedIntent !== manifest.intent) {
+    throw new Error('attestation intent is invalid')
+  }
   if (
-    typeof manifest.intent !== 'string' ||
     typeof manifest.intentHash !== 'string' ||
     !HEX_64.test(manifest.intentHash) ||
     manifest.intentHash !== intentHash(manifest.intent)
@@ -257,6 +283,7 @@ export function verifyManifest(manifest: PassedAttestationManifest): void {
   if (!Array.isArray(manifest.stageEvidence)) {
     throw new Error('attestation stage evidence is not an array')
   }
+  const presentStages = new Set<string>()
   for (const [index, entry] of manifest.stageEvidence.entries()) {
     if (
       !entry ||
@@ -279,6 +306,7 @@ export function verifyManifest(manifest: PassedAttestationManifest): void {
     ) {
       throw new Error(`attestation stage evidence entry ${index} has invalid required fields`)
     }
+    presentStages.add(entry.stage)
     if (entry.waiverOrApproval !== undefined) {
       const waiver = entry.waiverOrApproval
       if (
@@ -301,6 +329,10 @@ export function verifyManifest(manifest: PassedAttestationManifest): void {
     if (evidenceSha256({ ...entry, runId: manifest.runId }) !== entry.evidenceSha256) {
       throw new Error(`stage ${entry.stage} evidence hash does not match its recorded fields`)
     }
+  }
+  const missingStages = requiredStages.filter((stage) => !presentStages.has(stage))
+  if (missingStages.length > 0) {
+    throw new Error(`attestation is missing required stage evidence: ${missingStages.join(', ')}`)
   }
   if (merkleRoot(manifestLeaves(manifest)) !== manifest.merkleRoot) {
     throw new Error(
@@ -1035,6 +1067,22 @@ export class DomainLedger {
 
   releaseLease(runId: string): void {
     this.#db.prepare('DELETE FROM branch_leases WHERE run_id = ?').run(runId)
+  }
+
+  finalizePassedRun(
+    manifest: PassedAttestationManifest,
+    terminalCommitOid: string
+  ): void {
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      this.finishRun(manifest.runId, 'passed', terminalCommitOid)
+      this.releaseLease(manifest.runId)
+      this.recordAttestation(manifest)
+      this.#db.exec('COMMIT')
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
   }
 
   recordCheckpoint(input: {
