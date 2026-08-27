@@ -166,10 +166,16 @@ function configOverride(
 // they cannot be dropped or reordered away.
 const RESERVED_HARNESS_ARGS: Record<string, ReadonlySet<string>> = {
   agy: new Set([
+    '--continue',
+    '--conversation',
     '--dangerously-skip-permissions',
+    '--print',
+    '--prompt',
     '--prompt-interactive',
     '--sandbox',
+    '-c',
     '-i',
+    '-p',
   ]),
   claude: new Set([
     '--allow-dangerously-skip-permissions',
@@ -186,6 +192,22 @@ const RESERVED_HARNESS_ARGS: Record<string, ReadonlySet<string>> = {
     '-s',
   ]),
   kimi: new Set(['--auto', '--plan', '--prompt', '--yolo', '-p']),
+  pi: new Set([
+    '--continue',
+    '--export',
+    '--fork',
+    '--list-models',
+    '--mode',
+    '--no-session',
+    '--print',
+    '--resume',
+    '--session',
+    '--session-dir',
+    '--session-id',
+    '-c',
+    '-p',
+    '-r',
+  ]),
 }
 const RESERVED_CONFIG_KEYS: Record<string, ReadonlySet<string>> = {
   codex: new Set(['approval_policy', 'sandbox_mode', 'sandbox_permissions']),
@@ -235,6 +257,9 @@ export function buildCliCommand(harness: string, options: CliAgentCommandOptions
         throw new Error(
           `agent ${normalizedHarness}: invalid environment variable name '${key}' in agent_args_override`
         )
+      }
+      if (normalizedHarness === 'pi' && key === 'PI_CODING_AGENT_SESSION_DIR') {
+        throw new Error(`agent pi: reserved environment variable '${key}' cannot be overridden`)
       }
       env.push(`${key}=${shellQuote(value)}`)
     }
@@ -316,6 +341,9 @@ export function harnessTitleMatcher(harness: string): (title?: string | null) =>
   }
   if (normalizedHarness === 'agy') {
     return (title) => /\b(?:agy|antigravity)\b/i.test(title ?? '')
+  }
+  if (normalizedHarness === 'pi') {
+    return (title) => title?.startsWith('π - ') === true || /\bpi\b/i.test(title ?? '')
   }
   const pattern = new RegExp(`\\b${escapeRegExp(harness)}\\b`, 'i')
   return (title) => pattern.test(title ?? '')

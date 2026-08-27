@@ -331,8 +331,9 @@ auto_fix:
 # Agent CLI Arguments & Environment Overrides
 # ------------------------------------------------------------------------------
 # Custom flags or environment variables passed to specific agent harnesses.
-# Flags no-mistakes manages itself are reserved: an \`agy\` entry supplying
-# --dangerously-skip-permissions, --prompt-interactive, or -i fails the launch.
+# Flags no-mistakes manages itself are reserved. This includes \`agy\` permission,
+# prompt, print, and conversation controls, plus \`pi\` one-shot, mode, and session
+# controls (including \`PI_CODING_AGENT_SESSION_DIR\`); supplying one fails the launch.
 # agent_args_override:
 #   opencode:
 #     - "--agent"
