@@ -9926,6 +9926,53 @@ test("a fixer timeout during commit application leaves the branch unchanged", as
   );
 });
 
+test("a reviewer timeout preserves strict worker cleanup failures", async () => {
+  const git = new FakeGit();
+  class SlowCleanupOrca extends FakeOrca {
+    cleanupSettled = false;
+
+    override async startWorker(
+      taskId: string,
+      launch: WorkerLaunch,
+    ): Promise<WorkerResult> {
+      if (launch.role === "reviewer") {
+        await new Promise((resolve) => setTimeout(resolve, 75));
+      }
+      return super.startWorker(taskId, launch);
+    }
+
+    override async finishWorker(
+      worker: WorkerResult,
+      disposition: "release" | "retain",
+    ): Promise<void> {
+      await super.finishWorker(worker, disposition);
+      if (disposition === "release") {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        this.cleanupSettled = true;
+        throw new Error("timeout cleanup failed");
+      }
+    }
+  }
+  const orca = new SlowCleanupOrca(git);
+
+  await assert.rejects(
+    runPipeline(
+      {
+        intent: "Preserve timed-out reviewer cleanup failures.",
+        cliFlags: { reviewer: { timeout_ms: 10 } } as never,
+      },
+      orca,
+      git,
+    ),
+    /review reviewer cleanup failed.*timeout cleanup failed/,
+  );
+  assert.equal(
+    orca.cleanupSettled,
+    true,
+    "the timeout does not discard the owning reviewer cleanup failure",
+  );
+});
+
 test("a fixer timeout waits for strict worker cleanup failures", async () => {
   class SlowApplyGit extends FakeGit {
     async applyWorktreeCommits(
@@ -10246,6 +10293,126 @@ test("a timed-out fixer never applies commits after the run fails", async () => 
     0,
     "no worktree commits may land after the timeout",
   );
+  assert.equal(ledger.runStatus(ledger.listRuns()[0].run_id), "failed");
+});
+
+test("the default timeout bounds a reviewer invocation with no configured timeout_ms", async () => {
+  const git = new FakeGit();
+  class SlowReviewerOrca extends FakeOrca {
+    async startWorker(
+      taskId: string,
+      launch: WorkerLaunch,
+    ): Promise<WorkerResult> {
+      if (launch.role === "reviewer") {
+        await new Promise((resolve) => setTimeout(resolve, 75));
+      }
+      return super.startWorker(taskId, launch);
+    }
+  }
+  const orca = new SlowReviewerOrca(git);
+  const ledger = new DomainLedger(":memory:");
+  const previousDefault = process.env.WORKER_DEFAULT_TIMEOUT_MS;
+  process.env.WORKER_DEFAULT_TIMEOUT_MS = "10";
+  try {
+    await assert.rejects(
+      runPipeline(
+        { intent: "Bound the unconfigured reviewer." },
+        orca,
+        git,
+        ledger,
+      ),
+      /review reviewer exceeded its 10ms execution timeout/,
+    );
+  } finally {
+    if (previousDefault === undefined)
+      delete process.env.WORKER_DEFAULT_TIMEOUT_MS;
+    else process.env.WORKER_DEFAULT_TIMEOUT_MS = previousDefault;
+  }
+  assert.equal(ledger.listRuns().length, 1);
+  assert.equal(ledger.runStatus(ledger.listRuns()[0].run_id), "failed");
+});
+
+test("the default timeout rejects a fixer success that lands after the deadline", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  class SlowFixerOrca extends FakeOrca {
+    async startWorker(
+      taskId: string,
+      launch: WorkerLaunch,
+    ): Promise<WorkerResult> {
+      if (launch.role === "fixer") {
+        await new Promise((resolve) => setTimeout(resolve, 75));
+      }
+      return super.startWorker(taskId, launch);
+    }
+  }
+  const orca = new SlowFixerOrca(git);
+  const ledger = new DomainLedger(":memory:");
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Null input crashes the command",
+        },
+      ],
+      summary: "one defect",
+    },
+  ]);
+  const previousDefault = process.env.WORKER_DEFAULT_TIMEOUT_MS;
+  process.env.WORKER_DEFAULT_TIMEOUT_MS = "10";
+  try {
+    await assert.rejects(
+      runPipeline({ intent: "Fence the unconfigured fixer." }, orca, git, ledger),
+      /review fixer exceeded its 10ms execution timeout/,
+    );
+  } finally {
+    if (previousDefault === undefined)
+      delete process.env.WORKER_DEFAULT_TIMEOUT_MS;
+    else process.env.WORKER_DEFAULT_TIMEOUT_MS = previousDefault;
+  }
+  assert.equal(
+    git.calls.filter((call) => call.startsWith("apply:")).length,
+    0,
+    "no worktree commits may land after the default timeout",
+  );
+  assert.equal(ledger.runStatus(ledger.listRuns()[0].run_id), "failed");
+});
+
+test("a stalled worker that never settles still fails its stage at the deadline", async () => {
+  const git = new FakeGit();
+  class StalledOrca extends FakeOrca {
+    async startWorker(
+      taskId: string,
+      launch: WorkerLaunch,
+    ): Promise<WorkerResult> {
+      if (launch.role === "reviewer") {
+        return await new Promise<WorkerResult>(() => {});
+      }
+      return await super.startWorker(taskId, launch);
+    }
+  }
+  const orca = new StalledOrca(git);
+  const ledger = new DomainLedger(":memory:");
+  const previousDefault = process.env.WORKER_DEFAULT_TIMEOUT_MS;
+  const previousSettle = process.env.WORKER_ABORT_SETTLE_MS;
+  process.env.WORKER_DEFAULT_TIMEOUT_MS = "10";
+  process.env.WORKER_ABORT_SETTLE_MS = "50";
+  try {
+    await assert.rejects(
+      runPipeline({ intent: "Unwedge the stalled reviewer." }, orca, git, ledger),
+      /review reviewer exceeded its 10ms execution timeout/,
+    );
+  } finally {
+    if (previousDefault === undefined)
+      delete process.env.WORKER_DEFAULT_TIMEOUT_MS;
+    else process.env.WORKER_DEFAULT_TIMEOUT_MS = previousDefault;
+    if (previousSettle === undefined)
+      delete process.env.WORKER_ABORT_SETTLE_MS;
+    else process.env.WORKER_ABORT_SETTLE_MS = previousSettle;
+  }
   assert.equal(ledger.runStatus(ledger.listRuns()[0].run_id), "failed");
 });
 

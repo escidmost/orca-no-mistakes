@@ -701,7 +701,7 @@ export async function runPipeline(
         let nextFixer: Awaited<ReturnType<typeof runFixer>>;
         try {
           nextFixer = await withTimeout(
-            fixerRoles.timeout_ms,
+            fixerRoles.timeout_ms ?? defaultWorkerTimeoutMs(),
             `${stage} fixer`,
             async (fence) =>
               runFixer(
@@ -984,15 +984,25 @@ async function withTimeout<T>(
     ]);
   } catch (error) {
     if (fence.aborted) {
-      try {
-        await operation;
-      } catch (settledError) {
-        if (
-          settledError instanceof PostMutationCustodyError ||
-          settledError instanceof WorkerCleanupError
-        )
-          throw settledError;
-      }
+      // A stalled agent may ignore the abort signal and never settle; bound
+      // the wait for custody/cleanup errors so the deadline still fails the
+      // stage instead of wedging the run.
+      let settleTimer: ReturnType<typeof setTimeout> | undefined;
+      const settled = await Promise.race([
+        operation.then(
+          () => undefined,
+          (settledError: unknown) => settledError,
+        ),
+        new Promise<undefined>((resolve) => {
+          settleTimer = setTimeout(() => resolve(undefined), workerAbortSettleMs());
+        }),
+      ]);
+      clearTimeout(settleTimer);
+      if (
+        settled instanceof PostMutationCustodyError ||
+        settled instanceof WorkerCleanupError
+      )
+        throw settled;
     }
     throw error;
   } finally {
@@ -1120,7 +1130,7 @@ async function executeStage(
       resolvedAgent: "coordinator",
     };
   }
-  return await withTimeout(roles.reviewer.timeout_ms, `${stage} reviewer`, (fence) =>
+  return await withTimeout(roles.reviewer.timeout_ms ?? defaultWorkerTimeoutMs(), `${stage} reviewer`, (fence) =>
     runReviewer(
       stage,
       attempt,
@@ -1222,7 +1232,7 @@ async function runReviewer(
       evidenceCommitOid: untrusted.headOid,
     };
   } finally {
-    await releaseWorker(worker, orca);
+    await releaseReviewerWorker(worker, orca, stage);
   }
 }
 
@@ -1260,6 +1270,20 @@ async function releaseWorker(
     if (worker.worktreeId) {
       await orca.removeWorktree(worker.worktreeId);
     }
+  }
+}
+
+async function releaseReviewerWorker(
+  worker: WorkerResult,
+  orca: OrcaOperations,
+  stage: StageName,
+): Promise<void> {
+  try {
+    await releaseWorker(worker, orca);
+  } catch (cleanupError) {
+    throw new WorkerCleanupError(
+      `${stage} reviewer cleanup failed: ${String(cleanupError)}`,
+    );
   }
 }
 
@@ -2167,6 +2191,22 @@ const WORKER_IDLE_TIMEOUT_MS = 1_800_000;
 function workerIdleTimeoutMs(): number {
   const raw = Number(process.env.WORKER_IDLE_TIMEOUT_MS);
   return Number.isFinite(raw) && raw > 0 ? raw : WORKER_IDLE_TIMEOUT_MS;
+}
+// ONM-44: every agent invocation carries a deadline even when the role sets
+// no timeout_ms -- the idle watchdog only covers a silent channel, not a
+// stalled worker. Overridable so tests need not wait half an hour.
+const DEFAULT_WORKER_TIMEOUT_MS = 1_800_000;
+function defaultWorkerTimeoutMs(): number {
+  const raw = Number(process.env.WORKER_DEFAULT_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_WORKER_TIMEOUT_MS;
+}
+// Bounded grace for an aborted invocation to surface custody or cleanup
+// failures before its stage fails with the deadline error; an agent that
+// ignores cancellation must not wedge the run.
+const WORKER_ABORT_SETTLE_MS = 15_000;
+function workerAbortSettleMs(): number {
+  const raw = Number(process.env.WORKER_ABORT_SETTLE_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : WORKER_ABORT_SETTLE_MS;
 }
 // Terminal rows requested per stage-log drain, and the page ceiling that stops
 // one drain from monopolising the poll loop when a worker floods its terminal.
