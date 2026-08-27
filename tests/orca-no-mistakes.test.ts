@@ -2328,7 +2328,7 @@ if (args[1] === 'run-create') {
   }
 });
 
-test("CliOrca reuses a fixer through supervised worker-start", async () => {
+test("CliOrca reuses a pi fixer through supervised worker-start", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-cli-"));
   const fakeOrca = path.join(temp, "orca");
   const callsPath = path.join(temp, "calls.jsonl");
@@ -2368,7 +2368,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
   console.log(JSON.stringify({ ok: false, error: { code: 'terminal_close_failed', message: 'terminal_close_failed' } }))
   process.exit(1)
 } else if (args[0] === 'terminal' && args[1] === 'show') {
-  out({ terminal: { connected: true, title: 'OpenCode', preview: 'ready', worktreeId: 'worker-worktree' } })
+  out({ terminal: { connected: true, title: 'Pi', preview: 'ready', worktreeId: 'worker-worktree' } })
 } else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
   const count = fs.existsSync(${JSON.stringify(startCountPath)}) ? Number(fs.readFileSync(${JSON.stringify(startCountPath)}, 'utf8')) : 0
   fs.writeFileSync(${JSON.stringify(startCountPath)}, String(count + 1))
@@ -2405,7 +2405,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     await orca.createRun("adapter test");
 
     const first = await orca.startWorker("task-1", {
-      agent: { harness: "opencode", model: "gpt-5.6", variant: "high" },
+      agent: { harness: "pi", model: "gpt-5.6", effort: "high" },
       name: "first-fixer",
       prompt: "first",
       role: "fixer",
@@ -2518,6 +2518,16 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
           args.includes("created-fixer") &&
           args.includes("id:worker-worktree"),
       ),
+    );
+    assert.equal(
+      calls.filter(
+        (args) =>
+          args[0] === "terminal" &&
+          args[1] === "send" &&
+          args[args.indexOf("--text") + 1]?.startsWith("'pi'"),
+      ).length,
+      1,
+      "retained pi rounds stay in the original interactive process",
     );
     assert.equal(first.terminalHandle, "created-fixer");
     assert.equal(second.terminalHandle, "created-fixer");
@@ -2793,7 +2803,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
   }
 });
 
-test("CliOrca delivers agy preambles and preserves concurrent trust updates", async () => {
+test("CliOrca retains an agy fixer and preserves concurrent trust updates", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-agy-cli-"));
   const previousHome = process.env.HOME;
   const home = path.join(temp, "home");
@@ -2865,8 +2875,14 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
   out({ terminal: { status: 'running', tail: reads >= 2 ? ['Antigravity CLI', '>'] : ['starting'] } })
 } else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
   out({ dispatch: { id: 'dispatch-agy', status: 'dispatched' }, injected: false, preamble: 'authenticated' })
+} else if (args[0] === 'orchestration' && args[1] === 'worker-start') {
+  out({ dispatchId: 'dispatch-agy-retained', state: 'ready' })
 } else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
-  out({ deliveryId: 'delivery-agy', messages: [{ type: 'worker_done', body: 'Reviewed.', payload: JSON.stringify({ taskId: 'task-review', dispatchId: 'dispatch-agy', outcome: 'succeeded', reportPath: ${JSON.stringify(reportPath)} }) }] })
+  const history = fs.readFileSync(${JSON.stringify(callsPath)}, 'utf8').trim().split('\\n').map((line) => JSON.parse(line))
+  const start = history.reverse().find((call) => call[0] === 'orchestration' && (call[1] === 'dispatch' || call[1] === 'worker-start'))
+  const retained = start?.[1] === 'worker-start'
+  const dispatchId = retained ? 'dispatch-agy-retained' : 'dispatch-agy'
+  out({ deliveryId: retained ? 'delivery-agy-retained' : 'delivery-agy', messages: [{ type: 'worker_done', body: 'Reviewed.', payload: JSON.stringify({ taskId: 'task-review', dispatchId, outcome: 'succeeded', reportPath: ${JSON.stringify(reportPath)} }) }] })
 } else {
   out({ ok: true })
 }
@@ -2883,9 +2899,9 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
 
     const workerPromise = orca.startWorker("task-review", {
       agent: { harness: "AGY" },
-      name: "agy-reviewer",
+      name: "agy-fixer",
       prompt: "review",
-      role: "reviewer",
+      role: "fixer",
       stage: "review",
       worktree: "new-child",
     });
@@ -2909,7 +2925,19 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     await rm(lockPath, { recursive: true });
 
     const worker = await workerPromise;
-    await orca.finishWorker(worker, "release");
+    await orca.finishWorker(worker, "retain");
+    const retainedWorker = await orca.startWorker("task-review", {
+      agent: { harness: "agy" },
+      name: "agy-fixer-retained",
+      prompt: "review again",
+      retainedWorktreeId: worker.worktreeId,
+      retainedWorktreePath: worker.worktreePath,
+      role: "fixer",
+      stage: "review",
+      terminal: worker.terminalHandle,
+      worktree: "current",
+    });
+    await orca.finishWorker(retainedWorker, "release");
 
     const calls = (await readFile(callsPath, "utf8"))
       .trim()
@@ -2939,6 +2967,12 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     );
     assert.ok(!dispatch?.includes("--inject"));
     assert.ok(dispatch?.includes("--return-preamble"));
+    const retainedStarts = calls.filter(
+      (args) => args[0] === "orchestration" && args[1] === "worker-start",
+    );
+    assert.equal(retainedStarts.length, 1);
+    assert.ok(retainedStarts[0].includes("agy-shell"));
+    assert.ok(retainedStarts[0].includes("id:wt-agy"));
     assert.deepEqual(JSON.parse(await readFile(settingsPath, "utf8")), {
       trustAllWorkspaces: true,
       trustedWorkspaces: [peerPath, childPath],

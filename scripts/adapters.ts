@@ -166,10 +166,16 @@ function configOverride(
 // they cannot be dropped or reordered away.
 const RESERVED_HARNESS_ARGS: Record<string, ReadonlySet<string>> = {
   agy: new Set([
+    '--continue',
+    '--conversation',
     '--dangerously-skip-permissions',
+    '--print',
+    '--prompt',
     '--prompt-interactive',
     '--sandbox',
+    '-c',
     '-i',
+    '-p',
   ]),
   claude: new Set([
     '--allow-dangerously-skip-permissions',
@@ -186,6 +192,20 @@ const RESERVED_HARNESS_ARGS: Record<string, ReadonlySet<string>> = {
     '-s',
   ]),
   kimi: new Set(['--auto', '--plan', '--prompt', '--yolo', '-p']),
+  pi: new Set([
+    '--continue',
+    '--fork',
+    '--mode',
+    '--no-session',
+    '--print',
+    '--resume',
+    '--session',
+    '--session-dir',
+    '--session-id',
+    '-c',
+    '-p',
+    '-r',
+  ]),
 }
 const RESERVED_CONFIG_KEYS: Record<string, ReadonlySet<string>> = {
   codex: new Set(['approval_policy', 'sandbox_mode', 'sandbox_permissions']),

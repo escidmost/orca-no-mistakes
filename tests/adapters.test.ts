@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 
 import {
@@ -474,9 +475,15 @@ test('buildCliCommand always sends the agy reserved flag and rejects reserved ov
   })
   assert.match(envOverride, /^AGY_EFFORT='high' 'agy'/)
   for (const flag of [
+    '--continue',
+    '--conversation=00000000-0000-4000-8000-000000000000',
     '--dangerously-skip-permissions',
+    '--print',
+    '--prompt',
     '--prompt-interactive',
+    '-c00000000-0000-4000-8000-000000000000',
     '-i',
+    '-pprompt',
     '--prompt-interactive=/tmp/x',
     '--dangerously-skip-permissions=false'
   ]) {
@@ -496,6 +503,30 @@ test('buildCliCommand always sends the agy reserved flag and rejects reserved ov
     buildCliCommand('grok', { agentArgsOverride: { grok: ['-q'] } as never }),
     `'grok' '-q'`
   )
+})
+
+test('buildCliCommand reserves pi conversation and interactive-mode controls', () => {
+  for (const flag of [
+    '--continue',
+    '--fork=session-id',
+    '--mode=json',
+    '--no-session',
+    '--print',
+    '--resume=session-id',
+    '--session=session-id',
+    '--session-dir=/tmp/pi-sessions',
+    '--session-id=00000000-0000-4000-8000-000000000000',
+    '-c',
+    '-pprompt',
+    '-rsession-id'
+  ]) {
+    assert.throws(
+      () => buildCliCommand('pi', { agentArgsOverride: { pi: [flag] } }),
+      (error: unknown) =>
+        error instanceof Error &&
+        error.message === `agent pi: reserved argument '${flag}' cannot be overridden`
+    )
+  }
 })
 
 test('isBinaryMissingOutput spots shell binary failures naming the harness', () => {
@@ -611,6 +642,26 @@ test('parseAgyStream distinguishes a genuine zero of thinking tokens from absenc
   assert.equal(junkResult.text, '')
   assert.equal(junkResult.error, undefined)
   assert.deepEqual(junkResult.usage, {})
+})
+
+test('parseAgyStream replays recorded plain and structured agy fixtures', async () => {
+  const plain = parseAgyStream(
+    await readFile(new URL('./fixtures/agy/plain.jsonl', import.meta.url), 'utf8')
+  )
+  assert.equal(plain.error, undefined)
+  assert.equal(plain.text, 'OK')
+  assert.equal(plain.usage.inputTokens, 17586)
+  assert.equal(plain.usage.outputTokens, 26)
+  assert.equal(plain.usage.reasoningTokens, 25)
+
+  const structured = parseAgyStream(
+    await readFile(new URL('./fixtures/agy/structured.jsonl', import.meta.url), 'utf8')
+  )
+  assert.equal(structured.error, undefined)
+  assert.equal(structured.text, '{"ok":true}')
+  assert.equal(structured.usage.inputTokens, 35757)
+  assert.equal(structured.usage.outputTokens, 124)
+  assert.equal(structured.usage.reasoningTokens, 81)
 })
 
 test('extractStructuredJson prefers closed fences over unclosed tails and prose quotes', () => {
