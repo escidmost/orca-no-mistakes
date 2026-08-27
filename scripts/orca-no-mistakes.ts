@@ -995,7 +995,6 @@ async function withTimeout<T>(
         ),
         new Promise<undefined>((resolve) => {
           settleTimer = setTimeout(() => resolve(undefined), workerAbortSettleMs());
-          settleTimer.unref?.();
         }),
       ]);
       clearTimeout(settleTimer);
