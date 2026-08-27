@@ -787,6 +787,13 @@ export function artifactsRoot(): string {
 
 type LeaseRow = { generation_token: number | bigint; run_id: string }
 
+export type PrunableRun = {
+  base_branch: string
+  branch: string
+  repo_root: string
+  run_id: string
+}
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS runs (
   run_id TEXT PRIMARY KEY,
@@ -1488,28 +1495,48 @@ export class DomainLedger {
     return manifest
   }
 
-  prune(options: { before?: Date; repoSubstring?: string }): string[] {
+  /**
+   * Runs eligible for pruning: completed, matching the filters, and holding no
+   * branch lease. A lease outlives its run only when custody was never settled
+   * -- a coordinator killed mid-run, or a failure whose recovery ref could not
+   * be anchored -- and the lease row cascades away with the run, so pruning one
+   * would erase the only record that the branch is still owned.
+   *
+   * `repoRoot` matches the run's repository root itself or anything nested
+   * under it, so `--repo <path>` names a checkout rather than any run whose
+   * path happens to contain the text.
+   */
+  prunableRuns(options: { before?: Date; repoRoot?: string }): PrunableRun[] {
     const before = options.before ? options.before.toISOString() : null
+    const rows = this.#db
+      .prepare(
+        `SELECT run_id, repo_root, branch, base_branch FROM runs
+         WHERE status <> 'in-progress'
+           AND completed_at IS NOT NULL
+           AND (? IS NULL OR completed_at < ?)
+           AND run_id NOT IN (SELECT run_id FROM branch_leases)
+         ORDER BY completed_at, rowid`
+      )
+      .all(before, before) as PrunableRun[]
+    if (!options.repoRoot) return rows
+    const root = path.resolve(options.repoRoot)
+    return rows.filter((row) => isWithin(root, row.repo_root))
+  }
+
+  /**
+   * Deletes the named runs. Checkpoints, evidence, gate audit rows and the
+   * attestation cascade with them. Nothing else in the ledger removes a run:
+   * evidence is retained indefinitely until an operator asks for this.
+   */
+  prune(runIds: string[]): void {
+    if (runIds.length === 0) return
     this.#db.exec('BEGIN IMMEDIATE')
     try {
-      const rows = this.#db
-        .prepare(
-          `SELECT run_id FROM runs
-           WHERE status <> 'in-progress'
-             AND completed_at IS NOT NULL
-             AND (? IS NULL OR completed_at < ?)
-             AND (? IS NULL OR instr(repo_root, ?) > 0)`
-        )
-        .all(before, before, options.repoSubstring ?? null, options.repoSubstring ?? null) as {
-        run_id: string
-      }[]
-      const runIds = rows.map((row) => row.run_id)
-      if (runIds.length > 0) {
-        const placeholders = runIds.map(() => '?').join(', ')
-        this.#db.prepare(`DELETE FROM runs WHERE run_id IN (${placeholders})`).run(...runIds)
-      }
+      // One statement per id rather than an IN list: a long-lived ledger can
+      // hold more completed runs than SQLite allows host parameters.
+      const remove = this.#db.prepare('DELETE FROM runs WHERE run_id = ?')
+      for (const runId of runIds) remove.run(runId)
       this.#db.exec('COMMIT')
-      return runIds
     } catch (error) {
       this.#db.exec('ROLLBACK')
       throw error

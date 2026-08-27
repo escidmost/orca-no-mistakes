@@ -8,7 +8,7 @@ This document describes implemented behavior for Release 1 (Local Adversarial Va
 
 - `run` launches the coordinator detached in an isolated child gate worktree and dedicated Orca terminal tab and returns `{"detached":true,"terminalHandle":"..."}`. If `--notify <handle>` is passed or `ORCA_TERMINAL_HANDLE` is set, the coordinator also notifies that terminal when a decision gate opens and notifies and wakes the originating session on terminal run outcomes (`passed`, `failed`, or `cancelled`). (The internal `--attached` flag runs synchronously inside the spawned terminal tab).
 - `attestation export|verify` writes a portable Passed Attestation manifest, or checks one against its own digests and — when this ledger holds the run — against the stored record and retained evidence.
-- `prune [--before <date>] [--repo <substring>]` deletes completed runs (cascading checkpoints, evidence, gate audit rows, attestations) plus their artifact directories.
+- `prune [--before <date>] [--repo <path>]` deletes completed runs (cascading checkpoints, evidence, gate audit rows, attestations) plus their artifact directories, and drops each pruned run's recovery ref once its commits are proven contained. Nothing else deletes evidence: there is no TTL or count-based eviction. Runs still holding a branch lease, and runs whose recovery ref is not an ancestor of their branch, base, or `origin/<base>`, are retained.
 
 The runner requires an explicit single-line `--intent`, a clean, committed, named feature branch, rejects the detected default branch, verifies an `origin` remote, and optionally checks an expected `--head` SHA. It fetches and rebases onto the selected base before validation continues.
 

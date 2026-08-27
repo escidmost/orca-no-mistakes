@@ -68,6 +68,7 @@ import {
   sha256,
   verifyManifest,
   type PassedAttestationManifest,
+  type PrunableRun,
   type StageEvidenceManifestEntry,
 } from "./ledger.ts";
 export {
@@ -6225,6 +6226,135 @@ async function launchDetachedRun(
   return terminalHandle;
 }
 
+/**
+ * The commits a run preserved at its recovery ref, classified against the
+ * branch it was run on: the OID when they are already contained in the branch
+ * or its base, `"unmerged"` when they are not, and `undefined` when the ref is
+ * gone or the repository can no longer be read.
+ *
+ * Every run anchors this ref, including passing ones, so its mere existence
+ * proves nothing. What matters for pruning is containment: while the operator
+ * has not integrated the commits, the ledger row is the only record naming the
+ * ref that holds them, so the run must survive.
+ */
+async function recoveryHeadState(
+  run: PrunableRun,
+): Promise<string | "unmerged" | undefined> {
+  if (!RUN_ID_PATTERN.test(run.run_id)) return undefined;
+  const ref = recoveryRefFor(run.run_id);
+  const git = async (args: string[]) => {
+    try {
+      return await command(
+        "git",
+        ["-C", run.repo_root, ...args],
+        run.repo_root,
+        { allowFailure: true },
+      );
+    } catch {
+      // A repository that has since been deleted or moved leaves nothing to
+      // preserve, so its runs stay prunable.
+      return undefined;
+    }
+  };
+  const resolved = await git([
+    "rev-parse",
+    "--verify",
+    "--quiet",
+    `${ref}^{commit}`,
+  ]);
+  const oid = resolved?.code === 0 ? resolved.stdout.trim() : "";
+  if (!oid) return undefined;
+  for (const container of [
+    run.branch,
+    run.base_branch,
+    `origin/${run.base_branch}`,
+  ]) {
+    const contained = await git([
+      "merge-base",
+      "--is-ancestor",
+      oid,
+      `${container}^{commit}`,
+    ]);
+    if (contained?.code === 0) return oid;
+  }
+  return "unmerged";
+}
+
+async function runPruneCommand(flags: RawCliFlags): Promise<void> {
+  const beforeValue = stringFlag(flags, "before");
+  let before: Date | undefined;
+  if (beforeValue !== undefined) {
+    before = new Date(beforeValue);
+    if (Number.isNaN(before.getTime()))
+      throw new Error(`--before is not a valid date: ${beforeValue}`);
+  }
+  const repoFlag = stringFlag(flags, "repo");
+  // Runs record the root git itself reported, so a symlinked argument has to be
+  // canonicalised before it can match one.
+  const repoRoot =
+    repoFlag === undefined
+      ? undefined
+      : await realpath(path.resolve(repoFlag)).catch(() =>
+          path.resolve(repoFlag),
+        );
+  const ledger = new DomainLedger();
+  const pruned: { oid?: string; run: PrunableRun }[] = [];
+  const retained: string[] = [];
+  try {
+    for (const run of ledger.prunableRuns({ before, repoRoot })) {
+      const state = await recoveryHeadState(run);
+      if (state === "unmerged") {
+        retained.push(run.run_id);
+        console.error(
+          `no-mistakes: retained ${run.run_id}; ${recoveryRefFor(run.run_id)} is not contained in ${run.branch} or ${run.base_branch}`,
+        );
+        continue;
+      }
+      pruned.push({ oid: state, run });
+    }
+    ledger.prune(pruned.map((entry) => entry.run.run_id));
+  } finally {
+    ledger.close();
+  }
+  for (const { oid, run } of pruned) {
+    if (!RUN_ID_PATTERN.test(run.run_id)) {
+      console.error(
+        `no-mistakes: skipped unsafe artifact directory for run ${run.run_id}`,
+      );
+      continue;
+    }
+    await rm(path.join(artifactsRoot(), run.run_id), {
+      force: true,
+      recursive: true,
+    });
+    // The recovery ref outlives the run it belongs to and would pin its objects
+    // forever. Deleting it is safe only because the commits were just proven
+    // contained; the compare-and-swap on `oid` keeps a ref that moved in the
+    // meantime.
+    if (oid) {
+      await command(
+        "git",
+        [
+          "-C",
+          run.repo_root,
+          "update-ref",
+          "-d",
+          recoveryRefFor(run.run_id),
+          oid,
+        ],
+        run.repo_root,
+        { allowFailure: true },
+      ).catch(() => undefined);
+    }
+  }
+  console.log(
+    `Pruned ${pruned.length} run(s)` +
+      (retained.length > 0
+        ? `; retained ${retained.length} with unmerged recovery heads`
+        : ""),
+  );
+}
+
 export async function main(argv: string[]): Promise<void> {
   if (
     argv.length === 0 ||
@@ -6236,7 +6366,7 @@ export async function main(argv: string[]): Promise<void> {
   orca-no-mistakes run --intent <text> [--repo <path>] [--base <branch>] [--head <sha>] [--force-lease]
   orca-no-mistakes attestation export <run-id|commit-sha> [--out <path>]
   orca-no-mistakes attestation verify <manifest-file|run-id|commit-sha>
-  orca-no-mistakes prune [--before <date>] [--repo <name>]
+  orca-no-mistakes prune [--before <date>] [--repo <path>]
 
 Run options:
   --reviewer-model <model>
@@ -6253,34 +6383,7 @@ Run options:
     return;
   }
   if (parsed.command === "prune") {
-    const beforeValue = stringFlag(parsed.flags, "before");
-    let before: Date | undefined;
-    if (beforeValue !== undefined) {
-      before = new Date(beforeValue);
-      if (Number.isNaN(before.getTime()))
-        throw new Error(`--before is not a valid date: ${beforeValue}`);
-    }
-    const repoSubstring = stringFlag(parsed.flags, "repo");
-    const ledger = new DomainLedger();
-    let pruned: string[] = [];
-    try {
-      pruned = ledger.prune({ before, repoSubstring });
-      for (const runId of pruned) {
-        if (!RUN_ID_PATTERN.test(runId)) {
-          console.error(
-            `no-mistakes: skipped unsafe artifact directory for run ${runId}`,
-          );
-          continue;
-        }
-        await rm(path.join(artifactsRoot(), runId), {
-          force: true,
-          recursive: true,
-        });
-      }
-    } finally {
-      ledger.close();
-    }
-    console.log(`Pruned ${pruned.length} run(s)`);
+    await runPruneCommand(parsed.flags);
     return;
   }
   if (parsed.command !== "run")
