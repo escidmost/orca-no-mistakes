@@ -2093,6 +2093,116 @@ console.log(JSON.stringify({ result }))
   }
 });
 
+test("run places its coordinator under a configured repository worktree root", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-configured-gate-"));
+  const origin = path.join(temp, "origin.git");
+  const repo = path.join(temp, "repo");
+  const root = path.join(temp, "run-worktrees");
+  const configPath = path.join(temp, "config.yaml");
+  const fakeOrca = path.join(temp, "orca");
+  const callsPath = path.join(temp, "calls.jsonl");
+  const failTerminalCreate = path.join(temp, "fail-terminal-create");
+  const previousCommand = process.env.ORCA_CLI_COMMAND;
+  const previousConfig = process.env.ORCA_NO_MISTAKES_USER_CONFIG;
+  try {
+    git(temp, "init", "--bare", origin);
+    git(temp, "clone", origin, repo);
+    git(repo, "config", "user.email", "test@example.com");
+    git(repo, "config", "user.name", "Test User");
+    git(repo, "checkout", "-b", "main");
+    await writeFile(path.join(repo, "README.md"), "main\n");
+    git(repo, "add", "README.md");
+    git(repo, "commit", "-m", "main");
+    git(repo, "push", "-u", "origin", "main");
+    git(temp, `--git-dir=${origin}`, "symbolic-ref", "HEAD", "refs/heads/main");
+    git(repo, "checkout", "-b", "feature");
+    await mkdir(root);
+    const canonicalRepo = await realpath(repo);
+    await writeFile(
+      configPath,
+      JSON.stringify({ worktree_roots: { [canonicalRepo]: root } }),
+    );
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+const result = args[0] === 'orchestration' && args[1] === 'run-create'
+  ? { run: { id: 'configured-run' } }
+  : args[0] === 'terminal' && args[1] === 'create'
+    ? fs.existsSync(${JSON.stringify(failTerminalCreate)})
+      ? { accepted: true }
+      : { terminal: { handle: 'configured-gate-shell' } }
+    : args[0] === 'terminal' && args[1] === 'show'
+      ? { terminal: { connected: true, preview: 'ready shell prompt' } }
+      : { accepted: true }
+console.log(JSON.stringify({ result }))
+`,
+    );
+    await chmod(fakeOrca, 0o755);
+    process.env.ORCA_CLI_COMMAND = fakeOrca;
+    process.env.ORCA_NO_MISTAKES_USER_CONFIG = configPath;
+
+    await main([
+      "run",
+      `--repo=${repo}`,
+      "--intent=Validate configured detached coordination.",
+    ]);
+
+    const [runId] = await readdir(root);
+    assert.equal(runId, "configured-run");
+    const gatePath = await realpath(path.join(root, runId));
+    const calls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    assert.ok(
+      !calls.some((args) => args[0] === "worktree"),
+      "configured gates are Git-managed",
+    );
+    const terminalCreate = calls.find(
+      (args) => args[0] === "terminal" && args[1] === "create",
+    );
+    assert.equal(
+      terminalCreate?.[terminalCreate.indexOf("--worktree") + 1],
+      `path:${canonicalRepo}`,
+    );
+    const terminalSend = calls.find(
+      (args) => args[0] === "terminal" && args[1] === "send",
+    );
+    const commandText = terminalSend?.[terminalSend.indexOf("--text") + 1] ?? "";
+    assert.ok(commandText.includes(`'--repo' '${gatePath}'`));
+    assert.ok(
+      commandText.includes(`NO_MISTAKES_GATE_WORKTREE_ROOT='${await realpath(root)}'`),
+    );
+    assert.ok(commandText.includes("NO_MISTAKES_RUN_ID='configured-run'"));
+    const gateBranch = git(gatePath, "branch", "--show-current");
+    assert.match(gateBranch, /^no-mistakes-gate-[a-f0-9]{8}$/);
+
+    git(repo, "worktree", "remove", "--force", gatePath);
+    git(repo, "branch", "-D", gateBranch);
+    await writeFile(failTerminalCreate, "");
+    await assert.rejects(
+      main([
+        "run",
+        `--repo=${repo}`,
+        "--intent=Clean up failed configured coordination.",
+      ]),
+      /terminal create returned an invalid receipt/,
+    );
+    assert.deepEqual(await readdir(root), []);
+    assert.equal(git(repo, "branch", "--list", "no-mistakes-gate-*"), "");
+  } finally {
+    if (previousCommand === undefined) delete process.env.ORCA_CLI_COMMAND;
+    else process.env.ORCA_CLI_COMMAND = previousCommand;
+    if (previousConfig === undefined)
+      delete process.env.ORCA_NO_MISTAKES_USER_CONFIG;
+    else process.env.ORCA_NO_MISTAKES_USER_CONFIG = previousConfig;
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test("CliOrca notifies the originating terminal when a gate opens", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-gate-notify-"));
   const fakeOrca = path.join(temp, "orca");
@@ -2712,6 +2822,7 @@ test("CliOrca detaches new-child reviewer worktrees at the pinned commit", async
   const workerPath = path.join(temp, "worker-wt");
   const fakeOrca = path.join(temp, "orca");
   const callsPath = path.join(temp, "calls.jsonl");
+  const parentWorktree = path.join(temp, "registered-origin");
   const runId = `adapter-detach-${randomUUID().slice(0, 8)}`;
   const noMistakesHome = path.join(temp, "home");
   const evidence = path.join(noMistakesHome, "artifacts", runId);
@@ -2762,7 +2873,11 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
 `,
     );
     await chmod(fakeOrca, 0o755);
-    const orca = new CliOrca({ command: fakeOrca, cwd: temp });
+    const orca = new CliOrca({
+      command: fakeOrca,
+      cwd: temp,
+      parentWorktree,
+    });
     await orca.createRun("adapter detach test");
 
     const worker = await orca.startWorker("task-review", {
@@ -2791,6 +2906,17 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       await readFile(path.join(workerPath, "file.txt"), "utf8"),
       "one\n",
       "worker worktree contents must match the pinned commit",
+    );
+    const calls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    const worktreeCreate = calls.find(
+      (args) => args[0] === "worktree" && args[1] === "create",
+    );
+    assert.equal(
+      worktreeCreate?.[worktreeCreate.indexOf("--parent-worktree") + 1],
+      `path:${parentWorktree}`,
     );
   } finally {
     if (previousHome === undefined) {

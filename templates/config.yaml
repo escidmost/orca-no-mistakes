@@ -11,6 +11,11 @@
 # Optional default task intent or objective statement
 # intent: "Ensure zero regressions and complete test coverage"
 
+# Optional user-global placement for coordinator run worktrees. Keys are
+# absolute registered checkout paths and values are absolute operator-owned
+# directories. Repository-local config cannot choose operator placement.
+worktree_roots: {}
+
 # ------------------------------------------------------------------------------
 # Global Auto-Fix Settings
 # ------------------------------------------------------------------------------
