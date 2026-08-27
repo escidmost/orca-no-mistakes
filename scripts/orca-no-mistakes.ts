@@ -224,6 +224,7 @@ export type PipelineOptions = {
   deliveryBranch?: string;
   deliveryGit?: GitOperations;
   forceLease?: boolean;
+  intentTaskId?: string;
   intent: string;
   maxFixRounds?: number;
   userGlobalConfig?: OrcaNoMistakesConfig;
@@ -521,9 +522,12 @@ export async function runPipeline(
     let previousTask: string | undefined;
 
     for (const stage of PIPELINE_STEPS) {
-      const task = await orca.createTask(stageTaskSpec(stage, intent), {
-        deps: previousTask ? [previousTask] : [],
-      });
+      const task =
+        stage === "intent" && options.intentTaskId
+          ? options.intentTaskId
+          : await orca.createTask(stageTaskSpec(stage, intent), {
+              deps: previousTask ? [previousTask] : [],
+            });
       stageTasks.set(stage, task);
       previousTask = task;
     }
@@ -2492,6 +2496,7 @@ export class CliOrca implements OrcaOperations {
   readonly #terminalLastLines = new Map<string, string>();
   // Worktree ID -> the branch Orca minted for it, claimed at creation.
   readonly #workerBranches = new Map<string, string>();
+  readonly #completedTasks = new Set<string>();
   #runId?: string;
 
   constructor(options: CliOrcaOptions) {
@@ -3916,6 +3921,24 @@ export class CliOrca implements OrcaOperations {
       ...(this.#runId ? ["--run", this.#runId] : []),
       "--json",
     ]);
+    this.#completedTasks.add(taskId);
+  }
+
+  async failTask(taskId: string, summary: string): Promise<void> {
+    if (this.#completedTasks.has(taskId)) return;
+    await this.#json([
+      "orchestration",
+      "task-update",
+      "--id",
+      taskId,
+      "--status",
+      "failed",
+      "--result",
+      JSON.stringify({ findings: [], summary, tested: [] }),
+      ...(this.#runId ? ["--run", this.#runId] : []),
+      "--json",
+    ]);
+    this.#completedTasks.add(taskId);
   }
 
   async createGate(
@@ -6286,6 +6309,7 @@ type GateWorktree =
   | { branch: string; id: string; kind: "orca"; path: string }
   | {
       branch: string;
+      intentTaskId: string;
       kind: "configured";
       path: string;
       root: string;
@@ -6349,7 +6373,7 @@ async function configuredWorktreeRoot(
 async function createGateWorktree(
   repo: RepoSnapshot,
   orcaCommand: string,
-  configured?: { root: string; runId: string },
+  configured?: { intentTaskId: string; root: string; runId: string },
 ): Promise<GateWorktree> {
   const gateName = `no-mistakes-gate-${randomUUID().slice(0, 8)}`;
   if (configured) {
@@ -6361,6 +6385,7 @@ async function createGateWorktree(
     );
     return {
       branch: gateName,
+      intentTaskId: configured.intentTaskId,
       kind: "configured",
       path: gatePath,
       root: configured.root,
@@ -6471,6 +6496,8 @@ async function launchDetachedRun(
     repo.root,
     userGlobalConfig.worktree_roots,
   );
+  let configuredOrca: CliOrca | undefined;
+  let intentTaskId = "";
   let terminalHandle = "";
   let gate: GateWorktree;
   if (root) {
@@ -6513,11 +6540,33 @@ async function launchDetachedRun(
           )
         ).stdout,
       );
+      const runId = runReceipt.run?.id ?? "";
+      configuredRunPath(root, runId);
+      configuredOrca = new CliOrca({
+        command: orcaCommand,
+        cwd: repo.root,
+        runId,
+      });
+      intentTaskId = await configuredOrca.createTask(
+        stageTaskSpec("intent", normalizeIntent(stringFlag(flags, "intent")!)),
+      );
+      if (!intentTaskId) {
+        throw new Error("orchestration task-create returned an invalid task ID");
+      }
       gate = await createGateWorktree(repo, orcaCommand, {
+        intentTaskId,
         root,
-        runId: runReceipt.run?.id ?? "",
+        runId,
       });
     } catch (error) {
+      if (configuredOrca && intentTaskId) {
+        await configuredOrca
+          .failTask(
+            intentTaskId,
+            `Configured coordinator startup failed: ${error instanceof Error ? error.message : String(error)}`,
+          )
+          .catch(() => {});
+      }
       if (terminalHandle) {
         await command(
           orcaCommand,
@@ -6631,7 +6680,7 @@ async function launchDetachedRun(
   environment.push(
     gate.kind === "orca"
       ? `NO_MISTAKES_GATE_WORKTREE_ID=${shellQuote(gate.id)}`
-      : `NO_MISTAKES_GATE_WORKTREE_ROOT=${shellQuote(gate.root)} NO_MISTAKES_RUN_ID=${shellQuote(gate.runId)}`,
+      : `NO_MISTAKES_GATE_WORKTREE_ROOT=${shellQuote(gate.root)} NO_MISTAKES_RUN_ID=${shellQuote(gate.runId)} NO_MISTAKES_INTENT_TASK_ID=${shellQuote(gate.intentTaskId)}`,
   );
   if (process.env.ORCA_CLI_COMMAND) {
     environment.push(
@@ -6679,6 +6728,14 @@ async function launchDetachedRun(
       repo.root,
     );
   } catch (error) {
+    if (gate.kind === "configured") {
+      await configuredOrca
+        ?.failTask(
+          gate.intentTaskId,
+          `Configured coordinator startup failed: ${error instanceof Error ? error.message : String(error)}`,
+        )
+        .catch(() => {});
+    }
     await command(
       orcaCommand,
       ["terminal", "close", "--terminal", terminalHandle, "--tab", "--json"],
@@ -6938,6 +6995,7 @@ Run options:
     process.env.NO_MISTAKES_GATE_WORKTREE_ROOT
       ? {
           branch: gateBranch,
+          intentTaskId: process.env.NO_MISTAKES_INTENT_TASK_ID ?? "",
           kind: "configured",
           path: repoState.root,
           root: process.env.NO_MISTAKES_GATE_WORKTREE_ROOT,
@@ -6975,6 +7033,8 @@ Run options:
         deliveryBranch: process.env.NO_MISTAKES_DELIVERY_BRANCH,
         deliveryGit,
         forceLease: parsed.flags["force-lease"] === true,
+        intentTaskId:
+          gate?.kind === "configured" ? gate.intentTaskId : undefined,
         intent,
         maxFixRounds,
         userGlobalConfig,
@@ -7002,6 +7062,11 @@ Run options:
         ? "cancelled"
         : "failed";
     const message = error instanceof Error ? error.message : String(error);
+    if (gate?.kind === "configured" && gate.intentTaskId) {
+      await orca
+        .failTask(gate.intentTaskId, `Coordinator preflight failed: ${message}`)
+        .catch(() => {});
+    }
     const recoverRef = (error as CustodyTaggedError).recoverRef;
     await orca.notifyRunResult(
       outcome,
