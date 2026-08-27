@@ -206,9 +206,14 @@ process.exit(result.status ?? 1);
 `,
     );
     await chmod(wrapper, 0o755);
-    process.env.ONM_TEST_REAL_GIT = execFileSync("which", ["git"], {
-      encoding: "utf8",
-    }).trim();
+    // Resolved by scanning PATH rather than shelling out to `which`, which is
+    // absent from minimal CI images.
+    const realGit = (previousPath ?? "")
+      .split(path.delimiter)
+      .map((entry) => path.join(entry, "git"))
+      .find((candidate) => existsSync(candidate));
+    assert.ok(realGit, "git must be on PATH");
+    process.env.ONM_TEST_REAL_GIT = realGit;
     process.env.PATH = `${bin}${path.delimiter}${previousPath ?? ""}`;
 
     for (const code of [124, 128]) {
