@@ -256,6 +256,9 @@ export function buildCliCommand(harness: string, options: CliAgentCommandOptions
           `agent ${normalizedHarness}: invalid environment variable name '${key}' in agent_args_override`
         )
       }
+      if (normalizedHarness === 'pi' && key === 'PI_CODING_AGENT_SESSION_DIR') {
+        throw new Error(`agent pi: reserved environment variable '${key}' cannot be overridden`)
+      }
       env.push(`${key}=${shellQuote(value)}`)
     }
   }

@@ -333,7 +333,7 @@ auto_fix:
 # Custom flags or environment variables passed to specific agent harnesses.
 # Flags no-mistakes manages itself are reserved. This includes \`agy\` permission,
 # prompt, print, and conversation controls, plus \`pi\` print, mode, and session
-# controls; supplying one through an override fails the launch.
+# controls (including \`PI_CODING_AGENT_SESSION_DIR\`); supplying one fails the launch.
 # agent_args_override:
 #   opencode:
 #     - "--agent"

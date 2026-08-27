@@ -527,6 +527,16 @@ test('buildCliCommand reserves pi conversation and interactive-mode controls', (
         error.message === `agent pi: reserved argument '${flag}' cannot be overridden`
     )
   }
+  assert.throws(
+    () =>
+      buildCliCommand('pi', {
+        agentArgsOverride: { pi: { PI_CODING_AGENT_SESSION_DIR: '/tmp/pi-sessions' } }
+      }),
+    (error: unknown) =>
+      error instanceof Error &&
+      error.message ===
+        "agent pi: reserved environment variable 'PI_CODING_AGENT_SESSION_DIR' cannot be overridden"
+  )
 })
 
 test('isBinaryMissingOutput spots shell binary failures naming the harness', () => {
