@@ -1528,15 +1528,17 @@ export class DomainLedger {
    * attestation cascade with them. Nothing else in the ledger removes a run:
    * evidence is retained indefinitely until an operator asks for this.
    */
-  prune(runIds: string[]): void {
-    if (runIds.length === 0) return
+  prune(runIds: string[]): number {
+    if (runIds.length === 0) return 0
+    let pruned = 0
     this.#db.exec('BEGIN IMMEDIATE')
     try {
       // One statement per id rather than an IN list: a long-lived ledger can
       // hold more completed runs than SQLite allows host parameters.
       const remove = this.#db.prepare('DELETE FROM runs WHERE run_id = ?')
-      for (const runId of runIds) remove.run(runId)
+      for (const runId of runIds) pruned += Number(remove.run(runId).changes)
       this.#db.exec('COMMIT')
+      return pruned
     } catch (error) {
       this.#db.exec('ROLLBACK')
       throw error

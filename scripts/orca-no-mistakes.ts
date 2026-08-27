@@ -6227,10 +6227,8 @@ async function launchDetachedRun(
 }
 
 /**
- * The commits a run preserved at its recovery ref, classified against the
- * branch it was run on: the OID when they are already contained in the branch
- * or its base, `"unmerged"` when they are not, and `undefined` when the ref is
- * gone or the repository can no longer be read.
+ * The commits a run preserved at its recovery refs, classified against the
+ * branch it was run on.
  *
  * Every run anchors this ref, including passing ones, so its mere existence
  * proves nothing. What matters for pruning is containment: while the operator
@@ -6239,8 +6237,11 @@ async function launchDetachedRun(
  */
 async function recoveryHeadState(
   run: PrunableRun,
-): Promise<string | "unmerged" | undefined> {
-  if (!RUN_ID_PATTERN.test(run.run_id)) return undefined;
+  missingRepoAsserted: boolean,
+): Promise<"contained" | "missing-repo" | "unmerged"> {
+  if (!existsSync(run.repo_root)) {
+    return missingRepoAsserted ? "contained" : "missing-repo";
+  }
   const ref = recoveryRefFor(run.run_id);
   const git = async (args: string[]) => {
     try {
@@ -6251,36 +6252,55 @@ async function recoveryHeadState(
         { allowFailure: true },
       );
     } catch (error) {
-      // A repository that has since been deleted or moved leaves nothing to
-      // preserve, so its runs stay prunable. Any other failure to start git --
-      // no git on PATH, for one -- leaves the ref state unknown, and prune
-      // must not delete evidence on a guess.
-      if (existsSync(run.repo_root)) throw error;
-      return undefined;
+      throw new Error(
+        `could not inspect recovery refs for run ${run.run_id}: ${String(error)}`,
+      );
     }
   };
-  const resolved = await git([
-    "rev-parse",
-    "--verify",
-    "--quiet",
-    `${ref}^{commit}`,
+  const failedInspection = (operation: string, result: CommandResult) =>
+    new Error(
+      `could not inspect recovery refs for run ${run.run_id}: git ${operation} failed (${result.code}): ${result.stderr || result.stdout}`,
+    );
+  const listed = await git([
+    "for-each-ref",
+    "--format=%(refname)",
+    ref,
+    `${ref}-*`,
   ]);
-  const oid = resolved?.code === 0 ? resolved.stdout.trim() : "";
-  if (!oid) return undefined;
-  for (const container of [
-    run.branch,
-    run.base_branch,
-    `origin/${run.base_branch}`,
-  ]) {
-    const contained = await git([
-      "merge-base",
-      "--is-ancestor",
-      oid,
-      `${container}^{commit}`,
+  if (listed.code !== 0) throw failedInspection("for-each-ref", listed);
+  for (const recoveryRef of listed.stdout.split("\n").filter(Boolean)) {
+    const resolved = await git([
+      "rev-parse",
+      "--verify",
+      "--quiet",
+      `${recoveryRef}^{commit}`,
     ]);
-    if (contained?.code === 0) return oid;
+    if (resolved.code === 1) continue;
+    if (resolved.code !== 0) throw failedInspection("rev-parse", resolved);
+    const oid = resolved.stdout.trim();
+    if (!oid) throw failedInspection("rev-parse", resolved);
+    let isContained = false;
+    for (const container of [
+      run.branch,
+      run.base_branch,
+      `origin/${run.base_branch}`,
+    ]) {
+      const contained = await git([
+        "merge-base",
+        "--is-ancestor",
+        oid,
+        `${container}^{commit}`,
+      ]);
+      if (contained.code === 0) {
+        isContained = true;
+        break;
+      }
+      if (contained.code !== 1)
+        throw failedInspection("merge-base --is-ancestor", contained);
+    }
+    if (!isContained) return "unmerged";
   }
-  return "unmerged";
+  return "contained";
 }
 
 async function runPruneCommand(flags: RawCliFlags): Promise<void> {
@@ -6301,67 +6321,43 @@ async function runPruneCommand(flags: RawCliFlags): Promise<void> {
           path.resolve(repoFlag),
         );
   const ledger = new DomainLedger();
-  const pruned: { oid?: string; run: PrunableRun }[] = [];
-  const retained: string[] = [];
+  let pruned = 0;
+  let retained = 0;
   try {
     for (const run of ledger.prunableRuns({ before, repoRoot })) {
-      const state = await recoveryHeadState(run);
-      if (state === "unmerged") {
-        retained.push(run.run_id);
+      if (!RUN_ID_PATTERN.test(run.run_id)) {
+        retained += 1;
         console.error(
-          `no-mistakes: retained ${run.run_id}; ${recoveryRefFor(run.run_id)} is not contained in ${run.branch} or ${run.base_branch}`,
+          `no-mistakes: retained ${run.run_id}; its artifact directory is unsafe to remove`,
         );
         continue;
       }
-      pruned.push({ oid: state, run });
-    }
-    ledger.prune(pruned.map((entry) => entry.run.run_id));
-  } finally {
-    ledger.close();
-  }
-  for (const { oid, run } of pruned) {
-    if (!RUN_ID_PATTERN.test(run.run_id)) {
-      console.error(
-        `no-mistakes: skipped unsafe artifact directory for run ${run.run_id}`,
+      const state = await recoveryHeadState(
+        run,
+        repoRoot !== undefined && repoRoot === path.resolve(run.repo_root),
       );
-      continue;
-    }
-    // The ledger rows are already gone, so a directory that resists removal is
-    // reported and skipped rather than left to abort the runs after it.
-    try {
+      if (state !== "contained") {
+        retained += 1;
+        console.error(
+          state === "missing-repo"
+            ? `no-mistakes: retained ${run.run_id}; repository root ${run.repo_root} is unavailable (pass --repo=${run.repo_root} to assert it is gone)`
+            : `no-mistakes: retained ${run.run_id}; its recovery refs are not all contained in ${run.branch} or ${run.base_branch}`,
+        );
+        continue;
+      }
       await rm(path.join(artifactsRoot(), run.run_id), {
         force: true,
         recursive: true,
       });
-    } catch (error) {
-      console.error(
-        `no-mistakes: could not remove artifacts for pruned run ${run.run_id}: ${String(error)}`,
-      );
+      pruned += ledger.prune([run.run_id]);
     }
-    // The recovery ref outlives the run it belongs to and would pin its objects
-    // forever. Deleting it is safe only because the commits were just proven
-    // contained; the compare-and-swap on `oid` keeps a ref that moved in the
-    // meantime.
-    if (oid) {
-      await command(
-        "git",
-        [
-          "-C",
-          run.repo_root,
-          "update-ref",
-          "-d",
-          recoveryRefFor(run.run_id),
-          oid,
-        ],
-        run.repo_root,
-        { allowFailure: true },
-      ).catch(() => undefined);
-    }
+  } finally {
+    ledger.close();
   }
   console.log(
-    `Pruned ${pruned.length} run(s)` +
-      (retained.length > 0
-        ? `; retained ${retained.length} with unmerged recovery heads`
+    `Pruned ${pruned} run(s)` +
+      (retained > 0
+        ? `; retained ${retained} for recovery safety`
         : ""),
   );
 }
