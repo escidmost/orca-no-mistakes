@@ -19,6 +19,16 @@ export type GateAuditRow = {
   resolution: string
   resolved_at: string | null
   round_index: number
+  selected_finding_ids: string | null
+  stage_id: string
+}
+
+export type FindingDecisionRow = {
+  decision: string
+  findings_json: string
+  round_index: number
+  run_id: string
+  selected_finding_ids: string
   stage_id: string
 }
 
@@ -865,6 +875,7 @@ CREATE TABLE IF NOT EXISTS gate_audit (
   resolution TEXT NOT NULL,
   decision TEXT NOT NULL,
   guidance TEXT,
+  selected_finding_ids TEXT,
   opened_at TEXT NOT NULL,
   resolved_at TEXT
 );
@@ -955,17 +966,17 @@ export class DomainLedger {
       }
     }
     this.#db.exec(SCHEMA)
-    // ponytail: nullable provenance columns added post-release; ALTER is the
-    // idempotent path for ledgers created before ONM-40. Only the expected
-    // duplicate-column failure is tolerated — anything else fails startup.
-    for (const column of [
-      'effective_policy_hash TEXT',
-      'base_ref_sha TEXT',
-      'artifact_sha256 TEXT',
-      'findings_json TEXT'
+    // ponytail: nullable columns added post-release use the idempotent ALTER
+    // path. Only the expected duplicate-column failure is tolerated.
+    for (const [table, column] of [
+      ['stage_evidence', 'effective_policy_hash TEXT'],
+      ['stage_evidence', 'base_ref_sha TEXT'],
+      ['stage_evidence', 'artifact_sha256 TEXT'],
+      ['stage_evidence', 'findings_json TEXT'],
+      ['gate_audit', 'selected_finding_ids TEXT']
     ]) {
       try {
-        this.#db.exec(`ALTER TABLE stage_evidence ADD COLUMN ${column}`)
+        this.#db.exec(`ALTER TABLE ${table} ADD COLUMN ${column}`)
       } catch (error) {
         if (
           !(error instanceof Error) ||
@@ -1413,20 +1424,22 @@ export class DomainLedger {
     resolution: string
     roundIndex: number
     runId: string
+    selectedFindingIds?: string[]
     stageId: string
   }): void {
     const now = new Date().toISOString()
     this.#db
       .prepare(
-        `INSERT INTO gate_audit (
-           gate_id, run_id, stage_id, round_index, question, options_json,
-           resolution, decision, guidance, opened_at, resolved_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(gate_id) DO UPDATE SET
-           resolution = excluded.resolution,
-           decision = excluded.decision,
-           guidance = excluded.guidance,
-           resolved_at = excluded.resolved_at`
+         `INSERT INTO gate_audit (
+            gate_id, run_id, stage_id, round_index, question, options_json,
+            resolution, decision, guidance, selected_finding_ids, opened_at, resolved_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(gate_id) DO UPDATE SET
+            resolution = excluded.resolution,
+            decision = excluded.decision,
+            guidance = excluded.guidance,
+            selected_finding_ids = excluded.selected_finding_ids,
+            resolved_at = excluded.resolved_at`
       )
       .run(
         input.gateId,
@@ -1438,6 +1451,9 @@ export class DomainLedger {
         input.resolution,
         input.decision,
         input.guidance ?? null,
+        input.selectedFindingIds === undefined
+          ? null
+          : JSON.stringify(input.selectedFindingIds),
         now,
         now
       )
@@ -1590,10 +1606,46 @@ export class DomainLedger {
   listGateAudit(runId: string): GateAuditRow[] {
     return this.#db
       .prepare(
-        `SELECT decision, gate_id, stage_id, round_index, gate_kind, guidance, resolution, resolved_at
+        `SELECT decision, gate_id, stage_id, round_index, gate_kind, guidance, resolution,
+                resolved_at, selected_finding_ids
          FROM gate_audit WHERE run_id = ? ORDER BY opened_at, rowid`
       )
       .all(runId) as GateAuditRow[]
+  }
+
+  listFindingDecisions(input: {
+    branch: string
+    repoRoot: string
+    runId: string
+  }): { decisions: FindingDecisionRow[]; truncated: boolean } {
+    const limit = 20
+    const rows = this.#db
+      .prepare(
+        `SELECT g.decision,
+                (SELECT e.findings_json FROM stage_evidence e
+                  WHERE e.run_id = g.run_id AND e.stage_id = g.stage_id
+                    AND e.round_index = g.round_index AND e.findings_json IS NOT NULL
+                  ORDER BY e.created_at DESC, e.rowid DESC LIMIT 1) AS findings_json,
+                g.round_index, g.run_id, g.selected_finding_ids, g.stage_id
+           FROM gate_audit g
+           JOIN runs r ON r.run_id = g.run_id
+           JOIN runs current_run ON current_run.run_id = ?
+          WHERE r.repo_root = ? AND r.branch = ? AND r.rowid <= current_run.rowid
+            AND g.stage_id IN ('review', 'test', 'document', 'lint')
+            AND g.resolved_at IS NOT NULL AND g.selected_finding_ids IS NOT NULL
+            AND EXISTS (
+              SELECT 1 FROM stage_evidence e
+               WHERE e.run_id = g.run_id AND e.stage_id = g.stage_id
+                 AND e.round_index = g.round_index AND e.findings_json IS NOT NULL
+            )
+           ORDER BY g.resolved_at DESC, g.rowid DESC
+          LIMIT ?`
+      )
+      .all(input.runId, input.repoRoot, input.branch, limit + 1) as FindingDecisionRow[]
+    return {
+      decisions: rows.slice(0, limit).reverse(),
+      truncated: rows.length > limit
+    }
   }
 
   close(): void {
