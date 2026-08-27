@@ -9075,9 +9075,11 @@ test("prune drops merged runs with their artifacts and retains unmerged recovery
   try {
     await mkdir(path.join(temp, "repo"), { recursive: true });
     const repo = await realpath(path.join(temp, "repo"));
-    git(repo, "init", "--initial-branch=main", ".");
+    git(repo, "-c", "init.templateDir=", "init", "--initial-branch=main", ".");
     git(repo, "config", "user.email", "test@example.com");
     git(repo, "config", "user.name", "Test User");
+    git(repo, "config", "core.hooksPath", "/dev/null");
+    git(repo, "config", "commit.gpgsign", "false");
     await writeFile(path.join(repo, "README.md"), "main\n");
     git(repo, "add", "README.md");
     git(repo, "commit", "-m", "main");

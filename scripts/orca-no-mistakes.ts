@@ -6376,11 +6376,25 @@ async function runPruneCommand(flags: RawCliFlags): Promise<void> {
         );
         continue;
       }
+      // The row goes first because prune() re-checks the lease inside its
+      // transaction and refuses a run that acquired one since selection.
+      // Removing the artifacts first would destroy the evidence of a run the
+      // ledger then declines to delete. The cost is that a failure to remove
+      // the directory leaves it orphaned, which spends disk rather than
+      // evidence.
+      const removed = ledger.prune([run.run_id]);
+      if (removed === 0) {
+        retained += 1;
+        console.error(
+          `no-mistakes: retained ${run.run_id}; it was leased again while pruning`,
+        );
+        continue;
+      }
+      pruned += removed;
       await rm(path.join(artifactsRoot(), run.run_id), {
         force: true,
         recursive: true,
       });
-      pruned += ledger.prune([run.run_id]);
     }
   } finally {
     ledger.close();
