@@ -8571,7 +8571,7 @@ test("stop resolution cancels the run and records the audit decision", async () 
   );
   assert.equal(
     ledger.listGateAudit(cancelledRunId)[0].selected_finding_ids,
-    "[]",
+    null,
   );
   assert.ok(git.calls.some((call) => call.startsWith("recover:")));
   assert.equal(ledger.leaseFor("/repo", "feature"), undefined);
