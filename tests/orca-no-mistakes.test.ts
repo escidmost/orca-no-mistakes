@@ -2,6 +2,7 @@ import { fullStageEvidence } from './attestation-fixture.ts'
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import {
   chmod,
   link,
@@ -6381,7 +6382,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     const sends = calls.filter(
       (args) => args[0] === "terminal" && args[1] === "send",
     );
-    assert.equal(sends.length, 2);
+    assert.equal(sends.length, 3);
     const startupCommand = sends[0]?.[sends[0].indexOf("--text") + 1] ?? "";
     assert.equal(startupCommand, "'kimi' '--model' 'kimi-k2.5' '--auto'");
     const promptInstruction = sends[1]?.[sends[1].indexOf("--text") + 1] ?? "";
@@ -6393,6 +6394,10 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       promptInstruction,
       /^Read and follow the complete authenticated task in .*prompt-[^ ]+\.txt$/,
     );
+    // The instruction carries no Enter of its own: a trailing Enter in the same
+    // payload is absorbed by the paste and leaves the task unsubmitted.
+    assert.ok(!sends[1].includes("--enter"));
+    assert.ok(sends[2].includes("--enter") && !sends[2].includes("--text"));
     assert.equal(worker.report.summary, "kimi tested");
     assert.deepEqual(await readdir(trustDir), []);
 
@@ -8989,17 +8994,172 @@ test("prune removes completed runs with their evidence while retaining in-progre
     submissionCommitOid: "c".repeat(40),
   });
 
-  const pruned = ledger.prune({ repoSubstring: "old" });
-  assert.deepEqual(pruned, ["run-old"]);
+  const candidates = ledger.prunableRuns({ repoRoot: "/repo/old" });
+  assert.deepEqual(
+    candidates.map((run) => run.run_id),
+    ["run-old"],
+  );
+  ledger.prune(candidates.map((run) => run.run_id));
   assert.deepEqual(ledger.listCheckpoints("run-old"), []);
   assert.equal(ledger.runStatus("run-live"), "in-progress");
 
-  const future = ledger.prune({ before: new Date(Date.now() + 60_000) });
-  assert.deepEqual(future, []);
-
-  assert.deepEqual(ledger.prune({ repoSubstring: "live" }), []);
-  assert.deepEqual(ledger.prune({}), []);
+  // A cutoff in the future still excludes the in-progress run, and the
+  // completed one is already gone.
+  assert.deepEqual(
+    ledger.prunableRuns({ before: new Date(Date.now() + 60_000) }),
+    [],
+  );
+  assert.deepEqual(ledger.prunableRuns({ repoRoot: "/repo/live" }), []);
+  assert.deepEqual(ledger.prunableRuns({}), []);
   assert.equal(ledger.runStatus("run-live"), "in-progress");
+});
+
+test("--repo names a checkout rather than a substring of one", () => {
+  const ledger = new DomainLedger(":memory:");
+  for (const [runId, repoRoot] of [
+    ["run-inside", "/srv/repo/nested"],
+    ["run-sibling", "/srv/repo-other"],
+  ] as const) {
+    ledger.startRun({
+      baseBranch: "main",
+      branch: "feature",
+      intent: runId,
+      policySha256: "f".repeat(64),
+      repoRoot,
+      runId,
+      submissionCommitOid: "a".repeat(40),
+    });
+    ledger.finishRun(runId, "passed", "b".repeat(40));
+  }
+  assert.deepEqual(
+    ledger.prunableRuns({ repoRoot: "/srv/repo" }).map((run) => run.run_id),
+    ["run-inside"],
+  );
+  ledger.close();
+});
+
+test("prune retains a completed run whose branch lease was never released", () => {
+  const ledger = new DomainLedger(":memory:");
+  ledger.startRun({
+    baseBranch: "main",
+    branch: "feature",
+    intent: "stranded",
+    policySha256: "f".repeat(64),
+    repoRoot: "/repo/stranded",
+    runId: "run-stranded",
+    submissionCommitOid: "a".repeat(40),
+  });
+  ledger.acquireLease({
+    branch: "feature",
+    repoRoot: "/repo/stranded",
+    runId: "run-stranded",
+  });
+  // A coordinator killed after finishRun but before releaseLease leaves the
+  // branch owned; pruning the run would silently cascade the lease away.
+  ledger.finishRun("run-stranded", "failed");
+  assert.deepEqual(ledger.prunableRuns({}), []);
+
+  ledger.releaseLease("run-stranded");
+  assert.deepEqual(
+    ledger.prunableRuns({}).map((run) => run.run_id),
+    ["run-stranded"],
+  );
+  ledger.close();
+});
+
+test("prune drops merged runs with their artifacts and retains unmerged recovery heads", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-prune-recovery-"));
+  const home = path.join(temp, "home");
+  const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
+  process.env.ORCA_NO_MISTAKES_HOME = home;
+  try {
+    await mkdir(path.join(temp, "repo"), { recursive: true });
+    const repo = await realpath(path.join(temp, "repo"));
+    git(repo, "-c", "init.templateDir=", "init", "--initial-branch=main", ".");
+    git(repo, "config", "user.email", "test@example.com");
+    git(repo, "config", "user.name", "Test User");
+    git(repo, "config", "core.hooksPath", "/dev/null");
+    git(repo, "config", "commit.gpgsign", "false");
+    await writeFile(path.join(repo, "README.md"), "main\n");
+    git(repo, "add", "README.md");
+    git(repo, "commit", "-m", "main");
+    git(repo, "checkout", "-b", "feature");
+    await writeFile(path.join(repo, "feature.txt"), "feature\n");
+    git(repo, "add", "feature.txt");
+    git(repo, "commit", "-m", "feature");
+    const merged = git(repo, "rev-parse", "HEAD");
+
+    // A head the operator never integrated: committed, then left reachable
+    // only through the recovery ref.
+    git(repo, "checkout", "-b", "stray");
+    await writeFile(path.join(repo, "stray.txt"), "stray\n");
+    git(repo, "add", "stray.txt");
+    git(repo, "commit", "-m", "stray");
+    const stray = git(repo, "rev-parse", "HEAD");
+    git(repo, "checkout", "feature");
+    git(repo, "branch", "-D", "stray");
+
+    const ledger = new DomainLedger();
+    // A run whose checkout no longer exists has nothing left to preserve.
+    ledger.startRun({
+      baseBranch: "main",
+      branch: "feature",
+      intent: "run-gone",
+      policySha256: "f".repeat(64),
+      repoRoot: path.join(repo, "gone"),
+      runId: "run-gone",
+      submissionCommitOid: "a".repeat(40),
+    });
+    ledger.finishRun("run-gone", "failed");
+    for (const [runId, oid] of [
+      ["run-merged", merged],
+      ["run-unmerged", stray],
+    ] as const) {
+      ledger.startRun({
+        baseBranch: "main",
+        branch: "feature",
+        intent: runId,
+        policySha256: "f".repeat(64),
+        repoRoot: repo,
+        runId,
+        submissionCommitOid: "a".repeat(40),
+      });
+      ledger.finishRun(runId, runId === "run-merged" ? "passed" : "failed", oid);
+      git(repo, "update-ref", `refs/no-mistakes/recover/${runId}`, oid);
+      await mkdir(path.join(home, "artifacts", runId), { recursive: true });
+      await writeFile(
+        path.join(home, "artifacts", runId, "review.log"),
+        "output\n",
+      );
+    }
+    ledger.close();
+
+    await main(["prune", "--before=2999-01-01", `--repo=${repo}`]);
+
+    const reopened = new DomainLedger();
+    assert.equal(reopened.runStatus("run-merged"), undefined);
+    // A repository root that is gone is not proof that nothing was preserved:
+    // it is retained until --repo names that exact root.
+    assert.equal(reopened.runStatus("run-gone"), "failed");
+    assert.equal(reopened.runStatus("run-unmerged"), "failed");
+    reopened.close();
+    assert.equal(existsSync(path.join(home, "artifacts", "run-merged")), false);
+    assert.equal(existsSync(path.join(home, "artifacts", "run-unmerged")), true);
+    // Prune reclaims ledger rows and artifact logs, never Git history: both
+    // recovery refs survive the runs they belonged to.
+    assert.equal(
+      git(repo, "rev-parse", "refs/no-mistakes/recover/run-merged"),
+      merged,
+    );
+    assert.equal(
+      git(repo, "rev-parse", "refs/no-mistakes/recover/run-unmerged"),
+      stray,
+    );
+  } finally {
+    if (previousHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME;
+    else process.env.ORCA_NO_MISTAKES_HOME = previousHome;
+    await rm(temp, { recursive: true, force: true });
+  }
 });
 
 test("re-attesting an unchanged commit replaces the stored manifest instead of failing", async () => {
@@ -9136,7 +9296,9 @@ test("CLI exports, verifies, and prunes attestations through the domain ledger",
       /(ENOENT|no passed attestation)/,
     );
 
-    await main(["prune", "--before=2999-01-01"]);
+    // The fake repo root never existed on disk, so prune needs the operator's
+    // explicit assertion that the checkout is gone.
+    await main(["prune", "--before=2999-01-01", "--repo=/repo"]);
     const reopened = new DomainLedger();
     assert.throws(
       () => reopened.getAttestation(result.runId),

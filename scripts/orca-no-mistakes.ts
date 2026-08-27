@@ -2,7 +2,7 @@
 
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { readdirSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import {
   chmod,
   mkdir,
@@ -68,6 +68,7 @@ import {
   sha256,
   verifyManifest,
   type PassedAttestationManifest,
+  type PrunableRun,
   type StageEvidenceManifestEntry,
 } from "./ledger.ts";
 export {
@@ -3012,6 +3013,11 @@ export class CliOrca implements OrcaOperations {
       if (promptInstruction !== undefined) {
         if (fence?.aborted)
           throw new Error(`${launch.stage} worker attempt was cancelled`);
+        // The text and the Enter go in separate sends: this harness is typed
+        // into after launch rather than handed its prompt on the command line,
+        // and a trailing Enter inside the same payload is absorbed as part of
+        // the paste, leaving the instruction sitting unsubmitted in its input
+        // box until the stage times out.
         await this.#json(
           [
             "terminal",
@@ -3020,9 +3026,18 @@ export class CliOrca implements OrcaOperations {
             terminalHandle,
             "--text",
             promptInstruction,
-            "--enter",
             "--json",
           ],
+          false,
+          fence,
+        );
+        // ponytail: fixed settle before the Enter; if a harness ever needs
+        // longer, wait on its input box echoing the instruction instead.
+        await delay(500, undefined, { signal: fence?.signal });
+        if (fence?.aborted)
+          throw new Error(`${launch.stage} worker attempt was cancelled`);
+        await this.#json(
+          ["terminal", "send", "--terminal", terminalHandle, "--enter", "--json"],
           false,
           fence,
         );
@@ -6225,6 +6240,173 @@ async function launchDetachedRun(
   return terminalHandle;
 }
 
+/**
+ * The commits a run preserved at its recovery refs, classified against the
+ * branch it was run on.
+ *
+ * Every run anchors this ref, including passing ones, so its mere existence
+ * proves nothing. What matters for pruning is containment: while the operator
+ * has not integrated the commits, the ledger row is the only record naming the
+ * ref that holds them, so the run must survive.
+ */
+async function recoveryHeadState(
+  run: PrunableRun,
+  missingRepoAsserted: boolean,
+): Promise<"contained" | "missing-repo" | "unmerged"> {
+  if (!existsSync(run.repo_root)) {
+    return missingRepoAsserted ? "contained" : "missing-repo";
+  }
+  const ref = recoveryRefFor(run.run_id);
+  const git = async (args: string[]) => {
+    try {
+      return await command(
+        "git",
+        ["-C", run.repo_root, ...args],
+        run.repo_root,
+        { allowFailure: true },
+      );
+    } catch (error) {
+      throw new Error(
+        `could not inspect recovery refs for run ${run.run_id}: ${String(error)}`,
+      );
+    }
+  };
+  const failedInspection = (operation: string, result: CommandResult) =>
+    new Error(
+      `could not inspect recovery refs for run ${run.run_id}: git ${operation} failed (${result.code}): ${result.stderr || result.stdout}`,
+    );
+  const listed = await git([
+    "for-each-ref",
+    "--format=%(refname)",
+    ref,
+    `${ref}-*`,
+  ]);
+  if (listed.code !== 0) throw failedInspection("for-each-ref", listed);
+  const recoveryRefs = listed.stdout.split("\n").filter(Boolean);
+  if (recoveryRefs.length === 0) {
+    return missingRepoAsserted ? "contained" : "missing-repo";
+  }
+  for (const recoveryRef of recoveryRefs) {
+    const resolved = await git([
+      "rev-parse",
+      "--verify",
+      "--quiet",
+      `${recoveryRef}^{commit}`,
+    ]);
+    if (resolved.code !== 0) throw failedInspection("rev-parse", resolved);
+    const oid = resolved.stdout.trim();
+    if (!oid) throw failedInspection("rev-parse", resolved);
+    let isContained = false;
+    for (const container of [
+      `refs/heads/${run.branch}`,
+      `refs/heads/${run.base_branch}`,
+      `refs/remotes/origin/${run.base_branch}`,
+    ]) {
+      // A container that no longer resolves -- most often a feature branch
+      // deleted once its pull request merged -- cannot witness containment,
+      // but it is not an inspection failure either: skip it and try the next.
+      // Resolving it first also keeps `merge-base` exit 1 meaning "not an
+      // ancestor" rather than "bad revision".
+      const containerOid = await git([
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        `${container}^{commit}`,
+      ]);
+      if (containerOid.code === 1) continue;
+      if (containerOid.code !== 0)
+        throw failedInspection("rev-parse", containerOid);
+      const contained = await git([
+        "merge-base",
+        "--is-ancestor",
+        oid,
+        containerOid.stdout.trim(),
+      ]);
+      if (contained.code === 0) {
+        isContained = true;
+        break;
+      }
+      if (contained.code !== 1)
+        throw failedInspection("merge-base --is-ancestor", contained);
+    }
+    if (!isContained) return "unmerged";
+  }
+  return "contained";
+}
+
+async function runPruneCommand(flags: RawCliFlags): Promise<void> {
+  const beforeValue = stringFlag(flags, "before");
+  let before: Date | undefined;
+  if (beforeValue !== undefined) {
+    before = new Date(beforeValue);
+    if (Number.isNaN(before.getTime()))
+      throw new Error(`--before is not a valid date: ${beforeValue}`);
+  }
+  const repoFlag = stringFlag(flags, "repo");
+  // Runs record the root git itself reported, so a symlinked argument has to be
+  // canonicalised before it can match one.
+  const repoRoot =
+    repoFlag === undefined
+      ? undefined
+      : await realpath(path.resolve(repoFlag)).catch(() =>
+          path.resolve(repoFlag),
+        );
+  const ledger = new DomainLedger();
+  let pruned = 0;
+  let retained = 0;
+  try {
+    for (const run of ledger.prunableRuns({ before, repoRoot })) {
+      if (!RUN_ID_PATTERN.test(run.run_id)) {
+        retained += 1;
+        console.error(
+          `no-mistakes: retained ${run.run_id}; its artifact directory is unsafe to remove`,
+        );
+        continue;
+      }
+      const state = await recoveryHeadState(
+        run,
+        repoRoot !== undefined && repoRoot === path.resolve(run.repo_root),
+      );
+      if (state !== "contained") {
+        retained += 1;
+        console.error(
+          state === "missing-repo"
+            ? `no-mistakes: retained ${run.run_id}; repository root ${run.repo_root} is unavailable (pass --repo=${run.repo_root} to assert it is gone)`
+            : `no-mistakes: retained ${run.run_id}; its recovery refs are not all contained in ${run.branch} or ${run.base_branch}`,
+        );
+        continue;
+      }
+      // The row goes first because prune() re-checks the lease inside its
+      // transaction and refuses a run that acquired one since selection.
+      // Removing the artifacts first would destroy the evidence of a run the
+      // ledger then declines to delete. The cost is that a failure to remove
+      // the directory leaves it orphaned, which spends disk rather than
+      // evidence.
+      const removed = ledger.prune([run.run_id]);
+      if (removed === 0) {
+        retained += 1;
+        console.error(
+          `no-mistakes: retained ${run.run_id}; it was leased again while pruning`,
+        );
+        continue;
+      }
+      pruned += removed;
+      await rm(path.join(artifactsRoot(), run.run_id), {
+        force: true,
+        recursive: true,
+      });
+    }
+  } finally {
+    ledger.close();
+  }
+  console.log(
+    `Pruned ${pruned} run(s)` +
+      (retained > 0
+        ? `; retained ${retained} for recovery safety`
+        : ""),
+  );
+}
+
 export async function main(argv: string[]): Promise<void> {
   if (
     argv.length === 0 ||
@@ -6236,7 +6418,7 @@ export async function main(argv: string[]): Promise<void> {
   orca-no-mistakes run --intent <text> [--repo <path>] [--base <branch>] [--head <sha>] [--force-lease]
   orca-no-mistakes attestation export <run-id|commit-sha> [--out <path>]
   orca-no-mistakes attestation verify <manifest-file|run-id|commit-sha>
-  orca-no-mistakes prune [--before <date>] [--repo <name>]
+  orca-no-mistakes prune [--before <date>] [--repo <path>]
 
 Run options:
   --reviewer-model <model>
@@ -6253,34 +6435,7 @@ Run options:
     return;
   }
   if (parsed.command === "prune") {
-    const beforeValue = stringFlag(parsed.flags, "before");
-    let before: Date | undefined;
-    if (beforeValue !== undefined) {
-      before = new Date(beforeValue);
-      if (Number.isNaN(before.getTime()))
-        throw new Error(`--before is not a valid date: ${beforeValue}`);
-    }
-    const repoSubstring = stringFlag(parsed.flags, "repo");
-    const ledger = new DomainLedger();
-    let pruned: string[] = [];
-    try {
-      pruned = ledger.prune({ before, repoSubstring });
-      for (const runId of pruned) {
-        if (!RUN_ID_PATTERN.test(runId)) {
-          console.error(
-            `no-mistakes: skipped unsafe artifact directory for run ${runId}`,
-          );
-          continue;
-        }
-        await rm(path.join(artifactsRoot(), runId), {
-          force: true,
-          recursive: true,
-        });
-      }
-    } finally {
-      ledger.close();
-    }
-    console.log(`Pruned ${pruned.length} run(s)`);
+    await runPruneCommand(parsed.flags);
     return;
   }
   if (parsed.command !== "run")
