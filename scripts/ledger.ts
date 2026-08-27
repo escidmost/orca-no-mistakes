@@ -1505,6 +1505,16 @@ export class DomainLedger {
    * `repoRoot` matches the run's repository root itself or anything nested
    * under it, so `--repo <path>` names a checkout rather than any run whose
    * path happens to contain the text.
+   *
+   * Containment is proven outside this transaction, so a pipeline rewriting the
+   * same branch concurrently can make a proven-contained commit unmerged again
+   * after its row is gone. That is deliberately not fenced: prune never deletes
+   * refs, so the commits stay reachable at `refs/no-mistakes/recover/<run-id>`
+   * and remain discoverable by name. Only the ledger row and the artifact logs
+   * go -- which is what the operator asked for. Reserving the branch for the
+   * duration would put a manual cleanup command in the path of the lease that
+   * real runs depend on, to protect metadata about commits that are still on
+   * disk.
    */
   prunableRuns(options: { before?: Date; repoRoot?: string }): PrunableRun[] {
     const before = options.before ? options.before.toISOString() : null
