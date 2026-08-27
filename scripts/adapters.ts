@@ -340,6 +340,9 @@ export function harnessTitleMatcher(harness: string): (title?: string | null) =>
   if (normalizedHarness === 'agy') {
     return (title) => /\b(?:agy|antigravity)\b/i.test(title ?? '')
   }
+  if (normalizedHarness === 'pi') {
+    return (title) => title?.startsWith('π - ') === true || /\bpi\b/i.test(title ?? '')
+  }
   const pattern = new RegExp(`\\b${escapeRegExp(harness)}\\b`, 'i')
   return (title) => pattern.test(title ?? '')
 }

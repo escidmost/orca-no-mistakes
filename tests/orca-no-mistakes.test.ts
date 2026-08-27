@@ -2368,7 +2368,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
   console.log(JSON.stringify({ ok: false, error: { code: 'terminal_close_failed', message: 'terminal_close_failed' } }))
   process.exit(1)
 } else if (args[0] === 'terminal' && args[1] === 'show') {
-  out({ terminal: { connected: true, title: 'Pi', preview: 'ready', worktreeId: 'worker-worktree' } })
+  out({ terminal: { connected: true, title: 'π - worker-worktree', preview: 'ready', worktreeId: 'worker-worktree' } })
 } else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
   const count = fs.existsSync(${JSON.stringify(startCountPath)}) ? Number(fs.readFileSync(${JSON.stringify(startCountPath)}, 'utf8')) : 0
   fs.writeFileSync(${JSON.stringify(startCountPath)}, String(count + 1))

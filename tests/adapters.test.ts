@@ -344,6 +344,11 @@ test('readinessMatcher matches per-harness terminal titles and rejects interrupt
   assert.equal(gemini({ title: 'Gemini', preview: 'ok' }), true)
   assert.equal(gemini({ title: 'vim', preview: '' }), false)
 
+  const pi = readinessMatcher('pi')
+  assert.equal(pi({ title: 'π - worker-worktree', preview: 'ready' }), true)
+  assert.equal(pi({ title: 'Pi', preview: 'ready' }), true)
+  assert.equal(pi({ title: 'zsh', preview: 'ready' }), false)
+
   const agy = readinessMatcher('AGY')
   assert.equal(agy({ title: 'Antigravity', preview: 'ready' }), true)
   assert.equal(agy({ title: 'agy', preview: 'esc interrupt' }), false)
