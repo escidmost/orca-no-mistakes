@@ -6382,7 +6382,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     const sends = calls.filter(
       (args) => args[0] === "terminal" && args[1] === "send",
     );
-    assert.equal(sends.length, 2);
+    assert.equal(sends.length, 3);
     const startupCommand = sends[0]?.[sends[0].indexOf("--text") + 1] ?? "";
     assert.equal(startupCommand, "'kimi' '--model' 'kimi-k2.5' '--auto'");
     const promptInstruction = sends[1]?.[sends[1].indexOf("--text") + 1] ?? "";
@@ -6394,6 +6394,10 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       promptInstruction,
       /^Read and follow the complete authenticated task in .*prompt-[^ ]+\.txt$/,
     );
+    // The instruction carries no Enter of its own: a trailing Enter in the same
+    // payload is absorbed by the paste and leaves the task unsubmitted.
+    assert.ok(!sends[1].includes("--enter"));
+    assert.ok(sends[2].includes("--enter") && !sends[2].includes("--text"));
     assert.equal(worker.report.summary, "kimi tested");
     assert.deepEqual(await readdir(trustDir), []);
 

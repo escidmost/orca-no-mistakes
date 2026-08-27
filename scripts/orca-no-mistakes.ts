@@ -3013,6 +3013,11 @@ export class CliOrca implements OrcaOperations {
       if (promptInstruction !== undefined) {
         if (fence?.aborted)
           throw new Error(`${launch.stage} worker attempt was cancelled`);
+        // The text and the Enter go in separate sends: this harness is typed
+        // into after launch rather than handed its prompt on the command line,
+        // and a trailing Enter inside the same payload is absorbed as part of
+        // the paste, leaving the instruction sitting unsubmitted in its input
+        // box until the stage times out.
         await this.#json(
           [
             "terminal",
@@ -3021,9 +3026,18 @@ export class CliOrca implements OrcaOperations {
             terminalHandle,
             "--text",
             promptInstruction,
-            "--enter",
             "--json",
           ],
+          false,
+          fence,
+        );
+        // ponytail: fixed settle before the Enter; if a harness ever needs
+        // longer, wait on its input box echoing the instruction instead.
+        await delay(500, undefined, { signal: fence?.signal });
+        if (fence?.aborted)
+          throw new Error(`${launch.stage} worker attempt was cancelled`);
+        await this.#json(
+          ["terminal", "send", "--terminal", terminalHandle, "--enter", "--json"],
           false,
           fence,
         );
