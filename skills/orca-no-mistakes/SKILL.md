@@ -72,7 +72,7 @@ Export and verify attestations, and prune retained evidence:
 ```bash
 orca-no-mistakes attestation export <run-id-or-commit-sha> [--out manifest.json]
 orca-no-mistakes attestation verify <manifest-file|run-id|commit-sha>
-orca-no-mistakes prune [--before <date>] [--repo <name-substring>]
+orca-no-mistakes prune [--before <date>] [--repo <path>]
 ```
 
 On failure, report the error and Orca Run ID when available; retry only after addressing the blocker or receiving the user's decision.
