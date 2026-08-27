@@ -661,15 +661,10 @@ export async function runPipeline(
             resolution,
             roundIndex: round,
             runId,
-            selectedFindingIds:
-              decision.action === "approve" ||
-              decision.action === "skip" ||
-              decision.action === "stop"
-                ? []
-                : decision.action === "fix" &&
-                    decision.selectedFindings.length > 0
-                  ? decision.selectedFindings.map((finding) => finding.id)
-                  : undefined,
+            selectedFindingIds: selectedFindingIdsForGate(
+              decision,
+              gateOptions,
+            ),
             stageId: stage,
           });
           if (
@@ -1978,7 +1973,7 @@ export function findingDecisionHistoryPrompt(
   rows: FindingDecisionRow[],
   truncated: boolean,
 ): string {
-  const declinedById = new Map<
+  const declinedByKey = new Map<
     string,
     {
       action: string;
@@ -1996,10 +1991,8 @@ export function findingDecisionHistoryPrompt(
       if (
         !Array.isArray(findings) ||
         !findings.every(isValidFinding) ||
-        new Set(findings.map((finding) => finding.id)).size !== findings.length ||
         !Array.isArray(selected) ||
         !selected.every((id): id is string => typeof id === "string") ||
-        new Set(selected).size !== selected.length ||
         !["approve", "fix", "skip", "stop"].includes(row.decision) ||
         !Number.isInteger(row.round_index) ||
         row.round_index < 0 ||
@@ -2019,12 +2012,14 @@ export function findingDecisionHistoryPrompt(
         continue;
       }
       const selectedIds = new Set(selected);
-      for (const finding of actionable) {
-        declinedById.delete(finding.id);
-        if (!selectedIds.has(finding.id)) {
-          declinedById.set(finding.id, {
+      const findingsById = Map.groupBy(actionable, (finding) => finding.id);
+      for (const [id, groupedFindings] of findingsById) {
+        const key = `${row.stage_id}\0${id}`;
+        declinedByKey.delete(key);
+        if (!selectedIds.has(id)) {
+          declinedByKey.set(key, {
             action: row.decision,
-            declined: [finding],
+            declined: groupedFindings,
             round: row.round_index,
             runId: row.run_id,
             stage: row.stage_id,
@@ -2035,12 +2030,12 @@ export function findingDecisionHistoryPrompt(
       invalid = true;
     }
   }
-  if (declinedById.size === 0 && !truncated && !invalid) return "";
+  if (declinedByKey.size === 0 && !truncated && !invalid) return "";
 
   const decisions: string[] = [];
   let payloadBytes = 2;
   let payloadTruncated = truncated;
-  for (const decision of [...declinedById.values()].reverse()) {
+  for (const decision of [...declinedByKey.values()].reverse()) {
     const rendered = fenceUntrusted(JSON.stringify(decision));
     const renderedBytes = Buffer.byteLength(rendered) +
       (decisions.length > 0 ? 1 : 0);
@@ -2084,6 +2079,23 @@ export type GateDecision = {
   guidance: string;
   selectedFindings: Finding[];
 };
+
+export function selectedFindingIdsForGate(
+  decision: GateDecision,
+  options: string[],
+): string[] | undefined {
+  if (!options.includes(decision.action)) return undefined;
+  if (
+    decision.action === "approve" ||
+    decision.action === "skip" ||
+    decision.action === "stop"
+  ) {
+    return [];
+  }
+  return decision.action === "fix" && decision.selectedFindings.length > 0
+    ? decision.selectedFindings.map((finding) => finding.id)
+    : undefined;
+}
 
 export function parseGateResolution(
   resolution: string,
