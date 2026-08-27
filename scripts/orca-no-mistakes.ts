@@ -1232,7 +1232,7 @@ async function runReviewer(
       evidenceCommitOid: untrusted.headOid,
     };
   } finally {
-    await releaseWorker(worker, orca);
+    await releaseReviewerWorker(worker, orca, stage);
   }
 }
 
@@ -1270,6 +1270,20 @@ async function releaseWorker(
     if (worker.worktreeId) {
       await orca.removeWorktree(worker.worktreeId);
     }
+  }
+}
+
+async function releaseReviewerWorker(
+  worker: WorkerResult,
+  orca: OrcaOperations,
+  stage: StageName,
+): Promise<void> {
+  try {
+    await releaseWorker(worker, orca);
+  } catch (cleanupError) {
+    throw new WorkerCleanupError(
+      `${stage} reviewer cleanup failed: ${String(cleanupError)}`,
+    );
   }
 }
 

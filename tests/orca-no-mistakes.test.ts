@@ -9926,6 +9926,53 @@ test("a fixer timeout during commit application leaves the branch unchanged", as
   );
 });
 
+test("a reviewer timeout preserves strict worker cleanup failures", async () => {
+  const git = new FakeGit();
+  class SlowCleanupOrca extends FakeOrca {
+    cleanupSettled = false;
+
+    override async startWorker(
+      taskId: string,
+      launch: WorkerLaunch,
+    ): Promise<WorkerResult> {
+      if (launch.role === "reviewer") {
+        await new Promise((resolve) => setTimeout(resolve, 75));
+      }
+      return super.startWorker(taskId, launch);
+    }
+
+    override async finishWorker(
+      worker: WorkerResult,
+      disposition: "release" | "retain",
+    ): Promise<void> {
+      await super.finishWorker(worker, disposition);
+      if (disposition === "release") {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        this.cleanupSettled = true;
+        throw new Error("timeout cleanup failed");
+      }
+    }
+  }
+  const orca = new SlowCleanupOrca(git);
+
+  await assert.rejects(
+    runPipeline(
+      {
+        intent: "Preserve timed-out reviewer cleanup failures.",
+        cliFlags: { reviewer: { timeout_ms: 10 } } as never,
+      },
+      orca,
+      git,
+    ),
+    /review reviewer cleanup failed.*timeout cleanup failed/,
+  );
+  assert.equal(
+    orca.cleanupSettled,
+    true,
+    "the timeout does not discard the owning reviewer cleanup failure",
+  );
+});
+
 test("a fixer timeout waits for strict worker cleanup failures", async () => {
   class SlowApplyGit extends FakeGit {
     async applyWorktreeCommits(
