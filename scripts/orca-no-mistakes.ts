@@ -2,7 +2,7 @@
 
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { readdirSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import {
   chmod,
   mkdir,
@@ -6250,9 +6250,12 @@ async function recoveryHeadState(
         run.repo_root,
         { allowFailure: true },
       );
-    } catch {
+    } catch (error) {
       // A repository that has since been deleted or moved leaves nothing to
-      // preserve, so its runs stay prunable.
+      // preserve, so its runs stay prunable. Any other failure to start git --
+      // no git on PATH, for one -- leaves the ref state unknown, and prune
+      // must not delete evidence on a guess.
+      if (existsSync(run.repo_root)) throw error;
       return undefined;
     }
   };
@@ -6323,10 +6326,18 @@ async function runPruneCommand(flags: RawCliFlags): Promise<void> {
       );
       continue;
     }
-    await rm(path.join(artifactsRoot(), run.run_id), {
-      force: true,
-      recursive: true,
-    });
+    // The ledger rows are already gone, so a directory that resists removal is
+    // reported and skipped rather than left to abort the runs after it.
+    try {
+      await rm(path.join(artifactsRoot(), run.run_id), {
+        force: true,
+        recursive: true,
+      });
+    } catch (error) {
+      console.error(
+        `no-mistakes: could not remove artifacts for pruned run ${run.run_id}: ${String(error)}`,
+      );
+    }
     // The recovery ref outlives the run it belongs to and would pin its objects
     // forever. Deleting it is safe only because the commits were just proven
     // contained; the compare-and-swap on `oid` keeps a ref that moved in the

@@ -9094,6 +9094,17 @@ test("prune drops merged runs with their artifacts and retains unmerged recovery
     git(repo, "branch", "-D", "stray");
 
     const ledger = new DomainLedger();
+    // A run whose checkout no longer exists has nothing left to preserve.
+    ledger.startRun({
+      baseBranch: "main",
+      branch: "feature",
+      intent: "run-gone",
+      policySha256: "f".repeat(64),
+      repoRoot: path.join(repo, "gone"),
+      runId: "run-gone",
+      submissionCommitOid: "a".repeat(40),
+    });
+    ledger.finishRun("run-gone", "failed");
     for (const [runId, oid] of [
       ["run-merged", merged],
       ["run-unmerged", stray],
@@ -9121,6 +9132,7 @@ test("prune drops merged runs with their artifacts and retains unmerged recovery
 
     const reopened = new DomainLedger();
     assert.equal(reopened.runStatus("run-merged"), undefined);
+    assert.equal(reopened.runStatus("run-gone"), undefined);
     assert.equal(reopened.runStatus("run-unmerged"), "failed");
     reopened.close();
     assert.equal(existsSync(path.join(home, "artifacts", "run-merged")), false);
