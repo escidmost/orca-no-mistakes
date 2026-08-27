@@ -4851,7 +4851,7 @@ function weakensInlineTestValidation(
   if (source === expectedSource) return false;
   const qualifiedTestDeclaration = /(?<![.\w$])(?:Deno|vitest)\.test(?:\.[A-Za-z_$][\w$]*)*\s*\(/u;
   const testDeclaration = /(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|rstest|(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test)\s*\]|@(?:[A-Za-z_][\w]*\.)*(?:ParameterizedTest|Test|TestMethod|DataTestMethod)\b|\[(?:(?:[A-Za-z_][\w]*\.)*(?:Fact|Test|Theory|TestMethod|DataTestMethod)|(?:[A-Za-z_][\w]*\.)*TestCase(?:\([^\]\n]*\))?)\]|(?<![.\w$])(?:describe|context|it|test)(?:\.[A-Za-z_$][\w$]*)*\s*\(|\b(?:SCENARIO|TEMPLATE_TEST_CASE|TEST_CASE)\s*\(|\btest\s+"(?:[^"\\]|\\.)*"\s*\{|(?:^|\n)\s*(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(|\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b)/iu;
-  const inlineAssertion = /(?:(?:^|\n)\s*assert\s+\S|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\b(?:CHECK|REQUIRE)(?:_[A-Z0-9_]+)?\s*\(|\b(?:[A-Za-z_][\w]*\.)*Assert\.[A-Za-z_][\w]*\s*\(|\.should\.(?:deep\.)?(?:equal|eql|match|throw)\s*\(|\b(?:deepStrictEqual|strictEqual|notDeepStrictEqual|notStrictEqual|doesNotReject|doesNotThrow|ifError|rejects|throws)\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|\bassert[A-Z][A-Za-z0-9_$]*\s*\(|\bstd\.testing\.expect[A-Za-z0-9_]*\s*\(|\bexpect(?:\.(?:poll|soft))?\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
+  const inlineAssertion = /(?:(?:^|\n)\s*assert\s+\S|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\b(?:CHECK|REQUIRE)(?:_[A-Z0-9_]+)?\s*\(|\b(?:[A-Za-z_][\w]*\.)*Assert\.[A-Za-z_][\w]*\s*\(|\.should\.(?:deep\.)?(?:equal|eql|match|throw)\s*\(|\b(?:deepStrictEqual|strictEqual|notDeepStrictEqual|notStrictEqual|doesNotReject|doesNotThrow|ifError|rejects|throws)\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|(?<![.\w$])assert[A-Z][A-Za-z0-9_$]*\s*\(|\bstd\.testing\.expect[A-Za-z0-9_]*\s*\(|\bexpect(?:\.(?:poll|soft))?\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
   const doctestPrompt = /^\s*>>>/u;
   const nodeAssertImport = /(?:from\s+["'](?:node:)?assert(?:\/strict)?["']|require\s*\(\s*["'](?:node:)?assert(?:\/strict)?["']\s*\))/u;
   if (
@@ -6963,9 +6963,9 @@ Run options:
     base: stringFlag(parsed.flags, "base"),
     expectedHead: stringFlag(parsed.flags, "head"),
   });
-  const repoState = await git.assertReady();
-  const userGlobalConfig = loadUserConfig();
   if (parsed.flags.attached !== true) {
+    const repoState = await git.assertReady();
+    const userGlobalConfig = loadUserConfig();
     const terminalHandle = await launchDetachedRun(
       repoState,
       parsed.flags,
@@ -6988,6 +6988,7 @@ Run options:
   const gateBranch = process.env.NO_MISTAKES_GATE_BRANCH;
   const originWorktree = process.env.NO_MISTAKES_ORIGIN_WORKTREE;
   const gateRunId = process.env.NO_MISTAKES_RUN_ID;
+  const gatePath = await canonicalPath(repo);
   const gate: GateWorktree | undefined =
     gateBranch &&
     originWorktree &&
@@ -6997,7 +6998,7 @@ Run options:
           branch: gateBranch,
           intentTaskId: process.env.NO_MISTAKES_INTENT_TASK_ID ?? "",
           kind: "configured",
-          path: repoState.root,
+          path: gatePath,
           root: process.env.NO_MISTAKES_GATE_WORKTREE_ROOT,
           runId: gateRunId,
         }
@@ -7006,16 +7007,15 @@ Run options:
             branch: gateBranch,
             id: process.env.NO_MISTAKES_GATE_WORKTREE_ID,
             kind: "orca",
-            path: repoState.root,
+            path: gatePath,
           }
         : undefined;
   const orca = new CliOrca({
-    cwd: repoState.root,
+    cwd: gatePath,
     notifyHandle: stringFlag(parsed.flags, "notify"),
     parentWorktree: gate?.kind === "configured" ? originWorktree : undefined,
     runId: gate?.kind === "configured" ? gate.runId : undefined,
   });
-  const ledger = new DomainLedger();
   const deliveryGit = gate
     ? new GitShell({
         base: stringFlag(parsed.flags, "base"),
@@ -7023,8 +7023,11 @@ Run options:
         repo: originWorktree!,
       })
     : undefined;
+  let ledger: DomainLedger | undefined;
   let retainGate = false;
   try {
+    const userGlobalConfig = loadUserConfig();
+    ledger = new DomainLedger();
     const result = await runPipeline(
       {
         allowLocalConfig: parsed.flags["allow-local-config"] === true,
@@ -7077,7 +7080,7 @@ Run options:
     throw error;
   } finally {
     try {
-      ledger.close();
+      ledger?.close();
     } finally {
       if (gate && !retainGate) {
         await removeGateWorktree(

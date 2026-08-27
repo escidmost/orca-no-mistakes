@@ -65,8 +65,10 @@ const result = args[0] === 'terminal' && args[1] === 'create'
   ? { terminal: { handle: 'configured-coordinator' } }
   : args[0] === 'orchestration' && args[1] === 'run-create'
     ? { run: { id: 'configured-run' } }
-    : args[0] === 'terminal' && args[1] === 'show'
-      ? { terminal: { connected: true, preview: 'ready' } }
+    : args[0] === 'orchestration' && args[1] === 'task-create'
+      ? { task: { id: 'task-intent' } }
+      : args[0] === 'terminal' && args[1] === 'show'
+        ? { terminal: { connected: true, preview: 'ready' } }
       : { accepted: true }
 console.log(JSON.stringify({ result }))
 `,

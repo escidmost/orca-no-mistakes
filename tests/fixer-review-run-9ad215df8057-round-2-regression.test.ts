@@ -34,7 +34,6 @@ test("configured preflight failures settle the intent task", async () => {
   const repo = await seedRepo(temp);
   const root = path.join(temp, "runs");
   const userConfig = path.join(temp, "config.json");
-  const invalidPolicy = path.join(temp, "invalid-policy.yaml");
   const fakeOrca = path.join(temp, "orca");
   const callsPath = path.join(temp, "calls.jsonl");
   const environmentNames = [
@@ -56,7 +55,6 @@ test("configured preflight failures settle the intent task", async () => {
       userConfig,
       JSON.stringify({ worktree_roots: { [await realpath(repo)]: root } }),
     );
-    await writeFile(invalidPolicy, "stages: [\n");
     await writeFile(
       fakeOrca,
       `#!/usr/bin/env node
@@ -83,8 +81,6 @@ console.log(JSON.stringify({ result }))
       "run",
       `--repo=${repo}`,
       "--base=main",
-      "--allow-local-config",
-      `--config=${invalidPolicy}`,
       "--intent=Reject invalid policy.",
     ]);
 
@@ -115,6 +111,7 @@ console.log(JSON.stringify({ result }))
     process.env.NO_MISTAKES_INTENT_TASK_ID = "task-intent";
     process.env.NO_MISTAKES_ORIGIN_WORKTREE = repo;
     process.env.NO_MISTAKES_RUN_ID = "configured-run";
+    await writeFile(userConfig, "stages: [\n");
 
     await assert.rejects(
       main([
@@ -122,8 +119,6 @@ console.log(JSON.stringify({ result }))
         "--attached",
         `--repo=${gatePath}`,
         "--base=main",
-        "--allow-local-config",
-        `--config=${invalidPolicy}`,
         "--intent=Reject invalid policy.",
       ]),
       /invalid|parse|flow sequence/i,

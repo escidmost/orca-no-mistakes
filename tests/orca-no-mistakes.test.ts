@@ -2130,13 +2130,15 @@ const args = process.argv.slice(2)
 fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
 const result = args[0] === 'orchestration' && args[1] === 'run-create'
   ? { run: { id: 'configured-run' } }
-  : args[0] === 'terminal' && args[1] === 'create'
-    ? fs.existsSync(${JSON.stringify(failTerminalCreate)})
-      ? { accepted: true }
-      : { terminal: { handle: 'configured-gate-shell' } }
-    : args[0] === 'terminal' && args[1] === 'show'
-      ? { terminal: { connected: true, preview: 'ready shell prompt' } }
-      : { accepted: true }
+  : args[0] === 'orchestration' && args[1] === 'task-create'
+    ? { task: { id: 'task-intent' } }
+    : args[0] === 'terminal' && args[1] === 'create'
+      ? fs.existsSync(${JSON.stringify(failTerminalCreate)})
+        ? { accepted: true }
+        : { terminal: { handle: 'configured-gate-shell' } }
+      : args[0] === 'terminal' && args[1] === 'show'
+        ? { terminal: { connected: true, preview: 'ready shell prompt' } }
+        : { accepted: true }
 console.log(JSON.stringify({ result }))
 `,
     );
@@ -5209,6 +5211,18 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     git(worker, "add", "scripts/orca-no-mistakes.ts");
     git(worker, "commit", "-m", "repair implementation");
+    await assertWorkerChangesAllowed();
+
+    git(worker, "reset", "--hard", featureHead);
+    await writeFile(
+      path.join(worker, "scripts/orca-no-mistakes.ts"),
+      coordinatorSource.replace(
+        "    const repoState = await git.assertReady();",
+        "      const repoState = await git.assertReady();",
+      ),
+    );
+    git(worker, "add", "scripts/orca-no-mistakes.ts");
+    git(worker, "commit", "-m", "move runtime preflight");
     await assertWorkerChangesAllowed();
 
     git(worker, "reset", "--hard", featureHead);
