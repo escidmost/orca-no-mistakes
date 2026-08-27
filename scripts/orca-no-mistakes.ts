@@ -6945,8 +6945,10 @@ Run options:
   if (parsed.command !== "run")
     throw new Error(`unknown command: ${parsed.command}`);
   const repo = stringFlag(parsed.flags, "repo") ?? process.cwd();
-  const intent = stringFlag(parsed.flags, "intent");
-  if (!intent) throw new Error("run requires --intent");
+  const rawIntent = stringFlag(parsed.flags, "intent");
+  if (!rawIntent) throw new Error("run requires --intent");
+  const intent = normalizeIntent(rawIntent);
+  parsed.flags.intent = intent;
   const maxFixRoundsValue = parsed.flags["max-fix-rounds"];
   if (maxFixRoundsValue === true)
     throw new Error("--max-fix-rounds requires a number");
