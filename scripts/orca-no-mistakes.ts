@@ -6268,22 +6268,25 @@ async function recoveryHeadState(
     `${ref}-*`,
   ]);
   if (listed.code !== 0) throw failedInspection("for-each-ref", listed);
-  for (const recoveryRef of listed.stdout.split("\n").filter(Boolean)) {
+  const recoveryRefs = listed.stdout.split("\n").filter(Boolean);
+  if (recoveryRefs.length === 0) {
+    return missingRepoAsserted ? "contained" : "missing-repo";
+  }
+  for (const recoveryRef of recoveryRefs) {
     const resolved = await git([
       "rev-parse",
       "--verify",
       "--quiet",
       `${recoveryRef}^{commit}`,
     ]);
-    if (resolved.code === 1) continue;
     if (resolved.code !== 0) throw failedInspection("rev-parse", resolved);
     const oid = resolved.stdout.trim();
     if (!oid) throw failedInspection("rev-parse", resolved);
     let isContained = false;
     for (const container of [
-      run.branch,
-      run.base_branch,
-      `origin/${run.base_branch}`,
+      `refs/heads/${run.branch}`,
+      `refs/heads/${run.base_branch}`,
+      `refs/remotes/origin/${run.base_branch}`,
     ]) {
       // A container that no longer resolves -- most often a feature branch
       // deleted once its pull request merged -- cannot witness containment,

@@ -1535,7 +1535,9 @@ export class DomainLedger {
     try {
       // One statement per id rather than an IN list: a long-lived ledger can
       // hold more completed runs than SQLite allows host parameters.
-      const remove = this.#db.prepare('DELETE FROM runs WHERE run_id = ?')
+      const remove = this.#db.prepare(
+        "DELETE FROM runs WHERE run_id = ? AND status <> 'in-progress' AND run_id NOT IN (SELECT run_id FROM branch_leases)"
+      )
       for (const runId of runIds) pruned += Number(remove.run(runId).changes)
       this.#db.exec('COMMIT')
       return pruned
