@@ -68,7 +68,11 @@ defaults:
   # Harness variant (optional)
   # variant: "default"
 
-  # Execution timeout in milliseconds per stage (e.g. 120000 = 2 minutes)
+  # Execution timeout in milliseconds per agent invocation -- each reviewer
+  # or fixer attempt is bounded independently, not the run as a whole
+  # (e.g. 120000 = 2 minutes).
+  # Defaults to 1800000 (30 minutes) when unset, so a stalled worker fails
+  # its stage instead of hanging the run.
   # timeout_ms: 120000
 
   # Role-specific default overrides across all stages
