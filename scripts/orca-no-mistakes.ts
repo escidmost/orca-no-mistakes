@@ -2581,8 +2581,36 @@ export class CliOrca implements OrcaOperations {
     if (options.parent) args.push("--parent", options.parent);
     if (this.#runId) args.push("--run", this.#runId);
     args.push("--json");
-    const result = await this.#json<{ task: { id: string } }>(args);
-    return result.task.id;
+    const result = await this.#json<{ task?: { id?: string } }>(args);
+    const taskId = result.task?.id ?? "";
+    if (!taskId)
+      throw new Error("orchestration task-create returned an invalid task ID");
+    return taskId;
+  }
+
+  async failRun(summary: string): Promise<void> {
+    if (!this.#runId) return;
+    const result = await this.#json<{
+      tasks?: { id?: unknown; status?: unknown }[];
+    }>([
+      "orchestration",
+      "task-list",
+      "--run",
+      this.#runId,
+      "--json",
+    ]);
+    const taskIds = (Array.isArray(result.tasks) ? result.tasks : [])
+      .filter(
+        (task) =>
+          typeof task.id === "string" &&
+          task.id.length > 0 &&
+          task.status !== "completed" &&
+          task.status !== "failed",
+      )
+      .map((task) => task.id as string);
+    if (taskIds.length === 0)
+      taskIds.push(await this.createTask("Configured coordinator startup"));
+    await Promise.all(taskIds.map((taskId) => this.failTask(taskId, summary)));
   }
 
   async startWorker(
@@ -6541,32 +6569,26 @@ async function launchDetachedRun(
         ).stdout,
       );
       const runId = runReceipt.run?.id ?? "";
-      configuredRunPath(root, runId);
       configuredOrca = new CliOrca({
         command: orcaCommand,
         cwd: repo.root,
         runId,
       });
+      configuredRunPath(root, runId);
       intentTaskId = await configuredOrca.createTask(
         stageTaskSpec("intent", normalizeIntent(stringFlag(flags, "intent")!)),
       );
-      if (!intentTaskId) {
-        throw new Error("orchestration task-create returned an invalid task ID");
-      }
       gate = await createGateWorktree(repo, orcaCommand, {
         intentTaskId,
         root,
         runId,
       });
     } catch (error) {
-      if (configuredOrca && intentTaskId) {
-        await configuredOrca
-          .failTask(
-            intentTaskId,
-            `Configured coordinator startup failed: ${error instanceof Error ? error.message : String(error)}`,
-          )
-          .catch(() => {});
-      }
+      await configuredOrca
+        ?.failRun(
+          `Configured coordinator startup failed: ${error instanceof Error ? error.message : String(error)}`,
+        )
+        .catch(() => {});
       if (terminalHandle) {
         await command(
           orcaCommand,
