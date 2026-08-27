@@ -209,6 +209,59 @@ export function buildAttestation(
   return manifest
 }
 
+// JSON.stringify drops undefined keys, so a manifest that simply lacks a
+// required field hashes consistently and would verify clean while attesting
+// less than it claims to -- a deleted createdAt or coordinatorVersion is
+// invisible once the root is recomputed over the shorter preimage. Presence and
+// type therefore have to be settled before anything is hashed.
+const REQUIRED_HEADER_FIELDS = [
+  'runId',
+  'candidateCommitOid',
+  'baseCommitOid',
+  'policySha256',
+  'intent',
+  'intentHash',
+  'merkleRoot',
+  'coordinatorVersion',
+  'createdAt'
+] as const
+
+const REQUIRED_ENTRY_STRINGS = [
+  'stage',
+  'candidateCommitOid',
+  'baseCommitOid',
+  'workerIdentity',
+  'artifactSha256',
+  'evidenceSha256',
+  'summary'
+] as const
+
+function assertManifestShape(manifest: PassedAttestationManifest): void {
+  for (const field of REQUIRED_HEADER_FIELDS) {
+    if (typeof manifest[field] !== 'string' || manifest[field] === '') {
+      throw new Error(`attestation is missing its ${field}`)
+    }
+  }
+  if (!Array.isArray(manifest.stageEvidence)) {
+    throw new Error('attestation is missing its stage evidence')
+  }
+  manifest.stageEvidence.forEach((entry, index) => {
+    if (!entry || typeof entry !== 'object') {
+      throw new Error(`stage evidence entry ${index} is not an object`)
+    }
+    for (const field of REQUIRED_ENTRY_STRINGS) {
+      if (typeof entry[field] !== 'string' || entry[field] === '') {
+        throw new Error(`stage evidence entry ${index} is missing its ${field}`)
+      }
+    }
+    for (const field of ['round', 'exitCode'] as const) {
+      if (!Number.isInteger(entry[field])) {
+        throw new Error(`stage evidence entry ${index} is missing its ${field}`)
+      }
+    }
+  })
+}
+
 export function verifyManifest(manifest: PassedAttestationManifest): void {
   // Bumped whenever the digest preimages change: 1.0.0 predates the run ID in
   // the evidence preimage and 1.1.0 predates the header leaf in the Merkle
@@ -217,6 +270,7 @@ export function verifyManifest(manifest: PassedAttestationManifest): void {
   if (!manifest || manifest.version !== '1.2.0') {
     throw new Error('attestation version is not 1.2.0')
   }
+  assertManifestShape(manifest)
   if (!COMMIT_OID.test(manifest.candidateCommitOid) || !COMMIT_OID.test(manifest.baseCommitOid)) {
     throw new Error('attestation commit OIDs are not 40- or 64-character hex values')
   }

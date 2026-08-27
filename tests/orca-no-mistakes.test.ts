@@ -41,6 +41,7 @@ import {
   sha256,
   verifyManifest,
   type Finding,
+  type PassedAttestationManifest,
   type GitOperations,
   type OrcaOperations,
   type PipelineResult,
@@ -9146,6 +9147,68 @@ test("CLI exports, verifies, and prunes attestations through the domain ledger",
     else process.env.ORCA_NO_MISTAKES_HOME = previousHome;
     await rm(temp, { recursive: true, force: true });
   }
+});
+
+test("a manifest missing a declared field is rejected before it is hashed", () => {
+  const entry = {
+    stage: "review",
+    round: 0,
+    candidateCommitOid: "c".repeat(40),
+    baseCommitOid: "b".repeat(40),
+    workerIdentity: "reviewer",
+    exitCode: 0,
+    artifactSha256: "a".repeat(64),
+    summary: "clean",
+  };
+  const good = buildAttestation(
+    [{ ...entry, evidenceSha256: "" }].map((item) => ({
+      ...item,
+      evidenceSha256: evidenceSha256({ ...entry, runId: "run-shape" }),
+    })),
+    {
+      baseCommitOid: "b".repeat(40),
+      candidateCommitOid: "c".repeat(40),
+      intent: "Check manifest shape.",
+      policySha256: "f".repeat(64),
+      runId: "run-shape",
+    },
+  );
+
+  // Dropping a header field shortens the hashed preimage, so recomputing the
+  // root over the shorter manifest would otherwise verify clean.
+  for (const field of ["createdAt", "coordinatorVersion", "runId"] as const) {
+    const stripped = structuredClone(good) as Record<string, unknown>;
+    delete stripped[field];
+    stripped.merkleRoot = merkleRoot(
+      manifestLeaves(stripped as unknown as PassedAttestationManifest),
+    );
+    assert.throws(
+      () => verifyManifest(stripped as unknown as PassedAttestationManifest),
+      new RegExp(`missing its ${field}`),
+    );
+  }
+
+  // Absent stage evidence used to surface as a raw TypeError.
+  const noEvidence = structuredClone(good) as Record<string, unknown>;
+  delete noEvidence.stageEvidence;
+  assert.throws(
+    () => verifyManifest(noEvidence as unknown as PassedAttestationManifest),
+    /missing its stage evidence/,
+  );
+
+  const noSummary = structuredClone(good);
+  delete (noSummary.stageEvidence[0] as Record<string, unknown>).summary;
+  assert.throws(
+    () => verifyManifest(noSummary),
+    /stage evidence entry 0 is missing its summary/,
+  );
+
+  const noRound = structuredClone(good);
+  delete (noRound.stageEvidence[0] as Record<string, unknown>).round;
+  assert.throws(
+    () => verifyManifest(noRound),
+    /stage evidence entry 0 is missing its round/,
+  );
 });
 
 test("an exported manifest verifies offline against a ledger that never ran it", async () => {
