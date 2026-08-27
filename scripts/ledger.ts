@@ -97,6 +97,38 @@ export function normalizeIntent(value: unknown): string {
 const HEX_64 = /^[0-9a-f]{64}$/
 export const RUN_ID_PATTERN = /^[A-Za-z0-9._-]+$/
 const COMMIT_OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
+const MANIFEST_PROPERTIES = new Set([
+  'baseCommitOid',
+  'candidateCommitOid',
+  'coordinatorVersion',
+  'createdAt',
+  'intent',
+  'intentHash',
+  'merkleRoot',
+  'policySha256',
+  'runId',
+  'stageEvidence',
+  'version'
+])
+const STAGE_EVIDENCE_PROPERTIES = new Set([
+  'artifactSha256',
+  'baseCommitOid',
+  'candidateCommitOid',
+  'evidenceSha256',
+  'exitCode',
+  'round',
+  'stage',
+  'summary',
+  'waiverOrApproval',
+  'workerIdentity'
+])
+const WAIVER_PROPERTIES = new Set(['decision', 'gateId', 'resolvedAt'])
+
+function hasOnlyOwnProperties(value: object, allowed: ReadonlySet<string>): boolean {
+  return Reflect.ownKeys(value).every(
+    (property) => typeof property === 'string' && allowed.has(property)
+  )
+}
 
 function isCanonicalTimestamp(value: unknown): value is string {
   if (typeof value !== 'string') return false
@@ -241,6 +273,9 @@ export function verifyManifest(
   if (!manifest || manifest.version !== '1.2.0') {
     throw new Error('attestation version is not 1.2.0')
   }
+  if (!hasOnlyOwnProperties(manifest, MANIFEST_PROPERTIES)) {
+    throw new Error('attestation manifest has unknown properties')
+  }
   if (typeof manifest.runId !== 'string' || !RUN_ID_PATTERN.test(manifest.runId)) {
     throw new Error('attestation run ID is invalid')
   }
@@ -306,6 +341,9 @@ export function verifyManifest(
     ) {
       throw new Error(`attestation stage evidence entry ${index} has invalid required fields`)
     }
+    if (!hasOnlyOwnProperties(entry, STAGE_EVIDENCE_PROPERTIES)) {
+      throw new Error(`attestation stage evidence entry ${index} has unknown properties`)
+    }
     presentStages.add(entry.stage)
     if (entry.waiverOrApproval !== undefined) {
       const waiver = entry.waiverOrApproval
@@ -315,7 +353,8 @@ export function verifyManifest(
         (waiver.decision !== 'approve' && waiver.decision !== 'skip') ||
         typeof waiver.gateId !== 'string' ||
         waiver.gateId.trim() === '' ||
-        !isCanonicalTimestamp(waiver.resolvedAt)
+        !isCanonicalTimestamp(waiver.resolvedAt) ||
+        !hasOnlyOwnProperties(waiver, WAIVER_PROPERTIES)
       ) {
         throw new Error(`attestation stage evidence entry ${index} has an invalid waiver`)
       }
