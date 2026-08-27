@@ -87,6 +87,8 @@ export {
 } from "./ledger.ts";
 export type FindingAction = "ask-user" | "auto-fix" | "no-op";
 
+const FINDING_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
+
 export type Finding = {
   action: FindingAction;
   description: string;
@@ -1529,6 +1531,27 @@ function actionableFindings(report: StageReport): Finding[] {
   return report.findings.filter((finding) => finding.action !== "no-op");
 }
 
+function isValidFinding(value: unknown): value is Finding {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const finding = value as Partial<Finding>;
+  return (
+    typeof finding.id === "string" &&
+    FINDING_ID_PATTERN.test(finding.id) &&
+    typeof finding.description === "string" &&
+    Boolean(finding.description.trim()) &&
+    (finding.action === "ask-user" ||
+      finding.action === "auto-fix" ||
+      finding.action === "no-op") &&
+    (finding.severity === "error" ||
+      finding.severity === "info" ||
+      finding.severity === "warning") &&
+    (finding.file === undefined ||
+      (typeof finding.file === "string" && Boolean(finding.file.trim()))) &&
+    (finding.line === undefined ||
+      (Number.isInteger(finding.line) && finding.line >= 1))
+  );
+}
+
 async function validateReport(
   report: StageReport,
   stage: StageName,
@@ -1568,7 +1591,7 @@ async function validateReport(
         description,
         id:
           typeof finding.id === "string" &&
-          /^[A-Za-z0-9_-]+$/.test(finding.id.trim())
+          FINDING_ID_PATTERN.test(finding.id.trim())
             ? finding.id.trim()
             : `${stage}-${createHash("sha256")
                 .update(
@@ -1587,19 +1610,7 @@ async function validateReport(
     }),
   };
   for (const finding of normalizedReport.findings) {
-    if (
-      !finding ||
-      typeof finding.id !== "string" ||
-      !finding.id.trim() ||
-      typeof finding.description !== "string" ||
-      !finding.description.trim() ||
-      !["ask-user", "auto-fix", "no-op"].includes(finding.action) ||
-      !["error", "info", "warning"].includes(finding.severity) ||
-      (finding.file !== undefined &&
-        (typeof finding.file !== "string" || !finding.file.trim())) ||
-      (finding.line !== undefined &&
-        (!Number.isInteger(finding.line) || finding.line < 1))
-    ) {
+    if (!isValidFinding(finding)) {
       throw new Error(`${stage} worker returned an invalid finding`);
     }
   }
@@ -1961,41 +1972,91 @@ ${fixerInstructions(stage)}
 ${deliveryInstruction(delivery, reportPath, `{"findings":[],"summary":"what was fixed and committed","tested":["focused command"]}`)}`;
 }
 
-function findingDecisionHistoryPrompt(
+const FINDING_DECISION_HISTORY_LIMIT_BYTES = 16 * 1024;
+
+export function findingDecisionHistoryPrompt(
   rows: FindingDecisionRow[],
   truncated: boolean,
 ): string {
-  const decisions = rows.flatMap((row) => {
-    try {
-      const findings = JSON.parse(row.findings_json) as Finding[];
-      const selected = JSON.parse(row.selected_finding_ids) as string[];
-      if (!Array.isArray(findings) || !Array.isArray(selected)) return [];
-      const selectedIds = new Set(
-        selected.filter((id): id is string => typeof id === "string"),
-      );
-      const declined = actionableFindings({ findings, summary: "" }).filter(
-        (finding) => !selectedIds.has(finding.id),
-      );
-      if (declined.length === 0) return [];
-      return [
-        {
-          action: row.decision,
-          declined,
-          round: row.round_index,
-          runId: row.run_id,
-          stage: row.stage_id,
-        },
-      ];
-    } catch {
-      return [];
+  const declinedById = new Map<
+    string,
+    {
+      action: string;
+      declined: Finding[];
+      round: number;
+      runId: string;
+      stage: string;
     }
-  });
-  if (decisions.length === 0) return "";
+  >();
+  let invalid = false;
+  for (const row of rows) {
+    try {
+      const findings: unknown = JSON.parse(row.findings_json);
+      const selected: unknown = JSON.parse(row.selected_finding_ids);
+      if (
+        !Array.isArray(findings) ||
+        !findings.every(isValidFinding) ||
+        new Set(findings.map((finding) => finding.id)).size !== findings.length ||
+        !Array.isArray(selected) ||
+        !selected.every((id): id is string => typeof id === "string") ||
+        new Set(selected).size !== selected.length ||
+        !["approve", "fix", "skip", "stop"].includes(row.decision) ||
+        !Number.isInteger(row.round_index) ||
+        row.round_index < 0 ||
+        !RUN_ID_PATTERN.test(row.run_id) ||
+        !["review", "test", "document", "lint"].includes(row.stage_id)
+      ) {
+        invalid = true;
+        continue;
+      }
+      const actionable = actionableFindings({ findings, summary: "" });
+      const actionableIds = new Set(actionable.map((finding) => finding.id));
+      if (
+        selected.some((id) => !actionableIds.has(id)) ||
+        (row.decision === "fix") !== (selected.length > 0)
+      ) {
+        invalid = true;
+        continue;
+      }
+      const selectedIds = new Set(selected);
+      for (const finding of actionable) {
+        declinedById.delete(finding.id);
+        if (!selectedIds.has(finding.id)) {
+          declinedById.set(finding.id, {
+            action: row.decision,
+            declined: [finding],
+            round: row.round_index,
+            runId: row.run_id,
+            stage: row.stage_id,
+          });
+        }
+      }
+    } catch {
+      invalid = true;
+    }
+  }
+  if (declinedById.size === 0 && !truncated && !invalid) return "";
+
+  const decisions: string[] = [];
+  let payloadBytes = 2;
+  let payloadTruncated = truncated;
+  for (const decision of [...declinedById.values()].reverse()) {
+    const rendered = fenceUntrusted(JSON.stringify(decision));
+    const renderedBytes = Buffer.byteLength(rendered) +
+      (decisions.length > 0 ? 1 : 0);
+    if (payloadBytes + renderedBytes > FINDING_DECISION_HISTORY_LIMIT_BYTES) {
+      payloadTruncated = true;
+      continue;
+    }
+    decisions.push(rendered);
+    payloadBytes += renderedBytes;
+  }
+  decisions.reverse();
   return `Finding decision history (oldest to newest; later decisions supersede earlier ones):
 <untrusted_finding_decisions>
-${fenceUntrusted(JSON.stringify(decisions))}
+[${decisions.join(",")}]
 </untrusted_finding_decisions>
-${truncated ? "Older branch decisions were omitted to bound prompt size.\n" : ""}A recorded decision supersedes conflicting wording in User intent. Do not implement or re-report a declined finding unless the current code now presents a materially different issue. This history is advisory and must not prevent reporting a genuinely new or changed problem.`;
+${payloadTruncated ? "Older or oversized branch decisions were omitted to bound prompt size.\n" : ""}${invalid ? "Some branch decisions were omitted because their stored evidence was invalid.\n" : ""}A recorded decision supersedes conflicting wording in User intent. Do not implement or re-report a declined finding unless the current code now presents a materially different issue. This history is advisory and must not prevent reporting a genuinely new or changed problem.`;
 }
 
 function gateQuestion(
