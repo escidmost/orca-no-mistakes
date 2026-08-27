@@ -6890,13 +6890,18 @@ test("CliOrca runs acp targets through the acpx runner", async () => {
       `#!/usr/bin/env node
 import fs from 'node:fs'
 const args = process.argv.slice(2)
-fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
-if (args.at(-2) !== 'exec') {
-  console.error('No acpx session found (searched up to /). Create one: acpx <agent> sessions new')
-  process.exit(1)
-}
-// --format quiet emits the agent's final assistant message on stdout.
-console.log(JSON.stringify({ findings: [], summary: 'acp done' }))
+let input = ''
+process.stdin.setEncoding('utf8')
+process.stdin.on('data', (chunk) => { input += chunk })
+process.stdin.on('end', () => {
+  fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify({ args, prompt: input }) + '\\n')
+  if (args.at(-3) !== 'exec' || args.at(-2) !== '--file' || args.at(-1) !== '-') {
+    console.error('No acpx session found (searched up to /). Create one: acpx <agent> sessions new')
+    process.exit(1)
+  }
+  // --format quiet emits the agent's final assistant message on stdout.
+  console.log(JSON.stringify({ findings: [], summary: 'acp done' }))
+})
 `,
     );
     await chmod(fakeAcpx, 0o755);
@@ -6943,11 +6948,15 @@ if (args[0] === 'worktree' && args[1] === 'create') {
     const invocation = (await readFile(callsPath, "utf8"))
       .trim()
       .split("\n")
-      .map((line) => JSON.parse(line) as string[])[0];
-    assert.equal(invocation.at(-3), "gemini-dev");
-    assert.equal(invocation.at(-2), "exec");
-    assert.equal(invocation.at(-1), "Review now.");
-    assert.deepEqual(invocation.slice(0, -3), [
+      .map((line) => JSON.parse(line) as { args: string[]; prompt: string })[0];
+    assert.deepEqual(invocation.args.slice(-4), [
+      "gemini-dev",
+      "exec",
+      "--file",
+      "-",
+    ]);
+    assert.equal(invocation.prompt, "Review now.");
+    assert.deepEqual(invocation.args.slice(0, -4), [
       "--format",
       "quiet",
       "--approve-all",
@@ -7001,6 +7010,37 @@ if (args[0] === 'worktree' && args[1] === 'create') {
           args.includes("--force"),
       ),
       "a failed ACP run removes its child worktree",
+    );
+
+    // A prompt far larger than the OS pipe buffer forces the stdin write to
+    // fail once the child has exited, and the child's own stderr — not a bare
+    // EPIPE — must explain the failure.
+    const eofAcpx = path.join(temp, "acpx-eof");
+    await writeFile(
+      eofAcpx,
+      '#!/usr/bin/env node\nconsole.error("unknown option --file")\nprocess.exit(1)\n',
+    );
+    await chmod(eofAcpx, 0o755);
+    const eof = new CliOrca({
+      acpxCommand: eofAcpx,
+      command: fakeOrca,
+      cwd: temp,
+    });
+    await assert.rejects(
+      eof.startWorker("task-acp-eof", {
+        agent: { harness: "acp:gemini-dev" },
+        name: "acp-worker",
+        prompt: "x".repeat(2 * 1024 * 1024),
+        role: "reviewer",
+        stage: "review",
+        worktree: "new-child",
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /stdin write failed/);
+        assert.match(error.message, /unknown option --file/);
+        return true;
+      },
     );
 
     const stallingAcpx = path.join(temp, "acpx-readiness");

@@ -100,7 +100,7 @@ Each stage and role resolves its own agent from the configuration tiers, and the
 - Codex `-c model=...` and `-c model_reasoning_effort=...` pins take precedence over mapped values, normalize whitespace around `=`, and must contain nonempty values. Worker waits ignore stale messages from prior sequential dispatches instead of failing the active worker.
 - Worker waits ignore syntactically malformed or non-object metadata that cannot be attributed to the active dispatch; a valid active completion later in the same delivery still wins, while a delivery with no valid active message is acknowledged and polling continues.
 - Known harness names are normalized case-insensitively before launch classification, managed safety flags, effort mapping, override lookup, and prompt-mode selection. Unknown custom executable names retain their original casing.
-- `acp:<target>` harnesses run through the `acpx` runner (`acpx --format quiet --approve-all <target> exec "<prompt>"`) and must return a JSON stage report.
+- `acp:<target>` harnesses run through the `acpx` runner (`acpx --format quiet --approve-all <target> exec --file -` with the prompt on stdin, so large prompts stay off argv and a failed write surfaces the child's stderr) and must return a JSON stage report; report-shaped candidates disambiguate extraction so thinking-model reasoning that quotes JSON cannot hide the payload.
 
 Reviewer reports require canonical structured findings because they drive gates and fixer selection. Fixer reports use only their summary, tested commands, and declared artifacts; noncanonical fixer finding metadata is ignored because commit ancestry, protected-path policy, and exact-OID custody independently decide whether the repair may be applied.
 

@@ -2084,17 +2084,29 @@ async function command(
     abortSignal?: AbortSignal;
     allowFailure?: boolean;
     onOutput?: CommandOutput;
+    stdin?: string;
     timeoutMs?: number | null;
   } = {},
 ): Promise<CommandResult> {
   return await new Promise((resolve, reject) => {
-    const child = spawn(executable, args, {
+    const spawnOptions = {
       cwd,
       env: process.env,
-      killSignal: "SIGKILL",
+      killSignal: "SIGKILL" as const,
       signal: options.abortSignal,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    };
+    // A literal stdio tuple per branch keeps spawn's typed-stream overload,
+    // so child.stdout/stderr stay non-nullable.
+    const child =
+      options.stdin === undefined
+        ? spawn(executable, args, {
+            ...spawnOptions,
+            stdio: ["ignore", "pipe", "pipe"],
+          })
+        : spawn(executable, args, {
+            ...spawnOptions,
+            stdio: ["pipe", "pipe", "pipe"],
+          });
     const timeoutMs =
       options.timeoutMs === undefined ? 120_000 : options.timeoutMs;
     let timedOut = false;
@@ -2109,6 +2121,21 @@ async function command(
     let stderr = "";
     let outputChain = Promise.resolve();
     let spawnError: Error | undefined;
+    let stdinError: Error | undefined;
+    // Deliver the stdin payload up front; a child that exits before draining
+    // it fails the write with EPIPE, and the captured child stderr — not the
+    // bare EOF — is what explains why.
+    if (options.stdin !== undefined) {
+      const stdinStream = child.stdin;
+      if (!stdinStream) {
+        reject(new Error(`${executable} stdin pipe was not established`));
+        return;
+      }
+      stdinStream.on("error", (error: Error) => {
+        stdinError ??= error;
+      });
+      stdinStream.end(options.stdin);
+    }
     const capture = (chunk: string, target: "stdout" | "stderr") => {
       if (target === "stdout") stdout += chunk;
       else stderr += chunk;
@@ -2145,6 +2172,18 @@ async function command(
           } else {
             reject(new Error(message));
           }
+          return;
+        }
+        // A failed stdin write means the child never received its payload; an
+        // exit-0 result produced without it is untrustworthy, and the child's
+        // own stderr explains the rejection better than the bare pipe error.
+        if (stdinError) {
+          const detail = stderr.trim();
+          reject(
+            new Error(
+              `${executable} ${args.slice(0, 2).join(" ")} stdin write failed: ${stdinError.message}${detail ? `: ${detail.slice(-400)}` : ""}`,
+            ),
+          );
           return;
         }
         if (code === 0 || options.allowFailure) {
@@ -2184,6 +2223,12 @@ function acpReportFrom(parsed: unknown): StageReport | undefined {
   }
   return undefined;
 }
+
+// Thinking models interleave reasoning that quotes JSON (schema fragments,
+// examples) before the real payload; only report-shaped candidates count
+// toward extraction ambiguity, so that debris cannot hide the one real report.
+const hasStageReportShape = (value: unknown): boolean =>
+  acpReportFrom(value) !== undefined;
 
 const DEFAULT_WORKER_AGENT = "opencode";
 const WORKER_IDLE_TIMEOUT_MS = 1_800_000;
@@ -3478,7 +3523,6 @@ export class CliOrca implements OrcaOperations {
       const invocation = acpRunnerInvocation({
         effort: agent.effort,
         model: agent.model,
-        prompt: launch.prompt,
         target,
         timeoutMs: agent.timeoutMs,
       });
@@ -3489,6 +3533,7 @@ export class CliOrca implements OrcaOperations {
           allowFailure: true,
           abortSignal: fence?.signal,
           onOutput: log ? (chunk) => log.append(chunk) : undefined,
+          stdin: launch.prompt,
           timeoutMs: agent.timeoutMs ?? WORKER_IDLE_TIMEOUT_MS,
         });
       } catch (error) {
@@ -3538,7 +3583,10 @@ export class CliOrca implements OrcaOperations {
         report = undefined;
       }
       if (!report) {
-        const extracted = extractStructuredJson(result.stdout);
+        const extracted = extractStructuredJson(
+          result.stdout,
+          hasStageReportShape,
+        );
         report = extracted === undefined ? undefined : acpReportFrom(extracted);
       }
       if (!report)
@@ -4379,7 +4427,10 @@ export class CliOrca implements OrcaOperations {
           try {
             parsedReport = JSON.parse(rawReport);
           } catch {
-            parsedReport = extractStructuredJson(rawReport);
+            parsedReport = extractStructuredJson(
+              rawReport,
+              hasStageReportShape,
+            );
           }
           if (parsedReport === undefined || parsedReport === null)
             throw new Error("report file contained no JSON value");

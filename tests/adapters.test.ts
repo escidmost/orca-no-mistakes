@@ -395,7 +395,6 @@ test('workerAgentReadyTimeoutMs honors the environment override with a safe defa
 test('acpRunnerInvocation targets the acpx runner and forwards constraints', () => {
   const invocation = acpRunnerInvocation({
     model: 'glm-5',
-    prompt: 'Review this diff.',
     target: 'gemini-dev',
     timeoutMs: 30000
   })
@@ -409,15 +408,16 @@ test('acpRunnerInvocation targets the acpx runner and forwards constraints', () 
     '30',
     'gemini-dev',
     'exec',
-    'Review this diff.'
+    '--file',
+    '-'
   ])
-  const minimal = acpRunnerInvocation({ prompt: 'go', target: 'x' })
-  assert.deepEqual(minimal.args, ['--format', 'quiet', '--approve-all', 'x', 'exec', 'go'])
+  const minimal = acpRunnerInvocation({ target: 'x' })
+  assert.deepEqual(minimal.args, ['--format', 'quiet', '--approve-all', 'x', 'exec', '--file', '-'])
 })
 
 test('acpRunnerInvocation refuses effort instead of silently dropping it', () => {
   assert.throws(
-    () => acpRunnerInvocation({ effort: 'high', prompt: 'go', target: 'gemini-dev' }),
+    () => acpRunnerInvocation({ effort: 'high', target: 'gemini-dev' }),
     /agent acp:gemini-dev: cannot express effort/
   )
 })
@@ -724,5 +724,45 @@ test('extractStructuredJson prefers closed fences over unclosed tails and prose 
     extractStructuredJson('{"a":1} restated as {"a":1}'),
     { a: 1 },
     'repeated identical bare objects are not ambiguous'
+  )
+})
+
+test('extractStructuredJson with an accept gate ignores thinking-model reasoning debris', () => {
+  const isReport = (value: unknown): boolean =>
+    typeof value === 'object' &&
+    value !== null &&
+    Array.isArray((value as { findings?: unknown }).findings) &&
+    typeof (value as { summary?: unknown }).summary === 'string'
+  const report = { findings: [], summary: 'done' }
+  const schemaFragment = '{"type":"object","properties":{"findings":{"type":"array"}}}'
+
+  assert.deepEqual(
+    extractStructuredJson(
+      `Checking the schema first. ${schemaFragment}\n${JSON.stringify(report)}`,
+      isReport
+    ),
+    report,
+    'a quoted schema fragment in reasoning must not hide the bare payload'
+  )
+  assert.deepEqual(
+    extractStructuredJson(
+      `Example: \`\`\`json\n${schemaFragment}\n\`\`\`\nResult:\n\`\`\`json\n${JSON.stringify(report)}\n\`\`\``,
+      isReport
+    ),
+    report,
+    'a reasoning-phase fence quote must not compete with the real closed fence'
+  )
+  assert.equal(
+    extractStructuredJson(`x ${schemaFragment} y ${JSON.stringify(report)}`),
+    undefined,
+    'without the gate the same debris stays ambiguous'
+  )
+  assert.equal(
+    extractStructuredJson(
+      `${JSON.stringify(report)} then ${JSON.stringify({ findings: [], summary: 'different' })}`,
+      isReport
+    ),
+    undefined,
+    'two approved-but-different candidates still fail closed'
   )
 })

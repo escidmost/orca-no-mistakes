@@ -380,11 +380,12 @@ export type AcpRunnerInvocation = { args: string[] }
 // so they precede the target. `exec` is the one-shot sub-subcommand; the default action instead
 // resolves a persistent cwd-keyed session and throws when none exists. `--format json` is an NDJSON
 // event stream; `quiet` emits the final assistant message on stdout, which is the single JSON report
-// the worker prompt asks for.
+// the worker prompt asks for. The prompt itself rides stdin via `exec --file -`: a full worker
+// prompt in argv can exceed OS argument-size limits, and stdin delivery lets a failed write
+// surface the child's own stderr instead of a bare EOF.
 export function acpRunnerInvocation(options: {
   effort?: string
   model?: string
-  prompt: string
   target: string
   timeoutMs?: number
 }): AcpRunnerInvocation {
@@ -400,8 +401,7 @@ export function acpRunnerInvocation(options: {
   if (options.timeoutMs !== undefined) {
     args.push('--timeout', String(Math.max(1, Math.ceil(options.timeoutMs / 1000))))
   }
-  args.push(options.target, 'exec')
-  args.push(options.prompt)
+  args.push(options.target, 'exec', '--file', '-')
   return { args }
 }
 
@@ -626,7 +626,10 @@ function fencedJsonCandidates(text: string): FenceCandidates {
   return { closed, open }
 }
 
-function lastBareJsonObject(text: string): unknown | undefined {
+function lastBareJsonObject(
+  text: string,
+  accept?: (value: unknown) => boolean
+): unknown | undefined {
   let best: unknown
   const seen = new Set<string>()
   let depth = 0
@@ -652,7 +655,7 @@ function lastBareJsonObject(text: string): unknown | undefined {
         if (depth === 0 && start >= 0) {
           try {
             const parsed: unknown = JSON.parse(text.slice(start, index + 1))
-            if (parsed && typeof parsed === 'object') {
+            if (parsed && typeof parsed === 'object' && accept?.(parsed) !== false) {
               seen.add(JSON.stringify(parsed))
               best = parsed
             }
@@ -668,8 +671,15 @@ function lastBareJsonObject(text: string): unknown | undefined {
 // Extracts a structured result from agent text: direct JSON first, then closed
 // JSON fences, then unclosed tails, then the last bare JSON object. Candidates
 // that disagree are ambiguous at every layer and yield undefined rather than a
-// guess; repeated identical values are not a disagreement.
-export function extractStructuredJson(text: string): unknown | undefined {
+// guess; repeated identical values are not a disagreement. When `accept` is
+// given, only candidates it approves count toward ambiguity: a thinking model
+// whose stream interleaves reasoning that quotes JSON (schema fragments,
+// examples) before the real payload still yields that payload, while two
+// approved-but-different values keep failing closed.
+export function extractStructuredJson(
+  text: string,
+  accept?: (value: unknown) => boolean
+): unknown | undefined {
   try {
     return JSON.parse(text.trim())
   } catch {}
@@ -679,11 +689,11 @@ export function extractStructuredJson(text: string): unknown | undefined {
     for (const candidate of candidates) {
       try {
         const value: unknown = JSON.parse(candidate.trim())
-        distinct.set(JSON.stringify(value), value)
+        if (accept?.(value) !== false) distinct.set(JSON.stringify(value), value)
       } catch {}
     }
     if (distinct.size > 1) return undefined
     if (distinct.size === 1) return [...distinct.values()][0]
   }
-  return lastBareJsonObject(text)
+  return lastBareJsonObject(text, accept)
 }
