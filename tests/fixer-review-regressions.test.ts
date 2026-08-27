@@ -191,3 +191,42 @@ test("advisory guardrail mode still rejects fixer history rewrites", async () =>
     await rm(temp, { recursive: true, force: true });
   }
 });
+
+test("zod-style refinement contexts do not freeze source files", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-inline-context-"));
+  const repo = path.join(temp, "repo");
+  const worker = path.join(temp, "worker");
+  try {
+    await mkdir(repo);
+    git(repo, "init", "-b", "feature");
+    git(repo, "config", "user.email", "test@example.com");
+    git(repo, "config", "user.name", "Test User");
+    git(repo, "config", "core.hooksPath", "/dev/null");
+    await mkdir(path.join(repo, "scripts"), { recursive: true });
+    await writeFile(
+      path.join(repo, "scripts", "config.ts"),
+      "type Ctx = { addIssue(issue: object): void }\nexport const refine = (value: number, context: Ctx) => {\n  if (value < 0) context.addIssue({ code: \"custom\" })\n}\n",
+    );
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "add refinement");
+    const expectedHead = git(repo, "rev-parse", "HEAD");
+    git(repo, "worktree", "add", "--detach", worker, expectedHead);
+    await writeFile(
+      path.join(worker, "scripts", "config.ts"),
+      "type Ctx = { addIssue(issue: object): void }\nexport const refine = (value: number, context: Ctx) => {\n  if (value < 0) context.addIssue({ code: \"custom\", message: \"negative\" })\n}\n",
+    );
+    git(worker, "add", ".");
+    git(worker, "commit", "-m", "adjust refinement message");
+
+    assert.deepEqual(
+      await new GitShell({ repo }).assertFixerChangesAllowed(
+        worker,
+        expectedHead,
+        git(worker, "rev-parse", "HEAD"),
+      ),
+      { changed: true, guardrailViolations: [] },
+    );
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
