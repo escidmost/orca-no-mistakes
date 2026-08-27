@@ -64,6 +64,7 @@ import {
   buildAttestation,
   capLog,
   evidenceSha256,
+  normalizeIntent,
   sha256,
   verifyManifest,
   type PassedAttestationManifest,
@@ -74,7 +75,9 @@ export {
   buildAttestation,
   canonicalEntry,
   capLog,
+  manifestLeaves,
   merkleRoot,
+  normalizeIntent,
   sha256,
   verifyManifest,
   type PassedAttestationManifest,
@@ -288,21 +291,7 @@ export async function runPipeline(
   git: GitOperations,
   ledger: DomainLedger = new DomainLedger(":memory:"),
 ): Promise<PipelineResult> {
-  const intent = options.intent.trim();
-  if (!intent) {
-    throw new Error("--intent is required");
-  }
-  if (
-    intent.includes("<untrusted_instruction>") ||
-    intent.includes("</untrusted_instruction>")
-  ) {
-    throw new Error(
-      "--intent must not contain untrusted_instruction delimiters",
-    );
-  }
-  if (intent.includes("\n") || intent.includes("\0")) {
-    throw new Error("--intent must be a single line");
-  }
+  const intent = normalizeIntent(options.intent);
   const maxFixRounds = options.maxFixRounds;
   if (
     maxFixRounds !== undefined &&
@@ -862,9 +851,8 @@ export async function runPipeline(
       policySha256: policySha256Value,
       runId,
     });
-    ledger.recordAttestation(attestation);
-    ledger.finishRun(runId, "passed", terminalCommitOid);
-    ledger.releaseLease(runId);
+    verifyManifest(attestation, PIPELINE_STEPS);
+    ledger.finalizePassedRun(attestation, terminalCommitOid);
     await orca
       .setWorktreeStatus(
         `${statusPrefix}no-mistakes passed all ${PIPELINE_STEPS.length} stages`,
@@ -6415,6 +6403,18 @@ Run options:
   }
 }
 
+function assertStoredAttestationPassed(
+  ledger: DomainLedger,
+  manifest: PassedAttestationManifest,
+): void {
+  const status = ledger.runStatus(manifest.runId);
+  if (status !== "passed") {
+    throw new Error(
+      `run ${manifest.runId} has a stored attestation but status is ${status ?? "absent"}`,
+    );
+  }
+}
+
 async function runAttestationCommand(
   positionals: string[],
   flags: RawCliFlags,
@@ -6430,7 +6430,9 @@ async function runAttestationCommand(
   const ledger = new DomainLedger();
   try {
     if (action === "export") {
-      const manifest = await ledger.getAttestation(ref);
+      const manifest = ledger.getAttestation(ref);
+      verifyManifest(manifest, PIPELINE_STEPS);
+      assertStoredAttestationPassed(ledger, manifest);
       const output = `${JSON.stringify(manifest, null, 2)}\n`;
       const outPath = stringFlag(flags, "out");
       if (outPath) {
@@ -6442,21 +6444,48 @@ async function runAttestationCommand(
       }
       return;
     }
-    let manifest: PassedAttestationManifest;
+    // A readable path is always a manifest file; only an unreadable one falls
+    // through to a ledger lookup. Parsing a file that exists but is not JSON
+    // must report the parse failure rather than silently re-reading the path as
+    // a run ID and blaming a missing ledger record.
+    let raw: string | undefined;
     try {
-      manifest = JSON.parse(
-        await readFile(ref, "utf8"),
-      ) as PassedAttestationManifest;
+      raw = await readFile(ref, "utf8");
     } catch {
-      manifest = await ledger.getAttestation(ref);
+      raw = undefined;
     }
-    verifyManifest(manifest);
-    const stored = ledger.getAttestation(manifest.runId);
+    const manifest =
+      raw === undefined
+        ? ledger.getAttestation(ref)
+        : (JSON.parse(raw) as PassedAttestationManifest);
+    verifyManifest(manifest, PIPELINE_STEPS);
+    // The manifest is self-verifying: the Merkle root covers its header and
+    // every stage digest, so a manifest carried to a machine that never ran the
+    // pipeline still proves its own integrity. It is tamper-evident, not
+    // signed, so that alone never establishes who issued it. Where the ledger
+    // does hold the run, the weaker offline claim is not enough -- the stored
+    // record and the retained artifacts have to agree with it too.
+    const stored = ledger.findAttestation(manifest.runId);
+    if (!stored) {
+      const localRunStatus = ledger.runStatus(manifest.runId);
+      if (localRunStatus) {
+        throw new Error(
+          `run ${manifest.runId} has no passed attestation (status: ${localRunStatus})`,
+        );
+      }
+      console.log(
+        `Attestation self-consistent offline for candidate ${manifest.candidateCommitOid} (merkle root ${manifest.merkleRoot}); ` +
+          `run ${manifest.runId} is absent from this ledger, so retained stage artifacts were not re-checked. ` +
+          "A manifest is tamper-evident, not signed: this proves internal integrity, not that this coordinator issued it.",
+      );
+      return;
+    }
     if (!isDeepStrictEqual(stored, manifest)) {
       throw new Error(
         "manifest does not match the attestation recorded in the domain ledger",
       );
     }
+    assertStoredAttestationPassed(ledger, manifest);
     const problems = ledger.verifyEvidence(manifest);
     if (problems.length > 0) {
       throw new Error(

@@ -1,3 +1,4 @@
+import { fullStageEvidence } from './attestation-fixture.ts'
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -64,12 +65,12 @@ async function recordStageEvidence(
   return entry;
 }
 
-test("manifest-file verification requires an intact stored attestation", async () => {
+test("manifest-file verification verifies offline, then requires an intact stored attestation", async () => {
   const home = await mkdtemp(path.join(tmpdir(), "orca-attestation-verify-"));
   const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
   process.env.ORCA_NO_MISTAKES_HOME = home;
   try {
-    const manifest = buildAttestation([], {
+    const manifest = buildAttestation(fullStageEvidence({ baseCommitOid: commit, candidateCommitOid: commit, runId: "missing-run" }), {
       baseCommitOid: commit,
       candidateCommitOid: commit,
       intent: "Verify evidence.",
@@ -79,10 +80,8 @@ test("manifest-file verification requires an intact stored attestation", async (
     const manifestPath = path.join(home, "manifest.json");
     await writeFile(manifestPath, JSON.stringify(manifest));
 
-    await assert.rejects(
-      main(["attestation", "verify", manifestPath]),
-      /no passed attestation found for missing-run/,
-    );
+    // No ledger record for this run: the manifest still proves itself.
+    await main(["attestation", "verify", manifestPath]);
 
     const ledger = new DomainLedger();
     startRun(ledger, manifest.runId);

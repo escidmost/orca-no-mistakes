@@ -1,3 +1,4 @@
+import { fullStageEvidence } from './attestation-fixture.ts'
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -37,9 +38,11 @@ import {
   runPipeline,
   merkleRoot,
   canonicalEntry,
+  manifestLeaves,
   sha256,
   verifyManifest,
   type Finding,
+  type PassedAttestationManifest,
   type GitOperations,
   type OrcaOperations,
   type PipelineResult,
@@ -8302,6 +8305,18 @@ test("attestation verification detects tampering", async () => {
     () => verifyManifest(tamperedRoot),
     /(mismatch|does not match)/i,
   );
+
+  const tamperedPolicy = structuredClone(result.attestation);
+  tamperedPolicy.policySha256 = "a".repeat(64);
+  assert.throws(() => verifyManifest(tamperedPolicy), /policy hash/);
+
+  const tamperedCandidate = structuredClone(result.attestation);
+  tamperedCandidate.candidateCommitOid = "d".repeat(40);
+  assert.throws(() => verifyManifest(tamperedCandidate), /commit OIDs/);
+
+  const tamperedRunId = structuredClone(result.attestation);
+  tamperedRunId.runId = "run-someone-elses";
+  assert.throws(() => verifyManifest(tamperedRunId), /(run ID|does not match)/);
 });
 
 test("stop resolution cancels the run and records the audit decision", async () => {
@@ -9135,6 +9150,160 @@ test("CLI exports, verifies, and prunes attestations through the domain ledger",
   }
 });
 
+test("a manifest missing a declared field is rejected before it is hashed", () => {
+  const entry = {
+    stage: "review",
+    round: 0,
+    candidateCommitOid: "c".repeat(40),
+    baseCommitOid: "b".repeat(40),
+    workerIdentity: "reviewer",
+    exitCode: 0,
+    artifactSha256: "a".repeat(64),
+    summary: "clean",
+  };
+  const good = buildAttestation(
+    [{ ...entry, evidenceSha256: "" }].map((item) => ({
+      ...item,
+      evidenceSha256: evidenceSha256({ ...entry, runId: "run-shape" }),
+    })),
+    {
+      baseCommitOid: "b".repeat(40),
+      candidateCommitOid: "c".repeat(40),
+      intent: "Check manifest shape.",
+      policySha256: "f".repeat(64),
+      runId: "run-shape",
+    },
+  );
+
+  // Dropping a header field shortens the hashed preimage, so recomputing the
+  // root over the shorter manifest would otherwise verify clean.
+  const headerCases = [
+    ["createdAt", /creation timestamp is invalid/],
+    ["coordinatorVersion", /coordinator version is invalid/],
+    ["runId", /run ID is invalid/],
+  ] as const;
+  for (const [field, expected] of headerCases) {
+    const stripped = structuredClone(good) as Record<string, unknown>;
+    delete stripped[field];
+    stripped.merkleRoot = merkleRoot(
+      manifestLeaves(stripped as unknown as PassedAttestationManifest),
+    );
+    assert.throws(
+      () => verifyManifest(stripped as unknown as PassedAttestationManifest),
+      expected,
+    );
+  }
+
+  // Absent stage evidence used to surface as a raw TypeError.
+  const noEvidence = structuredClone(good) as Record<string, unknown>;
+  delete noEvidence.stageEvidence;
+  assert.throws(
+    () => verifyManifest(noEvidence as unknown as PassedAttestationManifest),
+    /stage evidence is not an array/,
+  );
+
+  for (const field of ["summary", "round"] as const) {
+    const stripped = structuredClone(good);
+    delete (stripped.stageEvidence[0] as Record<string, unknown>)[field];
+    assert.throws(
+      () => verifyManifest(stripped),
+      /stage evidence entry 0 has invalid required fields/,
+    );
+  }
+});
+
+test("an exported manifest verifies offline against a ledger that never ran it", async () => {
+  const origin = await mkdtemp(path.join(tmpdir(), "onm-attest-origin-"));
+  const elsewhere = await mkdtemp(path.join(tmpdir(), "onm-attest-elsewhere-"));
+  const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
+  process.env.ORCA_NO_MISTAKES_HOME = origin;
+  const manifestPath = path.join(origin, "manifest.json");
+  let runId: string;
+  try {
+    const git = new FakeGit();
+    const orca = new FakeOrca(git);
+    const ledger = new DomainLedger();
+    const result = await runPipeline(
+      { intent: "Attest for another machine." },
+      orca,
+      git,
+      ledger,
+    );
+    ledger.close();
+    runId = result.runId;
+    await main(["attestation", "export", runId, `--out=${manifestPath}`]);
+
+    // Another machine: the manifest travels, the ledger and its stage artifacts
+    // do not.
+    process.env.ORCA_NO_MISTAKES_HOME = elsewhere;
+    await main(["attestation", "verify", manifestPath]);
+    await assert.rejects(
+      main(["attestation", "verify", runId]),
+      /no passed attestation/,
+    );
+
+    // Offline verification still fails closed on a rewritten header.
+    const tampered = JSON.parse(await readFile(manifestPath, "utf8"));
+    tampered.policySha256 = "a".repeat(64);
+    const tamperedPath = path.join(elsewhere, "tampered.json");
+    await writeFile(tamperedPath, JSON.stringify(tampered));
+    await assert.rejects(
+      main(["attestation", "verify", tamperedPath]),
+      /policy hash/,
+    );
+
+    await writeFile(path.join(elsewhere, "garbage.json"), "not json at all");
+    await assert.rejects(
+      main(["attestation", "verify", path.join(elsewhere, "garbage.json")]),
+      /JSON/,
+    );
+  } finally {
+    if (previousHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME;
+    else process.env.ORCA_NO_MISTAKES_HOME = previousHome;
+    await rm(origin, { recursive: true, force: true });
+    await rm(elsewhere, { recursive: true, force: true });
+  }
+});
+
+test("verification fails closed when the local run has no passed attestation", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-attest-local-run-"));
+  const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
+  process.env.ORCA_NO_MISTAKES_HOME = temp;
+  const manifestPath = path.join(temp, "manifest.json");
+  try {
+    const ledger = new DomainLedger();
+    ledger.startRun({
+      baseBranch: "main",
+      branch: "feature",
+      intent: "A failed local run.",
+      policySha256: "f".repeat(64),
+      repoRoot: "/repo",
+      runId: "run-local",
+      submissionCommitOid: "a".repeat(40),
+    });
+    ledger.finishRun("run-local", "failed");
+    ledger.close();
+
+    const manifest = buildAttestation(fullStageEvidence({ baseCommitOid: "b".repeat(40), candidateCommitOid: "c".repeat(40), runId: "run-local" }), {
+      baseCommitOid: "b".repeat(40),
+      candidateCommitOid: "c".repeat(40),
+      intent: "A failed local run.",
+      policySha256: "f".repeat(64),
+      runId: "run-local",
+    });
+    await writeFile(manifestPath, JSON.stringify(manifest));
+
+    await assert.rejects(
+      main(["attestation", "verify", manifestPath]),
+      /run run-local has no passed attestation/,
+    );
+  } finally {
+    if (previousHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME;
+    else process.env.ORCA_NO_MISTAKES_HOME = previousHome;
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test("the attestation binds the base commit fetched by the rebase stage", async () => {
   const git = new FakeGit();
   const orca = new FakeOrca(git);
@@ -9253,9 +9422,7 @@ test("verifyManifest recomputes each stage evidence hash", async () => {
   assert.ok(result.attestation);
   const forged = structuredClone(result.attestation);
   forged.stageEvidence[3].summary = "rewritten after the fact";
-  forged.merkleRoot = merkleRoot(
-    forged.stageEvidence.map((entry) => sha256(canonicalEntry(entry))),
-  );
+  forged.merkleRoot = merkleRoot(manifestLeaves(forged));
   assert.throws(() => verifyManifest(forged), /evidence hash does not match/);
 });
 
@@ -9360,7 +9527,7 @@ test("attestations stay resolvable per run when candidate commits repeat, and co
         submissionCommitOid: "a".repeat(40),
       });
       const manifest = {
-        version: "1.1.0" as const,
+        version: "1.2.0" as const,
         runId,
         candidateCommitOid: candidate,
         baseCommitOid: "b".repeat(40),
@@ -10072,7 +10239,7 @@ test("a manifest carrying a malformed artifact digest is rejected", () => {
     summary: "clean",
   };
   const manifest = {
-    version: "1.1.0" as const,
+    version: "1.2.0" as const,
     runId: "run-forged",
     candidateCommitOid: entry.candidateCommitOid,
     baseCommitOid: entry.baseCommitOid,
@@ -10086,9 +10253,7 @@ test("a manifest carrying a malformed artifact digest is rejected", () => {
     coordinatorVersion: "test",
     createdAt: "2026-01-01T00:00:00.000Z",
   };
-  manifest.merkleRoot = merkleRoot(
-    manifest.stageEvidence.map((item) => sha256(canonicalEntry(item))),
-  );
+  manifest.merkleRoot = merkleRoot(manifestLeaves(manifest));
   assert.throws(
     () => verifyManifest(manifest),
     /stage review artifact hash is not a SHA-256/,

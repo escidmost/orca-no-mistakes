@@ -58,7 +58,7 @@ export type StageEvidenceManifestEntry = {
 }
 
 export type PassedAttestationManifest = {
-  version: '1.1.0'
+  version: '1.2.0'
   runId: string
   candidateCommitOid: string
   baseCommitOid: string
@@ -79,9 +79,62 @@ export function intentHash(intent: string): string {
   return sha256(intent)
 }
 
+export function normalizeIntent(value: unknown): string {
+  const intent = typeof value === 'string' ? value.trim() : ''
+  if (!intent) throw new Error('--intent is required')
+  if (
+    intent.includes('<untrusted_instruction>') ||
+    intent.includes('</untrusted_instruction>')
+  ) {
+    throw new Error('--intent must not contain untrusted_instruction delimiters')
+  }
+  if (intent.includes('\n') || intent.includes('\0')) {
+    throw new Error('--intent must be a single line')
+  }
+  return intent
+}
+
 const HEX_64 = /^[0-9a-f]{64}$/
 export const RUN_ID_PATTERN = /^[A-Za-z0-9._-]+$/
 const COMMIT_OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
+const MANIFEST_PROPERTIES = new Set([
+  'baseCommitOid',
+  'candidateCommitOid',
+  'coordinatorVersion',
+  'createdAt',
+  'intent',
+  'intentHash',
+  'merkleRoot',
+  'policySha256',
+  'runId',
+  'stageEvidence',
+  'version'
+])
+const STAGE_EVIDENCE_PROPERTIES = new Set([
+  'artifactSha256',
+  'baseCommitOid',
+  'candidateCommitOid',
+  'evidenceSha256',
+  'exitCode',
+  'round',
+  'stage',
+  'summary',
+  'waiverOrApproval',
+  'workerIdentity'
+])
+const WAIVER_PROPERTIES = new Set(['decision', 'gateId', 'resolvedAt'])
+
+function hasOnlyOwnProperties(value: object, allowed: ReadonlySet<string>): boolean {
+  return Reflect.ownKeys(value).every(
+    (property) => typeof property === 'string' && allowed.has(property)
+  )
+}
+
+function isCanonicalTimestamp(value: unknown): value is string {
+  if (typeof value !== 'string') return false
+  const date = new Date(value)
+  return !Number.isNaN(date.getTime()) && date.toISOString() === value
+}
 
 /**
  * Binds an evidence digest to the exact execution that produced it:
@@ -131,6 +184,32 @@ export function canonicalEntry(entry: StageEvidenceManifestEntry): string {
   })
 }
 
+/**
+ * The manifest fields that sit outside the stage evidence. They form a Merkle
+ * leaf of their own, so rewriting the run ID, either commit OID, the policy
+ * digest, or the intent hash on an otherwise intact manifest changes the root.
+ * Without that leaf those fields belong to no digest at all.
+ */
+export function canonicalHeader(manifest: PassedAttestationManifest): string {
+  return JSON.stringify({
+    baseCommitOid: manifest.baseCommitOid,
+    candidateCommitOid: manifest.candidateCommitOid,
+    coordinatorVersion: manifest.coordinatorVersion,
+    createdAt: manifest.createdAt,
+    intentHash: manifest.intentHash,
+    policySha256: manifest.policySha256,
+    runId: manifest.runId,
+    version: manifest.version
+  })
+}
+
+export function manifestLeaves(manifest: PassedAttestationManifest): string[] {
+  return [
+    sha256(canonicalHeader(manifest)),
+    ...manifest.stageEvidence.map((entry) => sha256(canonicalEntry(entry)))
+  ]
+}
+
 export function merkleRoot(hashes: string[]): string {
   let level = [...hashes]
   if (level.length === 0) level = [sha256('')]
@@ -166,7 +245,7 @@ export function buildAttestation(
   }
 ): PassedAttestationManifest {
   const manifest: PassedAttestationManifest = {
-    version: '1.1.0',
+    version: '1.2.0',
     runId: meta.runId,
     candidateCommitOid: meta.candidateCommitOid,
     baseCommitOid: meta.baseCommitOid,
@@ -174,29 +253,112 @@ export function buildAttestation(
     intent: meta.intent,
     intentHash: intentHash(meta.intent),
     stageEvidence: entries,
-    merkleRoot: merkleRoot(entries.map((entry) => sha256(canonicalEntry(entry)))),
+    merkleRoot: '',
     coordinatorVersion: COORDINATOR_VERSION,
     createdAt: new Date().toISOString()
   }
+  manifest.merkleRoot = merkleRoot(manifestLeaves(manifest))
   verifyManifest(manifest)
   return manifest
 }
 
-export function verifyManifest(manifest: PassedAttestationManifest): void {
-  // Bumped when the run ID entered the evidence preimage: a 1.0.0 manifest's
-  // digests are computed over a different tuple, so it has to be rejected as an
-  // unsupported version rather than misreported as tampering.
-  if (!manifest || manifest.version !== '1.1.0') {
-    throw new Error('attestation version is not 1.1.0')
+export function verifyManifest(
+  manifest: PassedAttestationManifest,
+  requiredStages: readonly string[] = []
+): void {
+  // Bumped whenever the digest preimages change: 1.0.0 predates the run ID in
+  // the evidence preimage and 1.1.0 predates the header leaf in the Merkle
+  // tree, so both compute over a different tuple and have to be rejected as
+  // unsupported versions rather than misreported as tampering.
+  if (!manifest || manifest.version !== '1.2.0') {
+    throw new Error('attestation version is not 1.2.0')
   }
-  if (!COMMIT_OID.test(manifest.candidateCommitOid) || !COMMIT_OID.test(manifest.baseCommitOid)) {
+  if (!hasOnlyOwnProperties(manifest, MANIFEST_PROPERTIES)) {
+    throw new Error('attestation manifest has unknown properties')
+  }
+  if (typeof manifest.runId !== 'string' || !RUN_ID_PATTERN.test(manifest.runId)) {
+    throw new Error('attestation run ID is invalid')
+  }
+  if (
+    typeof manifest.coordinatorVersion !== 'string' ||
+    manifest.coordinatorVersion.trim() === ''
+  ) {
+    throw new Error('attestation coordinator version is invalid')
+  }
+  if (!isCanonicalTimestamp(manifest.createdAt)) {
+    throw new Error('attestation creation timestamp is invalid')
+  }
+  if (
+    typeof manifest.candidateCommitOid !== 'string' ||
+    typeof manifest.baseCommitOid !== 'string' ||
+    !COMMIT_OID.test(manifest.candidateCommitOid) ||
+    !COMMIT_OID.test(manifest.baseCommitOid)
+  ) {
     throw new Error('attestation commit OIDs are not 40- or 64-character hex values')
   }
-  if (!HEX_64.test(manifest.policySha256)) throw new Error('attestation policy hash is not a SHA-256')
-  if (manifest.intentHash !== intentHash(manifest.intent)) {
+  if (typeof manifest.policySha256 !== 'string' || !HEX_64.test(manifest.policySha256)) {
+    throw new Error('attestation policy hash is not a SHA-256')
+  }
+  let normalizedIntent: string
+  try {
+    normalizedIntent = normalizeIntent(manifest.intent)
+  } catch {
+    throw new Error('attestation intent is invalid')
+  }
+  if (normalizedIntent !== manifest.intent) {
+    throw new Error('attestation intent is invalid')
+  }
+  if (
+    typeof manifest.intentHash !== 'string' ||
+    !HEX_64.test(manifest.intentHash) ||
+    manifest.intentHash !== intentHash(manifest.intent)
+  ) {
     throw new Error('attestation intent hash does not match the recorded intent')
   }
-  for (const entry of manifest.stageEvidence) {
+  if (!Array.isArray(manifest.stageEvidence)) {
+    throw new Error('attestation stage evidence is not an array')
+  }
+  const presentStages = new Set<string>()
+  for (const [index, entry] of manifest.stageEvidence.entries()) {
+    if (
+      !entry ||
+      typeof entry !== 'object' ||
+      typeof entry.stage !== 'string' ||
+      entry.stage.trim() === '' ||
+      !Number.isInteger(entry.round) ||
+      entry.round < 0 ||
+      typeof entry.candidateCommitOid !== 'string' ||
+      typeof entry.baseCommitOid !== 'string' ||
+      !COMMIT_OID.test(entry.candidateCommitOid) ||
+      !COMMIT_OID.test(entry.baseCommitOid) ||
+      typeof entry.workerIdentity !== 'string' ||
+      entry.workerIdentity.trim() === '' ||
+      !Number.isInteger(entry.exitCode) ||
+      typeof entry.artifactSha256 !== 'string' ||
+      typeof entry.evidenceSha256 !== 'string' ||
+      typeof entry.summary !== 'string' ||
+      entry.summary.trim() === ''
+    ) {
+      throw new Error(`attestation stage evidence entry ${index} has invalid required fields`)
+    }
+    if (!hasOnlyOwnProperties(entry, STAGE_EVIDENCE_PROPERTIES)) {
+      throw new Error(`attestation stage evidence entry ${index} has unknown properties`)
+    }
+    presentStages.add(entry.stage)
+    if (entry.waiverOrApproval !== undefined) {
+      const waiver = entry.waiverOrApproval
+      if (
+        !waiver ||
+        typeof waiver !== 'object' ||
+        (waiver.decision !== 'approve' && waiver.decision !== 'skip') ||
+        typeof waiver.gateId !== 'string' ||
+        waiver.gateId.trim() === '' ||
+        !isCanonicalTimestamp(waiver.resolvedAt) ||
+        !hasOnlyOwnProperties(waiver, WAIVER_PROPERTIES)
+      ) {
+        throw new Error(`attestation stage evidence entry ${index} has an invalid waiver`)
+      }
+    }
     if (!HEX_64.test(entry.evidenceSha256)) {
       throw new Error(`stage ${entry.stage} evidence hash is not a SHA-256`)
     }
@@ -207,9 +369,15 @@ export function verifyManifest(manifest: PassedAttestationManifest): void {
       throw new Error(`stage ${entry.stage} evidence hash does not match its recorded fields`)
     }
   }
-  const root = merkleRoot(manifest.stageEvidence.map((entry) => sha256(canonicalEntry(entry))))
-  if (root !== manifest.merkleRoot) {
-    throw new Error('attestation Merkle root does not match its stage evidence')
+  const missingStages = requiredStages.filter((stage) => !presentStages.has(stage))
+  if (missingStages.length > 0) {
+    throw new Error(`attestation is missing required stage evidence: ${missingStages.join(', ')}`)
+  }
+  if (merkleRoot(manifestLeaves(manifest)) !== manifest.merkleRoot) {
+    throw new Error(
+      'attestation Merkle root does not match its header ' +
+        '(run ID, commit OIDs, policy hash, intent hash) or its stage evidence'
+    )
   }
 }
 
@@ -940,6 +1108,22 @@ export class DomainLedger {
     this.#db.prepare('DELETE FROM branch_leases WHERE run_id = ?').run(runId)
   }
 
+  finalizePassedRun(
+    manifest: PassedAttestationManifest,
+    terminalCommitOid: string
+  ): void {
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      this.finishRun(manifest.runId, 'passed', terminalCommitOid)
+      this.releaseLease(manifest.runId)
+      this.recordAttestation(manifest)
+      this.#db.exec('COMMIT')
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
   recordCheckpoint(input: {
     inputCommitOid: string
     outputCommitOid: string
@@ -1275,6 +1459,19 @@ export class DomainLedger {
   }
 
   getAttestation(ref: string): PassedAttestationManifest {
+    const manifest = this.findAttestation(ref)
+    if (!manifest) throw new Error(`no passed attestation found for ${ref}`)
+    return manifest
+  }
+
+  /**
+   * The stored manifest for a run ID or candidate commit, or undefined when the
+   * ledger simply has no such record -- the case offline verification expects
+   * on a machine that never ran the pipeline. A record that is present but
+   * disagrees with its own indexed Merkle root still throws: that is tampering,
+   * not absence.
+   */
+  findAttestation(ref: string): PassedAttestationManifest | undefined {
     const row = (this.#db
       .prepare('SELECT manifest_json, merkle_root FROM passed_attestations WHERE run_id = ?')
       .get(ref)
@@ -1283,7 +1480,7 @@ export class DomainLedger {
           'SELECT manifest_json, merkle_root FROM passed_attestations WHERE candidate_commit_oid = ? ORDER BY created_at DESC, rowid DESC LIMIT 1'
         )
         .get(ref)) as { manifest_json: string; merkle_root: string } | undefined
-    if (!row) throw new Error(`no passed attestation found for ${ref}`)
+    if (!row) return undefined
     const manifest = JSON.parse(row.manifest_json) as PassedAttestationManifest
     if (manifest.merkleRoot !== row.merkle_root) {
       throw new Error('stored attestation manifest does not match the ledger Merkle root')

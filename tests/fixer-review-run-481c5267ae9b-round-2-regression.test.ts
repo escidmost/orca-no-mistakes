@@ -1,3 +1,4 @@
+import { fullStageEvidence } from './attestation-fixture.ts'
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -87,13 +88,13 @@ test("evidence verification rejects unattested ledger rows", async () => {
   }
 });
 
-test("manifest-file verification authenticates every manifest field", async () => {
+test("manifest-file verification rejects a forged manifest for a recorded run", async () => {
   const home = await mkdtemp(path.join(tmpdir(), "orca-complete-manifest-"));
   const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
   process.env.ORCA_NO_MISTAKES_HOME = home;
   try {
     const runId = "complete-manifest-run";
-    const manifest = buildAttestation([], {
+    const manifest = buildAttestation(fullStageEvidence({ baseCommitOid: commit, candidateCommitOid: commit, runId }), {
       baseCommitOid: commit,
       candidateCommitOid: commit,
       intent: "Verify evidence.",
@@ -104,15 +105,33 @@ test("manifest-file verification authenticates every manifest field", async () =
     startRun(ledger, runId);
     ledger.recordAttestation(manifest);
     ledger.close();
+    // Internally valid — rebuilt from scratch, so its Merkle root covers the
+    // forged candidate commit — but not the manifest this run recorded.
+    const forged = buildAttestation(fullStageEvidence({ baseCommitOid: commit, candidateCommitOid: otherCommit, runId }), {
+      baseCommitOid: commit,
+      candidateCommitOid: otherCommit,
+      intent: "Verify evidence.",
+      policySha256: policy,
+      runId,
+    });
     const manifestPath = path.join(home, "manifest.json");
-    await writeFile(
-      manifestPath,
-      JSON.stringify({ ...manifest, candidateCommitOid: otherCommit }),
-    );
+    await writeFile(manifestPath, JSON.stringify(forged));
 
     await assert.rejects(
       main(["attestation", "verify", manifestPath]),
       /manifest does not match the attestation recorded in the domain ledger/,
+    );
+
+    // A field edit on the recorded manifest fails on its own digests, with no
+    // ledger lookup needed.
+    const tamperedPath = path.join(home, "tampered.json");
+    await writeFile(
+      tamperedPath,
+      JSON.stringify({ ...manifest, candidateCommitOid: otherCommit }),
+    );
+    await assert.rejects(
+      main(["attestation", "verify", tamperedPath]),
+      /commit OIDs/,
     );
   } finally {
     if (previousHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME;
