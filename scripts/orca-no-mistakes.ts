@@ -46,6 +46,7 @@ import {
   resolvePipelineConfig,
   type AgentArgsOverride,
   type CliFlags,
+  type GuardrailMode,
   type OrcaNoMistakesConfig,
   type ResolvedRoleConfig,
   type StageName,
@@ -184,6 +185,11 @@ export type RepoSnapshot = {
   root: string;
 };
 
+export type FixerChangesVerdict = {
+  changed: boolean;
+  guardrailViolations: string[];
+};
+
 export interface GitOperations {
   assertReady(): Promise<RepoSnapshot>;
   assertClean(): Promise<void>;
@@ -191,7 +197,8 @@ export interface GitOperations {
     sourcePath: string,
     expectedHead: string,
     expectedSourceHead: string,
-  ): Promise<boolean | void>;
+    guardrails?: GuardrailMode,
+  ): Promise<FixerChangesVerdict | void>;
   head(): Promise<string>;
   /** Diff between the resolved trusted base and the captured HEAD snapshot
    *  (merge-base three-dot form). Must throw on failure so a missing diff
@@ -338,6 +345,10 @@ export async function runPipeline(
   const effectiveConfig = JSON.parse(
     JSON.stringify(pipelineConfig),
   ) as typeof pipelineConfig;
+  // Run-wide guardrail policy: the schema accepts the key only on the
+  // top-level auto_fix block, and the trusted base config outranks user-global
+  // config in the resolved merge.
+  const guardrailMode = pipelineConfig.auto_fix.guardrails;
   const effectiveProvenance = {
     ...provenance,
     effectivePolicyHash: effectivePolicyHash(effectiveConfig),
@@ -463,6 +474,7 @@ export async function runPipeline(
             summary: report.summary,
             tested: report.tested,
             resolvedAgent: fallback.resolvedAgent,
+            guardrail_mode: guardrailMode,
             effective_policy_hash: effectiveProvenance.effectivePolicyHash,
             ...(effectiveProvenance.baseRefSha
               ? { base_ref_sha: effectiveProvenance.baseRefSha }
@@ -631,6 +643,7 @@ export async function runPipeline(
             stage,
             report,
             gateOptions,
+            guardrailMode,
             exhausted ? stageAutoFix.max_rounds : undefined,
           );
           // Durable before the block: an interrupted run still shows why the
@@ -746,6 +759,7 @@ export async function runPipeline(
                 decisionHistory(),
                 path.join(artifactsDir, `fixer-${stage}-${round}.json`),
                 fixerRoles,
+                guardrailMode,
                 orca,
                 git,
                 fixerSession,
@@ -797,6 +811,29 @@ export async function runPipeline(
             { attempts: [], resolvedAgent: "coordinator" },
           );
           continue;
+        }
+        if (nextFixer.guardrailViolations.length > 0) {
+          // Advisory mode: custody proceeds, but the detected guardrail
+          // changes are recorded as coordinator evidence so an advisory run
+          // can never read as a strict run.
+          await recordStageEvidence(
+            stage,
+            round,
+            "coordinator:fixer-guardrail-advisory",
+            0,
+            {
+              findings: nextFixer.guardrailViolations.map(
+                (description, index): Finding => ({
+                  action: "no-op",
+                  description,
+                  id: `fixer-guardrail-advisory-${index + 1}`,
+                  severity: "warning",
+                }),
+              ),
+              summary: `${stage} fixer applied with advisory guardrail findings (guardrails: ${guardrailMode})`,
+            },
+            { attempts: [], resolvedAgent: "coordinator" },
+          );
         }
         fixerSession = nextFixer.session;
         if (nextFixer.fallbackAttempts && nextFixer.resolvedAgent) {
@@ -880,6 +917,7 @@ export async function runPipeline(
     const attestation = buildAttestation(stageEntries, {
       baseCommitOid,
       candidateCommitOid: terminalCommitOid,
+      guardrailMode,
       intent,
       policySha256: policySha256Value,
       runId,
@@ -1350,6 +1388,7 @@ async function runFixer(
   decisionHistory: string,
   reportPath: string,
   role: ResolvedRoleConfig,
+  guardrails: GuardrailMode,
   orca: OrcaOperations,
   git: GitOperations,
   retainedSession: FixerSession | undefined,
@@ -1358,6 +1397,7 @@ async function runFixer(
   after: string;
   before: string;
   fallbackAttempts?: FallbackAttempt[];
+  guardrailViolations: string[];
   resolvedAgent: string;
   session?: FixerSession;
 }> {
@@ -1447,12 +1487,13 @@ async function runFixer(
     if (before === workerHead) {
       throw new FixerNoChangeError(validatedReport, stage);
     }
-    const changedTree = await git.assertFixerChangesAllowed(
+    const verdict = await git.assertFixerChangesAllowed(
       worktreePath,
       before,
       workerHead,
+      guardrails,
     );
-    if (changedTree === false) {
+    if (verdict !== undefined && !verdict.changed) {
       throw new FixerNoChangeError(validatedReport, stage);
     }
     if (fence.aborted) {
@@ -1493,6 +1534,7 @@ async function runFixer(
     return {
       after,
       before,
+      guardrailViolations: verdict?.guardrailViolations ?? [],
       resolvedAgent: outcome.resolvedAgent,
       ...(retainWorker
         ? {
@@ -2063,6 +2105,7 @@ function gateQuestion(
   stage: StageName,
   report: StageReport,
   options: string[],
+  guardrailMode: GuardrailMode,
   exhaustedLimit?: number,
 ): string {
   const choices = options
@@ -2072,7 +2115,9 @@ function gateQuestion(
     exhaustedLimit === undefined
       ? `${stage} needs a human decision.`
       : `${stage} reached the limit of ${exhaustedLimit} fix rounds with actionable findings remaining.`;
-  return `${prefix} Resolve with ${choices}. Findings: ${JSON.stringify(actionableFindings(report))}`;
+  // The mode rides every gate question, and with it the durable gate audit
+  // row, so a gate raised under advisory guardrails cannot read as strict.
+  return `[guardrails: ${guardrailMode}] ${prefix} Resolve with ${choices}. Findings: ${JSON.stringify(actionableFindings(report))}`;
 }
 
 function gateDecision(resolution: string): string {
@@ -5665,7 +5710,8 @@ export class GitShell implements GitOperations {
     sourcePath: string,
     expectedHead: string,
     sourceHead: string,
-  ): Promise<boolean> {
+    guardrails: GuardrailMode = "strict",
+  ): Promise<FixerChangesVerdict> {
     const changed = await this.#git(
       [
         "-C",
@@ -5694,6 +5740,8 @@ export class GitShell implements GitOperations {
       ],
       true,
     );
+    // History rewrites are custody integrity, not a guardrail: they fail
+    // closed in every mode.
     if (expectedIsAncestor.failed) {
       throw new FixerPolicyViolationError(
         "ordinary fixer commit rewrote history instead of descending from the pre-round head",
@@ -5730,8 +5778,15 @@ export class GitShell implements GitOperations {
         validationEntrypoints,
       )),
     );
+    // Advisory mode reports every detected category instead of throwing at the
+    // first one, so the run evidence shows the full guardrail picture.
+    const violations: string[] = [];
+    const enforce = (message: string): void => {
+      if (guardrails === "advisory") violations.push(message);
+      else throw new FixerPolicyViolationError(message);
+    };
     if (protectedTests.length > 0) {
-      throw new FixerPolicyViolationError(
+      enforce(
         `fixer modified pre-existing test files: ${protectedTests.sort().join(", ")}`,
       );
     }
@@ -5739,16 +5794,16 @@ export class GitShell implements GitOperations {
       (filePath) => !protectedPolicy.includes(filePath),
     );
     if (inlineOnly.length > 0) {
-      throw new FixerPolicyViolationError(
+      enforce(
         `fixer modified co-located test assertions or skip markers: ${inlineOnly.sort().join(", ")}`,
       );
     }
     if (protectedPolicy.length > 0) {
-      throw new FixerPolicyViolationError(
+      enforce(
         `unexplained-policy-relaxation: fixer modified protected validation policy files: ${protectedPolicy.sort().join(", ")}`,
       );
     }
-    return changedPaths.length > 0;
+    return { changed: changedPaths.length > 0, guardrailViolations: violations };
   }
 
   async #referencedValidationEntrypoints(

@@ -85,7 +85,10 @@ test("validation policy protects named entrypoints but not their imports", async
     await writeFile(path.join(worker, "scripts/run-suite.sh"), "exit 0\n");
     git(worker, "add", "scripts/run-suite.sh");
     git(worker, "commit", "-m", "repair indirectly referenced source");
-    assert.equal(await assertWorkerChangesAllowed(), true);
+    assert.deepEqual(await assertWorkerChangesAllowed(), {
+      changed: true,
+      guardrailViolations: [],
+    });
   } finally {
     await rm(temp, { recursive: true, force: true });
   }

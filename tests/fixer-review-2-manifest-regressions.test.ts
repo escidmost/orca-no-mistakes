@@ -29,6 +29,7 @@ test('offline verification rejects a manifest for a failed local run', async () 
     const manifest = buildAttestation(fullStageEvidence({ baseCommitOid: commit, candidateCommitOid: commit, runId }), {
       baseCommitOid: commit,
       candidateCommitOid: commit,
+      guardrailMode: 'strict',
       intent: 'Reject contradictory offline evidence.',
       policySha256,
       runId
@@ -64,6 +65,7 @@ test('manifest verification rejects sparse stage evidence with matching digests'
   const manifest = buildAttestation([], {
     baseCommitOid: commit,
     candidateCommitOid: commit,
+    guardrailMode: 'strict',
     intent: 'Reject incomplete evidence.',
     policySha256,
     runId

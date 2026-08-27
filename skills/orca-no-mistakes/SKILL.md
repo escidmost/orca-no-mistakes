@@ -64,7 +64,7 @@ Approving or skipping a stage records the decision in the domain ledger's gate a
 On direct success the CLI prints JSON containing the attestation manifest:
 
 ```json
-{"runId":"<orca-run-id>","steps":["intent","rebase","review","test","document","lint"],"custodyNote":"...","attestation":{"version":"1.2.0","merkleRoot":"..."}}
+{"runId":"<orca-run-id>","steps":["intent","rebase","review","test","document","lint"],"custodyNote":"...","attestation":{"version":"1.3.0","guardrailMode":"strict","merkleRoot":"..."}}
 ```
 
 Export and verify attestations, and prune retained evidence:

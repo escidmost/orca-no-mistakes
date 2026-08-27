@@ -32,6 +32,7 @@ test('stored attestations require a passed run for verify and export', async () 
         const manifest = buildAttestation(fullStageEvidence({ baseCommitOid: commit, candidateCommitOid: commit, runId }), {
           baseCommitOid: commit,
           candidateCommitOid: commit,
+          guardrailMode: 'strict',
           intent: 'Reject attestations for runs that did not pass.',
           policySha256,
           runId
@@ -89,6 +90,7 @@ test('manifest verification rejects malformed waiver records with matching roots
   const valid = buildAttestation([entry], {
     baseCommitOid: commit,
     candidateCommitOid: commit,
+    guardrailMode: 'strict',
     intent: 'Reject malformed waivers.',
     policySha256,
     runId

@@ -45,6 +45,7 @@ function fullManifest(): PassedAttestationManifest {
   return buildAttestation(entries, {
     baseCommitOid: commit,
     candidateCommitOid: commit,
+    guardrailMode: 'strict',
     intent: 'Reject unknown properties.',
     policySha256,
     runId

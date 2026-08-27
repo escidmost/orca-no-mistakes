@@ -25,12 +25,24 @@ export type AgentEntry = z.infer<typeof AgentEntrySchema>
 export const AgentConfigSchema = z.union([AgentEntrySchema, z.array(AgentEntrySchema).nonempty()])
 export type AgentConfig = z.infer<typeof AgentConfigSchema>
 
-export const AutoFixConfigSchema = z.strictObject({
+export const GuardrailModeSchema = z.enum(['strict', 'advisory'])
+export type GuardrailMode = z.infer<typeof GuardrailModeSchema>
+
+const autoFixShape = {
   enabled: z.boolean().optional(),
   max_rounds: z.number().int().nonnegative().optional(),
   allow_review_autofix: z.boolean().optional()
+}
+// Guardrail mode is a run-wide trusted-policy decision, so the key exists only
+// on the top-level auto_fix block; a role-level `guardrails` fails closed as
+// an unrecognized key instead of being silently ignored.
+export const AutoFixConfigSchema = z.strictObject({
+  ...autoFixShape,
+  guardrails: GuardrailModeSchema.optional()
 })
 export type AutoFixConfig = z.infer<typeof AutoFixConfigSchema>
+
+const RoleAutoFixConfigSchema = z.strictObject(autoFixShape)
 
 export const AgentArgsOverrideSchema = z.record(
   z.string(),
@@ -45,7 +57,7 @@ export const RoleConfigSchema = z.strictObject({
   variant: z.string().min(1).optional(),
   timeout_ms: z.number().int().positive().optional(),
   agent_args_override: AgentArgsOverrideSchema.optional(),
-  auto_fix: AutoFixConfigSchema.optional()
+  auto_fix: RoleAutoFixConfigSchema.optional()
 })
 export type RoleConfig = z.infer<typeof RoleConfigSchema>
 
@@ -104,13 +116,15 @@ export type CliFlags = z.infer<typeof CliFlagsSchema>
 export const BASELINE_AUTO_FIX = {
   enabled: true,
   max_rounds: 3,
-  allow_review_autofix: false
+  allow_review_autofix: false,
+  guardrails: 'strict'
 } as const
 
 export interface ResolvedAutoFixConfig {
   enabled: boolean
   max_rounds: number
   allow_review_autofix: boolean
+  guardrails: GuardrailMode
 }
 
 export function formatZodError(error: z.ZodError): string {
@@ -190,7 +204,8 @@ function withAutoFixDefaults(partial: AutoFixConfig | undefined): ResolvedAutoFi
   return {
     enabled: partial?.enabled ?? BASELINE_AUTO_FIX.enabled,
     max_rounds: partial?.max_rounds ?? BASELINE_AUTO_FIX.max_rounds,
-    allow_review_autofix: partial?.allow_review_autofix ?? BASELINE_AUTO_FIX.allow_review_autofix
+    allow_review_autofix: partial?.allow_review_autofix ?? BASELINE_AUTO_FIX.allow_review_autofix,
+    guardrails: partial?.guardrails ?? BASELINE_AUTO_FIX.guardrails
   }
 }
 
@@ -349,6 +364,14 @@ auto_fix:
   # Whether to allow auto-fixing during the review stage (default: false)
   # Keeping this false prevents circular automated reviewer-fixer churn (ADR-0007).
   allow_review_autofix: false
+
+  # Fixer guardrail mode: strict (default) rejects fixer commits that touch
+  # protected validation policy, pre-existing tests, or test assertions;
+  # advisory keeps the fixer prompt warnings and records detected changes in
+  # the run evidence, gate audit, and attestation without blocking custody.
+  # Run-wide and resolved from the trusted base policy; the key is rejected on
+  # per-stage or per-role auto_fix blocks.
+  # guardrails: strict
 
 # ------------------------------------------------------------------------------
 # Agent CLI Arguments & Environment Overrides

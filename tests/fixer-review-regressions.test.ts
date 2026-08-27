@@ -116,3 +116,78 @@ test("pre-commit manifests are protected from committed fixer changes", async ()
     await rm(temp, { recursive: true, force: true });
   }
 });
+
+test("advisory guardrail mode reports protected changes without rejecting custody", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-advisory-policy-"));
+  const repo = path.join(temp, "repo");
+  const worker = path.join(temp, "worker");
+  try {
+    await mkdir(repo);
+    git(repo, "init", "-b", "feature");
+    git(repo, "config", "user.email", "test@example.com");
+    git(repo, "config", "user.name", "Test User");
+    git(repo, "config", "core.hooksPath", "/dev/null");
+    await writeFile(
+      path.join(repo, ".pre-commit-config.yaml"),
+      "repos: [{repo: local, hooks: []}]\n",
+    );
+    git(repo, "add", ".pre-commit-config.yaml");
+    git(repo, "commit", "-m", "add validation policy");
+    const expectedHead = git(repo, "rev-parse", "HEAD");
+    git(repo, "worktree", "add", "--detach", worker, expectedHead);
+    await writeFile(path.join(worker, ".pre-commit-config.yaml"), "repos: []\n");
+    git(worker, "add", ".pre-commit-config.yaml");
+    git(worker, "commit", "-m", "remove validation hooks");
+
+    const verdict = await new GitShell({ repo }).assertFixerChangesAllowed(
+      worker,
+      expectedHead,
+      git(worker, "rev-parse", "HEAD"),
+      "advisory",
+    );
+    assert.deepEqual(verdict, {
+      changed: true,
+      guardrailViolations: [
+        "unexplained-policy-relaxation: fixer modified protected validation policy files: .pre-commit-config.yaml",
+      ],
+    });
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("advisory guardrail mode still rejects fixer history rewrites", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-advisory-rewrite-"));
+  const repo = path.join(temp, "repo");
+  const worker = path.join(temp, "worker");
+  try {
+    await mkdir(repo);
+    git(repo, "init", "-b", "feature");
+    git(repo, "config", "user.email", "test@example.com");
+    git(repo, "config", "user.name", "Test User");
+    git(repo, "config", "core.hooksPath", "/dev/null");
+    await writeFile(path.join(repo, "app.ts"), "export const a = 1\n");
+    git(repo, "add", "app.ts");
+    git(repo, "commit", "-m", "first");
+    await writeFile(path.join(repo, "app.ts"), "export const a = 2\n");
+    git(repo, "commit", "-am", "second");
+    const expectedHead = git(repo, "rev-parse", "HEAD");
+    git(repo, "worktree", "add", "--detach", worker, expectedHead);
+    git(worker, "reset", "--hard", `${expectedHead}^`);
+    await writeFile(path.join(worker, "app.ts"), "export const a = 3\n");
+    git(worker, "add", "app.ts");
+    git(worker, "commit", "-m", "rewrite");
+
+    await assert.rejects(
+      new GitShell({ repo }).assertFixerChangesAllowed(
+        worker,
+        expectedHead,
+        git(worker, "rev-parse", "HEAD"),
+        "advisory",
+      ),
+      /rewrote history/,
+    );
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});

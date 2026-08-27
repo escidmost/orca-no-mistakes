@@ -175,6 +175,37 @@ test('fails closed on unknown keys in auto_fix configuration', () => {
   )
 })
 
+test('guardrails defaults to strict and resolves advisory from the top-level auto_fix block', () => {
+  // Existing projects without the key stay on fail-closed enforcement.
+  assert.equal(resolveRoleConfig('test', 'fixer').auto_fix.guardrails, 'strict')
+  assert.equal(resolvePipelineConfig({}).auto_fix.guardrails, 'strict')
+
+  const repoGlobalConfig: OrcaNoMistakesConfig = { auto_fix: { guardrails: 'advisory' } }
+  assert.equal(resolveRoleConfig('test', 'fixer', { repoGlobalConfig }).auto_fix.guardrails, 'advisory')
+  assert.equal(resolvePipelineConfig({ repoGlobalConfig }).auto_fix.guardrails, 'advisory')
+})
+
+test('fails closed on invalid guardrails modes and on role-level guardrails keys', () => {
+  assert.throws(
+    () => parseConfig({ auto_fix: { guardrails: 'permissive' } }),
+    /Invalid configuration/
+  )
+  for (const misplaced of [
+    { defaults: { auto_fix: { guardrails: 'advisory' } } },
+    { stages: { test: { auto_fix: { guardrails: 'advisory' } } } },
+    { stages: { test: { fixer: { auto_fix: { guardrails: 'advisory' } } } } }
+  ]) {
+    assert.throws(
+      () => parseConfig(misplaced),
+      (err: Error) => {
+        assert.match(err.message, /Invalid configuration/)
+        assert.match(err.message, /Unrecognized key\(s\) 'guardrails'/)
+        return true
+      }
+    )
+  }
+})
+
 test('fails closed on unknown stage names in stages configuration', () => {
   assert.throws(
     () => parseConfig({ stages: { unknown_stage_name: {} } }),

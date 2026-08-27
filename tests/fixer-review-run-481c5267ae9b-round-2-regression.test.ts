@@ -74,6 +74,7 @@ test("evidence verification rejects unattested ledger rows", async () => {
     const manifest = buildAttestation([entry], {
       baseCommitOid: commit,
       candidateCommitOid: commit,
+      guardrailMode: "strict",
       intent: "Verify evidence.",
       policySha256: policy,
       runId,
@@ -97,6 +98,7 @@ test("manifest-file verification rejects a forged manifest for a recorded run", 
     const manifest = buildAttestation(fullStageEvidence({ baseCommitOid: commit, candidateCommitOid: commit, runId }), {
       baseCommitOid: commit,
       candidateCommitOid: commit,
+      guardrailMode: "strict",
       intent: "Verify evidence.",
       policySha256: policy,
       runId,
@@ -110,6 +112,7 @@ test("manifest-file verification rejects a forged manifest for a recorded run", 
     const forged = buildAttestation(fullStageEvidence({ baseCommitOid: commit, candidateCommitOid: otherCommit, runId }), {
       baseCommitOid: commit,
       candidateCommitOid: otherCommit,
+      guardrailMode: "strict",
       intent: "Verify evidence.",
       policySha256: policy,
       runId,
