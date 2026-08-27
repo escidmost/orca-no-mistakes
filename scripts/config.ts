@@ -71,7 +71,25 @@ export const OrcaNoMistakesConfigSchema = z.strictObject({
   stages: StagesConfigSchema.optional(),
   auto_fix: AutoFixConfigSchema.optional(),
   agent_args_override: AgentArgsOverrideSchema.optional(),
-  intent: z.string().optional()
+  intent: z.string().optional(),
+  worktree_roots: z.record(z.string(), z.string()).superRefine((roots, context) => {
+    for (const [checkout, root] of Object.entries(roots)) {
+      if (!path.isAbsolute(checkout)) {
+        context.addIssue({
+          code: 'custom',
+          message: 'repository path must be absolute',
+          path: [checkout]
+        })
+      }
+      if (!path.isAbsolute(root)) {
+        context.addIssue({
+          code: 'custom',
+          message: 'worktree root must be absolute',
+          path: [checkout]
+        })
+      }
+    }
+  }).optional()
 })
 export type OrcaNoMistakesConfig = z.infer<typeof OrcaNoMistakesConfigSchema>
 
@@ -312,6 +330,11 @@ export const DEFAULT_CONFIG_TEMPLATE = `# ======================================
 
 # Optional default task intent or objective statement
 # intent: "Ensure zero regressions and complete test coverage"
+
+# Optional user-global placement for coordinator run worktrees. Keys are
+# absolute registered checkout paths and values are absolute operator-owned
+# directories. Repository-local config cannot choose operator placement.
+worktree_roots: {}
 
 # ------------------------------------------------------------------------------
 # Global Auto-Fix Settings

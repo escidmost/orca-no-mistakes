@@ -69,7 +69,10 @@ test('validates strict schema and parses valid configurations', () => {
       opencode: ['--agent', 'review-bot'],
       gemini: { TEMPERATURE: '0.2' }
     },
-    intent: 'Refactor configuration system'
+    intent: 'Refactor configuration system',
+    worktree_roots: {
+      '/srv/repos/project': '/srv/no-mistakes/project'
+    }
   }
 
   const parsed = parseConfig(valid)
@@ -229,6 +232,14 @@ test('fails closed on invalid types for configuration fields', () => {
   assert.throws(
     () => parseConfig({ defaults: { agent: [] } }),
     /Invalid configuration/
+  )
+  assert.throws(
+    () => parseConfig({ worktree_roots: { relative: '/tmp/worktrees' } }),
+    /repository path must be absolute/
+  )
+  assert.throws(
+    () => parseConfig({ worktree_roots: { '/tmp/repo': 'relative' } }),
+    /worktree root must be absolute/
   )
 })
 
@@ -509,6 +520,7 @@ test('DEFAULT_CONFIG_TEMPLATE parses cleanly into valid OrcaNoMistakesConfig', (
   assert.equal(parsed.auto_fix?.enabled, true)
   assert.equal(parsed.auto_fix?.max_rounds, 3)
   assert.equal(parsed.auto_fix?.allow_review_autofix, false)
+  assert.deepEqual(parsed.worktree_roots, {})
 })
 
 test('templates/config.yaml matches DEFAULT_CONFIG_TEMPLATE and parses validly', () => {
