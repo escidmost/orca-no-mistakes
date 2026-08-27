@@ -65,6 +65,7 @@ import {
   capLog,
   evidenceSha256,
   normalizeIntent,
+  noMistakesHome,
   sha256,
   verifyManifest,
   type FindingDecisionRow,
@@ -6374,27 +6375,31 @@ async function configuredWorktreeRoot(
 ): Promise<string | undefined> {
   if (!roots) return undefined;
   const canonicalRepo = await canonicalPath(repoRoot);
-  for (const [checkout, root] of Object.entries(roots)) {
-    if ((await canonicalPath(checkout)) !== canonicalRepo) continue;
-    const requestedRoot = path.resolve(root);
-    if (isWithin(canonicalRepo, requestedRoot)) {
-      throw new Error(
-        `configured worktree root must be outside repository ${canonicalRepo}`,
-      );
-    }
-    const canonicalRoot = await canonicalPathFromExistingAncestor(requestedRoot);
-    if (
-      canonicalRoot === canonicalRepo ||
-      isWithin(canonicalRepo, canonicalRoot)
-    ) {
-      throw new Error(
-        `configured worktree root must be outside repository ${canonicalRepo}`,
-      );
-    }
-    await mkdir(canonicalRoot, { recursive: true });
-    return await canonicalPath(canonicalRoot);
+  const entries = await Promise.all(
+    Object.entries(roots).map(async ([checkout, root]) => ({
+      checkout: await canonicalPath(checkout),
+      root,
+    })),
+  );
+  const configured = entries.find(({ checkout }) => checkout === canonicalRepo);
+  if (!configured) return undefined;
+  const canonicalRoot = await canonicalPathFromExistingAncestor(configured.root);
+  const conflictingCheckout = entries.find(({ checkout }) =>
+    isWithin(checkout, canonicalRoot),
+  )?.checkout;
+  if (conflictingCheckout) {
+    throw new Error(
+      `configured worktree root must be outside repository ${conflictingCheckout}`,
+    );
   }
-  return undefined;
+  const stateRoot = await canonicalPathFromExistingAncestor(noMistakesHome());
+  if (isWithin(stateRoot, canonicalRoot)) {
+    throw new Error(
+      `configured worktree root must be outside no-mistakes state ${stateRoot}`,
+    );
+  }
+  await mkdir(canonicalRoot, { recursive: true });
+  return await canonicalPath(canonicalRoot);
 }
 
 async function createGateWorktree(
