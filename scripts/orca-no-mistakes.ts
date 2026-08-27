@@ -7108,7 +7108,13 @@ Run options:
     throw error;
   } finally {
     try {
-      ledger?.close();
+      try {
+        ledger?.close();
+      } catch (closeError) {
+        console.error(
+          `warning: could not close the domain ledger: ${String(closeError)}`,
+        );
+      }
     } finally {
       if (gate && !retainGate) {
         await removeGateWorktree(

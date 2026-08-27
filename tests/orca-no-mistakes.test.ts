@@ -5214,12 +5214,18 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await assertWorkerChangesAllowed();
 
     git(worker, "reset", "--hard", featureHead);
+    const relocatedPreflight = coordinatorSource.replace(
+      "    const repoState = await git.assertReady();",
+      "      const repoState = await git.assertReady();",
+    );
+    assert.notEqual(
+      relocatedPreflight,
+      coordinatorSource,
+      "mutation setup failed: runtime preflight indentation literal was not found",
+    );
     await writeFile(
       path.join(worker, "scripts/orca-no-mistakes.ts"),
-      coordinatorSource.replace(
-        "    const repoState = await git.assertReady();",
-        "      const repoState = await git.assertReady();",
-      ),
+      relocatedPreflight,
     );
     git(worker, "add", "scripts/orca-no-mistakes.ts");
     git(worker, "commit", "-m", "move runtime preflight");

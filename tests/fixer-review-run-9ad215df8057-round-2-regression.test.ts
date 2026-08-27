@@ -102,11 +102,12 @@ console.log(JSON.stringify({ result }))
 
     const gatePath = path.join(root, "configured-run");
     process.env.NO_MISTAKES_DELIVERY_BRANCH = "feature";
-    process.env.NO_MISTAKES_GATE_BRANCH = git(
+    const gateBranch = git(
       gatePath,
       "branch",
       "--show-current",
     );
+    process.env.NO_MISTAKES_GATE_BRANCH = gateBranch;
     process.env.NO_MISTAKES_GATE_WORKTREE_ROOT = root;
     process.env.NO_MISTAKES_INTENT_TASK_ID = "task-intent";
     process.env.NO_MISTAKES_ORIGIN_WORKTREE = repo;
@@ -137,6 +138,7 @@ console.log(JSON.stringify({ result }))
     );
     assert.equal(failed.length, 1);
     assert.deepEqual(await readdir(root), []);
+    assert.equal(git(repo, "branch", "--list", gateBranch), "");
   } finally {
     for (const name of environmentNames) {
       const value = previous[name];

@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  DomainLedger,
   main,
   selectedFindingIdsForGate,
 } from "../scripts/orca-no-mistakes.ts";
@@ -46,6 +47,9 @@ test("configured attached failures settle every open task", async () => {
   const previous = Object.fromEntries(
     environmentNames.map((name) => [name, process.env[name]]),
   );
+  const originalClose = DomainLedger.prototype.close;
+  const originalConsoleError = console.error;
+  const warnings: string[] = [];
   try {
     git(temp, "-c", "init.templateDir=", "init", "--bare", origin);
     git(temp, "-c", "init.templateDir=", "init", "-b", "main", repo);
@@ -105,6 +109,11 @@ if (args[0] === 'orchestration' && args[1] === 'task-create') {
       ORCA_CLI_COMMAND: fakeOrca,
       ORCA_NO_MISTAKES_HOME: path.join(temp, "home"),
     });
+    DomainLedger.prototype.close = function () {
+      originalClose.call(this);
+      throw new Error("injected ledger close failure");
+    };
+    console.error = (...args) => warnings.push(args.map(String).join(" "));
 
     await assert.rejects(
       main([
@@ -115,6 +124,13 @@ if (args[0] === 'orchestration' && args[1] === 'task-create') {
         "--intent=Settle configured task failures.",
       ]),
       /injected task creation failure/,
+    );
+    assert.ok(
+      warnings.some((warning) =>
+        warning.includes(
+          "warning: could not close the domain ledger: Error: injected ledger close failure",
+        ),
+      ),
     );
 
     const calls = (await readFile(callsPath, "utf8"))
@@ -142,6 +158,8 @@ if (args[0] === 'orchestration' && args[1] === 'task-create') {
     }
     assert.equal(git(repo, "branch", "--list", gateBranch), "");
   } finally {
+    DomainLedger.prototype.close = originalClose;
+    console.error = originalConsoleError;
     for (const [name, value] of Object.entries(previous)) {
       if (value === undefined) delete process.env[name];
       else process.env[name] = value;
