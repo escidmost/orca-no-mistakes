@@ -136,7 +136,11 @@ test("a raw worktree racing branch deletion gets its branch restored", async () 
   const restore = setHome(path.join(seeded.temp, "home"));
   const ledger = new DomainLedger();
   const previousPath = process.env.PATH;
-  const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+  const realGit = (previousPath ?? "")
+    .split(path.delimiter)
+    .map((directory) => path.join(directory, "git"))
+    .find(existsSync);
+  if (realGit === undefined) throw new Error("git executable missing from PATH");
   const rawPath = path.join(seeded.temp, "raw-gate-owner");
   const gitWrapperDirectory = path.join(seeded.temp, "bin");
   const gitWrapper = path.join(gitWrapperDirectory, "git");
