@@ -7968,13 +7968,13 @@ async function removeGateWorktree(
       );
     } else {
       removed = await command(
-        orcaCommand,
+        "git",
         [
+          "-C",
+          originWorktree,
           "worktree",
-          "rm",
-          "--worktree",
-          `path:${gate.path}`,
-          "--json",
+          "remove",
+          gate.path,
         ],
         originWorktree,
         { allowFailure: true },
@@ -8882,7 +8882,19 @@ async function reapConfiguredGate(
     );
     return false;
   }
-  if (await coordinatorIsLive(marker, orcaCommand, repoRoot, markerFile)) {
+  const cleanupHasProcessIdentity =
+    marker.pid !== undefined || marker.launcherPid !== undefined;
+  if (
+    (marker.cleanupPending === true
+      ? cleanupHasProcessIdentity &&
+        (await coordinatorIsLive(
+          { ...marker, terminalHandle: undefined },
+          orcaCommand,
+          repoRoot,
+          markerFile,
+        ))
+      : await coordinatorIsLive(marker, orcaCommand, repoRoot, markerFile))
+  ) {
     console.error(
       `no-mistakes: retained gate workspace ${gate.path}; its coordinator is still live`,
     );

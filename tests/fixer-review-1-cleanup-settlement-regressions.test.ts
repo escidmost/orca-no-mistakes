@@ -246,10 +246,12 @@ test("attached settlement failure retains every gate kind", async () => {
     new URL("../scripts/orca-no-mistakes.ts", import.meta.url),
     "utf8",
   );
-  const start = source.indexOf("} catch (settlementError) {");
-  const end = source.indexOf("await orca.notifyRunResult(", start);
+  const start = source.indexOf("const retainedOutcome =");
+  const end = source.indexOf("} finally {", start);
   assert.ok(start >= 0 && end > start);
   const settlementCatch = source.slice(start, end);
+  assert.match(settlementCatch, /error instanceof RunSettlementError/u);
+  assert.match(settlementCatch, /retainGate = retainedOutcome !== undefined;/u);
   assert.match(settlementCatch, /retainGate = true;/u);
   assert.match(settlementCatch, /await markGateCleanupPending\(\)/u);
   assert.doesNotMatch(settlementCatch, /gate\.kind === "configured"/u);

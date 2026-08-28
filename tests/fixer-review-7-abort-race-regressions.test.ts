@@ -398,6 +398,7 @@ async function pruneCrashRemnant(
   prefix: string,
   runId: string,
   seedLedger: (ledger: DomainLedger, origin: string) => void,
+  expectReaped = true,
 ): Promise<string | undefined> {
   const seeded = await seedStrandedGate(prefix);
   const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
@@ -413,9 +414,12 @@ async function pruneCrashRemnant(
 
     await main(["prune", "--stranded", "--repo", seeded.origin]);
 
-    assert.equal(existsSync(seeded.gate.path), false);
-    assert.equal(git(seeded.origin, "branch", "--list", seeded.gate.branch), "");
-    assert.equal(existsSync(seeded.marker), false);
+    assert.equal(existsSync(seeded.gate.path), !expectReaped);
+    assert.equal(
+      git(seeded.origin, "branch", "--list", seeded.gate.branch) !== "",
+      !expectReaped,
+    );
+    assert.equal(existsSync(seeded.marker), !expectReaped);
     assert.equal(
       git(
         seeded.origin,
@@ -439,7 +443,7 @@ test("stranded prune reaps a marker whose ledger row was never started", async (
   await pruneCrashRemnant("onm-before-start-run-", "run-before-start", () => {});
 });
 
-test("stranded prune settles an in-progress run whose lease was never acquired", async () => {
+test("stranded prune retains an in-progress run whose lease was never acquired", async () => {
   const runId = "run-before-lease";
   assert.equal(
     await pruneCrashRemnant(
@@ -456,7 +460,8 @@ test("stranded prune settles an in-progress run whose lease was never acquired",
           submissionCommitOid: A,
         });
       },
+      false,
     ),
-    "cancelled",
+    "in-progress",
   );
 });
