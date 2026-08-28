@@ -10326,6 +10326,8 @@ async function runPruneCommand(flags: RawCliFlags): Promise<void> {
   const repoRoot =
     repoFlag === undefined ? undefined : await canonicalPath(repoFlag);
   if (flags.stranded === true) {
+    if (before !== undefined)
+      throw new Error("--before cannot be combined with --stranded");
     // Stranded reaping scans one repository's gate markers; without --repo
     // the current directory is the repository to scan.
     const scanRoot = repoRoot ?? (await canonicalPath(process.cwd()));
@@ -10399,7 +10401,8 @@ export async function main(argv: string[]): Promise<void> {
   orca-no-mistakes run --intent <text> [--repo <path>] [--base <branch>] [--head <sha>] [--force-lease]
   orca-no-mistakes attestation export <run-id|commit-sha> [--out <path>]
   orca-no-mistakes attestation verify <manifest-file|run-id|commit-sha>
-  orca-no-mistakes prune [--before <date>] [--repo <path>] [--stranded]
+  orca-no-mistakes prune [--before <date>] [--repo <path>]
+  orca-no-mistakes prune --stranded [--repo <path>]
 
 Run options:
   --reviewer-model <model>
@@ -10410,7 +10413,7 @@ Run options:
   --force-lease (reclaim a stranded branch lease)
 
 Prune options:
-  --stranded (reap gate workspaces whose coordinator terminal died)`);
+  --stranded (reap gate workspaces whose coordinator terminal died; cannot be combined with --before)`);
     return;
   }
   const parsed = parseCli(argv);

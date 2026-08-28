@@ -1173,8 +1173,9 @@ export class DomainLedger {
         (!run ||
           run.repo_root !== ownership.repoRoot ||
           run.branch !== ownership.branch ||
-          (run.status !== 'in-progress' && run.status !== status) ||
-          (lease !== undefined && lease.run_id !== runId))
+          (run.status === 'in-progress'
+            ? lease?.run_id !== runId
+            : run.status !== status))
       ) {
         this.#db.exec('COMMIT')
         return false

@@ -423,6 +423,22 @@ test("run settlement atomically releases its lease", () => {
   }
 });
 
+test("ownership-fenced settlement requires the in-progress run's lease", () => {
+  const ledger = new DomainLedger(":memory:");
+  try {
+    runRow(ledger, "run-owned", "/repo", "feature");
+    const ownership = { branch: "feature", repoRoot: "/repo" };
+    assert.equal(ledger.settleRun("run-owned", "cancelled", ownership), false);
+    assert.equal(ledger.runStatus("run-owned"), "in-progress");
+    ledger.acquireLease({ ...ownership, runId: "run-owned" });
+    assert.equal(ledger.settleRun("run-owned", "cancelled", ownership), true);
+    assert.equal(ledger.runStatus("run-owned"), "cancelled");
+    assert.equal(ledger.settleRun("run-owned", "cancelled", ownership), true);
+  } finally {
+    ledger.close();
+  }
+});
+
 test("stranded cleanup settles before removal and retries partial removal", async () => {
   const temp = await realpath(
     await mkdtemp(path.join(tmpdir(), "onm-stranded-retry-")),

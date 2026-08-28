@@ -9416,6 +9416,13 @@ test("prune removes completed runs with their evidence while retaining in-progre
   assert.equal(ledger.runStatus("run-live"), "in-progress");
 });
 
+test("stranded prune rejects the completed-run age filter", async () => {
+  await assert.rejects(
+    main(["prune", "--stranded", "--before", "2026-01-01"]),
+    /--before cannot be combined with --stranded/,
+  );
+});
+
 test("--repo names a checkout rather than a substring of one", () => {
   const ledger = new DomainLedger(":memory:");
   for (const [runId, repoRoot] of [
