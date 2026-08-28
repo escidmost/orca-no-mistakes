@@ -267,7 +267,10 @@ export function resolveRoleConfig(
     variant: merged.variant,
     timeout_ms: merged.timeout_ms,
     agent_args_override: merged.agent_args_override,
-    auto_fix: withAutoFixDefaults(merged.auto_fix)
+    auto_fix: {
+      ...withAutoFixDefaults(merged.auto_fix),
+      guardrails: r?.auto_fix?.guardrails ?? BASELINE_AUTO_FIX.guardrails
+    }
   }
 }
 
@@ -313,7 +316,10 @@ export function resolvePipelineConfig(options: ResolverOptions = {}): ResolvedPi
 
   return {
     intent: c?.intent ?? r?.intent ?? u?.intent,
-    auto_fix: withAutoFixDefaults(autoFix),
+    auto_fix: {
+      ...withAutoFixDefaults(autoFix),
+      guardrails: r?.auto_fix?.guardrails ?? BASELINE_AUTO_FIX.guardrails
+    },
     agent_args_override: agentArgs,
     stages
   }

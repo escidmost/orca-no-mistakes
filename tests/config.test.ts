@@ -175,10 +175,24 @@ test('fails closed on unknown keys in auto_fix configuration', () => {
   )
 })
 
-test('guardrails defaults to strict and resolves advisory from the top-level auto_fix block', () => {
+test('guardrails resolves only from trusted-base top-level auto_fix', () => {
   // Existing projects without the key stay on fail-closed enforcement.
   assert.equal(resolveRoleConfig('test', 'fixer').auto_fix.guardrails, 'strict')
   assert.equal(resolvePipelineConfig({}).auto_fix.guardrails, 'strict')
+
+  const userGlobalConfig: OrcaNoMistakesConfig = { auto_fix: { guardrails: 'advisory' } }
+  assert.equal(resolveRoleConfig('test', 'fixer', { userGlobalConfig }).auto_fix.guardrails, 'strict')
+  assert.equal(resolvePipelineConfig({ userGlobalConfig }).auto_fix.guardrails, 'strict')
+
+  const repoWithoutGuardrails: OrcaNoMistakesConfig = { auto_fix: { enabled: false } }
+  assert.equal(
+    resolveRoleConfig('test', 'fixer', { userGlobalConfig, repoGlobalConfig: repoWithoutGuardrails }).auto_fix.guardrails,
+    'strict'
+  )
+  assert.equal(
+    resolvePipelineConfig({ userGlobalConfig, repoGlobalConfig: repoWithoutGuardrails }).auto_fix.guardrails,
+    'strict'
+  )
 
   const repoGlobalConfig: OrcaNoMistakesConfig = { auto_fix: { guardrails: 'advisory' } }
   assert.equal(resolveRoleConfig('test', 'fixer', { repoGlobalConfig }).auto_fix.guardrails, 'advisory')
