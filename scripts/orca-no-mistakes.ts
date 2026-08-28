@@ -3696,7 +3696,16 @@ export class CliOrca implements OrcaOperations {
       this.#runId,
       "--json",
     ]);
-    const taskIds = (Array.isArray(result.tasks) ? result.tasks : [])
+    const tasks = Array.isArray(result.tasks) ? result.tasks : [];
+    if (
+      tasks.length > 0 &&
+      tasks.every(
+        (task) => task.status === "completed" || task.status === "failed",
+      )
+    ) {
+      return;
+    }
+    const taskIds = tasks
       .filter(
         (task) =>
           typeof task.id === "string" &&
