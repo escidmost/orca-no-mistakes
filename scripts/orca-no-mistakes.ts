@@ -934,11 +934,10 @@ export async function reapAbortedRun(reason: string): Promise<void> {
   let shouldFailOrcaRun = false;
   if (preserved && abortReap.ledger && abortReap.runId) {
     try {
-      const priorStatus = abortReap.ledger.runStatus(abortReap.runId);
       cancelled = abortReap.ledger.settleRun(abortReap.runId, "cancelled");
-      settled =
-        cancelled || abortReap.ledger.runStatus(abortReap.runId) !== "in-progress";
-      shouldFailOrcaRun = cancelled || priorStatus === undefined;
+      const status = abortReap.ledger.runStatus(abortReap.runId);
+      settled = status !== "in-progress";
+      shouldFailOrcaRun = settled && status !== "passed";
     } catch (error) {
       abortLog(
         `warning: abort could not settle the run: ${String(error)}`,
@@ -3697,14 +3696,6 @@ export class CliOrca implements OrcaOperations {
       "--json",
     ]);
     const tasks = Array.isArray(result.tasks) ? result.tasks : [];
-    if (
-      tasks.length > 0 &&
-      tasks.every(
-        (task) => task.status === "completed" || task.status === "failed",
-      )
-    ) {
-      return;
-    }
     const taskIds = tasks
       .filter(
         (task) =>
@@ -3714,8 +3705,10 @@ export class CliOrca implements OrcaOperations {
           task.status !== "failed",
       )
       .map((task) => task.id as string);
-    if (taskIds.length === 0)
+    if (taskIds.length === 0) {
+      if (tasks.some((task) => task.status === "failed")) return;
       taskIds.push(await this.createTask("Configured coordinator startup"));
+    }
     await Promise.all(taskIds.map((taskId) => this.failTask(taskId, summary)));
   }
 
