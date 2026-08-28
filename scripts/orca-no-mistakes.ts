@@ -7950,21 +7950,36 @@ async function removeGateWorktree(
       );
       return false;
     }
-    removed = owner
-      ? await command(
-          "git",
-          [
-            "-C",
-            originWorktree,
-            "worktree",
-            "remove",
-            ...(force ? ["--force"] : []),
-            gate.path,
-          ],
+    if (owner === undefined) {
+      removed = { code: 0, stderr: "", stdout: "" };
+    } else if (force) {
+      removed = await command(
+        "git",
+        [
+          "-C",
           originWorktree,
-          { allowFailure: true },
-        )
-      : { code: 0, stderr: "", stdout: "" };
+          "worktree",
+          "remove",
+          "--force",
+          gate.path,
+        ],
+        originWorktree,
+        { allowFailure: true },
+      );
+    } else {
+      removed = await command(
+        orcaCommand,
+        [
+          "worktree",
+          "rm",
+          "--worktree",
+          `path:${gate.path}`,
+          "--json",
+        ],
+        originWorktree,
+        { allowFailure: true },
+      );
+    }
   }
   if (removed.code !== 0) {
     if (gate.kind === "orca") {
