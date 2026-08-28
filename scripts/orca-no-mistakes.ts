@@ -4882,6 +4882,9 @@ export class CliOrca implements OrcaOperations {
     disposition: "release" | "retain",
   ): Promise<void> {
     const stop = workerStops.get(worker);
+    if (disposition === "release" && !stop && !worker.terminalHandle) {
+      throw new Error(`worker ${worker.dispatchId} shutdown cannot be verified`);
+    }
     if (disposition === "release" && stop) {
       await stop();
       workerStops.delete(worker);
@@ -9073,6 +9076,35 @@ async function reapOrcaLauncher(
   if (matches.length > 1) return false;
   const actual = matches[0];
   if (actual === undefined) {
+    if (!markerHasNamespace) {
+      const branches = await command(
+        "git",
+        [
+          "-C",
+          repoRoot,
+          "for-each-ref",
+          "--format=%(refname:short)",
+          "refs/heads",
+        ],
+        repoRoot,
+        { allowFailure: true },
+      );
+      if (branches.code !== 0) return false;
+      const matches = branches.stdout
+        .split(/\r?\n/u)
+        .filter(
+          (branch) => path.posix.basename(branch) === marker.gateBranch,
+        );
+      if (matches.length > 1) return false;
+      if (matches.length === 1 && matches[0] !== marker.gateBranch) {
+        marker.gateBranch = matches[0]!;
+        try {
+          await writeMarker(markerFile, marker);
+        } catch {
+          return false;
+        }
+      }
+    }
     const branchExists = await command(
       "git",
       [
@@ -9320,6 +9352,7 @@ async function discoverMarkerWorkers(
     ) {
       continue;
     }
+    if (terminal.connected !== false) return false;
     addTerminal(terminal.handle);
   }
   if (
