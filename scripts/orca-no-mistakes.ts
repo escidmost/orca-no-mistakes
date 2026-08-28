@@ -2155,7 +2155,7 @@ async function executeStage(
     }
     if (stage === "rebase") {
       const report = await withGateMutation(() =>
-        git.rebase(repo.base, (chunk) => stageLog.append(chunk)),
+        git.rebase(repo.base, stageLogCommandOutput(stageLog)),
       );
       return {
         exitCode: exitCodeFor(report),
@@ -3342,7 +3342,7 @@ export function parseGateResolution(
 }
 
 type CommandResult = { code: number; stderr: string; stdout: string };
-type CommandOutput = (chunk: string) => void | Promise<void>;
+type CommandOutput = (chunk: string, source: symbol) => void | Promise<void>;
 type AllocationCommandContext = {
   onExit: (pid: number) => Promise<void>;
   onSpawn: (pid: number) => Promise<void>;
@@ -3351,8 +3351,13 @@ type AllocationCommandContext = {
 const allocationCommands = new AsyncLocalStorage<AllocationCommandContext>();
 
 function stageLogOutput(launch: WorkerLaunch): CommandOutput | undefined {
-  const log = launch.stageLog;
-  return log ? (chunk) => log.append(chunk) : undefined;
+  return stageLogCommandOutput(launch.stageLog);
+}
+
+function stageLogCommandOutput(
+  log: StageLog | undefined,
+): CommandOutput | undefined {
+  return log ? (chunk, source) => log.append(chunk, source) : undefined;
 }
 
 async function command(
@@ -3415,6 +3420,7 @@ async function command(
     let stdout = "";
     let stderr = "";
     let outputChain = Promise.resolve();
+    const outputSources = { stderr: Symbol(), stdout: Symbol() };
     let spawnError: Error | undefined;
     let stdinError: Error | undefined;
     let allocationError: unknown;
@@ -3457,7 +3463,7 @@ async function command(
       else stderr += chunk;
       if (options.onOutput) {
         outputChain = outputChain
-          .then(() => options.onOutput!(chunk))
+          .then(() => options.onOutput!(chunk, outputSources[target]))
           .catch(() => {});
       }
     };
@@ -3663,12 +3669,17 @@ export class CliOrca implements OrcaOperations {
   // Terminal handle -> cursor of the last drained stage-log read, so a retained
   // terminal reused across rounds never replays output into the next log.
   readonly #terminalCursors = new Map<string, string>();
-  readonly #terminalPartialCursors = new Map<string, string>();
   // Terminal handle -> the stage log bound to it, created the moment the
   // terminal exists so capture outlives a failed launch.
   readonly #terminalLogs = new Map<
     string,
-    { log: StageLog; owned: boolean; path: string; ticker: NodeJS.Timeout }
+    {
+      log: StageLog;
+      owned: boolean;
+      path: string;
+      source: symbol;
+      ticker: NodeJS.Timeout;
+    }
   >();
   // Terminal handle -> the drain currently running for it, so overlapping
   // drains serialize instead of interleaving their appends.
@@ -5062,7 +5073,7 @@ export class CliOrca implements OrcaOperations {
           abortSignal: fenceSignal
             ? AbortSignal.any([fenceSignal, processAbort.signal])
             : processAbort.signal,
-          onOutput: log ? (chunk) => log.append(chunk) : undefined,
+          onOutput: stageLogCommandOutput(log),
           stdin: launch.prompt,
           timeoutMs: agent.timeoutMs ?? WORKER_IDLE_TIMEOUT_MS,
         });
@@ -5545,6 +5556,9 @@ export class CliOrca implements OrcaOperations {
     report?: StageReport;
   }> {
     const log = await this.#bindStageLog(terminalHandle, launch);
+    const source = log
+      ? this.#terminalLogs.get(terminalHandle)!.source
+      : undefined;
     const activity = {
       lastActivityAt: Date.now(),
       lastOutputAt: await this.#workerOutputAt(terminalHandle),
@@ -5575,6 +5589,7 @@ export class CliOrca implements OrcaOperations {
       terminalHandle,
       launch,
       log,
+      source,
       activity,
       waitFence,
     );
@@ -5637,20 +5652,22 @@ export class CliOrca implements OrcaOperations {
       await this.#releaseStageLog(terminalHandle);
     }
     const log = launch.stageLog ?? new StageLog(launch.logPath);
+    const source = Symbol();
     // Draining starts here, not when the coordinator begins waiting for a
     // report: a worker can print startup diagnostics and then hang in
     // readiness, and that transcript is exactly what explains the hang.
     const ticker = setInterval(() => {
-      void this.#drainWorkerLog(terminalHandle, log);
+      void this.#drainWorkerLog(terminalHandle, log, source);
     }, WORKER_LOG_DRAIN_INTERVAL_MS);
     ticker.unref();
     this.#terminalLogs.set(terminalHandle, {
       log,
       owned: launch.stageLog === undefined,
       path: launch.logPath,
+      source,
       ticker,
     });
-    void this.#drainWorkerLog(terminalHandle, log);
+    void this.#drainWorkerLog(terminalHandle, log, source);
     return log;
   }
 
@@ -5665,15 +5682,15 @@ export class CliOrca implements OrcaOperations {
     clearInterval(bound.ticker);
     // Output is stable now, so take everything rather than stopping at the
     // live-drain page ceiling: what is left is the final tail.
-    await this.#drainWorkerLog(terminalHandle, bound.log, true);
+    await this.#drainWorkerLog(terminalHandle, bound.log, bound.source, true);
     // worker_done can arrive while the agent is still printing its closing
     // response or the TUI is settling. One short pause and a second pass costs
     // a moment per worker and catches what lands in that window.
     await new Promise((resolve) =>
       setTimeout(resolve, WORKER_LOG_SETTLE_MS),
     );
-    await this.#drainWorkerLog(terminalHandle, bound.log, true);
-    await this.#captureFinalPartial(terminalHandle, bound.log);
+    await this.#drainWorkerLog(terminalHandle, bound.log, bound.source, true);
+    await this.#captureFinalPartial(terminalHandle, bound.log, bound.source);
     if (bound.owned) await bound.log.close().catch(() => {});
   }
 
@@ -5683,6 +5700,7 @@ export class CliOrca implements OrcaOperations {
   async #drainWorkerLog(
     terminalHandle: string,
     log: StageLog,
+    source: symbol,
     exhaustive = false,
   ): Promise<void> {
     // Timer-driven and wait-driven drains overlap. A periodic drain skips when
@@ -5694,7 +5712,7 @@ export class CliOrca implements OrcaOperations {
       if (!exhaustive) return;
       await inflight.catch(() => {});
     }
-    const run = this.#drainNow(terminalHandle, log, exhaustive);
+    const run = this.#drainNow(terminalHandle, log, source, exhaustive);
     this.#draining.set(terminalHandle, run);
     try {
       await run;
@@ -5708,6 +5726,7 @@ export class CliOrca implements OrcaOperations {
   async #drainNow(
     terminalHandle: string,
     log: StageLog,
+    source: symbol,
     exhaustive: boolean,
   ): Promise<void> {
     const maxPages = exhaustive
@@ -5738,6 +5757,7 @@ export class CliOrca implements OrcaOperations {
           if (terminal.truncated === true && oldest !== undefined) {
             await log.append(
               `\n[no-mistakes: terminal output dropped; retained history began at cursor ${oldest}]\n`,
+              source,
             );
           }
           const from = oldest ?? next;
@@ -5756,6 +5776,7 @@ export class CliOrca implements OrcaOperations {
         ) {
           await log.append(
             `\n[no-mistakes: terminal output dropped; retained history began at cursor ${oldest}]\n`,
+            source,
           );
           this.#terminalCursors.set(terminalHandle, oldest);
           continue;
@@ -5766,7 +5787,7 @@ export class CliOrca implements OrcaOperations {
         // The cursor moves only once the append it describes has landed, so a
         // failed write leaves the next drain to retry the same lines instead
         // of skipping past them.
-        if (lines.length > 0) await this.#appendLines(log, lines);
+        if (lines.length > 0) await this.#appendLines(log, source, lines);
         if (next !== undefined) this.#terminalCursors.set(terminalHandle, next);
         if (next === undefined || next === latest) return;
       }
@@ -5775,6 +5796,7 @@ export class CliOrca implements OrcaOperations {
       if (exhaustive) {
         await log.append(
           `\n[no-mistakes: terminal output dropped; drain page limit reached]\n`,
+          source,
         );
       }
     } catch (error) {
@@ -5820,13 +5842,18 @@ export class CliOrca implements OrcaOperations {
     return result.terminal ?? {};
   }
 
-  async #appendLines(log: StageLog, lines: string[]): Promise<void> {
-    await log.append(`${lines.join("\n")}\n`);
+  async #appendLines(
+    log: StageLog,
+    source: symbol,
+    lines: string[],
+  ): Promise<void> {
+    await log.append(`${lines.join("\n")}\n`, source);
   }
 
   async #captureFinalPartial(
     terminalHandle: string,
     log: StageLog,
+    source: symbol,
   ): Promise<void> {
     try {
       const terminal = await this.#readTerminal(terminalHandle);
@@ -5839,12 +5866,10 @@ export class CliOrca implements OrcaOperations {
       if (
         partialCursor === undefined ||
         terminal.latestCursor === undefined ||
-        partialCursor === String(terminal.latestCursor) ||
-        partialCursor === this.#terminalPartialCursors.get(terminalHandle)
+        partialCursor === String(terminal.latestCursor)
       )
         return;
-      await this.#appendLines(log, [partial]);
-      this.#terminalPartialCursors.set(terminalHandle, partialCursor);
+      await this.#appendLines(log, source, [partial]);
     } catch {
       // A transcript that is missing its last partial line is still a
       // transcript; capture never fails the stage it records.
@@ -5857,6 +5882,7 @@ export class CliOrca implements OrcaOperations {
     terminalHandle: string,
     launch: WorkerLaunch,
     log: StageLog | undefined,
+    source: symbol | undefined,
     activity: { lastActivityAt: number; lastOutputAt: number | undefined },
     fence?: TimeoutFence,
   ): Promise<{
@@ -5909,7 +5935,8 @@ export class CliOrca implements OrcaOperations {
         ) {
           activity.lastOutputAt = outputAt;
           activity.lastActivityAt = Date.now();
-          if (log) await this.#drainWorkerLog(terminalHandle, log);
+          if (log && source)
+            await this.#drainWorkerLog(terminalHandle, log, source);
         }
         if (
           Date.now() - activity.lastActivityAt >=
@@ -5971,7 +5998,8 @@ export class CliOrca implements OrcaOperations {
             };
           }
           activity.lastActivityAt = Date.now();
-          if (log) await this.#drainWorkerLog(terminalHandle, log);
+          if (log && source)
+            await this.#drainWorkerLog(terminalHandle, log, source);
           continue;
         }
         heartbeatOnly = false;

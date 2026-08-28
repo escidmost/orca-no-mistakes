@@ -540,8 +540,10 @@ export class StageLog {
   readonly #path: string
   readonly #keep: number
   readonly #maxBytes: number
-  #carry = ''
+  readonly #defaultSource = Symbol()
+  readonly #carries = new Map<symbol, string>()
   #fileBytes = 0
+  #fileIdentity = ''
   #originalBytes = 0
   #originalBytesKnown = true
   #started = false
@@ -560,23 +562,29 @@ export class StageLog {
     this.#keep = Math.max(0, Math.floor((maxBytes - LOG_MARKER_RESERVE_BYTES) / 4))
   }
 
-  append(chunk: string): Promise<void> {
-    const pending = this.#pending.then(() => this.#append(chunk))
+  append(chunk: string, source = this.#defaultSource): Promise<void> {
+    const pending = this.#pending.then(() => this.#append(chunk, source))
     this.#pending = pending.catch(() => {})
     return pending
   }
 
-  async #append(chunk: string): Promise<void> {
+  async #append(chunk: string, source: symbol): Promise<void> {
     if (chunk.length === 0) return
     await this.#start()
     const secrets = knownSecrets()
-    const redacted = applyRedaction(`${this.#carry}${chunk}`, secrets)
+    const redacted = applyRedaction(
+      `${this.#carries.get(source) ?? ''}${chunk}`,
+      secrets,
+    )
     // Hold back only a trailing partial secret, so a credential split across two
     // drain pages is whole the next time redaction runs while ordinary output
     // still reaches disk immediately. `[REDACTED]` contains no secret, so
     // re-scanning what is carried stays idempotent.
     const hold = pendingSecretPrefix(redacted, secrets)
-    this.#carry = redacted.slice(redacted.length - hold)
+    if (hold > 0) {
+      this.#carries.set(source, redacted.slice(redacted.length - hold))
+    }
+    else this.#carries.delete(source)
     await this.#absorb(redacted.slice(0, redacted.length - hold))
     if (this.#hasNewOutput) await this.#recordOriginalBytes()
   }
@@ -584,11 +592,11 @@ export class StageLog {
   async close(): Promise<void> {
     try {
       await this.#pending
-      if (this.#carry.length > 0) {
-        const carried = this.#carry
-        this.#carry = ''
+      if (this.#carries.size > 0) {
+        const carried = [...this.#carries.values()]
+        this.#carries.clear()
         await this.#start()
-        await this.#absorb(redactKnownSecrets(carried))
+        for (const chunk of carried) await this.#absorb(redactKnownSecrets(chunk))
       }
       // A silent instance never opens the log, so a worker that printed
       // nothing cannot disturb what the round already recorded.
@@ -703,6 +711,8 @@ export class StageLog {
     )
     await assertPrivateRegularFile(reopened)
     this.#file = reopened
+    const reopenedStat = await reopened.stat()
+    this.#fileIdentity = `${reopenedStat.dev}:${reopenedStat.ino}`
     this.#fileBytes = parts.reduce((total, part) => total + part.length, 0)
     this.#compacted = true
     await this.#recordOriginalBytes()
@@ -728,13 +738,20 @@ export class StageLog {
     const file = await open(logPath, O_APPEND | O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
     try {
       await assertPrivateRegularFile(file)
-      let existingBytes = (await file.stat()).size
+      const fileStat = await file.stat()
+      let existingBytes = fileStat.size
+      const fileIdentity = `${fileStat.dev}:${fileStat.ino}`
       await file.chmod(0o600)
       // The first `keep` bytes are the round's head and never change; whatever
       // follows is the previous worker's marker and tail, which this worker's
       // output replaces so the file ends with the round's final tail. Nothing
       // already on disk is parsed back, so worker text cannot forge accounting.
-      const prior = await this.#priorAccounting()
+      const recorded = await this.#priorAccounting()
+      const prior =
+        recorded?.fileIdentity !== undefined &&
+        recorded.fileIdentity !== fileIdentity
+          ? undefined
+          : recorded
       this.#originalBytesKnown = existingBytes === 0 || prior !== undefined
       this.#originalBytes =
         prior === undefined
@@ -751,9 +768,10 @@ export class StageLog {
         (this.#originalBytes > existingBytes ||
           (prior.fileBytes !== undefined && existingBytes < prior.fileBytes))
       this.#fileBytes = existingBytes
+      this.#fileIdentity = fileIdentity
       this.#file = file
       this.#started = true
-      if (prior && prior.fileBytes === undefined) {
+      if (prior && (prior.fileBytes === undefined || prior.fileIdentity === undefined)) {
         await this.#recordOriginalBytes()
       }
       // A crash during compaction can leave the artifact over its cap. Repair
@@ -779,7 +797,7 @@ export class StageLog {
    * worker-writable, and a worker could forge its own truncation accounting.
    */
   async #priorAccounting(): Promise<
-    { fileBytes?: number; originalBytes: number } | undefined
+    { fileBytes?: number; fileIdentity?: string; originalBytes: number } | undefined
   > {
     let file: Awaited<ReturnType<typeof open>>
     try {
@@ -797,16 +815,19 @@ export class StageLog {
       try {
         const parsed = JSON.parse(raw) as {
           fileBytes?: unknown
+          fileIdentity?: unknown
           originalBytes?: unknown
         }
         if (
           Number.isSafeInteger(parsed.originalBytes) &&
           (parsed.originalBytes as number) >= 0 &&
           Number.isSafeInteger(parsed.fileBytes) &&
-          (parsed.fileBytes as number) >= 0
+          (parsed.fileBytes as number) >= 0 &&
+          (parsed.fileIdentity === undefined || typeof parsed.fileIdentity === 'string')
         ) {
           return {
             fileBytes: parsed.fileBytes as number,
+            fileIdentity: parsed.fileIdentity as string | undefined,
             originalBytes: parsed.originalBytes as number,
           }
         }
@@ -829,6 +850,7 @@ export class StageLog {
         Buffer.from(
           JSON.stringify({
             fileBytes: this.#fileBytes,
+            fileIdentity: this.#fileIdentity,
             originalBytes: this.#originalBytes,
           }),
           'utf8',
@@ -843,7 +865,9 @@ export class StageLog {
   }
 
   #truncationMarker(headBytes: number, tailBytes: number): string {
-    const dropped = Math.max(0, this.#originalBytes - headBytes - tailBytes)
+    const dropped = this.#originalBytesKnown
+      ? String(Math.max(0, this.#originalBytes - headBytes - tailBytes))
+      : 'unknown'
     const ranges: string[] = []
     if (headBytes > 0) ranges.push(`0-${headBytes - 1}`)
     if (tailBytes > 0 && this.#originalBytesKnown) {
