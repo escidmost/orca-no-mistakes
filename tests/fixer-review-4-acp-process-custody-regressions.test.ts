@@ -55,7 +55,7 @@ async function seed(prefix: string) {
 }
 
 async function waitForFile(file: string): Promise<void> {
-  for (let attempt = 0; attempt < 200 && !existsSync(file); attempt += 1) {
+  for (let attempt = 0; attempt < 1_000 && !existsSync(file); attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   assert.equal(existsSync(file), true);

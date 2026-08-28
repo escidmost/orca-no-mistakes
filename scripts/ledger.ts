@@ -496,7 +496,7 @@ async function assertNoSymlinkChain(rootPath: string, targetPath: string): Promi
   let current = root
   for (const component of ['', ...relative.split(path.sep).filter(Boolean)]) {
     if (component) current = path.join(current, component)
-    let entry
+    let entry: Awaited<ReturnType<typeof lstat>>
     try {
       entry = await lstat(current)
     } catch (error) {
@@ -548,6 +548,7 @@ export class StageLog {
   #file?: Awaited<ReturnType<typeof open>>
   #hasNewOutput = false
   #compacted = false
+  #pending = Promise.resolve()
 
   constructor(filePath: string, maxBytes = MAX_LOG_BYTES) {
     this.#path = filePath
@@ -559,7 +560,13 @@ export class StageLog {
     this.#keep = Math.max(0, Math.floor((maxBytes - LOG_MARKER_RESERVE_BYTES) / 4))
   }
 
-  async append(chunk: string): Promise<void> {
+  append(chunk: string): Promise<void> {
+    const pending = this.#pending.then(() => this.#append(chunk))
+    this.#pending = pending.catch(() => {})
+    return pending
+  }
+
+  async #append(chunk: string): Promise<void> {
     if (chunk.length === 0) return
     await this.#start()
     const secrets = knownSecrets()
@@ -571,10 +578,12 @@ export class StageLog {
     const hold = pendingSecretPrefix(redacted, secrets)
     this.#carry = redacted.slice(redacted.length - hold)
     await this.#absorb(redacted.slice(0, redacted.length - hold))
+    if (this.#hasNewOutput) await this.#recordOriginalBytes()
   }
 
   async close(): Promise<void> {
     try {
+      await this.#pending
       if (this.#carry.length > 0) {
         const carried = this.#carry
         this.#carry = ''
@@ -596,7 +605,6 @@ export class StageLog {
   async #absorb(text: string): Promise<void> {
     let pending = Buffer.from(text, 'utf8')
     if (pending.length === 0) return
-    this.#originalBytes += pending.length
     this.#hasNewOutput = true
     // Everything reaches disk as it arrives -- keeping the tail in memory
     // until close would mean a coordinator that dies mid-run leaves only the
@@ -606,6 +614,7 @@ export class StageLog {
     while (pending.length > 0) {
       const room = Math.max(0, this.#maxBytes - this.#fileBytes)
       if (room === 0) {
+        await this.#recordOriginalBytes()
         const before = this.#fileBytes
         await this.#compact()
         if (this.#fileBytes >= before) return
@@ -614,6 +623,7 @@ export class StageLog {
       const slice = pending.subarray(0, room)
       await this.#write(slice)
       this.#fileBytes += slice.length
+      this.#originalBytes += slice.length
       pending = pending.subarray(slice.length)
     }
   }
@@ -695,6 +705,7 @@ export class StageLog {
     this.#file = reopened
     this.#fileBytes = parts.reduce((total, part) => total + part.length, 0)
     this.#compacted = true
+    await this.#recordOriginalBytes()
   }
 
   async #start(): Promise<void> {
@@ -723,13 +734,22 @@ export class StageLog {
       // follows is the previous worker's marker and tail, which this worker's
       // output replaces so the file ends with the round's final tail. Nothing
       // already on disk is parsed back, so worker text cannot forge accounting.
-      const prior = await this.#priorOriginalBytes()
+      const prior = await this.#priorAccounting()
       this.#originalBytesKnown = existingBytes === 0 || prior !== undefined
-      this.#originalBytes = prior ?? existingBytes
-    // A prior total larger than the file means the round already compacted:
-    // its marker describes the old tail, so close() has to rewrite it even
-    // though the physical file is back under the cap.
-    this.#compacted = prior !== undefined && prior > existingBytes
+      this.#originalBytes =
+        prior === undefined
+          ? existingBytes
+          : prior.originalBytes +
+            (prior.fileBytes !== undefined && existingBytes > prior.fileBytes
+              ? existingBytes - prior.fileBytes
+              : 0)
+      // A prior total larger than the file means the round already compacted:
+      // its marker describes the old tail, so close() has to rewrite it even
+      // though the physical file is back under the cap.
+      this.#compacted =
+        prior !== undefined &&
+        (this.#originalBytes > existingBytes ||
+          (prior.fileBytes !== undefined && existingBytes < prior.fileBytes))
       this.#fileBytes = existingBytes
       this.#file = file
       this.#started = true
@@ -755,8 +775,10 @@ export class StageLog {
    * rather than inside it because a count parsed back out of the log would be
    * worker-writable, and a worker could forge its own truncation accounting.
    */
-  async #priorOriginalBytes(): Promise<number | undefined> {
-    let file
+  async #priorAccounting(): Promise<
+    { fileBytes?: number; originalBytes: number } | undefined
+  > {
+    let file: Awaited<ReturnType<typeof open>>
     try {
       file = await open(this.#metaPath(), O_RDONLY | O_NOFOLLOW)
     } catch (error) {
@@ -768,8 +790,28 @@ export class StageLog {
     }
     try {
       if (!(await file.stat()).isFile()) return undefined
-      const parsed = Number.parseInt((await file.readFile('utf8')).trim(), 10)
-      return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined
+      const raw = (await file.readFile('utf8')).trim()
+      try {
+        const parsed = JSON.parse(raw) as {
+          fileBytes?: unknown
+          originalBytes?: unknown
+        }
+        if (
+          Number.isSafeInteger(parsed.originalBytes) &&
+          (parsed.originalBytes as number) >= 0 &&
+          Number.isSafeInteger(parsed.fileBytes) &&
+          (parsed.fileBytes as number) >= 0
+        ) {
+          return {
+            fileBytes: parsed.fileBytes as number,
+            originalBytes: parsed.originalBytes as number,
+          }
+        }
+      } catch {}
+      const originalBytes = Number.parseInt(raw, 10)
+      return Number.isSafeInteger(originalBytes) && originalBytes >= 0
+        ? { originalBytes }
+        : undefined
     } finally {
       await file.close()
     }
@@ -781,7 +823,13 @@ export class StageLog {
     // write onto an arbitrary file, matching how the log itself is opened.
     try {
       await this.#replaceFile(this.#metaPath(), [
-        Buffer.from(String(this.#originalBytes), 'utf8'),
+        Buffer.from(
+          JSON.stringify({
+            fileBytes: this.#fileBytes,
+            originalBytes: this.#originalBytes,
+          }),
+          'utf8',
+        ),
       ])
     } catch {
       // The sidecar is an optimisation: losing it costs the round its byte
