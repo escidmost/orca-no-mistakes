@@ -156,6 +156,65 @@ test("advisory guardrail mode reports protected changes without rejecting custod
   }
 });
 
+test("advisory guardrails report every protected change category", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-advisory-all-"));
+  const repo = path.join(temp, "repo");
+  const worker = path.join(temp, "worker");
+  try {
+    await mkdir(path.join(repo, "src"), { recursive: true });
+    await mkdir(path.join(repo, "tests"));
+    git(repo, "init", "-b", "feature");
+    git(repo, "config", "user.email", "test@example.com");
+    git(repo, "config", "user.name", "Test User");
+    git(repo, "config", "core.hooksPath", "/dev/null");
+    await writeFile(
+      path.join(repo, ".pre-commit-config.yaml"),
+      "repos: [{repo: local, hooks: []}]\n",
+    );
+    await writeFile(
+      path.join(repo, "src", "math.ts"),
+      'test("adds", () => assert.equal(1 + 1, 2))\n',
+    );
+    await writeFile(
+      path.join(repo, "tests", "existing.test.ts"),
+      'test("existing", () => assert.equal(true, true))\n',
+    );
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "add guarded validation");
+    const expectedHead = git(repo, "rev-parse", "HEAD");
+    git(repo, "worktree", "add", "--detach", worker, expectedHead);
+
+    await writeFile(path.join(worker, ".pre-commit-config.yaml"), "repos: []\n");
+    await writeFile(
+      path.join(worker, "src", "math.ts"),
+      'test("adds", () => assert.equal(1 + 1, 3))\n',
+    );
+    await writeFile(
+      path.join(worker, "tests", "existing.test.ts"),
+      'test.skip("existing", () => assert.equal(true, true))\n',
+    );
+    git(worker, "add", ".");
+    git(worker, "commit", "-m", "change every guarded category");
+
+    const verdict = await new GitShell({ repo }).assertFixerChangesAllowed(
+      worker,
+      expectedHead,
+      git(worker, "rev-parse", "HEAD"),
+      "advisory",
+    );
+    assert.deepEqual(verdict, {
+      changed: true,
+      guardrailViolations: [
+        "fixer modified pre-existing test files: tests/existing.test.ts",
+        "fixer modified co-located test assertions or skip markers: src/math.ts",
+        "unexplained-policy-relaxation: fixer modified protected validation policy files: .pre-commit-config.yaml",
+      ],
+    });
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test("advisory guardrail mode still rejects fixer history rewrites", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-advisory-rewrite-"));
   const repo = path.join(temp, "repo");
