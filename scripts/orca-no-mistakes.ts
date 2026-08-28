@@ -1142,6 +1142,23 @@ export class RecoveryAnchorError extends Error {
   }
 }
 
+export class RunSettlementError extends Error {
+  readonly outcome: "cancelled" | "failed";
+
+  constructor(
+    runId: string,
+    outcome: "cancelled" | "failed",
+    originalError: unknown,
+    settlementError: unknown,
+  ) {
+    super(
+      `no-mistakes ${outcome}, but run ${runId} could not be settled; the gate was retained`,
+      { cause: new AggregateError([originalError, settlementError]) },
+    );
+    this.outcome = outcome;
+  }
+}
+
 /**
  * Runs the configured validation and remediation pipeline for a repository.
  *
@@ -1833,7 +1850,18 @@ export async function runPipeline(
           (failure as CustodyTaggedError).recoverRef = recoveryRefFor(runId);
         }
       }
-      if (!anchorError) ledger.settleRun(runId, outcome);
+      if (!anchorError) {
+        try {
+          ledger.settleRun(runId, outcome);
+        } catch (settlementError) {
+          throw new RunSettlementError(
+            runId,
+            outcome,
+            failure,
+            settlementError,
+          );
+        }
+      }
       const message =
         failure instanceof Error ? failure.message : String(failure);
       await orca
@@ -8839,10 +8867,7 @@ async function reapConfiguredGate(
     );
     return false;
   }
-  if (
-    marker.cleanupPending !== true &&
-    (await coordinatorIsLive(marker, orcaCommand, repoRoot, markerFile))
-  ) {
+  if (await coordinatorIsLive(marker, orcaCommand, repoRoot, markerFile)) {
     console.error(
       `no-mistakes: retained gate workspace ${gate.path}; its coordinator is still live`,
     );
@@ -10507,10 +10532,13 @@ Prune options:
     );
     console.log(JSON.stringify(result));
   } catch (error) {
-    retainGate = error instanceof RecoveryAnchorError;
+    const retainedOutcome =
+      error instanceof RecoveryAnchorError || error instanceof RunSettlementError
+        ? error.outcome
+        : undefined;
+    retainGate = retainedOutcome !== undefined;
     const outcome =
-      error instanceof GateStopError ||
-      (error instanceof RecoveryAnchorError && error.outcome === "cancelled")
+      error instanceof GateStopError || retainedOutcome === "cancelled"
         ? "cancelled"
         : "failed";
     const message = error instanceof Error ? error.message : String(error);
