@@ -753,6 +753,9 @@ export class StageLog {
       this.#fileBytes = existingBytes
       this.#file = file
       this.#started = true
+      if (prior && prior.fileBytes === undefined) {
+        await this.#recordOriginalBytes()
+      }
       // A crash during compaction can leave the artifact over its cap. Repair
       // it here rather than refusing to open, so an interrupted run neither
       // loses its transcript nor keeps growing past the bound.

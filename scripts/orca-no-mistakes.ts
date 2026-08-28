@@ -4174,28 +4174,40 @@ export class CliOrca implements OrcaOperations {
       }
       if (fence?.aborted)
         throw new Error(`${launch.stage} worker attempt was cancelled`);
-      const started = await command(
-        this.#command,
-        nativeWorkerStartArgs({
-          agent: agent.harness,
-          baseBranch,
-          effort: agent.effort,
-          model: agent.model,
-          name: launch.name,
-          repoRoot,
-          runId: this.#runId,
-          taskId,
-          timeoutMs: agent.timeoutMs,
-          worktree: launch.worktree,
-        }),
-        this.#cwd,
-        {
-          allowFailure: true,
-          onOutput: stageLogOutput(launch),
-          timeoutMs:
-            workerAgentReadyTimeoutMs() + NATIVE_WORKER_CREATE_SLACK_MS,
-        },
+      let startupSettled = false;
+      const bindAllocatedTerminal = this.#bindNativeStageLog(
+        taskId,
+        launch,
+        () => !startupSettled,
       );
+      let started: CommandResult;
+      try {
+        started = await command(
+          this.#command,
+          nativeWorkerStartArgs({
+            agent: agent.harness,
+            baseBranch,
+            effort: agent.effort,
+            model: agent.model,
+            name: launch.name,
+            repoRoot,
+            runId: this.#runId,
+            taskId,
+            timeoutMs: agent.timeoutMs,
+            worktree: launch.worktree,
+          }),
+          this.#cwd,
+          {
+            allowFailure: true,
+            onOutput: stageLogOutput(launch),
+            timeoutMs:
+              workerAgentReadyTimeoutMs() + NATIVE_WORKER_CREATE_SLACK_MS,
+          },
+        );
+      } finally {
+        startupSettled = true;
+        terminalHandle = (await bindAllocatedTerminal) ?? "";
+      }
       let receipt: {
         dispatch?: { terminalHandle?: string };
         residualResources?: unknown;
@@ -4216,7 +4228,7 @@ export class CliOrca implements OrcaOperations {
         receipt.terminal?.handle ??
         receipt.worker?.terminalHandle ??
         receipt.dispatch?.terminalHandle ??
-        "";
+        terminalHandle;
       if (terminalHandle) await this.#bindStageLog(terminalHandle, launch);
       worktreeId = receipt.worktree?.id ?? receipt.worker?.worktreeId;
       const worktreePath =
@@ -4279,6 +4291,32 @@ export class CliOrca implements OrcaOperations {
       }
       throw error;
     }
+  }
+
+  async #bindNativeStageLog(
+    taskId: string,
+    launch: WorkerLaunch,
+    pending: () => boolean,
+  ): Promise<string | undefined> {
+    while (pending()) {
+      try {
+        const shown = await this.#json<{
+          dispatch?: { assignee_handle?: string };
+        }>(
+          ["orchestration", "dispatch-show", "--task", taskId, "--json"],
+          true,
+          undefined,
+          WORKER_LOG_READ_TIMEOUT_MS,
+        );
+        const terminalHandle = shown.dispatch?.assignee_handle;
+        if (terminalHandle) {
+          await this.#bindStageLog(terminalHandle, launch);
+          return terminalHandle;
+        }
+      } catch {}
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    return undefined;
   }
 
   async #detachWorkerWorktree(
@@ -5612,6 +5650,7 @@ export class CliOrca implements OrcaOperations {
       path: launch.logPath,
       ticker,
     });
+    void this.#drainWorkerLog(terminalHandle, log);
     return log;
   }
 
@@ -5634,6 +5673,7 @@ export class CliOrca implements OrcaOperations {
       setTimeout(resolve, WORKER_LOG_SETTLE_MS),
     );
     await this.#drainWorkerLog(terminalHandle, bound.log, true);
+    await this.#captureFinalPartial(terminalHandle, bound.log);
     if (bound.owned) await bound.log.close().catch(() => {});
   }
 
@@ -5741,10 +5781,6 @@ export class CliOrca implements OrcaOperations {
       console.error(
         `warning: could not capture worker output for ${terminalHandle}: ${String(error)}`,
       );
-    } finally {
-      // Every ordinary exit above returns from inside the try, so this only
-      // runs reliably from a finally.
-      if (exhaustive) await this.#captureFinalPartial(terminalHandle, log);
     }
   }
 
