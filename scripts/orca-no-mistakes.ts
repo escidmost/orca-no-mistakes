@@ -8763,72 +8763,75 @@ async function discoverConfiguredLauncherAllocations(
   orcaCommand: string,
   repoRoot: string,
 ): Promise<{ runId?: string; terminalHandle?: string } | undefined> {
-  let terminalHandle = marker.terminalHandle;
-  if (!terminalHandle) {
-    const terminals = await listGateTerminals(repoRoot, orcaCommand, repoRoot);
-    if (terminals === undefined) return undefined;
-    const matches = terminals.filter(
-      (terminal) => terminal.title === marker.terminalTitle,
-    );
-    if (matches.length > 1) return undefined;
-    terminalHandle = matches[0]?.handle;
+  const terminals = await listGateTerminals(repoRoot, orcaCommand, repoRoot);
+  if (terminals === undefined) return undefined;
+  const terminalMatches = terminals.filter(
+    (terminal) => terminal.title === marker.terminalTitle,
+  );
+  if (terminalMatches.length > 1) return undefined;
+  const terminalHandle = terminalMatches[0]?.handle;
+  if (
+    marker.terminalHandle !== undefined &&
+    marker.terminalHandle !== terminalHandle
+  ) {
+    return undefined;
   }
 
-  let runId = marker.runId;
-  if (!runId) {
-    const matches: string[] = [];
-    const cursors = new Set<string>();
-    let cursor: string | undefined;
-    do {
-      const listed = await command(
-        orcaCommand,
-        [
-          "orchestration",
-          "run-list",
-          "--limit",
-          "100",
-          ...(cursor ? ["--cursor", cursor] : []),
-          "--json",
-        ],
-        repoRoot,
-        { allowFailure: true },
-      );
-      if (listed.code !== 0) return undefined;
-      try {
-        const response = unwrapJson<{
-          nextCursor?: unknown;
-          runs?: Array<{ id?: unknown; objective?: unknown }>;
-        }>(listed.stdout);
-        if (!Array.isArray(response.runs)) return undefined;
-        for (const run of response.runs) {
-          if (
-            typeof run.id === "string" &&
-            run.objective === marker.runObjective
-          ) {
-            matches.push(run.id);
-          }
-        }
+  const runMatches: string[] = [];
+  const cursors = new Set<string>();
+  let cursor: string | undefined;
+  do {
+    const listed = await command(
+      orcaCommand,
+      [
+        "orchestration",
+        "run-list",
+        "--limit",
+        "100",
+        ...(cursor ? ["--cursor", cursor] : []),
+        "--json",
+      ],
+      repoRoot,
+      { allowFailure: true },
+    );
+    if (listed.code !== 0) return undefined;
+    try {
+      const response = unwrapJson<{
+        nextCursor?: unknown;
+        runs?: Array<{ id?: unknown; objective?: unknown }>;
+      }>(listed.stdout);
+      if (!Array.isArray(response.runs)) return undefined;
+      for (const run of response.runs) {
         if (
-          response.nextCursor === null ||
-          response.nextCursor === undefined ||
-          response.nextCursor === ""
+          typeof run.id === "string" &&
+          run.objective === marker.runObjective
         ) {
-          break;
+          runMatches.push(run.id);
         }
-        if (
-          typeof response.nextCursor !== "string" ||
-          cursors.has(response.nextCursor)
-        ) {
-          return undefined;
-        }
-        cursors.add(response.nextCursor);
-        cursor = response.nextCursor;
-      } catch {
+      }
+      if (
+        response.nextCursor === null ||
+        response.nextCursor === undefined ||
+        response.nextCursor === ""
+      ) {
+        break;
+      }
+      if (
+        typeof response.nextCursor !== "string" ||
+        cursors.has(response.nextCursor)
+      ) {
         return undefined;
       }
-    } while (true);
-    if (matches.length > 1) return undefined;
-    runId = matches[0];
+      cursors.add(response.nextCursor);
+      cursor = response.nextCursor;
+    } catch {
+      return undefined;
+    }
+  } while (true);
+  if (runMatches.length > 1) return undefined;
+  const runId = runMatches[0];
+  if (marker.runId !== undefined && marker.runId !== runId) {
+    return undefined;
   }
   return { runId, terminalHandle };
 }
@@ -9158,6 +9161,11 @@ async function reapConfiguredLauncher(
       repoRoot,
     ))
   ) {
+    return false;
+  }
+  const recordedRun =
+    marker.runId === undefined ? undefined : ledger.runIdentity(marker.runId);
+  if (recordedRun !== undefined && recordedRun.repo_root !== repoRoot) {
     return false;
   }
   const discovered = await discoverConfiguredLauncherAllocations(
