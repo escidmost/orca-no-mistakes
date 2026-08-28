@@ -686,6 +686,48 @@ function startupReceiptPath(markerPath: string): string {
   return `${markerPath}.startup`;
 }
 
+function startupReceiptPid(text: string, token: string): number | undefined {
+  try {
+    const receipt = JSON.parse(text) as { pid?: unknown; token?: unknown };
+    return receipt.token === token &&
+      Number.isSafeInteger(receipt.pid) &&
+      (receipt.pid as number) > 0
+      ? (receipt.pid as number)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function waitForStartupReceipt(
+  markerFile: string,
+  token: string,
+): Promise<void> {
+  const deadline = Date.now() + 60_000;
+  for (;;) {
+    let text: string | undefined;
+    try {
+      text = await readFile(startupReceiptPath(markerFile), "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    const pid = text === undefined ? undefined : startupReceiptPid(text, token);
+    if (pid !== undefined) {
+      try {
+        process.kill(pid, 0);
+        return;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") return;
+        throw new Error("detached coordinator exited during startup");
+      }
+    }
+    if (Date.now() >= deadline) {
+      throw new Error("detached coordinator did not publish its startup receipt");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
 function gateMarkerId(gate: GateWorktree): string {
   return gate.kind === "orca" ? gate.id : gate.path;
 }
@@ -876,11 +918,14 @@ export async function reapAbortedRun(reason: string): Promise<void> {
   }
   let cancelled = abortReap.runId === undefined;
   let settled = abortReap.runId === undefined;
+  let shouldFailOrcaRun = false;
   if (preserved && abortReap.ledger && abortReap.runId) {
     try {
+      const priorStatus = abortReap.ledger.runStatus(abortReap.runId);
       cancelled = abortReap.ledger.settleRun(abortReap.runId, "cancelled");
       settled =
         cancelled || abortReap.ledger.runStatus(abortReap.runId) !== "in-progress";
+      shouldFailOrcaRun = cancelled || priorStatus === undefined;
     } catch (error) {
       abortLog(
         `warning: abort could not settle the run: ${String(error)}`,
@@ -888,7 +933,7 @@ export async function reapAbortedRun(reason: string): Promise<void> {
       settled = false;
     }
   }
-  if (preserved && cancelled && abortReap.orca instanceof CliOrca) {
+  if (preserved && shouldFailOrcaRun && abortReap.orca instanceof CliOrca) {
     try {
       await abortReap.orca.failRun(`Coordinator aborted: ${reason}`);
     } catch (error) {
@@ -8321,6 +8366,10 @@ async function launchDetachedRun(
       ],
       repo.root,
     );
+    await waitForStartupReceipt(
+      gateMarkerPath(repo.root, gateMarkerId(gate)),
+      startupReceipt,
+    );
   } catch (error) {
     await cleanupFailedLaunch(error);
     throw error;
@@ -8510,26 +8559,13 @@ async function coordinatorIsLive(
     } catch (error) {
       return (error as NodeJS.ErrnoException).code !== "ENOENT";
     }
+    const receiptPid = startupReceiptPid(receiptText, startupReceipt);
+    if (receiptPid === undefined) return true;
     try {
-      const receipt = JSON.parse(receiptText) as {
-        pid?: unknown;
-        token?: unknown;
-      };
-      if (
-        receipt.token !== startupReceipt ||
-        !Number.isSafeInteger(receipt.pid) ||
-        (receipt.pid as number) <= 0
-      ) {
-        return true;
-      }
-      try {
-        process.kill(receipt.pid as number, 0);
-        return true;
-      } catch (error) {
-        return (error as NodeJS.ErrnoException).code !== "ESRCH";
-      }
-    } catch {
+      process.kill(receiptPid, 0);
       return true;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code !== "ESRCH";
     }
   }
   if (typeof marker.terminalHandle === "string") {
@@ -8753,7 +8789,13 @@ async function reapConfiguredGate(
       );
       return false;
     }
-    if (run !== undefined && run.status !== "in-progress") return true;
+    if (
+      run !== undefined &&
+      run.status !== "in-progress" &&
+      run.status !== "cancelled"
+    ) {
+      return true;
+    }
     try {
       await new CliOrca({
         command: orcaCommand,

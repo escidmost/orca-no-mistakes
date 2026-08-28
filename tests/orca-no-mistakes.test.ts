@@ -2092,6 +2092,14 @@ test("run starts its coordinator in a child gate worktree", async () => {
 import fs from 'node:fs'
 const args = process.argv.slice(2)
 fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+if (args[0] === 'terminal' && args[1] === 'send') {
+  const markerDirectory = ${JSON.stringify(path.join(repo, ".orca", "no-mistakes"))}
+  const markerFile = fs.readdirSync(markerDirectory)
+    .map((name) => markerDirectory + '/' + name)
+    .find((file) => file.endsWith('.json') && JSON.parse(fs.readFileSync(file, 'utf8')).startupReceipt)
+  const marker = JSON.parse(fs.readFileSync(markerFile, 'utf8'))
+  fs.writeFileSync(markerFile + '.startup', JSON.stringify({ pid: process.ppid, token: marker.startupReceipt }))
+}
 const gateName = args[args.indexOf('--name') + 1]
 const result = args[0] === 'worktree' && args[1] === 'create'
   ? { worktree: { id: 'gate-id', path: ${JSON.stringify(gate)}, branch: 'refs/heads/evs/' + gateName } }
@@ -2186,6 +2194,7 @@ test("run places its coordinator under a configured repository worktree root", a
   const root = path.join(temp, "run-worktrees");
   const configPath = path.join(temp, "config.yaml");
   const fakeOrca = path.join(temp, "orca");
+  const receiptWriter = path.join(temp, "receipt-writer.cjs");
   const callsPath = path.join(temp, "calls.jsonl");
   const failTerminalCreate = path.join(temp, "fail-terminal-create");
   const previousCommand = process.env.ORCA_CLI_COMMAND;
@@ -2209,11 +2218,24 @@ test("run places its coordinator under a configured repository worktree root", a
       JSON.stringify({ worktree_roots: { [canonicalRepo]: root } }),
     );
     await writeFile(
+      receiptWriter,
+      `const fs = require("node:fs"); setTimeout(() => fs.writeFileSync(process.argv[2], JSON.stringify({ pid: Number(process.argv[3]), token: process.argv[4] })), 100);`,
+    );
+    await writeFile(
       fakeOrca,
       `#!/usr/bin/env node
+import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 const args = process.argv.slice(2)
 fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+if (args[0] === 'terminal' && args[1] === 'send') {
+  const markerDirectory = ${JSON.stringify(path.join(repo, ".orca", "no-mistakes"))}
+  const markerFile = fs.readdirSync(markerDirectory)
+    .map((name) => markerDirectory + '/' + name)
+    .find((file) => file.endsWith('.json') && JSON.parse(fs.readFileSync(file, 'utf8')).startupReceipt)
+  const marker = JSON.parse(fs.readFileSync(markerFile, 'utf8'))
+  spawn(process.execPath, [${JSON.stringify(receiptWriter)}, markerFile + '.startup', String(marker.launcherPid), marker.startupReceipt], { detached: true, stdio: 'ignore' }).unref()
+}
 const result = args[0] === 'orchestration' && args[1] === 'run-create'
   ? { run: { id: 'configured-run' } }
   : args[0] === 'orchestration' && args[1] === 'task-create'
@@ -2232,11 +2254,13 @@ console.log(JSON.stringify({ result }))
     process.env.ORCA_CLI_COMMAND = fakeOrca;
     process.env.ORCA_NO_MISTAKES_USER_CONFIG = configPath;
 
+    const launchStartedAt = Date.now();
     await main([
       "run",
       `--repo=${repo}`,
       "--intent=Validate configured detached coordination.",
     ]);
+    assert.ok(Date.now() - launchStartedAt >= 75);
 
     const [runId] = await readdir(root);
     assert.equal(runId, "configured-run");

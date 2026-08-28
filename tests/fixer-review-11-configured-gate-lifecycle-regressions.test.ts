@@ -83,8 +83,10 @@ async function addGate(seeded: Awaited<ReturnType<typeof seed>>, runId: string) 
 
 async function fakeOrca(
   temp: string,
+  failFirstSettlement = false,
 ): Promise<{ calls: string; command: string }> {
   const calls = path.join(temp, "calls.jsonl");
+  const failedSettlement = path.join(temp, "failed-settlement");
   const command = path.join(temp, "orca");
   await writeFile(
     command,
@@ -103,6 +105,10 @@ if (args[0] === "terminal" && args[1] === "show") {
 } else if (args[0] === "orchestration" && args[1] === "task-create") {
   out({ task: { id: "task-intent" } })
 } else if (args[0] === "orchestration" && args[1] === "task-list") {
+  if (${JSON.stringify(failFirstSettlement)} && !fs.existsSync(${JSON.stringify(failedSettlement)})) {
+    fs.writeFileSync(${JSON.stringify(failedSettlement)}, "failed")
+    process.exit(1)
+  }
   out({ tasks: [{ id: "task-intent", status: "in_progress" }] })
 } else {
   out({ accepted: true })
@@ -217,6 +223,77 @@ test("stranded configured gates retry graceful cleanup", async () => {
           args[1] === "task-update" &&
           args[args.indexOf("--status") + 1] === "failed",
       ),
+    );
+  } finally {
+    restoreEnv("ORCA_CLI_COMMAND", previousCommand);
+    restoreEnv("ORCA_NO_MISTAKES_HOME", previousHome);
+    await rm(seeded.temp, { force: true, recursive: true });
+  }
+});
+
+test("cancelled configured runs retry task settlement", async () => {
+  const seeded = await seed("onm-configured-settlement-retry-");
+  const gate = await addGate(seeded, "run-settlement-retry");
+  const fake = await fakeOrca(seeded.temp, true);
+  const previousCommand = process.env.ORCA_CLI_COMMAND;
+  const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
+  const home = path.join(seeded.temp, "home");
+  const marker = markerPath(seeded.repo, gate.path);
+  try {
+    process.env.ORCA_CLI_COMMAND = fake.command;
+    process.env.ORCA_NO_MISTAKES_HOME = home;
+    await writeFile(
+      marker,
+      JSON.stringify({
+        createdAt: new Date().toISOString(),
+        gate,
+        originWorktree: seeded.repo,
+        runId: gate.runId,
+        terminalHandle: "term-configured",
+      }),
+    );
+    const ledger = new DomainLedger();
+    ledger.startRun({
+      baseBranch: "main",
+      branch: "feature",
+      intent: "retry configured settlement",
+      policySha256: "a".repeat(64),
+      repoRoot: seeded.repo,
+      runId: gate.runId,
+      submissionCommitOid: git(seeded.repo, "rev-parse", "HEAD"),
+    });
+    ledger.acquireLease({
+      branch: "feature",
+      repoRoot: seeded.repo,
+      runId: gate.runId,
+    });
+    ledger.close();
+
+    await main(["prune", "--stranded", `--repo=${seeded.repo}`]);
+    assert.equal(existsSync(gate.path), true);
+    assert.equal(existsSync(marker), true);
+    const cancelled = new DomainLedger();
+    assert.equal(cancelled.runStatus(gate.runId), "cancelled");
+    cancelled.close();
+
+    await main(["prune", "--stranded", `--repo=${seeded.repo}`]);
+    assert.equal(existsSync(gate.path), false);
+    assert.equal(existsSync(marker), false);
+    const calls = (await readFile(fake.calls, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    assert.equal(
+      calls.filter(
+        (args) => args[0] === "orchestration" && args[1] === "task-list",
+      ).length,
+      2,
+    );
+    assert.equal(
+      calls.filter(
+        (args) => args[0] === "orchestration" && args[1] === "task-update",
+      ).length,
+      1,
     );
   } finally {
     restoreEnv("ORCA_CLI_COMMAND", previousCommand);

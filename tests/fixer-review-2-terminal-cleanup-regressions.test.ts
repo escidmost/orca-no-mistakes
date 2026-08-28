@@ -192,6 +192,12 @@ for (const kind of ["configured", "orca"] as const) {
     );
     try {
       recordPassedRun(ledger, seeded.repo, runId);
+      git(
+        seeded.repo,
+        "update-ref",
+        `refs/no-mistakes/recover/${runId}`,
+        git(seeded.repo, "rev-parse", "HEAD"),
+      );
       ledger.close();
       await writeFile(
         marker,
