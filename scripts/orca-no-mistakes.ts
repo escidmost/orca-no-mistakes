@@ -9621,7 +9621,7 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
         const origin = worktrees.find((entry) => entry.path === repoRoot);
         const actualGate = worktrees.find((entry) => entry.id === gate.id);
         const run = runId === undefined ? undefined : ledger.runIdentity(runId);
-        const retrying = run?.status === "cancelled";
+        const cleanupRetry = run !== undefined && run.status !== "in-progress";
         if (
           !origin ||
           typeof origin.id !== "string" ||
@@ -9708,7 +9708,7 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
               continue;
             }
           }
-          if (retrying && runId !== undefined) {
+          if (cleanupRetry && runId !== undefined) {
             const recovery = await command(
               "git",
               ["-C", repoRoot, "rev-parse", "--verify", recoveryRefFor(runId)],
@@ -9722,6 +9722,8 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
               retained += 1;
               continue;
             }
+          }
+          if (run?.status === "cancelled" && runId !== undefined) {
             try {
               await new CliOrca({
                 command: orcaCommand,
@@ -9750,7 +9752,7 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
             { allowFailure: true },
           );
           if (branch.code === 0) {
-            if (!retrying || runId === undefined) {
+            if (!cleanupRetry || runId === undefined) {
               retained += 1;
               continue;
             }
@@ -9862,7 +9864,7 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
           continue;
         }
         let preservedOid: string | undefined;
-        if (retrying && runId !== undefined) {
+        if (cleanupRetry && runId !== undefined) {
           const preserved = await command(
             "git",
             ["-C", repoRoot, "rev-parse", "--verify", recoveryRefFor(runId)],
@@ -9899,7 +9901,7 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
             repoRoot,
             { allowFailure: true },
           );
-          if (!retrying || exists.code !== 1 || preservedOid === undefined) {
+          if (!cleanupRetry || exists.code !== 1 || preservedOid === undefined) {
             retained += 1;
             console.error(
               `no-mistakes: retained gate workspace ${gate.path}; its branch tip could not be resolved: ${`${tip.stdout}${tip.stderr}`.trim()}`,
@@ -10251,7 +10253,7 @@ Prune options:
       git,
       ledger,
     );
-    gateCleanupOid = await git.head();
+    gateCleanupOid = result.attestation?.candidateCommitOid ?? gateCleanupOid;
     await orca.notifyRunResult(
       "passed",
       [
