@@ -9030,7 +9030,7 @@ async function reapConfiguredGate(
     );
     if (
       actualGate !== undefined ||
-      (launcher?.gateAllocated === true &&
+      ((launcher === undefined || launcher.gateAllocated === true) &&
         (recovered.code !== 0 ||
           !COMMIT_OID.test(recovered.stdout.trim()))) ||
       !(await settleConfiguredRun())
@@ -9535,6 +9535,9 @@ async function discoverMarkerWorkers(
   const terminalHandles = new Set(
     resources.map((worker) => worker.terminalHandle).filter(Boolean),
   );
+  const ownedTerminalHandles = new Set(
+    gateTerminals.map((terminal) => terminal.handle),
+  );
   const addTerminal = (handle: string): void => {
     if (terminalHandles.has(handle)) return;
     const dispatchId = strandedWorkerId(handle);
@@ -9588,6 +9591,7 @@ async function discoverMarkerWorkers(
       if (terminal) terminalHandles.add(terminal.handle);
     }
     for (const terminal of terminals) {
+      ownedTerminalHandles.add(terminal.handle);
       addTerminal(terminal.handle);
     }
   }
@@ -9600,6 +9604,15 @@ async function discoverMarkerWorkers(
     }
     if (terminal.connected !== false) return false;
     addTerminal(terminal.handle);
+  }
+  if (
+    resources.some(
+      (worker) =>
+        worker.terminalHandle !== undefined &&
+        !ownedTerminalHandles.has(worker.terminalHandle),
+    )
+  ) {
+    return false;
   }
   if (
     resources.length === (marker.workers?.length ?? 0) &&
