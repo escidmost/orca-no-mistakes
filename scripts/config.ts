@@ -127,6 +127,12 @@ export interface ResolvedAutoFixConfig {
   guardrails: GuardrailMode
 }
 
+/**
+ * Formats Zod validation issues as a concise configuration error message.
+ *
+ * @param error - The Zod validation error to format
+ * @returns A formatted message describing the invalid configuration
+ */
 export function formatZodError(error: z.ZodError): string {
   const issues = error.issues.map((issue) => {
     const path = issue.path.join('.')
@@ -200,6 +206,12 @@ function extractBase(config: StageConfig | DefaultsConfig | undefined): RoleConf
   return base
 }
 
+/**
+ * Completes partial auto-fix settings with baseline defaults.
+ *
+ * @param partial - Optional auto-fix settings that override the baseline values
+ * @returns Complete auto-fix settings with enabled, round limit, review auto-fix, and guardrail values
+ */
 function withAutoFixDefaults(partial: AutoFixConfig | undefined): ResolvedAutoFixConfig {
   return {
     enabled: partial?.enabled ?? BASELINE_AUTO_FIX.enabled,
@@ -225,6 +237,16 @@ export interface ResolvedRoleConfig {
   auto_fix: ResolvedAutoFixConfig
 }
 
+/**
+ * Resolves the effective configuration for a pipeline stage and role.
+ *
+ * Configuration layers are applied from baseline through user, repository, stage, and CLI settings, with higher-precedence values overriding lower-precedence values. Guardrail mode is taken from the repository-level auto-fix configuration or the strict baseline.
+ *
+ * @param stage - The pipeline stage to resolve.
+ * @param role - The role whose configuration is resolved.
+ * @param options - Optional user, repository, and CLI configuration sources.
+ * @returns The resolved agent, execution, argument override, and auto-fix settings.
+ */
 export function resolveRoleConfig(
   stage: StageName,
   role: RoleName,
@@ -284,6 +306,15 @@ export interface ResolvedPipelineConfig {
   }>
 }
 
+/**
+ * Resolves the complete pipeline configuration from user, repository, and CLI settings.
+ *
+ * CLI settings take precedence over repository and user settings where applicable. Auto-fix
+ * guardrails are resolved from the repository configuration or the strict baseline.
+ *
+ * @param options - Configuration sources used to resolve pipeline settings
+ * @returns The resolved intent, auto-fix policy, agent argument overrides, and per-stage role configurations
+ */
 export function resolvePipelineConfig(options: ResolverOptions = {}): ResolvedPipelineConfig {
   const { userGlobalConfig: u, repoGlobalConfig: r, cliFlags: c } = options
   const autoFix = [
