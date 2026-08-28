@@ -41,6 +41,8 @@ test("configured launch settles Runs after post-creation failures", async () => 
     git(repo, "push", "-u", "origin", "main");
     git(temp, `--git-dir=${origin}`, "symbolic-ref", "HEAD", "refs/heads/main");
     git(repo, "checkout", "-b", "feature");
+    await mkdir(path.join(repo, ".git", "info"), { recursive: true });
+    await writeFile(path.join(repo, ".git", "info", "exclude"), ".orca/\n");
     await mkdir(root);
     await writeFile(
       configPath,

@@ -371,6 +371,7 @@ type GateRunMarker = {
 };
 
 type ConfiguredLauncherMarker = {
+  allocationPending?: boolean;
   allocationPid?: number;
   allocationProtocol?: "gated-v1";
   cleanupPending?: boolean;
@@ -390,6 +391,7 @@ type ConfiguredLauncherMarker = {
 };
 
 type OrcaLauncherMarker = {
+  allocationPending?: boolean;
   allocationPid?: number;
   allocationProtocol?: "gated-v1";
   createdAt: string;
@@ -2034,7 +2036,13 @@ export async function startWorkerWithFallback(
       };
     } catch (error) {
       finishAllocation();
-      if (!allocated) await clearAbortWorkerAllocation(allocationId);
+      if (
+        !allocated &&
+        error instanceof PreflightError &&
+        ["auth", "binary-missing", "quota"].includes(error.failureClass)
+      ) {
+        await clearAbortWorkerAllocation(allocationId);
+      }
       if (fence?.aborted) throw error;
       if (!(error instanceof PreflightError)) throw error;
       await orca
@@ -8013,8 +8021,10 @@ async function launchDetachedRun(
   const withLauncherAllocation = async <T>(
     marker: ConfiguredLauncherMarker | OrcaLauncherMarker,
     operation: () => Promise<T>,
-  ): Promise<T> =>
-    await allocationCommands.run(
+  ): Promise<T> => {
+    marker.allocationPending = true;
+    await writeMarker(launcherMarkerFile!, marker);
+    return await allocationCommands.run(
       {
         onExit: async (pid) => {
           if (marker.allocationPid === pid) delete marker.allocationPid;
@@ -8027,6 +8037,13 @@ async function launchDetachedRun(
       },
       operation,
     );
+  };
+  const finishLauncherAllocation = async (
+    marker: ConfiguredLauncherMarker | OrcaLauncherMarker,
+  ): Promise<void> => {
+    delete marker.allocationPending;
+    await writeMarker(launcherMarkerFile!, marker);
+  };
   const cleanupFailedLaunch = async (error: unknown): Promise<void> => {
     const cleanupGate = gate ?? launcherMarker?.gate ?? orcaLauncherMarker?.gate;
     if (launcherMarker && launcherMarkerFile) {
@@ -8084,6 +8101,26 @@ async function launchDetachedRun(
         `Configured coordinator startup failed: ${error instanceof Error ? error.message : String(error)}`,
       );
     } catch {
+      return;
+    }
+    if (
+      launcherMarker?.allocationPending === true ||
+      orcaLauncherMarker?.allocationPending === true
+    ) {
+      const pendingTerminal = terminalHandle || launcherMarker?.terminalHandle;
+      if (
+        pendingTerminal &&
+        (await closeTerminalOrProveStale(
+          pendingTerminal,
+          orcaCommand,
+          repo.root,
+        ))
+      ) {
+        if (launcherMarker) {
+          delete launcherMarker.terminalHandle;
+          await writeMarker(launcherMarkerFile!, launcherMarker).catch(() => {});
+        }
+      }
       return;
     }
     if (
@@ -8161,7 +8198,7 @@ async function launchDetachedRun(
         throw new Error("terminal create returned an invalid receipt");
       }
       launcherMarker.terminalHandle = terminalHandle;
-      await writeMarker(launcherMarkerFile, launcherMarker);
+      await finishLauncherAllocation(launcherMarker);
       const runReceipt = unwrapJson<{ run: { id: string } }>(
         (
           await withLauncherAllocation(launcherMarker, () =>
@@ -8189,7 +8226,7 @@ async function launchDetachedRun(
         runId,
       });
       launcherMarker.runId = runId;
-      await writeMarker(launcherMarkerFile, launcherMarker);
+      await finishLauncherAllocation(launcherMarker);
       intentTaskId = await withLauncherAllocation(launcherMarker, () =>
         configuredOrca!.createTask(stageTaskSpec("intent", intent)),
       );
@@ -8202,7 +8239,7 @@ async function launchDetachedRun(
         root,
         runId,
       };
-      await writeMarker(launcherMarkerFile, launcherMarker);
+      await finishLauncherAllocation(launcherMarker);
       gate = await withLauncherAllocation(launcherMarker, () =>
         createGateWorktree(repo, orcaCommand, {
           branch: gateBranch,
@@ -8212,7 +8249,7 @@ async function launchDetachedRun(
         }),
       );
       launcherMarker.gateAllocated = true;
-      await writeMarker(launcherMarkerFile, launcherMarker);
+      await finishLauncherAllocation(launcherMarker);
     } catch (error) {
       await cleanupFailedLaunch(error);
       throw error;
@@ -8244,7 +8281,7 @@ async function launchDetachedRun(
       }
       gate = allocatedGate;
       orcaLauncherMarker.gate = allocatedGate;
-      await writeMarker(launcherMarkerFile, orcaLauncherMarker);
+      await finishLauncherAllocation(orcaLauncherMarker);
     } catch (error) {
       await cleanupFailedLaunch(error);
       throw error;
@@ -8605,19 +8642,27 @@ async function coordinatorIsLive(
     ) {
       return true;
     }
+    let receiptMissing = false;
     let receiptText: string;
     try {
       receiptText = await readFile(startupReceiptPath(markerFile), "utf8");
     } catch (error) {
-      return (error as NodeJS.ErrnoException).code !== "ENOENT";
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return true;
+      if (typeof marker.terminalHandle !== "string") return false;
+      // A successful terminal send can race the shell's first receipt write.
+      // Fall through so the attached terminal remains the custody proof.
+      receiptMissing = true;
+      receiptText = "";
     }
     const receiptPid = startupReceiptPid(receiptText, startupReceipt);
-    if (receiptPid === undefined) return true;
-    try {
-      process.kill(receiptPid, 0);
-      return true;
-    } catch (error) {
-      return (error as NodeJS.ErrnoException).code !== "ESRCH";
+    if (receiptPid === undefined && !receiptMissing) return true;
+    if (receiptPid !== undefined) {
+      try {
+        process.kill(receiptPid, 0);
+        return true;
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code !== "ESRCH";
+      }
     }
   }
   if (typeof marker.terminalHandle === "string") {
@@ -8794,7 +8839,10 @@ async function reapConfiguredGate(
     );
     return false;
   }
-  if (await coordinatorIsLive(marker, orcaCommand, repoRoot, markerFile)) {
+  if (
+    marker.cleanupPending !== true &&
+    (await coordinatorIsLive(marker, orcaCommand, repoRoot, markerFile))
+  ) {
     console.error(
       `no-mistakes: retained gate workspace ${gate.path}; its coordinator is still live`,
     );
@@ -9030,6 +9078,8 @@ async function reapConfiguredLauncher(
       ) ||
     typeof marker.pid !== "number" ||
     marker.pid <= 0 ||
+    (marker.allocationPending !== undefined &&
+      typeof marker.allocationPending !== "boolean") ||
     (marker.allocationPid !== undefined &&
       (!Number.isInteger(marker.allocationPid) || marker.allocationPid <= 0)) ||
     (marker.runId !== undefined &&
@@ -9066,10 +9116,12 @@ async function reapConfiguredLauncher(
   if (discovered === undefined) return false;
   if (
     discovered.runId !== marker.runId ||
-    discovered.terminalHandle !== marker.terminalHandle
+    discovered.terminalHandle !== marker.terminalHandle ||
+    marker.allocationPending === true
   ) {
     marker.runId = discovered.runId;
     marker.terminalHandle = discovered.terminalHandle;
+    delete marker.allocationPending;
     try {
       await writeMarker(markerFile, marker);
     } catch {
@@ -9170,6 +9222,8 @@ async function reapOrcaLauncher(
       ) ||
     typeof marker.pid !== "number" ||
     marker.pid <= 0 ||
+    (marker.allocationPending !== undefined &&
+      typeof marker.allocationPending !== "boolean") ||
     (marker.allocationPid !== undefined &&
       (!Number.isInteger(marker.allocationPid) || marker.allocationPid <= 0)) ||
     (await coordinatorIsLive({ pid: marker.pid }, orcaCommand, repoRoot))
@@ -9190,6 +9244,14 @@ async function reapOrcaLauncher(
   if (worktrees === undefined) return false;
   const origin = worktrees.find((worktree) => worktree.path === repoRoot);
   if (typeof origin?.id !== "string") return false;
+  if (marker.allocationPending === true) {
+    delete marker.allocationPending;
+    try {
+      await writeMarker(markerFile, marker);
+    } catch {
+      return false;
+    }
+  }
   const originId = origin.id;
   const markerHasNamespace = marker.gateBranch.includes("/");
   const matches = worktrees.filter(

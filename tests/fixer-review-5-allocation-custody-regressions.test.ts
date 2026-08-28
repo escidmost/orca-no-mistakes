@@ -15,9 +15,13 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import { PreflightError } from "../scripts/adapters.ts";
 import {
   DomainLedger,
+  installAbortReaping,
   main,
+  startWorkerWithFallback,
+  type OrcaOperations,
 } from "../scripts/orca-no-mistakes.ts";
 
 function git(cwd: string, ...args: string[]): string {
@@ -95,6 +99,47 @@ test("gate removal retains allocation custody", async () => {
   assert.match(boundary, /marker\.workerAllocations\.length > 0/);
   assert.match(boundary, /"workerAllocationPids" in marker/);
   assert.match(boundary, /Object\.keys\(marker\.workerAllocationPids\)\.length > 0/);
+});
+
+test("malformed worker receipts retain allocation custody", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-worker-allocation-receipt-"));
+  const origin = path.join(temp, "origin");
+  await mkdir(path.join(origin, ".orca", "no-mistakes"), { recursive: true });
+  const gate = {
+    branch: "gate-allocation-receipt",
+    id: `repo::${path.join(temp, "gate")}`,
+    kind: "orca" as const,
+    path: path.join(temp, "gate"),
+  };
+  const orca = {
+    async completeTask() {},
+    async startWorker() {
+      throw new PreflightError("unclassified", "terminal create returned an invalid receipt");
+    },
+  } as unknown as OrcaOperations;
+  try {
+    await installAbortReaping({ gate, orca, originWorktree: origin, pid: process.pid });
+    await assert.rejects(
+      startWorkerWithFallback(orca, async () => "task", [
+        {
+          commitOid: "a".repeat(40),
+          name: "allocation-receipt",
+          prompt: "work",
+          role: "reviewer",
+          stage: "review",
+          worktree: "new-child",
+        },
+      ]),
+      /invalid receipt/,
+    );
+    const marker = JSON.parse(
+      await readFile(markerPath(origin, gate.id), "utf8"),
+    ) as { workerAllocations?: string[] };
+    assert.equal(marker.workerAllocations?.length, 1);
+  } finally {
+    await installAbortReaping({ pid: process.pid });
+    await rm(temp, { force: true, recursive: true });
+  }
 });
 
 test("allocation discovery refreshes snapshots after PID quiescence", async () => {

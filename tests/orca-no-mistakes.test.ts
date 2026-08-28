@@ -2244,8 +2244,12 @@ if (args[0] === 'terminal' && args[1] === 'send') {
 }
 const result = args[0] === 'orchestration' && args[1] === 'run-create'
   ? { run: { id: 'configured-run' } }
+  : args[0] === 'orchestration' && args[1] === 'run-list'
+    ? { runs: [] }
   : args[0] === 'orchestration' && args[1] === 'task-create'
     ? { task: { id: 'task-intent' } }
+    : args[0] === 'terminal' && args[1] === 'list'
+      ? { terminals: [] }
     : args[0] === 'terminal' && args[1] === 'create'
       ? fs.existsSync(${JSON.stringify(failTerminalCreate)})
         ? { accepted: true }
@@ -2312,8 +2316,25 @@ console.log(JSON.stringify({ result }))
     );
     assert.deepEqual(await readdir(root), []);
     assert.equal(git(repo, "branch", "--list", "no-mistakes-gate-*"), "");
-
+    const markerDirectory = path.join(repo, ".orca", "no-mistakes");
+    const [launcherMarker] = (await readdir(markerDirectory)).filter((name) =>
+      name.endsWith(".json"),
+    );
+    assert.ok(launcherMarker);
+    const launcherMarkerPath = path.join(markerDirectory, launcherMarker);
+    const launcher = JSON.parse(await readFile(launcherMarkerPath, "utf8")) as {
+      pid: number;
+    };
+    launcher.pid = 2_147_483_647;
+    await writeFile(launcherMarkerPath, JSON.stringify(launcher));
     await rm(failTerminalCreate, { force: true });
+    await main(["prune", "--stranded", `--repo=${repo}`]);
+    assert.equal(
+      (await readdir(markerDirectory)).filter((name) => name.endsWith(".json"))
+        .length,
+      0,
+    );
+
     await writeFile(failTerminalShow, "");
     await writeFile(failSettlement, "");
     await assert.rejects(

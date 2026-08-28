@@ -167,9 +167,17 @@ test("configured launch is discoverable before its first allocation", async () =
         root: seeded.root,
       },
     );
-    assert.deepEqual(await readdir(path.join(seeded.repo, ".orca", "no-mistakes")), [
-      ".gitkeep",
-    ]);
+    const markerDirectory = path.join(seeded.repo, ".orca", "no-mistakes");
+    const [pendingMarker] = (await readdir(markerDirectory)).filter((name) =>
+      name.endsWith(".json"),
+    );
+    assert.ok(pendingMarker);
+    assert.equal(
+      (JSON.parse(
+        await readFile(path.join(markerDirectory, pendingMarker), "utf8"),
+      ) as { allocationPending?: boolean }).allocationPending,
+      true,
+    );
   } finally {
     restoreEnv("ONM_CAPTURE_MARKER", previousCapture);
     restoreEnv("ORCA_CLI_COMMAND", previousCommand);

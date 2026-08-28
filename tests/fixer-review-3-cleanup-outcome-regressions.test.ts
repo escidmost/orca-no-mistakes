@@ -82,6 +82,8 @@ if (args[0] === "worktree" && args[1] === "list") out({ worktrees: [{
   branch: "refs/heads/feature",
   head: ${JSON.stringify(gateHead)}
 }] })
+else if (args[0] === "orchestration" && args[1] === "task-list") out({ tasks: [{ id: "task-failed", status: "ready" }] })
+else if (args[0] === "orchestration" && args[1] === "task-update") out({ task: { id: "task-failed", status: "failed" } })
 else out({ accepted: true })
 `,
   );
@@ -151,7 +153,7 @@ for (const status of ["passed", "failed"] as const) {
         .map((line) => JSON.parse(line) as string[]);
       assert.equal(
         calls.some((args) => args[0] === "orchestration"),
-        false,
+        status === "failed",
       );
     } finally {
       seeded.restore();

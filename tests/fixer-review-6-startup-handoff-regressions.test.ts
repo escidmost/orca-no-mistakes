@@ -150,7 +150,7 @@ test("startup receipts distinguish idle shells from dispatched coordinators", as
     source,
     /const coordinatorCommand = `\$\{receiptCommand\} && exec env /u,
   );
-  await pruneStartupReceipt("before-send", undefined, false);
+  await pruneStartupReceipt("sent-before-receipt", undefined, true);
   await pruneStartupReceipt(
     "live-dispatch",
     { pid: process.pid, token: RECEIPT },
