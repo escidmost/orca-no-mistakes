@@ -839,19 +839,6 @@ export async function reapAbortedRun(reason: string): Promise<void> {
       `warning: abort could not anchor recovery commits: ${String(error)}`,
     );
   }
-  if (
-    preserved &&
-    abortReap.orca instanceof CliOrca
-  ) {
-    try {
-      await abortReap.orca.failRun(`Coordinator aborted: ${reason}`);
-    } catch (error) {
-      abortLog(
-        `warning: abort could not settle the Orca run: ${String(error)}`,
-      );
-      preserved = false;
-    }
-  }
   let cancelled = abortReap.runId === undefined;
   let settled = abortReap.runId === undefined;
   if (preserved && abortReap.ledger && abortReap.runId) {
@@ -864,6 +851,16 @@ export async function reapAbortedRun(reason: string): Promise<void> {
         `warning: abort could not settle the run: ${String(error)}`,
       );
       settled = false;
+    }
+  }
+  if (preserved && cancelled && abortReap.orca instanceof CliOrca) {
+    try {
+      await abortReap.orca.failRun(`Coordinator aborted: ${reason}`);
+    } catch (error) {
+      abortLog(
+        `warning: abort could not settle the Orca run: ${String(error)}`,
+      );
+      preserved = false;
     }
   }
   if (cancelled && abortReap.notify) {
@@ -8685,8 +8682,19 @@ async function reapConfiguredGate(
     return false;
   }
   const run = ledger.runIdentity(gate.runId);
-  const retrying = run?.status === "cancelled";
   const settleConfiguredRun = async (): Promise<boolean> => {
+    if (
+      run?.status === "in-progress" &&
+      !ledger.settleRun(gate.runId, "cancelled", {
+        branch: run.branch,
+        repoRoot,
+      })
+    ) {
+      console.error(
+        `no-mistakes: retained gate workspace ${gate.path}; its run ownership changed before cancellation`,
+      );
+      return false;
+    }
     if (run !== undefined && run.status !== "in-progress") return true;
     try {
       await new CliOrca({
@@ -8706,8 +8714,7 @@ async function reapConfiguredGate(
   if (
     run !== undefined &&
     (run.repo_root !== repoRoot ||
-      origin?.branch !== `refs/heads/${run.branch.replace(/^refs\/heads\//, "")}` ||
-      (actualGate !== undefined && run.status !== "in-progress" && !retrying))
+      origin?.branch !== `refs/heads/${run.branch.replace(/^refs\/heads\//, "")}`)
   ) {
     console.error(
       `no-mistakes: retained gate workspace ${gate.path}; its run does not own this repository and branch`,
@@ -8794,12 +8801,7 @@ async function reapConfiguredGate(
       (launcher?.gateAllocated === true &&
         (recovered.code !== 0 ||
           !COMMIT_OID.test(recovered.stdout.trim()))) ||
-      !(await settleConfiguredRun()) ||
-      (run?.status === "in-progress" &&
-        !ledger.settleRun(gate.runId, "cancelled", {
-          branch: run.branch,
-          repoRoot,
-        }))
+      !(await settleConfiguredRun())
     ) {
       console.error(
         `no-mistakes: retained gate workspace ${gate.path}; completed cleanup could not be verified`,
@@ -8831,19 +8833,6 @@ async function reapConfiguredGate(
     return false;
   }
   if (!(await settleConfiguredRun())) return false;
-  if (
-    run !== undefined &&
-    !retrying &&
-    !ledger.settleRun(gate.runId, "cancelled", {
-      branch: run.branch,
-      repoRoot,
-    })
-  ) {
-    console.error(
-      `no-mistakes: retained gate workspace ${gate.path}; its run ownership changed before cancellation`,
-    );
-    return false;
-  }
   if (
     !(await removeGateWorktree(
       gate,
@@ -9640,10 +9629,7 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
             (run.repo_root !== repoRoot ||
               typeof origin.branch !== "string" ||
               origin.branch.replace(/^refs\/heads\//, "") !==
-                run.branch.replace(/^refs\/heads\//, "") ||
-              (actualGate !== undefined &&
-                run.status !== "in-progress" &&
-                !retrying)))
+                run.branch.replace(/^refs\/heads\//, "")))
         ) {
           retained += 1;
           console.error(
@@ -9939,18 +9925,33 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
             );
             continue;
           }
-          try {
-            await new CliOrca({
-              command: orcaCommand,
-              cwd: repoRoot,
-              runId,
-            }).failRun("Coordinator terminated before cleanup completed");
-          } catch (error) {
+          if (
+            run?.status === "in-progress" &&
+            !ledger.settleRun(runId, "cancelled", {
+              branch: run.branch,
+              repoRoot,
+            })
+          ) {
             retained += 1;
             console.error(
-              `no-mistakes: retained gate workspace ${gate.path}; its Orca run could not be settled: ${String(error)}`,
+              `no-mistakes: retained gate workspace ${gate.path}; its run ownership changed before cancellation`,
             );
             continue;
+          }
+          if (run?.status !== "passed" && run?.status !== "failed") {
+            try {
+              await new CliOrca({
+                command: orcaCommand,
+                cwd: repoRoot,
+                runId,
+              }).failRun("Coordinator terminated before cleanup completed");
+            } catch (error) {
+              retained += 1;
+              console.error(
+                `no-mistakes: retained gate workspace ${gate.path}; its Orca run could not be settled: ${String(error)}`,
+              );
+              continue;
+            }
           }
         } else {
           // No run to anchor to: only a branch already contained in HEAD
@@ -9968,20 +9969,6 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
             );
             continue;
           }
-        }
-        if (
-          runId !== undefined &&
-          run !== undefined &&
-          !ledger.settleRun(runId, "cancelled", {
-            branch: run.branch,
-            repoRoot,
-          })
-        ) {
-          retained += 1;
-          console.error(
-            `no-mistakes: retained gate workspace ${gate.path}; its run ownership changed before cancellation`,
-          );
-          continue;
         }
         // Orca cannot conditionally remove atomically, so stranded cleanup
         // removes WITHOUT --force: Orca's own removal path then verifies the
