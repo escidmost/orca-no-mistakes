@@ -8758,10 +8758,7 @@ async function reapConfiguredGate(
     );
     return false;
   }
-  if (
-    marker.cleanupPending !== true &&
-    (await coordinatorIsLive(marker, orcaCommand, repoRoot, markerFile))
-  ) {
+  if (await coordinatorIsLive(marker, orcaCommand, repoRoot, markerFile)) {
     console.error(
       `no-mistakes: retained gate workspace ${gate.path}; its coordinator is still live`,
     );
@@ -8908,6 +8905,7 @@ async function reapConfiguredGate(
       { allowFailure: true },
     );
     if (
+      actualGate !== undefined ||
       (launcher?.gateAllocated === true &&
         (recovered.code !== 0 ||
           !COMMIT_OID.test(recovered.stdout.trim()))) ||
@@ -9851,7 +9849,10 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
               continue;
             }
           }
-          if (run?.status === "cancelled" && runId !== undefined) {
+          if (
+            (run?.status === "cancelled" || run?.status === "failed") &&
+            runId !== undefined
+          ) {
             try {
               await new CliOrca({
                 command: orcaCommand,
@@ -10068,7 +10069,7 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
             );
             continue;
           }
-          if (run?.status !== "passed" && run?.status !== "failed") {
+          if (run?.status !== "passed") {
             try {
               await new CliOrca({
                 command: orcaCommand,
@@ -10418,14 +10419,12 @@ Prune options:
       try {
         await orca.failRun(`Coordinator failed: ${message}`);
       } catch (settlementError) {
-        if (gate.kind === "configured") {
-          retainGate = true;
-          await markGateCleanupPending().catch((markerError) =>
-            console.error(
-              `warning: configured run settlement failed (${String(settlementError)}) and its cleanup marker could not be refreshed: ${String(markerError)}`,
-            ),
-          );
-        }
+        retainGate = true;
+        await markGateCleanupPending().catch((markerError) =>
+          console.error(
+            `warning: run settlement failed (${String(settlementError)}) and its cleanup marker could not be refreshed: ${String(markerError)}`,
+          ),
+        );
       }
     }
     await orca.notifyRunResult(
