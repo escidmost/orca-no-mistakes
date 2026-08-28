@@ -7819,6 +7819,32 @@ async function removeGateWorktree(
   force = true,
 ): Promise<boolean> {
   if (!COMMIT_OID.test(preservedOid)) return false;
+  const cleanupMarkerFile =
+    markerFile ?? gateMarkerPath(originWorktree, gateMarkerId(gate));
+  try {
+    const marker: unknown = JSON.parse(
+      await readFile(cleanupMarkerFile, "utf8"),
+    );
+    if (
+      typeof marker !== "object" ||
+      marker === null ||
+      Array.isArray(marker) ||
+      ("workers" in marker &&
+        (!Array.isArray(marker.workers) || marker.workers.length > 0))
+    ) {
+      console.error(
+        `warning: refused to remove gate worktree ${gate.path}; its cleanup marker still records worker resources`,
+      );
+      return false;
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.error(
+        `warning: refused to remove gate worktree ${gate.path}; its cleanup marker could not be read: ${String(error)}`,
+      );
+      return false;
+    }
+  }
   const branchRef = `refs/heads/${gate.branch}`;
   let removed: CommandResult;
   if (gate.kind === "orca") {
@@ -7933,7 +7959,7 @@ async function removeGateWorktree(
   // describes still exists so prune --stranded can still identify it.
   if (gate.kind === "configured") return true;
   return await removeGateMarker(
-    markerFile ?? gateMarkerPath(originWorktree, gateMarkerId(gate)),
+    cleanupMarkerFile,
     gate,
   );
 }
