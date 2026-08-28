@@ -105,6 +105,24 @@ if (args[0] === 'terminal' && args[1] === 'create') {
         .map((line) => JSON.parse(line) as string[]);
       const scenarioCalls = calls.slice(callCount);
       callCount = calls.length;
+      assert.ok(
+        scenarioCalls.some(
+          (args) => args[0] === "terminal" && args[1] === "close",
+        ),
+      );
+      assert.deepEqual(await readdir(root), []);
+      if (mode === "invalid-run") {
+        assert.equal(await readdir(temp).then((entries) => entries.includes("escaped")), false);
+        assert.equal(
+          scenarioCalls.some((args) =>
+            args.some(
+              (arg, index) => arg === "--run" && args[index + 1] === runId,
+            ),
+          ),
+          false,
+        );
+        continue;
+      }
       const listed = scenarioCalls.find(
         (args) => args[0] === "orchestration" && args[1] === "task-list",
       );
@@ -117,12 +135,6 @@ if (args[0] === 'terminal' && args[1] === 'create') {
       );
       assert.equal(failed?.[failed.indexOf("--id") + 1], failedTask);
       assert.equal(failed?.[failed.indexOf("--run") + 1], runId);
-      assert.ok(
-        scenarioCalls.some(
-          (args) => args[0] === "terminal" && args[1] === "close",
-        ),
-      );
-      assert.deepEqual(await readdir(root), []);
     }
   } finally {
     for (const name of environmentNames) {

@@ -1,12 +1,16 @@
 #!/usr/bin/env node
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readdirSync } from "node:fs";
 import {
   chmod,
+  lstat,
   mkdir,
+  open,
   readFile,
+  readdir,
   realpath,
   rename,
   rm,
@@ -140,11 +144,19 @@ export type WorkerResult = {
   dispatchId: string;
   failedOutcome?: boolean;
   report: StageReport;
+  shutdownConfirmed?: boolean;
   taskId: string;
   terminalHandle?: string;
+  worktreeBranch?: string;
   worktreeId?: string;
   worktreePath?: string;
 };
+
+type WorkerRegistration = (() => void | Promise<void>) & {
+  abortOwnsCleanup?: () => boolean;
+  ready?: Promise<void>;
+};
+type WorkerAllocated = (worker: WorkerResult) => WorkerRegistration;
 
 export interface OrcaOperations {
   createRun(objective: string): Promise<string>;
@@ -152,20 +164,23 @@ export interface OrcaOperations {
     spec: string,
     options?: { deps?: string[]; parent?: string },
   ): Promise<string>;
-  // Implementations must synchronously settle every resource a failed launch
-  // created (close terminals, remove created worktrees, abandon dispatches)
-  // before rejecting, so the fallback chain can start the next candidate
-  // immediately after the rejection.
+  // Implementations settle every resource a failed launch created before
+  // rejecting unless abort handling owns the registered allocation.
   startWorker(
     taskId: string,
     launch: WorkerLaunch,
     fence?: TimeoutFence,
+    onAllocated?: WorkerAllocated,
   ): Promise<WorkerResult>;
   finishWorker(
     worker: WorkerResult,
     disposition: "release" | "retain",
   ): Promise<void>;
-  removeWorktree(worktreeId: string): Promise<void>;
+  removeWorktree(
+    worktreeId: string,
+    worktreeBranch?: string,
+    force?: boolean,
+  ): Promise<void>;
   completeTask(taskId: string, report: StageReport): Promise<void>;
   createGate(
     taskId: string,
@@ -254,6 +269,59 @@ function recoveryRefFor(runId: string): string {
   return `refs/no-mistakes/recover/${runId}`;
 }
 
+const COMMIT_OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
+
+async function anchorRecoveryCommit(
+  repoRoot: string,
+  runId: string,
+  oid: string,
+): Promise<void> {
+  if (!RUN_ID_PATTERN.test(runId) || !COMMIT_OID.test(oid)) {
+    throw new Error("recovery custody identifiers are invalid");
+  }
+  const ref = recoveryRefFor(runId);
+  const current = await command(
+    "git",
+    ["-C", repoRoot, "rev-parse", "--verify", ref],
+    repoRoot,
+    { allowFailure: true },
+  );
+  const currentOid = current.stdout.trim();
+  if (current.code === 0) {
+    if (!COMMIT_OID.test(currentOid)) {
+      throw new Error(`recovery ref ${ref} resolved to an invalid commit`);
+    }
+    if (currentOid === oid) return;
+    const contained = await command(
+      "git",
+      ["-C", repoRoot, "merge-base", "--is-ancestor", currentOid, oid],
+      repoRoot,
+      { allowFailure: true },
+    );
+    if (contained.code !== 0) {
+      throw new Error(`recovery ref ${ref} has divergent custody`);
+    }
+  }
+  const anchored = await command(
+    "git",
+    [
+      "-C",
+      repoRoot,
+      "update-ref",
+      ref,
+      oid,
+      current.code === 0 ? currentOid : "0".repeat(oid.length),
+    ],
+    repoRoot,
+    { allowFailure: true },
+  );
+  if (anchored.code !== 0) {
+    throw new Error(
+      `could not anchor recovery ref ${ref}: ${`${anchored.stdout}${anchored.stderr}`.trim()}`,
+    );
+  }
+}
+
 function recoveryInstructions(recoverRef: string): string {
   return (
     `pipeline commits preserved at ${recoverRef} — inspect with \`git log ${recoverRef}\`, ` +
@@ -262,6 +330,691 @@ function recoveryInstructions(recoverRef: string): string {
 }
 
 export class GateStopError extends Error {}
+
+// --- Abort reaping ---------------------------------------------------------
+// A coordinator owns its worker terminals, its gate worktree/branch, and the
+// branch lease. Closing or signalling its terminal kills only the coordinator
+// process, so those resources used to outlive the run. The registry below
+// tracks everything the run still holds; a signal handler reaps it all,
+// anchors the recovery ref, and only then exits. The marker file under
+// .orca/no-mistakes/ lets a later `prune --stranded` tell a dead run's
+// leftover gate workspace from a live one's without guessing.
+
+type GateWorktree =
+  | { branch: string; id: string; kind: "orca"; path: string }
+  | {
+      branch: string;
+      intentTaskId: string;
+      kind: "configured";
+      path: string;
+      root: string;
+      runId: string;
+    };
+
+type GateRunMarker = {
+  allocationProtocol?: "gated-v1";
+  cleanupPending?: boolean;
+  createdAt: string;
+  gate: GateWorktree;
+  launcherPid?: number;
+  originWorktree: string;
+  pid?: number;
+  runId?: string;
+  startupReceipt?: string;
+  terminalHandle?: string;
+  workerAllocations?: string[];
+  workerAllocationPids?: Record<string, number[]>;
+  workers?: WorkerResource[];
+};
+
+type ConfiguredLauncherMarker = {
+  allocationPid?: number;
+  allocationProtocol?: "gated-v1";
+  cleanupPending?: boolean;
+  createdAt: string;
+  gate?: Extract<GateWorktree, { kind: "configured" }>;
+  gateAllocated?: boolean;
+  intentTaskId?: string;
+  kind: "configured-launcher";
+  launcherId: string;
+  originWorktree: string;
+  pid: number;
+  root: string;
+  runObjective: string;
+  runId?: string;
+  terminalHandle?: string;
+  terminalTitle: string;
+};
+
+type OrcaLauncherMarker = {
+  allocationPid?: number;
+  allocationProtocol?: "gated-v1";
+  createdAt: string;
+  gate?: Extract<GateWorktree, { kind: "orca" }>;
+  gateBranch: string;
+  kind: "orca-launcher";
+  launcherId: string;
+  originWorktree: string;
+  pid: number;
+};
+
+type WorkerResource = Pick<
+  WorkerResult,
+  | "dispatchId"
+  | "taskId"
+  | "terminalHandle"
+  | "worktreeBranch"
+  | "worktreeId"
+  | "worktreePath"
+>;
+
+function isConfiguredLauncherMarker(
+  marker: GateRunMarker | ConfiguredLauncherMarker | OrcaLauncherMarker,
+): marker is ConfiguredLauncherMarker {
+  return (marker as ConfiguredLauncherMarker).kind === "configured-launcher";
+}
+
+function isOrcaLauncherMarker(
+  marker: GateRunMarker | ConfiguredLauncherMarker | OrcaLauncherMarker,
+): marker is OrcaLauncherMarker {
+  return (marker as OrcaLauncherMarker).kind === "orca-launcher";
+}
+
+type AbortReapState = {
+  cleanupPending?: boolean;
+  deliveryGit?: GitOperations;
+  gate?: GateWorktree;
+  git?: GitOperations;
+  launcherPid?: number;
+  ledger?: DomainLedger;
+  notify?: (summary: string) => Promise<void>;
+  orca?: OrcaOperations;
+  orcaCommand?: string;
+  originWorktree?: string;
+  pid?: number;
+  runId?: string;
+  startupReceipt?: string;
+  terminalHandle?: string;
+  workerAllocations: Set<string>;
+  workerAllocationPids: Map<string, Set<number>>;
+  workers: Set<WorkerResult>;
+};
+
+const abortReap: AbortReapState = {
+  workerAllocations: new Set(),
+  workerAllocationPids: new Map(),
+  workers: new Set(),
+};
+const abortAllocations = new Set<Promise<void>>();
+const workerStops = new WeakMap<WorkerResult, () => Promise<void>>();
+let abortReapStarted = false;
+let abortHandlersInstalled = false;
+let abortRequested = false;
+let gateMutationTail = Promise.resolve();
+
+async function withGateMutation<T>(
+  operation: () => Promise<T>,
+  allowAfterAbort = false,
+): Promise<T> {
+  let unlock!: () => void;
+  const previous = gateMutationTail;
+  gateMutationTail = new Promise<void>((resolve) => {
+    unlock = resolve;
+  });
+  await previous;
+  try {
+    if (abortRequested && !allowAfterAbort) {
+      throw new GateStopError("the run was aborted");
+    }
+    return await operation();
+  } finally {
+    unlock();
+  }
+}
+
+function abortLog(message: string): void {
+  // The terminal that signalled us may already be gone; logging must never
+  // crash the reap.
+  try {
+    console.error(message);
+  } catch {}
+}
+
+async function unregisterAbortWorker(worker: WorkerResult): Promise<void> {
+  if (!abortReap.workers.delete(worker)) return;
+  await refreshGateMarker();
+}
+
+function registerAbortWorker(
+  worker: WorkerResult,
+  allocationId: string,
+): WorkerRegistration {
+  abortReap.workers.add(worker);
+  abortReap.workerAllocations.delete(allocationId);
+  abortReap.workerAllocationPids.delete(allocationId);
+  const ready = refreshGateMarker().catch((error) => {
+    abortReap.workers.delete(worker);
+    abortReap.workerAllocations.add(allocationId);
+    throw error;
+  });
+  return Object.assign(() => unregisterAbortWorker(worker), {
+    abortOwnsCleanup: () => abortRequested,
+    ready,
+  });
+}
+
+async function registerAbortWorkerAllocation(allocationId: string): Promise<void> {
+  abortReap.workerAllocations.add(allocationId);
+  try {
+    await refreshGateMarker();
+  } catch (error) {
+    abortReap.workerAllocations.delete(allocationId);
+    throw error;
+  }
+}
+
+async function clearAbortWorkerAllocation(allocationId: string): Promise<void> {
+  if (!abortReap.workerAllocations.delete(allocationId)) return;
+  const pids = abortReap.workerAllocationPids.get(allocationId);
+  abortReap.workerAllocationPids.delete(allocationId);
+  try {
+    await refreshGateMarker();
+  } catch (error) {
+    abortReap.workerAllocations.add(allocationId);
+    if (pids) abortReap.workerAllocationPids.set(allocationId, pids);
+    throw error;
+  }
+}
+
+async function recordAbortAllocationPid(
+  allocationId: string,
+  pid: number,
+): Promise<void> {
+  const pids = abortReap.workerAllocationPids.get(allocationId) ?? new Set();
+  pids.add(pid);
+  abortReap.workerAllocationPids.set(allocationId, pids);
+  try {
+    await refreshGateMarker();
+  } catch (error) {
+    pids.delete(pid);
+    if (pids.size === 0) abortReap.workerAllocationPids.delete(allocationId);
+    throw error;
+  }
+}
+
+async function clearAbortAllocationPid(
+  allocationId: string,
+  pid: number,
+): Promise<void> {
+  const pids = abortReap.workerAllocationPids.get(allocationId);
+  if (!pids?.delete(pid)) return;
+  if (pids.size === 0) abortReap.workerAllocationPids.delete(allocationId);
+  try {
+    await refreshGateMarker();
+  } catch (error) {
+    pids.add(pid);
+    abortReap.workerAllocationPids.set(allocationId, pids);
+    throw error;
+  }
+}
+
+function abortOwnsWorkerCleanup(
+  registration: WorkerRegistration | undefined,
+): boolean {
+  return registration?.abortOwnsCleanup?.() === true;
+}
+
+function beginAbortAllocation(): () => void {
+  if (abortRequested) throw new GateStopError("the run was aborted");
+  let resolve!: () => void;
+  const allocation = new Promise<void>((done) => {
+    resolve = done;
+  });
+  abortAllocations.add(allocation);
+  let pending = true;
+  return () => {
+    if (!pending) return;
+    pending = false;
+    abortAllocations.delete(allocation);
+    resolve();
+  };
+}
+
+async function anchorAbortWorkerTips(
+  workers: WorkerResult[],
+  runId: string,
+  sourceGit: GitOperations,
+  recoveryGit: GitOperations,
+): Promise<Error[]> {
+  const failures: Error[] = [];
+  for (const worker of workers) {
+    try {
+      if (worker.worktreeId && !worker.worktreePath) {
+        throw new Error(
+          `worker ${worker.dispatchId} has no worktree path to preserve`,
+        );
+      }
+      if (!worker.worktreePath) continue;
+      const workerRunId = workerRecoveryRunId(runId, worker.dispatchId);
+      await recoveryGit.anchorRecoveryRef(
+        workerRunId,
+        await sourceGit.headOf(worker.worktreePath),
+      );
+    } catch (error) {
+      failures.push(
+        new Error(
+          `could not preserve worker ${worker.dispatchId}: ${String(error)}`,
+        ),
+      );
+    }
+  }
+  return failures;
+}
+
+function workerRecoveryRunId(runId: string, dispatchId: string): string {
+  return `${runId}-worker-${createHash("sha256")
+    .update(dispatchId)
+    .digest("hex")
+    .slice(0, 16)}`;
+}
+
+async function stopAbortWorkers(
+  workers: WorkerResult[],
+  orca: OrcaOperations | undefined,
+): Promise<Error[]> {
+  if (!orca && workers.length > 0) {
+    return [new Error("worker adapter is unavailable")];
+  }
+  const failures: Error[] = [];
+  for (const worker of workers) {
+    try {
+      await orca!.finishWorker(worker, "release");
+    } catch (error) {
+      failures.push(
+        new Error(
+          `could not stop worker ${worker.dispatchId}: ${String(error)}`,
+        ),
+      );
+    }
+  }
+  return failures;
+}
+
+function gateMarkerPath(originWorktree: string, gateId: string): string {
+  return path.join(
+    originWorktree,
+    ".orca",
+    "no-mistakes",
+    `gate-${createHash("sha256").update(gateId).digest("hex").slice(0, 32)}.json`,
+  );
+}
+
+function startupReceiptPath(markerPath: string): string {
+  return `${markerPath}.startup`;
+}
+
+function gateMarkerId(gate: GateWorktree): string {
+  return gate.kind === "orca" ? gate.id : gate.path;
+}
+
+function configuredLauncherTitle(launcherId: string): string {
+  return `no-mistakes-launcher-${launcherId}`;
+}
+
+function configuredLauncherObjective(
+  launcherId: string,
+  intent: string,
+): string {
+  return `[no-mistakes-launcher:${launcherId}] ${intent}`;
+}
+
+async function refreshGateMarker(): Promise<void> {
+  const { gate, originWorktree } = abortReap;
+  if (!gate || !originWorktree) return;
+  const markerPath = gateMarkerPath(originWorktree, gateMarkerId(gate));
+  let createdAt = new Date().toISOString();
+  let terminalHandle = abortReap.terminalHandle;
+  try {
+    const existing = JSON.parse(await readFile(markerPath, "utf8")) as Partial<GateRunMarker>;
+    if (typeof existing.createdAt === "string") createdAt = existing.createdAt;
+    if (terminalHandle === undefined && typeof existing.terminalHandle === "string") {
+      terminalHandle = existing.terminalHandle;
+    }
+  } catch {}
+  const marker: GateRunMarker = { createdAt, gate, originWorktree };
+  if (abortReap.cleanupPending === true) marker.cleanupPending = true;
+  if (abortReap.launcherPid !== undefined)
+    marker.launcherPid = abortReap.launcherPid;
+  if (abortReap.pid !== undefined) marker.pid = abortReap.pid;
+  if (abortReap.runId !== undefined) marker.runId = abortReap.runId;
+  if (abortReap.startupReceipt !== undefined)
+    marker.startupReceipt = abortReap.startupReceipt;
+  if (terminalHandle !== undefined) marker.terminalHandle = terminalHandle;
+  if (abortReap.workerAllocations.size > 0) {
+    marker.allocationProtocol = "gated-v1";
+    marker.workerAllocations = [...abortReap.workerAllocations];
+    const pids = Object.fromEntries(
+      [...abortReap.workerAllocationPids]
+        .filter(([, values]) => values.size > 0)
+        .map(([allocationId, values]) => [allocationId, [...values]]),
+    );
+    if (Object.keys(pids).length > 0) marker.workerAllocationPids = pids;
+  }
+  const workers = [...abortReap.workers].map(
+    ({
+      dispatchId,
+      taskId,
+      terminalHandle: workerTerminalHandle,
+      worktreeBranch,
+      worktreeId,
+      worktreePath,
+    }): WorkerResource => ({
+      dispatchId,
+      taskId,
+      ...(workerTerminalHandle ? { terminalHandle: workerTerminalHandle } : {}),
+      ...(worktreeBranch ? { worktreeBranch } : {}),
+      ...(worktreeId ? { worktreeId } : {}),
+      ...(worktreePath ? { worktreePath } : {}),
+    }),
+  );
+  if (workers.length > 0) marker.workers = workers;
+  await writeMarker(markerPath, marker);
+}
+
+async function writeMarker(
+  markerPath: string,
+  marker: GateRunMarker | ConfiguredLauncherMarker | OrcaLauncherMarker,
+): Promise<void> {
+  const temporaryPath = `${markerPath}.${randomUUID()}.tmp`;
+  await mkdir(path.dirname(markerPath), { recursive: true });
+  try {
+    await writeFile(temporaryPath, `${JSON.stringify(marker, null, 2)}\n`);
+    const temporaryHandle = await open(temporaryPath, "r");
+    try {
+      await temporaryHandle.sync();
+    } finally {
+      await temporaryHandle.close();
+    }
+    await rename(temporaryPath, markerPath);
+    const directoryHandle = await open(path.dirname(markerPath), "r");
+    try {
+      await directoryHandle.sync();
+    } finally {
+      await directoryHandle.close();
+    }
+  } finally {
+    await rm(temporaryPath, { force: true }).catch(() => {});
+  }
+}
+
+async function markGateCleanupPending(): Promise<void> {
+  abortReap.cleanupPending = true;
+  await refreshGateMarker();
+}
+
+// Called by the launcher as soon as the gate workspace exists, before the
+// coordinator ever starts: even a coordinator that dies in its first second
+// leaves an identifiable workspace.
+async function writeLauncherGateMarker(
+  originWorktree: string,
+  gate: GateWorktree,
+  startupReceipt: string,
+  terminalHandle?: string,
+): Promise<void> {
+  Object.assign(abortReap, { gate, originWorktree, startupReceipt });
+  if (gate.kind === "configured") abortReap.runId = gate.runId;
+  if (terminalHandle === undefined) {
+    abortReap.pid = process.pid;
+    delete abortReap.launcherPid;
+    delete abortReap.terminalHandle;
+  } else {
+    delete abortReap.pid;
+    abortReap.terminalHandle = terminalHandle;
+    abortReap.launcherPid = process.pid;
+  }
+  await refreshGateMarker();
+}
+
+// Called by runPipeline once the run row and lease exist: from here an abort
+// has a recovery ref to anchor and a lease to release.
+export async function registerAbortRunContext(state: {
+  deliveryGit: GitOperations;
+  git: GitOperations;
+  ledger: DomainLedger;
+  runId: string;
+}): Promise<void> {
+  Object.assign(abortReap, state);
+  await refreshGateMarker();
+}
+
+export async function reapAbortedRun(reason: string): Promise<void> {
+  abortRequested = true;
+  abortLog(`no-mistakes: ${reason}; reaping this run's resources`);
+  await Promise.all([...abortAllocations]);
+  let workers: WorkerResult[] = [];
+  let recoverRef: string | undefined;
+  let gateOid: string | undefined;
+  let preserved = false;
+  try {
+    await withGateMutation(async () => {
+      workers = [...abortReap.workers];
+      const { deliveryGit, git, runId } = abortReap;
+      if (runId === undefined) {
+        const stopFailures = await stopAbortWorkers(workers, abortReap.orca);
+        if (stopFailures.length > 0) {
+          throw new AggregateError(
+            stopFailures,
+            "worker shutdown was incomplete",
+          );
+        }
+        preserved = !workers.some(
+          (worker) => worker.worktreeId || worker.worktreePath,
+        );
+        if (preserved && git) gateOid = await git.head();
+        return;
+      }
+      if (!git || !deliveryGit) return;
+      const failures = await anchorAbortWorkerTips(
+        workers,
+        runId,
+        git,
+        deliveryGit,
+      );
+      const { orca } = abortReap;
+      const stopFailures = await stopAbortWorkers(workers, orca);
+      failures.push(
+        ...stopFailures,
+        ...(await anchorAbortWorkerTips(workers, runId, git, deliveryGit)),
+      );
+      gateOid = await git.head();
+      await deliveryGit.anchorRecoveryRef(runId, gateOid);
+      recoverRef = recoveryRefFor(runId);
+      if (failures.length > 0) {
+        throw new AggregateError(failures, "abort preservation was incomplete");
+      }
+      preserved = true;
+    }, true);
+  } catch (error) {
+    abortLog(
+      `warning: abort could not anchor recovery commits: ${String(error)}`,
+    );
+  }
+  if (
+    preserved &&
+    abortReap.orca instanceof CliOrca
+  ) {
+    try {
+      await abortReap.orca.failRun(`Coordinator aborted: ${reason}`);
+    } catch (error) {
+      abortLog(
+        `warning: abort could not settle the Orca run: ${String(error)}`,
+      );
+      preserved = false;
+    }
+  }
+  let cancelled = abortReap.runId === undefined;
+  let settled = abortReap.runId === undefined;
+  if (preserved && abortReap.ledger && abortReap.runId) {
+    try {
+      cancelled = abortReap.ledger.settleRun(abortReap.runId, "cancelled");
+      settled =
+        cancelled || abortReap.ledger.runStatus(abortReap.runId) !== "in-progress";
+    } catch (error) {
+      abortLog(
+        `warning: abort could not settle the run: ${String(error)}`,
+      );
+      settled = false;
+    }
+  }
+  if (cancelled && abortReap.notify) {
+    try {
+      await abortReap.notify(
+        recoverRef
+          ? `No-mistakes cancelled: ${reason}\n${recoveryInstructions(recoverRef)}`
+          : `No-mistakes cancelled: ${reason}`,
+      );
+    } catch {}
+  }
+  if (preserved && settled && abortReap.orca) {
+    for (const worker of workers) {
+      if (worker.worktreeId) {
+        try {
+          await abortReap.orca.removeWorktree(
+            worker.worktreeId,
+            worker.worktreeBranch,
+          );
+        } catch (error) {
+          abortLog(
+            `warning: abort could not remove worker worktree ${worker.worktreeId}: ${String(error)}`,
+          );
+          continue;
+        }
+      }
+      try {
+        await unregisterAbortWorker(worker);
+      } catch (error) {
+        abortLog(
+          `warning: abort could not record worker cleanup ${worker.dispatchId}: ${String(error)}`,
+        );
+      }
+    }
+  }
+  if (
+    preserved &&
+    settled &&
+    abortReap.gate &&
+    gateOid &&
+    abortReap.originWorktree &&
+    abortReap.orcaCommand
+  ) {
+    try {
+      if (abortReap.gate.kind === "configured") {
+        await markGateCleanupPending();
+      }
+      const removed = await removeGateWorktree(
+        abortReap.gate,
+        abortReap.originWorktree,
+        abortReap.orcaCommand,
+        gateOid,
+      );
+      if (
+        removed &&
+        abortReap.gate.kind === "configured"
+      ) {
+        if (
+          await closeTerminalOrProveStale(
+            abortReap.terminalHandle,
+            abortReap.orcaCommand,
+            abortReap.originWorktree,
+          )
+        ) {
+          await removeGateMarker(
+            gateMarkerPath(
+              abortReap.originWorktree,
+              gateMarkerId(abortReap.gate),
+            ),
+            abortReap.gate,
+          );
+        } else {
+          abortLog(
+            `warning: abort retained the gate marker because terminal ${String(abortReap.terminalHandle)} could not be closed or proved stale`,
+          );
+        }
+      }
+    } catch (error) {
+      abortLog(
+        `warning: abort could not remove the gate worktree: ${String(error)}`,
+      );
+    }
+  }
+}
+
+function onAbortSignal(signal: "SIGHUP" | "SIGINT" | "SIGTERM"): void {
+  // A second signal means the reap is wedged; die immediately.
+  if (abortReapStarted) process.exit(1);
+  abortReapStarted = true;
+  const exitCode =
+    signal === "SIGINT" ? 130 : signal === "SIGTERM" ? 143 : 129;
+  void reapAbortedRun(`received ${signal}`).finally(() =>
+    process.exit(exitCode),
+  );
+}
+
+export async function installAbortReaping(
+  state: Omit<
+    AbortReapState,
+    "workerAllocations" | "workerAllocationPids" | "workers"
+  >,
+): Promise<void> {
+  // Replace, never merge: a stale gate or runId from an earlier registration
+  // must not leak into this run's reap.
+  for (const key of Object.keys(abortReap) as (keyof AbortReapState)[]) {
+    if (
+      key !== "workerAllocations" &&
+      key !== "workerAllocationPids" &&
+      key !== "workers"
+    ) {
+      delete abortReap[key];
+    }
+  }
+  abortReap.workerAllocations.clear();
+  abortReap.workerAllocationPids.clear();
+  abortReap.workers.clear();
+  abortAllocations.clear();
+  abortRequested = false;
+  gateMutationTail = Promise.resolve();
+  Object.assign(abortReap, state);
+  let markerPublished = false;
+  try {
+    await refreshGateMarker();
+    markerPublished = true;
+  } catch (error) {
+    abortLog(`warning: could not write the gate marker: ${String(error)}`);
+  }
+  if (
+    markerPublished &&
+    abortReap.gate &&
+    abortReap.originWorktree &&
+    abortReap.pid !== undefined
+  ) {
+    await rm(
+      startupReceiptPath(
+        gateMarkerPath(
+          abortReap.originWorktree,
+          gateMarkerId(abortReap.gate),
+        ),
+      ),
+      { force: true },
+    ).catch((error: unknown) =>
+      abortLog(`warning: could not remove the startup receipt: ${String(error)}`),
+    );
+  }
+  if (abortHandlersInstalled) return;
+  abortHandlersInstalled = true;
+  for (const signal of ["SIGHUP", "SIGINT", "SIGTERM"] as const) {
+    process.on(signal, () => onAbortSignal(signal));
+  }
+}
 
 export class FixerPolicyViolationError extends Error {}
 
@@ -369,44 +1122,50 @@ export async function runPipeline(
     ? "[uncertified: local config bypass] "
     : "";
   const policySha256Value = await git.policySha256(repo.base);
-  const runId = await orca.createRun(`no-mistakes: ${intent}`);
-  const artifactsBase = artifactsRoot();
-  const artifactsDir = path.resolve(artifactsBase, runId);
-  if (!runId.trim() || !isWithin(artifactsBase, artifactsDir)) {
-    throw new Error("Orca returned an unsafe Run ID");
-  }
-  await mkdir(artifactsBase, { recursive: true });
-  await mkdir(artifactsDir, { recursive: true });
-  const [canonicalArtifactsBase, canonicalArtifactsDir] = await Promise.all([
-    realpath(artifactsBase),
-    realpath(artifactsDir),
-  ]);
-  if (!isWithin(canonicalArtifactsBase, canonicalArtifactsDir)) {
-    throw new Error("Orca returned an unsafe Run ID");
-  }
+  const { artifactsDir, runId } = await withGateMutation(async () => {
+    const runId = await orca.createRun(`no-mistakes: ${intent}`);
+    const artifactsBase = artifactsRoot();
+    const artifactsDir = path.resolve(artifactsBase, runId);
+    if (!runId.trim() || !isWithin(artifactsBase, artifactsDir)) {
+      throw new Error("Orca returned an unsafe Run ID");
+    }
+    abortReap.runId = runId;
+    await refreshGateMarker();
+    await mkdir(artifactsBase, { recursive: true });
+    await mkdir(artifactsDir, { recursive: true });
+    const [canonicalArtifactsBase, canonicalArtifactsDir] = await Promise.all([
+      realpath(artifactsBase),
+      realpath(artifactsDir),
+    ]);
+    if (!isWithin(canonicalArtifactsBase, canonicalArtifactsDir)) {
+      throw new Error("Orca returned an unsafe Run ID");
+    }
 
-  let baseCommitOid = repo.baseOid;
-  ledger.startRun({
-    baseBranch: deliveryRepo.base,
-    branch: deliveryRepo.branch,
-    intent,
-    policySha256: policySha256Value,
-    repoRoot: deliveryRepo.root,
-    runId,
-    submissionCommitOid: deliveryRepo.head,
-  });
-  let fixerSession: FixerSession | undefined;
-  try {
-    ledger.acquireLease({
+    ledger.startRun({
+      baseBranch: deliveryRepo.base,
       branch: deliveryRepo.branch,
-      force: options.forceLease === true,
+      intent,
+      policySha256: policySha256Value,
       repoRoot: deliveryRepo.root,
       runId,
+      submissionCommitOid: deliveryRepo.head,
     });
-  } catch (error) {
-    ledger.finishRun(runId, "failed");
-    throw error;
-  }
+    try {
+      ledger.acquireLease({
+        branch: deliveryRepo.branch,
+        force: options.forceLease === true,
+        repoRoot: deliveryRepo.root,
+        runId,
+      });
+      await registerAbortRunContext({ deliveryGit, git, ledger, runId });
+    } catch (error) {
+      ledger.settleRun(runId, "failed");
+      throw error;
+    }
+    return { artifactsDir, runId };
+  });
+  let baseCommitOid = repo.baseOid;
+  let fixerSession: FixerSession | undefined;
 
   try {
     await writeFile(
@@ -886,67 +1645,59 @@ export async function runPipeline(
       await releaseFixerSession(completedSession, orca);
     }
 
-    const terminalCommitOid = await git.head();
-    // Fail closed before the manifest exists: a stage whose recorded findings
-    // were never addressed, and never waived at a gate, must not be attested.
-    // The check reads the durable evidence rows rather than the stage loop's
-    // own bookkeeping, so it still holds if that control flow ever lets an
-    // unresolved stage through.
-    const blockers = ledger.attestationBlockers(runId, stageEntries);
-    if (blockers.length > 0) {
-      throw new Error(`this run cannot be attested: ${blockers.join("; ")}`);
-    }
-
-    // Anchor custody before the containment decision: in gate mode the gate
-    // worktree is removed after the run, so the terminal commit must be
-    // referenced in the delivery repo before any HEAD-advancing merge is
-    // attempted. On clean runs the ref is a harmless bookmark.
-    await deliveryGit.anchorRecoveryRef(runId, terminalCommitOid);
-    const operatorHead = await deliveryGit.head();
-    let custodyNote: string;
-    if (deliveryGit === git && operatorHead === terminalCommitOid) {
-      custodyNote =
-        operatorHead === submissionCommitOid
-          ? `branch ${deliveryRepo.branch} already at submission commit ${submissionCommitOid}`
-          : `branch ${deliveryRepo.branch} carries the terminal commit ${terminalCommitOid}`;
-    } else {
-      const recoverRef = recoveryRefFor(runId);
-      let advanced = false;
-      let transferFailure: string | undefined;
-      if (deliveryGit !== git && operatorHead === submissionCommitOid) {
-        try {
-          advanced = await deliveryGit.applyWorktreeCommits(
-            repo.root,
-            submissionCommitOid,
-            terminalCommitOid,
-          );
-        } catch (error) {
-          if (error instanceof PostMutationCustodyError) {
-            throw error;
-          }
-          transferFailure =
-            error instanceof Error ? error.message : String(error);
-        }
+    const { attestation, custodyNote } = await withGateMutation(async () => {
+      const terminalCommitOid = await git.head();
+      const blockers = ledger.attestationBlockers(runId, stageEntries);
+      if (blockers.length > 0) {
+        throw new Error(`this run cannot be attested: ${blockers.join("; ")}`);
       }
-      custodyNote = advanced
-        ? `advanced branch ${deliveryRepo.branch} from submission to terminal commit ${terminalCommitOid}`
-        : transferFailure
-          ? `custody transfer failed on the pipeline side (${transferFailure}); ` +
-            recoveryInstructions(recoverRef)
-          : "operator checkout diverged or carries uncommitted changes; " +
-            recoveryInstructions(recoverRef);
-    }
 
-    const attestation = buildAttestation(stageEntries, {
-      baseCommitOid,
-      candidateCommitOid: terminalCommitOid,
-      guardrailMode,
-      intent,
-      policySha256: policySha256Value,
-      runId,
+      await deliveryGit.anchorRecoveryRef(runId, terminalCommitOid);
+      const operatorHead = await deliveryGit.head();
+      let custodyNote: string;
+      if (deliveryGit === git && operatorHead === terminalCommitOid) {
+        custodyNote =
+          operatorHead === submissionCommitOid
+            ? `branch ${deliveryRepo.branch} already at submission commit ${submissionCommitOid}`
+            : `branch ${deliveryRepo.branch} carries the terminal commit ${terminalCommitOid}`;
+      } else {
+        const recoverRef = recoveryRefFor(runId);
+        let advanced = false;
+        let transferFailure: string | undefined;
+        if (deliveryGit !== git && operatorHead === submissionCommitOid) {
+          try {
+            advanced = await deliveryGit.applyWorktreeCommits(
+              repo.root,
+              submissionCommitOid,
+              terminalCommitOid,
+            );
+          } catch (error) {
+            if (error instanceof PostMutationCustodyError) throw error;
+            transferFailure =
+              error instanceof Error ? error.message : String(error);
+          }
+        }
+        custodyNote = advanced
+          ? `advanced branch ${deliveryRepo.branch} from submission to terminal commit ${terminalCommitOid}`
+          : transferFailure
+            ? `custody transfer failed on the pipeline side (${transferFailure}); ` +
+              recoveryInstructions(recoverRef)
+            : "operator checkout diverged or carries uncommitted changes; " +
+              recoveryInstructions(recoverRef);
+      }
+
+      const attestation = buildAttestation(stageEntries, {
+        baseCommitOid,
+        candidateCommitOid: terminalCommitOid,
+        guardrailMode,
+        intent,
+        policySha256: policySha256Value,
+        runId,
+      });
+      verifyManifest(attestation, PIPELINE_STEPS);
+      ledger.finalizePassedRun(attestation, terminalCommitOid);
+      return { attestation, custodyNote };
     });
-    verifyManifest(attestation, PIPELINE_STEPS);
-    ledger.finalizePassedRun(attestation, terminalCommitOid);
     await orca
       .setWorktreeStatus(
         `${statusPrefix}no-mistakes passed all ${PIPELINE_STEPS.length} stages`,
@@ -974,35 +1725,37 @@ export async function runPipeline(
         );
       }
     }
-    const outcome = error instanceof GateStopError ? "cancelled" : "failed";
-    let anchorError: unknown;
-    let anchoredOid: string | undefined;
-    try {
-      anchoredOid = await git.head();
-      await deliveryGit.anchorRecoveryRef(runId, anchoredOid);
-    } catch (recoveryError) {
-      anchorError = recoveryError;
-      anchoredOid = undefined;
-    }
-    if (anchoredOid !== undefined && failure instanceof Error) {
-      const operatorHead = await deliveryGit.head().catch(() => undefined);
-      if (operatorHead !== anchoredOid) {
-        (failure as CustodyTaggedError).recoverRef = recoveryRefFor(runId);
+    return await withGateMutation(async () => {
+      const outcome = error instanceof GateStopError ? "cancelled" : "failed";
+      let anchorError: unknown;
+      let anchoredOid: string | undefined;
+      try {
+        anchoredOid = await git.head();
+        await deliveryGit.anchorRecoveryRef(runId, anchoredOid);
+      } catch (recoveryError) {
+        anchorError = recoveryError;
+        anchoredOid = undefined;
       }
-    }
-    if (!anchorError) ledger.releaseLease(runId);
-    ledger.finishRun(runId, outcome);
-    const message = failure instanceof Error ? failure.message : String(failure);
-    await orca
-      .setWorktreeStatus(
-        `${statusPrefix}no-mistakes stopped: ${message}`,
-        "in-review",
-      )
-      .catch(() => {});
-    if (anchorError) {
-      throw new RecoveryAnchorError(runId, outcome, failure, anchorError);
-    }
-    throw failure;
+      if (anchoredOid !== undefined && failure instanceof Error) {
+        const operatorHead = await deliveryGit.head().catch(() => undefined);
+        if (operatorHead !== anchoredOid) {
+          (failure as CustodyTaggedError).recoverRef = recoveryRefFor(runId);
+        }
+      }
+      if (!anchorError) ledger.settleRun(runId, outcome);
+      const message =
+        failure instanceof Error ? failure.message : String(failure);
+      await orca
+        .setWorktreeStatus(
+          `${statusPrefix}no-mistakes stopped: ${message}`,
+          "in-review",
+        )
+        .catch(() => {});
+      if (anchorError) {
+        throw new RecoveryAnchorError(runId, outcome, failure, anchorError);
+      }
+      throw failure;
+    });
   }
 }
 
@@ -1138,14 +1891,44 @@ export async function startWorkerWithFallback(
     if (fence?.aborted) {
       throw new Error(`${launch.stage} worker attempt was cancelled`);
     }
+    const finishAllocation = beginAbortAllocation();
+    const allocationId = randomUUID();
     try {
-      const worker = await orca.startWorker(taskId, launch, fence);
+      await registerAbortWorkerAllocation(allocationId);
+    } catch (error) {
+      finishAllocation();
+      throw error;
+    }
+    let allocated = false;
+    let allocationRegistration: WorkerRegistration | undefined;
+    const onAllocated: WorkerAllocated = (worker) => {
+      allocated = true;
+      allocationRegistration = registerAbortWorker(worker, allocationId);
+      void allocationRegistration.ready?.then(
+        finishAllocation,
+        finishAllocation,
+      );
+      if (!allocationRegistration.ready) finishAllocation();
+      return allocationRegistration;
+    };
+    try {
+      const worker = await allocationCommands.run(
+        {
+          onExit: (pid) => clearAbortAllocationPid(allocationId, pid),
+          onSpawn: (pid) => recordAbortAllocationPid(allocationId, pid),
+        },
+        () => orca.startWorker(taskId, launch, fence, onAllocated),
+      );
+      if (!allocated) onAllocated(worker);
+      await allocationRegistration?.ready;
       return {
         attempts,
         resolvedAgent: launch.agent?.harness ?? DEFAULT_WORKER_AGENT,
         worker,
       };
     } catch (error) {
+      finishAllocation();
+      if (!allocated) await clearAbortWorkerAllocation(allocationId);
       if (fence?.aborted) throw error;
       if (!(error instanceof PreflightError)) throw error;
       await orca
@@ -1216,7 +1999,7 @@ async function executeStage(
     };
   }
   if (stage === "rebase") {
-    const report = await git.rebase(repo.base);
+    const report = await withGateMutation(() => git.rebase(repo.base));
     return {
       exitCode: exitCodeFor(report),
       report,
@@ -1357,17 +2140,72 @@ async function releaseFixerSession(
   await releaseWorker(session.worker, orca);
 }
 
-async function releaseWorker(
+export async function releaseWorker(
   worker: WorkerResult,
   orca: OrcaOperations,
 ): Promise<void> {
-  try {
-    await orca.finishWorker(worker, "release");
-  } finally {
-    if (worker.worktreeId) {
-      await orca.removeWorktree(worker.worktreeId);
+  await withGateMutation(async () => {
+    let workerPathExists = false;
+    if (worker.worktreePath) {
+      try {
+        await lstat(worker.worktreePath);
+        workerPathExists = true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
     }
-  }
+    if (worker.worktreeId && workerPathExists) {
+      if (!abortReap.runId || !abortReap.git || !abortReap.deliveryGit) {
+        throw new Error(
+          `worker ${worker.dispatchId} has no durable recovery context`,
+        );
+      }
+      const failures = await anchorAbortWorkerTips(
+        [worker],
+        abortReap.runId,
+        abortReap.git,
+        abortReap.deliveryGit,
+      );
+      if (failures.length > 0) {
+        throw new AggregateError(
+          failures,
+          `worker ${worker.dispatchId} could not be preserved`,
+        );
+      }
+    }
+    const cleanupFailures: unknown[] = [];
+    let shutdownConfirmed = false;
+    try {
+      await orca.finishWorker(worker, "release");
+      shutdownConfirmed = true;
+    } catch (error) {
+      cleanupFailures.push(error);
+      shutdownConfirmed = worker.shutdownConfirmed === true;
+    }
+    let cleanupCompleted = shutdownConfirmed && !worker.worktreeId;
+    if (!abortRequested && shutdownConfirmed && worker.worktreeId) {
+      try {
+        await orca.removeWorktree(worker.worktreeId);
+        cleanupCompleted = true;
+      } catch (error) {
+        cleanupFailures.push(error);
+      }
+    }
+    if (cleanupCompleted) {
+      try {
+        await unregisterAbortWorker(worker);
+      } catch (error) {
+        cleanupFailures.push(error);
+      }
+    }
+    if (cleanupFailures.length === 1) throw cleanupFailures[0];
+    if (cleanupFailures.length > 1) {
+      throw new AggregateError(
+        cleanupFailures,
+        `worker ${worker.dispatchId} cleanup failed`,
+      );
+    }
+  });
 }
 
 async function releaseReviewerWorker(
@@ -1533,22 +2371,27 @@ async function runFixer(
       // so a delayed worker cannot apply commits into a settled run.
       throw new Error(`${stage} fixer timed out; commits were not applied`);
     }
-    const transfer = git.applyWorktreeCommits(
-      worktreePath,
-      before,
-      workerHead,
-      fence,
-    );
-    if (!(await transfer)) {
-      throw new Error(`${stage} fixer could not apply its committed change`);
-    }
-    fence.deadlineSatisfied = true;
-    const after = await git.head();
-    if (after !== workerHead) {
-      throw new PostMutationCustodyError(
-        `${stage} fixer custody ended at unexpected HEAD ${after}; expected ${workerHead}`,
-      );
-    }
+    const expectedWorkerHead = workerHead;
+    const after = await withGateMutation(async () => {
+      if (
+        !(await git.applyWorktreeCommits(
+          worktreePath,
+          before,
+          expectedWorkerHead,
+          fence,
+        ))
+      ) {
+        throw new Error(`${stage} fixer could not apply its committed change`);
+      }
+      fence.deadlineSatisfied = true;
+      const after = await git.head();
+      if (after !== expectedWorkerHead) {
+        throw new PostMutationCustodyError(
+          `${stage} fixer custody ended at unexpected HEAD ${after}; expected ${expectedWorkerHead}`,
+        );
+      }
+      return after;
+    });
     const terminalHandle =
       worker.terminalHandle ?? retainedSession?.worker.terminalHandle;
     if (terminalHandle && worktreeId) {
@@ -2330,6 +3173,12 @@ export function parseGateResolution(
 
 type CommandResult = { code: number; stderr: string; stdout: string };
 type CommandOutput = (chunk: string) => void | Promise<void>;
+type AllocationCommandContext = {
+  onExit: (pid: number) => Promise<void>;
+  onSpawn: (pid: number) => Promise<void>;
+};
+
+const allocationCommands = new AsyncLocalStorage<AllocationCommandContext>();
 
 async function command(
   executable: string,
@@ -2344,6 +3193,8 @@ async function command(
   } = {},
 ): Promise<CommandResult> {
   return await new Promise((resolve, reject) => {
+    const allocation = allocationCommands.getStore();
+    const gated = allocation !== undefined;
     const spawnOptions = {
       cwd,
       env: process.env,
@@ -2352,8 +3203,22 @@ async function command(
     };
     // A literal stdio tuple per branch keeps spawn's typed-stream overload,
     // so child.stdout/stderr stay non-nullable.
-    const child =
-      options.stdin === undefined
+    const child = gated
+      ? spawn(
+          "/bin/sh",
+          [
+            "-c",
+            'IFS= read -r allocation_gate || exit 0; exec "$@"',
+            "allocation-gate",
+            executable,
+            ...args,
+          ],
+          {
+            ...spawnOptions,
+            stdio: ["pipe", "pipe", "pipe"],
+          },
+        )
+      : options.stdin === undefined
         ? spawn(executable, args, {
             ...spawnOptions,
             stdio: ["ignore", "pipe", "pipe"],
@@ -2377,20 +3242,41 @@ async function command(
     let outputChain = Promise.resolve();
     let spawnError: Error | undefined;
     let stdinError: Error | undefined;
+    let allocationError: unknown;
+    let allocationRecorded = false;
     // Deliver the stdin payload up front; a child that exits before draining
     // it fails the write with EPIPE, and the captured child stderr — not the
     // bare EOF — is what explains why.
-    if (options.stdin !== undefined) {
-      const stdinStream = child.stdin;
-      if (!stdinStream) {
-        reject(new Error(`${executable} stdin pipe was not established`));
-        return;
+    const allocationReady = (async () => {
+      if (allocation) {
+        if (child.pid === undefined) {
+          allocationError = new Error("allocation gate returned no process ID");
+          child.stdin?.end();
+          return;
+        }
+        try {
+          await allocation.onSpawn(child.pid);
+          allocationRecorded = true;
+        } catch (error) {
+          allocationError = error;
+          child.stdin?.end();
+          return;
+        }
       }
-      stdinStream.on("error", (error: Error) => {
-        stdinError ??= error;
-      });
-      stdinStream.end(options.stdin);
-    }
+      if (options.stdin !== undefined || gated) {
+        const stdinStream = child.stdin;
+        if (!stdinStream) {
+          allocationError = new Error(
+            `${executable} stdin pipe was not established`,
+          );
+          return;
+        }
+        stdinStream.on("error", (error: Error) => {
+          stdinError ??= error;
+        });
+        stdinStream.end(`${gated ? "go\n" : ""}${options.stdin ?? ""}`);
+      }
+    })();
     const capture = (chunk: string, target: "stdout" | "stderr") => {
       if (target === "stdout") stdout += chunk;
       else stderr += chunk;
@@ -2411,7 +3297,18 @@ async function command(
     });
     child.on("close", (code) => {
       if (timer) clearTimeout(timer);
-      void outputChain.then(() => {
+      void Promise.all([allocationReady, outputChain]).then(async () => {
+        if (allocationRecorded && child.pid !== undefined) {
+          try {
+            await allocation?.onExit(child.pid);
+          } catch (error) {
+            allocationError = error;
+          }
+        }
+        if (allocationError) {
+          reject(allocationError);
+          return;
+        }
         if (spawnError) {
           reject(spawnError);
           return;
@@ -2710,13 +3607,19 @@ export class CliOrca implements OrcaOperations {
     taskId: string,
     launch: WorkerLaunch,
     fence?: TimeoutFence,
+    onAllocated?: WorkerAllocated,
   ): Promise<WorkerResult> {
     if (launch.agent && classifyHarness(launch.agent.harness) === "acp") {
-      return await this.#startAcpWorker(taskId, launch, fence);
+      return await this.#startAcpWorker(taskId, launch, fence, onAllocated);
     }
     if (launch.reportPath) await rm(launch.reportPath, { force: true });
     if (launch.terminal)
-      return await this.#startRetainedWorker(taskId, launch, fence);
+      return await this.#startRetainedWorker(
+        taskId,
+        launch,
+        fence,
+        onAllocated,
+      );
     const harness = (
       launch.agent?.harness ?? DEFAULT_WORKER_AGENT
     ).toLowerCase();
@@ -2807,6 +3710,31 @@ export class CliOrca implements OrcaOperations {
         "dispatch returned an invalid receipt",
       );
     }
+    const worktreeId = prepared?.worktreeId;
+    const worktreePath = prepared?.worktreePath;
+    const worker: WorkerResult = {
+      dispatchId,
+      report: { findings: [], summary: "worker is active" },
+      taskId,
+      terminalHandle,
+      worktreeBranch: worktreeId
+        ? this.#workerBranches.get(worktreeId)
+        : undefined,
+      worktreeId,
+      worktreePath,
+    };
+    let registration: WorkerRegistration | undefined;
+    try {
+      registration = await onAllocated?.(worker);
+      await registration?.ready;
+    } catch (error) {
+      await this.#cleanupFailedWorker(
+        dispatchId,
+        terminalHandle,
+        worktreeId,
+      );
+      throw error;
+    }
     let promptPath: string | undefined;
     if (directPreamble) {
       let kimiTrustPath: string | undefined;
@@ -2829,11 +3757,15 @@ export class CliOrca implements OrcaOperations {
       } catch (error) {
         if (promptPath) await rm(promptPath, { force: true });
         if (kimiTrustPath) await rm(kimiTrustPath, { force: true }).catch(() => {});
-        await this.#cleanupFailedWorker(
-          dispatchId,
-          terminalHandle,
-          prepared?.worktreeId,
-        );
+        await withGateMutation(async () => {
+          if (abortOwnsWorkerCleanup(registration)) return;
+          await this.#cleanupFailedWorker(
+            dispatchId,
+            terminalHandle,
+            prepared?.worktreeId,
+          );
+          await registration?.();
+        }, true);
         throw new PreflightError(
           classifyPreflightFailure(String(error)),
           `initial prompt launch failed: ${String(error)}`,
@@ -2841,8 +3773,6 @@ export class CliOrca implements OrcaOperations {
         );
       }
     }
-    const worktreeId = prepared?.worktreeId;
-    const worktreePath = prepared?.worktreePath;
     let deliveryId: string | undefined;
     try {
       const result = await this.#waitForWorker(
@@ -2854,23 +3784,23 @@ export class CliOrca implements OrcaOperations {
       );
       deliveryId = result.deliveryId;
       if (result.error) throw new Error(result.error);
-      return {
+      Object.assign(worker, {
         deliveryId,
         failedOutcome: result.failedOutcome,
         report: result.report!,
-        taskId,
-        dispatchId,
-        terminalHandle,
-        worktreeId,
-        worktreePath,
-      };
+      });
+      return worker;
     } catch (error) {
-      await this.#cleanupFailedWorker(
-        dispatchId,
-        terminalHandle,
-        worktreeId,
-        deliveryId,
-      );
+      await withGateMutation(async () => {
+        if (abortOwnsWorkerCleanup(registration)) return;
+        await this.#cleanupFailedWorker(
+          dispatchId,
+          terminalHandle,
+          worktreeId,
+          deliveryId,
+        );
+        await registration?.();
+      }, true);
       throw error;
     } finally {
       if (promptPath) await rm(promptPath, { force: true });
@@ -2881,6 +3811,7 @@ export class CliOrca implements OrcaOperations {
     taskId: string,
     launch: WorkerLaunch,
     fence?: TimeoutFence,
+    onAllocated?: WorkerAllocated,
   ): Promise<WorkerResult> {
     const terminalHandle = launch.terminal!;
     // Bound before worker-start so a retained preflight failure still records
@@ -2952,6 +3883,23 @@ export class CliOrca implements OrcaOperations {
       );
     }
 
+    const worker: WorkerResult = {
+      dispatchId,
+      report: { findings: [], summary: "worker is active" },
+      taskId,
+      terminalHandle,
+      worktreeBranch: this.#workerBranches.get(worktreeId),
+      worktreeId,
+      worktreePath: launch.retainedWorktreePath,
+    };
+    let registration: WorkerRegistration | undefined;
+    try {
+      registration = await onAllocated?.(worker);
+      await registration?.ready;
+    } catch (error) {
+      await this.#cleanupFailedWorker(dispatchId, terminalHandle, worktreeId);
+      throw error;
+    }
     let deliveryId: string | undefined;
     try {
       const result = await this.#waitForWorker(
@@ -2963,23 +3911,23 @@ export class CliOrca implements OrcaOperations {
       );
       deliveryId = result.deliveryId;
       if (result.error) throw new Error(result.error);
-      return {
+      Object.assign(worker, {
         deliveryId,
         failedOutcome: result.failedOutcome,
         report: result.report!,
-        taskId,
-        dispatchId,
-        terminalHandle,
-        worktreeId,
-        worktreePath: launch.retainedWorktreePath,
-      };
+      });
+      return worker;
     } catch (error) {
-      await this.#cleanupFailedWorker(
-        dispatchId,
-        terminalHandle,
-        undefined,
-        deliveryId,
-      );
+      await withGateMutation(async () => {
+        if (abortOwnsWorkerCleanup(registration)) return;
+        await this.#cleanupFailedWorker(
+          dispatchId,
+          terminalHandle,
+          undefined,
+          deliveryId,
+        );
+        await registration?.();
+      }, true);
       throw error;
     }
   }
@@ -3747,11 +4695,14 @@ export class CliOrca implements OrcaOperations {
     taskId: string,
     launch: WorkerLaunch,
     fence?: TimeoutFence,
+    onAllocated?: WorkerAllocated,
   ): Promise<WorkerResult> {
     const agent = launch.agent!;
     const target = parseAcpTarget(agent.harness);
     let cwd = this.#cwd;
     let worktreeId: string | undefined;
+    let registration: WorkerRegistration | undefined;
+    const processAbort = new AbortController();
     try {
       if (fence?.aborted) {
         throw new Error(`${launch.stage} worker attempt was cancelled`);
@@ -3817,15 +4768,38 @@ export class CliOrca implements OrcaOperations {
         timeoutMs: agent.timeoutMs,
       });
       const log = launch.logPath ? new StageLog(launch.logPath) : undefined;
+      const worker: WorkerResult = {
+        dispatchId: `acp-${randomUUID()}`,
+        report: { findings: [], summary: "worker is active" },
+        taskId,
+        worktreeBranch: worktreeId
+          ? this.#workerBranches.get(worktreeId)
+          : undefined,
+        worktreeId,
+        worktreePath: worktreeId ? cwd : undefined,
+      };
+      let processDone: Promise<CommandResult> | undefined;
+      workerStops.set(worker, async () => {
+        processAbort.abort();
+        await processDone?.catch((error) => {
+          if (!processAbort.signal.aborted) throw error;
+        });
+      });
+      registration = await onAllocated?.(worker);
+      await registration?.ready;
       let result: { code: number; stderr: string; stdout: string } | undefined;
       try {
-        result = await command(this.#acpxCommand, invocation.args, cwd, {
+        const fenceSignal = fence?.signal;
+        processDone = command(this.#acpxCommand, invocation.args, cwd, {
           allowFailure: true,
-          abortSignal: fence?.signal,
+          abortSignal: fenceSignal
+            ? AbortSignal.any([fenceSignal, processAbort.signal])
+            : processAbort.signal,
           onOutput: log ? (chunk) => log.append(chunk) : undefined,
           stdin: launch.prompt,
           timeoutMs: agent.timeoutMs ?? WORKER_IDLE_TIMEOUT_MS,
         });
+        result = await processDone;
       } catch (error) {
         // The one-shot runner never accepted the task: a missing binary or
         // rejected session is preflight and may advance the fallback chain.
@@ -3881,16 +4855,20 @@ export class CliOrca implements OrcaOperations {
       }
       if (!report)
         throw new Error(`acp target ${target} returned an invalid report`);
-      return {
-        dispatchId: `acp-${randomUUID()}`,
-        report,
-        taskId,
-        worktreeId,
-        worktreePath: worktreeId ? cwd : undefined,
-      };
+      worker.report = report;
+      return worker;
     } catch (error) {
-      if (worktreeId)
-        await this.#cleanupPreparedWorker({ terminalHandle: "", worktreeId });
+      await withGateMutation(async () => {
+        if (
+          processAbort.signal.aborted ||
+          abortOwnsWorkerCleanup(registration)
+        ) {
+          return;
+        }
+        if (worktreeId)
+          await this.#cleanupPreparedWorker({ terminalHandle: "", worktreeId });
+        await registration?.();
+      }, true);
       throw error;
     }
   }
@@ -3903,6 +4881,11 @@ export class CliOrca implements OrcaOperations {
     worker: WorkerResult,
     disposition: "release" | "retain",
   ): Promise<void> {
+    const stop = workerStops.get(worker);
+    if (disposition === "release" && stop) {
+      await stop();
+      workerStops.delete(worker);
+    }
     if (worker.terminalHandle) {
       // Capture stays attached until the worker is done, so output emitted
       // after worker_done -- a command finishing, a TUI settling -- is still
@@ -3929,6 +4912,7 @@ export class CliOrca implements OrcaOperations {
         }
       }
     }
+    if (disposition === "release") worker.shutdownConfirmed = true;
     if (worker.deliveryId) {
       await this.#json([
         "orchestration",
@@ -3964,6 +4948,7 @@ export class CliOrca implements OrcaOperations {
   // must converge rather than fail permanently on a retry.
   async #removeWorktreeIfPresent(
     worktreeId: string,
+    force = true,
   ): Promise<string | undefined> {
     try {
       await this.#json([
@@ -3971,7 +4956,7 @@ export class CliOrca implements OrcaOperations {
         "rm",
         "--worktree",
         `id:${worktreeId}`,
-        "--force",
+        ...(force ? ["--force"] : []),
         "--json",
       ]);
       return undefined;
@@ -4014,9 +4999,14 @@ export class CliOrca implements OrcaOperations {
     return undefined;
   }
 
-  async removeWorktree(worktreeId: string): Promise<void> {
+  async removeWorktree(
+    worktreeId: string,
+    worktreeBranch?: string,
+    force = true,
+  ): Promise<void> {
+    if (worktreeBranch) this.#workerBranches.set(worktreeId, worktreeBranch);
     const failures: string[] = [];
-    const removal = await this.#removeWorktreeIfPresent(worktreeId);
+    const removal = await this.#removeWorktreeIfPresent(worktreeId, force);
     if (removal) failures.push(`worktree removal: ${removal}`);
     // Attempted even when removal failed: a surviving worktree is detached, so
     // it does not hold the branch, and one that does makes `git branch -D`
@@ -6229,10 +7219,7 @@ export class GitShell implements GitOperations {
   }
 
   async anchorRecoveryRef(runId: string, oid: string): Promise<void> {
-    if (!RUN_ID_PATTERN.test(runId)) {
-      throw new Error("Orca returned an unsafe Run ID");
-    }
-    await this.#git(["update-ref", recoveryRefFor(runId), oid]);
+    await anchorRecoveryCommit(this.#repo, runId, oid);
   }
 
   async rebase(base: string): Promise<StageReport> {
@@ -6365,6 +7352,7 @@ const BOOLEAN_FLAGS = new Set([
   "allow-local-config",
   "attached",
   "force-lease",
+  "stranded",
 ]);
 const VALUE_FLAGS = new Set([
   "base",
@@ -6382,7 +7370,7 @@ const VALUE_FLAGS = new Set([
 ]);
 const COMMAND_FLAGS: Record<string, Set<string>> = {
   attestation: new Set(["out"]),
-  prune: new Set(["before", "repo"]),
+  prune: new Set(["before", "repo", "stranded"]),
   run: new Set([
     "allow-local-config",
     "attached",
@@ -6445,17 +7433,6 @@ function stringFlag(flags: RawCliFlags, name: string): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
-type GateWorktree =
-  | { branch: string; id: string; kind: "orca"; path: string }
-  | {
-      branch: string;
-      intentTaskId: string;
-      kind: "configured";
-      path: string;
-      root: string;
-      runId: string;
-    };
-
 async function canonicalPath(value: string): Promise<string> {
   const absolute = path.resolve(value);
   return realpath(absolute).catch(() => absolute);
@@ -6514,12 +7491,87 @@ async function configuredWorktreeRoot(
   return await canonicalPath(canonicalRoot);
 }
 
+type OrcaWorktreeIdentity = {
+  branch?: unknown;
+  head?: unknown;
+  id?: unknown;
+  parentWorktreeId?: unknown;
+  path?: unknown;
+};
+
+type GitWorktreeIdentity = {
+  branch?: string;
+  head?: string;
+  path: string;
+};
+
+async function listGitWorktrees(
+  repoRoot: string,
+): Promise<GitWorktreeIdentity[] | undefined> {
+  const listed = await command(
+    "git",
+    ["-C", repoRoot, "worktree", "list", "--porcelain"],
+    repoRoot,
+    { allowFailure: true },
+  );
+  if (listed.code !== 0) return undefined;
+  const worktrees: GitWorktreeIdentity[] = [];
+  for (const record of listed.stdout.trim().split(/\r?\n\r?\n/u)) {
+    if (!record) continue;
+    const lines = record.split(/\r?\n/u);
+    const worktreePath = lines[0]?.startsWith("worktree ")
+      ? lines[0].slice("worktree ".length)
+      : "";
+    if (!worktreePath) return undefined;
+    const head = lines.find((line) => line.startsWith("HEAD "))?.slice(5);
+    const branch = lines
+      .find((line) => line.startsWith("branch "))
+      ?.slice("branch ".length);
+    worktrees.push({
+      path: worktreePath,
+      ...(head ? { head } : {}),
+      ...(branch ? { branch } : {}),
+    });
+  }
+  return worktrees;
+}
+
+async function listOrcaWorktrees(
+  orcaCommand: string,
+  cwd: string,
+): Promise<OrcaWorktreeIdentity[] | undefined> {
+  const listed = await command(
+    orcaCommand,
+    ["worktree", "list", "--json"],
+    cwd,
+    { allowFailure: true },
+  );
+  if (listed.code !== 0) return undefined;
+  try {
+    const worktrees = unwrapJson<{ worktrees?: OrcaWorktreeIdentity[] }>(
+      listed.stdout,
+    ).worktrees;
+    return Array.isArray(worktrees) ? worktrees : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 async function createGateWorktree(
   repo: RepoSnapshot,
   orcaCommand: string,
-  configured?: { intentTaskId: string; root: string; runId: string },
+  configured?: {
+    branch: string;
+    intentTaskId: string;
+    root: string;
+    runId: string;
+  },
+  declaredGateName?: string,
 ): Promise<GateWorktree> {
-  const gateName = `no-mistakes-gate-${randomUUID().slice(0, 8)}`;
+  const gateName =
+    configured?.branch ??
+    declaredGateName ??
+    `no-mistakes-gate-${randomUUID().slice(0, 8)}`;
   if (configured) {
     const gatePath = configuredRunPath(configured.root, configured.runId);
     await command(
@@ -6563,24 +7615,105 @@ async function createGateWorktree(
   if (!gate?.id || !gate.path || !gate.branch) {
     throw new Error("worktree create returned an invalid receipt");
   }
+  const gateBranch = gate.branch.replace(/^refs\/heads\//, "");
+  if (path.posix.basename(gateBranch) !== gateName) {
+    throw new Error("worktree create returned an unexpected gate branch");
+  }
   return {
-    branch: gate.branch.replace(/^refs\/heads\//, ""),
+    branch: gateBranch,
     id: gate.id,
     kind: "orca",
     path: gate.path,
   };
 }
 
+async function removePreservedBranch(
+  originWorktree: string,
+  branch: string,
+  preservedOid: string,
+): Promise<boolean> {
+  if (!COMMIT_OID.test(preservedOid)) return false;
+  const validBranch = await command(
+    "git",
+    ["-C", originWorktree, "check-ref-format", "--branch", branch],
+    originWorktree,
+    { allowFailure: true },
+  );
+  if (validBranch.code !== 0) return false;
+  const branchRef = `refs/heads/${branch}`;
+  const gitWorktrees = await command(
+    "git",
+    ["-C", originWorktree, "worktree", "list", "--porcelain"],
+    originWorktree,
+    { allowFailure: true },
+  );
+  if (gitWorktrees.code !== 0) return false;
+  if (gitWorktrees.stdout.split(/\r?\n/u).includes(`branch ${branchRef}`)) {
+    return false;
+  }
+  const deleted = await command(
+    "git",
+    ["-C", originWorktree, "update-ref", "-d", branchRef, preservedOid],
+    originWorktree,
+    { allowFailure: true },
+  );
+  if (deleted.code !== 0) {
+    const existing = await command(
+      "git",
+      ["-C", originWorktree, "show-ref", "--verify", "--quiet", branchRef],
+      originWorktree,
+      { allowFailure: true },
+    );
+    return existing.code === 1;
+  }
+  const owners = await command(
+    "git",
+    ["-C", originWorktree, "worktree", "list", "--porcelain"],
+    originWorktree,
+    { allowFailure: true },
+  );
+  const branchOwnerAppeared =
+    owners.code === 0 &&
+    owners.stdout.split(/\r?\n/u).includes(`branch ${branchRef}`);
+  if (owners.code === 0 && !branchOwnerAppeared) return true;
+  await command(
+    "git",
+    [
+      "-C",
+      originWorktree,
+      "update-ref",
+      branchRef,
+      preservedOid,
+      "0".repeat(preservedOid.length),
+    ],
+    originWorktree,
+    { allowFailure: true },
+  );
+  return false;
+}
+
 async function removeGateWorktree(
   gate: GateWorktree,
   originWorktree: string,
   orcaCommand: string,
-): Promise<void> {
+  preservedOid: string,
+  markerFile?: string,
+  force = true,
+): Promise<boolean> {
+  if (!COMMIT_OID.test(preservedOid)) return false;
+  const branchRef = `refs/heads/${gate.branch}`;
   let removed: CommandResult;
   if (gate.kind === "orca") {
     removed = await command(
       orcaCommand,
-      ["worktree", "rm", "--worktree", `id:${gate.id}`, "--force", "--json"],
+      [
+        "worktree",
+        "rm",
+        "--worktree",
+        `id:${gate.id}`,
+        ...(force ? ["--force"] : []),
+        "--json",
+      ],
       originWorktree,
       { allowFailure: true },
     );
@@ -6595,38 +7728,115 @@ async function removeGateWorktree(
       parent !== root ||
       gate.path !== expectedPath ||
       !gate.branch.startsWith("no-mistakes-gate-") ||
-      !RUN_ID_PATTERN.test(gate.branch) ||
+      !RUN_ID_PATTERN.test(gate.runId) ||
       path.basename(gate.path) !== gate.runId
     ) {
       console.error(
         `warning: refused to remove unsafe configured gate worktree ${gate.path}`,
       );
-      return;
+      return false;
     }
-    removed = await command(
-      "git",
-      ["-C", originWorktree, "worktree", "remove", "--force", gate.path],
-      originWorktree,
-      { allowFailure: true },
-    );
+    const worktrees = await listGitWorktrees(originWorktree);
+    const owner = worktrees?.find((worktree) => worktree.path === gate.path);
+    let pathPresent = false;
+    if (owner === undefined) {
+      try {
+        await lstat(gate.path);
+        pathPresent = true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
+      }
+    }
+    if (
+      worktrees === undefined ||
+      pathPresent ||
+      worktrees.some(
+        (worktree) =>
+          worktree.path !== gate.path && worktree.branch === branchRef,
+      ) ||
+      (owner !== undefined &&
+        (owner.branch !== branchRef || owner.head !== preservedOid))
+    ) {
+      console.error(
+        `warning: refused to remove configured gate worktree ${gate.path}; its current path, branch, and HEAD ownership could not be proved`,
+      );
+      return false;
+    }
+    removed = owner
+      ? await command(
+          "git",
+          [
+            "-C",
+            originWorktree,
+            "worktree",
+            "remove",
+            ...(force ? ["--force"] : []),
+            gate.path,
+          ],
+          originWorktree,
+          { allowFailure: true },
+        )
+      : { code: 0, stderr: "", stdout: "" };
   }
   if (removed.code !== 0) {
-    console.error(
-      `warning: could not remove gate worktree ${gate.path}: ${`${removed.stdout}${removed.stderr}`.trim()}`,
-    );
-    return;
+    if (gate.kind === "orca") {
+      const worktrees = await listOrcaWorktrees(orcaCommand, originWorktree);
+      if (
+        worktrees !== undefined &&
+        !worktrees.some((entry) => entry.id === gate.id)
+      ) {
+        // A previous cleanup attempt already removed it.
+      } else {
+        console.error(
+          `warning: could not remove gate worktree ${gate.path}: ${`${removed.stdout}${removed.stderr}`.trim()}`,
+        );
+        return false;
+      }
+    } else {
+      const worktrees = await listGitWorktrees(originWorktree);
+      if (
+        worktrees === undefined ||
+        worktrees.some((worktree) => worktree.path === gate.path)
+      ) {
+        console.error(
+          `warning: could not remove gate worktree ${gate.path}: ${`${removed.stdout}${removed.stderr}`.trim()}`,
+        );
+        return false;
+      }
+    }
   }
-  const deleted = await command(
-    "git",
-    ["-C", originWorktree, "branch", "-D", gate.branch],
-    originWorktree,
-    { allowFailure: true },
-  );
-  if (deleted.code !== 0) {
+  if (!(await removePreservedBranch(originWorktree, gate.branch, preservedOid))) {
     console.error(
-      `warning: removed gate worktree ${gate.path}, but could not delete branch ${gate.branch}: ${`${deleted.stdout}${deleted.stderr}`.trim()}`,
+      `warning: removed gate worktree ${gate.path}, but retained branch ${gate.branch} because its ownership could not be safely released`,
     );
-    return;
+    return false;
+  }
+  // Only now is the workspace fully gone; keep the marker while anything it
+  // describes still exists so prune --stranded can still identify it.
+  if (gate.kind === "configured") return true;
+  return await removeGateMarker(
+    markerFile ?? gateMarkerPath(originWorktree, gateMarkerId(gate)),
+    gate,
+  );
+}
+async function removeGateMarker(
+  markerFile: string,
+  gate: GateWorktree,
+): Promise<boolean> {
+  try {
+    await rm(markerFile, { force: true });
+    await rm(startupReceiptPath(markerFile), { force: true }).catch(
+      (error: unknown) =>
+        console.error(
+          `warning: removed gate marker ${markerFile}, but could not remove its startup receipt: ${String(error)}`,
+        ),
+    );
+    return true;
+  } catch (error) {
+    console.error(
+      `warning: removed gate resources for ${gateMarkerId(gate)}, but could not remove marker ${markerFile}: ${String(error)}`,
+    );
+    return false;
   }
 }
 
@@ -6643,23 +7853,152 @@ async function launchDetachedRun(
   let configuredOrca: CliOrca | undefined;
   let intentTaskId = "";
   let terminalHandle = "";
-  let gate: GateWorktree;
+  let gate: GateWorktree | undefined;
+  let launcherMarkerFile: string | undefined;
+  let launcherMarker: ConfiguredLauncherMarker | undefined;
+  let orcaLauncherMarker: OrcaLauncherMarker | undefined;
+  const startupReceipt = randomUUID();
+  const withLauncherAllocation = async <T>(
+    marker: ConfiguredLauncherMarker | OrcaLauncherMarker,
+    operation: () => Promise<T>,
+  ): Promise<T> =>
+    await allocationCommands.run(
+      {
+        onExit: async (pid) => {
+          if (marker.allocationPid === pid) delete marker.allocationPid;
+          await writeMarker(launcherMarkerFile!, marker);
+        },
+        onSpawn: async (pid) => {
+          marker.allocationPid = pid;
+          await writeMarker(launcherMarkerFile!, marker);
+        },
+      },
+      operation,
+    );
+  const cleanupFailedLaunch = async (error: unknown): Promise<void> => {
+    const cleanupGate = gate ?? launcherMarker?.gate ?? orcaLauncherMarker?.gate;
+    if (launcherMarker && launcherMarkerFile) {
+      launcherMarker.cleanupPending = true;
+      await writeMarker(launcherMarkerFile, launcherMarker).catch(() => {});
+    }
+    if (orcaLauncherMarker && launcherMarkerFile) {
+      await writeMarker(launcherMarkerFile, orcaLauncherMarker).catch(() => {});
+    }
+    if (orcaLauncherMarker && !cleanupGate) return;
+    let preservedOid = repo.head;
+    if (cleanupGate?.kind === "configured") {
+      await anchorRecoveryCommit(repo.root, cleanupGate.runId, repo.head);
+      if (!launcherMarkerFile) {
+        await markGateCleanupPending();
+      }
+    } else if (cleanupGate && orcaLauncherMarker) {
+      const tip = await command(
+        "git",
+        ["-C", repo.root, "rev-parse", `refs/heads/${cleanupGate.branch}`],
+        repo.root,
+        { allowFailure: true },
+      );
+      preservedOid = tip.stdout.trim();
+      if (tip.code !== 0 || !COMMIT_OID.test(preservedOid)) return;
+      try {
+        await anchorRecoveryCommit(
+          repo.root,
+          orcaLauncherMarker.launcherId,
+          preservedOid,
+        );
+      } catch {
+        return;
+      }
+      const terminals = await listGateTerminals(
+        cleanupGate.path,
+        orcaCommand,
+        repo.root,
+      );
+      if (terminals === undefined) return;
+      for (const terminal of terminals) {
+        if (
+          !(await closeTerminalOrProveStale(
+            terminal.handle,
+            orcaCommand,
+            repo.root,
+          ))
+        ) {
+          return;
+        }
+      }
+    }
+    await configuredOrca
+      ?.failRun(
+        `Configured coordinator startup failed: ${error instanceof Error ? error.message : String(error)}`,
+      )
+      .catch(() => {});
+    if (
+      cleanupGate &&
+      !(await removeGateWorktree(
+        cleanupGate,
+        repo.root,
+        orcaCommand,
+        preservedOid,
+      ))
+    ) {
+      return;
+    }
+    if (
+      !(await closeTerminalOrProveStale(
+        terminalHandle || launcherMarker?.terminalHandle,
+        orcaCommand,
+        repo.root,
+      ))
+    ) {
+      return;
+    }
+    if (cleanupGate) {
+      await removeGateMarker(
+        gateMarkerPath(repo.root, gateMarkerId(cleanupGate)),
+        cleanupGate,
+      );
+    }
+    if (launcherMarkerFile) await rm(launcherMarkerFile, { force: true });
+  };
   if (root) {
+    const launcherId = randomUUID();
+    const gateBranch = `no-mistakes-gate-${randomUUID().slice(0, 8)}`;
+    const intent = normalizeIntent(stringFlag(flags, "intent")!);
+    const terminalTitle = configuredLauncherTitle(launcherId);
+    const runObjective = configuredLauncherObjective(launcherId, intent);
+    launcherMarkerFile = gateMarkerPath(
+      repo.root,
+      `configured-launcher:${launcherId}`,
+    );
+    launcherMarker = {
+      allocationProtocol: "gated-v1",
+      createdAt: new Date().toISOString(),
+      kind: "configured-launcher",
+      launcherId,
+      originWorktree: repo.root,
+      pid: process.pid,
+      root,
+      runObjective,
+      terminalTitle,
+    };
+    await writeMarker(launcherMarkerFile, launcherMarker);
     try {
       const created = unwrapJson<{ terminal: { handle: string } }>(
         (
-          await command(
-            orcaCommand,
-            [
-              "terminal",
-              "create",
-              "--worktree",
-              `path:${repo.root}`,
-              "--title",
-              "no-mistakes",
-              "--json",
-            ],
-            repo.root,
+          await withLauncherAllocation(launcherMarker, () =>
+            command(
+              orcaCommand,
+              [
+                "terminal",
+                "create",
+                "--worktree",
+                `path:${repo.root}`,
+                "--title",
+                terminalTitle,
+                "--json",
+              ],
+              repo.root,
+            ),
           )
         ).stdout,
       );
@@ -6667,65 +8006,110 @@ async function launchDetachedRun(
       if (!terminalHandle) {
         throw new Error("terminal create returned an invalid receipt");
       }
+      launcherMarker.terminalHandle = terminalHandle;
+      await writeMarker(launcherMarkerFile, launcherMarker);
       const runReceipt = unwrapJson<{ run: { id: string } }>(
         (
-          await command(
-            orcaCommand,
-            [
-              "orchestration",
-              "run-create",
-              "--objective",
-              stringFlag(flags, "intent")!,
-              "--from",
-              terminalHandle,
-              "--json",
-            ],
-            repo.root,
+          await withLauncherAllocation(launcherMarker, () =>
+            command(
+              orcaCommand,
+              [
+                "orchestration",
+                "run-create",
+                "--objective",
+                runObjective,
+                "--from",
+                terminalHandle,
+                "--json",
+              ],
+              repo.root,
+            ),
           )
         ).stdout,
       );
       const runId = runReceipt.run?.id ?? "";
+      configuredRunPath(root, runId);
       configuredOrca = new CliOrca({
         command: orcaCommand,
         cwd: repo.root,
         runId,
       });
-      configuredRunPath(root, runId);
-      intentTaskId = await configuredOrca.createTask(
-        stageTaskSpec("intent", normalizeIntent(stringFlag(flags, "intent")!)),
+      launcherMarker.runId = runId;
+      await writeMarker(launcherMarkerFile, launcherMarker);
+      intentTaskId = await withLauncherAllocation(launcherMarker, () =>
+        configuredOrca!.createTask(stageTaskSpec("intent", intent)),
       );
-      gate = await createGateWorktree(repo, orcaCommand, {
+      launcherMarker.intentTaskId = intentTaskId;
+      launcherMarker.gate = {
+        branch: gateBranch,
         intentTaskId,
+        kind: "configured",
+        path: configuredRunPath(root, runId),
         root,
         runId,
-      });
+      };
+      await writeMarker(launcherMarkerFile, launcherMarker);
+      gate = await withLauncherAllocation(launcherMarker, () =>
+        createGateWorktree(repo, orcaCommand, {
+          branch: gateBranch,
+          intentTaskId,
+          root,
+          runId,
+        }),
+      );
+      launcherMarker.gateAllocated = true;
+      await writeMarker(launcherMarkerFile, launcherMarker);
     } catch (error) {
-      await configuredOrca
-        ?.failRun(
-          `Configured coordinator startup failed: ${error instanceof Error ? error.message : String(error)}`,
-        )
-        .catch(() => {});
-      if (terminalHandle) {
-        await command(
-          orcaCommand,
-          [
-            "terminal",
-            "close",
-            "--terminal",
-            terminalHandle,
-            "--tab",
-            "--json",
-          ],
-          repo.root,
-          { allowFailure: true },
-        );
-      }
+      await cleanupFailedLaunch(error);
       throw error;
     }
   } else {
-    gate = await createGateWorktree(repo, orcaCommand);
+    const launcherId = randomUUID();
+    const gateBranch = `no-mistakes-gate-${randomUUID().slice(0, 8)}`;
+    launcherMarkerFile = gateMarkerPath(
+      repo.root,
+      `orca-launcher:${launcherId}`,
+    );
+    orcaLauncherMarker = {
+      allocationProtocol: "gated-v1",
+      createdAt: new Date().toISOString(),
+      gateBranch,
+      kind: "orca-launcher",
+      launcherId,
+      originWorktree: repo.root,
+      pid: process.pid,
+    };
+    await writeMarker(launcherMarkerFile, orcaLauncherMarker);
+    try {
+      const allocatedGate = await withLauncherAllocation(
+        orcaLauncherMarker,
+        () => createGateWorktree(repo, orcaCommand, undefined, gateBranch),
+      );
+      if (allocatedGate.kind !== "orca") {
+        throw new Error("worktree create returned an unexpected gate kind");
+      }
+      gate = allocatedGate;
+      orcaLauncherMarker.gate = allocatedGate;
+      await writeMarker(launcherMarkerFile, orcaLauncherMarker);
+    } catch (error) {
+      await cleanupFailedLaunch(error);
+      throw error;
+    }
   }
+  if (!gate) throw new Error("gate worktree allocation returned no gate");
   try {
+    await writeLauncherGateMarker(
+      repo.root,
+      gate,
+      startupReceipt,
+      terminalHandle || undefined,
+    );
+    if (launcherMarkerFile) {
+      await rm(launcherMarkerFile, { force: true });
+      launcherMarkerFile = undefined;
+      launcherMarker = undefined;
+      orcaLauncherMarker = undefined;
+    }
     if (gate.kind === "orca") {
       await command(
         orcaCommand,
@@ -6781,13 +8165,12 @@ async function launchDetachedRun(
       );
       terminalHandle = created?.terminal?.handle ?? "";
     }
+    if (!terminalHandle) {
+      throw new Error("terminal create returned an invalid receipt");
+    }
   } catch (error) {
-    await removeGateWorktree(gate, repo.root, orcaCommand);
+    await cleanupFailedLaunch(error);
     throw error;
-  }
-  if (!terminalHandle) {
-    await removeGateWorktree(gate, repo.root, orcaCommand);
-    throw new Error("terminal create returned an invalid receipt");
   }
 
   const attachedArgs = ["run", "--attached", "--repo", gate.path];
@@ -6825,9 +8208,24 @@ async function launchDetachedRun(
       `ORCA_CLI_COMMAND=${shellQuote(process.env.ORCA_CLI_COMMAND)}`,
     );
   }
-  const coordinatorCommand = `${environment.join(" ")} ${quotedCommand}`;
+  const receiptCommand = [
+    process.execPath,
+    "-e",
+    'const fs=require("node:fs");const path=require("node:path");const [file,token]=process.argv.slice(1);let descriptor=fs.openSync(file,"wx",0o600);try{fs.writeFileSync(descriptor,JSON.stringify({pid:process.ppid,token}));fs.fsyncSync(descriptor)}finally{fs.closeSync(descriptor)}descriptor=fs.openSync(path.dirname(file),"r");try{fs.fsyncSync(descriptor)}finally{fs.closeSync(descriptor)}',
+    startupReceiptPath(gateMarkerPath(repo.root, gateMarkerId(gate))),
+    startupReceipt,
+  ]
+    .map(shellQuote)
+    .join(" ");
+  const coordinatorCommand = `${receiptCommand} && exec env ${environment.join(" ")} ${quotedCommand}`;
 
   try {
+    await writeLauncherGateMarker(
+      repo.root,
+      gate,
+      startupReceipt,
+      terminalHandle,
+    );
     const deadline = Date.now() + 60_000;
     for (;;) {
       const shown = unwrapJson<{
@@ -6866,21 +8264,7 @@ async function launchDetachedRun(
       repo.root,
     );
   } catch (error) {
-    if (gate.kind === "configured") {
-      await configuredOrca
-        ?.failTask(
-          gate.intentTaskId,
-          `Configured coordinator startup failed: ${error instanceof Error ? error.message : String(error)}`,
-        )
-        .catch(() => {});
-    }
-    await command(
-      orcaCommand,
-      ["terminal", "close", "--terminal", terminalHandle, "--tab", "--json"],
-      repo.root,
-      { allowFailure: true },
-    );
-    await removeGateWorktree(gate, repo.root, orcaCommand);
+    await cleanupFailedLaunch(error);
     throw error;
   }
   return terminalHandle;
@@ -6980,6 +8364,1641 @@ async function recoveryHeadState(
   return "contained";
 }
 
+function terminalProbeProvesStale(result: CommandResult): boolean {
+  if (result.code === 0) return false;
+  try {
+    const response = JSON.parse(result.stdout) as {
+      error?: { code?: unknown };
+      ok?: unknown;
+    };
+    return (
+      response.ok === false &&
+      (response.error?.code === "terminal_handle_stale" ||
+        response.error?.code === "tab_not_found")
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function closeTerminalOrProveStale(
+  terminalHandle: string | undefined,
+  orcaCommand: string,
+  cwd: string,
+): Promise<boolean> {
+  if (!terminalHandle) return true;
+  const closed = await command(
+    orcaCommand,
+    ["terminal", "close", "--terminal", terminalHandle, "--tab", "--json"],
+    cwd,
+    { allowFailure: true },
+  );
+  if (closed.code === 0) return true;
+  const shown = await command(
+    orcaCommand,
+    ["terminal", "show", "--terminal", terminalHandle, "--json"],
+    cwd,
+    { allowFailure: true },
+  );
+  return terminalProbeProvesStale(shown);
+}
+
+async function coordinatorIsLive(
+  marker: Pick<
+    GateRunMarker,
+    "launcherPid" | "pid" | "startupReceipt" | "terminalHandle"
+  >,
+  orcaCommand: string,
+  cwd: string,
+  markerFile?: string,
+): Promise<boolean> {
+  if (marker.pid !== undefined && marker.launcherPid !== undefined) return true;
+  // A dead pid is decisive: no process means no coordinator, whatever shape
+  // the terminal probe would fail in (Orca itself may be down). A live pid is
+  // retained even when it is a reused pid — reaping a live run is worse than
+  // keeping a leftover.
+  if (marker.pid !== undefined) {
+    if (!Number.isSafeInteger(marker.pid) || marker.pid <= 0) return true;
+    try {
+      process.kill(marker.pid, 0);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") return true;
+      return false;
+    }
+  }
+  if (marker.launcherPid !== undefined) {
+    if (!Number.isSafeInteger(marker.launcherPid) || marker.launcherPid <= 0)
+      return true;
+    try {
+      process.kill(marker.launcherPid, 0);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") return true;
+    }
+    const { startupReceipt } = marker;
+    if (
+      typeof startupReceipt !== "string" ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(
+        startupReceipt,
+      ) ||
+      !markerFile
+    ) {
+      return true;
+    }
+    let receiptText: string;
+    try {
+      receiptText = await readFile(startupReceiptPath(markerFile), "utf8");
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code !== "ENOENT";
+    }
+    try {
+      const receipt = JSON.parse(receiptText) as {
+        pid?: unknown;
+        token?: unknown;
+      };
+      if (
+        receipt.token !== startupReceipt ||
+        !Number.isSafeInteger(receipt.pid) ||
+        (receipt.pid as number) <= 0
+      ) {
+        return true;
+      }
+      try {
+        process.kill(receipt.pid as number, 0);
+        return true;
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code !== "ESRCH";
+      }
+    } catch {
+      return true;
+    }
+  }
+  if (typeof marker.terminalHandle === "string") {
+    const shown = await command(
+      orcaCommand,
+      ["terminal", "show", "--terminal", marker.terminalHandle, "--json"],
+      cwd,
+      { allowFailure: true },
+    );
+    if (shown.code === 0) {
+      try {
+        const response = unwrapJson<{
+          terminal?: { connected?: unknown };
+        }>(shown.stdout);
+        return response.terminal?.connected !== false;
+      } catch {
+        return true;
+      }
+    }
+    return !terminalProbeProvesStale(shown);
+  }
+  // The marker carries no liveness signal at all: not identifiable as dead.
+  return true;
+}
+
+type GateTerminal = { connected?: unknown; handle: string; title?: unknown };
+
+async function listGateTerminals(
+  gatePath: string,
+  orcaCommand: string,
+  cwd: string,
+): Promise<GateTerminal[] | undefined> {
+  const listed = await command(
+    orcaCommand,
+    ["terminal", "list", "--worktree", `path:${gatePath}`, "--json"],
+    cwd,
+    { allowFailure: true },
+  );
+  if (listed.code !== 0) return undefined;
+  try {
+    const terminals = unwrapJson<{ terminals?: GateTerminal[] }>(
+      listed.stdout,
+    ).terminals;
+    return Array.isArray(terminals) &&
+      terminals.every((terminal) => typeof terminal?.handle === "string")
+      ? terminals
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function discoverConfiguredLauncherAllocations(
+  marker: ConfiguredLauncherMarker,
+  orcaCommand: string,
+  repoRoot: string,
+): Promise<{ runId?: string; terminalHandle?: string } | undefined> {
+  let terminalHandle = marker.terminalHandle;
+  if (!terminalHandle) {
+    const terminals = await listGateTerminals(repoRoot, orcaCommand, repoRoot);
+    if (terminals === undefined) return undefined;
+    const matches = terminals.filter(
+      (terminal) => terminal.title === marker.terminalTitle,
+    );
+    if (matches.length > 1) return undefined;
+    terminalHandle = matches[0]?.handle;
+  }
+
+  let runId = marker.runId;
+  if (!runId) {
+    const matches: string[] = [];
+    const cursors = new Set<string>();
+    let cursor: string | undefined;
+    do {
+      const listed = await command(
+        orcaCommand,
+        [
+          "orchestration",
+          "run-list",
+          "--limit",
+          "100",
+          ...(cursor ? ["--cursor", cursor] : []),
+          "--json",
+        ],
+        repoRoot,
+        { allowFailure: true },
+      );
+      if (listed.code !== 0) return undefined;
+      try {
+        const response = unwrapJson<{
+          nextCursor?: unknown;
+          runs?: Array<{ id?: unknown; objective?: unknown }>;
+        }>(listed.stdout);
+        if (!Array.isArray(response.runs)) return undefined;
+        for (const run of response.runs) {
+          if (
+            typeof run.id === "string" &&
+            run.objective === marker.runObjective
+          ) {
+            matches.push(run.id);
+          }
+        }
+        if (
+          response.nextCursor === null ||
+          response.nextCursor === undefined ||
+          response.nextCursor === ""
+        ) {
+          break;
+        }
+        if (
+          typeof response.nextCursor !== "string" ||
+          cursors.has(response.nextCursor)
+        ) {
+          return undefined;
+        }
+        cursors.add(response.nextCursor);
+        cursor = response.nextCursor;
+      } catch {
+        return undefined;
+      }
+    } while (true);
+    if (matches.length > 1) return undefined;
+    runId = matches[0];
+  }
+  return { runId, terminalHandle };
+}
+
+async function reapConfiguredGate(
+  markerFile: string,
+  marker: GateRunMarker,
+  repoRoot: string,
+  orcaCommand: string,
+  ledger: DomainLedger,
+  launcher?: Pick<ConfiguredLauncherMarker, "gateAllocated" | "launcherId">,
+): Promise<boolean> {
+  const gate = marker.gate;
+  if (gate.kind !== "configured") return false;
+  const closeTerminal = (): Promise<boolean> =>
+    closeTerminalOrProveStale(
+      marker.terminalHandle,
+      orcaCommand,
+      repoRoot,
+    );
+  let root: string;
+  let expectedPath: string;
+  try {
+    root = await canonicalPath(gate.root);
+    expectedPath = configuredRunPath(root, gate.runId);
+  } catch {
+    console.error(
+      `no-mistakes: retained gate workspace ${gate.path}; its configured root or run ID is invalid`,
+    );
+    return false;
+  }
+  if (
+    marker.originWorktree !== repoRoot ||
+    marker.runId !== gate.runId ||
+    path.basename(markerFile) !==
+      path.basename(
+        gateMarkerPath(
+          repoRoot,
+          launcher
+            ? `configured-launcher:${launcher.launcherId}`
+            : gateMarkerId(gate),
+        ),
+      ) ||
+    gate.path !== expectedPath ||
+    path.dirname(gate.path) !== root ||
+    !gate.branch.startsWith("no-mistakes-gate-") ||
+    typeof gate.intentTaskId !== "string"
+  ) {
+    console.error(
+      `no-mistakes: retained gate workspace ${gate.path}; its marker does not identify its configured resources`,
+    );
+    return false;
+  }
+  if (
+    marker.cleanupPending !== true &&
+    (await coordinatorIsLive(marker, orcaCommand, repoRoot, markerFile))
+  ) {
+    console.error(
+      `no-mistakes: retained gate workspace ${gate.path}; its coordinator is still live`,
+    );
+    return false;
+  }
+  const worktrees = await listGitWorktrees(repoRoot);
+  if (worktrees === undefined) {
+    console.error(
+      `no-mistakes: retained gate workspace ${gate.path}; Git worktree ownership could not be verified`,
+    );
+    return false;
+  }
+  const branchRef = `refs/heads/${gate.branch}`;
+  const actualGate = worktrees.find((worktree) => worktree.path === gate.path);
+  if (
+    worktrees.some(
+      (worktree) =>
+        worktree.path !== gate.path && worktree.branch === branchRef,
+    ) ||
+    (actualGate !== undefined &&
+      (actualGate.branch !== branchRef ||
+        typeof actualGate.head !== "string" ||
+        !COMMIT_OID.test(actualGate.head)))
+  ) {
+    console.error(
+      `no-mistakes: retained gate workspace ${gate.path}; its current Git ownership does not match the marker`,
+    );
+    return false;
+  }
+  const run = ledger.runIdentity(gate.runId);
+  const retrying = run?.status === "cancelled";
+  const settleConfiguredRun = async (): Promise<boolean> => {
+    if (run !== undefined && run.status !== "in-progress") return true;
+    try {
+      await new CliOrca({
+        command: orcaCommand,
+        cwd: repoRoot,
+        runId: gate.runId,
+      }).failRun("Configured coordinator terminated before cleanup completed");
+      return true;
+    } catch (error) {
+      console.error(
+        `no-mistakes: retained gate workspace ${gate.path}; its configured run could not be settled: ${String(error)}`,
+      );
+      return false;
+    }
+  };
+  const origin = worktrees.find((worktree) => worktree.path === repoRoot);
+  if (
+    run !== undefined &&
+    (run.repo_root !== repoRoot ||
+      origin?.branch !== `refs/heads/${run.branch.replace(/^refs\/heads\//, "")}` ||
+      (actualGate !== undefined && run.status !== "in-progress" && !retrying))
+  ) {
+    console.error(
+      `no-mistakes: retained gate workspace ${gate.path}; its run does not own this repository and branch`,
+    );
+    return false;
+  }
+  const lease =
+    run === undefined ? undefined : ledger.leaseFor(repoRoot, run.branch);
+  if (lease !== undefined && lease.run_id !== gate.runId) {
+    console.error(
+      `no-mistakes: retained gate workspace ${gate.path}; its branch lease belongs to another run`,
+    );
+    return false;
+  }
+  if (marker.workers !== undefined || marker.workerAllocations !== undefined) {
+    const [workerWorktrees, gateTerminals] = await Promise.all([
+      listOrcaWorktrees(orcaCommand, repoRoot),
+      listGateTerminals(gate.path, orcaCommand, repoRoot),
+    ]);
+    if (
+      workerWorktrees === undefined ||
+      gateTerminals === undefined ||
+      !(await discoverMarkerWorkers(
+        markerFile,
+        marker,
+        workerWorktrees,
+        gateTerminals,
+        repoRoot,
+        orcaCommand,
+      )) ||
+      !(await reapMarkerWorkers(
+        markerFile,
+        marker,
+        workerWorktrees,
+        repoRoot,
+        orcaCommand,
+      ))
+    ) {
+      console.error(
+        `no-mistakes: retained gate workspace ${gate.path}; its worker cleanup did not converge`,
+      );
+      return false;
+    }
+    if ((marker.workerAllocations?.length ?? 0) > 0) {
+      console.error(
+        `no-mistakes: retained gate workspace ${gate.path}; a worker allocation is still in flight`,
+      );
+      return false;
+    }
+  }
+  const tip = await command(
+    "git",
+    ["-C", repoRoot, "rev-parse", "--verify", branchRef],
+    repoRoot,
+    { allowFailure: true },
+  );
+  const tipOid = tip.stdout.trim();
+  if (tip.code !== 0 || !COMMIT_OID.test(tipOid)) {
+    const absent = await command(
+      "git",
+      ["-C", repoRoot, "show-ref", "--verify", "--quiet", branchRef],
+      repoRoot,
+      { allowFailure: true },
+    );
+    if (absent.code !== 1) {
+      console.error(
+        `no-mistakes: retained gate workspace ${gate.path}; its branch tip could not be resolved`,
+      );
+      return false;
+    }
+    const recovered = await command(
+      "git",
+      [
+        "-C",
+        repoRoot,
+        "rev-parse",
+        "--verify",
+        `refs/no-mistakes/recover/${gate.runId}`,
+      ],
+      repoRoot,
+      { allowFailure: true },
+    );
+    if (
+      (launcher?.gateAllocated === true &&
+        (recovered.code !== 0 ||
+          !COMMIT_OID.test(recovered.stdout.trim()))) ||
+      !(await settleConfiguredRun()) ||
+      (run?.status === "in-progress" &&
+        !ledger.settleRun(gate.runId, "cancelled", {
+          branch: run.branch,
+          repoRoot,
+        }))
+    ) {
+      console.error(
+        `no-mistakes: retained gate workspace ${gate.path}; completed cleanup could not be verified`,
+      );
+      return false;
+    }
+    if (!(await closeTerminal())) {
+      console.error(
+        `no-mistakes: retained gate marker ${markerFile}; its terminal could not be closed or proved stale`,
+      );
+      return false;
+    }
+    if (!(await removeGateMarker(markerFile, gate))) return false;
+    console.error(`no-mistakes: reaped stranded gate marker ${markerFile}`);
+    return true;
+  }
+  if (actualGate !== undefined && actualGate.head !== tipOid) {
+    console.error(
+      `no-mistakes: retained gate workspace ${gate.path}; its preserved and owned commit tips do not agree`,
+    );
+    return false;
+  }
+  try {
+    await anchorRecoveryCommit(repoRoot, gate.runId, tipOid);
+  } catch (error) {
+    console.error(
+      `no-mistakes: retained gate workspace ${gate.path}; could not anchor recovery ref for ${gate.runId}: ${String(error)}`,
+    );
+    return false;
+  }
+  if (!(await settleConfiguredRun())) return false;
+  if (
+    run !== undefined &&
+    !retrying &&
+    !ledger.settleRun(gate.runId, "cancelled", {
+      branch: run.branch,
+      repoRoot,
+    })
+  ) {
+    console.error(
+      `no-mistakes: retained gate workspace ${gate.path}; its run ownership changed before cancellation`,
+    );
+    return false;
+  }
+  if (
+    !(await removeGateWorktree(
+      gate,
+      repoRoot,
+      orcaCommand,
+      tipOid,
+      markerFile,
+      false,
+    ))
+  ) {
+    return false;
+  }
+  if (!(await closeTerminal())) {
+    console.error(
+      `no-mistakes: retained gate marker ${markerFile}; its terminal could not be closed or proved stale`,
+    );
+    return false;
+  }
+  if (!(await removeGateMarker(markerFile, gate))) return false;
+  console.error(`no-mistakes: reaped stranded gate workspace ${gate.path}`);
+  return true;
+}
+
+async function reapConfiguredLauncher(
+  markerFile: string,
+  marker: ConfiguredLauncherMarker,
+  repoRoot: string,
+  orcaCommand: string,
+  ledger: DomainLedger,
+): Promise<boolean> {
+  let root: string;
+  try {
+    root = await canonicalPath(marker.root);
+  } catch {
+    return false;
+  }
+  if (
+    marker.originWorktree !== repoRoot ||
+    !RUN_ID_PATTERN.test(marker.launcherId) ||
+    marker.terminalTitle !== configuredLauncherTitle(marker.launcherId) ||
+    typeof marker.runObjective !== "string" ||
+    !marker.runObjective.startsWith(
+      `[no-mistakes-launcher:${marker.launcherId}] `,
+    ) ||
+    path.basename(markerFile) !==
+      path.basename(
+        gateMarkerPath(
+          repoRoot,
+          `configured-launcher:${marker.launcherId}`,
+        ),
+      ) ||
+    typeof marker.pid !== "number" ||
+    marker.pid <= 0 ||
+    (marker.allocationPid !== undefined &&
+      (!Number.isInteger(marker.allocationPid) || marker.allocationPid <= 0)) ||
+    (marker.runId !== undefined &&
+      (!RUN_ID_PATTERN.test(marker.runId) ||
+        configuredRunPath(root, marker.runId) !==
+          path.join(root, marker.runId)))
+  ) {
+    return false;
+  }
+  if (
+    await coordinatorIsLive(
+      { pid: marker.pid },
+      orcaCommand,
+      repoRoot,
+    )
+  ) {
+    return false;
+  }
+  if (
+    marker.allocationPid !== undefined &&
+    (await coordinatorIsLive(
+      { pid: marker.allocationPid },
+      orcaCommand,
+      repoRoot,
+    ))
+  ) {
+    return false;
+  }
+  const discovered = await discoverConfiguredLauncherAllocations(
+    marker,
+    orcaCommand,
+    repoRoot,
+  );
+  if (discovered === undefined) return false;
+  if (
+    discovered.runId !== marker.runId ||
+    discovered.terminalHandle !== marker.terminalHandle
+  ) {
+    marker.runId = discovered.runId;
+    marker.terminalHandle = discovered.terminalHandle;
+    try {
+      await writeMarker(markerFile, marker);
+    } catch {
+      return false;
+    }
+  }
+  if (
+    marker.allocationProtocol !== "gated-v1" &&
+    marker.runId === undefined &&
+    marker.terminalHandle === undefined &&
+    marker.gate === undefined &&
+    marker.gateAllocated !== true
+  ) {
+    return false;
+  }
+  if (marker.gate) {
+    marker.cleanupPending = true;
+    try {
+      await writeMarker(markerFile, marker);
+    } catch {
+      return false;
+    }
+    return await reapConfiguredGate(
+      markerFile,
+      {
+        cleanupPending: true,
+        createdAt: marker.createdAt,
+        gate: marker.gate,
+        originWorktree: marker.originWorktree,
+        pid: marker.pid,
+        runId: marker.runId,
+        terminalHandle: marker.terminalHandle,
+      },
+      repoRoot,
+      orcaCommand,
+      ledger,
+      marker,
+    );
+  }
+  if (marker.gateAllocated === true) return false;
+  if (marker.runId) {
+    try {
+      await new CliOrca({
+        command: orcaCommand,
+        cwd: repoRoot,
+        runId: marker.runId,
+      }).failRun("Configured launcher terminated before gate allocation");
+    } catch {
+      return false;
+    }
+    const run = ledger.runIdentity(marker.runId);
+    if (
+      run !== undefined &&
+      (run.repo_root !== repoRoot ||
+        (run.status === "in-progress" &&
+          !ledger.settleRun(marker.runId, "cancelled", {
+            branch: run.branch,
+            repoRoot,
+          })))
+    ) {
+      return false;
+    }
+  }
+  if (
+    !(await closeTerminalOrProveStale(
+      marker.terminalHandle,
+      orcaCommand,
+      repoRoot,
+    ))
+  ) {
+    return false;
+  }
+  try {
+    await rm(markerFile);
+    console.error(
+      `no-mistakes: reaped configured launcher marker ${markerFile}`,
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function reapOrcaLauncher(
+  markerFile: string,
+  marker: OrcaLauncherMarker,
+  repoRoot: string,
+  orcaCommand: string,
+): Promise<boolean> {
+  if (
+    marker.originWorktree !== repoRoot ||
+    !RUN_ID_PATTERN.test(marker.launcherId) ||
+    marker.gateBranch !== marker.gateBranch.replace(/^refs\/heads\//, "") ||
+    !path.posix.basename(marker.gateBranch).startsWith("no-mistakes-gate-") ||
+    path.basename(markerFile) !==
+      path.basename(
+        gateMarkerPath(repoRoot, `orca-launcher:${marker.launcherId}`),
+      ) ||
+    typeof marker.pid !== "number" ||
+    marker.pid <= 0 ||
+    (marker.allocationPid !== undefined &&
+      (!Number.isInteger(marker.allocationPid) || marker.allocationPid <= 0)) ||
+    (await coordinatorIsLive({ pid: marker.pid }, orcaCommand, repoRoot))
+  ) {
+    return false;
+  }
+  if (
+    marker.allocationPid !== undefined &&
+    (await coordinatorIsLive(
+      { pid: marker.allocationPid },
+      orcaCommand,
+      repoRoot,
+    ))
+  ) {
+    return false;
+  }
+  const worktrees = await listOrcaWorktrees(orcaCommand, repoRoot);
+  if (worktrees === undefined) return false;
+  const origin = worktrees.find((worktree) => worktree.path === repoRoot);
+  if (typeof origin?.id !== "string") return false;
+  const originId = origin.id;
+  const markerHasNamespace = marker.gateBranch.includes("/");
+  const matches = worktrees.filter(
+    (worktree) => {
+      if (
+        worktree.parentWorktreeId !== originId ||
+        typeof worktree.branch !== "string"
+      ) {
+        return false;
+      }
+      const branch = worktree.branch.replace(/^refs\/heads\//, "");
+      return markerHasNamespace
+        ? branch === marker.gateBranch
+        : path.posix.basename(branch) === marker.gateBranch;
+    },
+  );
+  if (matches.length > 1) return false;
+  const actual = matches[0];
+  if (actual === undefined) {
+    const branchExists = await command(
+      "git",
+      [
+        "-C",
+        repoRoot,
+        "show-ref",
+        "--verify",
+        "--quiet",
+        `refs/heads/${marker.gateBranch}`,
+      ],
+      repoRoot,
+      { allowFailure: true },
+    );
+    if (branchExists.code === 1) {
+      if (
+        marker.allocationProtocol !== "gated-v1" &&
+        marker.gate === undefined
+      ) {
+        return false;
+      }
+      await rm(markerFile);
+      return true;
+    }
+    if (branchExists.code !== 0) return false;
+    const [branch, recovery] = await Promise.all([
+      command(
+        "git",
+        ["-C", repoRoot, "rev-parse", `refs/heads/${marker.gateBranch}`],
+        repoRoot,
+        { allowFailure: true },
+      ),
+      command(
+        "git",
+        [
+          "-C",
+          repoRoot,
+          "rev-parse",
+          "--verify",
+          recoveryRefFor(marker.launcherId),
+        ],
+        repoRoot,
+        { allowFailure: true },
+      ),
+    ]);
+    const preservedOid = recovery.stdout.trim();
+    if (
+      branch.code !== 0 ||
+      recovery.code !== 0 ||
+      branch.stdout.trim() !== preservedOid ||
+      !COMMIT_OID.test(preservedOid) ||
+      !(await removePreservedBranch(
+        repoRoot,
+        marker.gateBranch,
+        preservedOid,
+      ))
+    ) {
+      return false;
+    }
+    await rm(markerFile);
+    return true;
+  }
+  if (
+    typeof actual.id !== "string" ||
+    typeof actual.path !== "string" ||
+    typeof actual.branch !== "string" ||
+    typeof actual.head !== "string" ||
+    !COMMIT_OID.test(actual.head) ||
+    !path.isAbsolute(actual.path) ||
+    !actual.id.endsWith(`::${actual.path}`) ||
+    actual.id.split("::", 1)[0] !== originId.split("::", 1)[0] ||
+    (marker.gate !== undefined &&
+      (marker.gate.kind !== "orca" ||
+        marker.gate.branch.replace(/^refs\/heads\//, "") !== marker.gateBranch ||
+        marker.gate.id !== actual.id ||
+        marker.gate.path !== actual.path))
+  ) {
+    return false;
+  }
+  const actualBranch = actual.branch.replace(/^refs\/heads\//, "");
+  const gate: Extract<GateWorktree, { kind: "orca" }> = {
+    branch: actualBranch,
+    id: actual.id,
+    kind: "orca",
+    path: actual.path,
+  };
+  if (marker.gate === undefined || marker.gateBranch !== actualBranch) {
+    marker.gateBranch = actualBranch;
+    marker.gate = gate;
+    try {
+      await writeMarker(markerFile, marker);
+    } catch {
+      return false;
+    }
+  }
+  const terminals = await listGateTerminals(gate.path, orcaCommand, repoRoot);
+  if (terminals === undefined) return false;
+  for (const terminal of terminals) {
+    if (
+      !(await closeTerminalOrProveStale(
+        terminal.handle,
+        orcaCommand,
+        repoRoot,
+      ))
+    ) {
+      return false;
+    }
+  }
+  try {
+    await anchorRecoveryCommit(repoRoot, marker.launcherId, actual.head);
+  } catch {
+    return false;
+  }
+  return await removeGateWorktree(
+    gate,
+    repoRoot,
+    orcaCommand,
+    actual.head,
+    markerFile,
+    false,
+  );
+}
+
+function strandedWorkerId(identity: string): string {
+  return `stranded-${createHash("sha256")
+    .update(identity)
+    .digest("hex")
+    .slice(0, 24)}`;
+}
+
+async function discoverMarkerWorkers(
+  markerFile: string,
+  marker: GateRunMarker,
+  worktrees: OrcaWorktreeIdentity[],
+  gateTerminals: GateTerminal[],
+  repoRoot: string,
+  orcaCommand: string,
+): Promise<boolean> {
+  if (marker.workers !== undefined && !Array.isArray(marker.workers)) {
+    return false;
+  }
+  if (
+    marker.workerAllocations !== undefined &&
+    (!Array.isArray(marker.workerAllocations) ||
+      marker.workerAllocations.some(
+        (allocation) => typeof allocation !== "string" || allocation.length === 0,
+      ) ||
+      new Set(marker.workerAllocations).size !== marker.workerAllocations.length)
+  ) {
+    return false;
+  }
+  const allocationIds = new Set(marker.workerAllocations ?? []);
+  let allocationsQuiescent = allocationIds.size === 0;
+  if (allocationIds.size > 0 && marker.allocationProtocol === "gated-v1") {
+    const entries = marker.workerAllocationPids;
+    if (
+      entries !== undefined &&
+      (typeof entries !== "object" || Array.isArray(entries) || entries === null)
+    ) {
+      return false;
+    }
+    allocationsQuiescent = true;
+    for (const [allocationId, pids] of Object.entries(entries ?? {})) {
+      if (
+        !allocationIds.has(allocationId) ||
+        !Array.isArray(pids) ||
+        pids.some((pid) => !Number.isInteger(pid) || pid <= 0) ||
+        new Set(pids).size !== pids.length
+      ) {
+        return false;
+      }
+      for (const pid of pids) {
+        if (
+          await coordinatorIsLive({ pid }, orcaCommand, repoRoot)
+        ) {
+          allocationsQuiescent = false;
+        }
+      }
+    }
+  }
+  const resources = Array.isArray(marker.workers) ? [...marker.workers] : [];
+  const worktreeIds = new Set(resources.map((worker) => worker.worktreeId));
+  const terminalHandles = new Set(
+    resources.map((worker) => worker.terminalHandle).filter(Boolean),
+  );
+  const addTerminal = (handle: string): void => {
+    if (terminalHandles.has(handle)) return;
+    const dispatchId = strandedWorkerId(handle);
+    resources.push({
+      dispatchId,
+      taskId: marker.runId ?? dispatchId,
+      terminalHandle: handle,
+    });
+    terminalHandles.add(handle);
+  };
+  const childWorktrees = worktrees.filter((worktree) => {
+    if (marker.gate.kind === "orca") {
+      return worktree.parentWorktreeId === marker.gate.id;
+    }
+    return (
+      typeof worktree.parentWorktreeId === "string" &&
+      worktree.parentWorktreeId.endsWith(`::${marker.gate.path}`)
+    );
+  });
+  for (const worktree of childWorktrees) {
+    if (
+      typeof worktree.id !== "string" ||
+      typeof worktree.path !== "string" ||
+      typeof worktree.branch !== "string" ||
+      typeof worktree.head !== "string" ||
+      !COMMIT_OID.test(worktree.head) ||
+      !worktree.id.endsWith(`::${worktree.path}`)
+    ) {
+      return false;
+    }
+    const terminals = await listGateTerminals(
+      worktree.path,
+      orcaCommand,
+      repoRoot,
+    );
+    if (terminals === undefined) return false;
+    if (!worktreeIds.has(worktree.id)) {
+      const terminal = terminals.find(
+        (candidate) => !terminalHandles.has(candidate.handle),
+      );
+      const dispatchId = strandedWorkerId(worktree.id);
+      resources.push({
+        dispatchId,
+        taskId: marker.runId ?? dispatchId,
+        ...(terminal ? { terminalHandle: terminal.handle } : {}),
+        worktreeBranch: worktree.branch.replace(/^refs\/heads\//, ""),
+        worktreeId: worktree.id,
+        worktreePath: worktree.path,
+      });
+      worktreeIds.add(worktree.id);
+      if (terminal) terminalHandles.add(terminal.handle);
+    }
+    for (const terminal of terminals) {
+      addTerminal(terminal.handle);
+    }
+  }
+  for (const terminal of gateTerminals) {
+    if (
+      terminal.handle === marker.terminalHandle ||
+      terminalHandles.has(terminal.handle)
+    ) {
+      continue;
+    }
+    addTerminal(terminal.handle);
+  }
+  if (
+    resources.length === (marker.workers?.length ?? 0) &&
+    (allocationIds.size === 0 || !allocationsQuiescent)
+  ) {
+    return true;
+  }
+  if (!marker.runId) return false;
+  marker.workers = resources;
+  if (allocationsQuiescent) {
+    delete marker.workerAllocations;
+    delete marker.workerAllocationPids;
+  }
+  try {
+    await writeMarker(markerFile, marker);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function reapMarkerWorkers(
+  markerFile: string,
+  marker: GateRunMarker,
+  worktrees: OrcaWorktreeIdentity[],
+  repoRoot: string,
+  orcaCommand: string,
+): Promise<boolean> {
+  if (marker.workers === undefined) return true;
+  if (!Array.isArray(marker.workers) || !marker.runId) return false;
+  const resources = marker.workers;
+  const dispatches = new Set<string>();
+  const preservedOids = new Map<string, string>();
+  for (const worker of resources) {
+    if (
+      typeof worker.dispatchId !== "string" ||
+      typeof worker.taskId !== "string" ||
+      dispatches.has(worker.dispatchId) ||
+      (worker.terminalHandle !== undefined &&
+        typeof worker.terminalHandle !== "string") ||
+      (worker.worktreeId === undefined) !==
+        (worker.worktreePath === undefined) ||
+      (worker.worktreeId === undefined) !==
+        (worker.worktreeBranch === undefined)
+    ) {
+      return false;
+    }
+    dispatches.add(worker.dispatchId);
+    if (!worker.worktreeId) continue;
+    if (
+      typeof worker.worktreeId !== "string" ||
+      typeof worker.worktreePath !== "string" ||
+      typeof worker.worktreeBranch !== "string" ||
+      !path.isAbsolute(worker.worktreePath) ||
+      !worker.worktreeId.endsWith(`::${worker.worktreePath}`)
+    ) {
+      return false;
+    }
+    const actual = worktrees.find(
+      (worktree) => worktree.id === worker.worktreeId,
+    );
+    const workerRepoId = worker.worktreeId.split("::", 1)[0];
+    const expectedParentId =
+      marker.gate.kind === "orca"
+        ? marker.gate.id
+        : `${workerRepoId}::${marker.gate.path}`;
+    if (
+      actual !== undefined &&
+      (actual.path !== worker.worktreePath ||
+        actual.parentWorktreeId !== expectedParentId ||
+        typeof actual.branch !== "string" ||
+        actual.branch.replace(/^refs\/heads\//, "") !==
+          worker.worktreeBranch?.replace(/^refs\/heads\//, "") ||
+        typeof actual.head !== "string" ||
+        !COMMIT_OID.test(actual.head))
+    ) {
+      return false;
+    }
+    if (actual === undefined) {
+      const preserved = await command(
+        "git",
+        [
+          "-C",
+          repoRoot,
+          "rev-parse",
+          "--verify",
+          recoveryRefFor(
+            workerRecoveryRunId(marker.runId, worker.dispatchId),
+          ),
+        ],
+        repoRoot,
+        { allowFailure: true },
+      );
+      if (preserved.code !== 0 || !COMMIT_OID.test(preserved.stdout.trim())) {
+        return false;
+      }
+      preservedOids.set(worker.dispatchId, preserved.stdout.trim());
+    } else {
+      try {
+        await anchorRecoveryCommit(
+          repoRoot,
+          workerRecoveryRunId(marker.runId, worker.dispatchId),
+          actual.head as string,
+        );
+      } catch {
+        return false;
+      }
+      preservedOids.set(worker.dispatchId, actual.head as string);
+    }
+  }
+
+  const orca = new CliOrca({
+    command: orcaCommand,
+    cwd: repoRoot,
+    runId: marker.runId,
+  });
+  for (const worker of [...resources]) {
+    const runtimeWorker: WorkerResult = {
+      ...worker,
+      report: { findings: [], summary: "stranded worker cleanup" },
+    };
+    try {
+      await orca.finishWorker(runtimeWorker, "release");
+      if (worker.worktreeId) {
+        await orca.removeWorktree(worker.worktreeId, undefined, false);
+        const preservedOid = preservedOids.get(worker.dispatchId);
+        if (
+          !worker.worktreeBranch ||
+          !preservedOid ||
+          !(await removePreservedBranch(
+            repoRoot,
+            worker.worktreeBranch,
+            preservedOid,
+          ))
+        ) {
+          return false;
+        }
+      }
+      marker.workers = marker.workers?.filter(
+        (candidate) => candidate.dispatchId !== worker.dispatchId,
+      );
+      if (marker.workers?.length === 0) delete marker.workers;
+      await writeMarker(markerFile, marker);
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+// `prune --stranded` reaps gate workspaces whose coordinator is dead. Every
+// doubt resolves towards retention: a reaped live run loses its workspace.
+async function reapStrandedGates(repoRoot: string): Promise<void> {
+  const markersDir = path.join(repoRoot, ".orca", "no-mistakes");
+  const names = await readdir(markersDir).catch(() => [] as string[]);
+  const orcaCommand = resolveOrcaCommand();
+  const ledger = new DomainLedger();
+  let reaped = 0;
+  let retained = 0;
+  try {
+    for (const name of names) {
+      if (!name.startsWith("gate-") || !name.endsWith(".json")) continue;
+      // One bad marker must never stop the others from being reaped.
+      try {
+        const markerFile = path.join(markersDir, name);
+        let marker:
+          | GateRunMarker
+          | ConfiguredLauncherMarker
+          | OrcaLauncherMarker;
+        try {
+          marker = JSON.parse(await readFile(markerFile, "utf8")) as
+            | GateRunMarker
+            | ConfiguredLauncherMarker
+            | OrcaLauncherMarker;
+        } catch {
+          retained += 1;
+          console.error(`no-mistakes: retained ${name}; its marker is unreadable`);
+          continue;
+        }
+        if (isConfiguredLauncherMarker(marker)) {
+          if (
+            await reapConfiguredLauncher(
+              markerFile,
+              marker,
+              repoRoot,
+              orcaCommand,
+              ledger,
+            )
+          ) {
+            reaped += 1;
+          } else {
+            retained += 1;
+          }
+          continue;
+        }
+        if (isOrcaLauncherMarker(marker)) {
+          if (
+            await reapOrcaLauncher(
+              markerFile,
+              marker,
+              repoRoot,
+              orcaCommand,
+            )
+          ) {
+            reaped += 1;
+          } else {
+            retained += 1;
+          }
+          continue;
+        }
+        const gate = marker.gate;
+        if (gate?.kind === "configured") {
+          if (
+            await reapConfiguredGate(
+              markerFile,
+              marker,
+              repoRoot,
+              orcaCommand,
+              ledger,
+            )
+          ) {
+            reaped += 1;
+          } else {
+            retained += 1;
+          }
+          continue;
+        }
+        if (
+          gate?.kind !== "orca" ||
+          typeof gate?.id !== "string" ||
+          typeof gate?.branch !== "string" ||
+          typeof gate?.path !== "string"
+        ) {
+          retained += 1;
+          console.error(`no-mistakes: retained ${name}; its marker is incomplete`);
+          continue;
+        }
+        if (marker.originWorktree !== repoRoot) {
+          retained += 1;
+          console.error(
+            `no-mistakes: retained ${name}; it belongs to ${String(marker.originWorktree)}, not this repository`,
+          );
+          continue;
+        }
+        if (
+          (name !== path.basename(gateMarkerPath(repoRoot, gate.id)) &&
+            name !== `gate-${encodeURIComponent(gate.id)}.json`) ||
+          !path.isAbsolute(gate.path) ||
+          !gate.id.endsWith(`::${gate.path}`) ||
+          path.basename(gate.branch) !== path.basename(gate.path)
+        ) {
+          retained += 1;
+          console.error(
+            `no-mistakes: retained ${name}; its marker does not identify its own gate resources`,
+          );
+          continue;
+        }
+        if (
+          marker.runId !== undefined &&
+          (typeof marker.runId !== "string" ||
+            !RUN_ID_PATTERN.test(marker.runId))
+        ) {
+          retained += 1;
+          console.error(`no-mistakes: retained ${name}; its run ID is invalid`);
+          continue;
+        }
+        const runId = marker.runId;
+        const worktrees = await listOrcaWorktrees(orcaCommand, repoRoot);
+        if (worktrees === undefined) {
+          retained += 1;
+          console.error(
+            `no-mistakes: retained gate workspace ${gate.path}; Orca worktree ownership could not be verified`,
+          );
+          continue;
+        }
+        const origin = worktrees.find((entry) => entry.path === repoRoot);
+        const actualGate = worktrees.find((entry) => entry.id === gate.id);
+        const run = runId === undefined ? undefined : ledger.runIdentity(runId);
+        const retrying = run?.status === "cancelled";
+        if (
+          !origin ||
+          typeof origin.id !== "string" ||
+          (run !== undefined &&
+            (run.repo_root !== repoRoot ||
+              typeof origin.branch !== "string" ||
+              origin.branch.replace(/^refs\/heads\//, "") !==
+                run.branch.replace(/^refs\/heads\//, "") ||
+              (actualGate !== undefined &&
+                run.status !== "in-progress" &&
+                !retrying)))
+        ) {
+          retained += 1;
+          console.error(
+            `no-mistakes: retained gate workspace ${gate.path}; its run does not own this repository and branch`,
+          );
+          continue;
+        }
+        const lease =
+          run === undefined ? undefined : ledger.leaseFor(repoRoot, run.branch);
+        if (
+          run !== undefined &&
+          lease !== undefined &&
+          lease.run_id !== runId
+        ) {
+          retained += 1;
+          console.error(
+            `no-mistakes: retained gate workspace ${gate.path}; its branch lease belongs to another run`,
+          );
+          continue;
+        }
+        if (
+          actualGate !== undefined &&
+          (actualGate.path !== gate.path ||
+            typeof actualGate.branch !== "string" ||
+            typeof actualGate.head !== "string" ||
+            actualGate.branch.replace(/^refs\/heads\//, "") !== gate.branch ||
+            actualGate.parentWorktreeId !== origin.id ||
+            gate.id.split("::", 1)[0] !== origin.id.split("::", 1)[0])
+        ) {
+          retained += 1;
+          console.error(
+            `no-mistakes: retained gate workspace ${gate.path}; its current Orca ownership does not match the marker`,
+          );
+          continue;
+        }
+        if (actualGate === undefined) {
+          if (
+            worktrees.some((entry) => entry.path === gate.path) ||
+            run?.status === "in-progress"
+          ) {
+            retained += 1;
+            console.error(
+              `no-mistakes: retained gate workspace ${gate.path}; its absent gate ownership could not be proved stale`,
+            );
+            continue;
+          }
+          if (marker.workers !== undefined || marker.workerAllocations !== undefined) {
+            if (
+              !(await discoverMarkerWorkers(
+                markerFile,
+                marker,
+                worktrees,
+                [],
+                repoRoot,
+                orcaCommand,
+              )) ||
+              !(await reapMarkerWorkers(
+                markerFile,
+                marker,
+                worktrees,
+                repoRoot,
+                orcaCommand,
+              ))
+            ) {
+              retained += 1;
+              console.error(
+                `no-mistakes: retained gate workspace ${gate.path}; its worker cleanup did not converge`,
+              );
+              continue;
+            }
+            if ((marker.workerAllocations?.length ?? 0) > 0) {
+              retained += 1;
+              console.error(
+                `no-mistakes: retained gate workspace ${gate.path}; a worker allocation is still in flight`,
+              );
+              continue;
+            }
+          }
+          if (retrying && runId !== undefined) {
+            const recovery = await command(
+              "git",
+              ["-C", repoRoot, "rev-parse", "--verify", recoveryRefFor(runId)],
+              repoRoot,
+              { allowFailure: true },
+            );
+            if (
+              recovery.code !== 0 ||
+              !COMMIT_OID.test(recovery.stdout.trim())
+            ) {
+              retained += 1;
+              continue;
+            }
+            try {
+              await new CliOrca({
+                command: orcaCommand,
+                cwd: repoRoot,
+                runId,
+              }).failRun("Coordinator terminated before cleanup completed");
+            } catch (error) {
+              retained += 1;
+              console.error(
+                `no-mistakes: retained gate workspace ${gate.path}; its Orca run could not be settled: ${String(error)}`,
+              );
+              continue;
+            }
+          }
+          const branch = await command(
+            "git",
+            [
+              "-C",
+              repoRoot,
+              "show-ref",
+              "--verify",
+              "--quiet",
+              `refs/heads/${gate.branch}`,
+            ],
+            repoRoot,
+            { allowFailure: true },
+          );
+          if (branch.code === 0) {
+            if (!retrying || runId === undefined) {
+              retained += 1;
+              continue;
+            }
+            const [branchTip, recoveryTip] = await Promise.all([
+              command(
+                "git",
+                ["-C", repoRoot, "rev-parse", `refs/heads/${gate.branch}`],
+                repoRoot,
+                { allowFailure: true },
+              ),
+              command(
+                "git",
+                ["-C", repoRoot, "rev-parse", recoveryRefFor(runId)],
+                repoRoot,
+                { allowFailure: true },
+              ),
+            ]);
+            const preservedOid = recoveryTip.stdout.trim();
+            if (
+              branchTip.code !== 0 ||
+              recoveryTip.code !== 0 ||
+              branchTip.stdout.trim() !== preservedOid ||
+              !COMMIT_OID.test(preservedOid) ||
+              !(await removePreservedBranch(
+                repoRoot,
+                gate.branch,
+                preservedOid,
+              ))
+            ) {
+              retained += 1;
+              console.error(
+                `no-mistakes: retained gate workspace ${gate.path}; its remaining branch could not be safely released`,
+              );
+              continue;
+            }
+          } else if (branch.code !== 1) {
+            retained += 1;
+            continue;
+          }
+          if (!(await removeGateMarker(markerFile, gate))) {
+            retained += 1;
+            continue;
+          }
+          reaped += 1;
+          console.error(`no-mistakes: reaped stranded gate marker ${markerFile}`);
+          continue;
+        }
+        const gateTerminals = await listGateTerminals(
+          gate.path,
+          orcaCommand,
+          repoRoot,
+        );
+        if (gateTerminals === undefined) {
+          retained += 1;
+          console.error(
+            `no-mistakes: retained gate workspace ${gate.path}; its attached terminals could not be verified`,
+          );
+          continue;
+        }
+        if (
+          await coordinatorIsLive(marker, orcaCommand, repoRoot, markerFile)
+        ) {
+          retained += 1;
+          console.error(
+            `no-mistakes: retained gate workspace ${gate.path}; its coordinator is still live`,
+          );
+          continue;
+        }
+        const recoverWorkers =
+          marker.workers !== undefined ||
+          marker.workerAllocations !== undefined ||
+          (marker.pid !== undefined && marker.terminalHandle === undefined);
+        if (!recoverWorkers) {
+          if (gateTerminals.some((terminal) => terminal.connected !== false)) {
+            retained += 1;
+            console.error(
+              `no-mistakes: retained gate workspace ${gate.path}; a live terminal is still attached`,
+            );
+            continue;
+          }
+        } else if (
+          !(await discoverMarkerWorkers(
+            markerFile,
+            marker,
+            worktrees,
+            gateTerminals,
+            repoRoot,
+            orcaCommand,
+          )) ||
+          !(await reapMarkerWorkers(
+            markerFile,
+            marker,
+            worktrees,
+            repoRoot,
+            orcaCommand,
+          ))
+        ) {
+          retained += 1;
+          console.error(
+            `no-mistakes: retained gate workspace ${gate.path}; its worker cleanup did not converge`,
+          );
+          continue;
+        }
+        if ((marker.workerAllocations?.length ?? 0) > 0) {
+          retained += 1;
+          console.error(
+            `no-mistakes: retained gate workspace ${gate.path}; a worker allocation is still in flight`,
+          );
+          continue;
+        }
+        let preservedOid: string | undefined;
+        if (retrying && runId !== undefined) {
+          const preserved = await command(
+            "git",
+            ["-C", repoRoot, "rev-parse", "--verify", recoveryRefFor(runId)],
+            repoRoot,
+            { allowFailure: true },
+          );
+          if (preserved.code !== 0 || !preserved.stdout.trim()) {
+            retained += 1;
+            console.error(
+              `no-mistakes: retained gate workspace ${gate.path}; its recovery ref could not be resolved`,
+            );
+            continue;
+          }
+          preservedOid = preserved.stdout.trim();
+        }
+        const tip = await command(
+          "git",
+          ["-C", repoRoot, "rev-parse", "--verify", `refs/heads/${gate.branch}`],
+          repoRoot,
+          { allowFailure: true },
+        );
+        let tipOid = tip.stdout.trim();
+        if (tip.code !== 0 || !tipOid) {
+          const exists = await command(
+            "git",
+            [
+              "-C",
+              repoRoot,
+              "show-ref",
+              "--verify",
+              "--quiet",
+              `refs/heads/${gate.branch}`,
+            ],
+            repoRoot,
+            { allowFailure: true },
+          );
+          if (!retrying || exists.code !== 1 || preservedOid === undefined) {
+            retained += 1;
+            console.error(
+              `no-mistakes: retained gate workspace ${gate.path}; its branch tip could not be resolved: ${`${tip.stdout}${tip.stderr}`.trim()}`,
+            );
+            continue;
+          }
+          tipOid = preservedOid;
+        }
+        if (actualGate !== undefined && actualGate.head !== tipOid) {
+          retained += 1;
+          console.error(
+            `no-mistakes: retained gate workspace ${gate.path}; its preserved and owned commit tips do not agree`,
+          );
+          continue;
+        }
+        if (runId !== undefined) {
+          try {
+            await anchorRecoveryCommit(repoRoot, runId, tipOid);
+          } catch (error) {
+            retained += 1;
+            console.error(
+              `no-mistakes: retained gate workspace ${gate.path}; could not anchor recovery ref for ${runId}: ${String(error)}`,
+            );
+            continue;
+          }
+          try {
+            await new CliOrca({
+              command: orcaCommand,
+              cwd: repoRoot,
+              runId,
+            }).failRun("Coordinator terminated before cleanup completed");
+          } catch (error) {
+            retained += 1;
+            console.error(
+              `no-mistakes: retained gate workspace ${gate.path}; its Orca run could not be settled: ${String(error)}`,
+            );
+            continue;
+          }
+        } else {
+          // No run to anchor to: only a branch already contained in HEAD
+          // carries nothing worth preserving.
+          const contained = await command(
+            "git",
+            ["-C", repoRoot, "merge-base", "--is-ancestor", tipOid, "HEAD"],
+            repoRoot,
+            { allowFailure: true },
+          );
+          if (contained.code !== 0) {
+            retained += 1;
+            console.error(
+              `no-mistakes: retained gate workspace ${gate.path}; it has no run to anchor to and its branch is not contained in HEAD`,
+            );
+            continue;
+          }
+        }
+        if (
+          runId !== undefined &&
+          run !== undefined &&
+          !ledger.settleRun(runId, "cancelled", {
+            branch: run.branch,
+            repoRoot,
+          })
+        ) {
+          retained += 1;
+          console.error(
+            `no-mistakes: retained gate workspace ${gate.path}; its run ownership changed before cancellation`,
+          );
+          continue;
+        }
+        // Orca cannot conditionally remove atomically, so stranded cleanup
+        // removes WITHOUT --force: Orca's own removal path then verifies the
+        // PTY stop at removal time and refuses a workspace that became live
+        // after this probe, instead of tearing it down. A refusal retains.
+        const finalGateTerminals = await listGateTerminals(
+          gate.path,
+          orcaCommand,
+          repoRoot,
+        );
+        if (
+          finalGateTerminals === undefined ||
+          finalGateTerminals.some((terminal) => terminal.connected !== false)
+        ) {
+          retained += 1;
+          console.error(
+            `no-mistakes: retained gate workspace ${gate.path}; its attached terminals changed before removal`,
+          );
+          continue;
+        }
+        const removed = await removeGateWorktree(
+          gate,
+          repoRoot,
+          orcaCommand,
+          tipOid,
+          markerFile,
+          false,
+        );
+        if (!removed) {
+          retained += 1;
+          continue;
+        }
+        reaped += 1;
+        console.error(`no-mistakes: reaped stranded gate workspace ${gate.path}`);
+      } catch (error) {
+        retained += 1;
+        console.error(
+          `no-mistakes: retained ${name}; reaping failed: ${String(error)}`,
+        );
+      }
+    }
+  } finally {
+    ledger.close();
+  }
+  console.log(
+    `Reaped ${reaped} stranded gate workspace(s)` +
+      (retained > 0 ? `; retained ${retained}` : ""),
+  );
+}
+
 async function runPruneCommand(flags: RawCliFlags): Promise<void> {
   const beforeValue = stringFlag(flags, "before");
   let before: Date | undefined;
@@ -6993,6 +10012,13 @@ async function runPruneCommand(flags: RawCliFlags): Promise<void> {
   // canonicalised before it can match one.
   const repoRoot =
     repoFlag === undefined ? undefined : await canonicalPath(repoFlag);
+  if (flags.stranded === true) {
+    // Stranded reaping scans one repository's gate markers; without --repo
+    // the current directory is the repository to scan.
+    const scanRoot = repoRoot ?? (await canonicalPath(process.cwd()));
+    await reapStrandedGates(scanRoot);
+    return;
+  }
   const ledger = new DomainLedger();
   let pruned = 0;
   let retained = 0;
@@ -7060,7 +10086,7 @@ export async function main(argv: string[]): Promise<void> {
   orca-no-mistakes run --intent <text> [--repo <path>] [--base <branch>] [--head <sha>] [--force-lease]
   orca-no-mistakes attestation export <run-id|commit-sha> [--out <path>]
   orca-no-mistakes attestation verify <manifest-file|run-id|commit-sha>
-  orca-no-mistakes prune [--before <date>] [--repo <path>]
+  orca-no-mistakes prune [--before <date>] [--repo <path>] [--stranded]
 
 Run options:
   --reviewer-model <model>
@@ -7068,7 +10094,10 @@ Run options:
   --max-fix-rounds <count>
   --allow-local-config
   --config <path>
-  --force-lease (reclaim a stranded branch lease)`);
+  --force-lease (reclaim a stranded branch lease)
+
+Prune options:
+  --stranded (reap gate workspaces whose coordinator terminal died)`);
     return;
   }
   const parsed = parseCli(argv);
@@ -7165,9 +10194,25 @@ Run options:
     : undefined;
   let ledger: DomainLedger | undefined;
   let retainGate = false;
+  let gateCleanupOid = await git.head();
   try {
     const userGlobalConfig = loadUserConfig();
     ledger = new DomainLedger();
+    await installAbortReaping({
+      ...(gate ? { gate } : {}),
+      ...(deliveryGit ? { deliveryGit } : {}),
+      git,
+      ledger,
+      notify: (summary) => orca.notifyRunResult("cancelled", summary),
+      orca,
+      orcaCommand: resolveOrcaCommand(),
+      ...(originWorktree ? { originWorktree } : {}),
+      pid: process.pid,
+      ...(gate?.kind === "configured" ? { runId: gate.runId } : {}),
+      ...(process.env.ORCA_TERMINAL_HANDLE
+        ? { terminalHandle: process.env.ORCA_TERMINAL_HANDLE }
+        : {}),
+    });
     const result = await runPipeline(
       {
         allowLocalConfig: parsed.flags["allow-local-config"] === true,
@@ -7186,6 +10231,7 @@ Run options:
       git,
       ledger,
     );
+    gateCleanupOid = await git.head();
     await orca.notifyRunResult(
       "passed",
       [
@@ -7205,12 +10251,15 @@ Run options:
         ? "cancelled"
         : "failed";
     const message = error instanceof Error ? error.message : String(error);
-    if (gate?.kind === "configured") {
-      await orca
-        .failRun(`Configured coordinator failed: ${message}`)
-        .catch(() => {});
-    }
     const recoverRef = (error as CustodyTaggedError).recoverRef;
+    if (recoverRef) {
+      gateCleanupOid =
+        (await git.resolveRefSha(recoverRef).catch(() => undefined)) ??
+        gateCleanupOid;
+    }
+    if (gate) {
+      await orca.failRun(`Coordinator failed: ${message}`).catch(() => {});
+    }
     await orca.notifyRunResult(
       outcome,
       recoverRef
@@ -7219,41 +10268,41 @@ Run options:
     );
     throw error;
   } finally {
-    try {
+    await withGateMutation(async () => {
+      if (abortRequested) return;
       try {
-        ledger?.close();
-      } catch (closeError) {
-        console.error(
-          `warning: could not close the domain ledger: ${String(closeError)}`,
-        );
-      }
-    } finally {
-      if (gate && !retainGate) {
-        await removeGateWorktree(
-          gate,
-          originWorktree!,
-          resolveOrcaCommand(),
-        );
-        if (
-          gate.kind === "configured" &&
-          process.env.ORCA_TERMINAL_HANDLE
-        ) {
-          await command(
-            resolveOrcaCommand(),
-            [
-              "terminal",
-              "close",
-              "--terminal",
-              process.env.ORCA_TERMINAL_HANDLE,
-              "--tab",
-              "--json",
-            ],
-            originWorktree!,
-            { allowFailure: true },
+        try {
+          ledger?.close();
+        } catch (closeError) {
+          console.error(
+            `warning: could not close the domain ledger: ${String(closeError)}`,
           );
         }
+      } finally {
+        if (gate && !retainGate) {
+          if (gate.kind === "configured") await markGateCleanupPending();
+          const removed = await removeGateWorktree(
+            gate,
+            originWorktree!,
+            resolveOrcaCommand(),
+            gateCleanupOid,
+          );
+          if (removed && gate.kind === "configured") {
+            const closed = await closeTerminalOrProveStale(
+              process.env.ORCA_TERMINAL_HANDLE,
+              resolveOrcaCommand(),
+              originWorktree!,
+            );
+            if (closed) {
+              await removeGateMarker(
+                gateMarkerPath(originWorktree!, gateMarkerId(gate)),
+                gate,
+              );
+            }
+          }
+        }
       }
-    }
+    }, true);
   }
 }
 
