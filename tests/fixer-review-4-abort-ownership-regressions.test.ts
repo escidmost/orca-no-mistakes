@@ -199,29 +199,36 @@ test("abort owns allocated cleanup through the final worker anchor", async () =>
       events.push(`anchor:${oid[0]}`);
     },
   });
-  await installAbortReaping({ orca, orcaCommand: "orca", pid: process.pid });
-  await registerAbortRunContext({
-    deliveryGit: recoveryGit,
-    git: sourceGit,
-    ledger,
-    runId: "run-worker-owner",
-  });
-  const started = startWorkerWithFallback(orca, async () => "task-owner", [
-    launch("owner"),
-  ]).then(
-    () => false,
-    () => true,
-  );
-  await allocation;
-  await reapAbortedRun("cleanup owner");
+  let started: Promise<boolean> | undefined;
+  try {
+    await installAbortReaping({ orca, orcaCommand: "orca", pid: process.pid });
+    await registerAbortRunContext({
+      deliveryGit: recoveryGit,
+      git: sourceGit,
+      ledger,
+      runId: "run-worker-owner",
+    });
+    started = startWorkerWithFallback(orca, async () => "task-owner", [
+      launch("owner"),
+    ]).then(
+      () => false,
+      () => true,
+    );
+    await allocation;
+    await reapAbortedRun("cleanup owner");
 
-  assert.equal(await started, true);
-  assert.equal(producerCleanup, false);
-  assert.ok(events.indexOf("anchor:a") < events.indexOf("stop"));
-  assert.ok(events.indexOf("stop") < events.indexOf("anchor:b"));
-  assert.ok(events.indexOf("anchor:b") < events.indexOf("remove"));
-  assert.equal(ledger.runStatus("run-worker-owner"), "cancelled");
-  ledger.close();
+    assert.equal(await started, true);
+    assert.equal(producerCleanup, false);
+    assert.ok(events.indexOf("anchor:a") < events.indexOf("stop"));
+    assert.ok(events.indexOf("stop") < events.indexOf("anchor:b"));
+    assert.ok(events.indexOf("anchor:b") < events.indexOf("remove"));
+    assert.equal(ledger.runStatus("run-worker-owner"), "cancelled");
+  } finally {
+    rejectDelivery(new Error("test cleanup"));
+    await started?.catch(() => {});
+    await installAbortReaping({ pid: process.pid });
+    ledger.close();
+  }
 });
 
 test("abort attempts every worker stop before retaining on failure", async () => {
@@ -265,26 +272,38 @@ test("abort attempts every worker stop before retaining on failure", async () =>
     },
   });
   const recoveryGit = gitStub("/repo");
-  await installAbortReaping({ orca, orcaCommand: "orca", pid: process.pid });
-  await registerAbortRunContext({
-    deliveryGit: recoveryGit,
-    git: sourceGit,
-    ledger,
-    runId: "run-stop-all",
-  });
-  const first = startWorkerWithFallback(orca, async () => "task-1", [
-    launch("one"),
-  ]).catch(() => undefined);
-  const second = startWorkerWithFallback(orca, async () => "task-2", [
-    launch("two"),
-  ]).catch(() => undefined);
-  await allocated;
-  await reapAbortedRun("stop all");
-  await Promise.all([first, second]);
+  let first: Promise<unknown> | undefined;
+  let second: Promise<unknown> | undefined;
+  try {
+    await installAbortReaping({ orca, orcaCommand: "orca", pid: process.pid });
+    await registerAbortRunContext({
+      deliveryGit: recoveryGit,
+      git: sourceGit,
+      ledger,
+      runId: "run-stop-all",
+    });
+    first = startWorkerWithFallback(orca, async () => "task-1", [
+      launch("one"),
+    ]).catch(() => undefined);
+    second = startWorkerWithFallback(orca, async () => "task-2", [
+      launch("two"),
+    ]).catch(() => undefined);
+    await allocated;
+    await reapAbortedRun("stop all");
+    await Promise.all([first, second]);
 
-  assert.deepEqual(attempts, ["dispatch-1", "dispatch-2"]);
-  assert.equal(ledger.runStatus("run-stop-all"), "in-progress");
-  ledger.close();
+    assert.deepEqual(attempts, ["dispatch-1", "dispatch-2"]);
+    assert.equal(ledger.runStatus("run-stop-all"), "in-progress");
+  } finally {
+    for (const reject of rejectors.values()) reject(new Error("test cleanup"));
+    await Promise.all(
+      [first, second].filter(
+        (value): value is Promise<unknown> => value !== undefined,
+      ),
+    );
+    await installAbortReaping({ pid: process.pid });
+    ledger.close();
+  }
 });
 
 test("stranded pruning treats connected false as a dead coordinator", async () => {

@@ -136,10 +136,13 @@ test("absent configured gate requires recovery custody", async () => {
     await main(["prune", "--stranded", "--repo", seeded.repo]);
 
     const retained = new DomainLedger(path.join(home, "ledger.db"));
-    assert.equal(existsSync(marker), true);
-    assert.equal(retained.runIdentity(runId)?.status, "in-progress");
-    assert.equal(retained.leaseFor(seeded.repo, "feature")?.run_id, runId);
-    retained.close();
+    try {
+      assert.equal(existsSync(marker), true);
+      assert.equal(retained.runIdentity(runId)?.status, "in-progress");
+      assert.equal(retained.leaseFor(seeded.repo, "feature")?.run_id, runId);
+    } finally {
+      retained.close();
+    }
   } finally {
     restoreEnv("ORCA_CLI_COMMAND", previousCommand);
     restoreEnv("ORCA_NO_MISTAKES_HOME", previousHome);

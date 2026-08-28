@@ -309,7 +309,10 @@ test("cancelled and failed configured runs retry task settlement", async (t) => 
   }
 });
 
-test("a configured marker write failure precedes launcher allocations", async () => {
+test(
+  "a configured marker write failure precedes launcher allocations",
+  { skip: process.platform === "win32" || process.getuid?.() === 0 },
+  async () => {
   const seeded = await seed("onm-configured-marker-failure-");
   const fake = await fakeOrca(seeded.temp);
   const config = path.join(seeded.temp, "config.json");
@@ -356,4 +359,5 @@ test("a configured marker write failure precedes launcher allocations", async ()
     restoreEnv("ORCA_NO_MISTAKES_USER_CONFIG", previousConfig);
     await rm(seeded.temp, { force: true, recursive: true });
   }
-});
+  },
+);

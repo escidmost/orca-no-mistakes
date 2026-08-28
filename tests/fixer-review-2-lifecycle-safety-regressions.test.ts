@@ -230,21 +230,26 @@ test("workers are registered before their delivery completes", async () => {
       return worker;
     },
   });
-  await installAbortReaping({ orca, orcaCommand: "orca", pid: process.pid });
-  const started = startWorkerWithFallback(orca, async () => "task", [
-    {
-      name: "reviewer",
-      prompt: "review",
-      role: "reviewer",
-      stage: "review",
-      worktree: "new-child",
-    },
-  ]);
-  await allocation;
-  await reapAbortedRun("signal during worker delivery");
-  assert.equal(reaped, 1);
-  deliver();
-  await started;
+  let started: ReturnType<typeof startWorkerWithFallback> | undefined;
+  try {
+    await installAbortReaping({ orca, orcaCommand: "orca", pid: process.pid });
+    started = startWorkerWithFallback(orca, async () => "task", [
+      {
+        name: "reviewer",
+        prompt: "review",
+        role: "reviewer",
+        stage: "review",
+        worktree: "new-child",
+      },
+    ]);
+    await allocation;
+    await reapAbortedRun("signal during worker delivery");
+    assert.equal(reaped, 1);
+  } finally {
+    deliver();
+    await started?.catch(() => {});
+    await installAbortReaping({ pid: process.pid });
+  }
 });
 
 test("abort waits for run setup before deciding settlement", async () => {

@@ -212,7 +212,10 @@ test("stranded prune removes without --force and retains when Orca refuses", asy
   }
 });
 
-test("stranded prune retries a marker after gate resources are gone", async () => {
+test(
+  "stranded prune retries a marker after gate resources are gone",
+  { skip: process.platform === "win32" || process.getuid?.() === 0 },
+  async () => {
   const seeded = await seedGate("onm-marker-retry-");
   const marker = await writeMarker(seeded);
   const fake = await fakeOrca(seeded, "remove");
@@ -235,4 +238,5 @@ test("stranded prune retries a marker after gate resources are gone", async () =
     restore();
     await rm(seeded.temp, { force: true, recursive: true });
   }
-});
+  },
+);

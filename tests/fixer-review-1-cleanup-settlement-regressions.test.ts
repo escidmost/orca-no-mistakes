@@ -78,9 +78,14 @@ function setEnv(home: string, orcaCommand: string): () => void {
   };
 }
 
-async function refusingOrca(temp: string): Promise<string> {
+async function refusingOrca(temp: string, calls?: string): Promise<string> {
   const command = path.join(temp, "orca-refuse");
-  await writeFile(command, "#!/bin/sh\nexit 1\n");
+  await writeFile(
+    command,
+    calls === undefined
+      ? "#!/bin/sh\nexit 1\n"
+      : `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(calls)}\nexit 1\n`,
+  );
   await chmod(command, 0o755);
   return command;
 }
@@ -105,9 +110,10 @@ test("cleanup-pending configured gates retain a live coordinator", async () => {
   const seeded = await seed("onm-live-cleanup-pending-");
   const gate = await addConfiguredGate(seeded, "run-live");
   const marker = markerPath(seeded.repo, gate.path);
+  const calls = path.join(seeded.temp, "calls");
   const restore = setEnv(
     path.join(seeded.temp, "home"),
-    await refusingOrca(seeded.temp),
+    await refusingOrca(seeded.temp, calls),
   );
   try {
     await writeFile(
@@ -127,6 +133,7 @@ test("cleanup-pending configured gates retain a live coordinator", async () => {
     assert.equal(existsSync(marker), true);
     assert.equal(existsSync(gate.path), true);
     assert.notEqual(git(seeded.repo, "branch", "--list", gate.branch), "");
+    assert.equal(existsSync(calls), false);
   } finally {
     restore();
     await rm(seeded.temp, { force: true, recursive: true });
@@ -235,6 +242,12 @@ else out({ accepted: true })
     );
     assert.equal(existsSync(marker), true);
     assert.equal(existsSync(gate.path), true);
+    const reopened = new DomainLedger();
+    try {
+      assert.equal(reopened.runStatus(runId), "failed");
+    } finally {
+      reopened.close();
+    }
   } finally {
     restore();
     await rm(seeded.temp, { force: true, recursive: true });

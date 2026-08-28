@@ -229,23 +229,27 @@ test("stranded prune removes an unowned branch at the recovery OID", async () =>
   );
   const restore = setEnv(home, path.join(seeded.temp, "orca"));
   const ledger = new DomainLedger();
-  ledger.startRun({
-    baseBranch: "main",
-    branch: "main",
-    intent: "retry cleanup",
-    policySha256: "policy",
-    repoRoot: seeded.repo,
-    runId,
-    submissionCommitOid: head,
-  });
-  ledger.acquireLease({ branch: "main", repoRoot: seeded.repo, runId });
-  assert.equal(
-    ledger.settleRun(runId, "cancelled", {
+  try {
+    ledger.startRun({
+      baseBranch: "main",
       branch: "main",
+      intent: "retry cleanup",
+      policySha256: "policy",
       repoRoot: seeded.repo,
-    }),
-    true,
-  );
+      runId,
+      submissionCommitOid: head,
+    });
+    ledger.acquireLease({ branch: "main", repoRoot: seeded.repo, runId });
+    assert.equal(
+      ledger.settleRun(runId, "cancelled", {
+        branch: "main",
+        repoRoot: seeded.repo,
+      }),
+      true,
+    );
+  } finally {
+    ledger.close();
+  }
   await writeFile(
     path.join(seeded.temp, "orca"),
     `#!/usr/bin/env node

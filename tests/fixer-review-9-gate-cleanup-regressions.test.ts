@@ -98,7 +98,10 @@ function setHome(home: string, orcaCommand?: string): () => void {
   };
 }
 
-test("a failed marker refresh preserves the previous marker", async () => {
+test(
+  "a failed marker refresh preserves the previous marker",
+  { skip: process.platform === "win32" || process.getuid?.() === 0 },
+  async () => {
   const seeded = await seedGate("onm-marker-refresh-failure-");
   const restore = setHome(path.join(seeded.temp, "home"));
   const ledger = new DomainLedger();
@@ -120,6 +123,7 @@ test("a failed marker refresh preserves the previous marker", async () => {
         ledger,
         runId: "run-marker-refresh-failure",
       }),
+      /EACCES|EPERM|permission denied/i,
     );
 
     assert.deepEqual(await readFile(marker), before);
@@ -129,18 +133,14 @@ test("a failed marker refresh preserves the previous marker", async () => {
     restore();
     await rm(seeded.temp, { force: true, recursive: true });
   }
-});
+  },
+);
 
 test("a raw worktree racing branch deletion gets its branch restored", async () => {
   const seeded = await seedGate("onm-gate-delete-race-");
   const restore = setHome(path.join(seeded.temp, "home"));
   const ledger = new DomainLedger();
   const previousPath = process.env.PATH;
-  const realGit = (previousPath ?? "")
-    .split(path.delimiter)
-    .map((directory) => path.join(directory, "git"))
-    .find(existsSync);
-  if (realGit === undefined) throw new Error("git executable missing from PATH");
   const rawPath = path.join(seeded.temp, "raw-gate-owner");
   const gitWrapperDirectory = path.join(seeded.temp, "bin");
   const gitWrapper = path.join(gitWrapperDirectory, "git");
@@ -151,16 +151,14 @@ test("a raw worktree racing branch deletion gets its branch restored", async () 
       `#!/usr/bin/env node
 import { spawnSync } from "node:child_process"
 const args = process.argv.slice(2)
+const options = { env: { ...process.env, PATH: ${JSON.stringify(previousPath ?? "")} }, stdio: "inherit" }
 if (args.includes("update-ref") && args.includes("-d") && args.includes(${JSON.stringify(`refs/heads/${seeded.gate.branch}`)})) {
-  const added = spawnSync(${JSON.stringify(realGit)}, ["-C", ${JSON.stringify(seeded.origin)}, "worktree", "add", ${JSON.stringify(rawPath)}, ${JSON.stringify(seeded.gate.branch)}], { encoding: "utf8" })
+  const added = spawnSync("git", ["-C", ${JSON.stringify(seeded.origin)}, "worktree", "add", ${JSON.stringify(rawPath)}, ${JSON.stringify(seeded.gate.branch)}], options)
   if (added.status !== 0) {
-    process.stderr.write(added.stderr || added.stdout || "raw worktree add failed")
     process.exit(added.status ?? 1)
   }
 }
-const result = spawnSync(${JSON.stringify(realGit)}, args, { encoding: "utf8" })
-if (result.stdout) process.stdout.write(result.stdout)
-if (result.stderr) process.stderr.write(result.stderr)
+const result = spawnSync("git", args, options)
 process.exit(result.status ?? 1)
 `,
     );

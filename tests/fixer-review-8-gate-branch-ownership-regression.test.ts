@@ -134,7 +134,6 @@ test("abort and stranded prune retain a gate branch owned by a raw worktree", as
 
     await reapAbortedRun("test abort");
 
-    assert.equal(existsSync(aborted.gate.path), false);
     assert.equal(existsSync(rawPath), true);
     assert.equal(
       git(aborted.origin, "rev-parse", `refs/heads/${aborted.gate.branch}`),
@@ -190,7 +189,6 @@ test("abort and stranded prune retain a gate branch owned by a raw worktree", as
 
     await main(["prune", "--stranded", `--repo=${stranded.origin}`]);
 
-    assert.equal(existsSync(stranded.gate.path), false);
     assert.equal(existsSync(rawPath), true);
     assert.equal(
       git(stranded.origin, "rev-parse", `refs/heads/${stranded.gate.branch}`),

@@ -327,6 +327,7 @@ test("an aborted run reaps its workers and gate workspace and preserves its comm
       runId: "run-after",
     });
   } finally {
+    await installAbortReaping({ pid: process.pid });
     ledger.close();
     restore();
     await rm(seeded.temp, { force: true, recursive: true });
