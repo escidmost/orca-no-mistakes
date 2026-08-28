@@ -813,6 +813,17 @@ export async function runPipeline(
           continue;
         }
         if (nextFixer.guardrailViolations.length > 0) {
+          ledger.recordGateAudit({
+            decision: "advisory",
+            gateId: `fixer-guardrail-advisory:${runId}:${stage}:${round}`,
+            gateKind: "guardrail",
+            optionsJson: "[]",
+            question: `${stage} fixer changed guarded content`,
+            resolution: JSON.stringify(nextFixer.guardrailViolations),
+            roundIndex: round,
+            runId,
+            stageId: stage,
+          });
           // Advisory mode: custody proceeds, but the detected guardrail
           // changes are recorded as coordinator evidence so an advisory run
           // can never read as a strict run.

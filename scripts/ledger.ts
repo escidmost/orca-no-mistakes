@@ -11,7 +11,7 @@ const { O_APPEND, O_CREAT, O_EXCL, O_NOFOLLOW, O_RDONLY, O_RDWR, O_WRONLY } = co
 
 export type RunStatus = 'in-progress' | 'passed' | 'failed' | 'cancelled'
 
-export type GateKind = 'exhaustion' | 'finding'
+export type GateKind = 'exhaustion' | 'finding' | 'guardrail'
 
 export type GateAuditRow = {
   decision: string
@@ -1429,6 +1429,7 @@ export class DomainLedger {
   recordGateAudit(input: {
     decision: string
     gateId: string
+    gateKind?: GateKind
     guidance?: string
     optionsJson: string
     question: string
@@ -1442,9 +1443,9 @@ export class DomainLedger {
     this.#db
       .prepare(
          `INSERT INTO gate_audit (
-            gate_id, run_id, stage_id, round_index, question, options_json,
+            gate_id, run_id, stage_id, round_index, gate_kind, question, options_json,
             resolution, decision, guidance, selected_finding_ids, opened_at, resolved_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(gate_id) DO UPDATE SET
             resolution = excluded.resolution,
             decision = excluded.decision,
@@ -1457,6 +1458,7 @@ export class DomainLedger {
         input.runId,
         input.stageId,
         input.roundIndex,
+        input.gateKind ?? 'finding',
         input.question,
         input.optionsJson,
         input.resolution,
