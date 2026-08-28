@@ -34,3 +34,17 @@ test('offline manifests reject invalid runtime headers with matching roots', () 
     assert.throws(() => verifyManifest(manifest), expected)
   }
 })
+
+test('the attested guardrail mode is bound into the manifest root', () => {
+  const manifest = buildAttestation([], {
+    baseCommitOid: 'a'.repeat(40),
+    candidateCommitOid: 'b'.repeat(40),
+    guardrailMode: 'strict',
+    intent: 'Bind guardrails into the attestation.',
+    policySha256: 'c'.repeat(64),
+    runId: 'run-guardrails'
+  })
+
+  manifest.guardrailMode = 'advisory'
+  assert.throws(() => verifyManifest(manifest), /Merkle root does not match/)
+})
