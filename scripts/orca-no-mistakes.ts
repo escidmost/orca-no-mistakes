@@ -7830,10 +7830,18 @@ async function removeGateWorktree(
       marker === null ||
       Array.isArray(marker) ||
       ("workers" in marker &&
-        (!Array.isArray(marker.workers) || marker.workers.length > 0))
+        (!Array.isArray(marker.workers) || marker.workers.length > 0)) ||
+      ("workerAllocations" in marker &&
+        (!Array.isArray(marker.workerAllocations) ||
+          marker.workerAllocations.length > 0)) ||
+      ("workerAllocationPids" in marker &&
+        (typeof marker.workerAllocationPids !== "object" ||
+          marker.workerAllocationPids === null ||
+          Array.isArray(marker.workerAllocationPids) ||
+          Object.keys(marker.workerAllocationPids).length > 0))
     ) {
       console.error(
-        `warning: refused to remove gate worktree ${gate.path}; its cleanup marker still records worker resources`,
+        `warning: refused to remove gate worktree ${gate.path}; its cleanup marker still records worker or allocation resources`,
       );
       return false;
     }
@@ -9408,6 +9416,17 @@ async function discoverMarkerWorkers(
         }
       }
     }
+  }
+  if (allocationIds.size > 0 && allocationsQuiescent) {
+    const [currentWorktrees, currentGateTerminals] = await Promise.all([
+      listOrcaWorktrees(orcaCommand, repoRoot),
+      listGateTerminals(marker.gate.path, orcaCommand, repoRoot),
+    ]);
+    if (currentWorktrees === undefined || currentGateTerminals === undefined) {
+      return false;
+    }
+    worktrees.splice(0, worktrees.length, ...currentWorktrees);
+    gateTerminals.splice(0, gateTerminals.length, ...currentGateTerminals);
   }
   const resources = Array.isArray(marker.workers) ? [...marker.workers] : [];
   const worktreeIds = new Set(resources.map((worker) => worker.worktreeId));
