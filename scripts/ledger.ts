@@ -18,6 +18,7 @@ export type GateAuditRow = {
   gate_id: string
   gate_kind: GateKind
   guidance: string | null
+  question: string
   resolution: string
   resolved_at: string | null
   round_index: number
@@ -1619,7 +1620,7 @@ export class DomainLedger {
   listGateAudit(runId: string): GateAuditRow[] {
     return this.#db
       .prepare(
-        `SELECT decision, gate_id, stage_id, round_index, gate_kind, guidance, resolution,
+        `SELECT decision, gate_id, stage_id, round_index, gate_kind, guidance, question, resolution,
                 resolved_at, selected_finding_ids
          FROM gate_audit WHERE run_id = ? ORDER BY opened_at, rowid`
       )

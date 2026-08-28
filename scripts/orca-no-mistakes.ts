@@ -818,7 +818,7 @@ export async function runPipeline(
             gateId: `fixer-guardrail-advisory:${runId}:${stage}:${round}`,
             gateKind: "guardrail",
             optionsJson: "[]",
-            question: `${stage} fixer changed guarded content`,
+            question: `[guardrails: ${guardrailMode}] ${stage} fixer changed guarded content`,
             resolution: JSON.stringify(nextFixer.guardrailViolations),
             roundIndex: round,
             runId,

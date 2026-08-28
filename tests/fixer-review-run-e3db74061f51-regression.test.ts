@@ -128,6 +128,7 @@ test("advisory fixer violations create a resolved guardrail audit", async () => 
     assert.equal(audits.length, 1);
     assert.equal(audits[0].gate_kind, "guardrail");
     assert.equal(audits[0].decision, "advisory");
+    assert.match(audits[0].question, /^\[guardrails: advisory\]/);
     assert.ok(audits[0].resolved_at);
     assert.deepEqual(JSON.parse(audits[0].resolution), [violation]);
   } finally {
