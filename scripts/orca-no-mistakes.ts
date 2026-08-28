@@ -9797,7 +9797,13 @@ async function reapMarkerWorkers(
 // doubt resolves towards retention: a reaped live run loses its workspace.
 async function reapStrandedGates(repoRoot: string): Promise<void> {
   const markersDir = path.join(repoRoot, ".orca", "no-mistakes");
-  const names = await readdir(markersDir).catch(() => [] as string[]);
+  let names: string[];
+  try {
+    names = await readdir(markersDir);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    names = [];
+  }
   const orcaCommand = resolveOrcaCommand();
   const ledger = new DomainLedger();
   let reaped = 0;
