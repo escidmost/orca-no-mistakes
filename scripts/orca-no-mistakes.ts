@@ -9215,6 +9215,8 @@ async function reapConfiguredLauncher(
   }
   if (marker.gateAllocated === true) return false;
   if (marker.runId) {
+    const run = ledger.runIdentity(marker.runId);
+    if (run !== undefined && run.repo_root !== repoRoot) return false;
     try {
       await new CliOrca({
         command: orcaCommand,
@@ -9224,15 +9226,13 @@ async function reapConfiguredLauncher(
     } catch {
       return false;
     }
-    const run = ledger.runIdentity(marker.runId);
     if (
       run !== undefined &&
-      (run.repo_root !== repoRoot ||
-        (run.status === "in-progress" &&
-          !ledger.settleRun(marker.runId, "cancelled", {
-            branch: run.branch,
-            repoRoot,
-          })))
+      run.status === "in-progress" &&
+      !ledger.settleRun(marker.runId, "cancelled", {
+        branch: run.branch,
+        repoRoot,
+      })
     ) {
       return false;
     }
