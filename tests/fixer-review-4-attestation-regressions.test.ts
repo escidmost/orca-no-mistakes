@@ -44,6 +44,7 @@ test('passed-run finalization commits status, attestation, and lease atomically'
     const manifest = buildAttestation([], {
       baseCommitOid: commit,
       candidateCommitOid: commit,
+      guardrailMode: 'strict',
       intent: 'Finalize atomically.',
       policySha256,
       runId
@@ -82,6 +83,7 @@ test('manifest verification enforces production intent invariants', () => {
   const valid = buildAttestation([], {
     baseCommitOid: commit,
     candidateCommitOid: commit,
+    guardrailMode: 'strict',
     intent: 'Validate intent.',
     policySha256,
     runId: 'invalid-intent'
@@ -123,6 +125,7 @@ test('offline verification requires evidence for every pipeline stage', async ()
       const manifest = buildAttestation(stageEvidence, {
         baseCommitOid: commit,
         candidateCommitOid: commit,
+        guardrailMode: 'strict',
         intent: 'Require every stage.',
         policySha256,
         runId

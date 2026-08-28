@@ -81,7 +81,10 @@ test("fixer protects multiline assertions and qualified test declarations", asyn
     }
 
     await change("src/service-registration.ts", "verify();\n");
-    assert.equal(await assertWorkerChangesAllowed(), true);
+    assert.deepEqual(await assertWorkerChangesAllowed(), {
+      changed: true,
+      guardrailViolations: [],
+    });
   } finally {
     await rm(temp, { recursive: true, force: true });
   }

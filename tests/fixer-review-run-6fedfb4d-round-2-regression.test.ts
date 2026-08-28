@@ -78,14 +78,20 @@ test("fixer protects Python assertion continuations and doctest output", async (
       "src/single-line.py",
       "def validate(value):\n    assert is_valid(value)\n    return normalize(value)\n",
     );
-    assert.equal(await assertWorkerChangesAllowed(), true);
+    assert.deepEqual(await assertWorkerChangesAllowed(), {
+      changed: true,
+      guardrailViolations: [],
+    });
 
     // An untouched doctest leaves the surrounding runtime code fixable.
     await change(
       "src/doctest.py",
       'def square(value):\n    """\n    >>> square(2)\n    4\n    """\n    return value ** 2\n',
     );
-    assert.equal(await assertWorkerChangesAllowed(), true);
+    assert.deepEqual(await assertWorkerChangesAllowed(), {
+      changed: true,
+      guardrailViolations: [],
+    });
   } finally {
     await rm(temp, { recursive: true, force: true });
   }

@@ -30,6 +30,14 @@ auto_fix:
   # Keeping this false prevents circular automated reviewer-fixer churn (ADR-0007).
   allow_review_autofix: false
 
+  # Fixer guardrail mode: strict (default) rejects fixer commits that touch
+  # protected validation policy, pre-existing tests, or test assertions;
+  # advisory keeps the fixer prompt warnings and records detected changes in
+  # the run evidence, gate audit, and attestation without blocking custody.
+  # Run-wide and resolved from the trusted base policy; the key is rejected on
+  # per-stage or per-role auto_fix blocks.
+  # guardrails: strict
+
 # ------------------------------------------------------------------------------
 # Agent CLI Arguments & Environment Overrides
 # ------------------------------------------------------------------------------

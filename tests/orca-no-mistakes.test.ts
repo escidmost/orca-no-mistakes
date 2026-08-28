@@ -43,6 +43,8 @@ import {
   sha256,
   verifyManifest,
   type Finding,
+  type FixerChangesVerdict,
+  type GuardrailMode,
   type PassedAttestationManifest,
   type GitOperations,
   type OrcaOperations,
@@ -135,16 +137,19 @@ class FakeGit implements GitOperations {
     sourcePath: string,
     expectedHead: string,
     _expectedSourceHead: string,
-  ): Promise<boolean> {
+    guardrails: GuardrailMode = "strict",
+  ): Promise<FixerChangesVerdict> {
     this.calls.push(`guard:${sourcePath}:${expectedHead}`);
     if (this.protectedTestMutation) {
       const mutation = this.protectedTestMutation;
       this.protectedTestMutation = undefined;
-      throw new FixerPolicyViolationError(
-        `fixer modified pre-existing test files: ${mutation}`,
-      );
+      const message = `fixer modified pre-existing test files: ${mutation}`;
+      if (guardrails === "strict") {
+        throw new FixerPolicyViolationError(message);
+      }
+      return { changed: this.fixerChangesTree, guardrailViolations: [message] };
     }
-    return this.fixerChangesTree;
+    return { changed: this.fixerChangesTree, guardrailViolations: [] };
   }
 
   async head(): Promise<string> {
@@ -1108,6 +1113,8 @@ test("protected fixer commits are rejected at a resumable human gate", async () 
   await runPipeline({ intent: "Protect existing assertions." }, orca, git);
 
   assert.equal(orca.gates.length, 2);
+  assert.match(orca.gates[0].question, /^\[guardrails: strict\] /);
+  assert.match(orca.gates[1].question, /^\[guardrails: strict\] /);
   assert.match(orca.gates[1].question, /fixer-policy-violation/);
   assert.match(
     orca.gates[1].question,
@@ -1160,6 +1167,7 @@ test("a policy-violation approval waives the evidence shown at its gate", async 
   const policyEvidence = result.attestation?.stageEvidence.find(
     (entry) => entry.summary === "review fixer commit rejected by protected-path policy",
   );
+  assert.equal(result.attestation?.guardrailMode, "strict");
   assert.equal(policyEvidence?.workerIdentity, "coordinator:fixer-policy");
   assert.equal(policyEvidence?.exitCode, 1);
   assert.equal(policyEvidence?.waiverOrApproval?.decision, "approve");
@@ -1176,6 +1184,79 @@ test("a policy-violation approval waives the evidence shown at its gate", async 
   );
   assert.deepEqual(policyLog?.artifacts, []);
   assert.deepEqual(policyLog?.tested, ["npm test"]);
+  assert.equal(policyLog?.guardrail_mode, "strict");
+  await rm(path.join(artifactsRoot(), runId), { recursive: true, force: true });
+});
+
+test("advisory guardrails accept protected fixer commits and record them in evidence and attestation", async () => {
+  const git = new FakeGit();
+  git.baseFiles.set(
+    "origin/main:.orca/no-mistakes.yaml",
+    "auto_fix:\n  allow_review_autofix: true\n  guardrails: advisory\n",
+  );
+  git.protectedTestMutation = "tests/existing.test.ts";
+  const runId = `advisory-guardrails-${randomUUID()}`;
+  const orca = new FakeOrca(git, runId);
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Repair the implementation.",
+        },
+      ],
+      summary: "one defect",
+    },
+    pass("protected fix applied"),
+    pass("clean rereview"),
+  ]);
+
+  const result = await runPipeline(
+    { intent: "Report guardrail findings without blocking." },
+    orca,
+    git,
+  );
+
+  // Custody proceeds: the protected commit is applied without a human gate.
+  assert.equal(orca.gates.length, 0);
+  assert.equal(
+    git.calls.filter((call) => call.startsWith("apply:/worktrees/")).length,
+    1,
+  );
+  assert.equal(result.attestation?.guardrailMode, "advisory");
+  const advisoryEvidence = result.attestation?.stageEvidence.find(
+    (entry) => entry.workerIdentity === "coordinator:fixer-guardrail-advisory",
+  );
+  assert.equal(advisoryEvidence?.stage, "review");
+  assert.match(
+    advisoryEvidence?.summary ?? "",
+    /advisory guardrail findings \(guardrails: advisory\)/,
+  );
+
+  const logsDir = path.join(artifactsRoot(), runId, "logs");
+  const advisoryLog = (
+    await Promise.all(
+      (await readdir(logsDir)).map(async (fileName) =>
+        JSON.parse(await readFile(path.join(logsDir, fileName), "utf8")),
+      ),
+    )
+  ).find(
+    (entry) =>
+      typeof entry.summary === "string" &&
+      entry.summary.includes("advisory guardrail findings"),
+  );
+  assert.equal(advisoryLog?.guardrail_mode, "advisory");
+  assert.deepEqual(
+    advisoryLog?.findings?.map((finding: Finding) => finding.id),
+    ["fixer-guardrail-advisory-1"],
+  );
+  assert.deepEqual(advisoryLog?.findings?.[0]?.action, "no-op");
+  assert.match(
+    advisoryLog?.findings?.[0]?.description,
+    /fixer modified pre-existing test files: tests\/existing\.test\.ts/,
+  );
   await rm(path.join(artifactsRoot(), runId), { recursive: true, force: true });
 });
 
@@ -7930,7 +8011,8 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       enabled: false,
       max_rounds: 0,
       allow_review_autofix: false,
-    };
+      guardrails: "strict",
+    } as const;
     const [grok, cursor] = ["grok", "cursor"].map(
       (harness) => launchAgent({ auto_fix: roleConfig, agent: harness })![0],
     );
@@ -8030,7 +8112,12 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
 });
 
 test("launchAgent carries role settings even when no agent harness is configured", () => {
-  const autoFix = { enabled: true, max_rounds: 3, allow_review_autofix: false };
+  const autoFix = {
+    enabled: true,
+    max_rounds: 3,
+    allow_review_autofix: false,
+    guardrails: "strict",
+  } as const;
   assert.deepEqual(launchAgent({ auto_fix: autoFix }), []);
   assert.deepEqual(
     launchAgent({ auto_fix: autoFix, model: "gpt-5.6", effort: "high" }),
@@ -8080,7 +8167,8 @@ test("fallback chains advance only on preflight failures and settle between cand
     enabled: false,
     max_rounds: 0,
     allow_review_autofix: false,
-  };
+    guardrails: "strict",
+  } as const;
   const launches = (["claude", "grok", "acp:gemini"] as const).map(
     (harness, index): WorkerLaunch => ({
       agent: launchAgent({ auto_fix: roleConfig, agent: harness })![0],
@@ -8125,7 +8213,8 @@ test("execution-phase errors do not advance the fallback chain", async () => {
     enabled: false,
     max_rounds: 0,
     allow_review_autofix: false,
-  };
+    guardrails: "strict",
+  } as const;
   const launches = (["claude", "grok"] as const).map(
     (harness): WorkerLaunch => ({
       agent: launchAgent({
@@ -8158,6 +8247,7 @@ test("exhausted chains fail closed with aggregated candidate diagnostics", async
           enabled: false,
           max_rounds: 0,
           allow_review_autofix: false,
+          guardrails: "strict",
         },
         agent: harness,
       })![0],
@@ -9404,6 +9494,7 @@ test("re-attesting an unchanged commit replaces the stored manifest instead of f
       buildAttestation([], {
         baseCommitOid: "a".repeat(40),
         candidateCommitOid: candidate,
+        guardrailMode: "strict",
         intent: `pass ${runId}`,
         policySha256: "f".repeat(64),
         runId,
@@ -9556,6 +9647,7 @@ test("a manifest missing a declared field is rejected before it is hashed", () =
     {
       baseCommitOid: "b".repeat(40),
       candidateCommitOid: "c".repeat(40),
+      guardrailMode: "strict",
       intent: "Check manifest shape.",
       policySha256: "f".repeat(64),
       runId: "run-shape",
@@ -9567,6 +9659,7 @@ test("a manifest missing a declared field is rejected before it is hashed", () =
   const headerCases = [
     ["createdAt", /creation timestamp is invalid/],
     ["coordinatorVersion", /coordinator version is invalid/],
+    ["guardrailMode", /guardrail mode is invalid/],
     ["runId", /run ID is invalid/],
   ] as const;
   for (const [field, expected] of headerCases) {
@@ -9674,6 +9767,7 @@ test("verification fails closed when the local run has no passed attestation", a
     const manifest = buildAttestation(fullStageEvidence({ baseCommitOid: "b".repeat(40), candidateCommitOid: "c".repeat(40), runId: "run-local" }), {
       baseCommitOid: "b".repeat(40),
       candidateCommitOid: "c".repeat(40),
+      guardrailMode: "strict",
       intent: "A failed local run.",
       policySha256: "f".repeat(64),
       runId: "run-local",
@@ -9914,11 +10008,12 @@ test("attestations stay resolvable per run when candidate commits repeat, and co
         submissionCommitOid: "a".repeat(40),
       });
       const manifest = {
-        version: "1.2.0" as const,
+        version: "1.3.0" as const,
         runId,
         candidateCommitOid: candidate,
         baseCommitOid: "b".repeat(40),
         policySha256: "f".repeat(64),
+        guardrailMode: "strict" as const,
         intent: `Intent ${runId}`,
         intentHash: sha256(`Intent ${runId}`),
         stageEvidence: [],
@@ -10793,11 +10888,12 @@ test("a manifest carrying a malformed artifact digest is rejected", () => {
     summary: "clean",
   };
   const manifest = {
-    version: "1.2.0" as const,
+    version: "1.3.0" as const,
     runId: "run-forged",
     candidateCommitOid: entry.candidateCommitOid,
     baseCommitOid: entry.baseCommitOid,
     policySha256: "f".repeat(64),
+    guardrailMode: "strict" as const,
     intent: "Forged intent",
     intentHash: sha256("Forged intent"),
     stageEvidence: [

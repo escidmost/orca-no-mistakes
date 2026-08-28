@@ -73,6 +73,7 @@ test("manifest-file verification verifies offline, then requires an intact store
     const manifest = buildAttestation(fullStageEvidence({ baseCommitOid: commit, candidateCommitOid: commit, runId: "missing-run" }), {
       baseCommitOid: commit,
       candidateCommitOid: commit,
+      guardrailMode: "strict",
       intent: "Verify evidence.",
       policySha256: policy,
       runId: "missing-run",
@@ -121,6 +122,7 @@ test("evidence verification hashes exact artifact bytes", async () => {
     const manifest = buildAttestation([entry], {
       baseCommitOid: commit,
       candidateCommitOid: commit,
+      guardrailMode: "strict",
       intent: "Verify evidence.",
       policySha256: policy,
       runId,
@@ -154,6 +156,7 @@ test("duplicate evidence entries require distinct ledger rows", async () => {
     const manifest = buildAttestation([entry, entry], {
       baseCommitOid: commit,
       candidateCommitOid: commit,
+      guardrailMode: "strict",
       intent: "Verify evidence.",
       policySha256: policy,
       runId,

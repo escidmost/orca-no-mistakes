@@ -89,6 +89,15 @@ test("a missing config on the trusted base resolves to an empty policy", async (
   assert.equal(provenance.effectivePolicyHash, effectivePolicyHash({}));
 });
 
+test("the trusted base config carries the run-wide guardrail mode", async () => {
+  const trusted = fakeGit({
+    "origin/main:.orca/no-mistakes.yaml": "auto_fix:\n  guardrails: advisory\n",
+  });
+  const resolved = await resolveRunPolicy({ base: "main", git: trusted, repoRoot: "/repo" });
+  assert.deepEqual(resolved.config.auto_fix, { guardrails: "advisory" });
+  assert.equal(resolved.provenance.localBypass, false);
+});
+
 test("a failed read of an existing base config fails closed instead of certifying an empty policy", async () => {
   const git = fakeGit({}, {}, { "origin/main:.orca/no-mistakes.yaml": true });
   await assert.rejects(

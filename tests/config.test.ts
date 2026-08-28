@@ -175,6 +175,51 @@ test('fails closed on unknown keys in auto_fix configuration', () => {
   )
 })
 
+test('guardrails resolves only from trusted-base top-level auto_fix', () => {
+  // Existing projects without the key stay on fail-closed enforcement.
+  assert.equal(resolveRoleConfig('test', 'fixer').auto_fix.guardrails, 'strict')
+  assert.equal(resolvePipelineConfig({}).auto_fix.guardrails, 'strict')
+
+  const userGlobalConfig: OrcaNoMistakesConfig = { auto_fix: { guardrails: 'advisory' } }
+  assert.equal(resolveRoleConfig('test', 'fixer', { userGlobalConfig }).auto_fix.guardrails, 'strict')
+  assert.equal(resolvePipelineConfig({ userGlobalConfig }).auto_fix.guardrails, 'strict')
+
+  const repoWithoutGuardrails: OrcaNoMistakesConfig = { auto_fix: { enabled: false } }
+  assert.equal(
+    resolveRoleConfig('test', 'fixer', { userGlobalConfig, repoGlobalConfig: repoWithoutGuardrails }).auto_fix.guardrails,
+    'strict'
+  )
+  assert.equal(
+    resolvePipelineConfig({ userGlobalConfig, repoGlobalConfig: repoWithoutGuardrails }).auto_fix.guardrails,
+    'strict'
+  )
+
+  const repoGlobalConfig: OrcaNoMistakesConfig = { auto_fix: { guardrails: 'advisory' } }
+  assert.equal(resolveRoleConfig('test', 'fixer', { repoGlobalConfig }).auto_fix.guardrails, 'advisory')
+  assert.equal(resolvePipelineConfig({ repoGlobalConfig }).auto_fix.guardrails, 'advisory')
+})
+
+test('fails closed on invalid guardrails modes and on role-level guardrails keys', () => {
+  assert.throws(
+    () => parseConfig({ auto_fix: { guardrails: 'permissive' } }),
+    /Invalid configuration/
+  )
+  for (const misplaced of [
+    { defaults: { auto_fix: { guardrails: 'advisory' } } },
+    { stages: { test: { auto_fix: { guardrails: 'advisory' } } } },
+    { stages: { test: { fixer: { auto_fix: { guardrails: 'advisory' } } } } }
+  ]) {
+    assert.throws(
+      () => parseConfig(misplaced),
+      (err: Error) => {
+        assert.match(err.message, /Invalid configuration/)
+        assert.match(err.message, /Unrecognized key\(s\) 'guardrails'/)
+        return true
+      }
+    )
+  }
+})
+
 test('fails closed on unknown stage names in stages configuration', () => {
   assert.throws(
     () => parseConfig({ stages: { unknown_stage_name: {} } }),

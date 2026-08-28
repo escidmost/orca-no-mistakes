@@ -95,7 +95,7 @@ test("each rebase attempt records its reported upstream", async () => {
     },
     async assertClean() {},
     async assertFixerChangesAllowed() {
-      return true;
+      return { changed: true, guardrailViolations: [] };
     },
     async head() {
       return head;

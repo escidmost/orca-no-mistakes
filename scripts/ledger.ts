@@ -5,17 +5,20 @@ import { homedir } from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
+import type { GuardrailMode } from './config.ts'
+
 const { O_APPEND, O_CREAT, O_EXCL, O_NOFOLLOW, O_RDONLY, O_RDWR, O_WRONLY } = constants
 
 export type RunStatus = 'in-progress' | 'passed' | 'failed' | 'cancelled'
 
-export type GateKind = 'exhaustion' | 'finding'
+export type GateKind = 'exhaustion' | 'finding' | 'guardrail'
 
 export type GateAuditRow = {
   decision: string
   gate_id: string
   gate_kind: GateKind
   guidance: string | null
+  question: string
   resolution: string
   resolved_at: string | null
   round_index: number
@@ -68,11 +71,12 @@ export type StageEvidenceManifestEntry = {
 }
 
 export type PassedAttestationManifest = {
-  version: '1.2.0'
+  version: '1.3.0'
   runId: string
   candidateCommitOid: string
   baseCommitOid: string
   policySha256: string
+  guardrailMode: GuardrailMode
   intent: string
   intentHash: string
   stageEvidence: StageEvidenceManifestEntry[]
@@ -112,6 +116,7 @@ const MANIFEST_PROPERTIES = new Set([
   'candidateCommitOid',
   'coordinatorVersion',
   'createdAt',
+  'guardrailMode',
   'intent',
   'intentHash',
   'merkleRoot',
@@ -206,6 +211,7 @@ export function canonicalHeader(manifest: PassedAttestationManifest): string {
     candidateCommitOid: manifest.candidateCommitOid,
     coordinatorVersion: manifest.coordinatorVersion,
     createdAt: manifest.createdAt,
+    guardrailMode: manifest.guardrailMode,
     intentHash: manifest.intentHash,
     policySha256: manifest.policySha256,
     runId: manifest.runId,
@@ -249,17 +255,19 @@ export function buildAttestation(
   meta: {
     baseCommitOid: string
     candidateCommitOid: string
+    guardrailMode: GuardrailMode
     intent: string
     policySha256: string
     runId: string
   }
 ): PassedAttestationManifest {
   const manifest: PassedAttestationManifest = {
-    version: '1.2.0',
+    version: '1.3.0',
     runId: meta.runId,
     candidateCommitOid: meta.candidateCommitOid,
     baseCommitOid: meta.baseCommitOid,
     policySha256: meta.policySha256,
+    guardrailMode: meta.guardrailMode,
     intent: meta.intent,
     intentHash: intentHash(meta.intent),
     stageEvidence: entries,
@@ -277,14 +285,18 @@ export function verifyManifest(
   requiredStages: readonly string[] = []
 ): void {
   // Bumped whenever the digest preimages change: 1.0.0 predates the run ID in
-  // the evidence preimage and 1.1.0 predates the header leaf in the Merkle
-  // tree, so both compute over a different tuple and have to be rejected as
-  // unsupported versions rather than misreported as tampering.
-  if (!manifest || manifest.version !== '1.2.0') {
-    throw new Error('attestation version is not 1.2.0')
+  // the evidence preimage, 1.1.0 predates the header leaf in the Merkle tree,
+  // and 1.2.0 predates the guardrail mode in the header, so all of them
+  // compute over a different tuple and have to be rejected as unsupported
+  // versions rather than misreported as tampering.
+  if (!manifest || manifest.version !== '1.3.0') {
+    throw new Error('attestation version is not 1.3.0')
   }
   if (!hasOnlyOwnProperties(manifest, MANIFEST_PROPERTIES)) {
     throw new Error('attestation manifest has unknown properties')
+  }
+  if (manifest.guardrailMode !== 'strict' && manifest.guardrailMode !== 'advisory') {
+    throw new Error('attestation guardrail mode is invalid')
   }
   if (typeof manifest.runId !== 'string' || !RUN_ID_PATTERN.test(manifest.runId)) {
     throw new Error('attestation run ID is invalid')
@@ -1418,6 +1430,7 @@ export class DomainLedger {
   recordGateAudit(input: {
     decision: string
     gateId: string
+    gateKind?: GateKind
     guidance?: string
     optionsJson: string
     question: string
@@ -1431,9 +1444,9 @@ export class DomainLedger {
     this.#db
       .prepare(
          `INSERT INTO gate_audit (
-            gate_id, run_id, stage_id, round_index, question, options_json,
+            gate_id, run_id, stage_id, round_index, gate_kind, question, options_json,
             resolution, decision, guidance, selected_finding_ids, opened_at, resolved_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(gate_id) DO UPDATE SET
             resolution = excluded.resolution,
             decision = excluded.decision,
@@ -1446,6 +1459,7 @@ export class DomainLedger {
         input.runId,
         input.stageId,
         input.roundIndex,
+        input.gateKind ?? 'finding',
         input.question,
         input.optionsJson,
         input.resolution,
@@ -1606,7 +1620,7 @@ export class DomainLedger {
   listGateAudit(runId: string): GateAuditRow[] {
     return this.#db
       .prepare(
-        `SELECT decision, gate_id, stage_id, round_index, gate_kind, guidance, resolution,
+        `SELECT decision, gate_id, stage_id, round_index, gate_kind, guidance, question, resolution,
                 resolved_at, selected_finding_ids
          FROM gate_audit WHERE run_id = ? ORDER BY opened_at, rowid`
       )
