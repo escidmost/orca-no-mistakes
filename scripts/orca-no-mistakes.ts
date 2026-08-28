@@ -143,6 +143,9 @@ export type WorkerResult = {
   deliveryId?: string;
   dispatchId: string;
   failedOutcome?: boolean;
+  processReceipt?:
+    | { protocol: "gated-v1"; state: "exited" | "pending" }
+    | { pid: number; protocol: "gated-v1"; state: "running" };
   report: StageReport;
   shutdownConfirmed?: boolean;
   taskId: string;
@@ -401,6 +404,7 @@ type OrcaLauncherMarker = {
 type WorkerResource = Pick<
   WorkerResult,
   | "dispatchId"
+  | "processReceipt"
   | "taskId"
   | "terminalHandle"
   | "worktreeBranch"
@@ -558,6 +562,35 @@ async function clearAbortAllocationPid(
   }
 }
 
+async function recordAbortWorkerPid(
+  worker: WorkerResult,
+  pid: number,
+): Promise<void> {
+  const previous = worker.processReceipt;
+  worker.processReceipt = { pid, protocol: "gated-v1", state: "running" };
+  try {
+    await refreshGateMarker();
+  } catch (error) {
+    worker.processReceipt = previous;
+    throw error;
+  }
+}
+
+async function confirmAbortWorkerShutdown(
+  worker: WorkerResult,
+  pid: number,
+): Promise<void> {
+  const previous = worker.processReceipt;
+  if (previous?.state !== "running" || previous.pid !== pid) return;
+  worker.processReceipt = { protocol: "gated-v1", state: "exited" };
+  try {
+    await refreshGateMarker();
+  } catch (error) {
+    worker.processReceipt = previous;
+    throw error;
+  }
+}
+
 function abortOwnsWorkerCleanup(
   registration: WorkerRegistration | undefined,
 ): boolean {
@@ -703,6 +736,7 @@ async function refreshGateMarker(): Promise<void> {
   const workers = [...abortReap.workers].map(
     ({
       dispatchId,
+      processReceipt,
       taskId,
       terminalHandle: workerTerminalHandle,
       worktreeBranch,
@@ -710,6 +744,7 @@ async function refreshGateMarker(): Promise<void> {
       worktreePath,
     }): WorkerResource => ({
       dispatchId,
+      ...(processReceipt ? { processReceipt } : {}),
       taskId,
       ...(workerTerminalHandle ? { terminalHandle: workerTerminalHandle } : {}),
       ...(worktreeBranch ? { worktreeBranch } : {}),
@@ -1897,9 +1932,12 @@ export async function startWorkerWithFallback(
       throw error;
     }
     let allocated = false;
+    let allocatedWorker: WorkerResult | undefined;
+    let workerPid: number | undefined;
     let allocationRegistration: WorkerRegistration | undefined;
     const onAllocated: WorkerAllocated = (worker) => {
       allocated = true;
+      allocatedWorker = worker;
       allocationRegistration = registerAbortWorker(worker, allocationId);
       void allocationRegistration.ready?.then(
         finishAllocation,
@@ -1911,8 +1949,22 @@ export async function startWorkerWithFallback(
     try {
       const worker = await allocationCommands.run(
         {
-          onExit: (pid) => clearAbortAllocationPid(allocationId, pid),
-          onSpawn: (pid) => recordAbortAllocationPid(allocationId, pid),
+          onExit: async (pid) => {
+            if (workerPid === pid) {
+              workerPid = undefined;
+              await confirmAbortWorkerShutdown(allocatedWorker!, pid);
+            } else {
+              await clearAbortAllocationPid(allocationId, pid);
+            }
+          },
+          onSpawn: async (pid) => {
+            if (allocatedWorker?.processReceipt?.state === "pending") {
+              await recordAbortWorkerPid(allocatedWorker, pid);
+              workerPid = pid;
+            } else {
+              await recordAbortAllocationPid(allocationId, pid);
+            }
+          },
         },
         () => orca.startWorker(taskId, launch, fence, onAllocated),
       );
@@ -4767,6 +4819,7 @@ export class CliOrca implements OrcaOperations {
       const log = launch.logPath ? new StageLog(launch.logPath) : undefined;
       const worker: WorkerResult = {
         dispatchId: `acp-${randomUUID()}`,
+        processReceipt: { protocol: "gated-v1", state: "pending" },
         report: { findings: [], summary: "worker is active" },
         taskId,
         worktreeBranch: worktreeId
@@ -4879,7 +4932,12 @@ export class CliOrca implements OrcaOperations {
     disposition: "release" | "retain",
   ): Promise<void> {
     const stop = workerStops.get(worker);
-    if (disposition === "release" && !stop && !worker.terminalHandle) {
+    if (
+      disposition === "release" &&
+      !stop &&
+      !worker.terminalHandle &&
+      worker.shutdownConfirmed !== true
+    ) {
       throw new Error(`worker ${worker.dispatchId} shutdown cannot be verified`);
     }
     if (disposition === "release" && stop) {
@@ -9377,16 +9435,33 @@ async function reapMarkerWorkers(
   const dispatches = new Set<string>();
   const preservedOids = new Map<string, string>();
   for (const worker of resources) {
+    const receipt = worker.processReceipt;
     if (
       typeof worker.dispatchId !== "string" ||
       typeof worker.taskId !== "string" ||
       dispatches.has(worker.dispatchId) ||
+      (receipt !== undefined &&
+        (typeof receipt !== "object" ||
+          receipt === null ||
+          receipt.protocol !== "gated-v1" ||
+          (receipt.state !== "pending" &&
+            receipt.state !== "running" &&
+            receipt.state !== "exited") ||
+          (receipt.state === "running"
+            ? !Number.isSafeInteger(receipt.pid) || receipt.pid <= 0
+            : "pid" in receipt))) ||
       (worker.terminalHandle !== undefined &&
         typeof worker.terminalHandle !== "string") ||
       (worker.worktreeId === undefined) !==
         (worker.worktreePath === undefined) ||
       (worker.worktreeId === undefined) !==
         (worker.worktreeBranch === undefined)
+    ) {
+      return false;
+    }
+    if (
+      receipt?.state === "running" &&
+      (await coordinatorIsLive({ pid: receipt.pid }, orcaCommand, repoRoot))
     ) {
       return false;
     }
@@ -9463,6 +9538,7 @@ async function reapMarkerWorkers(
     const runtimeWorker: WorkerResult = {
       ...worker,
       report: { findings: [], summary: "stranded worker cleanup" },
+      ...(worker.processReceipt ? { shutdownConfirmed: true } : {}),
     };
     try {
       await orca.finishWorker(runtimeWorker, "release");
