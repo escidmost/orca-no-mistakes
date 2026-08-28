@@ -1053,10 +1053,17 @@ export class DomainLedger {
       )
   }
 
-  finishRun(runId: string, status: Exclude<RunStatus, 'in-progress'>, terminalCommitOid?: string): void {
-    this.#db
-      .prepare('UPDATE runs SET status = ?, completed_at = ?, terminal_commit_oid = COALESCE(?, terminal_commit_oid) WHERE run_id = ?')
+  finishRun(
+    runId: string,
+    status: Exclude<RunStatus, 'in-progress'>,
+    terminalCommitOid?: string
+  ): boolean {
+    const result = this.#db
+      .prepare(
+        "UPDATE runs SET status = ?, completed_at = ?, terminal_commit_oid = COALESCE(?, terminal_commit_oid) WHERE run_id = ? AND status = 'in-progress'"
+      )
       .run(status, new Date().toISOString(), terminalCommitOid ?? null, runId)
+    return Number(result.changes) > 0
   }
 
   acquireLease(options: {
@@ -1151,13 +1158,47 @@ export class DomainLedger {
     this.#db.prepare('DELETE FROM branch_leases WHERE run_id = ?').run(runId)
   }
 
+  settleRun(
+    runId: string,
+    status: 'cancelled' | 'failed',
+    ownership?: { branch: string; repoRoot: string }
+  ): boolean {
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      const run = this.runIdentity(runId)
+      const lease =
+        ownership === undefined ? undefined : this.leaseFor(ownership.repoRoot, ownership.branch)
+      if (
+        ownership !== undefined &&
+        (!run ||
+          run.repo_root !== ownership.repoRoot ||
+          run.branch !== ownership.branch ||
+          (run.status === 'in-progress'
+            ? lease?.run_id !== runId
+            : run.status !== status))
+      ) {
+        this.#db.exec('COMMIT')
+        return false
+      }
+      const settled = this.finishRun(runId, status)
+      if (settled || run?.status === status) this.releaseLease(runId)
+      this.#db.exec('COMMIT')
+      return ownership === undefined ? settled : settled || run?.status === status
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
   finalizePassedRun(
     manifest: PassedAttestationManifest,
     terminalCommitOid: string
   ): void {
     this.#db.exec('BEGIN IMMEDIATE')
     try {
-      this.finishRun(manifest.runId, 'passed', terminalCommitOid)
+      if (!this.finishRun(manifest.runId, 'passed', terminalCommitOid)) {
+        throw new Error(`run ${manifest.runId} is already settled`)
+      }
       this.releaseLease(manifest.runId)
       this.recordAttestation(manifest)
       this.#db.exec('COMMIT')
@@ -1605,6 +1646,14 @@ export class DomainLedger {
       | { status: RunStatus }
       | undefined
     return row?.status
+  }
+
+  runIdentity(
+    runId: string
+  ): { branch: string; repo_root: string; status: RunStatus } | undefined {
+    return this.#db
+      .prepare('SELECT repo_root, branch, status FROM runs WHERE run_id = ?')
+      .get(runId) as { branch: string; repo_root: string; status: RunStatus } | undefined
   }
 
   listRuns(): { intent: string; run_id: string }[] {

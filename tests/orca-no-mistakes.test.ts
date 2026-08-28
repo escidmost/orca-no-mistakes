@@ -359,6 +359,7 @@ class FakeOrca implements OrcaOperations {
     disposition: "release" | "retain",
   ): Promise<void> {
     this.calls.push(`${disposition}:${worker.dispatchId}`);
+    if (disposition === "release") worker.shutdownConfirmed = true;
   }
 
   async removeWorktree(worktreeId: string): Promise<void> {
@@ -1780,7 +1781,9 @@ test("failed runs retain custody when their recovery ref cannot be anchored", as
   );
 
   const [run] = ledger.listRuns();
-  assert.equal(ledger.runStatus(run.run_id), "failed");
+  // Custody retention: with no recovery ref anchored the run is not settled;
+  // it stays in-progress and keeps its lease so recovery can retry.
+  assert.equal(ledger.runStatus(run.run_id), "in-progress");
   assert.ok(ledger.leaseFor("/repo", "feature"));
   assert.ok(git.calls.some((call) => call.startsWith("recover:")));
 });
@@ -2089,8 +2092,19 @@ test("run starts its coordinator in a child gate worktree", async () => {
 import fs from 'node:fs'
 const args = process.argv.slice(2)
 fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+if (args[0] === 'terminal' && args[1] === 'send') {
+  const markerDirectory = ${JSON.stringify(path.join(repo, ".orca", "no-mistakes"))}
+  const markerFile = fs.readdirSync(markerDirectory)
+    .map((name) => markerDirectory + '/' + name)
+    .find((file) => file.endsWith('.json') && JSON.parse(fs.readFileSync(file, 'utf8')).startupReceipt)
+  const marker = JSON.parse(fs.readFileSync(markerFile, 'utf8'))
+  delete marker.launcherPid
+  marker.pid = process.ppid
+  fs.writeFileSync(markerFile, JSON.stringify(marker))
+}
+const gateName = args[args.indexOf('--name') + 1]
 const result = args[0] === 'worktree' && args[1] === 'create'
-  ? { worktree: { id: 'gate-id', path: ${JSON.stringify(gate)}, branch: 'refs/heads/no-mistakes-gate-test' } }
+  ? { worktree: { id: 'gate-id', path: ${JSON.stringify(gate)}, branch: 'refs/heads/evs/' + gateName } }
   : args[0] === 'terminal' && args[1] === 'list'
     ? { terminals: [{ handle: 'gate-shell', connected: true, writable: true }] }
     : args[0] === 'terminal' && args[1] === 'show'
@@ -2154,11 +2168,13 @@ console.log(JSON.stringify({ result }))
     );
     assert.ok(!worktreeCreate?.includes("--repo"));
     assert.ok(commandText.includes("'--attached'"));
+    assert.ok(commandText.includes("&& exec env NO_MISTAKES_DELIVERY_BRANCH="));
     assert.ok(commandText.includes(`'--repo' '${gate}'`));
     assert.ok(
       commandText.includes(`NO_MISTAKES_ORIGIN_WORKTREE='${canonicalRepo}'`),
     );
     assert.ok(commandText.includes("NO_MISTAKES_DELIVERY_BRANCH='feature'"));
+    assert.ok(commandText.includes("NO_MISTAKES_STARTUP_RECEIPT="));
     assert.ok(commandText.includes("'--notify' 'originating-opencode'"));
     assert.ok(
       commandText.includes("'--intent' 'Validate detached coordination.'"),
@@ -2181,8 +2197,11 @@ test("run places its coordinator under a configured repository worktree root", a
   const root = path.join(temp, "run-worktrees");
   const configPath = path.join(temp, "config.yaml");
   const fakeOrca = path.join(temp, "orca");
+  const receiptWriter = path.join(temp, "receipt-writer.cjs");
   const callsPath = path.join(temp, "calls.jsonl");
   const failTerminalCreate = path.join(temp, "fail-terminal-create");
+  const failTerminalShow = path.join(temp, "fail-terminal-show");
+  const failSettlement = path.join(temp, "fail-settlement");
   const previousCommand = process.env.ORCA_CLI_COMMAND;
   const previousConfig = process.env.ORCA_NO_MISTAKES_USER_CONFIG;
   try {
@@ -2204,21 +2223,39 @@ test("run places its coordinator under a configured repository worktree root", a
       JSON.stringify({ worktree_roots: { [canonicalRepo]: root } }),
     );
     await writeFile(
+      receiptWriter,
+      `const fs = require("node:fs"); setTimeout(() => fs.writeFileSync(process.argv[2], JSON.stringify({ pid: Number(process.argv[3]), token: process.argv[4] })), 100);`,
+    );
+    await writeFile(
       fakeOrca,
       `#!/usr/bin/env node
+import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 const args = process.argv.slice(2)
 fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+if (args[0] === 'orchestration' && args[1] === 'task-list' && fs.existsSync(${JSON.stringify(failSettlement)})) process.exit(1)
+if (args[0] === 'terminal' && args[1] === 'send') {
+  const markerDirectory = ${JSON.stringify(path.join(repo, ".orca", "no-mistakes"))}
+  const markerFile = fs.readdirSync(markerDirectory)
+    .map((name) => markerDirectory + '/' + name)
+    .find((file) => file.endsWith('.json') && JSON.parse(fs.readFileSync(file, 'utf8')).startupReceipt)
+  const marker = JSON.parse(fs.readFileSync(markerFile, 'utf8'))
+  spawn(process.execPath, [${JSON.stringify(receiptWriter)}, markerFile + '.startup', String(marker.launcherPid), marker.startupReceipt], { detached: true, stdio: 'ignore' }).unref()
+}
 const result = args[0] === 'orchestration' && args[1] === 'run-create'
   ? { run: { id: 'configured-run' } }
+  : args[0] === 'orchestration' && args[1] === 'run-list'
+    ? { runs: [] }
   : args[0] === 'orchestration' && args[1] === 'task-create'
     ? { task: { id: 'task-intent' } }
+    : args[0] === 'terminal' && args[1] === 'list'
+      ? { terminals: [] }
     : args[0] === 'terminal' && args[1] === 'create'
       ? fs.existsSync(${JSON.stringify(failTerminalCreate)})
         ? { accepted: true }
         : { terminal: { handle: 'configured-gate-shell' } }
       : args[0] === 'terminal' && args[1] === 'show'
-        ? { terminal: { connected: true, preview: 'ready shell prompt' } }
+        ? { terminal: { connected: !fs.existsSync(${JSON.stringify(failTerminalShow)}), preview: 'ready shell prompt' } }
         : { accepted: true }
 console.log(JSON.stringify({ result }))
 `,
@@ -2227,11 +2264,13 @@ console.log(JSON.stringify({ result }))
     process.env.ORCA_CLI_COMMAND = fakeOrca;
     process.env.ORCA_NO_MISTAKES_USER_CONFIG = configPath;
 
+    const launchStartedAt = Date.now();
     await main([
       "run",
       `--repo=${repo}`,
       "--intent=Validate configured detached coordination.",
     ]);
+    assert.ok(Date.now() - launchStartedAt >= 75);
 
     const [runId] = await readdir(root);
     assert.equal(runId, "configured-run");
@@ -2265,6 +2304,7 @@ console.log(JSON.stringify({ result }))
 
     git(repo, "worktree", "remove", "--force", gatePath);
     git(repo, "branch", "-D", gateBranch);
+    await rm(path.join(repo, ".orca"), { recursive: true, force: true });
     await writeFile(failTerminalCreate, "");
     await assert.rejects(
       main([
@@ -2276,6 +2316,53 @@ console.log(JSON.stringify({ result }))
     );
     assert.deepEqual(await readdir(root), []);
     assert.equal(git(repo, "branch", "--list", "no-mistakes-gate-*"), "");
+    const markerDirectory = path.join(repo, ".orca", "no-mistakes");
+    const [launcherMarker] = (await readdir(markerDirectory)).filter((name) =>
+      name.endsWith(".json"),
+    );
+    assert.ok(launcherMarker);
+    const launcherMarkerPath = path.join(markerDirectory, launcherMarker);
+    const launcher = JSON.parse(await readFile(launcherMarkerPath, "utf8")) as {
+      pid: number;
+    };
+    launcher.pid = 2_147_483_647;
+    await writeFile(launcherMarkerPath, JSON.stringify(launcher));
+    await rm(failTerminalCreate, { force: true });
+    await main(["prune", "--stranded", `--repo=${repo}`]);
+    assert.equal(
+      (await readdir(markerDirectory)).filter((name) => name.endsWith(".json"))
+        .length,
+      0,
+    );
+
+    await writeFile(failTerminalShow, "");
+    await writeFile(failSettlement, "");
+    await assert.rejects(
+      main([
+        "run",
+        `--repo=${repo}`,
+        "--intent=Retain configured cleanup when task settlement fails.",
+      ]),
+      /detached coordinator terminal disconnected during startup/,
+    );
+    assert.deepEqual(await readdir(root), ["configured-run"]);
+    const retainedGate = path.join(root, "configured-run");
+    assert.match(
+      git(repo, "branch", "--list", "no-mistakes-gate-*"),
+      /no-mistakes-gate-/,
+    );
+    assert.ok(
+      (await readdir(path.join(repo, ".orca", "no-mistakes"))).some((name) =>
+        name.endsWith(".json"),
+      ),
+    );
+    git(repo, "worktree", "remove", "--force", retainedGate);
+    for (const branch of git(repo, "branch", "--list", "no-mistakes-gate-*")
+      .split("\n")
+      .map((value) => value.trim())
+      .filter(Boolean)) {
+      git(repo, "branch", "-D", branch);
+    }
   } finally {
     if (previousCommand === undefined) delete process.env.ORCA_CLI_COMMAND;
     else process.env.ORCA_CLI_COMMAND = previousCommand;
@@ -9329,6 +9416,13 @@ test("prune removes completed runs with their evidence while retaining in-progre
   assert.equal(ledger.runStatus("run-live"), "in-progress");
 });
 
+test("stranded prune rejects the completed-run age filter", async () => {
+  await assert.rejects(
+    main(["prune", "--stranded", "--before", "2026-01-01"]),
+    /--before cannot be combined with --stranded/,
+  );
+});
+
 test("--repo names a checkout rather than a substring of one", () => {
   const ledger = new DomainLedger(":memory:");
   for (const [runId, repoRoot] of [
@@ -10191,7 +10285,7 @@ test("a fixer timeout during commit application leaves the branch unchanged", as
     ): Promise<boolean> {
       this.headAtApply = await this.head();
       try {
-        await new Promise((resolve) => setTimeout(resolve, 75));
+        await new Promise((resolve) => setTimeout(resolve, 250));
         return super.applyWorktreeCommits(
           sourcePath,
           expectedHead,
@@ -10225,13 +10319,13 @@ test("a fixer timeout during commit application leaves the branch unchanged", as
     runPipeline(
       {
         intent: "Fence in-flight fixes.",
-        cliFlags: { fixer: { timeout_ms: 10 } } as never,
+        cliFlags: { fixer: { timeout_ms: 100 } } as never,
       },
       orca,
       git,
       ledger,
     ),
-    /review fixer exceeded its 10ms execution timeout/,
+    /review fixer exceeded its 100ms execution timeout/,
   );
 
   assert.equal(git.settled, true, "timeout waits for fenced application cleanup");
@@ -10386,7 +10480,7 @@ test("a fixer applied within its timeout may finish coordinator verification", a
     async head(): Promise<string> {
       if (this.#delayNextHead) {
         this.#delayNextHead = false;
-        await new Promise((resolve) => setTimeout(resolve, 75));
+        await new Promise((resolve) => setTimeout(resolve, 250));
       }
       return super.head();
     }
@@ -10413,7 +10507,7 @@ test("a fixer applied within its timeout may finish coordinator verification", a
   await runPipeline(
     {
       intent: "Finish verification after timely custody transfer.",
-      cliFlags: { fixer: { timeout_ms: 10 } } as never,
+      cliFlags: { fixer: { timeout_ms: 100 } } as never,
     },
     orca,
     git,
@@ -10685,7 +10779,15 @@ test("the default timeout rejects a fixer success that lands after the deadline"
   process.env.WORKER_DEFAULT_TIMEOUT_MS = "10";
   try {
     await assert.rejects(
-      runPipeline({ intent: "Fence the unconfigured fixer." }, orca, git, ledger),
+      runPipeline(
+        {
+          intent: "Fence the unconfigured fixer.",
+          cliFlags: { reviewer: { timeout_ms: 1_000 } } as never,
+        },
+        orca,
+        git,
+        ledger,
+      ),
       /review fixer exceeded its 10ms execution timeout/,
     );
   } finally {

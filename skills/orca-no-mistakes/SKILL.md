@@ -73,6 +73,9 @@ Export and verify attestations, and prune retained evidence:
 orca-no-mistakes attestation export <run-id-or-commit-sha> [--out manifest.json]
 orca-no-mistakes attestation verify <manifest-file|run-id|commit-sha>
 orca-no-mistakes prune [--before <date>] [--repo <path>]
+orca-no-mistakes prune --stranded [--repo <path>]
 ```
+
+`prune --stranded` reaps gate resources only when their owning coordinator is proven gone. When a run ID exists, it first anchors the gate HEAD at `refs/no-mistakes/recover/<run-id>` and retains the gate if ownership or preservation cannot be verified.
 
 On failure, report the error and Orca Run ID when available; retry only after addressing the blocker or receiving the user's decision.

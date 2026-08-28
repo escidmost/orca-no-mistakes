@@ -61,6 +61,14 @@ test("configured preflight failures settle the intent task", async () => {
 import fs from 'node:fs'
 const args = process.argv.slice(2)
 fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+if (args[0] === 'terminal' && args[1] === 'send') {
+  const markerDirectory = ${JSON.stringify(path.join(repo, ".orca", "no-mistakes"))}
+  const markerFile = fs.readdirSync(markerDirectory)
+    .map((name) => markerDirectory + '/' + name)
+    .find((file) => file.endsWith('.json') && JSON.parse(fs.readFileSync(file, 'utf8')).startupReceipt)
+  const marker = JSON.parse(fs.readFileSync(markerFile, 'utf8'))
+  fs.writeFileSync(markerFile + '.startup', JSON.stringify({ pid: process.ppid, token: marker.startupReceipt }))
+}
 const result = args[0] === 'terminal' && args[1] === 'create'
   ? { terminal: { handle: 'configured-coordinator' } }
   : args[0] === 'terminal' && args[1] === 'show'

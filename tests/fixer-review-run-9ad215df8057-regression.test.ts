@@ -61,6 +61,14 @@ test("configured Runs bind to the coordinator before path placement", async () =
 import fs from 'node:fs'
 const args = process.argv.slice(2)
 fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+if (args[0] === 'terminal' && args[1] === 'send') {
+  const markerDirectory = ${JSON.stringify(path.join(repo, ".orca", "no-mistakes"))}
+  const markerFile = fs.readdirSync(markerDirectory)
+    .map((name) => markerDirectory + '/' + name)
+    .find((file) => file.endsWith('.json') && JSON.parse(fs.readFileSync(file, 'utf8')).startupReceipt)
+  const marker = JSON.parse(fs.readFileSync(markerFile, 'utf8'))
+  fs.writeFileSync(markerFile + '.startup', JSON.stringify({ pid: process.ppid, token: marker.startupReceipt }))
+}
 const result = args[0] === 'terminal' && args[1] === 'create'
   ? { terminal: { handle: 'configured-coordinator' } }
   : args[0] === 'orchestration' && args[1] === 'run-create'
@@ -124,6 +132,8 @@ test("configured Run IDs cannot escape their root", async () => {
   const previousCommand = process.env.ORCA_CLI_COMMAND;
   const previousConfig = process.env.ORCA_NO_MISTAKES_USER_CONFIG;
   try {
+    await mkdir(path.join(repo, ".git", "info"), { recursive: true });
+    await writeFile(path.join(repo, ".git", "info", "exclude"), ".orca/\n");
     await mkdir(root);
     await writeFile(
       config,

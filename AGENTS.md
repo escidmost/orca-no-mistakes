@@ -1,7 +1,7 @@
 ## Standards
 
 - **Code reviews** Skip a separate `/code-review` but run `/ponytail-review` before making commits
-- **Push through orca-no-mistakes.** When told to push, run the gate through the worktree-local `./bin/orca-no-mistakes`; this package executes its TypeScript directly, so that executable is the worktree build. Do not push unless told to.
+- **Push through orca-no-mistakes.** When told to push, run the gate through the worktree-local `./bin/orca-no-mistakes` until it succeeds once per PR; ride each in-flight run to completion rather than starting another. This package executes its TypeScript directly, so that executable is the worktree build. Do not push unless told to.
 - **Dogfood repairs.** If `orca-no-mistakes` fails because of its own behavior, diagnose and fix the root cause in the current worktree, verify and commit the repair, then run every later attempt through `./bin/orca-no-mistakes` so it includes the repair. Continue through a passing gate rather than bypassing it or patching Orca.
 - **Detached gates.** After starting a detached `orca-no-mistakes` run, return to chat. Do not wait on, read, or poll its terminal; Orca delivers failures and questions here, and a blocking terminal prevents those messages from being handled.
 - **Long-running gates.** Preserve indefinite human decision waits and the absence of a total-run timeout so unattended overnight and multi-hour fix loops remain viable. Timeouts may bound explicitly configured worker attempts, not the whole run or a human gate.

@@ -56,6 +56,8 @@ test("configured attached failures settle every open task", async () => {
     git(repo, "config", "user.email", "test@example.com");
     git(repo, "config", "user.name", "Test User");
     git(repo, "config", "commit.gpgsign", "false");
+    await mkdir(path.join(repo, ".git", "info"));
+    await writeFile(path.join(repo, ".git", "info", "exclude"), ".orca/\n");
     await writeFile(path.join(repo, "README.md"), "seed\n");
     git(repo, "add", ".");
     git(repo, "commit", "-m", "seed");
@@ -153,7 +155,7 @@ if (args[0] === 'orchestration' && args[1] === 'task-create') {
       };
       assert.match(
         result.summary,
-        /^Configured coordinator failed: .*injected task creation failure$/,
+        /^Coordinator failed: .*injected task creation failure$/,
       );
     }
     assert.equal(git(repo, "branch", "--list", gateBranch), "");
