@@ -686,10 +686,14 @@ function startupReceiptPath(markerPath: string): string {
   return `${markerPath}.startup`;
 }
 
-function startupReceiptPid(text: string, token: string): number | undefined {
+function startupReceiptPid(
+  text: string,
+  token: string,
+  tokenKey: "startupReceipt" | "token" = "token",
+): number | undefined {
   try {
-    const receipt = JSON.parse(text) as { pid?: unknown; token?: unknown };
-    return receipt.token === token &&
+    const receipt = JSON.parse(text) as Record<string, unknown>;
+    return receipt[tokenKey] === token &&
       Number.isSafeInteger(receipt.pid) &&
       (receipt.pid as number) > 0
       ? (receipt.pid as number)
@@ -711,7 +715,16 @@ async function waitForStartupReceipt(
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
-    const pid = text === undefined ? undefined : startupReceiptPid(text, token);
+    let pid = text === undefined ? undefined : startupReceiptPid(text, token);
+    if (pid === undefined) {
+      try {
+        pid = startupReceiptPid(
+          await readFile(markerFile, "utf8"),
+          token,
+          "startupReceipt",
+        );
+      } catch {}
+    }
     if (pid !== undefined) {
       try {
         process.kill(pid, 0);
@@ -8030,11 +8043,13 @@ async function launchDetachedRun(
         }
       }
     }
-    await configuredOrca
-      ?.failRun(
+    try {
+      await configuredOrca?.failRun(
         `Configured coordinator startup failed: ${error instanceof Error ? error.message : String(error)}`,
-      )
-      .catch(() => {});
+      );
+    } catch {
+      return;
+    }
     if (
       cleanupGate &&
       !(await removeGateWorktree(
@@ -8300,6 +8315,7 @@ async function launchDetachedRun(
     `NO_MISTAKES_DELIVERY_BRANCH=${shellQuote(repo.branch)}`,
     `NO_MISTAKES_GATE_BRANCH=${shellQuote(gate.branch)}`,
     `NO_MISTAKES_ORIGIN_WORKTREE=${shellQuote(repo.root)}`,
+    `NO_MISTAKES_STARTUP_RECEIPT=${shellQuote(startupReceipt)}`,
   ];
   environment.push(
     gate.kind === "orca"
@@ -8789,13 +8805,7 @@ async function reapConfiguredGate(
       );
       return false;
     }
-    if (
-      run !== undefined &&
-      run.status !== "in-progress" &&
-      run.status !== "cancelled"
-    ) {
-      return true;
-    }
+    if (run?.status === "passed") return true;
     try {
       await new CliOrca({
         command: orcaCommand,
@@ -10352,6 +10362,9 @@ Prune options:
       ...(process.env.ORCA_TERMINAL_HANDLE
         ? { terminalHandle: process.env.ORCA_TERMINAL_HANDLE }
         : {}),
+      ...(process.env.NO_MISTAKES_STARTUP_RECEIPT
+        ? { startupReceipt: process.env.NO_MISTAKES_STARTUP_RECEIPT }
+        : {}),
     });
     const result = await runPipeline(
       {
@@ -10397,8 +10410,23 @@ Prune options:
         (await git.resolveRefSha(recoverRef).catch(() => undefined)) ??
         gateCleanupOid;
     }
-    if (gate) {
-      await orca.failRun(`Coordinator failed: ${message}`).catch(() => {});
+    if (
+      gate &&
+      (gate.kind !== "configured" ||
+        ledger?.runStatus(gate.runId) !== "passed")
+    ) {
+      try {
+        await orca.failRun(`Coordinator failed: ${message}`);
+      } catch (settlementError) {
+        if (gate.kind === "configured") {
+          retainGate = true;
+          await markGateCleanupPending().catch((markerError) =>
+            console.error(
+              `warning: configured run settlement failed (${String(settlementError)}) and its cleanup marker could not be refreshed: ${String(markerError)}`,
+            ),
+          );
+        }
+      }
     }
     await orca.notifyRunResult(
       outcome,

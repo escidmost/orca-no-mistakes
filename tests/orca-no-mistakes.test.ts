@@ -2098,7 +2098,9 @@ if (args[0] === 'terminal' && args[1] === 'send') {
     .map((name) => markerDirectory + '/' + name)
     .find((file) => file.endsWith('.json') && JSON.parse(fs.readFileSync(file, 'utf8')).startupReceipt)
   const marker = JSON.parse(fs.readFileSync(markerFile, 'utf8'))
-  fs.writeFileSync(markerFile + '.startup', JSON.stringify({ pid: process.ppid, token: marker.startupReceipt }))
+  delete marker.launcherPid
+  marker.pid = process.ppid
+  fs.writeFileSync(markerFile, JSON.stringify(marker))
 }
 const gateName = args[args.indexOf('--name') + 1]
 const result = args[0] === 'worktree' && args[1] === 'create'
@@ -2172,6 +2174,7 @@ console.log(JSON.stringify({ result }))
       commandText.includes(`NO_MISTAKES_ORIGIN_WORKTREE='${canonicalRepo}'`),
     );
     assert.ok(commandText.includes("NO_MISTAKES_DELIVERY_BRANCH='feature'"));
+    assert.ok(commandText.includes("NO_MISTAKES_STARTUP_RECEIPT="));
     assert.ok(commandText.includes("'--notify' 'originating-opencode'"));
     assert.ok(
       commandText.includes("'--intent' 'Validate detached coordination.'"),
@@ -2197,6 +2200,8 @@ test("run places its coordinator under a configured repository worktree root", a
   const receiptWriter = path.join(temp, "receipt-writer.cjs");
   const callsPath = path.join(temp, "calls.jsonl");
   const failTerminalCreate = path.join(temp, "fail-terminal-create");
+  const failTerminalShow = path.join(temp, "fail-terminal-show");
+  const failSettlement = path.join(temp, "fail-settlement");
   const previousCommand = process.env.ORCA_CLI_COMMAND;
   const previousConfig = process.env.ORCA_NO_MISTAKES_USER_CONFIG;
   try {
@@ -2228,6 +2233,7 @@ import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 const args = process.argv.slice(2)
 fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
+if (args[0] === 'orchestration' && args[1] === 'task-list' && fs.existsSync(${JSON.stringify(failSettlement)})) process.exit(1)
 if (args[0] === 'terminal' && args[1] === 'send') {
   const markerDirectory = ${JSON.stringify(path.join(repo, ".orca", "no-mistakes"))}
   const markerFile = fs.readdirSync(markerDirectory)
@@ -2245,7 +2251,7 @@ const result = args[0] === 'orchestration' && args[1] === 'run-create'
         ? { accepted: true }
         : { terminal: { handle: 'configured-gate-shell' } }
       : args[0] === 'terminal' && args[1] === 'show'
-        ? { terminal: { connected: true, preview: 'ready shell prompt' } }
+        ? { terminal: { connected: !fs.existsSync(${JSON.stringify(failTerminalShow)}), preview: 'ready shell prompt' } }
         : { accepted: true }
 console.log(JSON.stringify({ result }))
 `,
@@ -2306,6 +2312,36 @@ console.log(JSON.stringify({ result }))
     );
     assert.deepEqual(await readdir(root), []);
     assert.equal(git(repo, "branch", "--list", "no-mistakes-gate-*"), "");
+
+    await rm(failTerminalCreate, { force: true });
+    await writeFile(failTerminalShow, "");
+    await writeFile(failSettlement, "");
+    await assert.rejects(
+      main([
+        "run",
+        `--repo=${repo}`,
+        "--intent=Retain configured cleanup when task settlement fails.",
+      ]),
+      /detached coordinator terminal disconnected during startup/,
+    );
+    assert.deepEqual(await readdir(root), ["configured-run"]);
+    const retainedGate = path.join(root, "configured-run");
+    assert.match(
+      git(repo, "branch", "--list", "no-mistakes-gate-*"),
+      /no-mistakes-gate-/,
+    );
+    assert.ok(
+      (await readdir(path.join(repo, ".orca", "no-mistakes"))).some((name) =>
+        name.endsWith(".json"),
+      ),
+    );
+    git(repo, "worktree", "remove", "--force", retainedGate);
+    for (const branch of git(repo, "branch", "--list", "no-mistakes-gate-*")
+      .split("\n")
+      .map((value) => value.trim())
+      .filter(Boolean)) {
+      git(repo, "branch", "-D", branch);
+    }
   } finally {
     if (previousCommand === undefined) delete process.env.ORCA_CLI_COMMAND;
     else process.env.ORCA_CLI_COMMAND = previousCommand;
