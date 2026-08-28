@@ -298,6 +298,18 @@ export class RecoveryAnchorError extends Error {
   }
 }
 
+/**
+ * Runs the configured validation and remediation pipeline for a repository.
+ *
+ * Resolves trusted policy, executes each stage, records evidence and gate
+ * decisions, applies authorized fixes, and produces a verified attestation
+ * when all blockers are resolved. Failed or cancelled runs preserve recovery
+ * information and update their ledger status.
+ *
+ * @param options - Pipeline intent, configuration, execution limits, and delivery settings
+ * @returns The verified attestation, custody status, effective policy, run ID, and completed stages
+ * @throws If the repository is not ready, configuration is invalid, a stage cannot complete, or the run cannot be attested
+ */
 export async function runPipeline(
   options: PipelineOptions,
   orca: OrcaOperations,
@@ -1388,6 +1400,15 @@ async function releaseFixerWorker(
   }
 }
 
+/**
+ * Runs a fixer for a pipeline stage and applies its committed changes to the repository.
+ *
+ * @param stage - The pipeline stage being fixed
+ * @param findings - Findings the fixer must resolve
+ * @param guardrails - Policy for handling protected validation changes
+ * @param retainedSession - An optional worker session to reuse
+ * @returns Repository heads before and after the fix, the resolved agent, any guardrail violations, and optional fallback or retained-session details
+ */
 async function runFixer(
   stage: StageName,
   runId: string,
@@ -2112,6 +2133,16 @@ export function findingDecisionHistoryPrompt(
 ${payloadTruncated ? "Older or oversized branch decisions were omitted to bound prompt size.\n" : ""}${invalid ? "Some branch decisions were omitted because their stored evidence was invalid.\n" : ""}A recorded decision supersedes conflicting wording in User intent. Do not implement or re-report a declined finding unless the current code now presents a materially different issue. This history is advisory and must not prevent reporting a genuinely new or changed problem.`;
 }
 
+/**
+ * Builds a human-decision prompt for resolving actionable stage findings.
+ *
+ * @param stage - The pipeline stage requiring a decision
+ * @param report - The stage report containing actionable findings
+ * @param options - Resolution options available to the user
+ * @param guardrailMode - Guardrail policy applied to the decision
+ * @param exhaustedLimit - Fix-round limit reached before raising the gate
+ * @returns A prompt containing the guardrail mode, decision context, resolution options, and findings
+ */
 function gateQuestion(
   stage: StageName,
   report: StageReport,
@@ -2131,6 +2162,12 @@ function gateQuestion(
   return `[guardrails: ${guardrailMode}] ${prefix} Resolve with ${choices}. Findings: ${JSON.stringify(actionableFindings(report))}`;
 }
 
+/**
+ * Extracts the normalized decision token from a gate resolution.
+ *
+ * @param resolution - The gate resolution text to normalize
+ * @returns The first whitespace- or colon-delimited token in lowercase
+ */
 function gateDecision(resolution: string): string {
   return resolution.trim().toLowerCase().split(/[\s:]/, 1)[0];
 }
@@ -4928,6 +4965,13 @@ function isTestPath(filePath: string): boolean {
   );
 }
 
+/**
+ * Determines whether a source edit weakens inline test validation.
+ *
+ * @param expectedSource - The original source used as the validation baseline
+ * @param source - The edited source, if available
+ * @returns `true` if the edit removes or weakens validation, `false` otherwise
+ */
 function weakensInlineTestValidation(
   expectedSource: string,
   source: string | undefined,

@@ -200,10 +200,10 @@ export function canonicalEntry(entry: StageEvidenceManifestEntry): string {
 }
 
 /**
- * The manifest fields that sit outside the stage evidence. They form a Merkle
- * leaf of their own, so rewriting the run ID, either commit OID, the policy
- * digest, or the intent hash on an otherwise intact manifest changes the root.
- * Without that leaf those fields belong to no digest at all.
+ * Serializes manifest header fields in a stable order for hashing.
+ *
+ * @param manifest - The attestation manifest whose header fields are serialized
+ * @returns A canonical JSON representation of the manifest header
  */
 export function canonicalHeader(manifest: PassedAttestationManifest): string {
   return JSON.stringify({
@@ -250,6 +250,13 @@ const COORDINATOR_VERSION: string = (() => {
   }
 })()
 
+/**
+ * Builds and validates a version 1.3.0 attestation manifest.
+ *
+ * @param entries - Stage evidence entries to include in the manifest
+ * @param meta - Run metadata, commit identifiers, intent, policy digest, and guardrail mode
+ * @returns The completed attestation manifest with its intent hash and Merkle root
+ */
 export function buildAttestation(
   entries: StageEvidenceManifestEntry[],
   meta: {
@@ -280,6 +287,12 @@ export function buildAttestation(
   return manifest
 }
 
+/**
+ * Validates an attestation manifest and its stage evidence.
+ *
+ * @param manifest - The attestation manifest to validate
+ * @param requiredStages - Stage names that must have corresponding evidence
+ */
 export function verifyManifest(
   manifest: PassedAttestationManifest,
   requiredStages: readonly string[] = []
