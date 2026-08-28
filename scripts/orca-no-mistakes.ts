@@ -8774,7 +8774,19 @@ async function discoverConfiguredLauncherAllocations(
     marker.terminalHandle !== undefined &&
     marker.terminalHandle !== terminalHandle
   ) {
-    return undefined;
+    if (
+      terminalHandle !== undefined ||
+      terminals.some((terminal) => terminal.handle === marker.terminalHandle)
+    ) {
+      return undefined;
+    }
+    const shown = await command(
+      orcaCommand,
+      ["terminal", "show", "--terminal", marker.terminalHandle, "--json"],
+      repoRoot,
+      { allowFailure: true },
+    );
+    if (!terminalProbeProvesStale(shown)) return undefined;
   }
 
   const runMatches: string[] = [];
