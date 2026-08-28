@@ -418,6 +418,11 @@ auto_fix:
 # prompt, print, and conversation controls, plus \`pi\` one-shot, mode, and session
 # controls (including \`PI_CODING_AGENT_SESSION_DIR\`); supplying one fails the launch.
 # agent_args_override:
+#   codex:
+#     - "-c"
+#     - "features.hooks=false"
+#     - "-c"
+#     - "features.skill_search=false"
 #   opencode:
 #     - "--agent"
 #     - "custom-reviewer"
