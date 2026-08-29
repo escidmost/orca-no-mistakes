@@ -1584,8 +1584,15 @@ export async function runPipeline(
           approved !== undefined;
         const commitStillValid =
           stage === "intent" ||
-          stage === "rebase" ||
-          evidence.candidate_commit_oid === resumeCheckpoint.output_commit_oid;
+          (stage === "rebase"
+            ? priorCheckpoints.some(
+                (checkpoint) =>
+                  checkpoint.stage_id === stage &&
+                  checkpoint.round_index === evidence.round_index &&
+                  checkpoint.output_commit_oid === evidence.candidate_commit_oid,
+              )
+            : evidence.candidate_commit_oid ===
+              resumeCheckpoint.output_commit_oid);
         if (!complete || !commitStillValid) break;
         resumeStageIndex += 1;
       }
