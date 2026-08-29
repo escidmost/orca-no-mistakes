@@ -11394,6 +11394,7 @@ Prune options:
       const resumedRun = resumeLedger.run(resumeRunId);
       if (!resumedRun) throw new Error(`run ${resumeRunId} does not exist`);
       rawIntent ??= resumedRun.intent;
+      parsed.flags.base ??= resumedRun.base_branch;
       resumeStartOid = resumeLedger.listCheckpoints(resumeRunId).at(-1)
         ?.output_commit_oid;
       if (!resumeStartOid) {
