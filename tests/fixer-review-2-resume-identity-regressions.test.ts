@@ -43,7 +43,11 @@ async function recordEvidence(
   },
 ): Promise<StageEvidenceManifestEntry> {
   const artifactPath = path.join(directory, `${input.summary}.json`);
-  const artifact = JSON.stringify({ findings: input.findings });
+  const artifact = JSON.stringify({
+    base_ref_sha: input.baseRefSha,
+    effective_policy_hash: input.effectivePolicyHash,
+    findings: input.findings,
+  });
   await writeFile(artifactPath, artifact);
   const artifactSha256 = sha256(artifact);
   const workerIdentity = `worker:${input.summary}`;
