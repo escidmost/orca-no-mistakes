@@ -5687,7 +5687,6 @@ export class CliOrca implements OrcaOperations {
     await new Promise((resolve) =>
       setTimeout(resolve, WORKER_LOG_SETTLE_MS),
     );
-    await this.#drainWorkerLog(terminalHandle, bound.log, bound.source, true);
     await this.#captureFinalPartial(terminalHandle, bound.log, bound.source);
     if (bound.owned) await bound.log.close().catch(() => {});
   }
@@ -5854,7 +5853,15 @@ export class CliOrca implements OrcaOperations {
     source: symbol,
   ): Promise<void> {
     try {
-      const terminal = await this.#readTerminal(terminalHandle);
+      await this.#drainWorkerLog(terminalHandle, log, source, true);
+      let terminal = await this.#readTerminal(terminalHandle);
+      if (
+        terminal.truncated === true &&
+        terminal.oldestCursor !== undefined
+      ) {
+        await this.#drainWorkerLog(terminalHandle, log, source, true);
+        terminal = await this.#readTerminal(terminalHandle);
+      }
       const partial = terminal.tail?.at(-1);
       if (!partial) return;
       const partialCursor =

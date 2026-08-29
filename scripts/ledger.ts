@@ -751,12 +751,10 @@ export class StageLog {
       // output replaces so the file ends with the round's final tail. Nothing
       // already on disk is parsed back, so worker text cannot forge accounting.
       const recorded = await this.#priorAccounting()
-      const prior =
-        recorded?.fileIdentity !== undefined &&
-        recorded.fileIdentity !== fileIdentity
-          ? undefined
-          : recorded
-      this.#originalBytesKnown = existingBytes === 0 || prior !== undefined
+      const prior = recorded?.fileIdentity === fileIdentity ? recorded : undefined
+      this.#originalBytesKnown =
+        existingBytes === 0 ||
+        (prior !== undefined && prior.originalBytesKnown !== false)
       this.#originalBytes =
         prior === undefined
           ? existingBytes
@@ -775,11 +773,7 @@ export class StageLog {
       this.#fileIdentity = fileIdentity
       this.#file = file
       this.#started = true
-      if (
-        prior === undefined
-          ? existingBytes === 0
-          : prior.fileBytes === undefined || prior.fileIdentity === undefined
-      ) {
+      if (prior === undefined) {
         await this.#recordOriginalBytes()
       }
       // A crash during compaction can leave the artifact over its cap. Repair
@@ -805,7 +799,12 @@ export class StageLog {
    * worker-writable, and a worker could forge its own truncation accounting.
    */
   async #priorAccounting(): Promise<
-    { fileBytes?: number; fileIdentity?: string; originalBytes: number } | undefined
+    {
+      fileBytes?: number
+      fileIdentity?: string
+      originalBytes: number
+      originalBytesKnown?: boolean
+    } | undefined
   > {
     let file: Awaited<ReturnType<typeof open>>
     try {
@@ -825,18 +824,22 @@ export class StageLog {
           fileBytes?: unknown
           fileIdentity?: unknown
           originalBytes?: unknown
+          originalBytesKnown?: unknown
         }
         if (
           Number.isSafeInteger(parsed.originalBytes) &&
           (parsed.originalBytes as number) >= 0 &&
           Number.isSafeInteger(parsed.fileBytes) &&
           (parsed.fileBytes as number) >= 0 &&
-          (parsed.fileIdentity === undefined || typeof parsed.fileIdentity === 'string')
+          (parsed.fileIdentity === undefined || typeof parsed.fileIdentity === 'string') &&
+          (parsed.originalBytesKnown === undefined ||
+            typeof parsed.originalBytesKnown === 'boolean')
         ) {
           return {
             fileBytes: parsed.fileBytes as number,
             fileIdentity: parsed.fileIdentity as string | undefined,
             originalBytes: parsed.originalBytes as number,
+            originalBytesKnown: parsed.originalBytesKnown as boolean | undefined,
           }
         }
       } catch {}
@@ -850,7 +853,6 @@ export class StageLog {
   }
 
   async #recordOriginalBytes(): Promise<void> {
-    if (!this.#originalBytesKnown) return
     // O_NOFOLLOW so a symlink planted at the sidecar path cannot redirect this
     // write onto an arbitrary file, matching how the log itself is opened.
     try {
@@ -860,6 +862,7 @@ export class StageLog {
             fileBytes: this.#fileBytes,
             fileIdentity: this.#fileIdentity,
             originalBytes: this.#originalBytes,
+            originalBytesKnown: this.#originalBytesKnown,
           }),
           'utf8',
         ),
