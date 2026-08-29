@@ -298,6 +298,14 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
   )
   assert.equal(
     buildCliCommand('opencode', {
+      agentArgsOverride: { opencode: ['--model', 'custom-model'] } as never,
+      model: 'profile-model',
+      variant: 'high',
+    }),
+    `OPENCODE_CONFIG_CONTENT='{"agent":{"build":{"model":"custom-model","variant":"high"}}}' 'opencode' '--agent' 'build' '--model' 'custom-model'`,
+  )
+  assert.equal(
+    buildCliCommand('opencode', {
       agentArgsOverride: {
         opencode: ['--agent', 'reviewer'],
       } as never,

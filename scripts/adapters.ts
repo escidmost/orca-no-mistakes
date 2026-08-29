@@ -354,7 +354,7 @@ export function buildCliCommand(harness: string, options: CliAgentCommandOptions
     const variant = flagValue(raw, ['--variant']) ?? options.variant ?? options.effort
     if (variant) {
       const agent = flagValue(raw, ['--agent']) ?? 'build'
-      const model = options.model ?? flagValue(raw, MODEL_PIN_FLAGS)
+      const model = flagValue(raw, MODEL_PIN_FLAGS) ?? options.model
       const existingConfig = overrideEnv?.OPENCODE_CONFIG_CONTENT ?? process.env.OPENCODE_CONFIG_CONTENT
       const existingConfigIndex = env.findIndex((entry) =>
         entry.startsWith('OPENCODE_CONFIG_CONTENT='),
