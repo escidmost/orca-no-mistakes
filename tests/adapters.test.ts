@@ -265,7 +265,7 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
       `OPENCODE_CONFIG_CONTENT='{"agent":{"build":{"model":"custom-model","variant":"high"}}}' 'opencode' '--agent' 'build' ${rawArgs.map((a) => `'${a}'`).join(' ')}`
     )
   }
-  // Empty or invalid raw model pins do not satisfy the model requirement:
+  // Empty raw model pins are malformed rather than silently treated as absent.
   for (const rawArgs of [['--model'], ['--model='], ['--model', ''], ['-m'], ['-m='], ['-m', '']]) {
     assert.throws(
       () =>
@@ -273,7 +273,7 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
           agentArgsOverride: { opencode: rawArgs } as never,
           effort: 'high'
         }),
-      /cannot express effort without a model/
+      /requires a value/
     )
   }
   assert.equal(
@@ -321,6 +321,16 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
       }),
     /argument --variant requires a value/,
   )
+  for (const rawArgs of [['--variant='], ['--variant'], ['--agent='], ['--agent']]) {
+    assert.throws(
+      () =>
+        buildCliCommand('opencode', {
+          agentArgsOverride: { opencode: rawArgs } as never,
+          variant: 'high',
+        }),
+      /requires a value/,
+    )
+  }
   assert.equal(
     buildCliCommand('opencode', {
       agentArgsOverride: {

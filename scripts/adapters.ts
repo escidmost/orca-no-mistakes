@@ -110,22 +110,26 @@ function flagName(arg: string): string {
 }
 
 function flagValue(args: string[], flags: string[]): string | undefined {
+  let found: string | undefined
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]
     if (arg === '--') break
     for (const flag of flags) {
-      if (arg.startsWith(`${flag}=`)) return arg.slice(flag.length + 1) || undefined
-      if (flag.length === 2 && arg.startsWith(flag) && arg.length > 2) {
-        return arg.slice(2).replace(/^=/, '') || undefined
+      let value: string | undefined | null = null
+      if (arg.startsWith(`${flag}=`)) {
+        value = arg.slice(flag.length + 1)
+      } else if (flag.length === 2 && arg.startsWith(flag) && arg.length > 2) {
+        value = arg.slice(2).replace(/^=/, '')
+      } else if (arg === flag) {
+        value = args[++i]
       }
-      if (arg === flag) {
-        const value = args[i + 1]
-        if (value?.startsWith('-')) throw new Error(`argument ${flag} requires a value`)
-        return value || undefined
-      }
+      if (value === null) continue
+      if (!value || value.startsWith('-')) throw new Error(`argument ${flag} requires a value`)
+      found ??= value
+      break
     }
   }
-  return undefined
+  return found
 }
 
 function pinsAnyFlag(args: string[], flags: string[]): boolean {
