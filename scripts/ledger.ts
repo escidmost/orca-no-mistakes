@@ -759,7 +759,7 @@ export class StageLog {
         prior === undefined
           ? existingBytes
           : prior.originalBytes +
-            (prior.fileBytes !== undefined && existingBytes > prior.fileBytes
+            (existingBytes > prior.fileBytes
               ? existingBytes - prior.fileBytes
               : 0)
       // A prior total larger than the file means the round already compacted:
@@ -768,7 +768,7 @@ export class StageLog {
       this.#compacted =
         prior !== undefined &&
         (this.#originalBytes > existingBytes ||
-          (prior.fileBytes !== undefined && existingBytes < prior.fileBytes))
+          existingBytes < prior.fileBytes)
       this.#fileBytes = existingBytes
       this.#fileIdentity = fileIdentity
       this.#file = file
@@ -794,15 +794,15 @@ export class StageLog {
   }
 
   /**
-   * The round's byte accounting carried across writers and reopens. It lives
-   * beside the log rather than inside it because a count parsed back out of the
-   * log would be worker-writable, and a worker could forge its own truncation
-   * accounting.
+   * The round's identity-bound byte accounting carried across writers and
+   * reopens. Legacy numeric and identity-less records are treated as absent so
+   * #start writes a fresh baseline before new output. The sidecar lives beside
+   * the log because a count parsed from worker-writable output is forgeable.
    */
   async #priorAccounting(): Promise<
     {
-      fileBytes?: number
-      fileIdentity?: string
+      fileBytes: number
+      fileIdentity: string
       originalBytes: number
       originalBytesKnown?: boolean
     } | undefined
@@ -832,22 +832,19 @@ export class StageLog {
           (parsed.originalBytes as number) >= 0 &&
           Number.isSafeInteger(parsed.fileBytes) &&
           (parsed.fileBytes as number) >= 0 &&
-          (parsed.fileIdentity === undefined || typeof parsed.fileIdentity === 'string') &&
+          typeof parsed.fileIdentity === 'string' &&
           (parsed.originalBytesKnown === undefined ||
             typeof parsed.originalBytesKnown === 'boolean')
         ) {
           return {
             fileBytes: parsed.fileBytes as number,
-            fileIdentity: parsed.fileIdentity as string | undefined,
+            fileIdentity: parsed.fileIdentity,
             originalBytes: parsed.originalBytes as number,
             originalBytesKnown: parsed.originalBytesKnown as boolean | undefined,
           }
         }
       } catch {}
-      const originalBytes = Number.parseInt(raw, 10)
-      return Number.isSafeInteger(originalBytes) && originalBytes >= 0
-        ? { originalBytes }
-        : undefined
+      return undefined
     } finally {
       await file.close()
     }

@@ -75,6 +75,7 @@ if (args[0] === 'orchestration' && args[1] === 'worker-start') {
     };
 
     await assert.rejects(orca.startWorker("task-1", launch), /worker-start failed/);
+    assert.equal(await readFile(firstProbePath, "utf8"), "1");
     assert.match(chunks.join(""), /late-native-startup/);
     assert.equal(await readFile(closePath, "utf8"), "1");
   } finally {

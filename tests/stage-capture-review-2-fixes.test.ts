@@ -69,6 +69,7 @@ test("command streams keep independent redaction state", async () => {
   const fakeOrca = path.join(temp, "orca");
   const logPath = path.join(temp, "review_r1.log");
   const secret = "STAGE_CAPTURE_SECRET_123456789";
+  const restoreHome = isolateHome(temp);
   const previousSecret = process.env.OPENAI_API_KEY;
   process.env.OPENAI_API_KEY = secret;
   try {
@@ -106,6 +107,7 @@ if (args[0] === 'orchestration' && args[1] === 'worker-start') {
     assert.match(transcript, /\[REDACTED\]/);
     assert.doesNotMatch(transcript, /STAGE_CAPTURE|SECRET_123456789/);
   } finally {
+    restoreHome();
     if (previousSecret === undefined) delete process.env.OPENAI_API_KEY;
     else process.env.OPENAI_API_KEY = previousSecret;
     await rm(temp, { recursive: true, force: true });

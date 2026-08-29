@@ -179,7 +179,15 @@ test("legacy byte accounting is upgraded before the next append", async () => {
   try {
     const log = new StageLog(logPath);
     const appending = log.append("B");
-    await writeReached;
+    await Promise.race([
+      writeReached,
+      new Promise<never>((_, reject) => {
+        setTimeout(
+          () => reject(new Error("StageLog never reached the guarded write")),
+          5_000,
+        ).unref();
+      }),
+    ]);
     const accounting = JSON.parse(await readFile(`${logPath}.meta`, "utf8"));
     assert.equal(accounting.fileBytes, 10);
     assert.equal(accounting.originalBytes, 10);

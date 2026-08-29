@@ -153,6 +153,7 @@ test("native startup output reaches the stage sink before readiness", async () =
   const temp = await mkdtemp(path.join(tmpdir(), "onm-native-startup-log-"));
   const fakeOrca = path.join(temp, "orca");
   const chunks: string[] = [];
+  const restoreHome = isolateHome(temp);
   const stageLog = {
     async append(chunk: string): Promise<void> {
       chunks.push(chunk);
@@ -183,6 +184,7 @@ process.exitCode = 1
     await assert.rejects(orca.startWorker("task-1", launch), /worker-start failed/);
     assert.match(chunks.join(""), /native-startup-diagnostic/);
   } finally {
+    restoreHome();
     await rm(temp, { recursive: true, force: true });
   }
 });
