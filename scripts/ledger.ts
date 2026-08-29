@@ -1566,10 +1566,24 @@ export class DomainLedger {
 
   finalizePassedRun(
     manifest: PassedAttestationManifest,
-    terminalCommitOid: string
+    terminalCommitOid: string,
+    ownership?: { branch: string; generationToken: number; repoRoot: string }
   ): void {
     this.#db.exec('BEGIN IMMEDIATE')
     try {
+      const run = this.runIdentity(manifest.runId)
+      const lease = run === undefined ? undefined : this.leaseFor(run.repo_root, run.branch)
+      if (
+        !run ||
+        run.status !== 'in-progress' ||
+        lease?.run_id !== manifest.runId ||
+        (ownership !== undefined &&
+          (run.repo_root !== ownership.repoRoot ||
+            run.branch !== ownership.branch ||
+            lease.generation_token !== ownership.generationToken))
+      ) {
+        throw new Error(`run ${manifest.runId} no longer owns its branch lease`)
+      }
       if (!this.finishRun(manifest.runId, 'passed', terminalCommitOid)) {
         throw new Error(`run ${manifest.runId} is already settled`)
       }

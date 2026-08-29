@@ -1360,6 +1360,27 @@ export class RunSettlementError extends Error {
   }
 }
 
+function settleRunOrThrow(
+  ledger: DomainLedger,
+  runId: string,
+  outcome: "cancelled" | "failed",
+  originalError: unknown,
+  ownership?: Parameters<DomainLedger["settleRun"]>[2],
+): void {
+  try {
+    if (!ledger.settleRun(runId, outcome, ownership)) {
+      throw new Error(`run ${runId} no longer owns its branch lease`);
+    }
+  } catch (settlementError) {
+    throw new RunSettlementError(
+      runId,
+      outcome,
+      originalError,
+      settlementError,
+    );
+  }
+}
+
 /**
  * Runs the configured validation and remediation pipeline for a repository.
  *
@@ -1532,9 +1553,11 @@ export async function runPipeline(
       });
     } catch (error) {
       if (domainRunStarted) {
-        ledger.settleRun(
+        settleRunOrThrow(
+          ledger,
           runId,
           "failed",
+          error,
           generationToken === undefined
             ? undefined
             : {
@@ -2299,7 +2322,11 @@ export async function runPipeline(
         runId,
       });
       verifyManifest(attestation, PIPELINE_STEPS);
-      ledger.finalizePassedRun(attestation, terminalCommitOid);
+      ledger.finalizePassedRun(attestation, terminalCommitOid, {
+        branch: deliveryRepo.branch,
+        generationToken: generationToken!,
+        repoRoot: deliveryRepo.root,
+      });
       return { attestation, custodyNote };
     });
     await orca
@@ -2347,20 +2374,11 @@ export async function runPipeline(
         }
       }
       if (!anchorError) {
-        try {
-          ledger.settleRun(runId, outcome, {
-            branch: deliveryRepo.branch,
-            generationToken,
-            repoRoot: deliveryRepo.root,
-          });
-        } catch (settlementError) {
-          throw new RunSettlementError(
-            runId,
-            outcome,
-            failure,
-            settlementError,
-          );
-        }
+        settleRunOrThrow(ledger, runId, outcome, failure, {
+          branch: deliveryRepo.branch,
+          generationToken,
+          repoRoot: deliveryRepo.root,
+        });
       }
       const message =
         failure instanceof Error ? failure.message : String(failure);
