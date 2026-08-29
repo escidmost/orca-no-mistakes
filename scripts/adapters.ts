@@ -125,7 +125,8 @@ function flagValue(args: string[], flags: string[]): string | undefined {
       }
       if (value === null) continue
       if (!value || value.startsWith('-')) throw new Error(`argument ${flag} requires a value`)
-      found ??= value
+      if (found !== undefined) throw new Error(`argument ${flag} may only be specified once`)
+      found = value
       break
     }
   }

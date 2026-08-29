@@ -331,6 +331,20 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
       /requires a value/,
     )
   }
+  for (const rawArgs of [
+    ['--agent', 'reviewer', '--agent=build'],
+    ['--model', 'first', '-msecond'],
+    ['--variant=low', '--variant', 'high'],
+  ]) {
+    assert.throws(
+      () =>
+        buildCliCommand('opencode', {
+          agentArgsOverride: { opencode: rawArgs } as never,
+          variant: 'high',
+        }),
+      /may only be specified once/,
+    )
+  }
   assert.equal(
     buildCliCommand('opencode', {
       agentArgsOverride: {
