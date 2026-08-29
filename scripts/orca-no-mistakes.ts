@@ -1681,7 +1681,7 @@ export async function runPipeline(
         );
         const commitStillValid =
           stage === "intent" ||
-          (checkpointMatchesEvidence &&
+          ((checkpointMatchesEvidence || approved !== undefined) &&
             evidence.candidate_commit_oid ===
               resumeCheckpoint.output_commit_oid);
         if (!complete || !commitStillValid) break;
