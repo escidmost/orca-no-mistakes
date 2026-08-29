@@ -4309,7 +4309,8 @@ export class CliOrca implements OrcaOperations {
     launch: WorkerLaunch,
     pending: () => boolean,
   ): Promise<string | undefined> {
-    while (pending()) {
+    for (;;) {
+      const finalProbe = !pending();
       try {
         const shown = await this.#json<{
           dispatch?: { assignee_handle?: string };
@@ -4325,9 +4326,9 @@ export class CliOrca implements OrcaOperations {
           return terminalHandle;
         }
       } catch {}
-      await new Promise((resolve) => setTimeout(resolve, 250));
+      if (finalProbe) return undefined;
+      if (pending()) await delay(250);
     }
-    return undefined;
   }
 
   async #detachWorkerWorktree(
@@ -5607,7 +5608,17 @@ export class CliOrca implements OrcaOperations {
           watchdog = setInterval(() => {
             void this.#workerOutputAt(terminalHandle)
               .then((outputAt) => {
-                if (outputAt !== activity.lastOutputAt) {
+                if (outputAt === undefined) {
+                  resolve({
+                    error: `worker ${dispatchId} terminal disconnected`,
+                  });
+                  return;
+                }
+                if (activity.lastOutputAt === undefined) {
+                  activity.lastOutputAt = outputAt;
+                  return;
+                }
+                if (outputAt > activity.lastOutputAt) {
                   activity.lastOutputAt = outputAt;
                   activity.lastActivityAt = Date.now();
                   return;
