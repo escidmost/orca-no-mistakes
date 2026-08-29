@@ -83,6 +83,7 @@ class FakeGit implements GitOperations {
   failRebase = false;
   fixerCreatesCommit = true;
   fixerChangesTree = true;
+  policyDigest?: string;
   protectedTestMutation?: string;
   rebaseConflicts: string[] = [];
   diffOutput = "";
@@ -238,6 +239,7 @@ class FakeGit implements GitOperations {
 
   async policySha256(): Promise<string> {
     this.calls.push("policy");
+    if (this.policyDigest) return this.policyDigest;
     return this.#baseOid === "b".repeat(40) ? "e".repeat(64) : "f".repeat(64);
   }
 
@@ -752,15 +754,23 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
     ]),
     [
       ["intent", 0],
+      ["rebase", 0],
       ["review", 1],
+      ["review", 1],
+      ["test", 0],
+      ["document", 0],
+      ["lint", 1],
       ["lint", 1],
     ],
   );
-  assert.equal(
-    checkpoints[0].input_commit_oid,
-    checkpoints[0].output_commit_oid,
-  );
-  for (const checkpoint of checkpoints.slice(1)) {
+  for (const index of [0, 4, 5]) {
+    assert.equal(
+      checkpoints[index].input_commit_oid,
+      checkpoints[index].output_commit_oid,
+    );
+  }
+  for (const index of [1, 2, 3, 6, 7]) {
+    const checkpoint = checkpoints[index];
     assert.notEqual(checkpoint.input_commit_oid, checkpoint.output_commit_oid);
   }
   assert.ok(result.attestation);
@@ -772,6 +782,163 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
     orca.calls.at(-1),
     `status:completed:no-mistakes passed all ${PIPELINE_STEPS.length} stages`,
   );
+});
+
+test("a failed run resumes from its last checkpoint without repeating completed stages or gates", async () => {
+  const git = new FakeGit();
+  git.policyDigest = "f".repeat(64);
+  const deliveryGit = new FakeGit("/origin", "feature");
+  const submissionCommitOid = await deliveryGit.head();
+  const runId = `resume-${randomUUID()}`;
+  const intent = "Resume the interrupted validation.";
+  class InterruptedOrca extends FakeOrca {
+    override async startWorker(
+      taskId: string,
+      launch: WorkerLaunch,
+    ): Promise<WorkerResult> {
+      if (launch.stage === "test") throw new Error("test worker interrupted");
+      return await super.startWorker(taskId, launch);
+    }
+  }
+  const interrupted = new InterruptedOrca(git, runId);
+  interrupted.reports.set("review", [
+    {
+      findings: [
+        {
+          action: "ask-user",
+          description: "Confirm the reviewed behavior is intended.",
+          id: "review-decision",
+          severity: "warning",
+        },
+      ],
+      summary: "review needs approval",
+    },
+  ]);
+  const ledger = new DomainLedger(":memory:");
+
+  await assert.rejects(
+    runPipeline({ deliveryGit, intent }, interrupted, git, ledger),
+    /test worker interrupted/,
+  );
+  assert.equal(ledger.runStatus(runId), "failed");
+  assert.deepEqual(interrupted.completedStages, ["intent", "rebase", "review"]);
+
+  const resumed = new FakeOrca(git);
+  const result = await runPipeline(
+    { deliveryGit, intent, resumeRunId: runId },
+    resumed,
+    git,
+    ledger,
+  );
+
+  assert.equal(result.runId, runId);
+  assert.deepEqual(
+    resumed.launches.map((launch) => launch.stage),
+    ["test", "document", "lint"],
+  );
+  assert.equal(resumed.gates.length, 0);
+  assert.equal(git.calls.filter((call) => call === "rebase:main").length, 1);
+  assert.ok(
+    deliveryGit.calls.some((call) =>
+      call.startsWith(`apply:/repo:${submissionCommitOid}:`),
+    ),
+  );
+  assert.match(result.custodyNote ?? "", /advanced branch feature/);
+  assert.equal(ledger.runStatus(runId), "passed");
+  assert.ok(result.attestation);
+  verifyManifest(result.attestation, PIPELINE_STEPS);
+  assert.deepEqual(ledger.verifyEvidence(result.attestation), []);
+});
+
+test("resume refuses when HEAD no longer matches the failed run checkpoint", async () => {
+  const git = new FakeGit();
+  git.policyDigest = "f".repeat(64);
+  const runId = `resume-moved-${randomUUID()}`;
+  class InterruptedOrca extends FakeOrca {
+    override async startWorker(
+      taskId: string,
+      launch: WorkerLaunch,
+    ): Promise<WorkerResult> {
+      if (launch.stage === "test") throw new Error("test worker interrupted");
+      return await super.startWorker(taskId, launch);
+    }
+  }
+  const ledger = new DomainLedger(":memory:");
+  await assert.rejects(
+    runPipeline(
+      { intent: "Reject a moved resume target." },
+      new InterruptedOrca(git, runId),
+      git,
+      ledger,
+    ),
+    /test worker interrupted/,
+  );
+  git.advanceHead();
+
+  await assert.rejects(
+    runPipeline(
+      {
+        intent: "Reject a moved resume target.",
+        resumeRunId: runId,
+      },
+      new FakeOrca(git),
+      git,
+      ledger,
+    ),
+    /does not match checkpoint/,
+  );
+  assert.equal(ledger.runStatus(runId), "failed");
+});
+
+test("resume replays a recorded fix decision instead of asking the gate again", async () => {
+  const git = new FakeGit();
+  git.policyDigest = "f".repeat(64);
+  const runId = `resume-fix-${randomUUID()}`;
+  class InterruptedFixerOrca extends FakeOrca {
+    override async startWorker(
+      taskId: string,
+      launch: WorkerLaunch,
+    ): Promise<WorkerResult> {
+      if (launch.role === "fixer") throw new Error("fixer interrupted");
+      return await super.startWorker(taskId, launch);
+    }
+  }
+  const interrupted = new InterruptedFixerOrca(git, runId);
+  interrupted.gateResolution = "fix review-decision";
+  interrupted.reports.set("review", [
+    {
+      findings: [
+        {
+          action: "ask-user",
+          description: "Apply the requested review fix.",
+          id: "review-decision",
+          severity: "error",
+        },
+      ],
+      summary: "review requires a fix",
+    },
+  ]);
+  const ledger = new DomainLedger(":memory:");
+
+  await assert.rejects(
+    runPipeline({ intent: "Resume an approved fix." }, interrupted, git, ledger),
+    /fixer interrupted/,
+  );
+
+  const resumed = new FakeOrca(git);
+  await runPipeline(
+    {
+      intent: "Resume an approved fix.",
+      resumeRunId: runId,
+    },
+    resumed,
+    git,
+    ledger,
+  );
+
+  assert.equal(resumed.gates.length, 0);
+  assert.equal(resumed.launches[0]?.role, "fixer");
+  assert.equal(resumed.launches[0]?.stage, "review");
 });
 
 test("fix rounds reuse one durable fixer terminal and worktree", async () => {
@@ -2053,6 +2220,10 @@ test("CLI accepts equals syntax and preserves negative numeric values", async ()
     await assert.rejects(
       main(["run", "--intent=x", "stray-arg"]),
       /run does not accept positional arguments/,
+    );
+    await assert.rejects(
+      main(["run", `--resume=missing-${randomUUID()}`]),
+      /does not exist/,
     );
     await assert.rejects(
       main(["prune", "stray-arg"]),

@@ -39,7 +39,9 @@ export type StageEvidenceRow = {
   artifact_path: string
   artifact_sha256: string | null
   base_commit_oid: string
+  base_ref_sha: string | null
   candidate_commit_oid: string
+  effective_policy_hash: string | null
   evidence_id: string
   evidence_sha256: string
   exit_code: number
@@ -49,6 +51,24 @@ export type StageEvidenceRow = {
   stage_id: string
   summary: string
   worker_identity: string
+}
+
+export type RunRecord = {
+  base_branch: string
+  branch: string
+  intent: string
+  policy_sha256: string
+  repo_root: string
+  run_id: string
+  status: RunStatus
+  submission_commit_oid: string
+}
+
+export type StageCheckpointRow = {
+  input_commit_oid: string
+  output_commit_oid: string
+  round_index: number
+  stage_id: string
 }
 
 export type GateDecisionRecord = {
@@ -1137,6 +1157,75 @@ export class DomainLedger {
       )
   }
 
+  resumeRun(input: {
+    baseBranch: string
+    branch: string
+    effectivePolicyHash: string
+    force?: boolean
+    head: string
+    intent: string
+    policySha256: string
+    repoRoot: string
+    runId: string
+  }): StageCheckpointRow {
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      const run = this.run(input.runId)
+      if (!run) throw new Error(`run ${input.runId} does not exist`)
+      if (run.status !== 'failed') {
+        throw new Error(`run ${input.runId} cannot resume from status ${run.status}`)
+      }
+      if (
+        run.repo_root !== input.repoRoot ||
+        run.branch !== input.branch ||
+        run.base_branch !== input.baseBranch ||
+        run.intent !== input.intent
+      ) {
+        throw new Error(`run ${input.runId} does not match this repository, branch, base, and intent`)
+      }
+      if (run.policy_sha256 !== input.policySha256) {
+        throw new Error(`run ${input.runId} validation policy changed since it failed`)
+      }
+      const incompatibleEvidence = this.#db
+        .prepare(
+          `SELECT COUNT(*) AS count FROM stage_evidence
+           WHERE run_id = ? AND (effective_policy_hash IS NULL OR effective_policy_hash <> ?)`
+        )
+        .get(input.runId, input.effectivePolicyHash) as { count: number | bigint }
+      if (Number(incompatibleEvidence.count) > 0) {
+        throw new Error(`run ${input.runId} effective validation policy changed since it failed`)
+      }
+      const checkpoint = this.#db
+        .prepare(
+          `SELECT input_commit_oid, output_commit_oid, round_index, stage_id
+           FROM stage_checkpoints WHERE run_id = ? ORDER BY id DESC LIMIT 1`
+        )
+        .get(input.runId) as StageCheckpointRow | undefined
+      if (!checkpoint) throw new Error(`run ${input.runId} has no durable checkpoint to resume`)
+      if (checkpoint.output_commit_oid !== input.head) {
+        throw new Error(
+          `HEAD ${input.head} does not match checkpoint ${checkpoint.output_commit_oid} for run ${input.runId}`
+        )
+      }
+      this.#db
+        .prepare(
+          "UPDATE runs SET status = 'in-progress', terminal_commit_oid = NULL, completed_at = NULL WHERE run_id = ?"
+        )
+        .run(input.runId)
+      this.#acquireLeaseLocked({
+        branch: input.branch,
+        force: input.force,
+        repoRoot: input.repoRoot,
+        runId: input.runId
+      })
+      this.#db.exec('COMMIT')
+      return checkpoint
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
   finishRun(
     runId: string,
     status: Exclude<RunStatus, 'in-progress'>,
@@ -1364,8 +1453,8 @@ export class DomainLedger {
       .prepare(
         `SELECT evidence_id, run_id, stage_id, round_index, candidate_commit_oid, base_commit_oid,
                 worker_identity, exit_code, evidence_sha256, artifact_path, artifact_sha256,
-                summary, findings_json
-         FROM stage_evidence WHERE run_id = ? ORDER BY stage_id, round_index, rowid`
+                summary, findings_json, effective_policy_hash, base_ref_sha
+         FROM stage_evidence WHERE run_id = ? ORDER BY rowid`
       )
       .all(runId) as StageEvidenceRow[]
   }
@@ -1500,8 +1589,8 @@ export class DomainLedger {
         })
         .map((entry) => entry.evidenceSha256)
     )
-    // listEvidence orders by (stage_id, round_index, rowid), so the last row
-    // written for a stage is the one left in the map.
+    // listEvidence orders by insertion, so the last row written for a stage is
+    // the one left in the map.
     const latest = new Map<string, StageEvidenceRow>()
     for (const row of evidence.rows) latest.set(row.stage_id, row)
     const blockers: string[] = []
@@ -1740,6 +1829,15 @@ export class DomainLedger {
       .get(runId) as { branch: string; repo_root: string; status: RunStatus } | undefined
   }
 
+  run(runId: string): RunRecord | undefined {
+    return this.#db
+      .prepare(
+        `SELECT run_id, repo_root, branch, base_branch, submission_commit_oid,
+                intent, policy_sha256, status FROM runs WHERE run_id = ?`
+      )
+      .get(runId) as RunRecord | undefined
+  }
+
   listRuns(): { intent: string; run_id: string }[] {
     return this.#db.prepare('SELECT intent, run_id FROM runs ORDER BY created_at').all() as {
       intent: string
@@ -1753,14 +1851,12 @@ export class DomainLedger {
       .get(repoRoot, branch) as { generation_token: number; run_id: string } | undefined
   }
 
-  listCheckpoints(
-    runId: string
-  ): { input_commit_oid: string; output_commit_oid: string; round_index: number; stage_id: string }[] {
+  listCheckpoints(runId: string): StageCheckpointRow[] {
     return this.#db
       .prepare(
         'SELECT input_commit_oid, output_commit_oid, round_index, stage_id FROM stage_checkpoints WHERE run_id = ? ORDER BY id'
       )
-      .all(runId) as { input_commit_oid: string; output_commit_oid: string; round_index: number; stage_id: string }[]
+      .all(runId) as StageCheckpointRow[]
   }
 
   listGateAudit(runId: string): GateAuditRow[] {

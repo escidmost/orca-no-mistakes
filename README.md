@@ -25,9 +25,10 @@ Direct invocation returns a meaningful process exit status:
 
 ```bash
 orca-no-mistakes run --repo /path/to/repo --intent "Add X without changing Y"
+orca-no-mistakes run --repo /path/to/repo --resume <failed-run-id>
 ```
 
-The runner requires an explicit single-line `--intent`, a clean committed named feature branch, refuses the default base branch, and requires a configured `origin`. It rebases onto the detected default branch unless `--base` is supplied.
+New runs require an explicit single-line `--intent`; failed runs can instead use `--resume` without repeating the intent. The runner requires a clean committed named feature branch, refuses the default base branch, and requires a configured `origin`. It rebases onto the detected default branch unless `--base` is supplied. Resume reuses the failed run's ledger and evidence, requires HEAD to match its last durable checkpoint, and skips completed stages whose commit-bound evidence is still valid.
 
 Useful direct-run options:
 
@@ -38,6 +39,7 @@ Useful direct-run options:
 --reviewer-model <model>
 --fixer-model <model> --fixer-effort <level>
 --max-fix-rounds <count>
+--resume <failed-run-id>
 --allow-local-config
 --config <path>
 ```

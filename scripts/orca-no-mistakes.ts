@@ -76,6 +76,8 @@ import {
   type FindingDecisionRow,
   type PassedAttestationManifest,
   type PrunableRun,
+  type StageCheckpointRow,
+  type StageEvidenceRow,
   type StageEvidenceManifestEntry,
 } from "./ledger.ts";
 export {
@@ -254,6 +256,7 @@ export type PipelineOptions = {
   intentTaskId?: string;
   intent: string;
   maxFixRounds?: number;
+  resumeRunId?: string;
   userGlobalConfig?: OrcaNoMistakesConfig;
 };
 
@@ -1191,7 +1194,11 @@ export async function runPipeline(
   const deliveryGit = options.deliveryGit ?? git;
   const deliveryRepo =
     deliveryGit === git ? repo : await deliveryGit.assertReady();
-  if (deliveryGit !== git && deliveryRepo.head !== repo.head) {
+  if (
+    !options.resumeRunId &&
+    deliveryGit !== git &&
+    deliveryRepo.head !== repo.head
+  ) {
     throw new Error("gate worktree is not based on the initiating checkout");
   }
   if (
@@ -1231,8 +1238,11 @@ export async function runPipeline(
     ? "[uncertified: local config bypass] "
     : "";
   const policySha256Value = await git.policySha256(repo.base);
+  let domainRunStarted = false;
+  let resumeCheckpoint: StageCheckpointRow | undefined;
   const { artifactsDir, runId } = await withGateMutation(async () => {
-    const runId = await orca.createRun(`no-mistakes: ${intent}`);
+    const orchestrationRunId = await orca.createRun(`no-mistakes: ${intent}`);
+    const runId = options.resumeRunId ?? orchestrationRunId;
     const artifactsBase = artifactsRoot();
     const artifactsDir = path.resolve(artifactsBase, runId);
     if (!runId.trim() || !isWithin(artifactsBase, artifactsDir)) {
@@ -1250,25 +1260,41 @@ export async function runPipeline(
       throw new Error("Orca returned an unsafe Run ID");
     }
 
-    ledger.startRun({
-      baseBranch: deliveryRepo.base,
-      branch: deliveryRepo.branch,
-      intent,
-      policySha256: policySha256Value,
-      repoRoot: deliveryRepo.root,
-      runId,
-      submissionCommitOid: deliveryRepo.head,
-    });
     try {
-      ledger.acquireLease({
-        branch: deliveryRepo.branch,
-        force: options.forceLease === true,
-        repoRoot: deliveryRepo.root,
-        runId,
-      });
+      if (options.resumeRunId) {
+        resumeCheckpoint = ledger.resumeRun({
+          baseBranch: deliveryRepo.base,
+          branch: deliveryRepo.branch,
+          effectivePolicyHash: effectiveProvenance.effectivePolicyHash,
+          force: options.forceLease === true,
+          head: repo.head,
+          intent,
+          policySha256: policySha256Value,
+          repoRoot: deliveryRepo.root,
+          runId,
+        });
+        domainRunStarted = true;
+      } else {
+        ledger.startRun({
+          baseBranch: deliveryRepo.base,
+          branch: deliveryRepo.branch,
+          intent,
+          policySha256: policySha256Value,
+          repoRoot: deliveryRepo.root,
+          runId,
+          submissionCommitOid: deliveryRepo.head,
+        });
+        domainRunStarted = true;
+        ledger.acquireLease({
+          branch: deliveryRepo.branch,
+          force: options.forceLease === true,
+          repoRoot: deliveryRepo.root,
+          runId,
+        });
+      }
       await registerAbortRunContext({ deliveryGit, git, ledger, runId });
     } catch (error) {
-      ledger.settleRun(runId, "failed");
+      if (domainRunStarted) ledger.settleRun(runId, "failed");
       throw error;
     }
     return { artifactsDir, runId };
@@ -1294,17 +1320,89 @@ export async function runPipeline(
       ),
     );
 
-    const submissionCommitOid = deliveryRepo.head;
-    ledger.recordCheckpoint({
-      inputCommitOid: submissionCommitOid,
-      outputCommitOid: submissionCommitOid,
-      roundIndex: 0,
-      runId,
-      stageId: "intent",
-    });
-    let attemptCounter = 0;
-    const stageEntries: StageEvidenceManifestEntry[] = [];
+    const priorEvidence = options.resumeRunId ? ledger.listEvidence(runId) : [];
+    const priorGateAudit = options.resumeRunId
+      ? ledger.listGateAudit(runId)
+      : [];
+    const submissionCommitOid = ledger.run(runId)!.submission_commit_oid;
+    const latestEvidenceByStage = new Map<StageName, StageEvidenceRow>();
+    for (const entry of priorEvidence) {
+      if (PIPELINE_STEPS.includes(entry.stage_id as StageName)) {
+        latestEvidenceByStage.set(entry.stage_id as StageName, entry);
+      }
+    }
+    const priorRebase = latestEvidenceByStage.get("rebase");
+    if (priorRebase) baseCommitOid = priorRebase.base_commit_oid;
+
+    let resumeStageIndex = 0;
+    if (resumeCheckpoint) {
+      for (const stage of PIPELINE_STEPS) {
+        const evidence = latestEvidenceByStage.get(stage);
+        if (!evidence) break;
+        const findings = JSON.parse(evidence.findings_json ?? "[]") as Finding[];
+        const approved = priorGateAudit.findLast(
+          (audit) =>
+            audit.stage_id === stage &&
+            audit.round_index === evidence.round_index &&
+            audit.resolved_at !== null &&
+            (audit.decision === "approve" || audit.decision === "skip"),
+        );
+        const complete =
+          findings.every((finding) => finding.action === "no-op") ||
+          approved !== undefined;
+        const commitStillValid =
+          stage === "intent" ||
+          stage === "rebase" ||
+          evidence.candidate_commit_oid === resumeCheckpoint.output_commit_oid;
+        if (!complete || !commitStillValid) break;
+        resumeStageIndex += 1;
+      }
+    }
+    const stagesToRun = PIPELINE_STEPS.slice(resumeStageIndex);
+    let attemptCounter = priorEvidence.length;
+    const stageEntries: StageEvidenceManifestEntry[] = priorEvidence.map(
+      (entry) => {
+        if (!entry.artifact_sha256) {
+          throw new Error(`evidence ${entry.evidence_id} has no artifact digest`);
+        }
+        return {
+          artifactSha256: entry.artifact_sha256,
+          baseCommitOid: entry.base_commit_oid,
+          candidateCommitOid: entry.candidate_commit_oid,
+          evidenceSha256: entry.evidence_sha256,
+          exitCode: entry.exit_code,
+          round: entry.round_index,
+          stage: entry.stage_id,
+          summary: entry.summary,
+          workerIdentity: entry.worker_identity,
+        };
+      },
+    );
+    for (const audit of priorGateAudit) {
+      if (
+        !audit.resolved_at ||
+        (audit.decision !== "approve" && audit.decision !== "skip")
+      )
+        continue;
+      const entry = stageEntries.findLast(
+        (candidate) =>
+          candidate.stage === audit.stage_id &&
+          candidate.round === audit.round_index,
+      );
+      if (entry) {
+        entry.waiverOrApproval = {
+          decision: audit.decision,
+          gateId: audit.gate_id,
+          resolvedAt: audit.resolved_at,
+        };
+      }
+    }
     const latestEntryByStage = new Map<StageName, StageEvidenceManifestEntry>();
+    for (const entry of stageEntries) {
+      if (PIPELINE_STEPS.includes(entry.stage as StageName)) {
+        latestEntryByStage.set(entry.stage as StageName, entry);
+      }
+    }
     const decisionHistory = (): string => {
       try {
         const history = ledger.listFindingDecisions({
@@ -1414,7 +1512,7 @@ export async function runPipeline(
     const stageTasks = new Map<StageName, string>();
     let previousTask: string | undefined;
 
-    for (const stage of PIPELINE_STEPS) {
+    for (const stage of stagesToRun) {
       const task =
         stage === "intent" && options.intentTaskId
           ? options.intentTaskId
@@ -1426,19 +1524,38 @@ export async function runPipeline(
     }
 
     await orca.setWorktreeStatus(
-      `${statusPrefix}no-mistakes started: intent`,
+      `${statusPrefix}no-mistakes started: ${stagesToRun[0] ?? "attestation"}`,
       "in-progress",
     );
 
-    for (const stage of PIPELINE_STEPS) {
+    for (const stage of stagesToRun) {
       const taskId = stageTasks.get(stage)!;
+      const stageInputCommitOid = await git.head();
       ledger.heartbeatLease(deliveryRepo.root, deliveryRepo.branch, runId);
       await orca.setWorktreeStatus(
         `${statusPrefix}no-mistakes ${stage} (${stageIndex(stage)}/${PIPELINE_STEPS.length})`,
         "in-progress",
       );
-      let round = 0;
+      let round =
+        resumeCheckpoint?.stage_id === stage
+          ? resumeCheckpoint.round_index
+          : 0;
       let attempt = 0;
+      const resumedEvidence = latestEvidenceByStage.get(stage);
+      let resumedFixDecision =
+        resumedEvidence &&
+        resumeCheckpoint &&
+        resumedEvidence.candidate_commit_oid ===
+          resumeCheckpoint.output_commit_oid
+          ? priorGateAudit.findLast(
+              (audit) =>
+                audit.stage_id === stage &&
+                audit.round_index === resumedEvidence.round_index &&
+                audit.resolved_at !== null &&
+                audit.decision === "fix",
+            )
+          : undefined;
+      if (resumedFixDecision) round = resumedEvidence!.round_index;
       let inheritedFallback:
         { attempts: FallbackAttempt[]; resolvedAgent: string } | undefined;
       const runStage = async () => {
@@ -1486,7 +1603,14 @@ export async function runPipeline(
         );
         return execution.report;
       };
-      let report = await runStage();
+      let report = resumedFixDecision
+        ? {
+            findings: JSON.parse(
+              resumedEvidence!.findings_json ?? "[]",
+            ) as Finding[],
+            summary: resumedEvidence!.summary,
+          }
+        : await runStage();
 
       while (actionableFindings(report).length > 0) {
         const actionable = actionableFindings(report);
@@ -1510,7 +1634,27 @@ export async function runPipeline(
         let guidance = "";
         const manualRebaseIssue = stage === "rebase";
 
-        if (!shouldFix) {
+        if (resumedFixDecision) {
+          const recordedDecision = resumedFixDecision;
+          resumedFixDecision = undefined;
+          if (manualRebaseIssue) {
+            report = await runStage();
+            continue;
+          }
+          const selectedIds = new Set(
+            JSON.parse(recordedDecision.selected_finding_ids ?? "[]") as string[],
+          );
+          targetFindings = actionable.filter((finding) =>
+            selectedIds.has(finding.id),
+          );
+          if (targetFindings.length === 0) {
+            throw new Error(
+              `${stage} recorded fix decision no longer matches its findings`,
+            );
+          }
+          guidance = recordedDecision.guidance ?? "";
+          shouldFix = true;
+        } else if (!shouldFix) {
           if (fixerSession) {
             const pausedSession = fixerSession;
             fixerSession = undefined;
@@ -1753,6 +1897,13 @@ export async function runPipeline(
         report = await runStage();
       }
 
+      ledger.recordCheckpoint({
+        inputCommitOid: stageInputCommitOid,
+        outputCommitOid: await git.head(),
+        roundIndex: round,
+        runId,
+        stageId: stage,
+      });
       await orca.completeTask(taskId, report);
     }
 
@@ -7768,6 +7919,7 @@ const VALUE_FLAGS = new Set([
   "notify",
   "out",
   "repo",
+  "resume",
   "reviewer-model",
 ]);
 const COMMAND_FLAGS: Record<string, Set<string>> = {
@@ -7786,6 +7938,7 @@ const COMMAND_FLAGS: Record<string, Set<string>> = {
     "max-fix-rounds",
     "notify",
     "repo",
+    "resume",
     "reviewer-model",
   ]),
 };
@@ -7969,6 +8122,7 @@ async function createGateWorktree(
     runId: string;
   },
   declaredGateName?: string,
+  startOid: string = repo.head,
 ): Promise<GateWorktree> {
   const gateName =
     configured?.branch ??
@@ -7978,7 +8132,7 @@ async function createGateWorktree(
     const gatePath = configuredRunPath(configured.root, configured.runId);
     await command(
       "git",
-      ["-C", repo.root, "worktree", "add", "-b", gateName, gatePath, repo.head],
+      ["-C", repo.root, "worktree", "add", "-b", gateName, gatePath, startOid],
       repo.root,
     );
     return {
@@ -8020,6 +8174,9 @@ async function createGateWorktree(
   const gateBranch = gate.branch.replace(/^refs\/heads\//, "");
   if (path.posix.basename(gateBranch) !== gateName) {
     throw new Error("worktree create returned an unexpected gate branch");
+  }
+  if (startOid !== repo.head) {
+    await command("git", ["-C", gate.path, "reset", "--hard", startOid], repo.root);
   }
   return {
     branch: gateBranch,
@@ -8295,6 +8452,7 @@ async function launchDetachedRun(
   repo: RepoSnapshot,
   flags: RawCliFlags,
   userGlobalConfig: OrcaNoMistakesConfig,
+  resumeStartOid?: string,
 ): Promise<string> {
   const orcaCommand = resolveOrcaCommand();
   const root = await configuredWorktreeRoot(
@@ -8345,9 +8503,9 @@ async function launchDetachedRun(
       await writeMarker(launcherMarkerFile, orcaLauncherMarker).catch(() => {});
     }
     if (orcaLauncherMarker && !cleanupGate) return;
-    let preservedOid = repo.head;
+    let preservedOid = resumeStartOid ?? repo.head;
     if (cleanupGate?.kind === "configured") {
-      await anchorRecoveryCommit(repo.root, cleanupGate.runId, repo.head);
+      await anchorRecoveryCommit(repo.root, cleanupGate.runId, preservedOid);
       if (!launcherMarkerFile) {
         await markGateCleanupPending();
       }
@@ -8532,12 +8690,18 @@ async function launchDetachedRun(
       };
       await finishLauncherAllocation(launcherMarker);
       gate = await withLauncherAllocation(launcherMarker, () =>
-        createGateWorktree(repo, orcaCommand, {
-          branch: gateBranch,
-          intentTaskId,
-          root,
-          runId,
-        }),
+        createGateWorktree(
+          repo,
+          orcaCommand,
+          {
+            branch: gateBranch,
+            intentTaskId,
+            root,
+            runId,
+          },
+          undefined,
+          resumeStartOid,
+        ),
       );
       launcherMarker.gateAllocated = true;
       await finishLauncherAllocation(launcherMarker);
@@ -8565,7 +8729,14 @@ async function launchDetachedRun(
     try {
       const allocatedGate = await withLauncherAllocation(
         orcaLauncherMarker,
-        () => createGateWorktree(repo, orcaCommand, undefined, gateBranch),
+        () =>
+          createGateWorktree(
+            repo,
+            orcaCommand,
+            undefined,
+            gateBranch,
+            resumeStartOid,
+          ),
       );
       if (allocatedGate.kind !== "orca") {
         throw new Error("worktree create returned an unexpected gate kind");
@@ -8658,6 +8829,7 @@ async function launchDetachedRun(
   const attachedArgs = ["run", "--attached", "--repo", gate.path];
   for (const name of COMMAND_FLAGS.run) {
     if (name === "attached" || name === "notify" || name === "repo") continue;
+    if (name === "head" && resumeStartOid) continue;
     if (BOOLEAN_FLAGS.has(name)) {
       if (flags[name] === true) attachedArgs.push(`--${name}`);
       continue;
@@ -10684,7 +10856,7 @@ export async function main(argv: string[]): Promise<void> {
     argv.includes("--help")
   ) {
     console.log(`Usage:
-  orca-no-mistakes run --intent <text> [--repo <path>] [--base <branch>] [--head <sha>] [--force-lease]
+  orca-no-mistakes run (--intent <text> | --resume <run-id>) [--repo <path>] [--base <branch>] [--head <sha>] [--force-lease]
   orca-no-mistakes attestation export <run-id|commit-sha> [--out <path>]
   orca-no-mistakes attestation verify <manifest-file|run-id|commit-sha>
   orca-no-mistakes prune [--before <date>] [--repo <path>]
@@ -10694,6 +10866,7 @@ Run options:
   --reviewer-model <model>
   --fixer-model <model> --fixer-effort <level>
   --max-fix-rounds <count>
+  --resume <run-id> (continue a failed run from its last checkpoint)
   --allow-local-config
   --config <path>
   --force-lease (reclaim a stranded branch lease)
@@ -10714,8 +10887,25 @@ Prune options:
   if (parsed.command !== "run")
     throw new Error(`unknown command: ${parsed.command}`);
   const repo = stringFlag(parsed.flags, "repo") ?? process.cwd();
-  const rawIntent = stringFlag(parsed.flags, "intent");
-  if (!rawIntent) throw new Error("run requires --intent");
+  const resumeRunId = stringFlag(parsed.flags, "resume");
+  let rawIntent = stringFlag(parsed.flags, "intent");
+  let resumeStartOid: string | undefined;
+  if (resumeRunId) {
+    const resumeLedger = new DomainLedger();
+    try {
+      const resumedRun = resumeLedger.run(resumeRunId);
+      if (!resumedRun) throw new Error(`run ${resumeRunId} does not exist`);
+      rawIntent ??= resumedRun.intent;
+      resumeStartOid = resumeLedger.listCheckpoints(resumeRunId).at(-1)
+        ?.output_commit_oid;
+      if (!resumeStartOid) {
+        throw new Error(`run ${resumeRunId} has no durable checkpoint`);
+      }
+    } finally {
+      resumeLedger.close();
+    }
+  }
+  if (!rawIntent) throw new Error("run requires --intent or --resume");
   const intent = normalizeIntent(rawIntent);
   parsed.flags.intent = intent;
   const maxFixRoundsValue = parsed.flags["max-fix-rounds"];
@@ -10741,6 +10931,7 @@ Prune options:
       repoState,
       parsed.flags,
       userGlobalConfig,
+      resumeStartOid,
     );
     console.log(JSON.stringify({ detached: true, terminalHandle }));
     return;
@@ -10830,6 +11021,7 @@ Prune options:
           gate?.kind === "configured" ? gate.intentTaskId : undefined,
         intent,
         maxFixRounds,
+        resumeRunId,
         userGlobalConfig,
       },
       orca,
