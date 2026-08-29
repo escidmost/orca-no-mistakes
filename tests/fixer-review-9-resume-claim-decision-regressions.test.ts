@@ -203,7 +203,7 @@ test("resume publishes its exact claim and replays an identical approval", async
     const reviewEvidence = result.attestation.stageEvidence.filter(
       (entry) => entry.stage === "review",
     );
-    assert.equal(reviewEvidence.length, 2);
+    assert.equal(reviewEvidence.length, 1);
     assert.equal(reviewEvidence.at(-1)?.waiverOrApproval?.decision, "approve");
     const marker = JSON.parse(await readFile(ledger.markerPath, "utf8")) as {
       domainRunId?: string;

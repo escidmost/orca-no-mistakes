@@ -178,6 +178,7 @@ test("resume skips approved evidence when its checkpoint write failed", async ()
 
     assert.deepEqual(resumed.reviewDispatches, []);
     assert.equal(resumed.gateCount(), 0);
+    assert.ok(result.attestation);
     const reviewEvidence = result.attestation.stageEvidence.filter(
       (entry) => entry.stage === "review",
     );

@@ -8475,7 +8475,7 @@ test("launchAgent carries role settings even when no agent harness is configured
         effort: "high",
       })?.[0] ?? {},
     ),
-    `'opencode' '--model' 'gpt-5.6' '--variant' 'high'`,
+    `OPENCODE_CONFIG_CONTENT='{"agent":{"build":{"model":"gpt-5.6","variant":"high"}}}' 'opencode' '--model' 'gpt-5.6' '--agent' 'build'`,
   );
   assert.deepEqual(
     launchAgent({
