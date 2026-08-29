@@ -586,7 +586,6 @@ export class StageLog {
     }
     else this.#carries.delete(source)
     await this.#absorb(redacted.slice(0, redacted.length - hold))
-    if (this.#hasNewOutput) await this.#recordOriginalBytes()
   }
 
   async close(): Promise<void> {
@@ -772,7 +771,11 @@ export class StageLog {
       this.#fileIdentity = fileIdentity
       this.#file = file
       this.#started = true
-      if (prior && (prior.fileBytes === undefined || prior.fileIdentity === undefined)) {
+      if (
+        prior === undefined
+          ? existingBytes === 0
+          : prior.fileBytes === undefined || prior.fileIdentity === undefined
+      ) {
         await this.#recordOriginalBytes()
       }
       // A crash during compaction can leave the artifact over its cap. Repair
