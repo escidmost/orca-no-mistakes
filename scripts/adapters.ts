@@ -118,7 +118,11 @@ function flagValue(args: string[], flags: string[]): string | undefined {
       if (flag.length === 2 && arg.startsWith(flag) && arg.length > 2) {
         return arg.slice(2).replace(/^=/, '') || undefined
       }
-      if (arg === flag) return args[i + 1] || undefined
+      if (arg === flag) {
+        const value = args[i + 1]
+        if (value?.startsWith('-')) throw new Error(`argument ${flag} requires a value`)
+        return value || undefined
+      }
     }
   }
   return undefined
@@ -134,7 +138,7 @@ function withoutFlag(args: string[], flag: string): string[] {
     const arg = args[i]
     if (arg === '--') return [...filtered, ...args.slice(i)]
     if (arg === flag) {
-      i += 1
+      if (args[i + 1] && !args[i + 1].startsWith('-')) i += 1
       continue
     }
     if (arg.startsWith(`${flag}=`)) continue
