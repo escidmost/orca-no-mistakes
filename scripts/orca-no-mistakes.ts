@@ -4186,10 +4186,8 @@ export class CliOrca implements OrcaOperations {
       if (fence?.aborted)
         throw new Error(`${launch.stage} worker attempt was cancelled`);
       let startupSettled = false;
-      const bindAllocatedTerminal = this.#bindNativeStageLog(
-        taskId,
-        launch,
-        () => !startupSettled,
+      const bindAllocatedTerminal = allocationCommands.exit(() =>
+        this.#bindNativeStageLog(taskId, launch, () => !startupSettled),
       );
       let started: CommandResult;
       try {
