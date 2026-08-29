@@ -8,7 +8,9 @@
 - **Post-merge cleanup** When the PR for a Linear issue is merged, remove any labels from the issue that indicate readiness or process (ready-for-\*, wayfinder:\*). Make sure that the PR begins with the Linear issue number ($TeamSlug-##: $title).
 - **Keep example config updated.** When new features are added that have config options, be sure to add them and their default values to templates/config.yaml
 
-## No-mistakes findings 
+NOTE: DO NOT run the `no-mistakes` command. That is a different app; this app is an orca-native port/fork of it. If you use that command too, you're invalidating some of the dogfooding of this app.
+
+## orca-no-mistakes findings 
 
 For each finding, verify the claim against the code at the cited location before judging it. Trace the concrete sequence it describes; do not accept it because it sounds plausible or reject it because it sounds pedantic. Some findings will be wrong or overstated.
 
@@ -18,7 +20,7 @@ Per finding, state your judgment in 1-3 sentences — one of:
 - not confirmed in the code (cite what disproves it) -> approve
 - design question rather than a bug: decide it on the merits as the author would, then fix or approve accordingly
 
-Respond to no-mistakes with your verdict
+Respond to orca-no-mistakes with your verdict
 
 When asking questions, please use your elicitation tool instead of putting them in a chat response.
 

@@ -496,7 +496,7 @@ async function assertNoSymlinkChain(rootPath: string, targetPath: string): Promi
   let current = root
   for (const component of ['', ...relative.split(path.sep).filter(Boolean)]) {
     if (component) current = path.join(current, component)
-    let entry
+    let entry: Awaited<ReturnType<typeof lstat>>
     try {
       entry = await lstat(current)
     } catch (error) {
@@ -532,22 +532,25 @@ export function capLog(content: string, maxBytes = MAX_LOG_BYTES): string {
  * whole old log or the whole capped one. The middle is what a runaway worker
  * loses.
  *
- * The budget belongs to the file, not the instance: the workers of one stage
- * round share a single bounded artifact, and a round whose combined output
- * still fits keeps every byte of it.
+ * The budget belongs to the file, not the instance: coordinator commands and
+ * workers in one stage round share a single bounded artifact, and a round
+ * whose combined output still fits keeps every byte of it.
  */
 export class StageLog {
   readonly #path: string
   readonly #keep: number
   readonly #maxBytes: number
-  #carry = ''
+  readonly #defaultSource = Symbol()
+  readonly #carries = new Map<symbol, string>()
   #fileBytes = 0
+  #fileIdentity = ''
   #originalBytes = 0
   #originalBytesKnown = true
   #started = false
   #file?: Awaited<ReturnType<typeof open>>
   #hasNewOutput = false
   #compacted = false
+  #pending = Promise.resolve()
 
   constructor(filePath: string, maxBytes = MAX_LOG_BYTES) {
     this.#path = filePath
@@ -559,32 +562,50 @@ export class StageLog {
     this.#keep = Math.max(0, Math.floor((maxBytes - LOG_MARKER_RESERVE_BYTES) / 4))
   }
 
-  async append(chunk: string): Promise<void> {
+  append(chunk: string, source = this.#defaultSource): Promise<void> {
+    const pending = this.#pending.then(() => this.#append(chunk, source))
+    this.#pending = pending.catch(() => {})
+    return pending
+  }
+
+  async #append(chunk: string, source: symbol): Promise<void> {
     if (chunk.length === 0) return
     await this.#start()
     const secrets = knownSecrets()
-    const redacted = applyRedaction(`${this.#carry}${chunk}`, secrets)
+    const redacted = applyRedaction(
+      `${this.#carries.get(source) ?? ''}${chunk}`,
+      secrets,
+    )
     // Hold back only a trailing partial secret, so a credential split across two
     // drain pages is whole the next time redaction runs while ordinary output
     // still reaches disk immediately. `[REDACTED]` contains no secret, so
     // re-scanning what is carried stays idempotent.
     const hold = pendingSecretPrefix(redacted, secrets)
-    this.#carry = redacted.slice(redacted.length - hold)
+    if (hold > 0) {
+      this.#carries.set(source, redacted.slice(redacted.length - hold))
+    }
+    else this.#carries.delete(source)
     await this.#absorb(redacted.slice(0, redacted.length - hold))
   }
 
   async close(): Promise<void> {
     try {
-      if (this.#carry.length > 0) {
-        const carried = this.#carry
-        this.#carry = ''
+      await this.#pending
+      if (this.#carries.size > 0) {
+        const carried = [...this.#carries.values()]
+        this.#carries.clear()
         await this.#start()
-        await this.#absorb(redactKnownSecrets(carried))
+        for (const chunk of carried) await this.#absorb(redactKnownSecrets(chunk))
       }
-      // A silent instance never opens the log, so a worker that printed
-      // nothing cannot disturb what the round already recorded.
+      // A silent instance never opens the log, so it cannot disturb what the
+      // round already recorded.
       if (!this.#hasNewOutput) return
       if (this.#compacted) await this.#compact()
+      else if (!this.#originalBytesKnown) {
+        await this.#absorb(
+          '\n[no-mistakes: log accounting unavailable; original bytes unknown; retained ranges unknown]\n',
+        )
+      }
       await this.#recordOriginalBytes()
     } finally {
       const file = this.#file
@@ -596,7 +617,6 @@ export class StageLog {
   async #absorb(text: string): Promise<void> {
     let pending = Buffer.from(text, 'utf8')
     if (pending.length === 0) return
-    this.#originalBytes += pending.length
     this.#hasNewOutput = true
     // Everything reaches disk as it arrives -- keeping the tail in memory
     // until close would mean a coordinator that dies mid-run leaves only the
@@ -606,6 +626,7 @@ export class StageLog {
     while (pending.length > 0) {
       const room = Math.max(0, this.#maxBytes - this.#fileBytes)
       if (room === 0) {
+        await this.#recordOriginalBytes()
         const before = this.#fileBytes
         await this.#compact()
         if (this.#fileBytes >= before) return
@@ -614,6 +635,7 @@ export class StageLog {
       const slice = pending.subarray(0, room)
       await this.#write(slice)
       this.#fileBytes += slice.length
+      this.#originalBytes += slice.length
       pending = pending.subarray(slice.length)
     }
   }
@@ -693,8 +715,11 @@ export class StageLog {
     )
     await assertPrivateRegularFile(reopened)
     this.#file = reopened
+    const reopenedStat = await reopened.stat()
+    this.#fileIdentity = `${reopenedStat.dev}:${reopenedStat.ino}`
     this.#fileBytes = parts.reduce((total, part) => total + part.length, 0)
     this.#compacted = true
+    await this.#recordOriginalBytes()
   }
 
   async #start(): Promise<void> {
@@ -717,22 +742,40 @@ export class StageLog {
     const file = await open(logPath, O_APPEND | O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
     try {
       await assertPrivateRegularFile(file)
-      let existingBytes = (await file.stat()).size
+      const fileStat = await file.stat()
+      let existingBytes = fileStat.size
+      const fileIdentity = `${fileStat.dev}:${fileStat.ino}`
       await file.chmod(0o600)
       // The first `keep` bytes are the round's head and never change; whatever
       // follows is the previous worker's marker and tail, which this worker's
       // output replaces so the file ends with the round's final tail. Nothing
       // already on disk is parsed back, so worker text cannot forge accounting.
-      const prior = await this.#priorOriginalBytes()
-      this.#originalBytesKnown = existingBytes === 0 || prior !== undefined
-      this.#originalBytes = prior ?? existingBytes
-    // A prior total larger than the file means the round already compacted:
-    // its marker describes the old tail, so close() has to rewrite it even
-    // though the physical file is back under the cap.
-    this.#compacted = prior !== undefined && prior > existingBytes
+      const recorded = await this.#priorAccounting()
+      const prior = recorded?.fileIdentity === fileIdentity ? recorded : undefined
+      this.#originalBytesKnown =
+        existingBytes === 0 ||
+        (prior !== undefined && prior.originalBytesKnown !== false)
+      this.#originalBytes =
+        prior === undefined
+          ? existingBytes
+          : prior.originalBytes +
+            (existingBytes > prior.fileBytes
+              ? existingBytes - prior.fileBytes
+              : 0)
+      // A prior total larger than the file means the round already compacted:
+      // its marker describes the old tail, so close() has to rewrite it even
+      // though the physical file is back under the cap.
+      this.#compacted =
+        prior !== undefined &&
+        (this.#originalBytes > existingBytes ||
+          existingBytes < prior.fileBytes)
       this.#fileBytes = existingBytes
+      this.#fileIdentity = fileIdentity
       this.#file = file
       this.#started = true
+      if (prior === undefined) {
+        await this.#recordOriginalBytes()
+      }
       // A crash during compaction can leave the artifact over its cap. Repair
       // it here rather than refusing to open, so an interrupted run neither
       // loses its transcript nor keeps growing past the bound.
@@ -751,12 +794,20 @@ export class StageLog {
   }
 
   /**
-   * The round's byte total carried between workers. It lives beside the log
-   * rather than inside it because a count parsed back out of the log would be
-   * worker-writable, and a worker could forge its own truncation accounting.
+   * The round's identity-bound byte accounting carried across writers and
+   * reopens. Legacy numeric and identity-less records are treated as absent so
+   * #start writes a fresh baseline before new output. The sidecar lives beside
+   * the log because a count parsed from worker-writable output is forgeable.
    */
-  async #priorOriginalBytes(): Promise<number | undefined> {
-    let file
+  async #priorAccounting(): Promise<
+    {
+      fileBytes: number
+      fileIdentity: string
+      originalBytes: number
+      originalBytesKnown?: boolean
+    } | undefined
+  > {
+    let file: Awaited<ReturnType<typeof open>>
     try {
       file = await open(this.#metaPath(), O_RDONLY | O_NOFOLLOW)
     } catch (error) {
@@ -768,20 +819,51 @@ export class StageLog {
     }
     try {
       if (!(await file.stat()).isFile()) return undefined
-      const parsed = Number.parseInt((await file.readFile('utf8')).trim(), 10)
-      return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined
+      const raw = (await file.readFile('utf8')).trim()
+      try {
+        const parsed = JSON.parse(raw) as {
+          fileBytes?: unknown
+          fileIdentity?: unknown
+          originalBytes?: unknown
+          originalBytesKnown?: unknown
+        }
+        if (
+          Number.isSafeInteger(parsed.originalBytes) &&
+          (parsed.originalBytes as number) >= 0 &&
+          Number.isSafeInteger(parsed.fileBytes) &&
+          (parsed.fileBytes as number) >= 0 &&
+          typeof parsed.fileIdentity === 'string' &&
+          (parsed.originalBytesKnown === undefined ||
+            typeof parsed.originalBytesKnown === 'boolean')
+        ) {
+          return {
+            fileBytes: parsed.fileBytes as number,
+            fileIdentity: parsed.fileIdentity,
+            originalBytes: parsed.originalBytes as number,
+            originalBytesKnown: parsed.originalBytesKnown as boolean | undefined,
+          }
+        }
+      } catch {}
+      return undefined
     } finally {
       await file.close()
     }
   }
 
   async #recordOriginalBytes(): Promise<void> {
-    if (!this.#originalBytesKnown) return
     // O_NOFOLLOW so a symlink planted at the sidecar path cannot redirect this
     // write onto an arbitrary file, matching how the log itself is opened.
     try {
       await this.#replaceFile(this.#metaPath(), [
-        Buffer.from(String(this.#originalBytes), 'utf8'),
+        Buffer.from(
+          JSON.stringify({
+            fileBytes: this.#fileBytes,
+            fileIdentity: this.#fileIdentity,
+            originalBytes: this.#originalBytes,
+            originalBytesKnown: this.#originalBytesKnown,
+          }),
+          'utf8',
+        ),
       ])
     } catch {
       // The sidecar is an optimisation: losing it costs the round its byte
@@ -792,7 +874,9 @@ export class StageLog {
   }
 
   #truncationMarker(headBytes: number, tailBytes: number): string {
-    const dropped = Math.max(0, this.#originalBytes - headBytes - tailBytes)
+    const dropped = this.#originalBytesKnown
+      ? String(Math.max(0, this.#originalBytes - headBytes - tailBytes))
+      : 'unknown'
     const ranges: string[] = []
     if (headBytes > 0) ranges.push(`0-${headBytes - 1}`)
     if (tailBytes > 0 && this.#originalBytesKnown) {

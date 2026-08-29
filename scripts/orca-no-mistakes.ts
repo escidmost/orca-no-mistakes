@@ -128,6 +128,7 @@ export type WorkerLaunch = {
   /** Run-artifact file this worker's raw output is streamed to, outside the
    *  repository. Absent only when no run is bound. */
   logPath?: string;
+  stageLog?: StageLog;
   name: string;
   prompt: string;
   reportPath?: string;
@@ -222,7 +223,7 @@ export interface GitOperations {
    *  (merge-base three-dot form). Must throw on failure so a missing diff
    *  never certifies an empty one. */
   diffBase(base: string, headOid: string): Promise<string>;
-  rebase(base: string): Promise<StageReport>;
+  rebase(base: string, onOutput?: CommandOutput): Promise<StageReport>;
   resolveRefSha(ref: string): Promise<string | undefined>;
   showFile(ref: string, filePath: string): Promise<string | undefined>;
   pathExists(ref: string, filePath: string): Promise<boolean>;
@@ -1622,6 +1623,9 @@ export async function runPipeline(
           await releaseFixerSession(staleSession, orca);
         }
         let nextFixer: Awaited<ReturnType<typeof runFixer>>;
+        const fixerLog = new StageLog(
+          stageLogPath(artifactsDir, stage, round),
+        );
         try {
           nextFixer = await withTimeout(
             fixerRoles.timeout_ms ?? defaultWorkerTimeoutMs(),
@@ -1642,6 +1646,7 @@ export async function runPipeline(
                 orca,
                 git,
                 fixerSession,
+                fixerLog,
                 fence,
               ),
           );
@@ -1690,6 +1695,12 @@ export async function runPipeline(
             { attempts: [], resolvedAgent: "coordinator" },
           );
           continue;
+        } finally {
+          await fixerLog.close().catch((error) => {
+            console.error(
+              `warning: could not close ${stage} fixer log: ${String(error)}`,
+            );
+          });
         }
         if (nextFixer.guardrailViolations.length > 0) {
           ledger.recordGateAudit({
@@ -2128,43 +2139,56 @@ async function executeStage(
   roles: StageRoles,
   decisionHistory: string,
 ): Promise<StageExecution> {
-  if (stage === "intent") {
-    const report: StageReport = {
-      findings: [],
-      summary: `Intent recorded: ${intent}`,
-    };
-    return {
-      exitCode: exitCodeFor(report),
-      report,
-      workerIdentity: "coordinator",
-      resolvedAgent: "coordinator",
-    };
+  const stageLog = new StageLog(stageLogPath(evidenceDir, stage, round));
+  try {
+    if (stage === "intent") {
+      const report: StageReport = {
+        findings: [],
+        summary: `Intent recorded: ${intent}`,
+      };
+      return {
+        exitCode: exitCodeFor(report),
+        report,
+        workerIdentity: "coordinator",
+        resolvedAgent: "coordinator",
+      };
+    }
+    if (stage === "rebase") {
+      const report = await withGateMutation(() =>
+        git.rebase(repo.base, stageLogCommandOutput(stageLog)),
+      );
+      return {
+        exitCode: exitCodeFor(report),
+        report,
+        workerIdentity: "coordinator",
+        resolvedAgent: "coordinator",
+      };
+    }
+    return await withTimeout(
+      roles.reviewer.timeout_ms ?? defaultWorkerTimeoutMs(),
+      `${stage} reviewer`,
+      (fence) =>
+        runReviewer(
+          stage,
+          attempt,
+          round,
+          taskId,
+          intent,
+          evidenceDir,
+          repo,
+          orca,
+          git,
+          roles.reviewer,
+          stageLog,
+          fence,
+          decisionHistory,
+        ),
+    );
+  } finally {
+    await stageLog.close().catch((error) => {
+      console.error(`warning: could not close ${stage} log: ${String(error)}`);
+    });
   }
-  if (stage === "rebase") {
-    const report = await withGateMutation(() => git.rebase(repo.base));
-    return {
-      exitCode: exitCodeFor(report),
-      report,
-      workerIdentity: "coordinator",
-      resolvedAgent: "coordinator",
-    };
-  }
-  return await withTimeout(roles.reviewer.timeout_ms ?? defaultWorkerTimeoutMs(), `${stage} reviewer`, (fence) =>
-    runReviewer(
-      stage,
-      attempt,
-      round,
-      taskId,
-      intent,
-      evidenceDir,
-      repo,
-      orca,
-      git,
-      roles.reviewer,
-      fence,
-      decisionHistory,
-    ),
-  );
 }
 
 /** ONM-23: every raw transcript for a stage round lands in one run-artifact
@@ -2192,6 +2216,7 @@ async function runReviewer(
   orca: OrcaOperations,
   git: GitOperations,
   role: ResolvedRoleConfig,
+  stageLog: StageLog,
   fence: TimeoutFence,
   decisionHistory: string,
 ): Promise<StageExecution> {
@@ -2213,6 +2238,7 @@ async function runReviewer(
       acceptFailedReport: true,
       commitOid: untrusted.headOid,
       logPath,
+      stageLog,
       name: `no-mistakes-${stage}-${attempt + 1}`,
       prompt,
       reportPath,
@@ -2404,6 +2430,7 @@ async function runFixer(
   orca: OrcaOperations,
   git: GitOperations,
   retainedSession: FixerSession | undefined,
+  stageLog: StageLog,
   fence: TimeoutFence,
 ): Promise<{
   after: string;
@@ -2448,6 +2475,7 @@ async function runFixer(
       agent,
       commitOid: before,
       logPath: stageLogPath(path.dirname(reportPath), stage, round),
+      stageLog,
       name: `no-mistakes-fixer-${stage}-${round}`,
       prompt,
       reportPath,
@@ -3314,13 +3342,23 @@ export function parseGateResolution(
 }
 
 type CommandResult = { code: number; stderr: string; stdout: string };
-type CommandOutput = (chunk: string) => void | Promise<void>;
+type CommandOutput = (chunk: string, source: symbol) => void | Promise<void>;
 type AllocationCommandContext = {
   onExit: (pid: number) => Promise<void>;
   onSpawn: (pid: number) => Promise<void>;
 };
 
 const allocationCommands = new AsyncLocalStorage<AllocationCommandContext>();
+
+function stageLogOutput(launch: WorkerLaunch): CommandOutput | undefined {
+  return stageLogCommandOutput(launch.stageLog);
+}
+
+function stageLogCommandOutput(
+  log: StageLog | undefined,
+): CommandOutput | undefined {
+  return log ? (chunk, source) => log.append(chunk, source) : undefined;
+}
 
 async function command(
   executable: string,
@@ -3382,6 +3420,7 @@ async function command(
     let stdout = "";
     let stderr = "";
     let outputChain = Promise.resolve();
+    const outputSources = { stderr: Symbol(), stdout: Symbol() };
     let spawnError: Error | undefined;
     let stdinError: Error | undefined;
     let allocationError: unknown;
@@ -3424,7 +3463,7 @@ async function command(
       else stderr += chunk;
       if (options.onOutput) {
         outputChain = outputChain
-          .then(() => options.onOutput!(chunk))
+          .then(() => options.onOutput!(chunk, outputSources[target]))
           .catch(() => {});
       }
     };
@@ -3452,6 +3491,20 @@ async function command(
           return;
         }
         if (spawnError) {
+          // An aborted spawn surfaces as Node's AbortError, which says nothing
+          // about whose decision it was. Callers classify cancellation by
+          // message, so keep the word they look for.
+          if ((spawnError as NodeJS.ErrnoException).name === "AbortError") {
+            // Keep the AbortError identity the cleanup paths classify on, and
+            // add the word callers match to tell cancellation from failure.
+            const cancelled = new Error(
+              `${executable} ${args.slice(0, 2).join(" ")} was cancelled`,
+              { cause: spawnError },
+            );
+            cancelled.name = "AbortError";
+            reject(cancelled);
+            return;
+          }
           reject(spawnError);
           return;
         }
@@ -3620,12 +3673,17 @@ export class CliOrca implements OrcaOperations {
   // terminal exists so capture outlives a failed launch.
   readonly #terminalLogs = new Map<
     string,
-    { log: StageLog; path: string; ticker: NodeJS.Timeout }
+    {
+      log: StageLog;
+      owned: boolean;
+      path: string;
+      source: symbol;
+      ticker: NodeJS.Timeout;
+    }
   >();
   // Terminal handle -> the drain currently running for it, so overlapping
   // drains serialize instead of interleaving their appends.
   readonly #draining = new Map<string, Promise<void>>();
-  readonly #terminalLastLines = new Map<string, string>();
   // Worktree ID -> the branch Orca minted for it, claimed at creation.
   readonly #workerBranches = new Map<string, string>();
   readonly #completedTasks = new Set<string>();
@@ -3817,7 +3875,7 @@ export class CliOrca implements OrcaOperations {
         dispatch: { id: string; status: string } | null;
         injected?: boolean;
         preamble?: string;
-      }>(args);
+      }>(args, false, undefined, undefined, stageLogOutput(launch));
     } catch (error) {
       if (prepared) await this.#cleanupPreparedWorker(prepared);
       throw new PreflightError(
@@ -3997,6 +4055,7 @@ export class CliOrca implements OrcaOperations {
         false,
         undefined,
         readyTimeoutMs + NATIVE_WORKER_CREATE_SLACK_MS,
+        stageLogOutput(launch),
       );
     } catch (error) {
       throw new PreflightError(
@@ -4109,40 +4168,55 @@ export class CliOrca implements OrcaOperations {
         baseBranch =
           launch.commitOid ??
           (
-            await command("git", ["branch", "--show-current"], this.#cwd)
+            await command("git", ["branch", "--show-current"], this.#cwd, {
+              onOutput: stageLogOutput(launch),
+            })
           ).stdout.trim();
         if (!baseBranch)
           throw new Error(
             "no-mistakes requires a named branch for a worker worktree",
           );
         const commonGitDir = (
-          await command("git", ["rev-parse", "--git-common-dir"], this.#cwd)
+          await command("git", ["rev-parse", "--git-common-dir"], this.#cwd, {
+            onOutput: stageLogOutput(launch),
+          })
         ).stdout.trim();
         repoRoot = path.dirname(path.resolve(this.#cwd, commonGitDir));
       }
       if (fence?.aborted)
         throw new Error(`${launch.stage} worker attempt was cancelled`);
-      const started = await command(
-        this.#command,
-        nativeWorkerStartArgs({
-          agent: agent.harness,
-          baseBranch,
-          effort: agent.effort,
-          model: agent.model,
-          name: launch.name,
-          repoRoot,
-          runId: this.#runId,
-          taskId,
-          timeoutMs: agent.timeoutMs,
-          worktree: launch.worktree,
-        }),
-        this.#cwd,
-        {
-          allowFailure: true,
-          timeoutMs:
-            workerAgentReadyTimeoutMs() + NATIVE_WORKER_CREATE_SLACK_MS,
-        },
+      let startupSettled = false;
+      const bindAllocatedTerminal = allocationCommands.exit(() =>
+        this.#bindNativeStageLog(taskId, launch, () => !startupSettled),
       );
+      let started: CommandResult;
+      try {
+        started = await command(
+          this.#command,
+          nativeWorkerStartArgs({
+            agent: agent.harness,
+            baseBranch,
+            effort: agent.effort,
+            model: agent.model,
+            name: launch.name,
+            repoRoot,
+            runId: this.#runId,
+            taskId,
+            timeoutMs: agent.timeoutMs,
+            worktree: launch.worktree,
+          }),
+          this.#cwd,
+          {
+            allowFailure: true,
+            onOutput: stageLogOutput(launch),
+            timeoutMs:
+              workerAgentReadyTimeoutMs() + NATIVE_WORKER_CREATE_SLACK_MS,
+          },
+        );
+      } finally {
+        startupSettled = true;
+        terminalHandle = (await bindAllocatedTerminal) ?? "";
+      }
       let receipt: {
         dispatch?: { terminalHandle?: string };
         residualResources?: unknown;
@@ -4163,14 +4237,7 @@ export class CliOrca implements OrcaOperations {
         receipt.terminal?.handle ??
         receipt.worker?.terminalHandle ??
         receipt.dispatch?.terminalHandle ??
-        "";
-      // Bind before the checks below: this path closes the receipt's terminal
-      // in its own catch, so launch and readiness diagnostics from a failed
-      // native candidate would otherwise be gone before any drain could run.
-      // ONM-56: the handle only exists once the blocking worker-start returns,
-      // so a native worker that prints and then hangs is captured only if the
-      // coordinator survives that call. Binding earlier needs worker-start to
-      // expose its terminal before it waits for readiness.
+        terminalHandle;
       if (terminalHandle) await this.#bindStageLog(terminalHandle, launch);
       worktreeId = receipt.worktree?.id ?? receipt.worker?.worktreeId;
       const worktreePath =
@@ -4178,6 +4245,8 @@ export class CliOrca implements OrcaOperations {
       const reported = collectResidualResources(receipt.residualResources);
       residual.terminalHandles.push(...reported.terminalHandles);
       residual.worktreeIds.push(...reported.worktreeIds);
+      for (const handle of new Set(reported.terminalHandles))
+        await this.#bindStageLog(handle, launch);
       for (const id of new Set(
         [worktreeId, ...residual.worktreeIds].filter(
           (value): value is string => Boolean(value),
@@ -4235,6 +4304,33 @@ export class CliOrca implements OrcaOperations {
     }
   }
 
+  async #bindNativeStageLog(
+    taskId: string,
+    launch: WorkerLaunch,
+    pending: () => boolean,
+  ): Promise<string | undefined> {
+    for (;;) {
+      const finalProbe = !pending();
+      try {
+        const shown = await this.#json<{
+          dispatch?: { assignee_handle?: string };
+        }>(
+          ["orchestration", "dispatch-show", "--task", taskId, "--json"],
+          true,
+          undefined,
+          WORKER_LOG_READ_TIMEOUT_MS,
+        );
+        const terminalHandle = shown.dispatch?.assignee_handle;
+        if (terminalHandle) {
+          await this.#bindStageLog(terminalHandle, launch);
+          return terminalHandle;
+        }
+      } catch {}
+      if (finalProbe) return undefined;
+      if (pending()) await delay(250);
+    }
+  }
+
   async #detachWorkerWorktree(
     launch: WorkerLaunch,
     worktreePath: string | undefined,
@@ -4249,7 +4345,7 @@ export class CliOrca implements OrcaOperations {
       "git",
       ["checkout", "--detach", launch.commitOid],
       worktreePath,
-      { allowFailure: true },
+      { allowFailure: true, onOutput: stageLogOutput(launch) },
     );
     if (result.code !== 0) {
       throw new Error(
@@ -4268,14 +4364,18 @@ export class CliOrca implements OrcaOperations {
       const branch =
         launch.commitOid ??
         (
-          await command("git", ["branch", "--show-current"], this.#cwd)
+          await command("git", ["branch", "--show-current"], this.#cwd, {
+            onOutput: stageLogOutput(launch),
+          })
         ).stdout.trim();
       if (!branch)
         throw new Error(
           "no-mistakes requires a named branch for a worker worktree",
         );
       const commonGitDir = (
-        await command("git", ["rev-parse", "--git-common-dir"], this.#cwd)
+        await command("git", ["rev-parse", "--git-common-dir"], this.#cwd, {
+          onOutput: stageLogOutput(launch),
+        })
       ).stdout.trim();
       const repoRoot = path.dirname(path.resolve(this.#cwd, commonGitDir));
       const created = await this.#json<{
@@ -4297,6 +4397,9 @@ export class CliOrca implements OrcaOperations {
           "--json",
         ],
         false,
+        undefined,
+        undefined,
+        stageLogOutput(launch),
       );
       worktree = created.worktree;
       if (worktree?.id) await this.#claimWorkerBranch(worktree.id);
@@ -4316,6 +4419,9 @@ export class CliOrca implements OrcaOperations {
           "--json",
         ],
         false,
+        undefined,
+        undefined,
+        stageLogOutput(launch),
       );
       if (fence?.aborted)
         throw new Error(`${launch.stage} worker attempt was cancelled`);
@@ -4333,6 +4439,8 @@ export class CliOrca implements OrcaOperations {
         ["terminal", "list", "--worktree", `path:${worktree.path}`, "--json"],
         false,
         fence,
+        undefined,
+        stageLogOutput(launch),
       );
       terminalHandle =
         listed.terminals.find(
@@ -4351,6 +4459,9 @@ export class CliOrca implements OrcaOperations {
             "--json",
           ],
           false,
+          undefined,
+          undefined,
+          stageLogOutput(launch),
         );
         terminalHandle = createdTerminal?.terminal?.handle ?? "";
         if (fence?.aborted)
@@ -4395,6 +4506,9 @@ export class CliOrca implements OrcaOperations {
           "--json",
         ],
         false,
+        undefined,
+        undefined,
+        stageLogOutput(launch),
       );
       prepared.terminalHandle = created?.terminal?.handle ?? "";
       if (!prepared.terminalHandle)
@@ -4856,33 +4970,43 @@ export class CliOrca implements OrcaOperations {
         const branch =
           launch.commitOid ??
           (
-            await command("git", ["branch", "--show-current"], this.#cwd)
+            await command("git", ["branch", "--show-current"], this.#cwd, {
+              onOutput: stageLogOutput(launch),
+            })
           ).stdout.trim();
         if (!branch)
           throw new Error(
             "no-mistakes requires a named branch for a worker worktree",
           );
         const commonGitDir = (
-          await command("git", ["rev-parse", "--git-common-dir"], this.#cwd)
+          await command("git", ["rev-parse", "--git-common-dir"], this.#cwd, {
+            onOutput: stageLogOutput(launch),
+          })
         ).stdout.trim();
         const repoRoot = path.dirname(path.resolve(this.#cwd, commonGitDir));
         const created = await this.#json<{
           worktree: { id: string; path: string };
-        }>([
-          "worktree",
-          "create",
-          "--repo",
-          `path:${repoRoot}`,
-          "--name",
-          launch.name,
-          "--base-branch",
-          branch,
-          "--parent-worktree",
-          `path:${this.#parentWorktree}`,
-          "--setup",
-          "run",
-          "--json",
-        ]);
+        }>(
+          [
+            "worktree",
+            "create",
+            "--repo",
+            `path:${repoRoot}`,
+            "--name",
+            launch.name,
+            "--base-branch",
+            branch,
+            "--parent-worktree",
+            `path:${this.#parentWorktree}`,
+            "--setup",
+            "run",
+            "--json",
+          ],
+          false,
+          undefined,
+          undefined,
+          stageLogOutput(launch),
+        );
         if (!created.worktree?.id || !created.worktree.path) {
           throw new PreflightError(
             "unclassified",
@@ -4892,15 +5016,21 @@ export class CliOrca implements OrcaOperations {
         worktreeId = created.worktree.id;
         cwd = created.worktree.path;
         await this.#claimWorkerBranch(worktreeId);
-        await this.#json([
-          "worktree",
-          "set",
-          "--worktree",
-          `id:${worktreeId}`,
-          "--parent-worktree",
-          `path:${this.#parentWorktree}`,
-          "--json",
-        ]);
+        await this.#json(
+          [
+            "worktree",
+            "set",
+            "--worktree",
+            `id:${worktreeId}`,
+            "--parent-worktree",
+            `path:${this.#parentWorktree}`,
+            "--json",
+          ],
+          false,
+          undefined,
+          undefined,
+          stageLogOutput(launch),
+        );
         await this.#detachWorkerWorktree(launch, cwd);
       }
       if (fence?.aborted) {
@@ -4912,7 +5042,10 @@ export class CliOrca implements OrcaOperations {
         target,
         timeoutMs: agent.timeoutMs,
       });
-      const log = launch.logPath ? new StageLog(launch.logPath) : undefined;
+      const log =
+        launch.stageLog ??
+        (launch.logPath ? new StageLog(launch.logPath) : undefined);
+      const ownsLog = log !== undefined && launch.stageLog === undefined;
       const worker: WorkerResult = {
         dispatchId: `acp-${randomUUID()}`,
         processReceipt: { protocol: "gated-v1", state: "pending" },
@@ -4941,7 +5074,7 @@ export class CliOrca implements OrcaOperations {
           abortSignal: fenceSignal
             ? AbortSignal.any([fenceSignal, processAbort.signal])
             : processAbort.signal,
-          onOutput: log ? (chunk) => log.append(chunk) : undefined,
+          onOutput: stageLogCommandOutput(log),
           stdin: launch.prompt,
           timeoutMs: agent.timeoutMs ?? WORKER_IDLE_TIMEOUT_MS,
         });
@@ -4955,7 +5088,7 @@ export class CliOrca implements OrcaOperations {
           { cause: error },
         );
       } finally {
-        if (log) {
+        if (ownsLog) {
           await log.close().catch((error) => {
             console.error(
               `warning: could not capture acp worker output: ${String(error)}`,
@@ -5424,17 +5557,47 @@ export class CliOrca implements OrcaOperations {
     report?: StageReport;
   }> {
     const log = await this.#bindStageLog(terminalHandle, launch);
+    const source = log
+      ? this.#terminalLogs.get(terminalHandle)!.source
+      : undefined;
+    const activity = {
+      lastActivityAt: Date.now(),
+      lastOutputAt: await this.#workerOutputAt(terminalHandle),
+    };
+    const abortController = new AbortController();
+    // The caller's fence still owns cancellation state: a copy that hardcodes
+    // `aborted: false` hides a real abort from every downstream check, and the
+    // cleanup that abandons a dispatch created at the deadline is one of them.
+    let localDeadlineSatisfied = false;
+    const waitFence: TimeoutFence = {
+      get aborted() {
+        return fence?.aborted === true || abortController.signal.aborted;
+      },
+      get deadlineSatisfied() {
+        return fence?.deadlineSatisfied ?? localDeadlineSatisfied;
+      },
+      set deadlineSatisfied(value: boolean) {
+        if (fence) fence.deadlineSatisfied = value;
+        else localDeadlineSatisfied = value;
+      },
+      signal: fence?.signal
+        ? AbortSignal.any([fence.signal, abortController.signal])
+        : abortController.signal,
+    };
+    const workerReport = this.#awaitWorkerReport(
+      taskId,
+      dispatchId,
+      terminalHandle,
+      launch,
+      log,
+      source,
+      activity,
+      waitFence,
+    );
     let watchdog: NodeJS.Timeout | undefined;
     try {
       return await Promise.race([
-        this.#awaitWorkerReport(
-          taskId,
-          dispatchId,
-          terminalHandle,
-          launch,
-          log,
-          fence,
-        ),
+        workerReport,
         // The inactivity check inside the wait loop only runs when a delivery
         // or keepalive returns, so a delivery channel that goes quiet takes
         // the whole run with it -- a coordinator sitting at zero CPU for
@@ -5442,17 +5605,29 @@ export class CliOrca implements OrcaOperations {
         // terminal on its own clock, so it fails the attempt whether the
         // silence is the worker's or the channel's.
         new Promise<{ error?: string }>((resolve) => {
-          let idleSince = Date.now();
-          let lastOutputAt: number | undefined;
           watchdog = setInterval(() => {
             void this.#workerOutputAt(terminalHandle)
               .then((outputAt) => {
-                if (outputAt !== lastOutputAt) {
-                  lastOutputAt = outputAt;
-                  idleSince = Date.now();
+                if (outputAt === undefined) {
+                  resolve({
+                    error: `worker ${dispatchId} terminal disconnected`,
+                  });
                   return;
                 }
-                if (Date.now() - idleSince < workerIdleTimeoutMs()) return;
+                if (activity.lastOutputAt === undefined) {
+                  activity.lastOutputAt = outputAt;
+                  return;
+                }
+                if (outputAt > activity.lastOutputAt) {
+                  activity.lastOutputAt = outputAt;
+                  activity.lastActivityAt = Date.now();
+                  return;
+                }
+                if (
+                  Date.now() - activity.lastActivityAt <
+                  workerIdleTimeoutMs()
+                )
+                  return;
                 resolve({
                   error: `worker ${dispatchId} produced no output for ${workerIdleTimeoutMs()}ms`,
                 });
@@ -5464,6 +5639,8 @@ export class CliOrca implements OrcaOperations {
       ]);
     } finally {
       if (watchdog) clearInterval(watchdog);
+      abortController.abort();
+      await workerReport.catch(() => {});
     }
   }
 
@@ -5485,18 +5662,23 @@ export class CliOrca implements OrcaOperations {
       // shared cursor past it, so the new log would never see it.
       await this.#releaseStageLog(terminalHandle);
     }
-    // A new round writes a new file, so the previous round's last line must
-    // not suppress identical text at the start of this one.
-    this.#terminalLastLines.delete(terminalHandle);
-    const log = new StageLog(launch.logPath);
+    const log = launch.stageLog ?? new StageLog(launch.logPath);
+    const source = Symbol();
     // Draining starts here, not when the coordinator begins waiting for a
     // report: a worker can print startup diagnostics and then hang in
     // readiness, and that transcript is exactly what explains the hang.
     const ticker = setInterval(() => {
-      void this.#drainWorkerLog(terminalHandle, log);
+      void this.#drainWorkerLog(terminalHandle, log, source);
     }, WORKER_LOG_DRAIN_INTERVAL_MS);
     ticker.unref();
-    this.#terminalLogs.set(terminalHandle, { log, path: launch.logPath, ticker });
+    this.#terminalLogs.set(terminalHandle, {
+      log,
+      owned: launch.stageLog === undefined,
+      path: launch.logPath,
+      source,
+      ticker,
+    });
+    void this.#drainWorkerLog(terminalHandle, log, source);
     return log;
   }
 
@@ -5511,15 +5693,15 @@ export class CliOrca implements OrcaOperations {
     clearInterval(bound.ticker);
     // Output is stable now, so take everything rather than stopping at the
     // live-drain page ceiling: what is left is the final tail.
-    await this.#drainWorkerLog(terminalHandle, bound.log, true);
+    await this.#drainWorkerLog(terminalHandle, bound.log, bound.source, true);
     // worker_done can arrive while the agent is still printing its closing
     // response or the TUI is settling. One short pause and a second pass costs
     // a moment per worker and catches what lands in that window.
     await new Promise((resolve) =>
       setTimeout(resolve, WORKER_LOG_SETTLE_MS),
     );
-    await this.#drainWorkerLog(terminalHandle, bound.log, true);
-    await bound.log.close().catch(() => {});
+    await this.#captureFinalPartial(terminalHandle, bound.log, bound.source);
+    if (bound.owned) await bound.log.close().catch(() => {});
   }
 
   /** Appends new terminal output to the run's stage log. Capturing a worker's
@@ -5528,6 +5710,7 @@ export class CliOrca implements OrcaOperations {
   async #drainWorkerLog(
     terminalHandle: string,
     log: StageLog,
+    source: symbol,
     exhaustive = false,
   ): Promise<void> {
     // Timer-driven and wait-driven drains overlap. A periodic drain skips when
@@ -5539,7 +5722,7 @@ export class CliOrca implements OrcaOperations {
       if (!exhaustive) return;
       await inflight.catch(() => {});
     }
-    const run = this.#drainNow(terminalHandle, log, exhaustive);
+    const run = this.#drainNow(terminalHandle, log, source, exhaustive);
     this.#draining.set(terminalHandle, run);
     try {
       await run;
@@ -5553,6 +5736,7 @@ export class CliOrca implements OrcaOperations {
   async #drainNow(
     terminalHandle: string,
     log: StageLog,
+    source: symbol,
     exhaustive: boolean,
   ): Promise<void> {
     const maxPages = exhaustive
@@ -5583,11 +5767,28 @@ export class CliOrca implements OrcaOperations {
           if (terminal.truncated === true && oldest !== undefined) {
             await log.append(
               `\n[no-mistakes: terminal output dropped; retained history began at cursor ${oldest}]\n`,
+              source,
             );
           }
           const from = oldest ?? next;
           if (from === undefined) return;
           this.#terminalCursors.set(terminalHandle, from);
+          continue;
+        }
+        const oldest =
+          terminal.oldestCursor === undefined
+            ? undefined
+            : String(terminal.oldestCursor);
+        if (
+          terminal.truncated === true &&
+          oldest !== undefined &&
+          oldest !== cursor
+        ) {
+          await log.append(
+            `\n[no-mistakes: terminal output dropped; retained history began at cursor ${oldest}]\n`,
+            source,
+          );
+          this.#terminalCursors.set(terminalHandle, oldest);
           continue;
         }
         // A cursor that does not advance means the host re-served output this
@@ -5596,7 +5797,7 @@ export class CliOrca implements OrcaOperations {
         // The cursor moves only once the append it describes has landed, so a
         // failed write leaves the next drain to retry the same lines instead
         // of skipping past them.
-        if (lines.length > 0) await this.#appendLines(terminalHandle, log, lines);
+        if (lines.length > 0) await this.#appendLines(log, source, lines);
         if (next !== undefined) this.#terminalCursors.set(terminalHandle, next);
         if (next === undefined || next === latest) return;
       }
@@ -5605,16 +5806,13 @@ export class CliOrca implements OrcaOperations {
       if (exhaustive) {
         await log.append(
           `\n[no-mistakes: terminal output dropped; drain page limit reached]\n`,
+          source,
         );
       }
     } catch (error) {
       console.error(
         `warning: could not capture worker output for ${terminalHandle}: ${String(error)}`,
       );
-    } finally {
-      // Every ordinary exit above returns from inside the try, so this only
-      // runs reliably from a finally.
-      if (exhaustive) await this.#captureFinalPartial(terminalHandle, log);
     }
   }
 
@@ -5655,32 +5853,41 @@ export class CliOrca implements OrcaOperations {
   }
 
   async #appendLines(
-    terminalHandle: string,
     log: StageLog,
+    source: symbol,
     lines: string[],
   ): Promise<void> {
-    this.#terminalLastLines.set(terminalHandle, lines[lines.length - 1] ?? "");
-    await log.append(`${lines.join("\n")}\n`);
+    await log.append(`${lines.join("\n")}\n`, source);
   }
 
-  /**
-   * Records a trailing line the worker never terminated.
-   *
-   * Cursor reads only serve completed lines, so a last line still being
-   * written is invisible to them; the preview holds it. Appending it only
-   * when it differs from the last line already recorded keeps a line that the
-   * worker did finish from landing in the log twice.
-   */
   async #captureFinalPartial(
     terminalHandle: string,
     log: StageLog,
+    source: symbol,
   ): Promise<void> {
     try {
-      const terminal = await this.#readTerminal(terminalHandle);
+      await this.#drainWorkerLog(terminalHandle, log, source, true);
+      let terminal = await this.#readTerminal(terminalHandle);
+      if (
+        terminal.truncated === true &&
+        terminal.oldestCursor !== undefined
+      ) {
+        await this.#drainWorkerLog(terminalHandle, log, source, true);
+        terminal = await this.#readTerminal(terminalHandle);
+      }
       const partial = terminal.tail?.at(-1);
       if (!partial) return;
-      if (partial === this.#terminalLastLines.get(terminalHandle)) return;
-      await this.#appendLines(terminalHandle, log, [partial]);
+      const partialCursor =
+        terminal.nextCursor === undefined
+          ? undefined
+          : String(terminal.nextCursor);
+      if (
+        partialCursor === undefined ||
+        terminal.latestCursor === undefined ||
+        partialCursor === String(terminal.latestCursor)
+      )
+        return;
+      await this.#appendLines(log, source, [partial]);
     } catch {
       // A transcript that is missing its last partial line is still a
       // transcript; capture never fails the stage it records.
@@ -5693,6 +5900,8 @@ export class CliOrca implements OrcaOperations {
     terminalHandle: string,
     launch: WorkerLaunch,
     log: StageLog | undefined,
+    source: symbol | undefined,
+    activity: { lastActivityAt: number; lastOutputAt: number | undefined },
     fence?: TimeoutFence,
   ): Promise<{
     deliveryId?: string;
@@ -5700,8 +5909,6 @@ export class CliOrca implements OrcaOperations {
     failedOutcome?: boolean;
     report?: StageReport;
   }> {
-    let lastActivityAt = Date.now();
-    let lastOutputAt = await this.#workerOutputAt(terminalHandle);
     for (;;) {
       const result = await this.#json<{
         _heartbeat?: boolean;
@@ -5740,12 +5947,19 @@ export class CliOrca implements OrcaOperations {
             error: `worker ${dispatchId} terminal disconnected`,
           };
         }
-        if (lastOutputAt === undefined || outputAt > lastOutputAt) {
-          lastOutputAt = outputAt;
-          lastActivityAt = Date.now();
-          if (log) await this.#drainWorkerLog(terminalHandle, log);
+        if (
+          activity.lastOutputAt === undefined ||
+          outputAt > activity.lastOutputAt
+        ) {
+          activity.lastOutputAt = outputAt;
+          activity.lastActivityAt = Date.now();
+          if (log && source)
+            await this.#drainWorkerLog(terminalHandle, log, source);
         }
-        if (Date.now() - lastActivityAt >= workerIdleTimeoutMs()) {
+        if (
+          Date.now() - activity.lastActivityAt >=
+          workerIdleTimeoutMs()
+        ) {
           return {
             deliveryId: result.deliveryId,
             error: `worker ${dispatchId} was inactive for ${workerIdleTimeoutMs()}ms`,
@@ -5801,8 +6015,9 @@ export class CliOrca implements OrcaOperations {
               error: `worker ${dispatchId} heartbeated for the wrong task`,
             };
           }
-          lastActivityAt = Date.now();
-          if (log) await this.#drainWorkerLog(terminalHandle, log);
+          activity.lastActivityAt = Date.now();
+          if (log && source)
+            await this.#drainWorkerLog(terminalHandle, log, source);
           continue;
         }
         heartbeatOnly = false;
@@ -6002,10 +6217,12 @@ export class CliOrca implements OrcaOperations {
     acceptFailure = false,
     fence?: TimeoutFence,
     timeoutMs?: number | null,
+    onOutput?: CommandOutput,
   ): Promise<T> {
     const result = await command(this.#command, args, this.#cwd, {
       abortSignal: fence?.signal,
       allowFailure: acceptFailure,
+      onOutput,
       timeoutMs: timeoutMs ?? (args.includes("--wait") ? 910_000 : undefined),
     });
     if (result.code !== 0 && !result.stdout.trim()) {
@@ -7376,8 +7593,8 @@ export class GitShell implements GitOperations {
     await anchorRecoveryCommit(this.#repo, runId, oid);
   }
 
-  async rebase(base: string): Promise<StageReport> {
-    const fetch = await this.#git(["fetch", "origin", base], true);
+  async rebase(base: string, onOutput?: CommandOutput): Promise<StageReport> {
+    const fetch = await this.#git(["fetch", "origin", base], true, onOutput);
     if (fetch.failed) {
       return failureReport("rebase-fetch", "ask-user", fetch.output);
     }
@@ -7389,7 +7606,7 @@ export class GitShell implements GitOperations {
         `Could not resolve origin/${base} after fetching it.`,
       );
     }
-    const rebase = await this.#git(["rebase", upstreamHead], true);
+    const rebase = await this.#git(["rebase", upstreamHead], true, onOutput);
     if (!rebase.failed)
       return {
         findings: [],
@@ -7399,8 +7616,9 @@ export class GitShell implements GitOperations {
     const unmerged = await this.#git(
       ["diff", "--name-only", "--diff-filter=U", "-z"],
       true,
+      onOutput,
     );
-    await this.#git(["rebase", "--abort"], true);
+    await this.#git(["rebase", "--abort"], true, onOutput);
     const conflictFiles = unmerged.failed
       ? []
       : unmerged.stdout.split("\0").filter(Boolean);
@@ -7475,12 +7693,13 @@ export class GitShell implements GitOperations {
   async #git(
     args: string[],
     allowFailure = false,
+    onOutput?: CommandOutput,
   ): Promise<CommandResult & { failed: boolean; output: string }> {
     const result = await command(
       "git",
       ["-C", this.#repo, ...args],
       this.#repo,
-      { allowFailure },
+      { allowFailure, onOutput },
     );
     const output = `${result.stdout}${result.stderr}`.trim();
     return { ...result, failed: result.code !== 0, output };
