@@ -9759,7 +9759,12 @@ async function reapConfiguredGate(
     return false;
   }
   try {
-    await anchorRecoveryCommit(repoRoot, domainRunId, tipOid);
+    await anchorRecoveryCommit(
+      repoRoot,
+      domainRunId,
+      tipOid,
+      marker.generationToken,
+    );
   } catch (error) {
     console.error(
       `no-mistakes: retained gate workspace ${gate.path}; could not anchor recovery ref for ${domainRunId}: ${String(error)}`,
@@ -10961,7 +10966,12 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
         }
         if (domainRunId !== undefined) {
           try {
-            await anchorRecoveryCommit(repoRoot, domainRunId, tipOid);
+            await anchorRecoveryCommit(
+              repoRoot,
+              domainRunId,
+              tipOid,
+              marker.generationToken,
+            );
           } catch (error) {
             retained += 1;
             console.error(
