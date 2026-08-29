@@ -481,6 +481,7 @@ type AbortReapState = {
   notify?: (summary: string) => Promise<void>;
   orca?: OrcaOperations;
   orcaCommand?: string;
+  orchestrationRunId?: string;
   originWorktree?: string;
   pid?: number;
   runId?: string;
@@ -824,12 +825,12 @@ async function refreshGateMarker(): Promise<void> {
   if (abortReap.generationToken !== undefined)
     marker.generationToken = abortReap.generationToken;
   if (abortReap.runId !== undefined) {
-    if (gate.kind === "configured") {
-      marker.runId = gate.runId;
-      if (abortReap.runId !== gate.runId) marker.domainRunId = abortReap.runId;
-    } else {
-      marker.runId = abortReap.runId;
-    }
+    marker.runId =
+      gate.kind === "configured"
+        ? gate.runId
+        : (abortReap.orchestrationRunId ?? abortReap.runId);
+    if (abortReap.runId !== marker.runId)
+      marker.domainRunId = abortReap.runId;
   }
   if (abortReap.startupReceipt !== undefined)
     marker.startupReceipt = abortReap.startupReceipt;
@@ -928,6 +929,7 @@ export async function registerAbortRunContext(state: {
   git: GitOperations;
   generationToken?: number;
   ledger: DomainLedger;
+  orchestrationRunId?: string;
   runId: string;
 }): Promise<void> {
   Object.assign(abortReap, state);
@@ -1367,6 +1369,7 @@ export async function runPipeline(
         generationToken: generationToken!,
         git,
         ledger,
+        orchestrationRunId,
         runId,
       });
     } catch (error) {
@@ -10496,6 +10499,16 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
           continue;
         }
         if (
+          marker.domainRunId !== undefined &&
+          (typeof marker.domainRunId !== "string" ||
+            !RUN_ID_PATTERN.test(marker.domainRunId) ||
+            marker.runId === undefined)
+        ) {
+          retained += 1;
+          console.error(`no-mistakes: retained ${name}; its domain run ID is invalid`);
+          continue;
+        }
+        if (
           marker.generationToken !== undefined &&
           (!Number.isSafeInteger(marker.generationToken) ||
             marker.generationToken < 1)
@@ -10504,7 +10517,8 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
           console.error(`no-mistakes: retained ${name}; its lease generation is invalid`);
           continue;
         }
-        const runId = marker.runId;
+        const orchestrationRunId = marker.runId;
+        const domainRunId = marker.domainRunId ?? orchestrationRunId;
         const worktrees = await listOrcaWorktrees(orcaCommand, repoRoot);
         if (worktrees === undefined) {
           retained += 1;
@@ -10515,7 +10529,10 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
         }
         const origin = worktrees.find((entry) => entry.path === repoRoot);
         const actualGate = worktrees.find((entry) => entry.id === gate.id);
-        const run = runId === undefined ? undefined : ledger.runIdentity(runId);
+        const run =
+          domainRunId === undefined
+            ? undefined
+            : ledger.runIdentity(domainRunId);
         const cleanupRetry = run !== undefined && run.status !== "in-progress";
         if (
           !origin ||
@@ -10538,7 +10555,9 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
           (run?.status === "in-progress" &&
             (marker.generationToken === undefined ||
               lease?.generation_token !== marker.generationToken)) ||
-          (run !== undefined && lease !== undefined && lease.run_id !== runId)
+          (run !== undefined &&
+            lease !== undefined &&
+            lease.run_id !== domainRunId)
         ) {
           retained += 1;
           console.error(
@@ -10604,10 +10623,16 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
               continue;
             }
           }
-          if (cleanupRetry && runId !== undefined) {
+          if (cleanupRetry && domainRunId !== undefined) {
             const recovery = await command(
               "git",
-              ["-C", repoRoot, "rev-parse", "--verify", recoveryRefFor(runId)],
+              [
+                "-C",
+                repoRoot,
+                "rev-parse",
+                "--verify",
+                recoveryRefFor(domainRunId),
+              ],
               repoRoot,
               { allowFailure: true },
             );
@@ -10621,13 +10646,13 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
           }
           if (
             (run?.status === "cancelled" || run?.status === "failed") &&
-            runId !== undefined
+            orchestrationRunId !== undefined
           ) {
             try {
               await new CliOrca({
                 command: orcaCommand,
                 cwd: repoRoot,
-                runId,
+                runId: orchestrationRunId,
               }).failRun("Coordinator terminated before cleanup completed");
             } catch (error) {
               retained += 1;
@@ -10651,7 +10676,7 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
             { allowFailure: true },
           );
           if (branch.code === 0) {
-            if (!cleanupRetry || runId === undefined) {
+            if (!cleanupRetry || domainRunId === undefined) {
               retained += 1;
               continue;
             }
@@ -10664,7 +10689,7 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
               ),
               command(
                 "git",
-                ["-C", repoRoot, "rev-parse", recoveryRefFor(runId)],
+                ["-C", repoRoot, "rev-parse", recoveryRefFor(domainRunId)],
                 repoRoot,
                 { allowFailure: true },
               ),
@@ -10763,10 +10788,16 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
           continue;
         }
         let preservedOid: string | undefined;
-        if (cleanupRetry && runId !== undefined) {
+        if (cleanupRetry && domainRunId !== undefined) {
           const preserved = await command(
             "git",
-            ["-C", repoRoot, "rev-parse", "--verify", recoveryRefFor(runId)],
+            [
+              "-C",
+              repoRoot,
+              "rev-parse",
+              "--verify",
+              recoveryRefFor(domainRunId),
+            ],
             repoRoot,
             { allowFailure: true },
           );
@@ -10816,19 +10847,19 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
           );
           continue;
         }
-        if (runId !== undefined) {
+        if (domainRunId !== undefined) {
           try {
-            await anchorRecoveryCommit(repoRoot, runId, tipOid);
+            await anchorRecoveryCommit(repoRoot, domainRunId, tipOid);
           } catch (error) {
             retained += 1;
             console.error(
-              `no-mistakes: retained gate workspace ${gate.path}; could not anchor recovery ref for ${runId}: ${String(error)}`,
+              `no-mistakes: retained gate workspace ${gate.path}; could not anchor recovery ref for ${domainRunId}: ${String(error)}`,
             );
             continue;
           }
           if (
             run?.status === "in-progress" &&
-            !ledger.settleRun(runId, "cancelled", {
+            !ledger.settleRun(domainRunId, "cancelled", {
               branch: run.branch,
               generationToken: marker.generationToken,
               repoRoot,
@@ -10840,12 +10871,12 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
             );
             continue;
           }
-          if (run?.status !== "passed") {
+          if (run?.status !== "passed" && orchestrationRunId !== undefined) {
             try {
               await new CliOrca({
                 command: orcaCommand,
                 cwd: repoRoot,
-                runId,
+                runId: orchestrationRunId,
               }).failRun("Coordinator terminated before cleanup completed");
             } catch (error) {
               retained += 1;
