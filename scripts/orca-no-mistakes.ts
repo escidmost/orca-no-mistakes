@@ -9739,7 +9739,7 @@ async function reapConfiguredGate(
     return false;
   }
   const run = ledger.runIdentity(domainRunId);
-  if (
+  const staleResumeClaim =
     marker.resumeClaimId !== undefined &&
     (run === undefined ||
       marker.generationToken === undefined ||
@@ -9747,15 +9747,10 @@ async function reapConfiguredGate(
         claimId: marker.resumeClaimId,
         generationToken: marker.generationToken,
         runId: domainRunId,
-      }))
-  ) {
-    console.error(
-      `no-mistakes: retained gate workspace ${gate.path}; its resume claim is no longer current`,
-    );
-    return false;
-  }
+      }));
   let generationToken = marker.generationToken;
   const settleConfiguredRun = async (): Promise<boolean> => {
+    if (staleResumeClaim) return true;
     if (
       run?.status === "in-progress" &&
       !ledger.settleRun(domainRunId, "cancelled", {
@@ -9804,7 +9799,8 @@ async function reapConfiguredGate(
     lease,
   );
   if (
-    (run?.status === "in-progress" &&
+    (!staleResumeClaim &&
+      run?.status === "in-progress" &&
       (generationToken === undefined ||
         lease?.generation_token !== generationToken)) ||
     (lease !== undefined && lease.run_id !== domainRunId)
@@ -9884,7 +9880,8 @@ async function reapConfiguredGate(
     );
     if (
       actualGate !== undefined ||
-      ((launcher === undefined || launcher.gateAllocated === true) &&
+      (!staleResumeClaim &&
+        (launcher === undefined || launcher.gateAllocated === true) &&
         (recovered.code !== 0 ||
           !COMMIT_OID.test(recovered.stdout.trim()))) ||
       !(await settleConfiguredRun())
@@ -9901,7 +9898,7 @@ async function reapConfiguredGate(
       return false;
     }
     if (!(await removeGateMarker(markerFile, gate))) return false;
-    if (marker.resumeClaimId !== undefined)
+    if (marker.resumeClaimId !== undefined && !staleResumeClaim)
       ledger.clearResumeClaim(domainRunId, marker.resumeClaimId);
     console.error(`no-mistakes: reaped stranded gate marker ${markerFile}`);
     return true;
@@ -9912,18 +9909,20 @@ async function reapConfiguredGate(
     );
     return false;
   }
-  try {
-    await anchorRecoveryCommit(
-      repoRoot,
-      domainRunId,
-      tipOid,
-      generationToken,
-    );
-  } catch (error) {
-    console.error(
-      `no-mistakes: retained gate workspace ${gate.path}; could not anchor recovery ref for ${domainRunId}: ${String(error)}`,
-    );
-    return false;
+  if (!staleResumeClaim) {
+    try {
+      await anchorRecoveryCommit(
+        repoRoot,
+        domainRunId,
+        tipOid,
+        generationToken,
+      );
+    } catch (error) {
+      console.error(
+        `no-mistakes: retained gate workspace ${gate.path}; could not anchor recovery ref for ${domainRunId}: ${String(error)}`,
+      );
+      return false;
+    }
   }
   if (!(await settleConfiguredRun())) return false;
   if (
@@ -9945,7 +9944,7 @@ async function reapConfiguredGate(
     return false;
   }
   if (!(await removeGateMarker(markerFile, gate))) return false;
-  if (marker.resumeClaimId !== undefined)
+  if (marker.resumeClaimId !== undefined && !staleResumeClaim)
     ledger.clearResumeClaim(domainRunId, marker.resumeClaimId);
   console.error(`no-mistakes: reaped stranded gate workspace ${gate.path}`);
   return true;
@@ -10816,7 +10815,7 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
           domainRunId === undefined
             ? undefined
             : ledger.runIdentity(domainRunId);
-        if (
+        const staleResumeClaim =
           marker.resumeClaimId !== undefined &&
           (domainRunId === undefined ||
             run === undefined ||
@@ -10825,15 +10824,11 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
               claimId: marker.resumeClaimId,
               generationToken: marker.generationToken,
               runId: domainRunId,
-            }))
-        ) {
-          retained += 1;
-          console.error(
-            `no-mistakes: retained gate workspace ${gate.path}; its resume claim is no longer current`,
-          );
-          continue;
-        }
-        const cleanupRetry = run !== undefined && run.status !== "in-progress";
+            }));
+        const cleanupRetry =
+          !staleResumeClaim &&
+          run !== undefined &&
+          run.status !== "in-progress";
         if (
           !origin ||
           typeof origin.id !== "string" ||
@@ -10854,14 +10849,15 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
         const generationToken =
           domainRunId === undefined
             ? marker.generationToken
-            : await cleanupGenerationToken(
-                repoRoot,
-                domainRunId,
-                marker.generationToken,
-                lease,
-              );
+              : await cleanupGenerationToken(
+                  repoRoot,
+                  domainRunId,
+                  marker.generationToken,
+                  lease,
+                );
         if (
-          (run?.status === "in-progress" &&
+          (!staleResumeClaim &&
+            run?.status === "in-progress" &&
             (generationToken === undefined ||
               lease?.generation_token !== generationToken)) ||
           (run !== undefined &&
@@ -10892,7 +10888,7 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
         if (actualGate === undefined) {
           if (
             worktrees.some((entry) => entry.path === gate.path) ||
-            run?.status === "in-progress"
+            (!staleResumeClaim && run?.status === "in-progress")
           ) {
             retained += 1;
             console.error(
@@ -10954,6 +10950,7 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
             }
           }
           if (
+            !staleResumeClaim &&
             (run?.status === "cancelled" || run?.status === "failed") &&
             orchestrationRunId !== undefined
           ) {
@@ -10985,29 +10982,35 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
             { allowFailure: true },
           );
           if (branch.code === 0) {
-            if (!cleanupRetry || domainRunId === undefined) {
+            if (
+              !staleResumeClaim &&
+              (!cleanupRetry || domainRunId === undefined)
+            ) {
               retained += 1;
               continue;
             }
-            const [branchTip, recoveryTip] = await Promise.all([
-              command(
+            const branchTip = await command(
+              "git",
+              ["-C", repoRoot, "rev-parse", `refs/heads/${gate.branch}`],
+              repoRoot,
+              { allowFailure: true },
+            );
+            const recoveryTip = staleResumeClaim
+              ? undefined
+              : await command(
                 "git",
-                ["-C", repoRoot, "rev-parse", `refs/heads/${gate.branch}`],
+                ["-C", repoRoot, "rev-parse", recoveryRefFor(domainRunId!)],
                 repoRoot,
                 { allowFailure: true },
-              ),
-              command(
-                "git",
-                ["-C", repoRoot, "rev-parse", recoveryRefFor(domainRunId)],
-                repoRoot,
-                { allowFailure: true },
-              ),
-            ]);
-            const preservedOid = recoveryTip.stdout.trim();
+              );
+            const preservedOid = (
+              staleResumeClaim ? branchTip.stdout : recoveryTip?.stdout ?? ""
+            ).trim();
             if (
               branchTip.code !== 0 ||
-              recoveryTip.code !== 0 ||
-              branchTip.stdout.trim() !== preservedOid ||
+              (!staleResumeClaim &&
+                (recoveryTip?.code !== 0 ||
+                  branchTip.stdout.trim() !== preservedOid)) ||
               !COMMIT_OID.test(preservedOid) ||
               !(await removePreservedBranch(
                 repoRoot,
@@ -11140,14 +11143,18 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
             repoRoot,
             { allowFailure: true },
           );
-          if (!cleanupRetry || exists.code !== 1 || preservedOid === undefined) {
+          if (
+            exists.code !== 1 ||
+            (!staleResumeClaim &&
+              (!cleanupRetry || preservedOid === undefined))
+          ) {
             retained += 1;
             console.error(
               `no-mistakes: retained gate workspace ${gate.path}; its branch tip could not be resolved: ${`${tip.stdout}${tip.stderr}`.trim()}`,
             );
             continue;
           }
-          tipOid = preservedOid;
+          tipOid = staleResumeClaim ? (actualGate.head as string) : preservedOid!;
         }
         if (actualGate !== undefined && actualGate.head !== tipOid) {
           retained += 1;
@@ -11156,65 +11163,67 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
           );
           continue;
         }
-        if (domainRunId !== undefined) {
-          try {
-            await anchorRecoveryCommit(
-              repoRoot,
-              domainRunId,
-              tipOid,
-              generationToken,
-            );
-          } catch (error) {
-            retained += 1;
-            console.error(
-              `no-mistakes: retained gate workspace ${gate.path}; could not anchor recovery ref for ${domainRunId}: ${String(error)}`,
-            );
-            continue;
-          }
-          if (
-            run?.status === "in-progress" &&
-            !ledger.settleRun(domainRunId, "cancelled", {
-              branch: run.branch,
-              generationToken,
-              repoRoot,
-            })
-          ) {
-            retained += 1;
-            console.error(
-              `no-mistakes: retained gate workspace ${gate.path}; its run ownership changed before cancellation`,
-            );
-            continue;
-          }
-          if (run?.status !== "passed" && orchestrationRunId !== undefined) {
+        if (!staleResumeClaim) {
+          if (domainRunId !== undefined) {
             try {
-              await new CliOrca({
-                command: orcaCommand,
-                cwd: repoRoot,
-                runId: orchestrationRunId,
-              }).failRun("Coordinator terminated before cleanup completed");
+              await anchorRecoveryCommit(
+                repoRoot,
+                domainRunId,
+                tipOid,
+                generationToken,
+              );
             } catch (error) {
               retained += 1;
               console.error(
-                `no-mistakes: retained gate workspace ${gate.path}; its Orca run could not be settled: ${String(error)}`,
+                `no-mistakes: retained gate workspace ${gate.path}; could not anchor recovery ref for ${domainRunId}: ${String(error)}`,
               );
               continue;
             }
-          }
-        } else {
-          // No run to anchor to: only a branch already contained in HEAD
-          // carries nothing worth preserving.
-          const contained = await command(
-            "git",
-            ["-C", repoRoot, "merge-base", "--is-ancestor", tipOid, "HEAD"],
-            repoRoot,
-            { allowFailure: true },
-          );
-          if (contained.code !== 0) {
-            retained += 1;
-            console.error(
-              `no-mistakes: retained gate workspace ${gate.path}; it has no run to anchor to and its branch is not contained in HEAD`,
+            if (
+              run?.status === "in-progress" &&
+              !ledger.settleRun(domainRunId, "cancelled", {
+                branch: run.branch,
+                generationToken,
+                repoRoot,
+              })
+            ) {
+              retained += 1;
+              console.error(
+                `no-mistakes: retained gate workspace ${gate.path}; its run ownership changed before cancellation`,
+              );
+              continue;
+            }
+            if (run?.status !== "passed" && orchestrationRunId !== undefined) {
+              try {
+                await new CliOrca({
+                  command: orcaCommand,
+                  cwd: repoRoot,
+                  runId: orchestrationRunId,
+                }).failRun("Coordinator terminated before cleanup completed");
+              } catch (error) {
+                retained += 1;
+                console.error(
+                  `no-mistakes: retained gate workspace ${gate.path}; its Orca run could not be settled: ${String(error)}`,
+                );
+                continue;
+              }
+            }
+          } else {
+            // No run to anchor to: only a branch already contained in HEAD
+            // carries nothing worth preserving.
+            const contained = await command(
+              "git",
+              ["-C", repoRoot, "merge-base", "--is-ancestor", tipOid, "HEAD"],
+              repoRoot,
+              { allowFailure: true },
             );
-            continue;
+            if (contained.code !== 0) {
+              retained += 1;
+              console.error(
+                `no-mistakes: retained gate workspace ${gate.path}; it has no run to anchor to and its branch is not contained in HEAD`,
+              );
+              continue;
+            }
           }
         }
         // Orca cannot conditionally remove atomically, so stranded cleanup
@@ -11248,7 +11257,11 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
           retained += 1;
           continue;
         }
-        if (marker.resumeClaimId !== undefined && domainRunId !== undefined)
+        if (
+          marker.resumeClaimId !== undefined &&
+          domainRunId !== undefined &&
+          !staleResumeClaim
+        )
           ledger.clearResumeClaim(domainRunId, marker.resumeClaimId);
         reaped += 1;
         console.error(`no-mistakes: reaped stranded gate workspace ${gate.path}`);
