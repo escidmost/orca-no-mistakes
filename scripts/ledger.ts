@@ -601,6 +601,11 @@ export class StageLog {
       // nothing cannot disturb what the round already recorded.
       if (!this.#hasNewOutput) return
       if (this.#compacted) await this.#compact()
+      else if (!this.#originalBytesKnown) {
+        await this.#absorb(
+          '\n[no-mistakes: log accounting unavailable; original bytes unknown; retained ranges unknown]\n',
+        )
+      }
       await this.#recordOriginalBytes()
     } finally {
       const file = this.#file
@@ -763,10 +768,9 @@ export class StageLog {
       // its marker describes the old tail, so close() has to rewrite it even
       // though the physical file is back under the cap.
       this.#compacted =
-        prior === undefined
-          ? existingBytes > 0
-          : this.#originalBytes > existingBytes ||
-            (prior.fileBytes !== undefined && existingBytes < prior.fileBytes)
+        prior !== undefined &&
+        (this.#originalBytes > existingBytes ||
+          (prior.fileBytes !== undefined && existingBytes < prior.fileBytes))
       this.#fileBytes = existingBytes
       this.#fileIdentity = fileIdentity
       this.#file = file

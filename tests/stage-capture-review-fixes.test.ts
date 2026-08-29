@@ -180,10 +180,10 @@ test("legacy byte accounting is upgraded before the next append", async () => {
     const log = new StageLog(logPath);
     const appending = log.append("B");
     await writeReached;
-    assert.deepEqual(JSON.parse(await readFile(`${logPath}.meta`, "utf8")), {
-      fileBytes: 10,
-      originalBytes: 10,
-    });
+    const accounting = JSON.parse(await readFile(`${logPath}.meta`, "utf8"));
+    assert.equal(accounting.fileBytes, 10);
+    assert.equal(accounting.originalBytes, 10);
+    assert.equal(typeof accounting.fileIdentity, "string");
     releaseWrite();
     await appending;
     await log.close();
