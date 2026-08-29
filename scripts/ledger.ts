@@ -532,9 +532,9 @@ export function capLog(content: string, maxBytes = MAX_LOG_BYTES): string {
  * whole old log or the whole capped one. The middle is what a runaway worker
  * loses.
  *
- * The budget belongs to the file, not the instance: the workers of one stage
- * round share a single bounded artifact, and a round whose combined output
- * still fits keeps every byte of it.
+ * The budget belongs to the file, not the instance: coordinator commands and
+ * workers in one stage round share a single bounded artifact, and a round
+ * whose combined output still fits keeps every byte of it.
  */
 export class StageLog {
   readonly #path: string
@@ -597,8 +597,8 @@ export class StageLog {
         await this.#start()
         for (const chunk of carried) await this.#absorb(redactKnownSecrets(chunk))
       }
-      // A silent instance never opens the log, so a worker that printed
-      // nothing cannot disturb what the round already recorded.
+      // A silent instance never opens the log, so it cannot disturb what the
+      // round already recorded.
       if (!this.#hasNewOutput) return
       if (this.#compacted) await this.#compact()
       else if (!this.#originalBytesKnown) {
@@ -794,9 +794,10 @@ export class StageLog {
   }
 
   /**
-   * The round's byte total carried between workers. It lives beside the log
-   * rather than inside it because a count parsed back out of the log would be
-   * worker-writable, and a worker could forge its own truncation accounting.
+   * The round's byte accounting carried across writers and reopens. It lives
+   * beside the log rather than inside it because a count parsed back out of the
+   * log would be worker-writable, and a worker could forge its own truncation
+   * accounting.
    */
   async #priorAccounting(): Promise<
     {
