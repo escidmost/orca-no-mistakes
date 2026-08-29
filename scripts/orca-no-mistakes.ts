@@ -323,8 +323,23 @@ async function anchorRecoveryCommit(
       throw new Error(`recovery ref ${ref} resolved to an invalid commit`);
     }
   }
+  const fenceRef = recoveryGenerationFenceRefFor(runId);
+  if (generationToken === undefined) {
+    const fence = await command(
+      "git",
+      ["-C", repoRoot, "show-ref", "--verify", "--quiet", fenceRef],
+      repoRoot,
+      { allowFailure: true },
+    );
+    if (fence.code === 0) {
+      if (current.code === 0 && currentOid === oid) return;
+      throw new Error(`recovery generation ownership is required for run ${runId}`);
+    }
+    if (fence.code !== 1) {
+      throw new Error(`recovery generation fence ${fenceRef} could not be verified`);
+    }
+  }
   if (generationToken !== undefined) {
-    const fenceRef = recoveryGenerationFenceRefFor(runId);
     const fenceObject = await command(
       "git",
       ["-C", repoRoot, "hash-object", "-w", "--stdin"],
@@ -440,19 +455,17 @@ async function anchorRecoveryCommit(
       throw new Error(`recovery ref ${ref} has divergent custody`);
     }
   }
-  const anchored = await command(
-    "git",
-    [
-      "-C",
-      repoRoot,
-      "update-ref",
-      ref,
-      oid,
-      current.code === 0 ? currentOid : "0".repeat(oid.length),
-    ],
-    repoRoot,
-    { allowFailure: true },
-  );
+  const anchored = await command("git", ["-C", repoRoot, "update-ref", "--stdin"], repoRoot, {
+    allowFailure: true,
+    stdin: [
+      "start",
+      `verify ${fenceRef} ${"0".repeat(oid.length)}`,
+      `update ${ref} ${oid} ${current.code === 0 ? currentOid : "0".repeat(oid.length)}`,
+      "prepare",
+      "commit",
+      "",
+    ].join("\n"),
+  });
   if (anchored.code !== 0) {
     throw new Error(
       `could not anchor recovery ref ${ref}: ${`${anchored.stdout}${anchored.stderr}`.trim()}`,
@@ -1577,16 +1590,16 @@ export async function runPipeline(
         const complete =
           findings.every((finding) => finding.action === "no-op") ||
           approved !== undefined;
+        const checkpointMatchesEvidence = priorCheckpoints.some(
+          (checkpoint) =>
+            checkpoint.stage_id === stage &&
+            checkpoint.round_index === evidence.round_index &&
+            checkpoint.output_commit_oid === evidence.candidate_commit_oid,
+        );
         const commitStillValid =
           stage === "intent" ||
-          (stage === "rebase"
-            ? priorCheckpoints.some(
-                (checkpoint) =>
-                  checkpoint.stage_id === stage &&
-                  checkpoint.round_index === evidence.round_index &&
-                  checkpoint.output_commit_oid === evidence.candidate_commit_oid,
-              )
-            : evidence.candidate_commit_oid ===
+          (checkpointMatchesEvidence &&
+            evidence.candidate_commit_oid ===
               resumeCheckpoint.output_commit_oid);
         if (!complete || !commitStillValid) break;
         resumeStageIndex += 1;
