@@ -1141,6 +1141,22 @@ export class DomainLedger {
         }
       }
     }
+    this.#db.exec(`UPDATE gate_audit
+      SET evidence_sha256 = (
+        SELECT evidence_sha256 FROM stage_evidence
+        WHERE run_id = gate_audit.run_id
+          AND stage_id = gate_audit.stage_id
+          AND round_index = gate_audit.round_index
+        LIMIT 1
+      )
+      WHERE evidence_sha256 IS NULL
+        AND gate_kind != 'guardrail'
+        AND 1 = (
+          SELECT COUNT(DISTINCT evidence_sha256) FROM stage_evidence
+          WHERE run_id = gate_audit.run_id
+            AND stage_id = gate_audit.stage_id
+            AND round_index = gate_audit.round_index
+        )`)
   }
 
   tableDefinition(tableName: string): string | undefined {
