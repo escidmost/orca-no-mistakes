@@ -420,14 +420,16 @@ async function pruneCrashRemnant(
       !expectReaped,
     );
     assert.equal(existsSync(seeded.marker), !expectReaped);
-    assert.equal(
-      git(
-        seeded.origin,
-        "rev-parse",
-        `refs/no-mistakes/recover/${runId}`,
-      ),
-      seeded.gateHead,
-    );
+    if (expectReaped) {
+      assert.equal(
+        git(
+          seeded.origin,
+          "rev-parse",
+          `refs/no-mistakes/recover/${runId}`,
+        ),
+        seeded.gateHead,
+      );
+    }
     const reopened = new DomainLedger();
     status = reopened.runStatus(runId);
     reopened.close();

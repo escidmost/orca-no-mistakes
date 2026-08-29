@@ -294,6 +294,33 @@ function recoveryGenerationFenceRefFor(runId: string): string {
   return `refs/no-mistakes/recover-generation-fences/${runId}`;
 }
 
+async function recoveryGenerationFenceExists(
+  repoRoot: string,
+  runId: string,
+): Promise<boolean> {
+  const fence = await command(
+    "git",
+    ["-C", repoRoot, "show-ref", "--verify", "--quiet", recoveryGenerationFenceRefFor(runId)],
+    repoRoot,
+    { allowFailure: true },
+  );
+  if (fence.code === 0) return true;
+  if (fence.code === 1) return false;
+  throw new Error(`recovery generation fence for run ${runId} could not be verified`);
+}
+
+async function cleanupGenerationToken(
+  repoRoot: string,
+  runId: string,
+  markerToken: number | undefined,
+  lease: { generation_token: number; run_id: string } | undefined,
+): Promise<number | undefined> {
+  if (markerToken !== undefined || lease?.run_id !== runId) return markerToken;
+  return (await recoveryGenerationFenceExists(repoRoot, runId))
+    ? undefined
+    : lease.generation_token;
+}
+
 const COMMIT_OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
 
 async function anchorRecoveryCommit(
@@ -325,18 +352,9 @@ async function anchorRecoveryCommit(
   }
   const fenceRef = recoveryGenerationFenceRefFor(runId);
   if (generationToken === undefined) {
-    const fence = await command(
-      "git",
-      ["-C", repoRoot, "show-ref", "--verify", "--quiet", fenceRef],
-      repoRoot,
-      { allowFailure: true },
-    );
-    if (fence.code === 0) {
+    if (await recoveryGenerationFenceExists(repoRoot, runId)) {
       if (current.code === 0 && currentOid === oid) return;
       throw new Error(`recovery generation ownership is required for run ${runId}`);
-    }
-    if (fence.code !== 1) {
-      throw new Error(`recovery generation fence ${fenceRef} could not be verified`);
     }
   }
   if (generationToken !== undefined) {
@@ -1429,6 +1447,8 @@ export async function runPipeline(
     if (!runId.trim() || !isWithin(artifactsBase, artifactsDir)) {
       throw new Error("Orca returned an unsafe Run ID");
     }
+    Object.assign(abortReap, { orchestrationRunId, runId });
+    await refreshGateMarker();
     await mkdir(artifactsBase, { recursive: true });
     await mkdir(artifactsDir, { recursive: true });
     const [canonicalArtifactsBase, canonicalArtifactsDir] = await Promise.all([
@@ -1511,12 +1531,19 @@ export async function runPipeline(
         runId,
       });
     } catch (error) {
-      if (domainRunStarted)
-        ledger.settleRun(runId, "failed", {
-          branch: deliveryRepo.branch,
-          generationToken,
-          repoRoot: deliveryRepo.root,
-        });
+      if (domainRunStarted) {
+        ledger.settleRun(
+          runId,
+          "failed",
+          generationToken === undefined
+            ? undefined
+            : {
+                branch: deliveryRepo.branch,
+                generationToken,
+                repoRoot: deliveryRepo.root,
+              },
+        );
+      }
       throw error;
     }
     return { artifactsDir, runId };
@@ -9699,12 +9726,13 @@ async function reapConfiguredGate(
     );
     return false;
   }
+  let generationToken = marker.generationToken;
   const settleConfiguredRun = async (): Promise<boolean> => {
     if (
       run?.status === "in-progress" &&
       !ledger.settleRun(domainRunId, "cancelled", {
         branch: run.branch,
-        generationToken: marker.generationToken,
+        generationToken,
         repoRoot,
       })
     ) {
@@ -9741,10 +9769,16 @@ async function reapConfiguredGate(
   }
   const lease =
     run === undefined ? undefined : ledger.leaseFor(repoRoot, run.branch);
+  generationToken = await cleanupGenerationToken(
+    repoRoot,
+    domainRunId,
+    marker.generationToken,
+    lease,
+  );
   if (
     (run?.status === "in-progress" &&
-      (marker.generationToken === undefined ||
-        lease?.generation_token !== marker.generationToken)) ||
+      (generationToken === undefined ||
+        lease?.generation_token !== generationToken)) ||
     (lease !== undefined && lease.run_id !== domainRunId)
   ) {
     console.error(
@@ -9855,7 +9889,7 @@ async function reapConfiguredGate(
       repoRoot,
       domainRunId,
       tipOid,
-      marker.generationToken,
+      generationToken,
     );
   } catch (error) {
     console.error(
@@ -10789,10 +10823,19 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
         }
         const lease =
           run === undefined ? undefined : ledger.leaseFor(repoRoot, run.branch);
+        const generationToken =
+          domainRunId === undefined
+            ? marker.generationToken
+            : await cleanupGenerationToken(
+                repoRoot,
+                domainRunId,
+                marker.generationToken,
+                lease,
+              );
         if (
           (run?.status === "in-progress" &&
-            (marker.generationToken === undefined ||
-              lease?.generation_token !== marker.generationToken)) ||
+            (generationToken === undefined ||
+              lease?.generation_token !== generationToken)) ||
           (run !== undefined &&
             lease !== undefined &&
             lease.run_id !== domainRunId)
@@ -11091,7 +11134,7 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
               repoRoot,
               domainRunId,
               tipOid,
-              marker.generationToken,
+              generationToken,
             );
           } catch (error) {
             retained += 1;
@@ -11104,7 +11147,7 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
             run?.status === "in-progress" &&
             !ledger.settleRun(domainRunId, "cancelled", {
               branch: run.branch,
-              generationToken: marker.generationToken,
+              generationToken,
               repoRoot,
             })
           ) {

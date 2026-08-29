@@ -104,9 +104,20 @@ test("forced takeover advances the generation before same-domain resume", () => 
   );
 
   try {
+    const claim = ledger.prepareResume({
+      baseBranch: "main",
+      branch: "feature",
+      effectivePolicyHash: "c".repeat(64),
+      head,
+      intent: "resume safely",
+      policySha256: "b".repeat(64),
+      repoRoot,
+      runId: resumedRunId,
+    });
     const resumed = ledger.resumeRun({
       baseBranch: "main",
       branch: "feature",
+      claimId: claim.claimId,
       effectivePolicyHash: "c".repeat(64),
       head,
       intent: "resume safely",

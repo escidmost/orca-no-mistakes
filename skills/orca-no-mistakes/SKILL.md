@@ -35,7 +35,7 @@ orca-no-mistakes run --repo /path/to/repo --resume <failed-run-id>
 
 The coordinator launches detached in a dedicated Orca terminal and returns immediately with `{"detached":true,"terminalHandle":"..."}`. This avoids blocking the caller and allows the originating session to receive and resolve decision gates via `orca orchestration gate-resolve`.
 
-Use `--resume` only for a failed run whose repository HEAD is still at its last durable checkpoint. It retains the original evidence and resolved gate decisions and runs only the stages that still need validation.
+Use `--resume` only for a failed run whose clean initiating checkout is still at its original submission commit. Detached resume reconstructs the isolated gate worktree at the last durable checkpoint, retains the original evidence and resolved gate decisions, and runs only the stages that still need validation. Keeping the initiating checkout at the submission commit lets successful custody transfer advance it automatically.
 
 Available direct-run controls are `--base`, `--head`, `--force-lease`, `--notify`, `--resume`, `--reviewer-model`, `--fixer-model`, `--fixer-effort`, and `--max-fix-rounds`. Workers launch with the `opencode` agent on model `openai/gpt-5.6-luna` at max reasoning effort by default; the default maximum is 3 automated fix rounds, after which an exhaustion gate opens.
 

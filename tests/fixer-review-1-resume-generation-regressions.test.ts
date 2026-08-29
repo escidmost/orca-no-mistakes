@@ -49,9 +49,20 @@ test("stale resume generations cannot settle the current run", () => {
   );
 
   try {
+    const claim = ledger.prepareResume({
+      baseBranch: "main",
+      branch,
+      effectivePolicyHash,
+      head,
+      intent: "Fence resume generations.",
+      policySha256,
+      repoRoot,
+      runId,
+    });
     const resumed = ledger.resumeRun({
       baseBranch: "main",
       branch,
+      claimId: claim.claimId,
       effectivePolicyHash,
       head,
       intent: "Fence resume generations.",

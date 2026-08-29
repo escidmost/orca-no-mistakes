@@ -88,9 +88,20 @@ test("stale terminal cleanup cannot replace newer resume recovery custody", asyn
         }),
         true,
       );
+      const claim = ledger.prepareResume({
+        baseBranch: "main",
+        branch: "feature",
+        effectivePolicyHash: "b".repeat(64),
+        head: checkpoint,
+        intent: "Fence stale cleanup generations.",
+        policySha256: "a".repeat(64),
+        repoRoot: repo,
+        runId,
+      });
       const resumed = ledger.resumeRun({
         baseBranch: "main",
         branch: "feature",
+        claimId: claim.claimId,
         effectivePolicyHash: "b".repeat(64),
         head: checkpoint,
         intent: "Fence stale cleanup generations.",

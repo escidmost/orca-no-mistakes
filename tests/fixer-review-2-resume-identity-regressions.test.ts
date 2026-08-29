@@ -238,7 +238,7 @@ test("resume rejects evidence from a changed base ref", async () => {
   try {
     assert.throws(
       () =>
-        ledger.resumeRun({
+        ledger.prepareResume({
           baseBranch: "main",
           baseRefSha: oid(11),
           branch,
