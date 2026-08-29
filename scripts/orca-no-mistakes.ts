@@ -1508,6 +1508,33 @@ export async function runPipeline(
     const priorGateAudit = options.resumeRunId
       ? ledger.listGateAudit(runId)
       : [];
+    const stageEntries: StageEvidenceManifestEntry[] = priorEvidence.map(
+      (entry) => {
+        if (!entry.artifact_sha256) {
+          throw new Error(`evidence ${entry.evidence_id} has no artifact digest`);
+        }
+        return {
+          artifactSha256: entry.artifact_sha256,
+          baseCommitOid: entry.base_commit_oid,
+          candidateCommitOid: entry.candidate_commit_oid,
+          evidenceSha256: entry.evidence_sha256,
+          exitCode: entry.exit_code,
+          round: entry.round_index,
+          stage: entry.stage_id,
+          summary: entry.summary,
+          workerIdentity: entry.worker_identity,
+        };
+      },
+    );
+    const retainedEvidenceProblems = ledger.verifyEvidence({
+      runId,
+      stageEvidence: stageEntries,
+    });
+    if (retainedEvidenceProblems.length > 0) {
+      throw new Error(
+        `retained stage evidence verification failed: ${retainedEvidenceProblems.join("; ")}`,
+      );
+    }
     const submissionCommitOid = ledger.run(runId)!.submission_commit_oid;
     const latestEvidenceByStage = new Map<StageName, StageEvidenceRow>();
     const priorRoundByStage = new Map<StageName, number>();
@@ -1565,24 +1592,6 @@ export async function runPipeline(
     }
     const stagesToRun = PIPELINE_STEPS.slice(resumeStageIndex);
     let attemptCounter = priorEvidence.length;
-    const stageEntries: StageEvidenceManifestEntry[] = priorEvidence.map(
-      (entry) => {
-        if (!entry.artifact_sha256) {
-          throw new Error(`evidence ${entry.evidence_id} has no artifact digest`);
-        }
-        return {
-          artifactSha256: entry.artifact_sha256,
-          baseCommitOid: entry.base_commit_oid,
-          candidateCommitOid: entry.candidate_commit_oid,
-          evidenceSha256: entry.evidence_sha256,
-          exitCode: entry.exit_code,
-          round: entry.round_index,
-          stage: entry.stage_id,
-          summary: entry.summary,
-          workerIdentity: entry.worker_identity,
-        };
-      },
-    );
     for (const audit of priorGateAudit) {
       if (
         !audit.resolved_at ||

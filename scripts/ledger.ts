@@ -1507,7 +1507,9 @@ export class DomainLedger {
    * manifest entry must still find its row. Returns one message per failure so
    * a caller can report them all at once.
    */
-  verifyEvidence(manifest: PassedAttestationManifest): string[] {
+  verifyEvidence(
+    manifest: Pick<PassedAttestationManifest, 'runId' | 'stageEvidence'>
+  ): string[] {
     return this.#verifyEvidence(manifest.runId, manifest.stageEvidence).problems
   }
 
