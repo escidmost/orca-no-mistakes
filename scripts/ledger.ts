@@ -1582,6 +1582,23 @@ export class DomainLedger {
     }
   }
 
+  #requirePassedRunLease(
+    runId: string,
+    ownership?: { branch: string; generationToken: number; repoRoot: string }
+  ): void {
+    if (!this.ownsLease(runId, ownership)) {
+      throw new Error(`run ${runId} no longer owns its branch lease`)
+    }
+  }
+
+  #completePassedRun(manifest: PassedAttestationManifest, terminalCommitOid: string): void {
+    if (!this.finishRun(manifest.runId, 'passed', terminalCommitOid)) {
+      throw new Error(`run ${manifest.runId} is already settled`)
+    }
+    this.releaseLease(manifest.runId)
+    this.recordAttestation(manifest)
+  }
+
   finalizePassedRun(
     manifest: PassedAttestationManifest,
     terminalCommitOid: string,
@@ -1589,15 +1606,28 @@ export class DomainLedger {
   ): void {
     this.#db.exec('BEGIN IMMEDIATE')
     try {
-      if (!this.ownsLease(manifest.runId, ownership)) {
-        throw new Error(`run ${manifest.runId} no longer owns its branch lease`)
-      }
-      if (!this.finishRun(manifest.runId, 'passed', terminalCommitOid)) {
-        throw new Error(`run ${manifest.runId} is already settled`)
-      }
-      this.releaseLease(manifest.runId)
-      this.recordAttestation(manifest)
+      this.#requirePassedRunLease(manifest.runId, ownership)
+      this.#completePassedRun(manifest, terminalCommitOid)
       this.#db.exec('COMMIT')
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  async finalizePassedRunWithLeaseMutation(
+    manifest: PassedAttestationManifest,
+    terminalCommitOid: string,
+    ownership: { branch: string; generationToken: number; repoRoot: string },
+    mutation: () => Promise<string>
+  ): Promise<string> {
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      this.#requirePassedRunLease(manifest.runId, ownership)
+      const result = await mutation()
+      this.#completePassedRun(manifest, terminalCommitOid)
+      this.#db.exec('COMMIT')
+      return result
     } catch (error) {
       this.#db.exec('ROLLBACK')
       throw error

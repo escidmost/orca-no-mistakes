@@ -2290,39 +2290,6 @@ export async function runPipeline(
         generationToken,
       );
       const operatorHead = await deliveryGit.head();
-      let custodyNote: string;
-      if (deliveryGit === git && operatorHead === terminalCommitOid) {
-        custodyNote =
-          operatorHead === submissionCommitOid
-            ? `branch ${deliveryRepo.branch} already at submission commit ${submissionCommitOid}`
-            : `branch ${deliveryRepo.branch} carries the terminal commit ${terminalCommitOid}`;
-      } else {
-        const recoverRef = recoveryRefFor(runId);
-        let advanced = false;
-        let transferFailure: string | undefined;
-        if (deliveryGit !== git && operatorHead === submissionCommitOid) {
-          try {
-            advanced = await deliveryGit.applyWorktreeCommits(
-              repo.root,
-              submissionCommitOid,
-              terminalCommitOid,
-              leaseFence,
-            );
-          } catch (error) {
-            if (error instanceof PostMutationCustodyError) throw error;
-            transferFailure =
-              error instanceof Error ? error.message : String(error);
-          }
-        }
-        custodyNote = advanced
-          ? `advanced branch ${deliveryRepo.branch} from submission to terminal commit ${terminalCommitOid}`
-          : transferFailure
-            ? `custody transfer failed on the pipeline side (${transferFailure}); ` +
-              recoveryInstructions(recoverRef)
-            : "operator checkout diverged or carries uncommitted changes; " +
-              recoveryInstructions(recoverRef);
-      }
-
       const attestation = buildAttestation(stageEntries, {
         baseCommitOid,
         candidateCommitOid: terminalCommitOid,
@@ -2332,11 +2299,46 @@ export async function runPipeline(
         runId,
       });
       verifyManifest(attestation, PIPELINE_STEPS);
-      ledger.finalizePassedRun(attestation, terminalCommitOid, {
-        branch: deliveryRepo.branch,
-        generationToken: generationToken!,
-        repoRoot: deliveryRepo.root,
-      });
+      const custodyNote = await ledger.finalizePassedRunWithLeaseMutation(
+        attestation,
+        terminalCommitOid,
+        {
+          branch: deliveryRepo.branch,
+          generationToken: generationToken!,
+          repoRoot: deliveryRepo.root,
+        },
+        async () => {
+          if (deliveryGit === git && operatorHead === terminalCommitOid) {
+            return operatorHead === submissionCommitOid
+              ? `branch ${deliveryRepo.branch} already at submission commit ${submissionCommitOid}`
+              : `branch ${deliveryRepo.branch} carries the terminal commit ${terminalCommitOid}`;
+          }
+          const recoverRef = recoveryRefFor(runId);
+          let advanced = false;
+          let transferFailure: string | undefined;
+          if (deliveryGit !== git && operatorHead === submissionCommitOid) {
+            try {
+              advanced = await deliveryGit.applyWorktreeCommits(
+                repo.root,
+                submissionCommitOid,
+                terminalCommitOid,
+                leaseFence,
+              );
+            } catch (error) {
+              if (error instanceof PostMutationCustodyError) throw error;
+              transferFailure =
+                error instanceof Error ? error.message : String(error);
+            }
+          }
+          return advanced
+            ? `advanced branch ${deliveryRepo.branch} from submission to terminal commit ${terminalCommitOid}`
+            : transferFailure
+              ? `custody transfer failed on the pipeline side (${transferFailure}); ` +
+                recoveryInstructions(recoverRef)
+              : "operator checkout diverged or carries uncommitted changes; " +
+                recoveryInstructions(recoverRef);
+        },
+      );
       return { attestation, custodyNote };
     });
     await orca
