@@ -1526,6 +1526,24 @@ export class DomainLedger {
     }
   }
 
+  ownsLease(
+    runId: string,
+    ownership?: { branch: string; generationToken?: number; repoRoot: string }
+  ): boolean {
+    const run = this.runIdentity(runId)
+    if (!run || run.status !== 'in-progress') return false
+    const repoRoot = ownership?.repoRoot ?? run.repo_root
+    const branch = ownership?.branch ?? run.branch
+    const lease = this.leaseFor(repoRoot, branch)
+    return (
+      run.repo_root === repoRoot &&
+      run.branch === branch &&
+      lease?.run_id === runId &&
+      (ownership?.generationToken === undefined ||
+        lease.generation_token === ownership.generationToken)
+    )
+  }
+
   releaseLease(runId: string): void {
     this.#db.prepare('DELETE FROM branch_leases WHERE run_id = ?').run(runId)
   }
@@ -1571,17 +1589,7 @@ export class DomainLedger {
   ): void {
     this.#db.exec('BEGIN IMMEDIATE')
     try {
-      const run = this.runIdentity(manifest.runId)
-      const lease = run === undefined ? undefined : this.leaseFor(run.repo_root, run.branch)
-      if (
-        !run ||
-        run.status !== 'in-progress' ||
-        lease?.run_id !== manifest.runId ||
-        (ownership !== undefined &&
-          (run.repo_root !== ownership.repoRoot ||
-            run.branch !== ownership.branch ||
-            lease.generation_token !== ownership.generationToken))
-      ) {
+      if (!this.ownsLease(manifest.runId, ownership)) {
         throw new Error(`run ${manifest.runId} no longer owns its branch lease`)
       }
       if (!this.finishRun(manifest.runId, 'passed', terminalCommitOid)) {

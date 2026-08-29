@@ -2268,6 +2268,15 @@ export async function runPipeline(
       await releaseFixerSession(completedSession, orca);
     }
 
+    const leaseFence = {
+      get aborted() {
+        return !ledger.ownsLease(runId, {
+          branch: deliveryRepo.branch,
+          generationToken: generationToken!,
+          repoRoot: deliveryRepo.root,
+        });
+      },
+    };
     const { attestation, custodyNote } = await withGateMutation(async () => {
       const terminalCommitOid = await git.head();
       const blockers = ledger.attestationBlockers(runId, stageEntries);
@@ -2297,6 +2306,7 @@ export async function runPipeline(
               repo.root,
               submissionCommitOid,
               terminalCommitOid,
+              leaseFence,
             );
           } catch (error) {
             if (error instanceof PostMutationCustodyError) throw error;
