@@ -90,6 +90,10 @@ export type StageEvidenceManifestEntry = {
   waiverOrApproval?: GateDecisionRecord
 }
 
+export function isAuthoritativeStageEvidence(workerIdentity: string): boolean {
+  return workerIdentity !== 'coordinator:fixer-guardrail-advisory'
+}
+
 export type PassedAttestationManifest = {
   version: '1.3.0'
   runId: string
@@ -1592,7 +1596,11 @@ export class DomainLedger {
     // listEvidence orders by insertion, so the last row written for a stage is
     // the one left in the map.
     const latest = new Map<string, StageEvidenceRow>()
-    for (const row of evidence.rows) latest.set(row.stage_id, row)
+    for (const row of evidence.rows) {
+      if (isAuthoritativeStageEvidence(row.worker_identity)) {
+        latest.set(row.stage_id, row)
+      }
+    }
     const blockers: string[] = []
     for (const row of latest.values()) {
       const label = `${row.stage_id} round ${row.round_index}`

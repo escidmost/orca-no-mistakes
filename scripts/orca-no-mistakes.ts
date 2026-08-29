@@ -69,6 +69,7 @@ import {
   buildAttestation,
   capLog,
   evidenceSha256,
+  isAuthoritativeStageEvidence,
   normalizeIntent,
   noMistakesHome,
   sha256,
@@ -1327,7 +1328,10 @@ export async function runPipeline(
     const submissionCommitOid = ledger.run(runId)!.submission_commit_oid;
     const latestEvidenceByStage = new Map<StageName, StageEvidenceRow>();
     for (const entry of priorEvidence) {
-      if (PIPELINE_STEPS.includes(entry.stage_id as StageName)) {
+      if (
+        PIPELINE_STEPS.includes(entry.stage_id as StageName) &&
+        isAuthoritativeStageEvidence(entry.worker_identity)
+      ) {
         latestEvidenceByStage.set(entry.stage_id as StageName, entry);
       }
     }
@@ -1511,6 +1515,15 @@ export async function runPipeline(
 
     const stageTasks = new Map<StageName, string>();
     let previousTask: string | undefined;
+
+    if (options.intentTaskId && resumeStageIndex > 0) {
+      const intentEvidence = latestEvidenceByStage.get("intent")!;
+      await orca.completeTask(options.intentTaskId, {
+        findings: JSON.parse(intentEvidence.findings_json ?? "[]") as Finding[],
+        summary: intentEvidence.summary,
+      });
+      previousTask = options.intentTaskId;
+    }
 
     for (const stage of stagesToRun) {
       const task =
