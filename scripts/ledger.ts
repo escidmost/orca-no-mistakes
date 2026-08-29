@@ -764,9 +764,10 @@ export class StageLog {
       // its marker describes the old tail, so close() has to rewrite it even
       // though the physical file is back under the cap.
       this.#compacted =
-        prior !== undefined &&
-        (this.#originalBytes > existingBytes ||
-          (prior.fileBytes !== undefined && existingBytes < prior.fileBytes))
+        prior === undefined
+          ? existingBytes > 0
+          : this.#originalBytes > existingBytes ||
+            (prior.fileBytes !== undefined && existingBytes < prior.fileBytes)
       this.#fileBytes = existingBytes
       this.#fileIdentity = fileIdentity
       this.#file = file
