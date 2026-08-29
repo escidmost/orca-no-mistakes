@@ -61,6 +61,7 @@ test("default resume cleanup keeps orchestration and domain identities", async (
     git(repo, "-c", "init.templateDir=", "init", "-b", "feature");
     git(repo, "config", "user.email", "test@example.com");
     git(repo, "config", "user.name", "Test User");
+    git(repo, "config", "commit.gpgsign", "false");
     git(repo, "commit", "--allow-empty", "-m", "seed");
     const repoRoot = await realpath(repo);
     const head = git(repoRoot, "rev-parse", "HEAD");

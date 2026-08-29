@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import {
   chmod,
   mkdir,
   mkdtemp,
+  readFile,
   realpath,
   rm,
   writeFile,
@@ -40,6 +41,7 @@ test("stale resume claims release their dead gate resources", async () => {
     const rootPath = path.join(temp, "gates");
     const home = path.join(temp, "home");
     const command = path.join(temp, "orca");
+    const callsPath = path.join(temp, "calls.jsonl");
     const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
     const previousOrca = process.env.ORCA_CLI_COMMAND;
     try {
@@ -155,6 +157,8 @@ test("stale resume claims release their dead gate resources", async () => {
           `refs/no-mistakes/recover/${domainRunId}`,
           currentHead,
         );
+        const dead = spawnSync(process.execPath, ["-e", ""]);
+        assert.ok(dead.pid);
         await writeFile(
           marker,
           JSON.stringify({
@@ -163,9 +167,9 @@ test("stale resume claims release their dead gate resources", async () => {
             gate,
             generationToken: staleClaim.generationToken,
             originWorktree: repo,
+            pid: dead.pid,
             resumeClaimId: staleClaim.claimId,
             runId: orchestrationRunId,
-            terminalHandle: "term-dead",
           }),
         );
       } finally {
@@ -177,8 +181,9 @@ test("stale resume claims release their dead gate resources", async () => {
         command,
         `#!/usr/bin/env node
 import { execFileSync } from "node:child_process"
-import { existsSync } from "node:fs"
+import { appendFileSync, existsSync } from "node:fs"
 const args = process.argv.slice(2)
+appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + "\\n")
 const out = (result) => console.log(JSON.stringify({ result }))
 if (args[0] === "terminal" && args[1] === "show") {
   console.log(JSON.stringify({ ok: false, error: { code: "terminal_handle_stale" } }))
@@ -192,6 +197,10 @@ else if (args[0] === "worktree" && args[1] === "list") {
 } else if (args[0] === "worktree" && args[1] === "rm") {
   execFileSync("git", ["worktree", "remove", ${JSON.stringify(canonicalGate)}], { cwd: ${JSON.stringify(repo)} })
   out({ removed: true })
+} else if (args[0] === "orchestration" && args[1] === "task-list") {
+  out({ tasks: [{ id: "stale-task", status: "pending" }] })
+} else if (args[0] === "orchestration" && args[1] === "task-update") {
+  out({ task: { id: "stale-task", status: "failed" } })
 } else {
   console.error(JSON.stringify({ ok: false, error: { code: "unexpected", args } }))
   process.exit(1)
@@ -219,6 +228,19 @@ else if (args[0] === "worktree" && args[1] === "list") {
       assert.equal(existsSync(marker), false);
       assert.equal(existsSync(canonicalGate), false);
       assert.equal(git(repo, "branch", "--list", branch), "");
+      const calls = (await readFile(callsPath, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as string[]);
+      assert.ok(
+        calls.some(
+          (args) =>
+            args[0] === "orchestration" &&
+            args.includes("--run") &&
+            args.includes(orchestrationRunId),
+        ),
+      );
+      assert.equal(calls.some((args) => args.includes(domainRunId)), false);
     } finally {
       restoreEnv("ORCA_NO_MISTAKES_HOME", previousHome);
       restoreEnv("ORCA_CLI_COMMAND", previousOrca);

@@ -297,7 +297,8 @@ setInterval(() => {}, 1000)
       for (let attempt = 0; attempt < 500 && !existsSync(pidPath); attempt += 1) {
         await delay(10);
       }
-      const pid = Number(await readFile(pidPath, "utf8"));
+      const pid = Number((await readFile(pidPath, "utf8")).trim());
+      assert.ok(Number.isInteger(pid) && pid > 0, `unexpected worker pid: ${pid}`);
       await orca.finishWorker(worker, "release");
       stopped = true;
       await assert.rejects(running);

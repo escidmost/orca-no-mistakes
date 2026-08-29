@@ -39,6 +39,7 @@ test("legacy gate audits recover only unambiguous evidence identity", async () =
       insertEvidence.run("ambiguous-1", runId, 1, "d".repeat(40), "e".repeat(40), "f".repeat(64), now);
       insertEvidence.run("ambiguous-2", runId, 1, "d".repeat(40), "e".repeat(40), "0".repeat(64), now);
       legacy.exec("ALTER TABLE gate_audit DROP COLUMN evidence_sha256");
+      legacy.exec("PRAGMA user_version = 0");
       const insertGate = legacy.prepare(`INSERT INTO gate_audit (
         gate_id, run_id, stage_id, round_index, gate_kind, question,
         options_json, resolution, decision, opened_at, resolved_at
@@ -59,6 +60,21 @@ test("legacy gate audits recover only unambiguous evidence identity", async () =
         { evidence_sha256: uniqueEvidence, gate_id: "unique-gate" },
         { evidence_sha256: null, gate_id: "ambiguous-gate" },
       ],
+    );
+    ledger.close();
+    ledger = undefined;
+
+    const changed = new DatabaseSync(dbPath);
+    try {
+      changed.prepare("DELETE FROM stage_evidence WHERE evidence_id = ?").run("ambiguous-2");
+    } finally {
+      changed.close();
+    }
+    ledger = new DomainLedger(dbPath);
+    assert.equal(
+      ledger.listGateAudit(runId).find(({ gate_id }) => gate_id === "ambiguous-gate")
+        ?.evidence_sha256,
+      null,
     );
   } finally {
     ledger?.close();

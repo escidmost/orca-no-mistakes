@@ -1866,9 +1866,7 @@ export async function runPipeline(
       const resumedEvidence = latestEvidenceByStage.get(stage);
       let resumedFixDecision =
         resumedEvidence &&
-        resumeCheckpoint &&
-        resumedEvidence.candidate_commit_oid ===
-          resumeCheckpoint.output_commit_oid
+        resumedEvidence.candidate_commit_oid === stageInputCommitOid
           ? priorGateAudit.findLast(
               (audit) =>
                 gateAuditMatchesEvidence(
@@ -9752,21 +9750,22 @@ async function reapConfiguredGate(
       }));
   let generationToken = marker.generationToken;
   const settleConfiguredRun = async (): Promise<boolean> => {
-    if (staleResumeClaim) return true;
-    if (
-      run?.status === "in-progress" &&
-      !ledger.settleRun(domainRunId, "cancelled", {
-        branch: run.branch,
-        generationToken,
-        repoRoot,
-      })
-    ) {
-      console.error(
-        `no-mistakes: retained gate workspace ${gate.path}; its run ownership changed before cancellation`,
-      );
-      return false;
+    if (!staleResumeClaim) {
+      if (
+        run?.status === "in-progress" &&
+        !ledger.settleRun(domainRunId, "cancelled", {
+          branch: run.branch,
+          generationToken,
+          repoRoot,
+        })
+      ) {
+        console.error(
+          `no-mistakes: retained gate workspace ${gate.path}; its run ownership changed before cancellation`,
+        );
+        return false;
+      }
+      if (run?.status === "passed") return true;
     }
-    if (run?.status === "passed") return true;
     try {
       await new CliOrca({
         command: orcaCommand,
@@ -10952,9 +10951,10 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
             }
           }
           if (
-            !staleResumeClaim &&
-            (run?.status === "cancelled" || run?.status === "failed") &&
-            orchestrationRunId !== undefined
+            orchestrationRunId !== undefined &&
+            (staleResumeClaim ||
+              run?.status === "cancelled" ||
+              run?.status === "failed")
           ) {
             try {
               await new CliOrca({
@@ -11195,21 +11195,6 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
               );
               continue;
             }
-            if (run?.status !== "passed" && orchestrationRunId !== undefined) {
-              try {
-                await new CliOrca({
-                  command: orcaCommand,
-                  cwd: repoRoot,
-                  runId: orchestrationRunId,
-                }).failRun("Coordinator terminated before cleanup completed");
-              } catch (error) {
-                retained += 1;
-                console.error(
-                  `no-mistakes: retained gate workspace ${gate.path}; its Orca run could not be settled: ${String(error)}`,
-                );
-                continue;
-              }
-            }
           } else {
             // No run to anchor to: only a branch already contained in HEAD
             // carries nothing worth preserving.
@@ -11226,6 +11211,24 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
               );
               continue;
             }
+          }
+        }
+        if (
+          orchestrationRunId !== undefined &&
+          (staleResumeClaim || run?.status !== "passed")
+        ) {
+          try {
+            await new CliOrca({
+              command: orcaCommand,
+              cwd: repoRoot,
+              runId: orchestrationRunId,
+            }).failRun("Coordinator terminated before cleanup completed");
+          } catch (error) {
+            retained += 1;
+            console.error(
+              `no-mistakes: retained gate workspace ${gate.path}; its Orca run could not be settled: ${String(error)}`,
+            );
+            continue;
           }
         }
         // Orca cannot conditionally remove atomically, so stranded cleanup

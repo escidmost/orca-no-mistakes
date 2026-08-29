@@ -1066,7 +1066,7 @@ export class DomainLedger {
       mkdirSync(path.dirname(dbPath), { recursive: true })
     }
     this.#path = dbPath
-    this.#db = new DatabaseSync(dbPath)
+    this.#db = new DatabaseSync(dbPath, { timeout: 5_000 })
     this.#db.exec('PRAGMA journal_mode = WAL')
     this.#db.exec('PRAGMA foreign_keys = ON')
     // ponytail: pre-release rebuild — legacy ledgers keyed attestations by candidate OID,
@@ -1141,22 +1141,35 @@ export class DomainLedger {
         }
       }
     }
-    this.#db.exec(`UPDATE gate_audit
-      SET evidence_sha256 = (
-        SELECT evidence_sha256 FROM stage_evidence
-        WHERE run_id = gate_audit.run_id
-          AND stage_id = gate_audit.stage_id
-          AND round_index = gate_audit.round_index
-        LIMIT 1
-      )
-      WHERE evidence_sha256 IS NULL
-        AND gate_kind != 'guardrail'
-        AND 1 = (
-          SELECT COUNT(DISTINCT evidence_sha256) FROM stage_evidence
-          WHERE run_id = gate_audit.run_id
-            AND stage_id = gate_audit.stage_id
-            AND round_index = gate_audit.round_index
-        )`)
+    const schemaVersion = this.#db.prepare('PRAGMA user_version').get() as {
+      user_version: number
+    }
+    if (schemaVersion.user_version < 1) {
+      this.#db.exec('BEGIN IMMEDIATE')
+      try {
+        this.#db.exec(`UPDATE gate_audit
+          SET evidence_sha256 = (
+            SELECT evidence_sha256 FROM stage_evidence
+            WHERE run_id = gate_audit.run_id
+              AND stage_id = gate_audit.stage_id
+              AND round_index = gate_audit.round_index
+            LIMIT 1
+          )
+          WHERE evidence_sha256 IS NULL
+            AND gate_kind != 'guardrail'
+            AND 1 = (
+              SELECT COUNT(DISTINCT evidence_sha256) FROM stage_evidence
+              WHERE run_id = gate_audit.run_id
+                AND stage_id = gate_audit.stage_id
+                AND round_index = gate_audit.round_index
+            )`)
+        this.#db.exec('PRAGMA user_version = 1')
+        this.#db.exec('COMMIT')
+      } catch (error) {
+        this.#db.exec('ROLLBACK')
+        throw error
+      }
+    }
   }
 
   tableDefinition(tableName: string): string | undefined {

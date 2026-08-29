@@ -140,6 +140,7 @@ class ResumeOrca implements OrcaOperations {
         : undefined;
     if (
       launch.stage === this.interruptStage &&
+      launch.role === "reviewer" &&
       queuedReviewReport === undefined
     ) {
       throw new Error(`${launch.stage} worker interrupted`);
@@ -209,6 +210,14 @@ test("resume reruns review after advisory fixer evidence", async () => {
       /review worker interrupted/,
     );
     assert.equal(ledger.runStatus(runId), "failed");
+    assert.ok(
+      ledger
+        .listEvidence(runId)
+        .some(
+          ({ worker_identity }) =>
+            worker_identity === "coordinator:fixer-guardrail-advisory",
+        ),
+    );
 
     const resumed = new ResumeOrca("new-orchestration-run");
     resumed.reviewReports = [pass("review passed after fix")];

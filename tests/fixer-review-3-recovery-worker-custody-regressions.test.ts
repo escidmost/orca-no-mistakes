@@ -218,6 +218,7 @@ test("configured resume cleanup separates orchestration and domain run IDs", asy
       .split("\n")
       .map((line) => JSON.parse(line) as string[]);
     assert.ok(calls.some((args) => args.includes(orchestrationRunId)));
+    assert.equal(calls.some((args) => args.includes(domainRunId)), false);
   } finally {
     restoreEnv("ORCA_CLI_COMMAND", previousCommand);
     restoreEnv("ORCA_NO_MISTAKES_HOME", previousHome);

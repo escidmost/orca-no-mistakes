@@ -18,9 +18,10 @@ test("custody transfer refuses a reclaimed lease generation before CAS", async (
   const worker = path.join(temp, "worker");
   const ledger = new DomainLedger(":memory:");
   try {
-    git(temp, "init", repo);
+    git(temp, "-c", "init.templateDir=", "init", repo);
     git(repo, "config", "user.email", "test@example.com");
     git(repo, "config", "user.name", "Test User");
+    git(repo, "config", "commit.gpgsign", "false");
     git(repo, "checkout", "-b", "feature");
     await writeFile(path.join(repo, "change.txt"), "submission\n");
     git(repo, "add", "change.txt");

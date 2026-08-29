@@ -24,10 +24,11 @@ test("detached resume restores its stored non-default base", async () => {
   const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
 
   try {
-    git(temp, "init", "--bare", origin);
-    git(temp, "clone", origin, repo);
+    git(temp, "-c", "init.templateDir=", "init", "--bare", origin);
+    git(temp, "-c", "init.templateDir=", "clone", origin, repo);
     git(repo, "config", "user.email", "test@example.com");
     git(repo, "config", "user.name", "Test User");
+    git(repo, "config", "commit.gpgsign", "false");
     git(repo, "checkout", "-b", "main");
     await writeFile(path.join(repo, "README.md"), "main\n");
     git(repo, "add", "README.md");
