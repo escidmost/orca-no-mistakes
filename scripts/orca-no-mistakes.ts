@@ -69,6 +69,7 @@ import {
   buildAttestation,
   capLog,
   evidenceSha256,
+  gateAuditMatchesEvidence,
   isAuthoritativeStageEvidence,
   normalizeIntent,
   noMistakesHome,
@@ -1265,6 +1266,8 @@ export async function runPipeline(
       if (options.resumeRunId) {
         resumeCheckpoint = ledger.resumeRun({
           baseBranch: deliveryRepo.base,
+          baseOid: repo.baseOid,
+          baseRefSha: effectiveProvenance.baseRefSha,
           branch: deliveryRepo.branch,
           effectivePolicyHash: effectiveProvenance.effectivePolicyHash,
           force: options.forceLease === true,
@@ -1346,8 +1349,12 @@ export async function runPipeline(
         const findings = JSON.parse(evidence.findings_json ?? "[]") as Finding[];
         const approved = priorGateAudit.findLast(
           (audit) =>
-            audit.stage_id === stage &&
-            audit.round_index === evidence.round_index &&
+            gateAuditMatchesEvidence(
+              audit,
+              stage,
+              evidence.round_index,
+              evidence.evidence_sha256,
+            ) &&
             audit.resolved_at !== null &&
             (audit.decision === "approve" || audit.decision === "skip"),
         );
@@ -1390,8 +1397,12 @@ export async function runPipeline(
         continue;
       const entry = stageEntries.findLast(
         (candidate) =>
-          candidate.stage === audit.stage_id &&
-          candidate.round === audit.round_index,
+          gateAuditMatchesEvidence(
+            audit,
+            candidate.stage,
+            candidate.round,
+            candidate.evidenceSha256,
+          ),
       );
       if (entry) {
         entry.waiverOrApproval = {
@@ -1562,8 +1573,12 @@ export async function runPipeline(
           resumeCheckpoint.output_commit_oid
           ? priorGateAudit.findLast(
               (audit) =>
-                audit.stage_id === stage &&
-                audit.round_index === resumedEvidence.round_index &&
+                gateAuditMatchesEvidence(
+                  audit,
+                  stage,
+                  resumedEvidence.round_index,
+                  resumedEvidence.evidence_sha256,
+                ) &&
                 audit.resolved_at !== null &&
                 audit.decision === "fix",
             )
@@ -1683,11 +1698,14 @@ export async function runPipeline(
             guardrailMode,
             exhausted ? stageAutoFix.max_rounds : undefined,
           );
+          const gateEvidenceSha256 =
+            latestEntryByStage.get(stage)!.evidenceSha256;
           // Durable before the block: an interrupted run still shows why the
           // gate opened and that nobody has resolved it yet.
           let gateAudited = false;
           const openGateAudit = (gateId: string) => {
             ledger.openGateAudit({
+              evidenceSha256: gateEvidenceSha256,
               gateId,
               gateKind: exhausted ? "exhaustion" : "finding",
               optionsJson: JSON.stringify(gateOptions),
@@ -1709,6 +1727,7 @@ export async function runPipeline(
           const decision = parseGateResolution(resolution, actionable);
           ledger.recordGateAudit({
             decision: decision.action,
+            evidenceSha256: gateEvidenceSha256,
             gateId,
             guidance: decision.guidance || undefined,
             optionsJson: JSON.stringify(gateOptions),
@@ -8169,7 +8188,7 @@ async function createGateWorktree(
           "--name",
           gateName,
           "--base-branch",
-          repo.branch,
+          startOid === repo.head ? repo.branch : startOid,
           "--parent-worktree",
           `path:${repo.root}`,
           "--setup",
@@ -8187,9 +8206,6 @@ async function createGateWorktree(
   const gateBranch = gate.branch.replace(/^refs\/heads\//, "");
   if (path.posix.basename(gateBranch) !== gateName) {
     throw new Error("worktree create returned an unexpected gate branch");
-  }
-  if (startOid !== repo.head) {
-    await command("git", ["-C", gate.path, "reset", "--hard", startOid], repo.root);
   }
   return {
     branch: gateBranch,

@@ -15,6 +15,7 @@ export type GateKind = 'exhaustion' | 'finding' | 'guardrail'
 
 export type GateAuditRow = {
   decision: string
+  evidence_sha256: string | null
   gate_id: string
   gate_kind: GateKind
   guidance: string | null
@@ -24,6 +25,19 @@ export type GateAuditRow = {
   round_index: number
   selected_finding_ids: string | null
   stage_id: string
+}
+
+export function gateAuditMatchesEvidence(
+  audit: GateAuditRow,
+  stage: string,
+  round: number,
+  evidenceSha256: string
+): boolean {
+  return (
+    audit.stage_id === stage &&
+    audit.round_index === round &&
+    audit.evidence_sha256 === evidenceSha256
+  )
 }
 
 export type FindingDecisionRow = {
@@ -1002,6 +1016,7 @@ CREATE TABLE IF NOT EXISTS gate_audit (
   run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
   stage_id TEXT NOT NULL,
   round_index INTEGER NOT NULL,
+  evidence_sha256 TEXT,
   gate_kind TEXT NOT NULL DEFAULT 'finding',
   question TEXT NOT NULL,
   options_json TEXT NOT NULL,
@@ -1106,7 +1121,8 @@ export class DomainLedger {
       ['stage_evidence', 'base_ref_sha TEXT'],
       ['stage_evidence', 'artifact_sha256 TEXT'],
       ['stage_evidence', 'findings_json TEXT'],
-      ['gate_audit', 'selected_finding_ids TEXT']
+      ['gate_audit', 'selected_finding_ids TEXT'],
+      ['gate_audit', 'evidence_sha256 TEXT']
     ]) {
       try {
         this.#db.exec(`ALTER TABLE ${table} ADD COLUMN ${column}`)
@@ -1163,6 +1179,8 @@ export class DomainLedger {
 
   resumeRun(input: {
     baseBranch: string
+    baseOid: string
+    baseRefSha?: string
     branch: string
     effectivePolicyHash: string
     force?: boolean
@@ -1198,6 +1216,21 @@ export class DomainLedger {
         .get(input.runId, input.effectivePolicyHash) as { count: number | bigint }
       if (Number(incompatibleEvidence.count) > 0) {
         throw new Error(`run ${input.runId} effective validation policy changed since it failed`)
+      }
+      const incompatibleBaseEvidence = (
+        input.baseRefSha === undefined
+          ? this.#db.prepare(
+              `SELECT COUNT(*) AS count FROM stage_evidence
+               WHERE run_id = ? AND (base_commit_oid <> ? OR base_ref_sha IS NOT NULL)`
+            ).get(input.runId, input.baseOid)
+          : this.#db.prepare(
+              `SELECT COUNT(*) AS count FROM stage_evidence
+               WHERE run_id = ? AND
+                 (base_commit_oid <> ? OR base_ref_sha IS NULL OR base_ref_sha <> ?)`
+            ).get(input.runId, input.baseOid, input.baseRefSha)
+      ) as { count: number | bigint }
+      if (Number(incompatibleBaseEvidence.count) > 0) {
+        throw new Error(`run ${input.runId} base ref changed since it failed`)
       }
       const checkpoint = this.#db
         .prepare(
@@ -1585,8 +1618,13 @@ export class DomainLedger {
           if (!waiver) return false
           const audit = auditsByGateId.get(waiver.gateId)
           return (
-            audit?.stage_id === entry.stage &&
-            audit.round_index === entry.round &&
+            audit !== undefined &&
+            gateAuditMatchesEvidence(
+              audit,
+              entry.stage,
+              entry.round,
+              entry.evidenceSha256
+            ) &&
             audit.decision === waiver.decision &&
             audit.resolved_at !== null
           )
@@ -1634,6 +1672,7 @@ export class DomainLedger {
    * event — including its exhaustion origin — in the ledger as `pending`.
    */
   openGateAudit(input: {
+    evidenceSha256: string
     gateId: string
     gateKind: GateKind
     optionsJson: string
@@ -1645,9 +1684,9 @@ export class DomainLedger {
     this.#db
       .prepare(
         `INSERT INTO gate_audit (
-           gate_id, run_id, stage_id, round_index, gate_kind, question, options_json,
+           gate_id, run_id, stage_id, round_index, evidence_sha256, gate_kind, question, options_json,
            resolution, decision, guidance, opened_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, '', 'pending', NULL, ?)
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', 'pending', NULL, ?)
          ON CONFLICT(gate_id) DO NOTHING`
       )
       .run(
@@ -1655,6 +1694,7 @@ export class DomainLedger {
         input.runId,
         input.stageId,
         input.roundIndex,
+        input.evidenceSha256,
         input.gateKind,
         input.question,
         input.optionsJson,
@@ -1664,6 +1704,7 @@ export class DomainLedger {
 
   recordGateAudit(input: {
     decision: string
+    evidenceSha256?: string
     gateId: string
     gateKind?: GateKind
     guidance?: string
@@ -1676,17 +1717,31 @@ export class DomainLedger {
     stageId: string
   }): void {
     const now = new Date().toISOString()
+    const evidenceSha256 =
+      input.evidenceSha256 ??
+      (input.gateKind === 'guardrail'
+        ? null
+        : (this.#db
+            .prepare(
+              `SELECT evidence_sha256 FROM stage_evidence
+               WHERE run_id = ? AND stage_id = ? AND round_index = ?
+               ORDER BY rowid DESC LIMIT 1`
+            )
+            .get(input.runId, input.stageId, input.roundIndex) as
+            | { evidence_sha256: string }
+            | undefined)?.evidence_sha256 ?? null)
     this.#db
       .prepare(
          `INSERT INTO gate_audit (
-            gate_id, run_id, stage_id, round_index, gate_kind, question, options_json,
+            gate_id, run_id, stage_id, round_index, evidence_sha256, gate_kind, question, options_json,
             resolution, decision, guidance, selected_finding_ids, opened_at, resolved_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(gate_id) DO UPDATE SET
             resolution = excluded.resolution,
             decision = excluded.decision,
             guidance = excluded.guidance,
             selected_finding_ids = excluded.selected_finding_ids,
+            evidence_sha256 = COALESCE(gate_audit.evidence_sha256, excluded.evidence_sha256),
             resolved_at = excluded.resolved_at`
       )
       .run(
@@ -1694,6 +1749,7 @@ export class DomainLedger {
         input.runId,
         input.stageId,
         input.roundIndex,
+        evidenceSha256,
         input.gateKind ?? 'finding',
         input.question,
         input.optionsJson,
@@ -1870,7 +1926,7 @@ export class DomainLedger {
   listGateAudit(runId: string): GateAuditRow[] {
     return this.#db
       .prepare(
-        `SELECT decision, gate_id, stage_id, round_index, gate_kind, guidance, question, resolution,
+        `SELECT decision, evidence_sha256, gate_id, stage_id, round_index, gate_kind, guidance, question, resolution,
                 resolved_at, selected_finding_ids
          FROM gate_audit WHERE run_id = ? ORDER BY opened_at, rowid`
       )
@@ -1887,9 +1943,8 @@ export class DomainLedger {
       .prepare(
         `SELECT g.decision,
                 (SELECT e.findings_json FROM stage_evidence e
-                  WHERE e.run_id = g.run_id AND e.stage_id = g.stage_id
-                    AND e.round_index = g.round_index AND e.findings_json IS NOT NULL
-                  ORDER BY e.created_at DESC, e.rowid DESC LIMIT 1) AS findings_json,
+                  WHERE e.run_id = g.run_id AND e.evidence_sha256 = g.evidence_sha256
+                    AND e.findings_json IS NOT NULL LIMIT 1) AS findings_json,
                 g.round_index, g.run_id, g.selected_finding_ids, g.stage_id
            FROM gate_audit g
            JOIN runs r ON r.run_id = g.run_id
@@ -1899,8 +1954,8 @@ export class DomainLedger {
             AND g.resolved_at IS NOT NULL AND g.selected_finding_ids IS NOT NULL
             AND EXISTS (
               SELECT 1 FROM stage_evidence e
-               WHERE e.run_id = g.run_id AND e.stage_id = g.stage_id
-                 AND e.round_index = g.round_index AND e.findings_json IS NOT NULL
+               WHERE e.run_id = g.run_id AND e.evidence_sha256 = g.evidence_sha256
+                 AND e.findings_json IS NOT NULL
             )
            ORDER BY g.resolved_at DESC, g.rowid DESC
           LIMIT ?`
