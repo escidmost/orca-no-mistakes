@@ -4245,6 +4245,8 @@ export class CliOrca implements OrcaOperations {
       const reported = collectResidualResources(receipt.residualResources);
       residual.terminalHandles.push(...reported.terminalHandles);
       residual.worktreeIds.push(...reported.worktreeIds);
+      for (const handle of new Set(reported.terminalHandles))
+        await this.#bindStageLog(handle, launch);
       for (const id of new Set(
         [worktreeId, ...residual.worktreeIds].filter(
           (value): value is string => Boolean(value),
