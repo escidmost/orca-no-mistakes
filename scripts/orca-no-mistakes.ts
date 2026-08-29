@@ -6263,10 +6263,13 @@ function isTestPath(filePath: string): boolean {
       part.toLowerCase() === "it",
   );
   const gherkinSupportSource = parts.some(
-    (part, index) =>
-      part.toLowerCase() === "features" &&
-      (parts[index + 1]?.toLowerCase() === "support" ||
-        parts[index + 1]?.toLowerCase() === "environment.py"),
+    (part, index) => {
+      if (part.toLowerCase() !== "features") return false;
+      const next = parts[index + 1]?.toLowerCase();
+      return ["support", "step_definitions", "steps", "environment.py"].includes(
+        next ?? "",
+      );
+    },
   );
   return (
     singularSpecSource ||
@@ -6341,7 +6344,7 @@ function weakensInlineTestValidation(
   const qualifiedTestDeclaration = /(?<![.\w$])(?:Deno|vitest)\.test(?:\.[A-Za-z_$][\w$]*)*\s*\(/u;
   // Context chains are limited to known test modifiers so same-named object
   // calls stay fixable; the character class avoids matching this regex itself.
-  const testDeclaration = /(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|rstest|(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test)\s*\]|@(?:[A-Za-z_][\w]*\.)*(?:ParameterizedTest|Test|TestMethod|DataTestMethod)\b|\[(?:(?:[A-Za-z_][\w]*\.)*(?:Fact|Test|Theory|TestMethod|DataTestMethod)|(?:[A-Za-z_][\w]*\.)*TestCase(?:\([^\]\n]*\))?)\]|(?<![.\w$])(?:(?:describe|it|test)(?:\.[A-Za-z_$][\w$]*)*|conte[x]t(?:\.(?:skip|only|todo|each|failing|fails|concurrent|sequential|shuffle|extend|describe|fixme|slow|if|runIf|skipIf))*)\s*\(|\b(?:SCENARIO|TEMPLATE_TEST_CASE|TEST_CASE)\s*\(|\btest\s+"(?:[^"\\]|\\.)*"\s*\{|(?:^|\n)\s*(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(|\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b)/iu;
+  const testDeclaration = /(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|rstest|(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test)\s*\]|@(?:[A-Za-z_][\w]*\.)*(?:ParameterizedTest|Test|TestMethod|DataTestMethod)\b|\[(?:(?:[A-Za-z_][\w]*\.)*(?:Fact|Test|Theory|TestMethod|DataTestMethod)|(?:[A-Za-z_][\w]*\.)*TestCase(?:\([^\]\n]*\))?)\]|(?<![.\w$])(?:(?:describe|it|test)(?:\.[A-Za-z_$][\w$]*)*|conte[x]t(?:\.(?:skip|only|todo|each|failing|fails|concurrent|sequential|shuffle|extend|describe|fixme|slow|if|runIf|skipIf))*)\s*\(|\b(?:SCENARIO|TEMPLATE_TEST_CASE|TEST_CASE|TEST_F|TEST_P|TYPED_TEST|TYPED_TEST_P)\s*\(|\btest\s+"(?:[^"\\]|\\.)*"\s*\{|(?:^|\n)\s*(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(|\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b)/iu;
   const inlineAssertion = /(?:(?:^|\n)\s*assert\s+\S|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\b(?:CHECK|REQUIRE)(?:_[A-Z0-9_]+)?\s*\(|\b(?:[A-Za-z_][\w]*\.)*Assert\.[A-Za-z_][\w]*\s*\(|\.should\.(?:deep\.)?(?:equal|eql|match|throw)\s*\(|\b(?:deepStrictEqual|strictEqual|notDeepStrictEqual|notStrictEqual|doesNotReject|doesNotThrow|ifError|rejects|throws)\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|(?<![.\w$])assert[A-Z][A-Za-z0-9_$]*\s*\(|\bstd\.testing\.expect[A-Za-z0-9_]*\s*\(|\bexpect(?:\.(?:poll|soft))?\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
   const doctestPrompt = /^\s*>>>/u;
   const nodeAssertImport = /(?:from\s+["'](?:node:)?assert(?:\/strict)?["']|require\s*\(\s*["'](?:node:)?assert(?:\/strict)?["']\s*\))/u;
@@ -6567,6 +6570,8 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
       "project.clj",
       "pyproject.toml",
       "pytest.ini",
+      "pytest.toml",
+      ".pytest.toml",
       "rakefile",
       "setup.cfg",
       "taskfile.yaml",
@@ -6589,7 +6594,7 @@ function isProtectedValidationPolicyPath(filePath: string): boolean {
     (parts[0] !== "docs" && parts.slice(0, -1).includes("prompts")) ||
     /^(?:(?:vitest|jest|playwright|cypress)\.config\..+|vitest\.workspace\..+|nyc\.config\..+|\.mocharc(?:\..+)?|karma\.conf\..+|phpunit\.xml(?:\.dist)?|eslint\.config\..+|\.eslintrc(?:\..+)?|\.eslintignore|\.oxlintrc\.json|prettier\.config\..+|\.prettierrc(?:\..+)?|\.prettierignore|\.lintstagedrc(?:\..+)?|lint-staged\.config\..+|biome\.jsonc?|deno\.jsonc?|\.coveragerc|\.nycrc(?:\..+)?|\.rspec|\.yamllint(?:\.ya?ml)?|\.editorconfig|\.flake8|\.?ruff\.toml|\.?mypy\.ini|\.?pylintrc|pyrightconfig\.json|\.rubocop\.ya?ml|\.?swiftlint\.ya?ml|stylelint\.config\..+|\.stylelintrc(?:\..+)?|\.stylelintignore|\.?markdownlint(?:-cli2)?(?:\..+)?|\.markdownlintignore|\.shellcheckrc|actionlint\.ya?ml|\.golangci\.(?:ya?ml|toml|json)|\.?rustfmt\.toml|\.?clippy\.toml|\.clang-format|\.clang-format-ignore|\.clang-tidy|analysis_options\.yaml|checkstyle\.xml|detekt\.ya?ml|phpcs\.xml(?:\.dist)?|phpstan(?:\.[^.]+)?\.neon(?:\.dist)?|sonar-project\.properties|tsconfig(?:\.[^.]+)*\.json|tslint(?:\.[^.]+)*\.json)$/.test(
       fileName,
-    )
+    ) || /^vite\.config\..+$/.test(fileName)
   );
 }
 
@@ -6879,11 +6884,51 @@ function inspectJenkinsDirectoryBlocks(
   return { matches: false, shellSource: masked + source.slice(cursor) };
 }
 
+type ValidationPolicyRun = { command: string; directory?: string };
+
+type ValidationPolicyIndex = {
+  source: string;
+  yamlRuns?: ValidationPolicyRun[];
+};
+
+function indexValidationPolicySource(source: string): ValidationPolicyIndex {
+  try {
+    const yamlRuns: ValidationPolicyRun[] = [];
+    const collect = (value: unknown, inheritedDirectory?: string): void => {
+      if (Array.isArray(value)) {
+        for (const item of value) collect(item, inheritedDirectory);
+        return;
+      }
+      if (!value || typeof value !== "object") return;
+      const record = value as Record<string, unknown>;
+      const defaults = record.defaults as Record<string, unknown> | undefined;
+      const runDefaults = defaults?.run as Record<string, unknown> | undefined;
+      const directory =
+        (typeof record["working-directory"] === "string"
+          ? record["working-directory"]
+          : undefined) ??
+        (typeof runDefaults?.["working-directory"] === "string"
+          ? runDefaults["working-directory"]
+          : undefined) ??
+        inheritedDirectory;
+      if (typeof record.run === "string") {
+        yamlRuns.push({ command: record.run, directory });
+      }
+      for (const item of Object.values(record)) collect(item, directory);
+    };
+    collect(YAML.parse(source));
+    return { source, yamlRuns };
+  } catch {
+    return { source };
+  }
+}
+
 function containsValidationPathReference(
-  source: string,
+  policy: ValidationPolicyIndex,
   policyPath: string,
   targetPath: string,
 ): boolean {
+  const source = policy.source;
   const references = new Set([
     targetPath,
     path.posix.relative(path.posix.dirname(policyPath), targetPath),
@@ -7021,35 +7066,15 @@ function containsValidationPathReference(
   const commandMatches = (command: string): boolean =>
     containsPathReference(command, basename);
 
-  try {
-    const visit = (value: unknown, inheritedDirectory?: string): boolean => {
-      if (Array.isArray(value)) return value.some((item) => visit(item, inheritedDirectory));
-      if (!value || typeof value !== "object") return false;
-      const record = value as Record<string, unknown>;
-      const defaults = record.defaults as Record<string, unknown> | undefined;
-      const runDefaults = defaults?.run as Record<string, unknown> | undefined;
-      const directory =
-        (typeof record["working-directory"] === "string"
-          ? record["working-directory"]
-          : undefined) ??
-        (typeof runDefaults?.["working-directory"] === "string"
-          ? runDefaults["working-directory"]
-          : undefined) ??
-        inheritedDirectory;
-      if (
-        typeof record.run === "string" &&
-        ((directory !== undefined &&
-          ((directoryMatches(directory) && commandMatches(record.run)) ||
-            referencesPythonModule?.(record.run, directory))) ||
-          shellCommandReferencesTarget(record.run, workingDirectories, basename))
-      ) {
-        return true;
-      }
-      return Object.values(record).some((item) => visit(item, directory));
-    };
-    if (visit(YAML.parse(source))) return true;
-  } catch {
-    // Non-YAML policy sources still receive exact-path and shell-command checks.
+  for (const { command, directory } of policy.yamlRuns ?? []) {
+    if (
+      (directory !== undefined &&
+        ((directoryMatches(directory) && commandMatches(command)) ||
+          referencesPythonModule?.(command, directory))) ||
+      shellCommandReferencesTarget(command, workingDirectories, basename)
+    ) {
+      return true;
+    }
   }
   return shellCommandReferencesTarget(source, workingDirectories, basename);
 }
@@ -7238,49 +7263,57 @@ export class GitShell implements GitOperations {
     ]);
     const trackedPaths = tracked.stdout.split("\0").filter(Boolean);
     const trackedPathSet = new Set(trackedPaths);
-    const policySources = new Map<string, string>();
+    const policySources = new Map<string, ValidationPolicyIndex>();
+    const pendingPolicyPaths: string[] = [];
+    const addPolicySource = (policyPath: string, source: string): void => {
+      if (policySources.has(policyPath)) return;
+      policySources.set(policyPath, indexValidationPolicySource(source));
+      pendingPolicyPaths.push(policyPath);
+    };
     for (const policyPath of trackedPaths.filter(isProtectedValidationPolicyPath)) {
       const source = await this.showFile(ref, policyPath);
       if (source === undefined) {
         throw new Error(`could not read validation policy ${ref}:${policyPath}`);
       }
-      policySources.set(policyPath, source);
+      addPolicySource(policyPath, source);
     }
     const rootActionPaths = ["action.yml", "action.yaml"].filter((actionPath) =>
       trackedPathSet.has(actionPath),
     );
     const rootActionReferenced =
       rootActionPaths.length > 0 &&
-      [...policySources.values()].some(referencesRootLocalAction);
+      [...policySources.values()].some(({ source }) => referencesRootLocalAction(source));
     if (rootActionReferenced) {
       for (const actionPath of rootActionPaths) {
         const source = await this.showFile(ref, actionPath);
         if (source === undefined) {
           throw new Error(`could not read local action ${ref}:${actionPath}`);
         }
-        policySources.set(actionPath, source);
+        addPolicySource(actionPath, source);
       }
     }
     const typeScriptAliases = [...policySources]
       .filter(([policyPath]) => /(?:^|\/)tsconfig(?:\.[^/]+)*\.json$/i.test(policyPath))
-      .flatMap(([policyPath, source]) => typeScriptPathAliases(policyPath, source));
+      .flatMap(([policyPath, { source }]) => typeScriptPathAliases(policyPath, source));
     const policySourceReferences = (
       policyPath: string,
-      source: string,
+      policy: ValidationPolicyIndex,
       candidatePath: string,
       targets: string[],
     ): boolean =>
       targets.some((targetPath) =>
-        containsValidationPathReference(source, policyPath, targetPath),
+        containsValidationPathReference(policy, policyPath, targetPath),
       ) ||
       typeScriptAliasReferences(candidatePath, typeScriptAliases).some(
         (alias) =>
           alias.configPath !== policyPath &&
-          containsTypeScriptModuleReference(source, alias.reference),
+          containsTypeScriptModuleReference(policy.source, alias.reference),
       );
-    let policySourceCount = -1;
-    while (policySources.size !== policySourceCount) {
-      policySourceCount = policySources.size;
+    while (pendingPolicyPaths.length > 0) {
+      const policyPath = pendingPolicyPaths.shift();
+      if (policyPath === undefined) continue;
+      const policy = policySources.get(policyPath);
+      if (policy === undefined) continue;
       for (const candidatePath of trackedPaths) {
         if (policySources.has(candidatePath)) continue;
         const targets = [candidatePath];
@@ -7297,18 +7330,14 @@ export class GitShell implements GitOperations {
         ) {
           continue;
         }
-        if (
-          ![...policySources].some(([policyPath, source]) =>
-            policySourceReferences(policyPath, source, candidatePath, targets),
-          )
-        ) {
+        if (!policySourceReferences(policyPath, policy, candidatePath, targets)) {
           continue;
         }
         const source = await this.showFile(ref, candidatePath);
         if (source === undefined) {
           throw new Error(`could not read validation entrypoint ${ref}:${candidatePath}`);
         }
-        policySources.set(candidatePath, source);
+        addPolicySource(candidatePath, source);
       }
     }
     return candidates.filter((entrypointPath) => {
@@ -7342,8 +7371,8 @@ export class GitShell implements GitOperations {
         });
       return (
         protectedByRootAction ||
-        [...policySources].some(([policyPath, source]) =>
-          policySourceReferences(policyPath, source, entrypointPath, [...targets]),
+        [...policySources].some(([policyPath, policy]) =>
+          policySourceReferences(policyPath, policy, entrypointPath, [...targets]),
         )
       );
     });

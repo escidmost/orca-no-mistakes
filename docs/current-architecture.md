@@ -73,6 +73,8 @@ Each stage and role resolves its own agent from the configuration tiers, and the
 
 - Conventional `e2e/` trees are protected test data. Actionlint `actionlint.yaml` and SwiftLint `.swiftlint.yml`/`.swiftlint.yaml` are protected implicit validation policy.
 - Catch2/doctest `TEST_CASE` registrations and `REQUIRE`/`CHECK` assertions are protected co-located validation, and `vitest.workspace.*` is protected runner policy.
+- Cucumber `features/step_definitions/**` and Behave `features/steps/**` are protected test support trees. GoogleTest `TEST_F`, `TEST_P`, `TYPED_TEST`, and `TYPED_TEST_P` registrations make their source files immutable, while `pytest.toml`, `.pytest.toml`, and `vite.config.*` are protected validation policy.
+- Validation-entrypoint closure indexes each policy source once and processes newly discovered policy sources incrementally. It still uses path and shell heuristics rather than parsing every build system, so unusual conventions remain a residual risk; advisory mode records these findings without weakening custody checks.
 - Every rebase conflict requires human resolution. The conflict report carries the immutable upstream OID fetched by that exact attempt; selecting `fix` reruns the coordinator rebase after the human resolves or otherwise updates the branch, while `stop` cancels the run. Clean rebases remain automatic.
 - Nox's implicit `noxfile.py` runner configuration is protected validation policy.
 - Central MSBuild policy files `Directory.Build.props`, `Directory.Build.targets`, and `Directory.Packages.props` are protected case-insensitively because projects import them implicitly.
