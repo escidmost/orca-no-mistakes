@@ -286,6 +286,14 @@ function recoveryGenerationRefFor(runId: string, generationToken: number): strin
   return `refs/no-mistakes/recover-generations/${runId}/${generationToken}`;
 }
 
+function recoveryGenerationPrefixFor(runId: string): string {
+  return `refs/no-mistakes/recover-generations/${runId}/`;
+}
+
+function recoveryGenerationFenceRefFor(runId: string): string {
+  return `refs/no-mistakes/recover-generation-fences/${runId}`;
+}
+
 const COMMIT_OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
 
 async function anchorRecoveryCommit(
@@ -314,37 +322,122 @@ async function anchorRecoveryCommit(
     if (!COMMIT_OID.test(currentOid)) {
       throw new Error(`recovery ref ${ref} resolved to an invalid commit`);
     }
-    if (generationToken !== undefined) {
-      const generationRef = recoveryGenerationRefFor(runId, generationToken);
-      const preserved = await command(
+  }
+  if (generationToken !== undefined) {
+    const fenceRef = recoveryGenerationFenceRefFor(runId);
+    const fenceObject = await command(
+      "git",
+      ["-C", repoRoot, "hash-object", "-w", "--stdin"],
+      repoRoot,
+      { stdin: `recovery-generation:${generationToken}\n` },
+    );
+    const fenceOid = fenceObject.stdout.trim();
+    if (!COMMIT_OID.test(fenceOid)) {
+      throw new Error(`recovery generation fence for run ${runId} is invalid`);
+    }
+    const readFence = async (): Promise<{ oid: string; token: number } | undefined> => {
+      const resolved = await command(
         "git",
-        ["-C", repoRoot, "update-ref", generationRef, currentOid, "0".repeat(currentOid.length)],
+        ["-C", repoRoot, "rev-parse", "--verify", fenceRef],
         repoRoot,
         { allowFailure: true },
       );
-      if (preserved.code !== 0) {
-        const existing = await command(
-          "git",
-          ["-C", repoRoot, "rev-parse", "--verify", generationRef],
+      if (resolved.code !== 0) return undefined;
+      const fenceValue = await command(
+        "git",
+        ["-C", repoRoot, "cat-file", "blob", resolved.stdout.trim()],
+        repoRoot,
+        { allowFailure: true },
+      );
+      const match = /^recovery-generation:(\d+)\n$/u.exec(fenceValue.stdout);
+      const token = match ? Number(match[1]) : Number.NaN;
+      if (fenceValue.code !== 0 || !Number.isSafeInteger(token) || token < 1) {
+        throw new Error(`recovery generation fence ${fenceRef} is invalid`);
+      }
+      return { oid: resolved.stdout.trim(), token };
+    };
+    let fence = await readFence();
+    if (fence && fence.token > generationToken) {
+      throw new Error(`recovery generation ${generationToken} is stale`);
+    }
+    if (!fence || fence.token < generationToken) {
+      const claimed = await command(
+        "git",
+        [
+          "-C",
           repoRoot,
-          { allowFailure: true },
-        );
-        if (existing.code !== 0 || existing.stdout.trim() !== currentOid) {
-          throw new Error(`could not preserve recovery ref ${generationRef}`);
+          "update-ref",
+          fenceRef,
+          fenceOid,
+          fence?.oid ?? "0".repeat(fenceOid.length),
+        ],
+        repoRoot,
+        { allowFailure: true },
+      );
+      if (claimed.code !== 0) {
+        fence = await readFence();
+        if (fence?.oid !== fenceOid) {
+          throw new Error(`recovery generation ${generationToken} is stale`);
         }
       }
-      if (currentOid === oid) return;
-    } else {
-      if (currentOid === oid) return;
-      const contained = await command(
+    }
+    const generationRef = recoveryGenerationRefFor(runId, generationToken);
+    const preservedOid = current.code === 0 ? currentOid : oid;
+    const preserved = await command(
+      "git",
+      [
+        "-C",
+        repoRoot,
+        "update-ref",
+        generationRef,
+        preservedOid,
+        "0".repeat(preservedOid.length),
+      ],
+      repoRoot,
+      { allowFailure: true },
+    );
+    if (preserved.code !== 0) {
+      const existing = await command(
         "git",
-        ["-C", repoRoot, "merge-base", "--is-ancestor", currentOid, oid],
+        ["-C", repoRoot, "rev-parse", "--verify", generationRef],
         repoRoot,
         { allowFailure: true },
       );
-      if (contained.code !== 0) {
-        throw new Error(`recovery ref ${ref} has divergent custody`);
+      if (existing.code !== 0 || !COMMIT_OID.test(existing.stdout.trim())) {
+        throw new Error(`could not preserve recovery ref ${generationRef}`);
       }
+    }
+    if (currentOid === oid) return;
+    const anchored = await command(
+      "git",
+      ["-C", repoRoot, "update-ref", "--stdin"],
+      repoRoot,
+      {
+        allowFailure: true,
+        stdin: [
+          "start",
+          `verify ${fenceRef} ${fenceOid}`,
+          `update ${ref} ${oid} ${current.code === 0 ? currentOid : "0".repeat(oid.length)}`,
+          "prepare",
+          "commit",
+          "",
+        ].join("\n"),
+      },
+    );
+    if (anchored.code !== 0) {
+      throw new Error(`could not anchor recovery ref ${ref}: ${anchored.stderr.trim()}`);
+    }
+    return;
+  } else if (current.code === 0) {
+    if (currentOid === oid) return;
+    const contained = await command(
+      "git",
+      ["-C", repoRoot, "merge-base", "--is-ancestor", currentOid, oid],
+      repoRoot,
+      { allowFailure: true },
+    );
+    if (contained.code !== 0) {
+      throw new Error(`recovery ref ${ref} has divergent custody`);
     }
   }
   const anchored = await command(
@@ -976,7 +1069,11 @@ export async function reapAbortedRun(reason: string): Promise<void> {
         ...(await anchorAbortWorkerTips(workers, runId, git, deliveryGit)),
       );
       gateOid = await git.head();
-      await deliveryGit.anchorRecoveryRef(runId, gateOid);
+      await deliveryGit.anchorRecoveryRef(
+        runId,
+        gateOid,
+        abortReap.generationToken,
+      );
       recoverRef = recoveryRefFor(runId);
       if (failures.length > 0) {
         throw new AggregateError(failures, "abort preservation was incomplete");
@@ -2048,7 +2145,11 @@ export async function runPipeline(
         throw new Error(`this run cannot be attested: ${blockers.join("; ")}`);
       }
 
-      await deliveryGit.anchorRecoveryRef(runId, terminalCommitOid);
+      await deliveryGit.anchorRecoveryRef(
+        runId,
+        terminalCommitOid,
+        generationToken,
+      );
       const operatorHead = await deliveryGit.head();
       let custodyNote: string;
       if (deliveryGit === git && operatorHead === terminalCommitOid) {
@@ -2127,7 +2228,7 @@ export async function runPipeline(
       let anchoredOid: string | undefined;
       try {
         anchoredOid = await git.head();
-        await deliveryGit.anchorRecoveryRef(runId, anchoredOid);
+        await deliveryGit.anchorRecoveryRef(runId, anchoredOid, generationToken);
       } catch (recoveryError) {
         anchorError = recoveryError;
         anchoredOid = undefined;
@@ -9077,6 +9178,7 @@ async function recoveryHeadState(
     return missingRepoAsserted ? "contained" : "missing-repo";
   }
   const ref = recoveryRefFor(run.run_id);
+  const generationPrefix = recoveryGenerationPrefixFor(run.run_id);
   const git = async (args: string[]) => {
     try {
       return await command(
@@ -9100,6 +9202,7 @@ async function recoveryHeadState(
     "--format=%(refname)",
     ref,
     `${ref}-*`,
+    generationPrefix,
   ]);
   if (listed.code !== 0) throw failedInspection("for-each-ref", listed);
   const recoveryRefs = listed.stdout.split("\n").filter(Boolean);
