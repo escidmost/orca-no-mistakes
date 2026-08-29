@@ -941,6 +941,77 @@ test("resume replays a recorded fix decision instead of asking the gate again", 
   assert.equal(resumed.launches[0]?.stage, "review");
 });
 
+test("resume preserves a stage's consumed automatic-fix budget", async () => {
+  const git = new FakeGit();
+  git.policyDigest = "f".repeat(64);
+  allowReviewAutoFix(git);
+  const runId = `resume-budget-${randomUUID()}`;
+  const finding = (id: string): Finding => ({
+    action: "auto-fix",
+    description: `${id} remains unresolved.`,
+    id,
+    severity: "error",
+  });
+  class InterruptedAfterLintFix extends FakeOrca {
+    #lintFixed = false;
+
+    override async startWorker(
+      taskId: string,
+      launch: WorkerLaunch,
+    ): Promise<WorkerResult> {
+      if (launch.stage === "lint" && launch.role === "reviewer" && this.#lintFixed) {
+        throw new Error("lint rereview interrupted");
+      }
+      if (launch.stage === "lint" && launch.role === "fixer") this.#lintFixed = true;
+      return await super.startWorker(taskId, launch);
+    }
+  }
+  const interrupted = new InterruptedAfterLintFix(git, runId);
+  interrupted.reports.set("review", [
+    { findings: [finding("review-fix")], summary: "review failed" },
+    pass("review fixed"),
+    pass("review clean"),
+  ]);
+  interrupted.reports.set("lint", [
+    { findings: [finding("lint-fix")], summary: "lint failed" },
+    pass("lint fixed"),
+  ]);
+  const ledger = new DomainLedger(":memory:");
+
+  await assert.rejects(
+    runPipeline(
+      { intent: "Preserve consumed fix rounds.", maxFixRounds: 1 },
+      interrupted,
+      git,
+      ledger,
+    ),
+    /lint rereview interrupted/,
+  );
+
+  const resumed = new FakeOrca(git);
+  resumed.reports.set("review", [
+    { findings: [finding("review-still-broken")], summary: "review failed again" },
+  ]);
+  await runPipeline(
+    {
+      intent: "Preserve consumed fix rounds.",
+      maxFixRounds: 1,
+      resumeRunId: runId,
+    },
+    resumed,
+    git,
+    ledger,
+  );
+
+  assert.equal(
+    resumed.launches.some(
+      (launch) => launch.stage === "review" && launch.role === "fixer",
+    ),
+    false,
+  );
+  assert.equal(resumed.gates.length, 1);
+});
+
 test("fix rounds reuse one durable fixer terminal and worktree", async () => {
   const git = new FakeGit();
   allowReviewAutoFix(git);

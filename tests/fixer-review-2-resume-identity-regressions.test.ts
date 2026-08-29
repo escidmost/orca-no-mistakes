@@ -240,7 +240,6 @@ test("resume rejects evidence from a changed base ref", async () => {
       () =>
         ledger.resumeRun({
           baseBranch: "main",
-          baseOid: oid(11),
           baseRefSha: oid(11),
           branch,
           effectivePolicyHash,

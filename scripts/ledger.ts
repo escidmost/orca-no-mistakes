@@ -1179,7 +1179,6 @@ export class DomainLedger {
 
   resumeRun(input: {
     baseBranch: string
-    baseOid: string
     baseRefSha?: string
     branch: string
     effectivePolicyHash: string
@@ -1221,13 +1220,12 @@ export class DomainLedger {
         input.baseRefSha === undefined
           ? this.#db.prepare(
               `SELECT COUNT(*) AS count FROM stage_evidence
-               WHERE run_id = ? AND (base_commit_oid <> ? OR base_ref_sha IS NOT NULL)`
-            ).get(input.runId, input.baseOid)
+               WHERE run_id = ? AND base_ref_sha IS NOT NULL`
+            ).get(input.runId)
           : this.#db.prepare(
               `SELECT COUNT(*) AS count FROM stage_evidence
-               WHERE run_id = ? AND
-                 (base_commit_oid <> ? OR base_ref_sha IS NULL OR base_ref_sha <> ?)`
-            ).get(input.runId, input.baseOid, input.baseRefSha)
+               WHERE run_id = ? AND (base_ref_sha IS NULL OR base_ref_sha <> ?)`
+            ).get(input.runId, input.baseRefSha)
       ) as { count: number | bigint }
       if (Number(incompatibleBaseEvidence.count) > 0) {
         throw new Error(`run ${input.runId} base ref changed since it failed`)

@@ -364,6 +364,7 @@ type GateRunMarker = {
   allocationProtocol?: "gated-v1";
   cleanupPending?: boolean;
   createdAt: string;
+  domainRunId?: string;
   gate: GateWorktree;
   launcherPid?: number;
   originWorktree: string;
@@ -782,7 +783,14 @@ async function refreshGateMarker(): Promise<void> {
   if (abortReap.launcherPid !== undefined)
     marker.launcherPid = abortReap.launcherPid;
   if (abortReap.pid !== undefined) marker.pid = abortReap.pid;
-  if (abortReap.runId !== undefined) marker.runId = abortReap.runId;
+  if (abortReap.runId !== undefined) {
+    if (gate.kind === "configured") {
+      marker.runId = gate.runId;
+      if (abortReap.runId !== gate.runId) marker.domainRunId = abortReap.runId;
+    } else {
+      marker.runId = abortReap.runId;
+    }
+  }
   if (abortReap.startupReceipt !== undefined)
     marker.startupReceipt = abortReap.startupReceipt;
   if (terminalHandle !== undefined) marker.terminalHandle = terminalHandle;
@@ -1266,7 +1274,6 @@ export async function runPipeline(
       if (options.resumeRunId) {
         resumeCheckpoint = ledger.resumeRun({
           baseBranch: deliveryRepo.base,
-          baseOid: repo.baseOid,
           baseRefSha: effectiveProvenance.baseRefSha,
           branch: deliveryRepo.branch,
           effectivePolicyHash: effectiveProvenance.effectivePolicyHash,
@@ -1325,18 +1332,35 @@ export async function runPipeline(
     );
 
     const priorEvidence = options.resumeRunId ? ledger.listEvidence(runId) : [];
+    const priorCheckpoints = options.resumeRunId
+      ? ledger.listCheckpoints(runId)
+      : [];
     const priorGateAudit = options.resumeRunId
       ? ledger.listGateAudit(runId)
       : [];
     const submissionCommitOid = ledger.run(runId)!.submission_commit_oid;
     const latestEvidenceByStage = new Map<StageName, StageEvidenceRow>();
+    const priorRoundByStage = new Map<StageName, number>();
     for (const entry of priorEvidence) {
       if (
         PIPELINE_STEPS.includes(entry.stage_id as StageName) &&
         isAuthoritativeStageEvidence(entry.worker_identity)
       ) {
-        latestEvidenceByStage.set(entry.stage_id as StageName, entry);
+        const stage = entry.stage_id as StageName;
+        latestEvidenceByStage.set(stage, entry);
+        priorRoundByStage.set(
+          stage,
+          Math.max(priorRoundByStage.get(stage) ?? 0, entry.round_index),
+        );
       }
+    }
+    for (const checkpoint of priorCheckpoints) {
+      if (!PIPELINE_STEPS.includes(checkpoint.stage_id as StageName)) continue;
+      const stage = checkpoint.stage_id as StageName;
+      priorRoundByStage.set(
+        stage,
+        Math.max(priorRoundByStage.get(stage) ?? 0, checkpoint.round_index),
+      );
     }
     const priorRebase = latestEvidenceByStage.get("rebase");
     if (priorRebase) baseCommitOid = priorRebase.base_commit_oid;
@@ -1560,10 +1584,7 @@ export async function runPipeline(
         `${statusPrefix}no-mistakes ${stage} (${stageIndex(stage)}/${PIPELINE_STEPS.length})`,
         "in-progress",
       );
-      let round =
-        resumeCheckpoint?.stage_id === stage
-          ? resumeCheckpoint.round_index
-          : 0;
+      let round = priorRoundByStage.get(stage) ?? 0;
       let attempt = 0;
       const resumedEvidence = latestEvidenceByStage.get(stage);
       let resumedFixDecision =
@@ -9327,6 +9348,8 @@ async function reapConfiguredGate(
   if (
     marker.originWorktree !== repoRoot ||
     marker.runId !== gate.runId ||
+    (marker.domainRunId !== undefined &&
+      !RUN_ID_PATTERN.test(marker.domainRunId)) ||
     path.basename(markerFile) !==
       path.basename(
         gateMarkerPath(
@@ -9346,6 +9369,7 @@ async function reapConfiguredGate(
     );
     return false;
   }
+  const domainRunId = marker.domainRunId ?? gate.runId;
   const cleanupHasProcessIdentity =
     marker.pid !== undefined || marker.launcherPid !== undefined;
   if (
@@ -9388,11 +9412,11 @@ async function reapConfiguredGate(
     );
     return false;
   }
-  const run = ledger.runIdentity(gate.runId);
+  const run = ledger.runIdentity(domainRunId);
   const settleConfiguredRun = async (): Promise<boolean> => {
     if (
       run?.status === "in-progress" &&
-      !ledger.settleRun(gate.runId, "cancelled", {
+      !ledger.settleRun(domainRunId, "cancelled", {
         branch: run.branch,
         repoRoot,
       })
@@ -9430,7 +9454,7 @@ async function reapConfiguredGate(
   }
   const lease =
     run === undefined ? undefined : ledger.leaseFor(repoRoot, run.branch);
-  if (lease !== undefined && lease.run_id !== gate.runId) {
+  if (lease !== undefined && lease.run_id !== domainRunId) {
     console.error(
       `no-mistakes: retained gate workspace ${gate.path}; its branch lease belongs to another run`,
     );
@@ -9499,7 +9523,7 @@ async function reapConfiguredGate(
         repoRoot,
         "rev-parse",
         "--verify",
-        `refs/no-mistakes/recover/${gate.runId}`,
+        `refs/no-mistakes/recover/${domainRunId}`,
       ],
       repoRoot,
       { allowFailure: true },
@@ -9533,10 +9557,10 @@ async function reapConfiguredGate(
     return false;
   }
   try {
-    await anchorRecoveryCommit(repoRoot, gate.runId, tipOid);
+    await anchorRecoveryCommit(repoRoot, domainRunId, tipOid);
   } catch (error) {
     console.error(
-      `no-mistakes: retained gate workspace ${gate.path}; could not anchor recovery ref for ${gate.runId}: ${String(error)}`,
+      `no-mistakes: retained gate workspace ${gate.path}; could not anchor recovery ref for ${domainRunId}: ${String(error)}`,
     );
     return false;
   }
