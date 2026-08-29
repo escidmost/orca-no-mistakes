@@ -1188,7 +1188,7 @@ export class DomainLedger {
     policySha256: string
     repoRoot: string
     runId: string
-  }): StageCheckpointRow {
+  }): { checkpoint: StageCheckpointRow; generationToken: number } {
     this.#db.exec('BEGIN IMMEDIATE')
     try {
       const run = this.run(input.runId)
@@ -1247,14 +1247,14 @@ export class DomainLedger {
           "UPDATE runs SET status = 'in-progress', terminal_commit_oid = NULL, completed_at = NULL WHERE run_id = ?"
         )
         .run(input.runId)
-      this.#acquireLeaseLocked({
+      const generationToken = this.#acquireLeaseLocked({
         branch: input.branch,
         force: input.force,
         repoRoot: input.repoRoot,
         runId: input.runId
       })
       this.#db.exec('COMMIT')
-      return checkpoint
+      return { checkpoint, generationToken }
     } catch (error) {
       this.#db.exec('ROLLBACK')
       throw error
@@ -1369,7 +1369,7 @@ export class DomainLedger {
   settleRun(
     runId: string,
     status: 'cancelled' | 'failed',
-    ownership?: { branch: string; repoRoot: string }
+    ownership?: { branch: string; generationToken?: number; repoRoot: string }
   ): boolean {
     this.#db.exec('BEGIN IMMEDIATE')
     try {
@@ -1382,7 +1382,9 @@ export class DomainLedger {
           run.repo_root !== ownership.repoRoot ||
           run.branch !== ownership.branch ||
           (run.status === 'in-progress'
-            ? lease?.run_id !== runId
+            ? lease?.run_id !== runId ||
+              (ownership.generationToken !== undefined &&
+                lease.generation_token !== ownership.generationToken)
             : run.status !== status))
       ) {
         this.#db.exec('COMMIT')

@@ -245,7 +245,11 @@ export interface GitOperations {
     worktreePath: string,
     expectedHead: string,
   ): Promise<boolean>;
-  anchorRecoveryRef(runId: string, oid: string): Promise<void>;
+  anchorRecoveryRef(
+    runId: string,
+    oid: string,
+    generationToken?: number,
+  ): Promise<void>;
 }
 
 export type PipelineOptions = {
@@ -278,14 +282,24 @@ function recoveryRefFor(runId: string): string {
   return `refs/no-mistakes/recover/${runId}`;
 }
 
+function recoveryGenerationRefFor(runId: string, generationToken: number): string {
+  return `refs/no-mistakes/recover-generations/${runId}/${generationToken}`;
+}
+
 const COMMIT_OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
 
 async function anchorRecoveryCommit(
   repoRoot: string,
   runId: string,
   oid: string,
+  generationToken?: number,
 ): Promise<void> {
-  if (!RUN_ID_PATTERN.test(runId) || !COMMIT_OID.test(oid)) {
+  if (
+    !RUN_ID_PATTERN.test(runId) ||
+    !COMMIT_OID.test(oid) ||
+    (generationToken !== undefined &&
+      (!Number.isSafeInteger(generationToken) || generationToken < 1))
+  ) {
     throw new Error("recovery custody identifiers are invalid");
   }
   const ref = recoveryRefFor(runId);
@@ -300,15 +314,37 @@ async function anchorRecoveryCommit(
     if (!COMMIT_OID.test(currentOid)) {
       throw new Error(`recovery ref ${ref} resolved to an invalid commit`);
     }
-    if (currentOid === oid) return;
-    const contained = await command(
-      "git",
-      ["-C", repoRoot, "merge-base", "--is-ancestor", currentOid, oid],
-      repoRoot,
-      { allowFailure: true },
-    );
-    if (contained.code !== 0) {
-      throw new Error(`recovery ref ${ref} has divergent custody`);
+    if (generationToken !== undefined) {
+      const generationRef = recoveryGenerationRefFor(runId, generationToken);
+      const preserved = await command(
+        "git",
+        ["-C", repoRoot, "update-ref", generationRef, currentOid, "0".repeat(currentOid.length)],
+        repoRoot,
+        { allowFailure: true },
+      );
+      if (preserved.code !== 0) {
+        const existing = await command(
+          "git",
+          ["-C", repoRoot, "rev-parse", "--verify", generationRef],
+          repoRoot,
+          { allowFailure: true },
+        );
+        if (existing.code !== 0 || existing.stdout.trim() !== currentOid) {
+          throw new Error(`could not preserve recovery ref ${generationRef}`);
+        }
+      }
+      if (currentOid === oid) return;
+    } else {
+      if (currentOid === oid) return;
+      const contained = await command(
+        "git",
+        ["-C", repoRoot, "merge-base", "--is-ancestor", currentOid, oid],
+        repoRoot,
+        { allowFailure: true },
+      );
+      if (contained.code !== 0) {
+        throw new Error(`recovery ref ${ref} has divergent custody`);
+      }
     }
   }
   const anchored = await command(
@@ -365,6 +401,7 @@ type GateRunMarker = {
   cleanupPending?: boolean;
   createdAt: string;
   domainRunId?: string;
+  generationToken?: number;
   gate: GateWorktree;
   launcherPid?: number;
   originWorktree: string;
@@ -438,6 +475,7 @@ type AbortReapState = {
   deliveryGit?: GitOperations;
   gate?: GateWorktree;
   git?: GitOperations;
+  generationToken?: number;
   launcherPid?: number;
   ledger?: DomainLedger;
   notify?: (summary: string) => Promise<void>;
@@ -783,6 +821,8 @@ async function refreshGateMarker(): Promise<void> {
   if (abortReap.launcherPid !== undefined)
     marker.launcherPid = abortReap.launcherPid;
   if (abortReap.pid !== undefined) marker.pid = abortReap.pid;
+  if (abortReap.generationToken !== undefined)
+    marker.generationToken = abortReap.generationToken;
   if (abortReap.runId !== undefined) {
     if (gate.kind === "configured") {
       marker.runId = gate.runId;
@@ -886,6 +926,7 @@ async function writeLauncherGateMarker(
 export async function registerAbortRunContext(state: {
   deliveryGit: GitOperations;
   git: GitOperations;
+  generationToken?: number;
   ledger: DomainLedger;
   runId: string;
 }): Promise<void> {
@@ -950,7 +991,19 @@ export async function reapAbortedRun(reason: string): Promise<void> {
   let shouldFailOrcaRun = false;
   if (preserved && abortReap.ledger && abortReap.runId) {
     try {
-      cancelled = abortReap.ledger.settleRun(abortReap.runId, "cancelled");
+      const ownership =
+        abortReap.gate && abortReap.originWorktree
+          ? {
+              branch: abortReap.gate.branch,
+              generationToken: abortReap.generationToken,
+              repoRoot: abortReap.originWorktree,
+            }
+          : undefined;
+      cancelled = abortReap.ledger.settleRun(
+        abortReap.runId,
+        "cancelled",
+        ownership,
+      );
       const status = abortReap.ledger.runStatus(abortReap.runId);
       settled = status !== "in-progress";
       shouldFailOrcaRun = settled && status !== "passed";
@@ -1249,6 +1302,7 @@ export async function runPipeline(
     : "";
   const policySha256Value = await git.policySha256(repo.base);
   let domainRunStarted = false;
+  let generationToken: number | undefined;
   let resumeCheckpoint: StageCheckpointRow | undefined;
   const { artifactsDir, runId } = await withGateMutation(async () => {
     const orchestrationRunId = await orca.createRun(`no-mistakes: ${intent}`);
@@ -1258,8 +1312,6 @@ export async function runPipeline(
     if (!runId.trim() || !isWithin(artifactsBase, artifactsDir)) {
       throw new Error("Orca returned an unsafe Run ID");
     }
-    abortReap.runId = runId;
-    await refreshGateMarker();
     await mkdir(artifactsBase, { recursive: true });
     await mkdir(artifactsDir, { recursive: true });
     const [canonicalArtifactsBase, canonicalArtifactsDir] = await Promise.all([
@@ -1272,7 +1324,7 @@ export async function runPipeline(
 
     try {
       if (options.resumeRunId) {
-        resumeCheckpoint = ledger.resumeRun({
+        const resumed = ledger.resumeRun({
           baseBranch: deliveryRepo.base,
           baseRefSha: effectiveProvenance.baseRefSha,
           branch: deliveryRepo.branch,
@@ -1284,7 +1336,14 @@ export async function runPipeline(
           repoRoot: deliveryRepo.root,
           runId,
         });
+        resumeCheckpoint = resumed.checkpoint;
+        generationToken = resumed.generationToken;
         domainRunStarted = true;
+        await deliveryGit.anchorRecoveryRef(
+          runId,
+          resumeCheckpoint.output_commit_oid,
+          generationToken,
+        );
       } else {
         ledger.startRun({
           baseBranch: deliveryRepo.base,
@@ -1296,16 +1355,27 @@ export async function runPipeline(
           submissionCommitOid: deliveryRepo.head,
         });
         domainRunStarted = true;
-        ledger.acquireLease({
+        generationToken = ledger.acquireLease({
           branch: deliveryRepo.branch,
           force: options.forceLease === true,
           repoRoot: deliveryRepo.root,
           runId,
         });
       }
-      await registerAbortRunContext({ deliveryGit, git, ledger, runId });
+      await registerAbortRunContext({
+        deliveryGit,
+        generationToken: generationToken!,
+        git,
+        ledger,
+        runId,
+      });
     } catch (error) {
-      if (domainRunStarted) ledger.settleRun(runId, "failed");
+      if (domainRunStarted)
+        ledger.settleRun(runId, "failed", {
+          branch: deliveryRepo.branch,
+          generationToken,
+          repoRoot: deliveryRepo.root,
+        });
       throw error;
     }
     return { artifactsDir, runId };
@@ -2067,7 +2137,11 @@ export async function runPipeline(
       }
       if (!anchorError) {
         try {
-          ledger.settleRun(runId, outcome);
+          ledger.settleRun(runId, outcome, {
+            branch: deliveryRepo.branch,
+            generationToken,
+            repoRoot: deliveryRepo.root,
+          });
         } catch (settlementError) {
           throw new RunSettlementError(
             runId,
@@ -7822,8 +7896,12 @@ export class GitShell implements GitOperations {
     ).stdout.trim();
   }
 
-  async anchorRecoveryRef(runId: string, oid: string): Promise<void> {
-    await anchorRecoveryCommit(this.#repo, runId, oid);
+  async anchorRecoveryRef(
+    runId: string,
+    oid: string,
+    generationToken?: number,
+  ): Promise<void> {
+    await anchorRecoveryCommit(this.#repo, runId, oid, generationToken);
   }
 
   async rebase(base: string, onOutput?: CommandOutput): Promise<StageReport> {
@@ -9350,6 +9428,9 @@ async function reapConfiguredGate(
     marker.runId !== gate.runId ||
     (marker.domainRunId !== undefined &&
       !RUN_ID_PATTERN.test(marker.domainRunId)) ||
+    (marker.generationToken !== undefined &&
+      (!Number.isSafeInteger(marker.generationToken) ||
+        marker.generationToken < 1)) ||
     path.basename(markerFile) !==
       path.basename(
         gateMarkerPath(
@@ -9418,6 +9499,7 @@ async function reapConfiguredGate(
       run?.status === "in-progress" &&
       !ledger.settleRun(domainRunId, "cancelled", {
         branch: run.branch,
+        generationToken: marker.generationToken,
         repoRoot,
       })
     ) {
@@ -9454,7 +9536,12 @@ async function reapConfiguredGate(
   }
   const lease =
     run === undefined ? undefined : ledger.leaseFor(repoRoot, run.branch);
-  if (lease !== undefined && lease.run_id !== domainRunId) {
+  if (
+    (run?.status === "in-progress" &&
+      (marker.generationToken === undefined ||
+        lease?.generation_token !== marker.generationToken)) ||
+    (lease !== undefined && lease.run_id !== domainRunId)
+  ) {
     console.error(
       `no-mistakes: retained gate workspace ${gate.path}; its branch lease belongs to another run`,
     );
@@ -10408,6 +10495,15 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
           console.error(`no-mistakes: retained ${name}; its run ID is invalid`);
           continue;
         }
+        if (
+          marker.generationToken !== undefined &&
+          (!Number.isSafeInteger(marker.generationToken) ||
+            marker.generationToken < 1)
+        ) {
+          retained += 1;
+          console.error(`no-mistakes: retained ${name}; its lease generation is invalid`);
+          continue;
+        }
         const runId = marker.runId;
         const worktrees = await listOrcaWorktrees(orcaCommand, repoRoot);
         if (worktrees === undefined) {
@@ -10439,9 +10535,10 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
         const lease =
           run === undefined ? undefined : ledger.leaseFor(repoRoot, run.branch);
         if (
-          run !== undefined &&
-          lease !== undefined &&
-          lease.run_id !== runId
+          (run?.status === "in-progress" &&
+            (marker.generationToken === undefined ||
+              lease?.generation_token !== marker.generationToken)) ||
+          (run !== undefined && lease !== undefined && lease.run_id !== runId)
         ) {
           retained += 1;
           console.error(
@@ -10733,6 +10830,7 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
             run?.status === "in-progress" &&
             !ledger.settleRun(runId, "cancelled", {
               branch: run.branch,
+              generationToken: marker.generationToken,
               repoRoot,
             })
           ) {
