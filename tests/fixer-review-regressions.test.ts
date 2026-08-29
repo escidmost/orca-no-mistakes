@@ -230,3 +230,81 @@ test("zod-style refinement contexts do not freeze source files", async () => {
     await rm(temp, { recursive: true, force: true });
   }
 });
+
+test("deferred ecosystem test and policy conventions stay protected", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-deferred-guardrails-"));
+  const repo = path.join(temp, "repo");
+  const worker = path.join(temp, "worker");
+  const files = new Map([
+    ["features/step_definitions/login.rb", "Given(\"a logged-in user\") do\nend\n"],
+    ["features/steps/login.py", "def user_is_logged_in(context):\n    pass\n"],
+    ["src/gtest-f.cc", "TEST_F(Fixture, Works) { EXPECT_EQ(1, 1); }\n"],
+    ["src/gtest-p.cc", "TEST_P(Fixture, Works) { EXPECT_EQ(1, 1); }\n"],
+    ["src/gtest-typed.cc", "TYPED_TEST(Fixture, Works) { EXPECT_EQ(1, 1); }\n"],
+    ["src/gtest-typed-p.cc", "TYPED_TEST_P(Fixture, Works) { EXPECT_EQ(1, 1); }\n"],
+    ["pytest.toml", "[tool.pytest.ini_options]\naddopts = \"-q\"\n"],
+    [".pytest.toml", "[tool.pytest.ini_options]\naddopts = \"-q\"\n"],
+    ["vite.config.ts", "export default { test: {} };\n"],
+  ]);
+  try {
+    await mkdir(repo);
+    git(repo, "init", "-b", "feature");
+    git(repo, "config", "user.email", "test@example.com");
+    git(repo, "config", "user.name", "Test User");
+    git(repo, "config", "core.hooksPath", "/dev/null");
+    for (const [filePath, source] of files) {
+      await mkdir(path.dirname(path.join(repo, filePath)), { recursive: true });
+      await writeFile(path.join(repo, filePath), source);
+    }
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "add deferred guardrail conventions");
+    const expectedHead = git(repo, "rev-parse", "HEAD");
+    git(repo, "worktree", "add", "--detach", worker, expectedHead);
+
+    const assertProtected = async (
+      paths: string[],
+      pattern: RegExp,
+    ): Promise<void> => {
+      git(worker, "reset", "--hard", expectedHead);
+      for (const filePath of paths) {
+        await writeFile(
+          path.join(worker, filePath),
+          `${files.get(filePath)}changed\n`,
+        );
+      }
+      git(worker, "add", "--", ...paths);
+      git(worker, "commit", "-m", "mutate protected convention");
+      await assert.rejects(
+        new GitShell({ repo }).assertFixerChangesAllowed(
+          worker,
+          expectedHead,
+          git(worker, "rev-parse", "HEAD"),
+        ),
+        (error: unknown) => {
+          assert.match(String(error), pattern);
+          return true;
+        },
+      );
+    };
+
+    await assertProtected(
+      ["features/step_definitions/login.rb", "features/steps/login.py"],
+      /fixer modified pre-existing test files: .*features\/step_definitions\/login\.rb.*features\/steps\/login\.py/,
+    );
+    await assertProtected(
+      [
+        "src/gtest-f.cc",
+        "src/gtest-p.cc",
+        "src/gtest-typed.cc",
+        "src/gtest-typed-p.cc",
+      ],
+      /fixer modified co-located test assertions or skip markers: .*src\/gtest-f\.cc.*src\/gtest-p\.cc.*src\/gtest-typed-p\.cc.*src\/gtest-typed\.cc/,
+    );
+    await assertProtected(
+      ["pytest.toml", ".pytest.toml", "vite.config.ts"],
+      /unexplained-policy-relaxation: fixer modified protected validation policy files: .*\.pytest\.toml.*pytest\.toml.*vite\.config\.ts/,
+    );
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
