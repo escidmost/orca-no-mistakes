@@ -512,6 +512,7 @@ type GateRunMarker = {
   launcherPid?: number;
   originWorktree: string;
   pid?: number;
+  resumeClaimId?: string;
   runId?: string;
   startupReceipt?: string;
   terminalHandle?: string;
@@ -590,6 +591,7 @@ type AbortReapState = {
   orchestrationRunId?: string;
   originWorktree?: string;
   pid?: number;
+  resumeClaimId?: string;
   runId?: string;
   startupReceipt?: string;
   terminalHandle?: string;
@@ -930,6 +932,8 @@ async function refreshGateMarker(): Promise<void> {
   if (abortReap.pid !== undefined) marker.pid = abortReap.pid;
   if (abortReap.generationToken !== undefined)
     marker.generationToken = abortReap.generationToken;
+  if (abortReap.resumeClaimId !== undefined)
+    marker.resumeClaimId = abortReap.resumeClaimId;
   if (abortReap.runId !== undefined) {
     marker.runId =
       gate.kind === "configured"
@@ -1036,10 +1040,15 @@ export async function registerAbortRunContext(state: {
   generationToken?: number;
   ledger: DomainLedger;
   orchestrationRunId?: string;
+  resumeClaimId?: string;
   runId: string;
 }): Promise<void> {
   Object.assign(abortReap, state);
+  delete abortReap.resumeClaimId;
   await refreshGateMarker();
+  if (state.resumeClaimId) {
+    state.ledger.clearResumeClaim(state.runId, state.resumeClaimId);
+  }
 }
 
 export async function reapAbortedRun(reason: string): Promise<void> {
@@ -1410,6 +1419,7 @@ export async function runPipeline(
   const policySha256Value = await git.policySha256(repo.base);
   let domainRunStarted = false;
   let generationToken: number | undefined;
+  let resumeClaimId: string | undefined;
   let resumeCheckpoint: StageCheckpointRow | undefined;
   const { artifactsDir, runId } = await withGateMutation(async () => {
     const orchestrationRunId = await orca.createRun(`no-mistakes: ${intent}`);
@@ -1431,10 +1441,32 @@ export async function runPipeline(
 
     try {
       if (options.resumeRunId) {
+        const resumeClaim = ledger.prepareResume({
+          baseBranch: deliveryRepo.base,
+          baseRefSha: effectiveProvenance.baseRefSha,
+          branch: deliveryRepo.branch,
+          effectivePolicyHash: effectiveProvenance.effectivePolicyHash,
+          force: options.forceLease === true,
+          head: repo.head,
+          intent,
+          policySha256: policySha256Value,
+          repoRoot: deliveryRepo.root,
+          runId,
+        });
+        generationToken = resumeClaim.generationToken;
+        resumeClaimId = resumeClaim.claimId;
+        Object.assign(abortReap, {
+          generationToken,
+          orchestrationRunId,
+          resumeClaimId,
+          runId,
+        });
+        await refreshGateMarker();
         const resumed = ledger.resumeRun({
           baseBranch: deliveryRepo.base,
           baseRefSha: effectiveProvenance.baseRefSha,
           branch: deliveryRepo.branch,
+          claimId: resumeClaimId,
           effectivePolicyHash: effectiveProvenance.effectivePolicyHash,
           force: options.forceLease === true,
           head: repo.head,
@@ -1475,6 +1507,7 @@ export async function runPipeline(
         git,
         ledger,
         orchestrationRunId,
+        resumeClaimId,
         runId,
       });
     } catch (error) {
@@ -1857,6 +1890,29 @@ export async function runPipeline(
 
       while (actionableFindings(report).length > 0) {
         const actionable = actionableFindings(report);
+        const latestEntry = latestEntryByStage.get(stage);
+        const resumedApproval = latestEntry
+          ? priorGateAudit.findLast(
+              (audit) =>
+                audit.resolved_at !== null &&
+                (audit.decision === "approve" || audit.decision === "skip") &&
+                gateAuditMatchesEvidence(
+                  audit,
+                  stage,
+                  latestEntry.round,
+                  latestEntry.evidenceSha256,
+                ),
+            )
+          : undefined;
+        if (latestEntry && resumedApproval?.resolved_at) {
+          latestEntry.waiverOrApproval = {
+            decision:
+              resumedApproval.decision === "approve" ? "approve" : "skip",
+            gateId: resumedApproval.gate_id,
+            resolvedAt: resumedApproval.resolved_at,
+          };
+          break;
+        }
         const autoFixable = actionable.filter(
           (finding) => finding.action === "auto-fix",
         );
@@ -9561,6 +9617,10 @@ async function reapConfiguredGate(
     (marker.generationToken !== undefined &&
       (!Number.isSafeInteger(marker.generationToken) ||
         marker.generationToken < 1)) ||
+    (marker.resumeClaimId !== undefined &&
+      (typeof marker.resumeClaimId !== "string" ||
+        !RUN_ID_PATTERN.test(marker.resumeClaimId) ||
+        marker.generationToken === undefined)) ||
     path.basename(markerFile) !==
       path.basename(
         gateMarkerPath(
@@ -9624,6 +9684,21 @@ async function reapConfiguredGate(
     return false;
   }
   const run = ledger.runIdentity(domainRunId);
+  if (
+    marker.resumeClaimId !== undefined &&
+    (run === undefined ||
+      marker.generationToken === undefined ||
+      !ledger.resumeClaimMatches({
+        claimId: marker.resumeClaimId,
+        generationToken: marker.generationToken,
+        runId: domainRunId,
+      }))
+  ) {
+    console.error(
+      `no-mistakes: retained gate workspace ${gate.path}; its resume claim is no longer current`,
+    );
+    return false;
+  }
   const settleConfiguredRun = async (): Promise<boolean> => {
     if (
       run?.status === "in-progress" &&
@@ -9764,6 +9839,8 @@ async function reapConfiguredGate(
       return false;
     }
     if (!(await removeGateMarker(markerFile, gate))) return false;
+    if (marker.resumeClaimId !== undefined)
+      ledger.clearResumeClaim(domainRunId, marker.resumeClaimId);
     console.error(`no-mistakes: reaped stranded gate marker ${markerFile}`);
     return true;
   }
@@ -9806,6 +9883,8 @@ async function reapConfiguredGate(
     return false;
   }
   if (!(await removeGateMarker(markerFile, gate))) return false;
+  if (marker.resumeClaimId !== undefined)
+    ledger.clearResumeClaim(domainRunId, marker.resumeClaimId);
   console.error(`no-mistakes: reaped stranded gate workspace ${gate.path}`);
   return true;
 }
@@ -10649,6 +10728,16 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
           console.error(`no-mistakes: retained ${name}; its lease generation is invalid`);
           continue;
         }
+        if (
+          marker.resumeClaimId !== undefined &&
+          (typeof marker.resumeClaimId !== "string" ||
+            !RUN_ID_PATTERN.test(marker.resumeClaimId) ||
+            marker.generationToken === undefined)
+        ) {
+          retained += 1;
+          console.error(`no-mistakes: retained ${name}; its resume claim is invalid`);
+          continue;
+        }
         const orchestrationRunId = marker.runId;
         const domainRunId = marker.domainRunId ?? orchestrationRunId;
         const worktrees = await listOrcaWorktrees(orcaCommand, repoRoot);
@@ -10665,6 +10754,23 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
           domainRunId === undefined
             ? undefined
             : ledger.runIdentity(domainRunId);
+        if (
+          marker.resumeClaimId !== undefined &&
+          (domainRunId === undefined ||
+            run === undefined ||
+            marker.generationToken === undefined ||
+            !ledger.resumeClaimMatches({
+              claimId: marker.resumeClaimId,
+              generationToken: marker.generationToken,
+              runId: domainRunId,
+            }))
+        ) {
+          retained += 1;
+          console.error(
+            `no-mistakes: retained gate workspace ${gate.path}; its resume claim is no longer current`,
+          );
+          continue;
+        }
         const cleanupRetry = run !== undefined && run.status !== "in-progress";
         if (
           !origin ||
@@ -11071,6 +11177,8 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
           retained += 1;
           continue;
         }
+        if (marker.resumeClaimId !== undefined && domainRunId !== undefined)
+          ledger.clearResumeClaim(domainRunId, marker.resumeClaimId);
         reaped += 1;
         console.error(`no-mistakes: reaped stranded gate workspace ${gate.path}`);
       } catch (error) {

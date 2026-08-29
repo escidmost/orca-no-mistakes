@@ -982,6 +982,12 @@ CREATE TABLE IF NOT EXISTS lease_generations (
   next_token INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS resume_claims (
+  run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE CASCADE,
+  claim_id TEXT NOT NULL UNIQUE,
+  generation_token INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS stage_checkpoints (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
@@ -1177,7 +1183,7 @@ export class DomainLedger {
       )
   }
 
-  resumeRun(input: {
+  prepareResume(input: {
     baseBranch: string
     baseRefSha?: string
     branch: string
@@ -1188,77 +1194,165 @@ export class DomainLedger {
     policySha256: string
     repoRoot: string
     runId: string
+  }): { claimId: string; checkpoint: StageCheckpointRow; generationToken: number } {
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      const checkpoint = this.#validateResume(input)
+      const existing = this.leaseFor(input.repoRoot, input.branch)
+      if (existing && existing.run_id !== input.runId && !input.force) {
+        throw new Error(
+          `branch ${input.branch} is already leased by run ${existing.run_id}; pass --force-lease to reclaim it`
+        )
+      }
+      const generationToken =
+        existing?.run_id === input.runId
+          ? existing.generation_token
+          : this.#nextGenerationToken(
+              input.repoRoot,
+              existing ? existing.generation_token + 1 : 1
+            )
+      const claimId = randomUUID()
+      this.#db
+        .prepare(
+          `INSERT INTO resume_claims (run_id, claim_id, generation_token)
+           VALUES (?, ?, ?)
+           ON CONFLICT(run_id) DO UPDATE SET
+             claim_id = excluded.claim_id,
+             generation_token = excluded.generation_token`
+        )
+        .run(input.runId, claimId, generationToken)
+      this.#db.exec('COMMIT')
+      return { claimId, checkpoint, generationToken }
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  resumeRun(input: {
+    baseBranch: string
+    baseRefSha?: string
+    branch: string
+    claimId: string
+    effectivePolicyHash: string
+    force?: boolean
+    head: string
+    intent: string
+    policySha256: string
+    repoRoot: string
+    runId: string
   }): { checkpoint: StageCheckpointRow; generationToken: number } {
     this.#db.exec('BEGIN IMMEDIATE')
     try {
-      const run = this.run(input.runId)
-      if (!run) throw new Error(`run ${input.runId} does not exist`)
-      if (run.status !== 'failed') {
-        throw new Error(`run ${input.runId} cannot resume from status ${run.status}`)
-      }
-      if (
-        run.repo_root !== input.repoRoot ||
-        run.branch !== input.branch ||
-        run.base_branch !== input.baseBranch ||
-        run.intent !== input.intent
-      ) {
-        throw new Error(`run ${input.runId} does not match this repository, branch, base, and intent`)
-      }
-      if (run.policy_sha256 !== input.policySha256) {
-        throw new Error(`run ${input.runId} validation policy changed since it failed`)
-      }
-      const incompatibleEvidence = this.#db
+      const checkpoint = this.#validateResume(input)
+      const claim = this.#db
         .prepare(
-          `SELECT COUNT(*) AS count FROM stage_evidence
-           WHERE run_id = ? AND (effective_policy_hash IS NULL OR effective_policy_hash <> ?)`
+          `SELECT generation_token FROM resume_claims
+           WHERE run_id = ? AND claim_id = ?`
         )
-        .get(input.runId, input.effectivePolicyHash) as { count: number | bigint }
-      if (Number(incompatibleEvidence.count) > 0) {
-        throw new Error(`run ${input.runId} effective validation policy changed since it failed`)
-      }
-      const incompatibleBaseEvidence = (
-        input.baseRefSha === undefined
-          ? this.#db.prepare(
-              `SELECT COUNT(*) AS count FROM stage_evidence
-               WHERE run_id = ? AND base_ref_sha IS NOT NULL`
-            ).get(input.runId)
-          : this.#db.prepare(
-              `SELECT COUNT(*) AS count FROM stage_evidence
-               WHERE run_id = ? AND (base_ref_sha IS NULL OR base_ref_sha <> ?)`
-            ).get(input.runId, input.baseRefSha)
-      ) as { count: number | bigint }
-      if (Number(incompatibleBaseEvidence.count) > 0) {
-        throw new Error(`run ${input.runId} base ref changed since it failed`)
-      }
-      const checkpoint = this.#db
-        .prepare(
-          `SELECT input_commit_oid, output_commit_oid, round_index, stage_id
-           FROM stage_checkpoints WHERE run_id = ? ORDER BY id DESC LIMIT 1`
-        )
-        .get(input.runId) as StageCheckpointRow | undefined
-      if (!checkpoint) throw new Error(`run ${input.runId} has no durable checkpoint to resume`)
-      if (checkpoint.output_commit_oid !== input.head) {
-        throw new Error(
-          `HEAD ${input.head} does not match checkpoint ${checkpoint.output_commit_oid} for run ${input.runId}`
-        )
-      }
+        .get(input.runId, input.claimId) as
+        | { generation_token: number | bigint }
+        | undefined
+      if (!claim) throw new Error(`run ${input.runId} has no matching resume claim`)
+      const generationToken = Number(claim.generation_token)
+      this.#acquireClaimedLeaseLocked(input, generationToken)
       this.#db
         .prepare(
           "UPDATE runs SET status = 'in-progress', terminal_commit_oid = NULL, completed_at = NULL WHERE run_id = ?"
         )
         .run(input.runId)
-      const generationToken = this.#acquireLeaseLocked({
-        branch: input.branch,
-        force: input.force,
-        repoRoot: input.repoRoot,
-        runId: input.runId
-      })
       this.#db.exec('COMMIT')
       return { checkpoint, generationToken }
     } catch (error) {
       this.#db.exec('ROLLBACK')
       throw error
     }
+  }
+
+  resumeClaimMatches(input: {
+    claimId: string
+    generationToken: number
+    runId: string
+  }): boolean {
+    return (
+      this.#db
+        .prepare(
+          `SELECT 1 FROM resume_claims
+           WHERE run_id = ? AND claim_id = ? AND generation_token = ?`
+        )
+        .get(input.runId, input.claimId, input.generationToken) !== undefined
+    )
+  }
+
+  clearResumeClaim(runId: string, claimId: string): void {
+    this.#db
+      .prepare('DELETE FROM resume_claims WHERE run_id = ? AND claim_id = ?')
+      .run(runId, claimId)
+  }
+
+  #validateResume(input: {
+    baseBranch: string
+    baseRefSha?: string
+    branch: string
+    effectivePolicyHash: string
+    head: string
+    intent: string
+    policySha256: string
+    repoRoot: string
+    runId: string
+  }): StageCheckpointRow {
+    const run = this.run(input.runId)
+    if (!run) throw new Error(`run ${input.runId} does not exist`)
+    if (run.status !== 'failed') {
+      throw new Error(`run ${input.runId} cannot resume from status ${run.status}`)
+    }
+    if (
+      run.repo_root !== input.repoRoot ||
+      run.branch !== input.branch ||
+      run.base_branch !== input.baseBranch ||
+      run.intent !== input.intent
+    ) {
+      throw new Error(`run ${input.runId} does not match this repository, branch, base, and intent`)
+    }
+    if (run.policy_sha256 !== input.policySha256) {
+      throw new Error(`run ${input.runId} validation policy changed since it failed`)
+    }
+    const incompatibleEvidence = this.#db
+      .prepare(
+        `SELECT COUNT(*) AS count FROM stage_evidence
+         WHERE run_id = ? AND (effective_policy_hash IS NULL OR effective_policy_hash <> ?)`
+      )
+      .get(input.runId, input.effectivePolicyHash) as { count: number | bigint }
+    if (Number(incompatibleEvidence.count) > 0) {
+      throw new Error(`run ${input.runId} effective validation policy changed since it failed`)
+    }
+    const incompatibleBaseEvidence = (
+      input.baseRefSha === undefined
+        ? this.#db.prepare(
+            `SELECT COUNT(*) AS count FROM stage_evidence
+             WHERE run_id = ? AND base_ref_sha IS NOT NULL`
+          ).get(input.runId)
+        : this.#db.prepare(
+            `SELECT COUNT(*) AS count FROM stage_evidence
+             WHERE run_id = ? AND (base_ref_sha IS NULL OR base_ref_sha <> ?)`
+          ).get(input.runId, input.baseRefSha)
+    ) as { count: number | bigint }
+    if (Number(incompatibleBaseEvidence.count) > 0) {
+      throw new Error(`run ${input.runId} base ref changed since it failed`)
+    }
+    const checkpoint = this.#db
+      .prepare(
+        `SELECT input_commit_oid, output_commit_oid, round_index, stage_id
+         FROM stage_checkpoints WHERE run_id = ? ORDER BY id DESC LIMIT 1`
+      )
+      .get(input.runId) as StageCheckpointRow | undefined
+    if (!checkpoint) throw new Error(`run ${input.runId} has no durable checkpoint to resume`)
+    if (checkpoint.output_commit_oid !== input.head) {
+      throw new Error(
+        `HEAD ${input.head} does not match checkpoint ${checkpoint.output_commit_oid} for run ${input.runId}`
+      )
+    }
+    return checkpoint
   }
 
   finishRun(
@@ -1341,6 +1435,57 @@ export class DomainLedger {
       )
       .run(options.repoRoot, options.branch, options.runId, token, now, now)
     return token
+  }
+
+  #acquireClaimedLeaseLocked(
+    options: { branch: string; force?: boolean; repoRoot: string; runId: string },
+    generationToken: number
+  ): void {
+    const existing = this.#db
+      .prepare('SELECT run_id, generation_token FROM branch_leases WHERE repo_root = ? AND branch = ?')
+      .get(options.repoRoot, options.branch) as LeaseRow | undefined
+    const now = new Date().toISOString()
+    if (existing?.run_id === options.runId) {
+      if (Number(existing.generation_token) !== generationToken) {
+        throw new Error(`run ${options.runId} resume claim no longer matches its branch lease`)
+      }
+      this.#db
+        .prepare('UPDATE branch_leases SET heartbeat_at = ? WHERE repo_root = ? AND branch = ?')
+        .run(now, options.repoRoot, options.branch)
+      return
+    }
+    if (existing) {
+      if (!options.force) {
+        throw new Error(
+          `branch ${options.branch} is already leased by run ${existing.run_id}; pass --force-lease to reclaim it`
+        )
+      }
+      if (Number(existing.generation_token) >= generationToken) {
+        throw new Error(`run ${options.runId} resume claim is stale`)
+      }
+      const takeover = this.#db
+        .prepare(
+          'UPDATE branch_leases SET run_id = ?, generation_token = ?, acquired_at = ?, heartbeat_at = ? WHERE repo_root = ? AND branch = ? AND generation_token = ?'
+        )
+        .run(
+          options.runId,
+          generationToken,
+          now,
+          now,
+          options.repoRoot,
+          options.branch,
+          existing.generation_token
+        )
+      if (Number(takeover.changes) === 0) {
+        throw new Error(`run ${options.runId} resume claim is stale`)
+      }
+      return
+    }
+    this.#db
+      .prepare(
+        'INSERT INTO branch_leases (repo_root, branch, run_id, generation_token, acquired_at, heartbeat_at) VALUES (?, ?, ?, ?, ?, ?)'
+      )
+      .run(options.repoRoot, options.branch, options.runId, generationToken, now, now)
   }
 
   #nextGenerationToken(repoRoot: string, minimum = 1): number {
