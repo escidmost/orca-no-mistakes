@@ -1312,7 +1312,10 @@ export class DomainLedger {
       }
       // ponytail: fenced compare-and-swap on the observed generation; SQLite serializes
       // writers, so a concurrent taker changes the token first and this update no-ops.
-      const nextToken = Number(existing.generation_token) + 1
+      const nextToken = this.#nextGenerationToken(
+        options.repoRoot,
+        Number(existing.generation_token) + 1
+      )
       const takeover = this.#db
         .prepare(
           'UPDATE branch_leases SET run_id = ?, generation_token = ?, acquired_at = ?, heartbeat_at = ? WHERE repo_root = ? AND branch = ? AND generation_token = ?'
@@ -1340,11 +1343,11 @@ export class DomainLedger {
     return token
   }
 
-  #nextGenerationToken(repoRoot: string): number {
+  #nextGenerationToken(repoRoot: string, minimum = 1): number {
     const row = this.#db
       .prepare('SELECT next_token FROM lease_generations WHERE repo_root = ?')
       .get(repoRoot) as { next_token: number | bigint } | undefined
-    const token = row ? Number(row.next_token) : 1
+    const token = Math.max(row ? Number(row.next_token) : 1, minimum)
     this.#db
       .prepare(
         'INSERT INTO lease_generations (repo_root, next_token) VALUES (?, ?) ON CONFLICT(repo_root) DO UPDATE SET next_token = excluded.next_token'

@@ -1090,19 +1090,14 @@ export async function reapAbortedRun(reason: string): Promise<void> {
   let shouldFailOrcaRun = false;
   if (preserved && abortReap.ledger && abortReap.runId) {
     try {
-      const ownership =
-        abortReap.gate && abortReap.originWorktree
-          ? {
-              branch: abortReap.gate.branch,
-              generationToken: abortReap.generationToken,
-              repoRoot: abortReap.originWorktree,
-            }
-          : undefined;
-      cancelled = abortReap.ledger.settleRun(
-        abortReap.runId,
-        "cancelled",
-        ownership,
-      );
+      const run = abortReap.ledger.runIdentity(abortReap.runId);
+      cancelled =
+        run !== undefined &&
+        abortReap.ledger.settleRun(abortReap.runId, "cancelled", {
+          branch: run.branch,
+          generationToken: abortReap.generationToken,
+          repoRoot: run.repo_root,
+        });
       const status = abortReap.ledger.runStatus(abortReap.runId);
       settled = status !== "in-progress";
       shouldFailOrcaRun = settled && status !== "passed";
