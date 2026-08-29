@@ -1748,21 +1748,41 @@ export class DomainLedger {
         problems.push(`${label}: artifact ${row.artifact_path} does not match its recorded digest`)
         continue
       }
-      if (row.findings_json !== null) {
-        let artifactFindings: unknown
-        try {
-          const parsed = JSON.parse(artifact.toString('utf8')) as { findings?: unknown } | null
-          if (!parsed || typeof parsed !== 'object' || !Object.hasOwn(parsed, 'findings')) {
-            throw new Error('artifact findings are unreadable')
-          }
-          artifactFindings = parsed.findings
-        } catch {
-          problems.push(`${label}: artifact findings are unreadable`)
-          continue
+      let artifactReport: Record<string, unknown> | undefined
+      try {
+        const parsed = JSON.parse(artifact.toString('utf8')) as unknown
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          artifactReport = parsed as Record<string, unknown>
         }
-        if (JSON.stringify(artifactFindings) !== row.findings_json) {
+      } catch {}
+      if (
+        artifactReport === undefined &&
+        (row.findings_json !== null ||
+          row.effective_policy_hash !== null ||
+          row.base_ref_sha !== null)
+      ) {
+        problems.push(`${label}: artifact findings are unreadable`)
+        continue
+      }
+      if (artifactReport !== undefined) {
+        if (
+          (Object.hasOwn(artifactReport, 'effective_policy_hash') ||
+            row.effective_policy_hash !== null) &&
+          artifactReport.effective_policy_hash !== row.effective_policy_hash
+        ) {
+          problems.push(`${label}: recorded policy provenance does not match the attested artifact`)
+        }
+        const artifactBaseRefSha = Object.hasOwn(artifactReport, 'base_ref_sha')
+          ? artifactReport.base_ref_sha
+          : null
+        if (artifactBaseRefSha !== row.base_ref_sha) {
+          problems.push(`${label}: recorded base provenance does not match the attested artifact`)
+        }
+        if (
+          row.findings_json !== null &&
+          JSON.stringify(artifactReport.findings) !== row.findings_json
+        ) {
           problems.push(`${label}: recorded findings do not match the attested artifact`)
-          continue
         }
       }
       const expected = evidenceSha256({
