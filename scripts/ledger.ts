@@ -34,6 +34,7 @@ export type RemoteReceiptKind = 'candidate-publication' | 'pull-request-binding'
 export type RemoteReceiptRow = {
   authoritative_post_observation_sha256: string
   candidate_commit_oid: string
+  created_at: string
   kind: RemoteReceiptKind
   receipt_json: string
   receipt_sha256: string
@@ -2410,6 +2411,14 @@ export class DomainLedger {
     } catch {
       return false
     }
+    if (sha256(canonicalJson({
+      attemptId: observation.attempt_id,
+      kind: observation.kind,
+      observedAt: observation.observed_at,
+      payload,
+      runId: input.runId,
+      subject: observation.subject
+    })) !== input.observationSha256) return false
     if (input.kind === 'candidate-publication') {
       const receipt = input.receiptPayload
       if (!hasOnlyOwnProperties(receipt, new Set([
@@ -2451,6 +2460,21 @@ export class DomainLedger {
       } catch {
         return false
       }
+      if (sha256(canonicalJson({
+        attemptId: preRead.attempt_id,
+        kind: preRead.kind,
+        observedAt: preRead.observed_at,
+        payload: prePayload,
+        runId: input.runId,
+        subject: preRead.subject
+      })) !== receipt.preRead || sha256(canonicalJson({
+        attemptId: mutation.attempt_id,
+        createdAt: mutation.created_at,
+        kind: mutation.kind,
+        payload: mutationPayload,
+        runId: input.runId,
+        targetFingerprint: mutation.target_fingerprint
+      })) !== receipt.mutationIntent) return false
       const subject = `${route.forge_host}/${route.head_repository_id}:refs/heads/${route.head_branch}`
       const routeFactsMatch = (candidate: Record<string, unknown>): boolean =>
         candidate.forgeHost === route.forge_host &&
@@ -2506,6 +2530,14 @@ export class DomainLedger {
     } catch {
       return false
     }
+    if (sha256(canonicalJson({
+      attemptId: mutation.attempt_id,
+      createdAt: mutation.created_at,
+      kind: mutation.kind,
+      payload: mutationPayload,
+      runId: input.runId,
+      targetFingerprint: mutation.target_fingerprint
+    })) !== receipt.mutationIntent) return false
     const routeFacts = {
       baseBranch: route.base_branch,
       baseRepositoryId: route.base_repository_id,
@@ -2628,7 +2660,7 @@ export class DomainLedger {
   remoteReceipt(runId: string, kind: RemoteReceiptKind): RemoteReceiptRow | undefined {
     return this.#db.prepare(
       `SELECT kind, candidate_commit_oid, authoritative_post_observation_sha256,
-              receipt_json, receipt_sha256
+              receipt_json, receipt_sha256, created_at
        FROM remote_receipts WHERE run_id = ? AND kind = ?`
     ).get(runId, kind) as RemoteReceiptRow | undefined
   }
@@ -3560,21 +3592,50 @@ export class DomainLedger {
     }
 
     const retainedOutcomes = this.#db.prepare(
-      `SELECT o.attempt_id, o.verdict, o.candidate_commit_oid, o.custody_json,
-              o.receipt_digests_json, o.outcome_sha256, a.generation_token
+      `SELECT o.attempt_id, o.run_id, o.verdict, o.stopping_fact, o.reason,
+              o.candidate_commit_oid, o.coordinator_identity, o.actor_identity,
+              o.custody_json, o.receipt_digests_json, o.resume_eligible,
+              o.completed_at, o.outcome_sha256, a.generation_token
        FROM attempt_outcomes o
        JOIN run_attempts a ON a.run_id = o.run_id AND a.attempt_id = o.attempt_id
        WHERE o.run_id = ? ORDER BY o.completed_at, o.rowid`
     ).all(manifest.runId) as {
+      actor_identity: string
       attempt_id: string
       candidate_commit_oid: string
+      completed_at: string
+      coordinator_identity: string
       custody_json: string
       generation_token: number | bigint
       outcome_sha256: string
+      reason: string
       receipt_digests_json: string
+      resume_eligible: number | bigint
+      run_id: string
+      stopping_fact: string
       verdict: Exclude<RunStatus, 'in-progress'>
     }[]
-    const outcomes = retainedOutcomes.map((row) => row.outcome_sha256)
+    const outcomes = retainedOutcomes.map((row) => {
+      try {
+        const digest = sha256(canonicalJson({
+          actorIdentity: row.actor_identity,
+          attemptId: row.attempt_id,
+          candidateCommitOid: row.candidate_commit_oid,
+          completedAt: row.completed_at,
+          coordinatorIdentity: row.coordinator_identity,
+          custody: JSON.parse(row.custody_json) as unknown,
+          reason: row.reason,
+          receiptDigests: JSON.parse(row.receipt_digests_json) as unknown,
+          resumeEligible: Number(row.resume_eligible) === 1,
+          runId: row.run_id,
+          stoppingFact: row.stopping_fact,
+          verdict: row.verdict
+        }))
+        return digest === row.outcome_sha256 ? digest : ''
+      } catch {
+        return ''
+      }
+    })
     if (canonicalJson(outcomes) !== canonicalJson(manifest.attemptOutcomeDigests)) {
       problems.push('attempt outcomes')
     }
@@ -3626,6 +3687,16 @@ export class DomainLedger {
       } catch {
         problems.push(`${receipt.kind} observation`)
         continue
+      }
+      if (sha256(canonicalJson({
+        authoritativePostObservationSha256: receipt.authoritative_post_observation_sha256,
+        candidateCommitOid: receipt.candidate_commit_oid,
+        createdAt: receipt.created_at,
+        kind: receipt.kind,
+        payload,
+        runId: manifest.runId
+      })) !== receipt.receipt_sha256) {
+        problems.push(`${receipt.kind} receipt digest`)
       }
       if (!this.#remoteObservationMatches({
         allowHistoricalAttempt: true,
