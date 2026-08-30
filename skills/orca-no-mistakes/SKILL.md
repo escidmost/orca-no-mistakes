@@ -10,7 +10,7 @@ Drive the implemented `orca-no-mistakes` CLI. It runs the six local validation s
 
 `intent -> rebase -> review -> test -> document -> lint`
 
-Release 1 is local-only: it does not push, create PRs, or wait for CI. Success produces a pipeline completion attestation bound to the validated commit.
+Release 1 is local-only: it does not push, create PRs, or wait for CI. Success produces a v1.3 local evidence manifest bound to the validated commit.
 
 If your assigned task explicitly says you are already a no-mistakes stage worker, complete only that stage and return its structured report. Do not start a nested pipeline.
 

@@ -25,7 +25,7 @@ Release 1 pulled forward two capabilities the list above assigns to later releas
 
 Release 2 still owns `--force-with-lease` candidate publication and pull-request creation; Release 4 still owns coordinator restart recovery, parked-gate reattachment, and three-way custody reconciliation. Every other item stands as decided.
 
-The local v1.3 manifest emitted at the end of Release 1 is a pipeline completion attestation, historically called a "Passed Attestation" by the current implementation. It proves that every required *local* validation stage reached an accepted terminal disposition for the exact candidate; it does not prove delivery. Full "Passed" — including remote delivery, PR, and CI proof — remains reserved for Release 4.
+The local v1.3 evidence manifest emitted at the end of Release 1, historically called a "Passed Attestation" by the current implementation, predates and does not satisfy the version 2 pipeline completion-attestation schema. It binds the recorded stage history and terminal candidate after every required *local* validation stage reaches an accepted terminal disposition; it does not prove that every stage ran against one unchanged candidate or prove delivery. Full "Passed" — including remote delivery, PR, and CI proof — remains reserved for Release 4.
 
 ## Consequences
 
