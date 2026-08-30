@@ -311,6 +311,15 @@ const STAGE_EVIDENCE_PROPERTIES = new Set([
   'waiverOrApproval',
   'workerIdentity'
 ])
+const PUBLICATION_ROUTE_PROPERTIES = new Set([
+  'baseBranch',
+  'baseRepositoryId',
+  'forgeHost',
+  'headBranch',
+  'headOwner',
+  'headRepositoryId',
+  'routeFingerprint'
+])
 const WAIVER_PROPERTIES = new Set(['decision', 'gateId', 'resolvedAt'])
 
 function hasOnlyOwnProperties(value: object, allowed: ReadonlySet<string>): boolean {
@@ -614,9 +623,11 @@ export function verifyCompletionAttestation(manifest: CompletionAttestationManif
   ) {
     throw new Error('attestation stage dispositions do not match the stage plan')
   }
-  const evidenceByStage = new Map(manifest.stageEvidence.map((entry) => [entry.stage, entry]))
-  if (evidenceByStage.size !== manifest.stageEvidence.length) {
-    throw new Error('attestation stage evidence contains duplicate stages')
+  const evidenceByDigest = new Map(
+    manifest.stageEvidence.map((entry) => [entry.evidenceSha256, entry])
+  )
+  if (evidenceByDigest.size !== manifest.stageEvidence.length) {
+    throw new Error('attestation stage evidence contains duplicate entries')
   }
   for (const [index, disposition] of manifest.stageDispositions.entries()) {
     const plan = manifest.stagePlan[index]
@@ -638,10 +649,10 @@ export function verifyCompletionAttestation(manifest: CompletionAttestationManif
     if (!completed) {
       throw new Error(`attestation stage ${plan.stage} is not conclusively disposed`)
     }
-    const evidence = evidenceByStage.get(plan.stage)
+    const evidence = evidenceByDigest.get(disposition.evidenceSha256 ?? '')
     if (
       disposition.disposition === 'satisfied' &&
-      (!evidence || disposition.evidenceSha256 !== evidence.evidenceSha256)
+      evidence?.stage !== plan.stage
     ) {
       throw new Error(`attestation stage ${plan.stage} disposition does not bind its evidence`)
     }
@@ -656,18 +667,8 @@ export function verifyCompletionAttestation(manifest: CompletionAttestationManif
   const route = manifest.publicationRoute
   if (
     !route ||
-    !hasOnlyOwnProperties(
-      route,
-      new Set([
-        'baseBranch',
-        'baseRepositoryId',
-        'forgeHost',
-        'headBranch',
-        'headOwner',
-        'headRepositoryId',
-        'routeFingerprint'
-      ])
-    ) ||
+    Reflect.ownKeys(route).length !== PUBLICATION_ROUTE_PROPERTIES.size ||
+    !hasOnlyOwnProperties(route, PUBLICATION_ROUTE_PROPERTIES) ||
     Object.entries(route).some(([key, value]) => key !== 'routeFingerprint' &&
       (typeof value !== 'string' || value.trim() === ''))
   ) {
@@ -1898,9 +1899,9 @@ export class DomainLedger {
       this.#db.exec('BEGIN IMMEDIATE')
       transaction = true
       const marker = this.#db.prepare(
-        'SELECT 1 FROM repository_migrations WHERE source_path = ? AND repo_root = ?'
-      ).get(sourcePath, repoRoot)
-      if (marker) {
+        'SELECT source_present FROM repository_migrations WHERE source_path = ? AND repo_root = ?'
+      ).get(sourcePath, repoRoot) as { source_present: number } | undefined
+      if (marker && (marker.source_present === 1 || !sourcePresent)) {
         this.#db.exec('COMMIT')
         transaction = false
         return
@@ -1952,11 +1953,12 @@ export class DomainLedger {
           `PRAGMA legacy.table_info(${table})`
         ).all() as { name: string }[])
           .map(({ name }) => name)
-          .filter((name) => destinationColumns.has(name))
+          .filter((name) => destinationColumns.has(name) &&
+            !(table === 'stage_checkpoints' && name === 'id'))
         if (columns.length === 0) return
         const names = columns.join(', ')
         this.#db.prepare(
-          `INSERT OR IGNORE INTO main.${table} (${names})
+          `INSERT INTO main.${table} (${names})
            SELECT ${names} FROM legacy.${table} ${where}`
         ).run(repoRoot)
       }
@@ -1992,7 +1994,10 @@ export class DomainLedger {
       this.#db.prepare(
         `INSERT INTO repository_migrations
            (source_path, repo_root, source_present, completed_at)
-         VALUES (?, ?, 1, ?)`
+         VALUES (?, ?, 1, ?)
+         ON CONFLICT(source_path, repo_root) DO UPDATE SET
+           source_present = excluded.source_present,
+           completed_at = excluded.completed_at`
       ).run(sourcePath, repoRoot, new Date().toISOString())
       this.#db.exec('COMMIT')
       transaction = false
@@ -3527,11 +3532,11 @@ export class DomainLedger {
     ) {
       problems.push('stage dispositions')
     }
-    const finalStage = manifest.stagePlan.findLast((plan) =>
-      manifest.stageEvidence.some((evidence) => evidence.stage === plan.stage)
+    const finalDisposition = manifest.stageDispositions.findLast(
+      (disposition) => disposition.evidenceSha256 !== undefined
     )
     const finalEvidence = manifest.stageEvidence.find(
-      (evidence) => evidence.stage === finalStage?.stage
+      (evidence) => evidence.evidenceSha256 === finalDisposition?.evidenceSha256
     )
     const retainedFinalEvidence = retainedEvidence.rows.find(
       (row) => row.evidence_sha256 === finalEvidence?.evidenceSha256
