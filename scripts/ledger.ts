@@ -2361,7 +2361,7 @@ export class DomainLedger {
     const route = this.publicationRoute(input.runId)
     if (!route || input.receiptPayload.routeFingerprint !== route.route_fingerprint) return false
     const observation = this.#db.prepare(
-      `SELECT o.attempt_id, o.kind, o.subject, o.payload_json, a.generation_token
+      `SELECT o.attempt_id, o.kind, o.subject, o.payload_json, o.observed_at, a.generation_token
        FROM remote_observations o
        JOIN run_attempts a ON a.attempt_id = o.attempt_id AND a.run_id = o.run_id
        WHERE o.run_id = ? AND o.observation_sha256 = ?`
@@ -2370,6 +2370,7 @@ export class DomainLedger {
           attempt_id: string
           generation_token: number | bigint
           kind: string
+          observed_at: string
           payload_json: string
           subject: string
         }
@@ -2384,6 +2385,8 @@ export class DomainLedger {
       if (latest.generation_token === null ||
           Number(observation.generation_token) !== Number(latest.generation_token)) return false
     }
+    const baseline = this.publicationBaseline(input.runId)
+    if (!baseline || baseline.route_fingerprint !== route.route_fingerprint) return false
     let payload: Record<string, unknown>
     try {
       payload = JSON.parse(observation.payload_json) as Record<string, unknown>
@@ -2391,19 +2394,124 @@ export class DomainLedger {
       return false
     }
     if (input.kind === 'candidate-publication') {
-      return observation.kind === 'publication-head' &&
-        observation.subject === `refs/heads/${route.head_branch}` &&
-        payload.oid === input.candidateCommitOid
+      const receipt = input.receiptPayload
+      if (!hasOnlyOwnProperties(receipt, new Set([
+        'mutationIntent', 'outcome', 'postRead', 'preRead', 'routeFingerprint'
+      ])) ||
+          !['created', 'updated', 'unchanged'].includes(String(receipt.outcome)) ||
+          typeof receipt.preRead !== 'string' || typeof receipt.mutationIntent !== 'string' ||
+          receipt.postRead !== input.observationSha256) return false
+      const preRead = this.#db.prepare(
+        `SELECT attempt_id, kind, subject, payload_json, observed_at
+         FROM remote_observations WHERE run_id = ? AND observation_sha256 = ?`
+      ).get(input.runId, receipt.preRead) as
+        | { attempt_id: string; kind: string; observed_at: string; payload_json: string; subject: string }
+        | undefined
+      const mutation = this.#db.prepare(
+        `SELECT attempt_id, kind, target_fingerprint, payload_json, created_at
+         FROM mutation_intents WHERE run_id = ? AND intent_sha256 = ?`
+      ).get(input.runId, receipt.mutationIntent) as
+        | {
+            attempt_id: string
+            created_at: string
+            kind: string
+            payload_json: string
+            target_fingerprint: string
+          }
+        | undefined
+      if (!preRead || !mutation || preRead.attempt_id !== observation.attempt_id ||
+          mutation.attempt_id !== observation.attempt_id ||
+          mutation.kind !== 'candidate-publication' ||
+          mutation.target_fingerprint !== route.route_fingerprint ||
+          baseline.observed_at !== preRead.observed_at ||
+          preRead.observed_at > mutation.created_at || mutation.created_at > observation.observed_at) {
+        return false
+      }
+      let prePayload: Record<string, unknown>
+      let mutationPayload: Record<string, unknown>
+      try {
+        prePayload = JSON.parse(preRead.payload_json) as Record<string, unknown>
+        mutationPayload = JSON.parse(mutation.payload_json) as Record<string, unknown>
+      } catch {
+        return false
+      }
+      const subject = `${route.forge_host}/${route.head_repository_id}:refs/heads/${route.head_branch}`
+      const routeFactsMatch = (candidate: Record<string, unknown>): boolean =>
+        candidate.forgeHost === route.forge_host &&
+        candidate.repositoryId === route.head_repository_id &&
+        candidate.headOwner === route.head_owner &&
+        candidate.headBranch === route.head_branch
+      const preReadMatches = baseline.authoritative_absence === 1
+        ? hasOnlyOwnProperties(prePayload, new Set([
+            'forgeHost', 'headBranch', 'headOwner', 'repositoryId', 'state'
+          ])) && prePayload.state === 'absent'
+        : hasOnlyOwnProperties(prePayload, new Set([
+            'forgeHost', 'headBranch', 'headOwner', 'oid', 'repositoryId'
+          ])) && prePayload.oid === baseline.head_commit_oid
+      return preRead.kind === 'publication-head' && preRead.subject === subject &&
+        observation.kind === 'publication-head' && observation.subject === subject &&
+        routeFactsMatch(prePayload) && routeFactsMatch(payload) && preReadMatches &&
+        hasOnlyOwnProperties(payload, new Set([
+          'forgeHost', 'headBranch', 'headOwner', 'oid', 'repositoryId'
+        ])) && payload.oid === input.candidateCommitOid &&
+        hasOnlyOwnProperties(mutationPayload, new Set(['expected', 'update'])) &&
+        mutationPayload.expected === (baseline.authoritative_absence === 1
+          ? 'absent'
+          : baseline.head_commit_oid) &&
+        mutationPayload.update === input.candidateCommitOid
     }
-    const number = input.receiptPayload.number
-    const expectedSubject = input.receiptPayload.subject
+    const receipt = input.receiptPayload
+    if (!hasOnlyOwnProperties(receipt, new Set([
+      'mutationIntent', 'number', 'outcome', 'postRead', 'routeFingerprint'
+    ])) || !Number.isInteger(receipt.number) || Number(receipt.number) <= 0 ||
+        !['created', 'updated', 'unchanged'].includes(String(receipt.outcome)) ||
+        typeof receipt.mutationIntent !== 'string' ||
+        receipt.postRead !== input.observationSha256) return false
+    const mutation = this.#db.prepare(
+      `SELECT attempt_id, kind, target_fingerprint, payload_json, created_at
+       FROM mutation_intents WHERE run_id = ? AND intent_sha256 = ?`
+    ).get(input.runId, receipt.mutationIntent) as
+      | {
+          attempt_id: string
+          created_at: string
+          kind: string
+          payload_json: string
+          target_fingerprint: string
+        }
+      | undefined
+    const publication = this.remoteReceipt(input.runId, 'candidate-publication')
+    if (!mutation || !publication || publication.candidate_commit_oid !== input.candidateCommitOid ||
+        mutation.attempt_id !== observation.attempt_id || mutation.kind !== 'pull-request' ||
+        mutation.target_fingerprint !== route.route_fingerprint ||
+        mutation.created_at > observation.observed_at) return false
+    let mutationPayload: Record<string, unknown>
+    try {
+      mutationPayload = JSON.parse(mutation.payload_json) as Record<string, unknown>
+    } catch {
+      return false
+    }
+    const routeFacts = {
+      baseBranch: route.base_branch,
+      baseRepositoryId: route.base_repository_id,
+      candidateCommitOid: input.candidateCommitOid,
+      forgeHost: route.forge_host,
+      headBranch: route.head_branch,
+      headOwner: route.head_owner,
+      headRepositoryId: route.head_repository_id
+    }
     return observation.kind === 'pull-request' &&
-      payload.candidateCommitOid === input.candidateCommitOid &&
-      number !== undefined && payload.number === number &&
-      (typeof expectedSubject === 'string'
-        ? observation.subject === expectedSubject
-        : observation.subject.startsWith(`${route.head_owner}/`) &&
-          observation.subject.endsWith(`#${String(number)}`))
+      observation.subject === `${route.forge_host}/${route.base_repository_id}#${String(receipt.number)}` &&
+      hasOnlyOwnProperties(payload, new Set([
+        ...Object.keys(routeFacts), 'number', 'state'
+      ])) &&
+      hasOnlyOwnProperties(mutationPayload, new Set([
+        ...Object.keys(routeFacts), 'action'
+      ])) &&
+      Object.entries(routeFacts).every(([key, value]) =>
+        payload[key] === value && mutationPayload[key] === value
+      ) &&
+      payload.number === receipt.number && payload.state === 'open' &&
+      mutationPayload.action === 'ensure-open'
   }
 
   settleRemoteStage(input: {
@@ -3368,8 +3476,10 @@ export class DomainLedger {
 
   verifyRetainedCompletionAttestation(manifest: PipelineCompletionAttestationManifest): void {
     const problems: string[] = []
+    const retainedEvidence = this.#verifyEvidence(manifest.runId, manifest.stageEvidence)
+    problems.push(...retainedEvidence.problems.map((problem) => `stage evidence: ${problem}`))
     const retainedRun = this.#db.prepare(
-      `SELECT status, terminal_commit_oid, submission_commit_oid, intent, intent_hash, policy_sha256
+      `SELECT status, terminal_commit_oid, intent, intent_hash, policy_sha256
        FROM runs WHERE run_id = ?`
     ).get(manifest.runId) as
       | {
@@ -3377,13 +3487,11 @@ export class DomainLedger {
           intent_hash: string
           policy_sha256: string
           status: RunStatus
-          submission_commit_oid: string
           terminal_commit_oid: string | null
         }
       | undefined
     if (!retainedRun || retainedRun.status !== 'passed' ||
         retainedRun.terminal_commit_oid !== manifest.candidateCommitOid ||
-        retainedRun.submission_commit_oid !== manifest.baseCommitOid ||
         retainedRun.intent !== manifest.intent || retainedRun.intent_hash !== manifest.intentHash ||
         retainedRun.policy_sha256 !== manifest.policySha256) {
       problems.push('passed run')
@@ -3407,6 +3515,18 @@ export class DomainLedger {
       canonicalJson(expectedDispositions)
     ) {
       problems.push('stage dispositions')
+    }
+    const finalStage = manifest.stagePlan.findLast((plan) =>
+      manifest.stageEvidence.some((evidence) => evidence.stage === plan.stage)
+    )
+    const finalEvidence = manifest.stageEvidence.find(
+      (evidence) => evidence.stage === finalStage?.stage
+    )
+    const retainedFinalEvidence = retainedEvidence.rows.find(
+      (row) => row.evidence_sha256 === finalEvidence?.evidenceSha256
+    )
+    if (!retainedFinalEvidence || retainedFinalEvidence.base_commit_oid !== manifest.baseCommitOid) {
+      problems.push('base commit evidence')
     }
 
     const route = this.publicationRoute(manifest.runId)
