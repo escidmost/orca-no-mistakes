@@ -1891,25 +1891,30 @@ export class DomainLedger {
   }
 
   #migrateLegacyRepository(repoRoot: string, sourcePath: string): void {
-    const marker = this.#db.prepare(
-      'SELECT 1 FROM repository_migrations WHERE source_path = ? AND repo_root = ?'
-    ).get(sourcePath, repoRoot)
-    if (marker) return
-
-    if (!existsSync(sourcePath)) {
-      this.#db.prepare(
-        `INSERT INTO repository_migrations
-           (source_path, repo_root, source_present, completed_at)
-         VALUES (?, ?, 0, ?)`
-      ).run(sourcePath, repoRoot, new Date().toISOString())
-      return
-    }
-
-    this.#db.prepare('ATTACH DATABASE ? AS legacy').run(sourcePath)
+    const sourcePresent = existsSync(sourcePath)
+    if (sourcePresent) this.#db.prepare('ATTACH DATABASE ? AS legacy').run(sourcePath)
     let transaction = false
     try {
       this.#db.exec('BEGIN IMMEDIATE')
       transaction = true
+      const marker = this.#db.prepare(
+        'SELECT 1 FROM repository_migrations WHERE source_path = ? AND repo_root = ?'
+      ).get(sourcePath, repoRoot)
+      if (marker) {
+        this.#db.exec('COMMIT')
+        transaction = false
+        return
+      }
+      if (!sourcePresent) {
+        this.#db.prepare(
+          `INSERT INTO repository_migrations
+             (source_path, repo_root, source_present, completed_at)
+           VALUES (?, ?, 0, ?)`
+        ).run(sourcePath, repoRoot, new Date().toISOString())
+        this.#db.exec('COMMIT')
+        transaction = false
+        return
+      }
       const active = this.#db.prepare(
         `SELECT r.run_id, r.status,
                 EXISTS(SELECT 1 FROM legacy.branch_leases l WHERE l.run_id = r.run_id) AS has_lease
@@ -1995,7 +2000,7 @@ export class DomainLedger {
       if (transaction) this.#db.exec('ROLLBACK')
       throw error
     } finally {
-      this.#db.exec('DETACH DATABASE legacy')
+      if (sourcePresent) this.#db.exec('DETACH DATABASE legacy')
     }
   }
 
@@ -2086,8 +2091,10 @@ export class DomainLedger {
 
   stageDispositions(runId: string): StageDispositionRow[] {
     return this.#db.prepare(
-      `SELECT stage_id, disposition, evidence_sha256
-       FROM stage_dispositions WHERE run_id = ? ORDER BY rowid`
+      `SELECT d.stage_id, d.disposition, d.evidence_sha256
+       FROM stage_dispositions d
+       JOIN stage_plan_entries p ON p.run_id = d.run_id AND p.stage_id = d.stage_id
+       WHERE d.run_id = ? ORDER BY p.position`
     ).all(runId) as StageDispositionRow[]
   }
 
@@ -2351,8 +2358,8 @@ export class DomainLedger {
   }
 
   #remoteObservationMatches(input: {
+    allowHistoricalAttempt?: boolean
     candidateCommitOid: string
-    expectedAttemptId?: string
     kind: RemoteReceiptKind
     observationSha256: string
     receiptPayload: Record<string, unknown>
@@ -2376,9 +2383,7 @@ export class DomainLedger {
         }
       | undefined
     if (!observation) return false
-    if (input.expectedAttemptId) {
-      if (observation.attempt_id !== input.expectedAttemptId) return false
-    } else {
+    if (!input.allowHistoricalAttempt) {
       const latest = this.#db.prepare(
         'SELECT MAX(generation_token) AS generation_token FROM run_attempts WHERE run_id = ?'
       ).get(input.runId) as { generation_token: number | bigint | null }
@@ -2423,7 +2428,6 @@ export class DomainLedger {
           mutation.attempt_id !== observation.attempt_id ||
           mutation.kind !== 'candidate-publication' ||
           mutation.target_fingerprint !== route.route_fingerprint ||
-          baseline.observed_at !== preRead.observed_at ||
           preRead.observed_at > mutation.created_at || mutation.created_at > observation.observed_at) {
         return false
       }
@@ -3544,13 +3548,16 @@ export class DomainLedger {
     }
 
     const retainedOutcomes = this.#db.prepare(
-      `SELECT attempt_id, verdict, candidate_commit_oid, custody_json,
-              receipt_digests_json, outcome_sha256
-       FROM attempt_outcomes WHERE run_id = ? ORDER BY completed_at, rowid`
+      `SELECT o.attempt_id, o.verdict, o.candidate_commit_oid, o.custody_json,
+              o.receipt_digests_json, o.outcome_sha256, a.generation_token
+       FROM attempt_outcomes o
+       JOIN run_attempts a ON a.run_id = o.run_id AND a.attempt_id = o.attempt_id
+       WHERE o.run_id = ? ORDER BY o.completed_at, o.rowid`
     ).all(manifest.runId) as {
       attempt_id: string
       candidate_commit_oid: string
       custody_json: string
+      generation_token: number | bigint
       outcome_sha256: string
       receipt_digests_json: string
       verdict: Exclude<RunStatus, 'in-progress'>
@@ -3564,10 +3571,15 @@ export class DomainLedger {
       manifest.candidatePublicationReceiptSha256,
       manifest.pullRequestBindingReceiptSha256
     ].sort()
+    const latestAttempt = this.#db.prepare(
+      'SELECT MAX(generation_token) AS generation_token FROM run_attempts WHERE run_id = ?'
+    ).get(manifest.runId) as { generation_token: number | bigint | null }
     const passedOutcome = retainedOutcomes.find((row) => {
       if (row.verdict !== 'passed' || row.candidate_commit_oid !== manifest.candidateCommitOid) {
         return false
       }
+      if (latestAttempt.generation_token === null ||
+          Number(row.generation_token) !== Number(latestAttempt.generation_token)) return false
       try {
         const custody = JSON.parse(row.custody_json) as unknown
         const receipts = JSON.parse(row.receipt_digests_json) as unknown
@@ -3604,8 +3616,8 @@ export class DomainLedger {
         continue
       }
       if (!this.#remoteObservationMatches({
+        allowHistoricalAttempt: true,
         candidateCommitOid: receipt.candidate_commit_oid,
-        ...(passedOutcome ? { expectedAttemptId: passedOutcome.attempt_id } : {}),
         kind: receipt.kind,
         observationSha256: receipt.authoritative_post_observation_sha256,
         receiptPayload: payload,
