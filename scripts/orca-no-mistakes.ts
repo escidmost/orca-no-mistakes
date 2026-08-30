@@ -80,7 +80,9 @@ import {
   normalizeIntent,
   noMistakesHome,
   sha256,
+  verifyCompletionAttestation,
   verifyManifest,
+  type CompletionAttestationManifest,
   type FindingDecisionRow,
   type PassedAttestationManifest,
   type PrunableRun,
@@ -11919,7 +11921,7 @@ Prune options:
 
 function assertStoredAttestationPassed(
   ledger: DomainLedger,
-  manifest: PassedAttestationManifest,
+  manifest: CompletionAttestationManifest,
 ): void {
   const status = ledger.runStatus(manifest.runId);
   if (status !== "passed") {
@@ -11944,8 +11946,9 @@ async function runAttestationCommand(
   const ledger = new DomainLedger();
   try {
     if (action === "export") {
-      const manifest = ledger.getAttestation(ref);
-      verifyManifest(manifest, PIPELINE_STEPS);
+      const manifest = ledger.getCompletionAttestation(ref);
+      if (manifest.version === "1.3.0") verifyManifest(manifest, PIPELINE_STEPS);
+      else verifyCompletionAttestation(manifest);
       assertStoredAttestationPassed(ledger, manifest);
       const output = `${JSON.stringify(manifest, null, 2)}\n`;
       const outPath = stringFlag(flags, "out");
@@ -11970,9 +11973,10 @@ async function runAttestationCommand(
     }
     const manifest =
       raw === undefined
-        ? ledger.getAttestation(ref)
-        : (JSON.parse(raw) as PassedAttestationManifest);
-    verifyManifest(manifest, PIPELINE_STEPS);
+        ? ledger.getCompletionAttestation(ref)
+        : (JSON.parse(raw) as CompletionAttestationManifest);
+    if (manifest.version === "1.3.0") verifyManifest(manifest, PIPELINE_STEPS);
+    else verifyCompletionAttestation(manifest);
     // The manifest is self-verifying: the Merkle root covers its header and
     // every stage digest, so a manifest carried to a machine that never ran the
     // pipeline still proves its own integrity. It is tamper-evident, not
