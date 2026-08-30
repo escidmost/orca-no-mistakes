@@ -93,7 +93,7 @@ The single Orca No-Mistakes-owned forge comment that presents redacted run and s
 _Avoid_: Pull-request body, trust anchor, remote evidence store
 
 **Pull-request binding receipt**:
-A durable local record binding exact pull-request and managed-summary identities to the publication route, candidate commit, forge observations, and mutation outcome.
+A durable local record binding exact pull-request and managed-summary identities to the publication route, candidate commit, forge observations, and operation outcome.
 _Avoid_: PR URL, comment text, create response
 
 **Required policy**:
