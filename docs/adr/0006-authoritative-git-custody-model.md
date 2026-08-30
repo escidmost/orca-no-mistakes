@@ -19,4 +19,4 @@ The target pipeline owns an exact proposed-change head while it creates rebases 
 
 ## Consequences
 
-Release 4 implements custody return and recovery under ADR-0010. Earlier remote-delivery releases explicitly accept that a crash may strand pipeline-created commits and therefore cannot emit the full target Passed outcome.
+Release 1 implements preserved recovery refs for terminal runs and uncontended fast-forward custody return on successful runs. Release 4 implements adoption and three-way custody recovery for interrupted or divergent runs under ADR-0010. Earlier remote releases explicitly accept that a crash may strand pipeline-created commits and therefore cannot emit the full target Passed outcome.
