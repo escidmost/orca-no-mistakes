@@ -127,9 +127,15 @@ test('Release 2 ledger facts are immutable, append-only, and atomically checkpoi
       attemptId: 'attempt-1',
       kind: 'publication-head',
       observedAt: timestamp,
-      payload: { state: 'absent' },
+      payload: {
+        forgeHost: 'github.com',
+        headBranch: 'feature',
+        headOwner: 'fork-owner',
+        repositoryId: 'R_head',
+        state: 'absent'
+      },
       runId,
-      subject: 'refs/heads/feature'
+      subject: 'github.com/R_head:refs/heads/feature'
     })
     const mutationIntent = ledger.recordMutationIntent({
       attemptId: 'attempt-1',
@@ -143,9 +149,15 @@ test('Release 2 ledger facts are immutable, append-only, and atomically checkpoi
       attemptId: 'attempt-1',
       kind: 'publication-head',
       observedAt: timestamp,
-      payload: { oid: commit },
+      payload: {
+        forgeHost: 'github.com',
+        headBranch: 'feature',
+        headOwner: 'fork-owner',
+        oid: commit,
+        repositoryId: 'R_head'
+      },
       runId,
-      subject: 'refs/heads/feature'
+      subject: 'github.com/R_head:refs/heads/feature'
     })
 
     const evidence = {

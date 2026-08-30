@@ -11550,9 +11550,14 @@ async function runPruneCommand(flags: RawCliFlags): Promise<void> {
   // Runs record the root git itself reported, so a symlinked argument has to be
   // canonicalised before it can match one.
   const repoRoot =
+    repoFlag === undefined ? undefined : await canonicalPath(repoFlag);
+  const assertedRepoRoots =
     repoFlag === undefined
       ? undefined
-      : await canonicalPathFromExistingAncestor(repoFlag);
+      : new Set([
+          repoRoot as string,
+          await canonicalPathFromExistingAncestor(repoFlag),
+        ]);
   if (flags.stranded === true) {
     if (before !== undefined)
       throw new Error("--before cannot be combined with --stranded");
@@ -11568,7 +11573,13 @@ async function runPruneCommand(flags: RawCliFlags): Promise<void> {
   let pruned = 0;
   let retained = 0;
   try {
-    for (const run of ledger.prunableRuns({ before, repoRoot })) {
+    for (const run of ledger.prunableRuns({ before })) {
+      if (
+        assertedRepoRoots !== undefined &&
+        !assertedRepoRoots.has(path.resolve(run.repo_root))
+      ) {
+        continue;
+      }
       if (!RUN_ID_PATTERN.test(run.run_id)) {
         retained += 1;
         console.error(
@@ -11578,7 +11589,7 @@ async function runPruneCommand(flags: RawCliFlags): Promise<void> {
       }
       const state = await recoveryHeadState(
         run,
-        repoRoot !== undefined && repoRoot === path.resolve(run.repo_root),
+        assertedRepoRoots?.has(path.resolve(run.repo_root)) ?? false,
       );
       if (state !== "contained") {
         retained += 1;

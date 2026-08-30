@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
+import { writeFileSync } from 'node:fs'
 import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -42,6 +43,7 @@ function stageEvidence(runId: string, stage: 'pr' | 'push', round: number): Stag
 function completionFacts(
   ledger: DomainLedger,
   runId: string,
+  artifactRoot: string,
   verdict: 'failed' | 'passed' = 'passed'
 ): { manifest: PipelineCompletionAttestationManifest; publicationObservation: string } {
   const intent = `Complete ${runId}.`
@@ -63,6 +65,7 @@ function completionFacts(
       runId,
       stageId: entry.stage
     })
+    writeFileSync(path.join(artifactRoot, `${runId}-${entry.stage}.txt`), `${entry.stage}-artifact`)
   }
   const publicationRoute = {
     baseBranch: 'main',
@@ -73,6 +76,12 @@ function completionFacts(
     headRepositoryId: 'R_head'
   }
   const routeFingerprint = ledger.recordPublicationRoute({ ...publicationRoute, runId })
+  ledger.recordPublicationBaseline({
+    headCommitOid: null,
+    observedAt: '2026-08-30T12:00:01.000Z',
+    routeFingerprint,
+    runId
+  })
   const attemptId = `${runId}-attempt`
   ledger.startAttempt({
     actorIdentity: 'operator',
@@ -86,23 +95,43 @@ function completionFacts(
     attemptId,
     kind: 'publication-head',
     observedAt: '2026-08-30T12:00:01.000Z',
-    payload: { state: 'absent' },
+    payload: {
+      forgeHost: 'github.com',
+      headBranch: 'feature',
+      headOwner: 'owner',
+      repositoryId: 'R_head',
+      state: 'absent'
+    },
     runId,
-    subject: 'refs/heads/feature'
+    subject: 'github.com/R_head:refs/heads/feature'
+  })
+  const publicationIntent = ledger.recordMutationIntent({
+    attemptId,
+    createdAt: '2026-08-30T12:00:01.500Z',
+    kind: 'candidate-publication',
+    payload: { expected: 'absent', update: commit },
+    runId,
+    targetFingerprint: routeFingerprint
   })
   const publicationObservation = ledger.recordRemoteObservation({
     attemptId,
     kind: 'publication-head',
     observedAt: '2026-08-30T12:00:02.000Z',
-    payload: { oid: commit },
+    payload: {
+      forgeHost: 'github.com',
+      headBranch: 'feature',
+      headOwner: 'owner',
+      oid: commit,
+      repositoryId: 'R_head'
+    },
     runId,
-    subject: 'refs/heads/feature'
+    subject: 'github.com/R_head:refs/heads/feature'
   })
   const push = evidence[0]
   const pushSettlement = {
     checkpoint: { inputCommitOid: commit, outputCommitOid: commit, roundIndex: 0 },
     evidence: {
-      artifactPath: `/tmp/${runId}-push.json`,
+      artifactPath: path.join(artifactRoot, `${runId}-push.txt`),
       artifactSha256: push.artifactSha256,
       baseCommitOid: commit,
       candidateCommitOid: commit,
@@ -118,7 +147,13 @@ function completionFacts(
       authoritativePostObservationSha256: unrelatedObservation,
       candidateCommitOid: commit,
       kind: 'candidate-publication',
-      payload: { routeFingerprint }
+      payload: {
+        mutationIntent: publicationIntent,
+        outcome: 'created',
+        postRead: unrelatedObservation,
+        preRead: unrelatedObservation,
+        routeFingerprint
+      }
     },
     runId,
     stageId: 'push'
@@ -131,22 +166,53 @@ function completionFacts(
     ...pushSettlement,
     receipt: {
       ...pushSettlement.receipt,
-      authoritativePostObservationSha256: publicationObservation
+      authoritativePostObservationSha256: publicationObservation,
+      payload: {
+        ...pushSettlement.receipt.payload,
+        postRead: publicationObservation
+      }
     }
   }).receiptSha256
+  const pullRequestIntent = ledger.recordMutationIntent({
+    attemptId,
+    createdAt: '2026-08-30T12:00:02.500Z',
+    kind: 'pull-request',
+    payload: {
+      action: 'ensure-open',
+      baseBranch: 'main',
+      baseRepositoryId: 'R_base',
+      candidateCommitOid: commit,
+      forgeHost: 'github.com',
+      headBranch: 'feature',
+      headOwner: 'owner',
+      headRepositoryId: 'R_head'
+    },
+    runId,
+    targetFingerprint: routeFingerprint
+  })
   const pullRequestObservation = ledger.recordRemoteObservation({
     attemptId,
     kind: 'pull-request',
     observedAt: '2026-08-30T12:00:03.000Z',
-    payload: { candidateCommitOid: commit, number: 77 },
+    payload: {
+      baseBranch: 'main',
+      baseRepositoryId: 'R_base',
+      candidateCommitOid: commit,
+      forgeHost: 'github.com',
+      headBranch: 'feature',
+      headOwner: 'owner',
+      headRepositoryId: 'R_head',
+      number: 77,
+      state: 'open'
+    },
     runId,
-    subject: 'owner/repo#77'
+    subject: 'github.com/R_base#77'
   })
   const pr = evidence[1]
   const pullRequestReceipt = ledger.settleRemoteStage({
     checkpoint: { inputCommitOid: commit, outputCommitOid: commit, roundIndex: 1 },
     evidence: {
-      artifactPath: `/tmp/${runId}-pr.json`,
+      artifactPath: path.join(artifactRoot, `${runId}-pr.txt`),
       artifactSha256: pr.artifactSha256,
       baseCommitOid: commit,
       candidateCommitOid: commit,
@@ -162,7 +228,13 @@ function completionFacts(
       authoritativePostObservationSha256: pullRequestObservation,
       candidateCommitOid: commit,
       kind: 'pull-request-binding',
-      payload: { number: 77, routeFingerprint }
+      payload: {
+        mutationIntent: pullRequestIntent,
+        number: 77,
+        outcome: 'created',
+        postRead: pullRequestObservation,
+        routeFingerprint
+      }
     },
     runId,
     stageId: 'pr'
@@ -265,7 +337,7 @@ test('v2 receipts, outcomes, and child facts remain bound to passed runs', async
   const ledger = new DomainLedger(dbPath)
   const failedLedger = new DomainLedger(':memory:')
   try {
-    const { manifest, publicationObservation } = completionFacts(ledger, 'passed-run')
+    const { manifest, publicationObservation } = completionFacts(ledger, 'passed-run', temp)
     const wrongIntent = buildPipelineCompletionAttestation(manifest.stageEvidence, {
       ...manifest,
       intent: 'Different retained intent.'
@@ -273,7 +345,7 @@ test('v2 receipts, outcomes, and child facts remain bound to passed runs', async
     assert.throws(() => ledger.recordAttestation(wrongIntent), /passed run/)
     ledger.recordAttestation(manifest)
 
-    const failed = completionFacts(failedLedger, 'failed-only-run', 'failed')
+    const failed = completionFacts(failedLedger, 'failed-only-run', temp, 'failed')
     assert.throws(
       () => failedLedger.recordAttestation(failed.manifest),
       /passed attempt outcome/

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -28,7 +28,7 @@ function evidence(
 ): StageEvidenceManifestEntry[] {
   return plan.map((stage, round) => {
     const entry: StageEvidenceManifestEntry = {
-      artifactSha256: sha256(`${stage}-artifact`),
+      artifactSha256: sha256('{}'),
       baseCommitOid: commit,
       candidateCommitOid: commit,
       evidenceSha256: '',
@@ -96,6 +96,23 @@ test('v2 completion attestations bind Release 2 facts without overstating assura
         runId,
         stageId: entry.stage
       })
+      const artifactPath = path.join(home, `${entry.stage}.json`)
+      await writeFile(artifactPath, '{}')
+      if (entry.stage !== 'push' && entry.stage !== 'pr') {
+        ledger.recordEvidence({
+          artifactPath,
+          artifactSha256: entry.artifactSha256,
+          baseCommitOid: entry.baseCommitOid,
+          candidateCommitOid: entry.candidateCommitOid,
+          evidenceSha256: entry.evidenceSha256,
+          exitCode: entry.exitCode,
+          roundIndex: entry.round,
+          runId,
+          stageId: entry.stage,
+          summary: entry.summary,
+          workerIdentity: entry.workerIdentity
+        })
+      }
     }
     const routeFingerprint = ledger.recordPublicationRoute({
       ...publicationRoute,
@@ -132,14 +149,48 @@ test('v2 completion attestations bind Release 2 facts without overstating assura
       startedAt: '2026-08-30T12:00:02.000Z'
     })
 
+    ledger.recordPublicationBaseline({
+      headCommitOid: null,
+      observedAt: '2026-08-30T12:00:03.000Z',
+      routeFingerprint,
+      runId
+    })
+    const preRead = ledger.recordRemoteObservation({
+      attemptId: 'passed-attempt',
+      kind: 'publication-head',
+      observedAt: '2026-08-30T12:00:03.000Z',
+      payload: {
+        forgeHost: 'github.com',
+        headBranch: 'feature',
+        headOwner: 'owner',
+        repositoryId: 'R_head',
+        state: 'absent'
+      },
+      runId,
+      subject: 'github.com/R_head:refs/heads/feature'
+    })
+    const publicationIntent = ledger.recordMutationIntent({
+      attemptId: 'passed-attempt',
+      createdAt: '2026-08-30T12:00:04.000Z',
+      kind: 'candidate-publication',
+      payload: { expected: 'absent', update: commit },
+      runId,
+      targetFingerprint: routeFingerprint
+    })
     const pushEvidence = stageEvidence.find((entry) => entry.stage === 'push')!
     const pushObservation = ledger.recordRemoteObservation({
       attemptId: 'passed-attempt',
       kind: 'publication-head',
-      observedAt: '2026-08-30T12:00:03.000Z',
-      payload: { oid: commit },
+      observedAt: '2026-08-30T12:00:05.000Z',
+      payload: {
+        forgeHost: 'github.com',
+        headBranch: 'feature',
+        headOwner: 'owner',
+        oid: commit,
+        repositoryId: 'R_head'
+      },
       runId,
-      subject: 'refs/heads/feature'
+      subject: 'github.com/R_head:refs/heads/feature'
     })
     const publicationReceipt = ledger.settleRemoteStage({
       checkpoint: { inputCommitOid: commit, outputCommitOid: commit, roundIndex: 6 },
@@ -160,20 +211,53 @@ test('v2 completion attestations bind Release 2 facts without overstating assura
         authoritativePostObservationSha256: pushObservation,
         candidateCommitOid: commit,
         kind: 'candidate-publication',
-        payload: { routeFingerprint }
+        payload: {
+          mutationIntent: publicationIntent,
+          outcome: 'created',
+          postRead: pushObservation,
+          preRead,
+          routeFingerprint
+        }
       },
       runId,
       stageId: 'push'
     }).receiptSha256
 
     const prEvidence = stageEvidence.find((entry) => entry.stage === 'pr')!
+    const pullRequestIntent = ledger.recordMutationIntent({
+      attemptId: 'passed-attempt',
+      createdAt: '2026-08-30T12:00:06.000Z',
+      kind: 'pull-request',
+      payload: {
+        action: 'ensure-open',
+        baseBranch: 'main',
+        baseRepositoryId: 'R_base',
+        candidateCommitOid: commit,
+        forgeHost: 'github.com',
+        headBranch: 'feature',
+        headOwner: 'owner',
+        headRepositoryId: 'R_head'
+      },
+      runId,
+      targetFingerprint: routeFingerprint
+    })
     const prObservation = ledger.recordRemoteObservation({
       attemptId: 'passed-attempt',
       kind: 'pull-request',
-      observedAt: '2026-08-30T12:00:04.000Z',
-      payload: { candidateCommitOid: commit, number: 77 },
+      observedAt: '2026-08-30T12:00:07.000Z',
+      payload: {
+        baseBranch: 'main',
+        baseRepositoryId: 'R_base',
+        candidateCommitOid: commit,
+        forgeHost: 'github.com',
+        headBranch: 'feature',
+        headOwner: 'owner',
+        headRepositoryId: 'R_head',
+        number: 77,
+        state: 'open'
+      },
       runId,
-      subject: 'owner/repo#77'
+      subject: 'github.com/R_base#77'
     })
     const prReceipt = ledger.settleRemoteStage({
       checkpoint: { inputCommitOid: commit, outputCommitOid: commit, roundIndex: 7 },
@@ -194,7 +278,13 @@ test('v2 completion attestations bind Release 2 facts without overstating assura
         authoritativePostObservationSha256: prObservation,
         candidateCommitOid: commit,
         kind: 'pull-request-binding',
-        payload: { number: 77, routeFingerprint }
+        payload: {
+          mutationIntent: pullRequestIntent,
+          number: 77,
+          outcome: 'created',
+          postRead: prObservation,
+          routeFingerprint
+        }
       },
       runId,
       stageId: 'pr'
@@ -203,7 +293,7 @@ test('v2 completion attestations bind Release 2 facts without overstating assura
       actorIdentity: 'operator',
       attemptId: 'passed-attempt',
       candidateCommitOid: commit,
-      completedAt: '2026-08-30T12:00:05.000Z',
+      completedAt: '2026-08-30T12:00:08.000Z',
       coordinatorIdentity: 'coordinator',
       custody: {
         recoveryRef: `refs/no-mistakes/recover/${runId}`,
