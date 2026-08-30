@@ -11777,3 +11777,44 @@ test("a stage whose findings were never addressed cannot be attested", async () 
     ["review round 5: artifact findings are unreadable"],
   );
 });
+
+test("Test prompts keep checker read-only and authorize fixer repairs", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  const ledger = new DomainLedger(":memory:");
+  orca.gateResolution = "fix missing-focused-evidence";
+  orca.reports.set("test", [
+    {
+      findings: [
+        {
+          id: "missing-focused-evidence",
+          severity: "warning",
+          action: "ask-user",
+          description: "No focused test proves the requested intent",
+        },
+      ],
+      summary: "focused evidence missing",
+    },
+    pass("focused regression added"),
+    pass("focused evidence verified"),
+  ]);
+
+  await runPipeline({ intent: "Prove the requested behavior" }, orca, git, ledger);
+
+  const checker = orca.launches.find(
+    (launch) => launch.stage === "test" && launch.role === "reviewer",
+  )?.prompt;
+  const fixer = orca.launches.find(
+    (launch) => launch.stage === "test" && launch.role === "fixer",
+  )?.prompt;
+  assert.ok(checker);
+  assert.ok(fixer);
+  assert.match(checker, /Do not edit or commit files/);
+  assert.match(checker, /report a warning finding.*focused test.*evidence/i);
+  assert.doesNotMatch(checker, /write or improve a focused test/i);
+  assert.match(
+    fixer,
+    /add the smallest focused regression test file or repair product code/i,
+  );
+  assert.match(fixer, /Do NOT modify or delete pre-existing test files/);
+});
