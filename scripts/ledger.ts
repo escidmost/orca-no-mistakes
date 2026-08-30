@@ -2223,10 +2223,17 @@ export class DomainLedger {
     verdict: Exclude<RunStatus, 'in-progress'>
   }): string {
     const attempt = this.#db.prepare(
-      'SELECT run_id FROM run_attempts WHERE attempt_id = ?'
-    ).get(input.attemptId) as { run_id: string } | undefined
+      `SELECT run_id, actor_identity, coordinator_identity
+       FROM run_attempts WHERE attempt_id = ?`
+    ).get(input.attemptId) as
+      | { actor_identity: string; coordinator_identity: string; run_id: string }
+      | undefined
     if (attempt?.run_id !== input.runId) {
       throw new Error(`attempt ${input.attemptId} does not belong to run ${input.runId}`)
+    }
+    if (attempt.actor_identity !== input.actorIdentity ||
+        attempt.coordinator_identity !== input.coordinatorIdentity) {
+      throw new Error(`attempt ${input.attemptId} identity does not match its outcome`)
     }
     const outcome = {
       actorIdentity: input.actorIdentity,

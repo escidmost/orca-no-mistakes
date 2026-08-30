@@ -11550,7 +11550,9 @@ async function runPruneCommand(flags: RawCliFlags): Promise<void> {
   // Runs record the root git itself reported, so a symlinked argument has to be
   // canonicalised before it can match one.
   const repoRoot =
-    repoFlag === undefined ? undefined : await canonicalPath(repoFlag);
+    repoFlag === undefined
+      ? undefined
+      : await canonicalPathFromExistingAncestor(repoFlag);
   if (flags.stranded === true) {
     if (before !== undefined)
       throw new Error("--before cannot be combined with --stranded");
@@ -11560,7 +11562,9 @@ async function runPruneCommand(flags: RawCliFlags): Promise<void> {
     await reapStrandedGates(scanRoot);
     return;
   }
-  const ledger = openRepositoryLedger(repoRoot ?? process.cwd());
+  const ledger = openRepositoryLedger(
+    repoRoot !== undefined && !existsSync(repoRoot) ? process.cwd() : repoRoot ?? process.cwd(),
+  );
   let pruned = 0;
   let retained = 0;
   try {
