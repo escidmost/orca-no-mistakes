@@ -6,6 +6,7 @@ import {
   mkdtemp,
   readFile,
   rm,
+  stat,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -26,7 +27,7 @@ function isolateHome(temp: string): () => void {
   };
 }
 
-test("StageLog rejects stale accounting from a replaced compacted file", async () => {
+test("StageLog rejects stale accounting when a replaced compacted file reuses an inode", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "onm-stale-accounting-"));
   const logPath = path.join(temp, "artifacts", "run", "review_r1.log");
   const crashScript = path.join(temp, "crash.mjs");
@@ -53,6 +54,15 @@ process.exit(0)
 `,
     );
     execFileSync(process.execPath, [crashScript, logPath]);
+
+    const metadataPath = `${logPath}.meta`;
+    const metadata = JSON.parse(await readFile(metadataPath, "utf8")) as {
+      fileIdentity: string;
+    };
+    const current = await stat(logPath, { bigint: true });
+    const staleGeneration = metadata.fileIdentity.split(":").slice(2).map(() => "stale");
+    metadata.fileIdentity = [current.dev, current.ino, ...staleGeneration].join(":");
+    await writeFile(metadataPath, JSON.stringify(metadata));
 
     const reopened = new StageLog(logPath, 2_048);
     await reopened.append("C".repeat(3_000));

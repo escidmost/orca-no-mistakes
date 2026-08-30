@@ -753,8 +753,8 @@ export class StageLog {
     )
     await assertPrivateRegularFile(reopened)
     this.#file = reopened
-    const reopenedStat = await reopened.stat()
-    this.#fileIdentity = `${reopenedStat.dev}:${reopenedStat.ino}`
+    const reopenedStat = await reopened.stat({ bigint: true })
+    this.#fileIdentity = `${reopenedStat.dev}:${reopenedStat.ino}:${reopenedStat.birthtimeNs}`
     this.#fileBytes = parts.reduce((total, part) => total + part.length, 0)
     this.#compacted = true
     await this.#recordOriginalBytes()
@@ -780,16 +780,21 @@ export class StageLog {
     const file = await open(logPath, O_APPEND | O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
     try {
       await assertPrivateRegularFile(file)
-      const fileStat = await file.stat()
-      let existingBytes = fileStat.size
-      const fileIdentity = `${fileStat.dev}:${fileStat.ino}`
+      const fileStat = await file.stat({ bigint: true })
+      let existingBytes = Number(fileStat.size)
+      const fileIdentity = `${fileStat.dev}:${fileStat.ino}:${fileStat.birthtimeNs}`
+      const canTrustFileIdentity =
+        fileStat.birthtimeNs > 0n && fileStat.birthtimeNs !== fileStat.ctimeNs
       await file.chmod(0o600)
       // The first `keep` bytes are the round's head and never change; whatever
       // follows is the previous worker's marker and tail, which this worker's
       // output replaces so the file ends with the round's final tail. Nothing
       // already on disk is parsed back, so worker text cannot forge accounting.
       const recorded = await this.#priorAccounting()
-      const prior = recorded?.fileIdentity === fileIdentity ? recorded : undefined
+      const prior =
+        canTrustFileIdentity && recorded?.fileIdentity === fileIdentity
+          ? recorded
+          : undefined
       this.#originalBytesKnown =
         existingBytes === 0 ||
         (prior !== undefined && prior.originalBytesKnown !== false)
