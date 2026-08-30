@@ -3317,7 +3317,7 @@ Rules:
 - For UI, HTML, CSS, Electron renderer, browser, visual layout, or copy-placement changes, attempt to capture reviewer-visible visual evidence (screenshots, videos, rendered HTML). If not possible, state why in summary.
 - Look for existing tests that would generate sufficient evidence. If they exist, run the smallest relevant set that proves the requested intent.
 - Do NOT run the complete repository test suite. Local Test is targeted validation of the requested intent; remote CI owns broad regression.
-- Never treat "do not run everything" as permission to run nothing: if no targeted automated test can establish the intent, write or improve a focused test, perform manual verification with evidence, or report a warning finding.
+- Never treat "do not run everything" as permission to run nothing: if no targeted automated test can establish the intent, perform manual verification with evidence or report a warning finding identifying the missing focused test or evidence. Do not add or modify tests.
 - If automated testing cannot produce the needed evidence, execute manual verification steps and record the evidence-producing steps you performed.
 - If sufficient evidence is not possible, report a warning finding with action "ask-user" explaining what evidence is missing.
 
@@ -3480,7 +3480,8 @@ function fixerInstructions(stage: StageName): string {
 
     case "test":
       return `Rules:
-- Reproduce the specific failing case first (the exact test, package, script, or check named in the findings), then re-run only that focused verification after the fix.
+- For a reported failure, reproduce the exact test, package, script, or check named in the findings, then re-run only that focused verification after the fix.
+- For a missing focused test or evidence finding, add the smallest focused regression test file or repair product code as needed to establish the requested intent.
 - Make the smallest correct root-cause fix.
 - Do not refactor beyond what is needed for that root-cause fix.
 - If tests fail, determine whether the problem is a real product/code failure, a setup/environment problem you can fix, or a flaky/infrastructure issue.
