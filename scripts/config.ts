@@ -289,15 +289,16 @@ export function resolveRoleConfig(
     if (!config) continue
     if (config.agent !== undefined && name && source) {
       const agents = Array.isArray(config.agent) ? config.agent : [config.agent]
-      const inherited = selectionKeys.flatMap((key) => {
+      const conflicts: string[] = []
+      for (const key of selectionKeys) {
         const origin = selectionOrigins[key]
         const usesFallback = agents.some((agent) => typeof agent === 'string' || agent[key] === undefined)
-        return config[key] === undefined && usesFallback && merged[key] !== undefined && origin?.source !== source
-          ? [`${key} from ${origin?.name ?? 'a lower layer'}`]
-          : []
-      })
-      if (inherited.length > 0) {
-        throw new Error(`Configuration conflict: ${name} sets agent but would inherit ${inherited.join(', ')}`)
+        if (config[key] !== undefined || !usesFallback || merged[key] === undefined) continue
+        if (origin?.source !== source) conflicts.push(`${key} from ${origin?.name ?? 'a lower layer'}`)
+        else delete merged[key]
+      }
+      if (conflicts.length > 0) {
+        throw new Error(`Configuration conflict: ${name} sets agent but would inherit ${conflicts.join(', ')}`)
       }
     }
     merged = deepMerge(merged, config)

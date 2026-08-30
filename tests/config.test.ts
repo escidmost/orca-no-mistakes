@@ -453,6 +453,15 @@ test('rejects cross-layer harness/model selection', () => {
 
   repoGlobalConfig.defaults = { agent: { harness: 'claude', model: 'claude-sonnet-4-6' } }
   assert.doesNotThrow(() => resolveRoleConfig('review', 'reviewer', { userGlobalConfig, repoGlobalConfig }))
+
+  const sameSource = resolveRoleConfig('review', 'reviewer', {
+    repoGlobalConfig: {
+      defaults: { model: 'gpt-5.6-sol' },
+      stages: { review: { agent: 'claude' } }
+    }
+  })
+  assert.equal(sameSource.agent, 'claude')
+  assert.equal(sameSource.model, undefined)
 })
 
 test('stage defaults apply when stage role override is not specified', () => {
