@@ -83,8 +83,9 @@ export type AgentProfile = {
 }
 
 // One table: how each terminal-launched harness expresses reasoning effort,
-// and which harnesses expose no mechanism at all. Model is uniformly --model
-// where a harness accepts it. Native harnesses (cursor) bypass
+// and which harnesses expose no mechanism at all. OpenCode's variant is mapped
+// to inline agent config below because its interactive TUI has no --variant.
+// Model is uniformly --model where a harness accepts it. Native harnesses (cursor) bypass
 // this table: Orca worker-start owns their per-harness flags; acp:<target>
 // rides acpx's own --model and exposes no effort surface.
 const EFFORT_KNOBS: Record<string, { flag: string; requiresModel?: boolean }> = {
@@ -108,21 +109,80 @@ function flagName(arg: string): string {
   return /^-[A-Za-z].+/.test(arg) && !arg.startsWith('--') ? arg.slice(0, 2) : arg
 }
 
-function pinsAnyFlag(args: string[], flags: string[]): boolean {
+function flagValue(args: string[], flags: string[]): string | undefined {
+  let found: string | undefined
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]
     if (arg === '--') break
     for (const flag of flags) {
+      let value: string | undefined | null = null
       if (arg.startsWith(`${flag}=`)) {
-        if (arg.length > flag.length + 1) return true
+        value = arg.slice(flag.length + 1)
       } else if (flag.length === 2 && arg.startsWith(flag) && arg.length > 2) {
-        return true
+        value = arg.slice(2).replace(/^=/, '')
       } else if (arg === flag) {
-        if (i + 1 < args.length && args[i + 1] !== '') return true
+        value = args[++i]
       }
+      if (value === null) continue
+      if (!value || value.startsWith('-')) throw new Error(`argument ${flag} requires a value`)
+      if (found !== undefined) throw new Error(`argument ${flag} may only be specified once`)
+      found = value
+      break
     }
   }
-  return false
+  return found
+}
+
+function pinsAnyFlag(args: string[], flags: string[]): boolean {
+  return flagValue(args, flags) !== undefined
+}
+
+function withoutFlag(args: string[], flag: string): string[] {
+  const filtered: string[] = []
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]
+    if (arg === '--') return [...filtered, ...args.slice(i)]
+    if (arg === flag) {
+      if (args[i + 1] && !args[i + 1].startsWith('-')) i += 1
+      continue
+    }
+    if (arg.startsWith(`${flag}=`)) continue
+    filtered.push(arg)
+  }
+  return filtered
+}
+
+function opencodeConfigContent(
+  existing: string | undefined,
+  agent: string,
+  model: string | undefined,
+  variant: string,
+): string {
+  let config: Record<string, unknown> = {}
+  if (existing) {
+    try {
+      const parsed: unknown = JSON.parse(existing)
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error()
+      config = parsed as Record<string, unknown>
+    } catch {
+      throw new Error('agent opencode: OPENCODE_CONFIG_CONTENT must be a JSON object')
+    }
+  }
+  const agents =
+    config.agent && typeof config.agent === 'object' && !Array.isArray(config.agent)
+      ? (config.agent as Record<string, unknown>)
+      : {}
+  const current =
+    agents[agent] && typeof agents[agent] === 'object' && !Array.isArray(agents[agent])
+      ? (agents[agent] as Record<string, unknown>)
+      : {}
+  return JSON.stringify({
+    ...config,
+    agent: {
+      ...agents,
+      [agent]: { ...current, ...(model ? { model } : {}), variant },
+    },
+  })
 }
 
 function pinsConfigKey(args: string[], key: string): boolean {
@@ -251,6 +311,7 @@ export function buildCliCommand(harness: string, options: CliAgentCommandOptions
   const env: string[] = []
   const parts: string[] = [normalizedHarness]
   const override = agentArgsOverrideForHarness(options.agentArgsOverride, normalizedHarness)
+  const overrideEnv = override && !Array.isArray(override) ? override : undefined
   if (override && !Array.isArray(override)) {
     for (const [key, value] of Object.entries(override)) {
       if (!ENV_NAME_PATTERN.test(key)) {
@@ -264,7 +325,7 @@ export function buildCliCommand(harness: string, options: CliAgentCommandOptions
       env.push(`${key}=${shellQuote(value)}`)
     }
   }
-  const raw = Array.isArray(override) ? override : []
+  let raw = Array.isArray(override) ? override : []
   if (normalizedHarness === 'agy' && raw.includes('--')) {
     throw new Error(
       `agent ${normalizedHarness}: option terminator '--' cannot precede the managed prompt carrier`
@@ -298,7 +359,23 @@ export function buildCliCommand(harness: string, options: CliAgentCommandOptions
     )
   }
   if (options.model && !modelPinned) parts.push('--model', options.model)
-  if (effortKnob?.requiresModel) {
+  if (normalizedHarness === 'opencode') {
+    const variant = flagValue(raw, ['--variant']) ?? options.variant ?? options.effort
+    if (variant) {
+      const agent = flagValue(raw, ['--agent']) ?? 'build'
+      const model = flagValue(raw, MODEL_PIN_FLAGS) ?? options.model
+      const existingConfig = overrideEnv?.OPENCODE_CONFIG_CONTENT ?? process.env.OPENCODE_CONFIG_CONTENT
+      const existingConfigIndex = env.findIndex((entry) =>
+        entry.startsWith('OPENCODE_CONFIG_CONTENT='),
+      )
+      if (existingConfigIndex >= 0) env.splice(existingConfigIndex, 1)
+      env.push(
+        `OPENCODE_CONFIG_CONTENT=${shellQuote(opencodeConfigContent(existingConfig, agent, model, variant))}`,
+      )
+      if (!flagValue(raw, ['--agent'])) parts.push('--agent', agent)
+      raw = withoutFlag(raw, '--variant')
+    }
+  } else if (effortKnob?.requiresModel) {
     const variant = options.variant ?? options.effort
     if (variant && !pinsAnyFlag(raw, [effortKnob.flag])) parts.push(effortKnob.flag, variant)
   } else if (effortKnob && options.effort && !effortPinned) {

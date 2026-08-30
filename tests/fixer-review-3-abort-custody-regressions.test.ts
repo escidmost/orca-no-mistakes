@@ -292,15 +292,23 @@ setInterval(() => {}, 1000)
       },
     );
     const worker = await workerAllocated;
-    for (let attempt = 0; attempt < 100 && !existsSync(pidPath); attempt += 1) {
-      await delay(10);
+    let stopped = false;
+    try {
+      for (let attempt = 0; attempt < 500 && !existsSync(pidPath); attempt += 1) {
+        await delay(10);
+      }
+      const pid = Number((await readFile(pidPath, "utf8")).trim());
+      assert.ok(Number.isInteger(pid) && pid > 0, `unexpected worker pid: ${pid}`);
+      await orca.finishWorker(worker, "release");
+      stopped = true;
+      await assert.rejects(running);
+      assert.throws(() => process.kill(pid, 0), (error: unknown) => {
+        return (error as NodeJS.ErrnoException).code === "ESRCH";
+      });
+    } finally {
+      if (!stopped) await orca.finishWorker(worker, "release").catch(() => {});
+      await running.catch(() => {});
     }
-    const pid = Number(await readFile(pidPath, "utf8"));
-    await orca.finishWorker(worker, "release");
-    await assert.rejects(running);
-    assert.throws(() => process.kill(pid, 0), (error: unknown) => {
-      return (error as NodeJS.ErrnoException).code === "ESRCH";
-    });
   } finally {
     await rm(temp, { force: true, recursive: true });
   }

@@ -6,7 +6,7 @@ An Orca-native, six-stage local adversarial validation pipeline:
 
 The current runner creates an Orca Run, acquires an exclusive semantic lease on the branch in a SQLite domain ledger (`~/.orca-no-mistakes/ledger.db`), compiles its validation policy from the trusted base commit, and drives fresh reviewers plus retained fixers across disposable child worktrees while the coordinator runs in an isolated gate worktree and applies fixer commits. The worker agent for each stage and role comes from the resolved validation policy configuration. Human decisions use Orca gates; every approval or skip is recorded as an audit row and bound into the final attestation. Stage evidence (reports, logs, exit codes, content hashes) lands under `~/.orca-no-mistakes/artifacts/<run-id>/`, outside the branch. Release 1 is deliberately local-only: it excludes remote `push`, `pr`, and `ci` stages and terminates with a signed-off **Passed Attestation** instead of a push.
 
-Successful completion means all six stages completed with a tamper-evident Merkle attestation binding stage evidence to the exact candidate commit, base commit, policy hash, and declared intent. Remote delivery verification, crash resumption, and forge adapters remain future releases. See [Current Architecture](docs/current-architecture.md) for implemented behavior and [the ADRs](docs/adr/) for accepted target decisions.
+Successful completion means all six stages completed with a tamper-evident Merkle attestation binding stage evidence to the exact candidate commit, base commit, policy hash, and declared intent. Remote delivery verification and forge adapters remain future releases. See [Current Architecture](docs/current-architecture.md) for implemented behavior and [the ADRs](docs/adr/) for accepted target decisions.
 
 ## Install
 
@@ -25,9 +25,10 @@ Direct invocation returns a meaningful process exit status:
 
 ```bash
 orca-no-mistakes run --repo /path/to/repo --intent "Add X without changing Y"
+orca-no-mistakes run --repo /path/to/repo --resume <failed-run-id>
 ```
 
-The runner requires an explicit single-line `--intent`, a clean committed named feature branch, refuses the default base branch, and requires a configured `origin`. It rebases onto the detected default branch unless `--base` is supplied.
+New runs require an explicit single-line `--intent`; failed runs can instead use `--resume` without repeating the intent. The runner requires a clean committed named feature branch, refuses the default base branch, and requires a configured `origin`. It rebases onto the detected default branch unless `--base` is supplied. Detached resume reuses the failed run's ledger and evidence, reconstructs the isolated gate worktree at its last durable checkpoint, and skips completed stages whose commit-bound evidence is still valid. Leave the clean initiating checkout at the failed run's original submission commit so successful custody transfer can advance it automatically.
 
 Useful direct-run options:
 
@@ -38,6 +39,7 @@ Useful direct-run options:
 --reviewer-model <model>
 --fixer-model <model> --fixer-effort <level>
 --max-fix-rounds <count>
+--resume <failed-run-id>
 --allow-local-config
 --config <path>
 ```

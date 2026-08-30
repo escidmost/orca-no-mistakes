@@ -15,6 +15,7 @@ export type GateKind = 'exhaustion' | 'finding' | 'guardrail'
 
 export type GateAuditRow = {
   decision: string
+  evidence_sha256: string | null
   gate_id: string
   gate_kind: GateKind
   guidance: string | null
@@ -24,6 +25,19 @@ export type GateAuditRow = {
   round_index: number
   selected_finding_ids: string | null
   stage_id: string
+}
+
+export function gateAuditMatchesEvidence(
+  audit: GateAuditRow,
+  stage: string,
+  round: number,
+  evidenceSha256: string
+): boolean {
+  return (
+    audit.stage_id === stage &&
+    audit.round_index === round &&
+    audit.evidence_sha256 === evidenceSha256
+  )
 }
 
 export type FindingDecisionRow = {
@@ -39,7 +53,9 @@ export type StageEvidenceRow = {
   artifact_path: string
   artifact_sha256: string | null
   base_commit_oid: string
+  base_ref_sha: string | null
   candidate_commit_oid: string
+  effective_policy_hash: string | null
   evidence_id: string
   evidence_sha256: string
   exit_code: number
@@ -49,6 +65,24 @@ export type StageEvidenceRow = {
   stage_id: string
   summary: string
   worker_identity: string
+}
+
+export type RunRecord = {
+  base_branch: string
+  branch: string
+  intent: string
+  policy_sha256: string
+  repo_root: string
+  run_id: string
+  status: RunStatus
+  submission_commit_oid: string
+}
+
+export type StageCheckpointRow = {
+  input_commit_oid: string
+  output_commit_oid: string
+  round_index: number
+  stage_id: string
 }
 
 export type GateDecisionRecord = {
@@ -68,6 +102,10 @@ export type StageEvidenceManifestEntry = {
   evidenceSha256: string
   summary: string
   waiverOrApproval?: GateDecisionRecord
+}
+
+export function isAuthoritativeStageEvidence(workerIdentity: string): boolean {
+  return workerIdentity !== 'coordinator:fixer-guardrail-advisory'
 }
 
 export type PassedAttestationManifest = {
@@ -944,6 +982,12 @@ CREATE TABLE IF NOT EXISTS lease_generations (
   next_token INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS resume_claims (
+  run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE CASCADE,
+  claim_id TEXT NOT NULL UNIQUE,
+  generation_token INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS stage_checkpoints (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
@@ -978,6 +1022,7 @@ CREATE TABLE IF NOT EXISTS gate_audit (
   run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
   stage_id TEXT NOT NULL,
   round_index INTEGER NOT NULL,
+  evidence_sha256 TEXT,
   gate_kind TEXT NOT NULL DEFAULT 'finding',
   question TEXT NOT NULL,
   options_json TEXT NOT NULL,
@@ -1021,7 +1066,7 @@ export class DomainLedger {
       mkdirSync(path.dirname(dbPath), { recursive: true })
     }
     this.#path = dbPath
-    this.#db = new DatabaseSync(dbPath)
+    this.#db = new DatabaseSync(dbPath, { timeout: 5_000 })
     this.#db.exec('PRAGMA journal_mode = WAL')
     this.#db.exec('PRAGMA foreign_keys = ON')
     // ponytail: pre-release rebuild — legacy ledgers keyed attestations by candidate OID,
@@ -1082,7 +1127,8 @@ export class DomainLedger {
       ['stage_evidence', 'base_ref_sha TEXT'],
       ['stage_evidence', 'artifact_sha256 TEXT'],
       ['stage_evidence', 'findings_json TEXT'],
-      ['gate_audit', 'selected_finding_ids TEXT']
+      ['gate_audit', 'selected_finding_ids TEXT'],
+      ['gate_audit', 'evidence_sha256 TEXT']
     ]) {
       try {
         this.#db.exec(`ALTER TABLE ${table} ADD COLUMN ${column}`)
@@ -1093,6 +1139,35 @@ export class DomainLedger {
         ) {
           throw error
         }
+      }
+    }
+    const schemaVersion = this.#db.prepare('PRAGMA user_version').get() as {
+      user_version: number
+    }
+    if (schemaVersion.user_version < 1) {
+      this.#db.exec('BEGIN IMMEDIATE')
+      try {
+        this.#db.exec(`UPDATE gate_audit
+          SET evidence_sha256 = (
+            SELECT evidence_sha256 FROM stage_evidence
+            WHERE run_id = gate_audit.run_id
+              AND stage_id = gate_audit.stage_id
+              AND round_index = gate_audit.round_index
+            LIMIT 1
+          )
+          WHERE evidence_sha256 IS NULL
+            AND gate_kind != 'guardrail'
+            AND 1 = (
+              SELECT COUNT(DISTINCT evidence_sha256) FROM stage_evidence
+              WHERE run_id = gate_audit.run_id
+                AND stage_id = gate_audit.stage_id
+                AND round_index = gate_audit.round_index
+            )`)
+        this.#db.exec('PRAGMA user_version = 1')
+        this.#db.exec('COMMIT')
+      } catch (error) {
+        this.#db.exec('ROLLBACK')
+        throw error
       }
     }
   }
@@ -1135,6 +1210,178 @@ export class DomainLedger {
         input.policySha256,
         new Date().toISOString()
       )
+  }
+
+  prepareResume(input: {
+    baseBranch: string
+    baseRefSha?: string
+    branch: string
+    effectivePolicyHash: string
+    force?: boolean
+    head: string
+    intent: string
+    policySha256: string
+    repoRoot: string
+    runId: string
+  }): { claimId: string; checkpoint: StageCheckpointRow; generationToken: number } {
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      const checkpoint = this.#validateResume(input)
+      const existing = this.leaseFor(input.repoRoot, input.branch)
+      if (existing && existing.run_id !== input.runId && !input.force) {
+        throw new Error(
+          `branch ${input.branch} is already leased by run ${existing.run_id}; pass --force-lease to reclaim it`
+        )
+      }
+      const generationToken =
+        existing?.run_id === input.runId
+          ? existing.generation_token
+          : this.#nextGenerationToken(
+              input.repoRoot,
+              existing ? existing.generation_token + 1 : 1
+            )
+      const claimId = randomUUID()
+      this.#db
+        .prepare(
+          `INSERT INTO resume_claims (run_id, claim_id, generation_token)
+           VALUES (?, ?, ?)
+           ON CONFLICT(run_id) DO UPDATE SET
+             claim_id = excluded.claim_id,
+             generation_token = excluded.generation_token`
+        )
+        .run(input.runId, claimId, generationToken)
+      this.#db.exec('COMMIT')
+      return { claimId, checkpoint, generationToken }
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  resumeRun(input: {
+    baseBranch: string
+    baseRefSha?: string
+    branch: string
+    claimId: string
+    effectivePolicyHash: string
+    force?: boolean
+    head: string
+    intent: string
+    policySha256: string
+    repoRoot: string
+    runId: string
+  }): { checkpoint: StageCheckpointRow; generationToken: number } {
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      const checkpoint = this.#validateResume(input)
+      const claim = this.#db
+        .prepare(
+          `SELECT generation_token FROM resume_claims
+           WHERE run_id = ? AND claim_id = ?`
+        )
+        .get(input.runId, input.claimId) as
+        | { generation_token: number | bigint }
+        | undefined
+      if (!claim) throw new Error(`run ${input.runId} has no matching resume claim`)
+      const generationToken = Number(claim.generation_token)
+      this.#acquireClaimedLeaseLocked(input, generationToken)
+      this.#db
+        .prepare(
+          "UPDATE runs SET status = 'in-progress', terminal_commit_oid = NULL, completed_at = NULL WHERE run_id = ?"
+        )
+        .run(input.runId)
+      this.#db.exec('COMMIT')
+      return { checkpoint, generationToken }
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  resumeClaimMatches(input: {
+    claimId: string
+    generationToken: number
+    runId: string
+  }): boolean {
+    return (
+      this.#db
+        .prepare(
+          `SELECT 1 FROM resume_claims
+           WHERE run_id = ? AND claim_id = ? AND generation_token = ?`
+        )
+        .get(input.runId, input.claimId, input.generationToken) !== undefined
+    )
+  }
+
+  clearResumeClaim(runId: string, claimId: string): void {
+    this.#db
+      .prepare('DELETE FROM resume_claims WHERE run_id = ? AND claim_id = ?')
+      .run(runId, claimId)
+  }
+
+  #validateResume(input: {
+    baseBranch: string
+    baseRefSha?: string
+    branch: string
+    effectivePolicyHash: string
+    head: string
+    intent: string
+    policySha256: string
+    repoRoot: string
+    runId: string
+  }): StageCheckpointRow {
+    const run = this.run(input.runId)
+    if (!run) throw new Error(`run ${input.runId} does not exist`)
+    if (run.status !== 'failed') {
+      throw new Error(`run ${input.runId} cannot resume from status ${run.status}`)
+    }
+    if (
+      run.repo_root !== input.repoRoot ||
+      run.branch !== input.branch ||
+      run.base_branch !== input.baseBranch ||
+      run.intent !== input.intent
+    ) {
+      throw new Error(`run ${input.runId} does not match this repository, branch, base, and intent`)
+    }
+    if (run.policy_sha256 !== input.policySha256) {
+      throw new Error(`run ${input.runId} validation policy changed since it failed`)
+    }
+    const incompatibleEvidence = this.#db
+      .prepare(
+        `SELECT COUNT(*) AS count FROM stage_evidence
+         WHERE run_id = ? AND (effective_policy_hash IS NULL OR effective_policy_hash <> ?)`
+      )
+      .get(input.runId, input.effectivePolicyHash) as { count: number | bigint }
+    if (Number(incompatibleEvidence.count) > 0) {
+      throw new Error(`run ${input.runId} effective validation policy changed since it failed`)
+    }
+    const incompatibleBaseEvidence = (
+      input.baseRefSha === undefined
+        ? this.#db.prepare(
+            `SELECT COUNT(*) AS count FROM stage_evidence
+             WHERE run_id = ? AND base_ref_sha IS NOT NULL`
+          ).get(input.runId)
+        : this.#db.prepare(
+            `SELECT COUNT(*) AS count FROM stage_evidence
+             WHERE run_id = ? AND (base_ref_sha IS NULL OR base_ref_sha <> ?)`
+          ).get(input.runId, input.baseRefSha)
+    ) as { count: number | bigint }
+    if (Number(incompatibleBaseEvidence.count) > 0) {
+      throw new Error(`run ${input.runId} base ref changed since it failed`)
+    }
+    const checkpoint = this.#db
+      .prepare(
+        `SELECT input_commit_oid, output_commit_oid, round_index, stage_id
+         FROM stage_checkpoints WHERE run_id = ? ORDER BY id DESC LIMIT 1`
+      )
+      .get(input.runId) as StageCheckpointRow | undefined
+    if (!checkpoint) throw new Error(`run ${input.runId} has no durable checkpoint to resume`)
+    if (checkpoint.output_commit_oid !== input.head) {
+      throw new Error(
+        `HEAD ${input.head} does not match checkpoint ${checkpoint.output_commit_oid} for run ${input.runId}`
+      )
+    }
+    return checkpoint
   }
 
   finishRun(
@@ -1188,7 +1435,10 @@ export class DomainLedger {
       }
       // ponytail: fenced compare-and-swap on the observed generation; SQLite serializes
       // writers, so a concurrent taker changes the token first and this update no-ops.
-      const nextToken = Number(existing.generation_token) + 1
+      const nextToken = this.#nextGenerationToken(
+        options.repoRoot,
+        Number(existing.generation_token) + 1
+      )
       const takeover = this.#db
         .prepare(
           'UPDATE branch_leases SET run_id = ?, generation_token = ?, acquired_at = ?, heartbeat_at = ? WHERE repo_root = ? AND branch = ? AND generation_token = ?'
@@ -1216,11 +1466,62 @@ export class DomainLedger {
     return token
   }
 
-  #nextGenerationToken(repoRoot: string): number {
+  #acquireClaimedLeaseLocked(
+    options: { branch: string; force?: boolean; repoRoot: string; runId: string },
+    generationToken: number
+  ): void {
+    const existing = this.#db
+      .prepare('SELECT run_id, generation_token FROM branch_leases WHERE repo_root = ? AND branch = ?')
+      .get(options.repoRoot, options.branch) as LeaseRow | undefined
+    const now = new Date().toISOString()
+    if (existing?.run_id === options.runId) {
+      if (Number(existing.generation_token) !== generationToken) {
+        throw new Error(`run ${options.runId} resume claim no longer matches its branch lease`)
+      }
+      this.#db
+        .prepare('UPDATE branch_leases SET heartbeat_at = ? WHERE repo_root = ? AND branch = ?')
+        .run(now, options.repoRoot, options.branch)
+      return
+    }
+    if (existing) {
+      if (!options.force) {
+        throw new Error(
+          `branch ${options.branch} is already leased by run ${existing.run_id}; pass --force-lease to reclaim it`
+        )
+      }
+      if (Number(existing.generation_token) >= generationToken) {
+        throw new Error(`run ${options.runId} resume claim is stale`)
+      }
+      const takeover = this.#db
+        .prepare(
+          'UPDATE branch_leases SET run_id = ?, generation_token = ?, acquired_at = ?, heartbeat_at = ? WHERE repo_root = ? AND branch = ? AND generation_token = ?'
+        )
+        .run(
+          options.runId,
+          generationToken,
+          now,
+          now,
+          options.repoRoot,
+          options.branch,
+          existing.generation_token
+        )
+      if (Number(takeover.changes) === 0) {
+        throw new Error(`run ${options.runId} resume claim is stale`)
+      }
+      return
+    }
+    this.#db
+      .prepare(
+        'INSERT INTO branch_leases (repo_root, branch, run_id, generation_token, acquired_at, heartbeat_at) VALUES (?, ?, ?, ?, ?, ?)'
+      )
+      .run(options.repoRoot, options.branch, options.runId, generationToken, now, now)
+  }
+
+  #nextGenerationToken(repoRoot: string, minimum = 1): number {
     const row = this.#db
       .prepare('SELECT next_token FROM lease_generations WHERE repo_root = ?')
       .get(repoRoot) as { next_token: number | bigint } | undefined
-    const token = row ? Number(row.next_token) : 1
+    const token = Math.max(row ? Number(row.next_token) : 1, minimum)
     this.#db
       .prepare(
         'INSERT INTO lease_generations (repo_root, next_token) VALUES (?, ?) ON CONFLICT(repo_root) DO UPDATE SET next_token = excluded.next_token'
@@ -1238,6 +1539,24 @@ export class DomainLedger {
     }
   }
 
+  ownsLease(
+    runId: string,
+    ownership?: { branch: string; generationToken?: number; repoRoot: string }
+  ): boolean {
+    const run = this.runIdentity(runId)
+    if (!run || run.status !== 'in-progress') return false
+    const repoRoot = ownership?.repoRoot ?? run.repo_root
+    const branch = ownership?.branch ?? run.branch
+    const lease = this.leaseFor(repoRoot, branch)
+    return (
+      run.repo_root === repoRoot &&
+      run.branch === branch &&
+      lease?.run_id === runId &&
+      (ownership?.generationToken === undefined ||
+        lease.generation_token === ownership.generationToken)
+    )
+  }
+
   releaseLease(runId: string): void {
     this.#db.prepare('DELETE FROM branch_leases WHERE run_id = ?').run(runId)
   }
@@ -1245,7 +1564,7 @@ export class DomainLedger {
   settleRun(
     runId: string,
     status: 'cancelled' | 'failed',
-    ownership?: { branch: string; repoRoot: string }
+    ownership?: { branch: string; generationToken?: number; repoRoot: string }
   ): boolean {
     this.#db.exec('BEGIN IMMEDIATE')
     try {
@@ -1258,7 +1577,9 @@ export class DomainLedger {
           run.repo_root !== ownership.repoRoot ||
           run.branch !== ownership.branch ||
           (run.status === 'in-progress'
-            ? lease?.run_id !== runId
+            ? lease?.run_id !== runId ||
+              (ownership.generationToken !== undefined &&
+                lease.generation_token !== ownership.generationToken)
             : run.status !== status))
       ) {
         this.#db.exec('COMMIT')
@@ -1274,18 +1595,52 @@ export class DomainLedger {
     }
   }
 
+  #requirePassedRunLease(
+    runId: string,
+    ownership?: { branch: string; generationToken: number; repoRoot: string }
+  ): void {
+    if (!this.ownsLease(runId, ownership)) {
+      throw new Error(`run ${runId} no longer owns its branch lease`)
+    }
+  }
+
+  #completePassedRun(manifest: PassedAttestationManifest, terminalCommitOid: string): void {
+    if (!this.finishRun(manifest.runId, 'passed', terminalCommitOid)) {
+      throw new Error(`run ${manifest.runId} is already settled`)
+    }
+    this.releaseLease(manifest.runId)
+    this.recordAttestation(manifest)
+  }
+
   finalizePassedRun(
     manifest: PassedAttestationManifest,
-    terminalCommitOid: string
+    terminalCommitOid: string,
+    ownership?: { branch: string; generationToken: number; repoRoot: string }
   ): void {
     this.#db.exec('BEGIN IMMEDIATE')
     try {
-      if (!this.finishRun(manifest.runId, 'passed', terminalCommitOid)) {
-        throw new Error(`run ${manifest.runId} is already settled`)
-      }
-      this.releaseLease(manifest.runId)
-      this.recordAttestation(manifest)
+      this.#requirePassedRunLease(manifest.runId, ownership)
+      this.#completePassedRun(manifest, terminalCommitOid)
       this.#db.exec('COMMIT')
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  async finalizePassedRunWithLeaseMutation(
+    manifest: PassedAttestationManifest,
+    terminalCommitOid: string,
+    ownership: { branch: string; generationToken: number; repoRoot: string },
+    mutation: () => Promise<string>
+  ): Promise<string> {
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      this.#requirePassedRunLease(manifest.runId, ownership)
+      const result = await mutation()
+      this.#completePassedRun(manifest, terminalCommitOid)
+      this.#db.exec('COMMIT')
+      return result
     } catch (error) {
       this.#db.exec('ROLLBACK')
       throw error
@@ -1364,8 +1719,8 @@ export class DomainLedger {
       .prepare(
         `SELECT evidence_id, run_id, stage_id, round_index, candidate_commit_oid, base_commit_oid,
                 worker_identity, exit_code, evidence_sha256, artifact_path, artifact_sha256,
-                summary, findings_json
-         FROM stage_evidence WHERE run_id = ? ORDER BY stage_id, round_index, rowid`
+                summary, findings_json, effective_policy_hash, base_ref_sha
+         FROM stage_evidence WHERE run_id = ? ORDER BY rowid`
       )
       .all(runId) as StageEvidenceRow[]
   }
@@ -1381,7 +1736,9 @@ export class DomainLedger {
    * manifest entry must still find its row. Returns one message per failure so
    * a caller can report them all at once.
    */
-  verifyEvidence(manifest: PassedAttestationManifest): string[] {
+  verifyEvidence(
+    manifest: Pick<PassedAttestationManifest, 'runId' | 'stageEvidence'>
+  ): string[] {
     return this.#verifyEvidence(manifest.runId, manifest.stageEvidence).problems
   }
 
@@ -1434,21 +1791,41 @@ export class DomainLedger {
         problems.push(`${label}: artifact ${row.artifact_path} does not match its recorded digest`)
         continue
       }
-      if (row.findings_json !== null) {
-        let artifactFindings: unknown
-        try {
-          const parsed = JSON.parse(artifact.toString('utf8')) as { findings?: unknown } | null
-          if (!parsed || typeof parsed !== 'object' || !Object.hasOwn(parsed, 'findings')) {
-            throw new Error('artifact findings are unreadable')
-          }
-          artifactFindings = parsed.findings
-        } catch {
-          problems.push(`${label}: artifact findings are unreadable`)
-          continue
+      let artifactReport: Record<string, unknown> | undefined
+      try {
+        const parsed = JSON.parse(artifact.toString('utf8')) as unknown
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          artifactReport = parsed as Record<string, unknown>
         }
-        if (JSON.stringify(artifactFindings) !== row.findings_json) {
+      } catch {}
+      if (
+        artifactReport === undefined &&
+        (row.findings_json !== null ||
+          row.effective_policy_hash !== null ||
+          row.base_ref_sha !== null)
+      ) {
+        problems.push(`${label}: artifact findings are unreadable`)
+        continue
+      }
+      if (artifactReport !== undefined) {
+        if (
+          (Object.hasOwn(artifactReport, 'effective_policy_hash') ||
+            row.effective_policy_hash !== null) &&
+          artifactReport.effective_policy_hash !== row.effective_policy_hash
+        ) {
+          problems.push(`${label}: recorded policy provenance does not match the attested artifact`)
+        }
+        const artifactBaseRefSha = Object.hasOwn(artifactReport, 'base_ref_sha')
+          ? artifactReport.base_ref_sha
+          : null
+        if (artifactBaseRefSha !== row.base_ref_sha) {
+          problems.push(`${label}: recorded base provenance does not match the attested artifact`)
+        }
+        if (
+          row.findings_json !== null &&
+          JSON.stringify(artifactReport.findings) !== row.findings_json
+        ) {
           problems.push(`${label}: recorded findings do not match the attested artifact`)
-          continue
         }
       }
       const expected = evidenceSha256({
@@ -1492,18 +1869,27 @@ export class DomainLedger {
           if (!waiver) return false
           const audit = auditsByGateId.get(waiver.gateId)
           return (
-            audit?.stage_id === entry.stage &&
-            audit.round_index === entry.round &&
+            audit !== undefined &&
+            gateAuditMatchesEvidence(
+              audit,
+              entry.stage,
+              entry.round,
+              entry.evidenceSha256
+            ) &&
             audit.decision === waiver.decision &&
             audit.resolved_at !== null
           )
         })
         .map((entry) => entry.evidenceSha256)
     )
-    // listEvidence orders by (stage_id, round_index, rowid), so the last row
-    // written for a stage is the one left in the map.
+    // listEvidence orders by insertion, so the last row written for a stage is
+    // the one left in the map.
     const latest = new Map<string, StageEvidenceRow>()
-    for (const row of evidence.rows) latest.set(row.stage_id, row)
+    for (const row of evidence.rows) {
+      if (isAuthoritativeStageEvidence(row.worker_identity)) {
+        latest.set(row.stage_id, row)
+      }
+    }
     const blockers: string[] = []
     for (const row of latest.values()) {
       const label = `${row.stage_id} round ${row.round_index}`
@@ -1537,6 +1923,7 @@ export class DomainLedger {
    * event — including its exhaustion origin — in the ledger as `pending`.
    */
   openGateAudit(input: {
+    evidenceSha256: string
     gateId: string
     gateKind: GateKind
     optionsJson: string
@@ -1548,9 +1935,9 @@ export class DomainLedger {
     this.#db
       .prepare(
         `INSERT INTO gate_audit (
-           gate_id, run_id, stage_id, round_index, gate_kind, question, options_json,
+           gate_id, run_id, stage_id, round_index, evidence_sha256, gate_kind, question, options_json,
            resolution, decision, guidance, opened_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, '', 'pending', NULL, ?)
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', 'pending', NULL, ?)
          ON CONFLICT(gate_id) DO NOTHING`
       )
       .run(
@@ -1558,6 +1945,7 @@ export class DomainLedger {
         input.runId,
         input.stageId,
         input.roundIndex,
+        input.evidenceSha256,
         input.gateKind,
         input.question,
         input.optionsJson,
@@ -1567,6 +1955,7 @@ export class DomainLedger {
 
   recordGateAudit(input: {
     decision: string
+    evidenceSha256?: string
     gateId: string
     gateKind?: GateKind
     guidance?: string
@@ -1579,17 +1968,31 @@ export class DomainLedger {
     stageId: string
   }): void {
     const now = new Date().toISOString()
+    const evidenceSha256 =
+      input.evidenceSha256 ??
+      (input.gateKind === 'guardrail'
+        ? null
+        : (this.#db
+            .prepare(
+              `SELECT evidence_sha256 FROM stage_evidence
+               WHERE run_id = ? AND stage_id = ? AND round_index = ?
+               ORDER BY rowid DESC LIMIT 1`
+            )
+            .get(input.runId, input.stageId, input.roundIndex) as
+            | { evidence_sha256: string }
+            | undefined)?.evidence_sha256 ?? null)
     this.#db
       .prepare(
          `INSERT INTO gate_audit (
-            gate_id, run_id, stage_id, round_index, gate_kind, question, options_json,
+            gate_id, run_id, stage_id, round_index, evidence_sha256, gate_kind, question, options_json,
             resolution, decision, guidance, selected_finding_ids, opened_at, resolved_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(gate_id) DO UPDATE SET
             resolution = excluded.resolution,
             decision = excluded.decision,
             guidance = excluded.guidance,
             selected_finding_ids = excluded.selected_finding_ids,
+            evidence_sha256 = COALESCE(gate_audit.evidence_sha256, excluded.evidence_sha256),
             resolved_at = excluded.resolved_at`
       )
       .run(
@@ -1597,6 +2000,7 @@ export class DomainLedger {
         input.runId,
         input.stageId,
         input.roundIndex,
+        evidenceSha256,
         input.gateKind ?? 'finding',
         input.question,
         input.optionsJson,
@@ -1740,6 +2144,15 @@ export class DomainLedger {
       .get(runId) as { branch: string; repo_root: string; status: RunStatus } | undefined
   }
 
+  run(runId: string): RunRecord | undefined {
+    return this.#db
+      .prepare(
+        `SELECT run_id, repo_root, branch, base_branch, submission_commit_oid,
+                intent, policy_sha256, status FROM runs WHERE run_id = ?`
+      )
+      .get(runId) as RunRecord | undefined
+  }
+
   listRuns(): { intent: string; run_id: string }[] {
     return this.#db.prepare('SELECT intent, run_id FROM runs ORDER BY created_at').all() as {
       intent: string
@@ -1753,20 +2166,18 @@ export class DomainLedger {
       .get(repoRoot, branch) as { generation_token: number; run_id: string } | undefined
   }
 
-  listCheckpoints(
-    runId: string
-  ): { input_commit_oid: string; output_commit_oid: string; round_index: number; stage_id: string }[] {
+  listCheckpoints(runId: string): StageCheckpointRow[] {
     return this.#db
       .prepare(
         'SELECT input_commit_oid, output_commit_oid, round_index, stage_id FROM stage_checkpoints WHERE run_id = ? ORDER BY id'
       )
-      .all(runId) as { input_commit_oid: string; output_commit_oid: string; round_index: number; stage_id: string }[]
+      .all(runId) as StageCheckpointRow[]
   }
 
   listGateAudit(runId: string): GateAuditRow[] {
     return this.#db
       .prepare(
-        `SELECT decision, gate_id, stage_id, round_index, gate_kind, guidance, question, resolution,
+        `SELECT decision, evidence_sha256, gate_id, stage_id, round_index, gate_kind, guidance, question, resolution,
                 resolved_at, selected_finding_ids
          FROM gate_audit WHERE run_id = ? ORDER BY opened_at, rowid`
       )
@@ -1783,9 +2194,8 @@ export class DomainLedger {
       .prepare(
         `SELECT g.decision,
                 (SELECT e.findings_json FROM stage_evidence e
-                  WHERE e.run_id = g.run_id AND e.stage_id = g.stage_id
-                    AND e.round_index = g.round_index AND e.findings_json IS NOT NULL
-                  ORDER BY e.created_at DESC, e.rowid DESC LIMIT 1) AS findings_json,
+                  WHERE e.run_id = g.run_id AND e.evidence_sha256 = g.evidence_sha256
+                    AND e.findings_json IS NOT NULL LIMIT 1) AS findings_json,
                 g.round_index, g.run_id, g.selected_finding_ids, g.stage_id
            FROM gate_audit g
            JOIN runs r ON r.run_id = g.run_id
@@ -1795,8 +2205,8 @@ export class DomainLedger {
             AND g.resolved_at IS NOT NULL AND g.selected_finding_ids IS NOT NULL
             AND EXISTS (
               SELECT 1 FROM stage_evidence e
-               WHERE e.run_id = g.run_id AND e.stage_id = g.stage_id
-                 AND e.round_index = g.round_index AND e.findings_json IS NOT NULL
+               WHERE e.run_id = g.run_id AND e.evidence_sha256 = g.evidence_sha256
+                 AND e.findings_json IS NOT NULL
             )
            ORDER BY g.resolved_at DESC, g.rowid DESC
           LIMIT ?`

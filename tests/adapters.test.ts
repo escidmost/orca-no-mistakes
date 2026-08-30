@@ -107,11 +107,11 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
   assert.equal(buildCliCommand('opencode'), `'opencode'`)
   assert.equal(
     buildCliCommand('opencode', { model: 'gpt-5.6', variant: 'high' }),
-    `'opencode' '--model' 'gpt-5.6' '--variant' 'high'`
+    `OPENCODE_CONFIG_CONTENT='{"agent":{"build":{"model":"gpt-5.6","variant":"high"}}}' 'opencode' '--model' 'gpt-5.6' '--agent' 'build'`
   )
   assert.equal(
     buildCliCommand('opencode', { effort: 'high', model: 'gpt-5.6' }),
-    `'opencode' '--model' 'gpt-5.6' '--variant' 'high'`
+    `OPENCODE_CONFIG_CONTENT='{"agent":{"build":{"model":"gpt-5.6","variant":"high"}}}' 'opencode' '--model' 'gpt-5.6' '--agent' 'build'`
   )
   // Variant is opencode-specific.
   assert.equal(buildCliCommand('grok', { model: 'grok-4', variant: 'high' }), `'grok' '--model' 'grok-4'`)
@@ -262,10 +262,10 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
         agentArgsOverride: { opencode: rawArgs } as never,
         effort: 'high'
       }),
-      `'opencode' '--variant' 'high' ${rawArgs.map((a) => `'${a}'`).join(' ')}`
+      `OPENCODE_CONFIG_CONTENT='{"agent":{"build":{"model":"custom-model","variant":"high"}}}' 'opencode' '--agent' 'build' ${rawArgs.map((a) => `'${a}'`).join(' ')}`
     )
   }
-  // Empty or invalid raw model pins do not satisfy the model requirement:
+  // Empty raw model pins are malformed rather than silently treated as absent.
   for (const rawArgs of [['--model'], ['--model='], ['--model', ''], ['-m'], ['-m='], ['-m', '']]) {
     assert.throws(
       () =>
@@ -273,12 +273,12 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
           agentArgsOverride: { opencode: rawArgs } as never,
           effort: 'high'
         }),
-      /cannot express effort without a model/
+      /requires a value/
     )
   }
   assert.equal(
     buildCliCommand('opencode', { effort: 'medium', variant: 'high' }),
-    `'opencode' '--variant' 'high'`
+    `OPENCODE_CONFIG_CONTENT='{"agent":{"build":{"variant":"high"}}}' 'opencode' '--agent' 'build'`
   )
   // A raw override flag that already pins a knob wins over the profile value.
   const pinned = buildCliCommand('grok', {
@@ -292,7 +292,70 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
     effort: 'high',
     model: 'gpt-5.6'
   })
-  assert.equal(pinnedVariant, `'opencode' '--model' 'gpt-5.6' '--variant=low'`)
+  assert.equal(
+    pinnedVariant,
+    `OPENCODE_CONFIG_CONTENT='{"agent":{"build":{"model":"gpt-5.6","variant":"low"}}}' 'opencode' '--model' 'gpt-5.6' '--agent' 'build'`,
+  )
+  assert.equal(
+    buildCliCommand('opencode', {
+      agentArgsOverride: { opencode: ['--model', 'custom-model'] } as never,
+      model: 'profile-model',
+      variant: 'high',
+    }),
+    `OPENCODE_CONFIG_CONTENT='{"agent":{"build":{"model":"custom-model","variant":"high"}}}' 'opencode' '--agent' 'build' '--model' 'custom-model'`,
+  )
+  assert.equal(
+    buildCliCommand('opencode', {
+      agentArgsOverride: {
+        opencode: ['--agent', 'reviewer'],
+      } as never,
+      variant: 'high',
+    }),
+    `OPENCODE_CONFIG_CONTENT='{"agent":{"reviewer":{"variant":"high"}}}' 'opencode' '--agent' 'reviewer'`,
+  )
+  assert.throws(
+    () =>
+      buildCliCommand('opencode', {
+        agentArgsOverride: { opencode: ['--variant', '--print-logs'] } as never,
+        model: 'gpt-5.6',
+      }),
+    /argument --variant requires a value/,
+  )
+  for (const rawArgs of [['--variant='], ['--variant'], ['--agent='], ['--agent']]) {
+    assert.throws(
+      () =>
+        buildCliCommand('opencode', {
+          agentArgsOverride: { opencode: rawArgs } as never,
+          variant: 'high',
+        }),
+      /requires a value/,
+    )
+  }
+  for (const rawArgs of [
+    ['--agent', 'reviewer', '--agent=build'],
+    ['--model', 'first', '-msecond'],
+    ['--variant=low', '--variant', 'high'],
+  ]) {
+    assert.throws(
+      () =>
+        buildCliCommand('opencode', {
+          agentArgsOverride: { opencode: rawArgs } as never,
+          variant: 'high',
+        }),
+      /may only be specified once/,
+    )
+  }
+  assert.equal(
+    buildCliCommand('opencode', {
+      agentArgsOverride: {
+        opencode: {
+          OPENCODE_CONFIG_CONTENT: '{"theme":"dark","agent":{"build":{"temperature":0.2}}}',
+        },
+      } as never,
+      variant: 'high',
+    }),
+    `OPENCODE_CONFIG_CONTENT='{"theme":"dark","agent":{"build":{"temperature":0.2,"variant":"high"}}}' 'opencode' '--agent' 'build'`,
+  )
   // Unknown harnesses keep the legacy --model passthrough.
   assert.equal(buildCliCommand('mycli', { model: 'm1' }), `'mycli' '--model' 'm1'`)
 

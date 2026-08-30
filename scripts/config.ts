@@ -443,8 +443,8 @@ defaults:
   # codex -> -c model_reasoning_effort=...,
   # claude/agy -> --effort,
   # grok -> --reasoning-effort, pi -> --thinking,
-  # opencode -> --variant (model-scoped: needs a model, a raw model pin, or
-  # an explicit variant),
+  # opencode -> inline agent variant config (model-scoped: needs a model, a raw
+  # model pin, or an explicit variant),
   # acp:<target> -> acpx --model (effort is refused).
   # A raw agent_args_override flag that already pins a knob wins over this
   # value; overrides reach terminal-spawned CLI launches only - Orca native
