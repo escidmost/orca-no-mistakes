@@ -375,6 +375,7 @@ test('5-tier precedence hierarchy resolves in exact order: CLI > Stage Role > St
     stages: {
       // Tier 3: Stage Default Config
       review: {
+        agent: 'tier3-stage-agent',
         model: 'tier3-stage-model',
         effort: 'high',
         // Tier 2: Stage Role Config
@@ -458,6 +459,16 @@ test('rejects cross-layer harness/model selection in either merge order', () => 
       repoGlobalConfig: { defaults: { model: 'gpt-5.6-sol' } }
     }),
     /repository defaults sets model but would apply to agent from user-global defaults/
+  )
+
+  assert.throws(
+    () => resolveRoleConfig('review', 'reviewer', {
+      repoGlobalConfig: {
+        defaults: { agent: 'codex' },
+        stages: { review: { reviewer: { model: 'gpt-5.6-sol' } } }
+      }
+    }),
+    /repository stages\.review\.reviewer sets model but would apply to agent from repository defaults/
   )
 
   repoGlobalConfig.defaults = { agent: { harness: 'claude', model: 'claude-sonnet-4-6' } }
@@ -565,7 +576,7 @@ test('resolvePipelineConfig builds resolved configurations for all pipeline step
     },
     stages: {
       review: {
-        reviewer: { effort: 'high' }
+        reviewer: { agent: 'claude', model: 'sonnet', effort: 'high' }
       }
     },
     auto_fix: {

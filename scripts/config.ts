@@ -288,7 +288,7 @@ export function resolveRoleConfig(
   let merged: RoleConfig = {}
   for (const [config, name, source] of layers) {
     if (!config) continue
-    if (config.agent === undefined && name && source && merged.agent !== undefined && agentOrigin?.source !== source) {
+    if (config.agent === undefined && name && source && merged.agent !== undefined && agentOrigin?.name !== name) {
       const agents = Array.isArray(merged.agent) ? merged.agent : [merged.agent]
       const conflicts = selectionKeys.filter(
         (key) => config[key] !== undefined && agents.some((agent) => typeof agent === 'string' || agent[key] === undefined)
