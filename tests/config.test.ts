@@ -436,6 +436,25 @@ test('5-tier precedence hierarchy resolves in exact order: CLI > Stage Role > St
   assert.equal(fixerConfig.timeout_ms, 20000) // From Tier 4 repo defaults
 })
 
+test('rejects cross-layer harness/model selection', () => {
+  const userGlobalConfig: OrcaNoMistakesConfig = {
+    stages: {
+      review: {
+        reviewer: { agent: 'codex', model: 'gpt-5.6-sol' }
+      }
+    }
+  }
+  const repoGlobalConfig: OrcaNoMistakesConfig = { defaults: { agent: 'claude' } }
+
+  assert.throws(
+    () => resolveRoleConfig('review', 'reviewer', { userGlobalConfig, repoGlobalConfig }),
+    /repository defaults sets agent but would inherit model from user-global stages\.review\.reviewer/
+  )
+
+  repoGlobalConfig.defaults = { agent: { harness: 'claude', model: 'claude-sonnet-4-6' } }
+  assert.doesNotThrow(() => resolveRoleConfig('review', 'reviewer', { userGlobalConfig, repoGlobalConfig }))
+})
+
 test('stage defaults apply when stage role override is not specified', () => {
   const repoGlobalConfig: OrcaNoMistakesConfig = {
     stages: {
