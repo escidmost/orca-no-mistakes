@@ -18,7 +18,7 @@ The target architecture is delivered in four independently useful releases. Each
 
 ## Amendment 2026-08-21
 
-Release 1 pulled forward two capabilities the list above assigns to later releases, because both are prerequisites for a trustworthy local attestation rather than remote-publication features:
+Release 1 pulled forward two capabilities the list above assigns to later releases, because both are prerequisites for a trustworthy local evidence manifest rather than remote-publication features:
 
 - Repository-scoped semantic branch leases (item 2) — a local run must fail closed when a second run holds the branch, otherwise stage evidence is not bound to a single custodian.
 - Preserved recovery refs and fast-forward custody return (item 4) — `refs/no-mistakes/recover/<run-id>` anchors pipeline-created commits so a local run cannot strand them.
