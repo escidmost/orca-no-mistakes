@@ -284,9 +284,21 @@ export function resolveRoleConfig(
   const selectionOrigins: Partial<
     Record<(typeof selectionKeys)[number], { name: string; source: string }>
   > = {}
+  let agentOrigin: { name: string; source: string } | undefined
   let merged: RoleConfig = {}
   for (const [config, name, source] of layers) {
     if (!config) continue
+    if (config.agent === undefined && name && source && merged.agent !== undefined && agentOrigin?.source !== source) {
+      const agents = Array.isArray(merged.agent) ? merged.agent : [merged.agent]
+      const conflicts = selectionKeys.filter(
+        (key) => config[key] !== undefined && agents.some((agent) => typeof agent === 'string' || agent[key] === undefined)
+      )
+      if (conflicts.length > 0) {
+        throw new Error(
+          `Configuration conflict: ${name} sets ${conflicts.join(', ')} but would apply to agent from ${agentOrigin?.name ?? 'a lower layer'}`
+        )
+      }
+    }
     if (config.agent !== undefined && name && source) {
       const agents = Array.isArray(config.agent) ? config.agent : [config.agent]
       const conflicts: string[] = []
@@ -302,7 +314,10 @@ export function resolveRoleConfig(
       }
     }
     merged = deepMerge(merged, config)
-    if (config.agent !== undefined) merged.agent = cloneSafe(config.agent)
+    if (config.agent !== undefined) {
+      merged.agent = cloneSafe(config.agent)
+      if (name && source) agentOrigin = { name, source }
+    }
     for (const key of selectionKeys) {
       if (config[key] !== undefined && name && source) selectionOrigins[key] = { name, source }
     }
