@@ -61,6 +61,10 @@ import {
   type PolicyProvenance,
 } from "./policy.ts";
 import {
+  PlainStatusRenderer,
+  PresentationPublisher,
+} from "./presentation.ts";
+import {
   DomainLedger,
   RUN_ID_PATTERN,
   isWithin,
@@ -95,6 +99,7 @@ export {
   type PassedAttestationManifest,
   type StageEvidenceManifestEntry,
 } from "./ledger.ts";
+export * from "./presentation.ts";
 export type FindingAction = "ask-user" | "auto-fix" | "no-op";
 
 const FINDING_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
@@ -262,6 +267,7 @@ export type PipelineOptions = {
   intentTaskId?: string;
   intent: string;
   maxFixRounds?: number;
+  plainStatus?: boolean;
   resumeRunId?: string;
   userGlobalConfig?: OrcaNoMistakesConfig;
 };
@@ -609,6 +615,7 @@ type AbortReapState = {
   orchestrationRunId?: string;
   originWorktree?: string;
   pid?: number;
+  plainStatus?: boolean;
   resumeClaimId?: string;
   runId?: string;
   startupReceipt?: string;
@@ -1058,6 +1065,7 @@ export async function registerAbortRunContext(state: {
   generationToken?: number;
   ledger: DomainLedger;
   orchestrationRunId?: string;
+  plainStatus?: boolean;
   resumeClaimId?: string;
   runId: string;
 }): Promise<void> {
@@ -1141,6 +1149,25 @@ export async function reapAbortedRun(reason: string): Promise<void> {
       const status = abortReap.ledger.runStatus(abortReap.runId);
       settled = status !== "in-progress";
       shouldFailOrcaRun = settled && status !== "passed";
+      if (cancelled) {
+        const presentation = new PresentationPublisher(
+          abortReap.ledger,
+          abortReap.runId,
+          abortReap.plainStatus
+            ? new PlainStatusRenderer(process.stderr)
+            : undefined,
+          () => new Date(),
+          (error) => abortLog(String(error)),
+        );
+        presentation.publish(
+          `attempt:${presentation.current.attempt}:cancellation:cancel`,
+          { action: "cancel", kind: "cancellation-recorded" },
+        );
+        presentation.publish("run:completed:cancelled", {
+          kind: "run-completed",
+          status: "cancelled",
+        });
+      }
     } catch (error) {
       abortLog(
         `warning: abort could not settle the run: ${String(error)}`,
@@ -1458,6 +1485,8 @@ export async function runPipeline(
   const policySha256Value = await git.policySha256(repo.base);
   let domainRunStarted = false;
   let generationToken: number | undefined;
+  let presentation!: PresentationPublisher;
+  let presentationReady = false;
   let resumeClaimId: string | undefined;
   let resumeCheckpoint: StageCheckpointRow | undefined;
   const { artifactsDir, runId } = await withGateMutation(async () => {
@@ -1519,11 +1548,6 @@ export async function runPipeline(
         resumeCheckpoint = resumed.checkpoint;
         generationToken = resumed.generationToken;
         domainRunStarted = true;
-        await deliveryGit.anchorRecoveryRef(
-          runId,
-          resumeCheckpoint.output_commit_oid,
-          generationToken,
-        );
       } else {
         ledger.startRun({
           baseBranch: deliveryRepo.base,
@@ -1535,6 +1559,43 @@ export async function runPipeline(
           submissionCommitOid: deliveryRepo.head,
         });
         domainRunStarted = true;
+      }
+      presentation = new PresentationPublisher(
+        ledger,
+        runId,
+        options.plainStatus ? new PlainStatusRenderer(process.stderr) : undefined,
+        () => new Date(),
+        (error) =>
+          console.error(`warning: plain status renderer failed: ${String(error)}`),
+      );
+      presentationReady = true;
+      if (!options.resumeRunId) {
+        presentation.publish("run:started", { kind: "run-started" });
+      }
+      const attempt = presentation.nextAttempt();
+      presentation.publish(`attempt:${attempt}:started`, {
+        attempt,
+        kind: "attempt-started",
+      });
+      if (
+        attempt === 1 ||
+        presentation.current.mode.autoFix !== pipelineConfig.auto_fix.enabled
+      ) {
+        presentation.publish(
+          `attempt:${attempt}:mode:${pipelineConfig.auto_fix.enabled ? "on" : "off"}`,
+          {
+            enabled: pipelineConfig.auto_fix.enabled,
+            kind: "mode-changed",
+          },
+        );
+      }
+      if (options.resumeRunId) {
+        await deliveryGit.anchorRecoveryRef(
+          runId,
+          resumeCheckpoint!.output_commit_oid,
+          generationToken!,
+        );
+      } else {
         generationToken = ledger.acquireLease({
           branch: deliveryRepo.branch,
           force: options.forceLease === true,
@@ -1548,6 +1609,7 @@ export async function runPipeline(
         git,
         ledger,
         orchestrationRunId,
+        plainStatus: options.plainStatus,
         resumeClaimId,
         runId,
       });
@@ -1566,6 +1628,22 @@ export async function runPipeline(
                 repoRoot: deliveryRepo.root,
               },
         );
+        if (presentationReady) {
+          presentation.publish(
+            `attempt:${presentation.current.attempt}:error:setup`,
+            {
+              kind: "error-recorded",
+              resumable: ledger.listCheckpoints(runId).length > 0,
+            },
+          );
+          presentation.publish(
+            `attempt:${presentation.current.attempt}:run:completed:failed`,
+            {
+              kind: "run-completed",
+              status: "failed",
+            },
+          );
+        }
       }
       throw error;
     }
@@ -1821,6 +1899,13 @@ export async function runPipeline(
         effectivePolicyHash: effectiveProvenance.effectivePolicyHash,
         baseRefSha: effectiveProvenance.baseRefSha,
       });
+      presentation.publish(`findings:${entry.evidenceSha256}`, {
+        actionable: actionableFindings(report).length,
+        kind: "findings-recorded",
+        round,
+        stage,
+        total: report.findings.length,
+      });
       stageEntries.push(entry);
       latestEntryByStage.set(stage, entry);
     };
@@ -1862,6 +1947,10 @@ export async function runPipeline(
         "in-progress",
       );
       let round = priorRoundByStage.get(stage) ?? 0;
+      presentation.publish(
+        `attempt:${presentation.current.attempt}:stage:${stage}:started`,
+        { kind: "stage-started", stage },
+      );
       let attempt = 0;
       const resumedEvidence = latestEvidenceByStage.get(stage);
       let resumedFixDecision =
@@ -1883,6 +1972,10 @@ export async function runPipeline(
       let inheritedFallback:
         { attempts: FallbackAttempt[]; resolvedAgent: string } | undefined;
       const runStage = async () => {
+        presentation.publish(
+          `attempt:${presentation.current.attempt}:stage:${stage}:round:${round}:started`,
+          { kind: "round-started", round, stage },
+        );
         const execution = await executeStage(
           stage,
           attempt++,
@@ -2033,6 +2126,12 @@ export async function runPipeline(
               runId,
               stageId: stage,
             });
+            presentation.publish(`gate:${gateId}:opened`, {
+              gateId,
+              kind: "gate-opened",
+              round,
+              stage,
+            });
             gateAudited = true;
           };
           const gateId = await orca.createGate(
@@ -2059,6 +2158,13 @@ export async function runPipeline(
               gateOptions,
             ),
             stageId: stage,
+          });
+          presentation.publish(`gate:${gateId}:resolved`, {
+            decision: decision.action,
+            gateId,
+            kind: "gate-resolved",
+            round,
+            stage,
           });
           if (
             decision.action !== "unknown" &&
@@ -2110,6 +2216,10 @@ export async function runPipeline(
         }
 
         round += 1;
+        presentation.publish(
+          `attempt:${presentation.current.attempt}:stage:${stage}:round:${round}:started`,
+          { kind: "round-started", round, stage },
+        );
         ledger.heartbeatLease(deliveryRepo.root, deliveryRepo.branch, runId);
         const fixerRoles = pipelineConfig.stages[stage].fixer;
         if (fixerSession && !fixerSessionMatchesRole(fixerSession, fixerRoles)) {
@@ -2248,13 +2358,18 @@ export async function runPipeline(
         report = await runStage();
       }
 
+      const stageOutputCommitOid = await git.head();
       ledger.recordCheckpoint({
         inputCommitOid: stageInputCommitOid,
-        outputCommitOid: await git.head(),
+        outputCommitOid: stageOutputCommitOid,
         roundIndex: round,
         runId,
         stageId: stage,
       });
+      presentation.publish(
+        `stage:${stage}:round:${round}:completed:${stageOutputCommitOid}`,
+        { kind: "stage-completed", round, stage },
+      );
       await orca.completeTask(taskId, report);
     }
 
@@ -2339,6 +2454,10 @@ export async function runPipeline(
       );
       return { attestation, custodyNote };
     });
+    presentation.publish("run:completed:passed", {
+      kind: "run-completed",
+      status: "passed",
+    });
     await orca
       .setWorktreeStatus(
         `${statusPrefix}no-mistakes passed all ${PIPELINE_STEPS.length} stages`,
@@ -2389,6 +2508,27 @@ export async function runPipeline(
           generationToken,
           repoRoot: deliveryRepo.root,
         });
+        if (outcome === "cancelled") {
+          presentation.publish(
+            `attempt:${presentation.current.attempt}:cancellation:gate-stop`,
+            { action: "gate-stop", kind: "cancellation-recorded" },
+          );
+        } else {
+          presentation.publish(
+            `attempt:${presentation.current.attempt}:error`,
+            {
+              kind: "error-recorded",
+              resumable: ledger.listCheckpoints(runId).length > 0,
+            },
+          );
+        }
+        presentation.publish(
+          `attempt:${presentation.current.attempt}:run:completed:${outcome}`,
+          {
+            kind: "run-completed",
+            status: outcome,
+          },
+        );
       }
       const message =
         failure instanceof Error ? failure.message : String(failure);
@@ -8276,6 +8416,7 @@ const BOOLEAN_FLAGS = new Set([
   "allow-local-config",
   "attached",
   "force-lease",
+  "no-tui",
   "stranded",
 ]);
 const VALUE_FLAGS = new Set([
@@ -8307,6 +8448,7 @@ const COMMAND_FLAGS: Record<string, Set<string>> = {
     "head",
     "intent",
     "max-fix-rounds",
+    "no-tui",
     "notify",
     "repo",
     "resume",
@@ -11383,6 +11525,7 @@ Run options:
   --reviewer-model <model>
   --fixer-model <model> --fixer-effort <level>
   --max-fix-rounds <count>
+  --no-tui (emit semantic run progress on stderr)
   --resume <run-id> (continue a failed run from its last checkpoint)
   --allow-local-config
   --config <path>
@@ -11539,6 +11682,7 @@ Prune options:
           gate?.kind === "configured" ? gate.intentTaskId : undefined,
         intent,
         maxFixRounds,
+        plainStatus: parsed.flags["no-tui"] === true,
         resumeRunId,
         userGlobalConfig,
       },

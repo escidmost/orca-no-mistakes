@@ -37,7 +37,7 @@ The coordinator launches detached in a dedicated Orca terminal and returns immed
 
 Use `--resume` only for a failed run whose clean initiating checkout is still at its original submission commit. Detached resume reconstructs the isolated gate worktree at the last durable checkpoint, retains the original evidence and resolved gate decisions, and runs only the stages that still need validation. Keeping the initiating checkout at the submission commit lets successful custody transfer advance it automatically.
 
-Available direct-run controls are `--base`, `--head`, `--force-lease`, `--notify`, `--resume`, `--reviewer-model`, `--fixer-model`, `--fixer-effort`, and `--max-fix-rounds`. Workers launch with the `opencode` agent without a model or effort override by default; the model and effort flags set explicit overrides. The default maximum is 3 automated fix rounds, after which an exhaustion gate opens.
+Available direct-run controls are `--base`, `--head`, `--force-lease`, `--notify`, `--resume`, `--no-tui`, `--reviewer-model`, `--fixer-model`, `--fixer-effort`, and `--max-fix-rounds`. `--no-tui` emits bounded semantic progress on stderr while attached stdout remains reserved for the final JSON result. Workers launch with the `opencode` agent without a model or effort override by default; the model and effort flags set explicit overrides. The default maximum is 3 automated fix rounds, after which an exhaustion gate opens.
 
 ## Gates
 

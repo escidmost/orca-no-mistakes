@@ -782,6 +782,29 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
     orca.calls.at(-1),
     `status:completed:no-mistakes passed all ${PIPELINE_STEPS.length} stages`,
   );
+  const presentation = ledger.listPresentationSnapshots(result.runId);
+  assert.deepEqual(
+    presentation.slice(0, 3).map((snapshot) => snapshot.transition.kind),
+    ["run-started", "attempt-started", "mode-changed"],
+  );
+  assert.deepEqual(
+    presentation.flatMap((snapshot) =>
+      snapshot.transition.kind === "stage-completed"
+        ? [snapshot.transition.stage]
+        : [],
+    ),
+    PIPELINE_STEPS,
+  );
+  assert.equal(
+    presentation.filter(
+      (snapshot) => snapshot.transition.kind === "findings-recorded",
+    ).length,
+    8,
+  );
+  assert.deepEqual(presentation.at(-1)?.transition, {
+    kind: "run-completed",
+    status: "passed",
+  });
 });
 
 test("a failed run resumes from its last checkpoint without repeating completed stages or gates", async () => {
@@ -822,6 +845,13 @@ test("a failed run resumes from its last checkpoint without repeating completed 
   );
   assert.equal(ledger.runStatus(runId), "failed");
   assert.deepEqual(interrupted.completedStages, ["intent", "rebase", "review"]);
+  assert.deepEqual(
+    ledger
+      .listPresentationSnapshots(runId)
+      .slice(-2)
+      .map((snapshot) => snapshot.transition.kind),
+    ["error-recorded", "run-completed"],
+  );
 
   const resumed = new FakeOrca(git);
   const result = await runPipeline(
@@ -848,6 +878,31 @@ test("a failed run resumes from its last checkpoint without repeating completed 
   assert.ok(result.attestation);
   verifyManifest(result.attestation, PIPELINE_STEPS);
   assert.deepEqual(ledger.verifyEvidence(result.attestation), []);
+  const presentation = ledger.listPresentationSnapshots(runId);
+  assert.deepEqual(
+    presentation
+      .filter((snapshot) => snapshot.transition.kind === "attempt-started")
+      .map((snapshot) => snapshot.attempt),
+    [1, 2],
+  );
+  assert.deepEqual(
+    presentation.flatMap((snapshot) =>
+      snapshot.transition.kind === "stage-completed"
+        ? [snapshot.transition.stage]
+        : [],
+    ),
+    PIPELINE_STEPS,
+  );
+  assert.equal(
+    presentation.filter(
+      (snapshot) => snapshot.transition.kind === "gate-opened",
+    ).length,
+    1,
+  );
+  assert.deepEqual(presentation.at(-1)?.transition, {
+    kind: "run-completed",
+    status: "passed",
+  });
 });
 
 test("resume refuses when HEAD no longer matches the failed run checkpoint", async () => {

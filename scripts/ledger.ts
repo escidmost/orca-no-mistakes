@@ -6,6 +6,7 @@ import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
 import type { GuardrailMode } from './config.ts'
+import type { PresentationSnapshot } from './presentation.ts'
 
 const { O_APPEND, O_CREAT, O_EXCL, O_NOFOLLOW, O_RDONLY, O_RDWR, O_WRONLY } = constants
 
@@ -1044,6 +1045,20 @@ CREATE INDEX IF NOT EXISTS idx_stage_evidence_run ON stage_evidence(run_id);
 CREATE INDEX IF NOT EXISTS idx_stage_evidence_stage
   ON stage_evidence(run_id, stage_id, round_index);
 CREATE INDEX IF NOT EXISTS idx_gate_audit_run ON gate_audit(run_id);
+
+CREATE TABLE IF NOT EXISTS presentation_snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  event_key TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  snapshot_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE (run_id, event_key),
+  UNIQUE (run_id, sequence)
+);
+
+CREATE INDEX IF NOT EXISTS idx_presentation_snapshots_run
+  ON presentation_snapshots(run_id, sequence);
 
 CREATE TABLE IF NOT EXISTS passed_attestations (
   run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE CASCADE,
@@ -2132,6 +2147,32 @@ export class DomainLedger {
       this.#db.exec('ROLLBACK')
       throw error
     }
+  }
+
+  recordPresentationSnapshot(
+    runId: string,
+    eventKey: string,
+    snapshot: PresentationSnapshot
+  ): boolean {
+    if (snapshot.runId !== runId) throw new Error('presentation snapshot run ID mismatch')
+    const result = this.#db
+      .prepare(
+        `INSERT OR IGNORE INTO presentation_snapshots (
+           run_id, event_key, sequence, snapshot_json, created_at
+         ) VALUES (?, ?, ?, ?, ?)`
+      )
+      .run(runId, eventKey, snapshot.sequence, JSON.stringify(snapshot), snapshot.updatedAt)
+    return Number(result.changes) > 0
+  }
+
+  listPresentationSnapshots(runId: string): PresentationSnapshot[] {
+    return (
+      this.#db
+        .prepare(
+          'SELECT snapshot_json FROM presentation_snapshots WHERE run_id = ? ORDER BY sequence'
+        )
+        .all(runId) as { snapshot_json: string }[]
+    ).map(({ snapshot_json }) => JSON.parse(snapshot_json) as PresentationSnapshot)
   }
 
   runStatus(runId: string): RunStatus | undefined {
