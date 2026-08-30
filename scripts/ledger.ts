@@ -1513,7 +1513,8 @@ CREATE TABLE IF NOT EXISTS remote_observations (
   subject TEXT NOT NULL,
   payload_json TEXT NOT NULL,
   observed_at TEXT NOT NULL,
-  observation_sha256 TEXT NOT NULL UNIQUE
+  observation_sha256 TEXT NOT NULL UNIQUE,
+  UNIQUE (run_id, observation_sha256)
 );
 
 CREATE TABLE IF NOT EXISTS mutation_intents (
@@ -1536,7 +1537,9 @@ CREATE TABLE IF NOT EXISTS remote_receipts (
   receipt_json TEXT NOT NULL,
   receipt_sha256 TEXT NOT NULL UNIQUE,
   created_at TEXT NOT NULL,
-  UNIQUE (run_id, kind)
+  UNIQUE (run_id, kind),
+  FOREIGN KEY (run_id, authoritative_post_observation_sha256)
+    REFERENCES remote_observations(run_id, observation_sha256) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS branch_leases (
@@ -1682,6 +1685,51 @@ CREATE TRIGGER IF NOT EXISTS immutable_remote_receipts
 BEFORE UPDATE ON remote_receipts
 BEGIN SELECT RAISE(ABORT, 'remote_receipts rows are immutable'); END;
 
+CREATE TRIGGER IF NOT EXISTS immutable_stage_plan_entries_delete
+BEFORE DELETE ON stage_plan_entries
+WHEN EXISTS (SELECT 1 FROM runs WHERE run_id = OLD.run_id)
+BEGIN SELECT RAISE(ABORT, 'stage_plan_entries rows are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_stage_dispositions_delete
+BEFORE DELETE ON stage_dispositions
+WHEN EXISTS (SELECT 1 FROM runs WHERE run_id = OLD.run_id)
+BEGIN SELECT RAISE(ABORT, 'stage_dispositions rows are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_publication_routes_delete
+BEFORE DELETE ON publication_routes
+WHEN EXISTS (SELECT 1 FROM runs WHERE run_id = OLD.run_id)
+BEGIN SELECT RAISE(ABORT, 'publication_routes rows are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_publication_baselines_delete
+BEFORE DELETE ON publication_baselines
+WHEN EXISTS (SELECT 1 FROM runs WHERE run_id = OLD.run_id)
+BEGIN SELECT RAISE(ABORT, 'publication_baselines rows are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_run_attempts_delete
+BEFORE DELETE ON run_attempts
+WHEN EXISTS (SELECT 1 FROM runs WHERE run_id = OLD.run_id)
+BEGIN SELECT RAISE(ABORT, 'run_attempts rows are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_attempt_outcomes_delete
+BEFORE DELETE ON attempt_outcomes
+WHEN EXISTS (SELECT 1 FROM runs WHERE run_id = OLD.run_id)
+BEGIN SELECT RAISE(ABORT, 'attempt_outcomes rows are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_remote_observations_delete
+BEFORE DELETE ON remote_observations
+WHEN EXISTS (SELECT 1 FROM runs WHERE run_id = OLD.run_id)
+BEGIN SELECT RAISE(ABORT, 'remote_observations rows are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_mutation_intents_delete
+BEFORE DELETE ON mutation_intents
+WHEN EXISTS (SELECT 1 FROM runs WHERE run_id = OLD.run_id)
+BEGIN SELECT RAISE(ABORT, 'mutation_intents rows are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_remote_receipts_delete
+BEFORE DELETE ON remote_receipts
+WHEN EXISTS (SELECT 1 FROM runs WHERE run_id = OLD.run_id)
+BEGIN SELECT RAISE(ABORT, 'remote_receipts rows are immutable'); END;
+
 CREATE TRIGGER IF NOT EXISTS enforce_remote_observation_attempt
 BEFORE INSERT ON remote_observations
 WHEN NOT EXISTS (
@@ -1697,6 +1745,15 @@ WHEN NOT EXISTS (
   WHERE attempt_id = NEW.attempt_id AND run_id = NEW.run_id
 )
 BEGIN SELECT RAISE(ABORT, 'attempt does not belong to run'); END;
+
+CREATE TRIGGER IF NOT EXISTS enforce_remote_receipt_observation
+BEFORE INSERT ON remote_receipts
+WHEN NOT EXISTS (
+  SELECT 1 FROM remote_observations
+  WHERE run_id = NEW.run_id
+    AND observation_sha256 = NEW.authoritative_post_observation_sha256
+)
+BEGIN SELECT RAISE(ABORT, 'receipt observation does not belong to run'); END;
 `
 
 export class DomainLedger {
@@ -2293,6 +2350,62 @@ export class DomainLedger {
     ).all(runId) as { intent_sha256: string }[]
   }
 
+  #remoteObservationMatches(input: {
+    candidateCommitOid: string
+    expectedAttemptId?: string
+    kind: RemoteReceiptKind
+    observationSha256: string
+    receiptPayload: Record<string, unknown>
+    runId: string
+  }): boolean {
+    const route = this.publicationRoute(input.runId)
+    if (!route || input.receiptPayload.routeFingerprint !== route.route_fingerprint) return false
+    const observation = this.#db.prepare(
+      `SELECT o.attempt_id, o.kind, o.subject, o.payload_json, a.generation_token
+       FROM remote_observations o
+       JOIN run_attempts a ON a.attempt_id = o.attempt_id AND a.run_id = o.run_id
+       WHERE o.run_id = ? AND o.observation_sha256 = ?`
+    ).get(input.runId, input.observationSha256) as
+      | {
+          attempt_id: string
+          generation_token: number | bigint
+          kind: string
+          payload_json: string
+          subject: string
+        }
+      | undefined
+    if (!observation) return false
+    if (input.expectedAttemptId) {
+      if (observation.attempt_id !== input.expectedAttemptId) return false
+    } else {
+      const latest = this.#db.prepare(
+        'SELECT MAX(generation_token) AS generation_token FROM run_attempts WHERE run_id = ?'
+      ).get(input.runId) as { generation_token: number | bigint | null }
+      if (latest.generation_token === null ||
+          Number(observation.generation_token) !== Number(latest.generation_token)) return false
+    }
+    let payload: Record<string, unknown>
+    try {
+      payload = JSON.parse(observation.payload_json) as Record<string, unknown>
+    } catch {
+      return false
+    }
+    if (input.kind === 'candidate-publication') {
+      return observation.kind === 'publication-head' &&
+        observation.subject === `refs/heads/${route.head_branch}` &&
+        payload.oid === input.candidateCommitOid
+    }
+    const number = input.receiptPayload.number
+    const expectedSubject = input.receiptPayload.subject
+    return observation.kind === 'pull-request' &&
+      payload.candidateCommitOid === input.candidateCommitOid &&
+      number !== undefined && payload.number === number &&
+      (typeof expectedSubject === 'string'
+        ? observation.subject === expectedSubject
+        : observation.subject.startsWith(`${route.head_owner}/`) &&
+          observation.subject.endsWith(`#${String(number)}`))
+  }
+
   settleRemoteStage(input: {
     checkpoint: {
       inputCommitOid: string
@@ -2337,12 +2450,14 @@ export class DomainLedger {
     if (input.evidence.evidenceSha256 !== expectedEvidenceSha256) {
       throw new Error(`${input.stageId} evidence digest does not match its recorded fields`)
     }
-    const observation = this.#db.prepare(
-      `SELECT 1 FROM remote_observations
-       WHERE run_id = ? AND observation_sha256 = ?`
-    ).get(input.runId, input.receipt.authoritativePostObservationSha256)
-    if (!observation) {
-      throw new Error(`${input.stageId} receipt has no authoritative post-read observation`)
+    if (!this.#remoteObservationMatches({
+      candidateCommitOid: input.receipt.candidateCommitOid,
+      kind: input.receipt.kind,
+      observationSha256: input.receipt.authoritativePostObservationSha256,
+      receiptPayload: input.receipt.payload,
+      runId: input.runId
+    })) {
+      throw new Error(`${input.stageId} receipt does not match its authoritative post-read observation`)
     }
 
     const createdAt = new Date().toISOString()
@@ -3253,6 +3368,26 @@ export class DomainLedger {
 
   verifyRetainedCompletionAttestation(manifest: PipelineCompletionAttestationManifest): void {
     const problems: string[] = []
+    const retainedRun = this.#db.prepare(
+      `SELECT status, terminal_commit_oid, submission_commit_oid, intent, intent_hash, policy_sha256
+       FROM runs WHERE run_id = ?`
+    ).get(manifest.runId) as
+      | {
+          intent: string
+          intent_hash: string
+          policy_sha256: string
+          status: RunStatus
+          submission_commit_oid: string
+          terminal_commit_oid: string | null
+        }
+      | undefined
+    if (!retainedRun || retainedRun.status !== 'passed' ||
+        retainedRun.terminal_commit_oid !== manifest.candidateCommitOid ||
+        retainedRun.submission_commit_oid !== manifest.baseCommitOid ||
+        retainedRun.intent !== manifest.intent || retainedRun.intent_hash !== manifest.intentHash ||
+        retainedRun.policy_sha256 !== manifest.policySha256) {
+      problems.push('passed run')
+    }
     const expectedPlan = manifest.stagePlan.map((entry, position) => ({
       position,
       requirement: entry.requirement,
@@ -3288,10 +3423,42 @@ export class DomainLedger {
       problems.push('publication route')
     }
 
-    const outcomes = this.listAttemptOutcomes(manifest.runId).map((row) => row.outcome_sha256)
+    const retainedOutcomes = this.#db.prepare(
+      `SELECT attempt_id, verdict, candidate_commit_oid, custody_json,
+              receipt_digests_json, outcome_sha256
+       FROM attempt_outcomes WHERE run_id = ? ORDER BY completed_at, rowid`
+    ).all(manifest.runId) as {
+      attempt_id: string
+      candidate_commit_oid: string
+      custody_json: string
+      outcome_sha256: string
+      receipt_digests_json: string
+      verdict: Exclude<RunStatus, 'in-progress'>
+    }[]
+    const outcomes = retainedOutcomes.map((row) => row.outcome_sha256)
     if (canonicalJson(outcomes) !== canonicalJson(manifest.attemptOutcomeDigests)) {
       problems.push('attempt outcomes')
     }
+
+    const expectedReceiptDigests = [
+      manifest.candidatePublicationReceiptSha256,
+      manifest.pullRequestBindingReceiptSha256
+    ].sort()
+    const passedOutcome = retainedOutcomes.find((row) => {
+      if (row.verdict !== 'passed' || row.candidate_commit_oid !== manifest.candidateCommitOid) {
+        return false
+      }
+      try {
+        const custody = JSON.parse(row.custody_json) as unknown
+        const receipts = JSON.parse(row.receipt_digests_json) as unknown
+        return canonicalJson(custody) === canonicalJson(manifest.custody) &&
+          Array.isArray(receipts) &&
+          canonicalJson([...receipts].sort()) === canonicalJson(expectedReceiptDigests)
+      } catch {
+        return false
+      }
+    })
+    if (!passedOutcome) problems.push('passed attempt outcome')
 
     const publication = this.remoteReceipt(manifest.runId, 'candidate-publication')
     if (
@@ -3306,6 +3473,26 @@ export class DomainLedger {
       pullRequest.candidate_commit_oid !== manifest.candidateCommitOid
     ) {
       problems.push('pull-request-binding receipt')
+    }
+    for (const receipt of [publication, pullRequest]) {
+      if (!receipt) continue
+      let payload: Record<string, unknown>
+      try {
+        payload = JSON.parse(receipt.receipt_json) as Record<string, unknown>
+      } catch {
+        problems.push(`${receipt.kind} observation`)
+        continue
+      }
+      if (!this.#remoteObservationMatches({
+        candidateCommitOid: receipt.candidate_commit_oid,
+        ...(passedOutcome ? { expectedAttemptId: passedOutcome.attempt_id } : {}),
+        kind: receipt.kind,
+        observationSha256: receipt.authoritative_post_observation_sha256,
+        receiptPayload: payload,
+        runId: manifest.runId
+      })) {
+        problems.push(`${receipt.kind} observation`)
+      }
     }
 
     if (problems.length > 0) {

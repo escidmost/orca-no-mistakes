@@ -11779,7 +11779,7 @@ Prune options:
   let gateCleanupOid = await git.head();
   try {
     const userGlobalConfig = loadUserConfig();
-    ledger = openRepositoryLedger(gatePath);
+    ledger = openRepositoryLedger(originWorktree ?? gatePath);
     await installAbortReaping({
       ...(gate ? { gate } : {}),
       ...(deliveryGit ? { deliveryGit } : {}),
