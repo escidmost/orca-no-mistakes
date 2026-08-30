@@ -1584,7 +1584,8 @@ export class DomainLedger {
   settleRun(
     runId: string,
     status: 'cancelled' | 'failed',
-    ownership?: { branch: string; generationToken?: number; repoRoot: string }
+    ownership?: { branch: string; generationToken?: number; repoRoot: string },
+    presentation?: { eventKey: string; snapshot: PresentationSnapshot }
   ): boolean {
     this.#db.exec('BEGIN IMMEDIATE')
     try {
@@ -1607,6 +1608,7 @@ export class DomainLedger {
       }
       const settled = this.finishRun(runId, status)
       if (settled || run?.status === status) this.releaseLease(runId)
+      if (settled && presentation) this.#recordPresentationMilestone(runId, presentation)
       this.#db.exec('COMMIT')
       return ownership === undefined ? settled : settled || run?.status === status
     } catch (error) {
@@ -1652,13 +1654,15 @@ export class DomainLedger {
     manifest: PassedAttestationManifest,
     terminalCommitOid: string,
     ownership: { branch: string; generationToken: number; repoRoot: string },
-    mutation: () => Promise<string>
+    mutation: () => Promise<string>,
+    presentation?: { eventKey: string; snapshot: PresentationSnapshot }
   ): Promise<string> {
     this.#db.exec('BEGIN IMMEDIATE')
     try {
       this.#requirePassedRunLease(manifest.runId, ownership)
       const result = await mutation()
       this.#completePassedRun(manifest, terminalCommitOid)
+      if (presentation) this.#recordPresentationMilestone(manifest.runId, presentation)
       this.#db.exec('COMMIT')
       return result
     } catch (error) {
@@ -1667,25 +1671,38 @@ export class DomainLedger {
     }
   }
 
-  recordCheckpoint(input: {
-    inputCommitOid: string
-    outputCommitOid: string
-    roundIndex: number
-    runId: string
-    stageId: string
-  }): void {
-    this.#db
-      .prepare(
-        'INSERT INTO stage_checkpoints (run_id, stage_id, round_index, input_commit_oid, output_commit_oid, created_at) VALUES (?, ?, ?, ?, ?, ?)'
-      )
-      .run(
-        input.runId,
-        input.stageId,
-        input.roundIndex,
-        input.inputCommitOid,
-        input.outputCommitOid,
-        new Date().toISOString()
-      )
+  recordCheckpoint(
+    input: {
+      inputCommitOid: string
+      outputCommitOid: string
+      roundIndex: number
+      runId: string
+      stageId: string
+    },
+    presentation?: { eventKey: string; snapshot: PresentationSnapshot }
+  ): void {
+    if (presentation) this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      this.#db
+        .prepare(
+          'INSERT INTO stage_checkpoints (run_id, stage_id, round_index, input_commit_oid, output_commit_oid, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+        )
+        .run(
+          input.runId,
+          input.stageId,
+          input.roundIndex,
+          input.inputCommitOid,
+          input.outputCommitOid,
+          new Date().toISOString()
+        )
+      if (presentation) {
+        this.#recordPresentationMilestone(input.runId, presentation)
+        this.#db.exec('COMMIT')
+      }
+    } catch (error) {
+      if (presentation) this.#db.exec('ROLLBACK')
+      throw error
+    }
   }
 
   recordEvidence(input: {
@@ -2163,6 +2180,15 @@ export class DomainLedger {
       )
       .run(runId, eventKey, snapshot.sequence, JSON.stringify(snapshot), snapshot.updatedAt)
     return Number(result.changes) > 0
+  }
+
+  #recordPresentationMilestone(
+    runId: string,
+    presentation: { eventKey: string; snapshot: PresentationSnapshot }
+  ): void {
+    if (!this.recordPresentationSnapshot(runId, presentation.eventKey, presentation.snapshot)) {
+      throw new Error(`presentation event ${presentation.eventKey} is already recorded`)
+    }
   }
 
   listPresentationSnapshots(runId: string): PresentationSnapshot[] {

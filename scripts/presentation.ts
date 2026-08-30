@@ -265,15 +265,7 @@ export class PresentationPublisher {
     return this.#current.attempt + 1;
   }
 
-  publish(eventKey: string, transition: PresentationTransition): PresentationSnapshot {
-    const snapshot = nextSnapshot(
-      this.#current,
-      transition,
-      this.clock().toISOString(),
-    );
-    if (!this.store.recordPresentationSnapshot(this.runId, eventKey, snapshot)) {
-      return this.#current;
-    }
+  #accept(snapshot: PresentationSnapshot): PresentationSnapshot {
     this.#current = snapshot;
     if (this.#renderer && !this.#rendererFailed) {
       try {
@@ -285,6 +277,37 @@ export class PresentationPublisher {
     }
     return snapshot;
   }
+
+  publish(
+    eventKey: string,
+    transition: PresentationTransition,
+    persist: (snapshot: PresentationSnapshot) => boolean | void = (snapshot) =>
+      this.store.recordPresentationSnapshot(this.runId, eventKey, snapshot),
+  ): PresentationSnapshot {
+    const snapshot = nextSnapshot(
+      this.#current,
+      transition,
+      this.clock().toISOString(),
+    );
+    if (persist(snapshot) === false) {
+      return this.#current;
+    }
+    return this.#accept(snapshot);
+  }
+
+  async publishAsync<T>(
+    transition: PresentationTransition,
+    persist: (snapshot: PresentationSnapshot) => Promise<T>,
+  ): Promise<T> {
+    const snapshot = nextSnapshot(
+      this.#current,
+      transition,
+      this.clock().toISOString(),
+    );
+    const result = await persist(snapshot);
+    this.#accept(snapshot);
+    return result;
+  }
 }
 
 function safeToken(value: string): string {
@@ -292,13 +315,24 @@ function safeToken(value: string): string {
 }
 
 export class PlainStatusRenderer implements PresentationRenderer {
-  readonly output: { write(chunk: string): unknown };
+  #failed = false;
+  readonly output: {
+    on?(event: "error", listener: (error: Error) => void): unknown;
+    write(chunk: string): unknown;
+  };
 
-  constructor(output: { write(chunk: string): unknown }) {
+  constructor(output: {
+    on?(event: "error", listener: (error: Error) => void): unknown;
+    write(chunk: string): unknown;
+  }) {
     this.output = output;
+    this.output.on?.("error", () => {
+      this.#failed = true;
+    });
   }
 
   render(snapshot: PresentationSnapshot): void {
+    if (this.#failed) return;
     const event = snapshot.transition;
     const stageNumber = "stage" in event
       ? PIPELINE_STEPS.indexOf(event.stage) + 1

@@ -1138,31 +1138,41 @@ export async function reapAbortedRun(reason: string): Promise<void> {
   let shouldFailOrcaRun = false;
   if (preserved && abortReap.ledger && abortReap.runId) {
     try {
-      const run = abortReap.ledger.runIdentity(abortReap.runId);
-      cancelled =
-        run !== undefined &&
-        abortReap.ledger.settleRun(abortReap.runId, "cancelled", {
-          branch: run.branch,
-          generationToken: abortReap.generationToken,
-          repoRoot: run.repo_root,
-        });
-      const status = abortReap.ledger.runStatus(abortReap.runId);
+      const ledger = abortReap.ledger;
+      const runId = abortReap.runId;
+      const run = ledger.runIdentity(runId);
+      const presentation = new PresentationPublisher(
+        ledger,
+        runId,
+        abortReap.plainStatus
+          ? new PlainStatusRenderer(process.stderr)
+          : undefined,
+        () => new Date(),
+        (error) => abortLog(String(error)),
+      );
+      cancelled = run !== undefined;
+      if (run) {
+        const eventKey = `attempt:${presentation.current.attempt}:cancellation:cancel`;
+        presentation.publish(
+          eventKey,
+          { action: "cancel", kind: "cancellation-recorded" },
+          (snapshot) =>
+            (cancelled = ledger.settleRun(
+              runId,
+              "cancelled",
+              {
+                branch: run.branch,
+                generationToken: abortReap.generationToken,
+                repoRoot: run.repo_root,
+              },
+              { eventKey, snapshot },
+            )),
+        );
+      }
+      const status = ledger.runStatus(runId);
       settled = status !== "in-progress";
       shouldFailOrcaRun = settled && status !== "passed";
       if (cancelled) {
-        const presentation = new PresentationPublisher(
-          abortReap.ledger,
-          abortReap.runId,
-          abortReap.plainStatus
-            ? new PlainStatusRenderer(process.stderr)
-            : undefined,
-          () => new Date(),
-          (error) => abortLog(String(error)),
-        );
-        presentation.publish(
-          `attempt:${presentation.current.attempt}:cancellation:cancel`,
-          { action: "cancel", kind: "cancellation-recorded" },
-        );
         presentation.publish("run:completed:cancelled", {
           kind: "run-completed",
           status: "cancelled",
@@ -1393,9 +1403,10 @@ function settleRunOrThrow(
   outcome: "cancelled" | "failed",
   originalError: unknown,
   ownership?: Parameters<DomainLedger["settleRun"]>[2],
+  presentation?: Parameters<DomainLedger["settleRun"]>[3],
 ): void {
   try {
-    if (!ledger.settleRun(runId, outcome, ownership)) {
+    if (!ledger.settleRun(runId, outcome, ownership, presentation)) {
       throw new Error(`run ${runId} no longer owns its branch lease`);
     }
   } catch (settlementError) {
@@ -1615,25 +1626,30 @@ export async function runPipeline(
       });
     } catch (error) {
       if (domainRunStarted) {
-        settleRunOrThrow(
-          ledger,
-          runId,
-          "failed",
-          error,
-          generationToken === undefined
-            ? undefined
-            : {
-                branch: deliveryRepo.branch,
-                generationToken,
-                repoRoot: deliveryRepo.root,
-              },
-        );
+        const ownership = generationToken === undefined
+          ? undefined
+          : {
+              branch: deliveryRepo.branch,
+              generationToken,
+              repoRoot: deliveryRepo.root,
+            };
         if (presentationReady) {
+          const eventKey = `attempt:${presentation.current.attempt}:error:setup`;
           presentation.publish(
-            `attempt:${presentation.current.attempt}:error:setup`,
+            eventKey,
             {
               kind: "error-recorded",
               resumable: ledger.listCheckpoints(runId).length > 0,
+            },
+            (snapshot) => {
+              settleRunOrThrow(
+                ledger,
+                runId,
+                "failed",
+                error,
+                ownership,
+                { eventKey, snapshot },
+              );
             },
           );
           presentation.publish(
@@ -1643,6 +1659,8 @@ export async function runPipeline(
               status: "failed",
             },
           );
+        } else {
+          settleRunOrThrow(ledger, runId, "failed", error, ownership);
         }
       }
       throw error;
@@ -2359,16 +2377,21 @@ export async function runPipeline(
       }
 
       const stageOutputCommitOid = await git.head();
-      ledger.recordCheckpoint({
-        inputCommitOid: stageInputCommitOid,
-        outputCommitOid: stageOutputCommitOid,
-        roundIndex: round,
-        runId,
-        stageId: stage,
-      });
+      const eventKey = `stage:${stage}:round:${round}:completed:${stageOutputCommitOid}`;
       presentation.publish(
-        `stage:${stage}:round:${round}:completed:${stageOutputCommitOid}`,
+        eventKey,
         { kind: "stage-completed", round, stage },
+        (snapshot) =>
+          ledger.recordCheckpoint(
+            {
+              inputCommitOid: stageInputCommitOid,
+              outputCommitOid: stageOutputCommitOid,
+              roundIndex: round,
+              runId,
+              stageId: stage,
+            },
+            { eventKey, snapshot },
+          ),
       );
       await orca.completeTask(taskId, report);
     }
@@ -2412,51 +2435,52 @@ export async function runPipeline(
         runId,
       });
       verifyManifest(attestation, PIPELINE_STEPS);
-      const custodyNote = await ledger.finalizePassedRunWithLeaseMutation(
-        attestation,
-        terminalCommitOid,
-        {
-          branch: deliveryRepo.branch,
-          generationToken: generationToken!,
-          repoRoot: deliveryRepo.root,
-        },
-        async () => {
-          if (deliveryGit === git && operatorHead === terminalCommitOid) {
-            return operatorHead === submissionCommitOid
-              ? `branch ${deliveryRepo.branch} already at submission commit ${submissionCommitOid}`
-              : `branch ${deliveryRepo.branch} carries the terminal commit ${terminalCommitOid}`;
-          }
-          const recoverRef = recoveryRefFor(runId);
-          let advanced = false;
-          let transferFailure: string | undefined;
-          if (deliveryGit !== git && operatorHead === submissionCommitOid) {
-            try {
-              advanced = await deliveryGit.applyWorktreeCommits(
-                repo.root,
-                submissionCommitOid,
-                terminalCommitOid,
-                leaseFence,
-              );
-            } catch (error) {
-              if (error instanceof PostMutationCustodyError) throw error;
-              transferFailure =
-                error instanceof Error ? error.message : String(error);
+      const eventKey = "run:completed:passed";
+      const custodyNote = await presentation.publishAsync(
+        { kind: "run-completed", status: "passed" },
+        (snapshot) => ledger.finalizePassedRunWithLeaseMutation(
+          attestation,
+          terminalCommitOid,
+          {
+            branch: deliveryRepo.branch,
+            generationToken: generationToken!,
+            repoRoot: deliveryRepo.root,
+          },
+          async () => {
+            if (deliveryGit === git && operatorHead === terminalCommitOid) {
+              return operatorHead === submissionCommitOid
+                ? `branch ${deliveryRepo.branch} already at submission commit ${submissionCommitOid}`
+                : `branch ${deliveryRepo.branch} carries the terminal commit ${terminalCommitOid}`;
             }
-          }
-          return advanced
-            ? `advanced branch ${deliveryRepo.branch} from submission to terminal commit ${terminalCommitOid}`
-            : transferFailure
-              ? `custody transfer failed on the pipeline side (${transferFailure}); ` +
-                recoveryInstructions(recoverRef)
-              : "operator checkout diverged or carries uncommitted changes; " +
-                recoveryInstructions(recoverRef);
-        },
+            const recoverRef = recoveryRefFor(runId);
+            let advanced = false;
+            let transferFailure: string | undefined;
+            if (deliveryGit !== git && operatorHead === submissionCommitOid) {
+              try {
+                advanced = await deliveryGit.applyWorktreeCommits(
+                  repo.root,
+                  submissionCommitOid,
+                  terminalCommitOid,
+                  leaseFence,
+                );
+              } catch (error) {
+                if (error instanceof PostMutationCustodyError) throw error;
+                transferFailure =
+                  error instanceof Error ? error.message : String(error);
+              }
+            }
+            return advanced
+              ? `advanced branch ${deliveryRepo.branch} from submission to terminal commit ${terminalCommitOid}`
+              : transferFailure
+                ? `custody transfer failed on the pipeline side (${transferFailure}); ` +
+                  recoveryInstructions(recoverRef)
+                : "operator checkout diverged or carries uncommitted changes; " +
+                  recoveryInstructions(recoverRef);
+          },
+          { eventKey, snapshot },
+        ),
       );
       return { attestation, custodyNote };
-    });
-    presentation.publish("run:completed:passed", {
-      kind: "run-completed",
-      status: "passed",
     });
     await orca
       .setWorktreeStatus(
@@ -2503,22 +2527,47 @@ export async function runPipeline(
         }
       }
       if (!anchorError) {
-        settleRunOrThrow(ledger, runId, outcome, failure, {
-          branch: deliveryRepo.branch,
-          generationToken,
-          repoRoot: deliveryRepo.root,
-        });
         if (outcome === "cancelled") {
+          const eventKey = `attempt:${presentation.current.attempt}:cancellation:gate-stop`;
           presentation.publish(
-            `attempt:${presentation.current.attempt}:cancellation:gate-stop`,
+            eventKey,
             { action: "gate-stop", kind: "cancellation-recorded" },
+            (snapshot) => {
+              settleRunOrThrow(
+                ledger,
+                runId,
+                outcome,
+                failure,
+                {
+                  branch: deliveryRepo.branch,
+                  generationToken,
+                  repoRoot: deliveryRepo.root,
+                },
+                { eventKey, snapshot },
+              );
+            },
           );
         } else {
+          const eventKey = `attempt:${presentation.current.attempt}:error`;
           presentation.publish(
-            `attempt:${presentation.current.attempt}:error`,
+            eventKey,
             {
               kind: "error-recorded",
               resumable: ledger.listCheckpoints(runId).length > 0,
+            },
+            (snapshot) => {
+              settleRunOrThrow(
+                ledger,
+                runId,
+                outcome,
+                failure,
+                {
+                  branch: deliveryRepo.branch,
+                  generationToken,
+                  repoRoot: deliveryRepo.root,
+                },
+                { eventKey, snapshot },
+              );
             },
           );
         }
