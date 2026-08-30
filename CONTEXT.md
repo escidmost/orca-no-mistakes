@@ -137,7 +137,7 @@ An optional, human-facing terminal interface for observing and safely controllin
 _Avoid_: Multi-run dashboard, worker shell, policy editor
 
 **Plain status renderer**:
-A non-interactive, line-oriented view of meaningful transitions in one pipeline run, used when the Run TUI is disabled or unavailable.
+A non-interactive, line-oriented view of meaningful transitions in one pipeline run. Direct invocations select it with `--no-tui`, which is mutually exclusive with `--tui`; it is also used when the Run TUI is unavailable.
 _Avoid_: Raw subprocess stream, static final report, screen-reader-only mode
 
 **Auto-fix mode**:
