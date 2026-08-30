@@ -1607,10 +1607,22 @@ export class DomainLedger {
         return false
       }
       const settled = this.finishRun(runId, status)
-      if (settled || run?.status === status) this.releaseLease(runId)
-      if (settled && presentation) this.#recordPresentationMilestone(runId, presentation)
+      const alreadySettled = run?.status === status
+      if (settled || alreadySettled) this.releaseLease(runId)
+      let presentationRecorded: boolean | undefined
+      if (presentation && (settled || alreadySettled)) {
+        presentationRecorded = this.recordPresentationSnapshot(
+          runId,
+          presentation.eventKey,
+          presentation.snapshot
+        )
+        if (settled && !presentationRecorded) {
+          throw new Error(`presentation event ${presentation.eventKey} is already recorded`)
+        }
+      }
       this.#db.exec('COMMIT')
-      return ownership === undefined ? settled : settled || run?.status === status
+      if (presentation) return presentationRecorded ?? false
+      return ownership === undefined ? settled : settled || alreadySettled
     } catch (error) {
       this.#db.exec('ROLLBACK')
       throw error
@@ -2179,7 +2191,24 @@ export class DomainLedger {
          ) VALUES (?, ?, ?, ?, ?)`
       )
       .run(runId, eventKey, snapshot.sequence, JSON.stringify(snapshot), snapshot.updatedAt)
-    return Number(result.changes) > 0
+    if (Number(result.changes) > 0) return true
+    const replay = this.#db
+      .prepare(
+        'SELECT sequence FROM presentation_snapshots WHERE run_id = ? AND event_key = ?'
+      )
+      .get(runId, eventKey) as { sequence: number } | undefined
+    if (replay) return false
+    const conflict = this.#db
+      .prepare(
+        'SELECT event_key FROM presentation_snapshots WHERE run_id = ? AND sequence = ?'
+      )
+      .get(runId, snapshot.sequence) as { event_key: string } | undefined
+    if (conflict) {
+      throw new Error(
+        `presentation sequence ${snapshot.sequence} for run ${runId} is already held by event ${conflict.event_key}`
+      )
+    }
+    throw new Error(`presentation event ${eventKey} could not be recorded`)
   }
 
   #recordPresentationMilestone(

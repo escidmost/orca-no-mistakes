@@ -119,6 +119,51 @@ test("domain milestones and presentation snapshots commit atomically", async () 
     assert.equal(ledger.runStatus("failed"), "failed");
     assert.equal(ledger.listPresentationSnapshots("failed").length, 1);
 
+    const failedPublisher = new PresentationPublisher(ledger, "failed");
+    const beforeReplay = failedPublisher.current;
+    failedPublisher.publish("failed", { kind: "run-completed", status: "failed" }, (next) =>
+      ledger.settleRun(
+        "failed",
+        "failed",
+        {
+          branch: "failed-branch",
+          generationToken: failedToken,
+          repoRoot: "/repo",
+        },
+        { eventKey: "failed", snapshot: next },
+      ),
+    );
+    assert.equal(failedPublisher.current, beforeReplay);
+    assert.equal(ledger.listPresentationSnapshots("failed").length, 1);
+
+    assert.throws(
+      () =>
+        ledger.recordPresentationSnapshot(
+          "failed",
+          "conflicting-sequence",
+          snapshot("failed", { kind: "run-completed", status: "failed" }),
+        ),
+      /presentation sequence 1/,
+    );
+
+    failedPublisher.publish(
+      "failed-terminal",
+      { kind: "run-completed", status: "failed" },
+      (next) =>
+        ledger.settleRun(
+          "failed",
+          "failed",
+          {
+            branch: "failed-branch",
+            generationToken: failedToken,
+            repoRoot: "/repo",
+          },
+          { eventKey: "failed-terminal", snapshot: next },
+        ),
+    );
+    assert.equal(failedPublisher.current.sequence, 2);
+    assert.equal(ledger.listPresentationSnapshots("failed").length, 2);
+
     const manifest = buildAttestation([], {
       baseCommitOid: commit,
       candidateCommitOid: commit,

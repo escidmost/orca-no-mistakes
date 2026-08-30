@@ -1173,10 +1173,10 @@ export async function reapAbortedRun(reason: string): Promise<void> {
       settled = status !== "in-progress";
       shouldFailOrcaRun = settled && status !== "passed";
       if (cancelled) {
-        presentation.publish("run:completed:cancelled", {
-          kind: "run-completed",
-          status: "cancelled",
-        });
+        presentation.publish(
+          `attempt:${presentation.current.attempt}:run:completed:cancelled`,
+          { kind: "run-completed", status: "cancelled" },
+        );
       }
     } catch (error) {
       abortLog(
@@ -1404,11 +1404,13 @@ function settleRunOrThrow(
   originalError: unknown,
   ownership?: Parameters<DomainLedger["settleRun"]>[2],
   presentation?: Parameters<DomainLedger["settleRun"]>[3],
-): void {
+): boolean {
   try {
-    if (!ledger.settleRun(runId, outcome, ownership, presentation)) {
+    const settled = ledger.settleRun(runId, outcome, ownership, presentation);
+    if (!settled && ledger.runStatus(runId) !== outcome) {
       throw new Error(`run ${runId} no longer owns its branch lease`);
     }
+    return settled;
   } catch (settlementError) {
     throw new RunSettlementError(
       runId,
@@ -1641,7 +1643,7 @@ export async function runPipeline(
               kind: "error-recorded",
               resumable: ledger.listCheckpoints(runId).length > 0,
             },
-            (snapshot) => {
+            (snapshot) =>
               settleRunOrThrow(
                 ledger,
                 runId,
@@ -1649,8 +1651,7 @@ export async function runPipeline(
                 error,
                 ownership,
                 { eventKey, snapshot },
-              );
-            },
+              ),
           );
           presentation.publish(
             `attempt:${presentation.current.attempt}:run:completed:failed`,
@@ -2532,7 +2533,7 @@ export async function runPipeline(
           presentation.publish(
             eventKey,
             { action: "gate-stop", kind: "cancellation-recorded" },
-            (snapshot) => {
+            (snapshot) =>
               settleRunOrThrow(
                 ledger,
                 runId,
@@ -2544,8 +2545,7 @@ export async function runPipeline(
                   repoRoot: deliveryRepo.root,
                 },
                 { eventKey, snapshot },
-              );
-            },
+              ),
           );
         } else {
           const eventKey = `attempt:${presentation.current.attempt}:error`;
@@ -2555,7 +2555,7 @@ export async function runPipeline(
               kind: "error-recorded",
               resumable: ledger.listCheckpoints(runId).length > 0,
             },
-            (snapshot) => {
+            (snapshot) =>
               settleRunOrThrow(
                 ledger,
                 runId,
@@ -2567,8 +2567,7 @@ export async function runPipeline(
                   repoRoot: deliveryRepo.root,
                 },
                 { eventKey, snapshot },
-              );
-            },
+              ),
           );
         }
         presentation.publish(

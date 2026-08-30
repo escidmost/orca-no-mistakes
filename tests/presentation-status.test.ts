@@ -202,6 +202,36 @@ test("renderer failure does not stop durable publication", () => {
   assert.equal(failures.length, 1);
 });
 
+test("a new attempt clears unfinished stage progress", () => {
+  const ledger = new DomainLedger(":memory:");
+  try {
+    const runId = "attempt-reset";
+    startRun(ledger, runId);
+    const publisher = new PresentationPublisher(ledger, runId);
+    publisher.publish("test-findings", {
+      actionable: 2,
+      kind: "findings-recorded",
+      round: 3,
+      stage: "test",
+      total: 4,
+    });
+    publisher.publish("attempt-2", { attempt: 2, kind: "attempt-started" });
+
+    assert.deepEqual(
+      publisher.current.stages.find((stage) => stage.id === "test"),
+      {
+        actionableFindings: 0,
+        id: "test",
+        round: 0,
+        status: "pending",
+        totalFindings: 0,
+      },
+    );
+  } finally {
+    ledger.close();
+  }
+});
+
 test("plain status uses stderr while structured result remains on stdout", () => {
   const moduleUrl = new URL("../scripts/presentation.ts", import.meta.url).href;
   const script = `
