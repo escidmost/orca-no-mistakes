@@ -360,6 +360,7 @@ test('5-tier precedence hierarchy resolves in exact order: CLI > Stage Role > St
   // Tier 4: Repository Global Config (.orca/no-mistakes.yaml)
   const repoGlobalConfig: OrcaNoMistakesConfig = {
     defaults: {
+      agent: 'tier4-repo-agent',
       model: 'tier4-repo-model',
       effort: 'medium',
       timeout_ms: 20000,
@@ -374,14 +375,17 @@ test('5-tier precedence hierarchy resolves in exact order: CLI > Stage Role > St
     stages: {
       // Tier 3: Stage Default Config
       review: {
+        agent: 'tier3-stage-agent',
         model: 'tier3-stage-model',
         effort: 'high',
         // Tier 2: Stage Role Config
         reviewer: {
+          model: 'tier2-reviewer-model',
           effort: 'tier2-reviewer-effort',
           agent: ['tier2-reviewer-agent1', 'tier2-reviewer-agent2']
         },
         fixer: {
+          model: 'tier2-fixer-model',
           effort: 'tier2-fixer-effort',
           agent: 'tier2-fixer-agent'
         }
@@ -391,7 +395,6 @@ test('5-tier precedence hierarchy resolves in exact order: CLI > Stage Role > St
 
   // Tier 1: CLI Flags
   const cliFlags = {
-    model: 'tier1-cli-model',
     reviewer: {
       timeout_ms: 99999
     }
@@ -404,8 +407,8 @@ test('5-tier precedence hierarchy resolves in exact order: CLI > Stage Role > St
     cliFlags
   })
 
-  // 1. model: CLI flag (Tier 1) wins over Tier 2, 3, 4, 5
-  assert.equal(reviewerConfig.model, 'tier1-cli-model')
+  // 1. model: Stage Role Config (Tier 2) wins over Tier 3, 4, 5
+  assert.equal(reviewerConfig.model, 'tier2-reviewer-model')
   // 2. effort: Stage Role Config (Tier 2) wins over Tier 3, 4, 5
   assert.equal(reviewerConfig.effort, 'tier2-reviewer-effort')
   // 3. agent: Stage Role Config (Tier 2) array replacement wins over Tier 5
@@ -426,14 +429,59 @@ test('5-tier precedence hierarchy resolves in exact order: CLI > Stage Role > St
   // Resolve fixer for review stage (no CLI fixer overrides)
   const fixerConfig = resolveRoleConfig('review', 'fixer', {
     userGlobalConfig,
-    repoGlobalConfig,
-    cliFlags: { model: 'tier1-cli-model' }
+    repoGlobalConfig
   })
 
-  assert.equal(fixerConfig.model, 'tier1-cli-model')
+  assert.equal(fixerConfig.model, 'tier2-fixer-model')
   assert.equal(fixerConfig.effort, 'tier2-fixer-effort')
   assert.equal(fixerConfig.agent, 'tier2-fixer-agent')
   assert.equal(fixerConfig.timeout_ms, 20000) // From Tier 4 repo defaults
+})
+
+test('rejects cross-layer harness/model selection in either merge order', () => {
+  const userGlobalConfig: OrcaNoMistakesConfig = {
+    stages: {
+      review: {
+        reviewer: { agent: 'codex', model: 'gpt-5.6-sol' }
+      }
+    }
+  }
+  const repoGlobalConfig: OrcaNoMistakesConfig = { defaults: { agent: 'claude' } }
+
+  assert.throws(
+    () => resolveRoleConfig('review', 'reviewer', { userGlobalConfig, repoGlobalConfig }),
+    /repository defaults sets agent but would inherit model from user-global stages\.review\.reviewer/
+  )
+
+  assert.throws(
+    () => resolveRoleConfig('review', 'reviewer', {
+      userGlobalConfig: { defaults: { agent: 'codex' } },
+      repoGlobalConfig: { defaults: { model: 'gpt-5.6-sol' } }
+    }),
+    /repository defaults sets model but would apply to agent from user-global defaults/
+  )
+
+  assert.throws(
+    () => resolveRoleConfig('review', 'reviewer', {
+      repoGlobalConfig: {
+        defaults: { agent: 'codex' },
+        stages: { review: { reviewer: { model: 'gpt-5.6-sol' } } }
+      }
+    }),
+    /repository stages\.review\.reviewer sets model but would apply to agent from repository defaults/
+  )
+
+  repoGlobalConfig.defaults = { agent: { harness: 'claude', model: 'claude-sonnet-4-6' } }
+  assert.doesNotThrow(() => resolveRoleConfig('review', 'reviewer', { userGlobalConfig, repoGlobalConfig }))
+
+  const sameSource = resolveRoleConfig('review', 'reviewer', {
+    repoGlobalConfig: {
+      defaults: { model: 'gpt-5.6-sol' },
+      stages: { review: { agent: 'claude' } }
+    }
+  })
+  assert.equal(sameSource.agent, 'claude')
+  assert.equal(sameSource.model, undefined)
 })
 
 test('stage defaults apply when stage role override is not specified', () => {
@@ -528,7 +576,7 @@ test('resolvePipelineConfig builds resolved configurations for all pipeline step
     },
     stages: {
       review: {
-        reviewer: { effort: 'high' }
+        reviewer: { agent: 'claude', model: 'sonnet', effort: 'high' }
       }
     },
     auto_fix: {

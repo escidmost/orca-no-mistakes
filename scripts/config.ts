@@ -256,31 +256,72 @@ export function resolveRoleConfig(
   const directCli = c ? { ...c, reviewer: undefined, fixer: undefined, max_fix_rounds: undefined } : undefined
 
   // 5-Tier precedence layers from lowest (Tier 5: User Global) to highest (Tier 1: CLI Flags)
-  const layers: (RoleConfig | undefined)[] = [
-    { auto_fix: { ...BASELINE_AUTO_FIX } },
+  const layers: [RoleConfig | undefined, string?, string?][] = [
+    [{ auto_fix: { ...BASELINE_AUTO_FIX } }],
     // Tier 5: User Global
-    u?.auto_fix ? { auto_fix: u.auto_fix } : undefined,
-    u?.agent_args_override ? { agent_args_override: u.agent_args_override } : undefined,
-    extractBase(u?.defaults),
-    u?.defaults?.[role],
-    extractBase(u?.stages?.[stage]),
-    u?.stages?.[stage]?.[role],
+    [u?.auto_fix ? { auto_fix: u.auto_fix } : undefined],
+    [u?.agent_args_override ? { agent_args_override: u.agent_args_override } : undefined],
+    [extractBase(u?.defaults), 'user-global defaults', 'user-global'],
+    [u?.defaults?.[role], `user-global defaults.${role}`, 'user-global'],
+    [extractBase(u?.stages?.[stage]), `user-global stages.${stage}`, 'user-global'],
+    [u?.stages?.[stage]?.[role], `user-global stages.${stage}.${role}`, 'user-global'],
     // Tier 4: Repo Global
-    r?.auto_fix ? { auto_fix: r.auto_fix } : undefined,
-    r?.agent_args_override ? { agent_args_override: r.agent_args_override } : undefined,
-    extractBase(r?.defaults),
-    r?.defaults?.[role],
+    [r?.auto_fix ? { auto_fix: r.auto_fix } : undefined],
+    [r?.agent_args_override ? { agent_args_override: r.agent_args_override } : undefined],
+    [extractBase(r?.defaults), 'repository defaults', 'repository'],
+    [r?.defaults?.[role], `repository defaults.${role}`, 'repository'],
     // Tier 3: Stage Default
-    extractBase(r?.stages?.[stage]),
+    [extractBase(r?.stages?.[stage]), `repository stages.${stage}`, 'repository'],
     // Tier 2: Stage Role
-    r?.stages?.[stage]?.[role],
+    [r?.stages?.[stage]?.[role], `repository stages.${stage}.${role}`, 'repository'],
     // Tier 1: CLI Flags
-    directCli,
-    c?.max_fix_rounds !== undefined ? { auto_fix: { max_rounds: c.max_fix_rounds } } : undefined,
-    c?.[role]
+    [directCli, 'CLI flags', 'CLI'],
+    [c?.max_fix_rounds !== undefined ? { auto_fix: { max_rounds: c.max_fix_rounds } } : undefined],
+    [c?.[role], `CLI ${role}`, 'CLI']
   ]
 
-  const merged = layers.reduce<RoleConfig>((acc, layer) => (layer ? deepMerge(acc, layer) : acc), {})
+  const selectionKeys = ['model', 'effort', 'variant'] as const
+  const selectionOrigins: Partial<
+    Record<(typeof selectionKeys)[number], { name: string; source: string }>
+  > = {}
+  let agentOrigin: { name: string; source: string } | undefined
+  let merged: RoleConfig = {}
+  for (const [config, name, source] of layers) {
+    if (!config) continue
+    if (config.agent === undefined && name && source && merged.agent !== undefined && agentOrigin?.name !== name) {
+      const agents = Array.isArray(merged.agent) ? merged.agent : [merged.agent]
+      const conflicts = selectionKeys.filter(
+        (key) => config[key] !== undefined && agents.some((agent) => typeof agent === 'string' || agent[key] === undefined)
+      )
+      if (conflicts.length > 0) {
+        throw new Error(
+          `Configuration conflict: ${name} sets ${conflicts.join(', ')} but would apply to agent from ${agentOrigin?.name ?? 'a lower layer'}`
+        )
+      }
+    }
+    if (config.agent !== undefined && name && source) {
+      const agents = Array.isArray(config.agent) ? config.agent : [config.agent]
+      const conflicts: string[] = []
+      for (const key of selectionKeys) {
+        const origin = selectionOrigins[key]
+        const usesFallback = agents.some((agent) => typeof agent === 'string' || agent[key] === undefined)
+        if (config[key] !== undefined || !usesFallback || merged[key] === undefined) continue
+        if (origin?.source !== source) conflicts.push(`${key} from ${origin?.name ?? 'a lower layer'}`)
+        else delete merged[key]
+      }
+      if (conflicts.length > 0) {
+        throw new Error(`Configuration conflict: ${name} sets agent but would inherit ${conflicts.join(', ')}`)
+      }
+    }
+    merged = deepMerge(merged, config)
+    if (config.agent !== undefined) {
+      merged.agent = cloneSafe(config.agent)
+      if (name && source) agentOrigin = { name, source }
+    }
+    for (const key of selectionKeys) {
+      if (config[key] !== undefined && name && source) selectionOrigins[key] = { name, source }
+    }
+  }
 
   return {
     agent: merged.agent,

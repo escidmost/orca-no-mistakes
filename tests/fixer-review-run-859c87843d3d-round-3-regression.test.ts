@@ -43,6 +43,7 @@ test("configured attached failures settle every open task", async () => {
     "NO_MISTAKES_RUN_ID",
     "ORCA_CLI_COMMAND",
     "ORCA_NO_MISTAKES_HOME",
+    "ORCA_NO_MISTAKES_USER_CONFIG",
   ] as const;
   const previous = Object.fromEntries(
     environmentNames.map((name) => [name, process.env[name]]),
@@ -110,6 +111,7 @@ if (args[0] === 'orchestration' && args[1] === 'task-create') {
       NO_MISTAKES_RUN_ID: "configured-run",
       ORCA_CLI_COMMAND: fakeOrca,
       ORCA_NO_MISTAKES_HOME: path.join(temp, "home"),
+      ORCA_NO_MISTAKES_USER_CONFIG: path.join(temp, "missing-user-config.yaml"),
     });
     DomainLedger.prototype.close = function () {
       originalClose.call(this);
