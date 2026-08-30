@@ -1383,13 +1383,22 @@ export function repositoryLedgerPath(repositoryPath = process.cwd()): string {
   return repositoryLocation(repositoryPath).ledgerPath
 }
 
-export function defaultLedgerPath(): string {
-  if (process.env.ORCA_NO_MISTAKES_HOME) return legacyLedgerPath()
+function defaultLedgerLocation(): { dbPath: string; legacyPath?: string; repoRoot?: string } {
+  if (process.env.ORCA_NO_MISTAKES_HOME) return { dbPath: legacyLedgerPath() }
   try {
-    return repositoryLedgerPath()
+    const repository = repositoryLocation(process.cwd())
+    return {
+      dbPath: repository.ledgerPath,
+      legacyPath: legacyLedgerPath(),
+      repoRoot: repository.repoRoot
+    }
   } catch {
-    return legacyLedgerPath()
+    return { dbPath: legacyLedgerPath() }
   }
+}
+
+export function defaultLedgerPath(): string {
+  return defaultLedgerLocation().dbPath
 }
 
 export function artifactsRoot(): string {
@@ -1672,6 +1681,22 @@ BEGIN SELECT RAISE(ABORT, 'mutation_intents rows are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS immutable_remote_receipts
 BEFORE UPDATE ON remote_receipts
 BEGIN SELECT RAISE(ABORT, 'remote_receipts rows are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS enforce_remote_observation_attempt
+BEFORE INSERT ON remote_observations
+WHEN NOT EXISTS (
+  SELECT 1 FROM run_attempts
+  WHERE attempt_id = NEW.attempt_id AND run_id = NEW.run_id
+)
+BEGIN SELECT RAISE(ABORT, 'attempt does not belong to run'); END;
+
+CREATE TRIGGER IF NOT EXISTS enforce_mutation_intent_attempt
+BEFORE INSERT ON mutation_intents
+WHEN NOT EXISTS (
+  SELECT 1 FROM run_attempts
+  WHERE attempt_id = NEW.attempt_id AND run_id = NEW.run_id
+)
+BEGIN SELECT RAISE(ABORT, 'attempt does not belong to run'); END;
 `
 
 export class DomainLedger {
@@ -1679,10 +1704,12 @@ export class DomainLedger {
   readonly #path: string
 
   constructor(
-    location: string | { legacyPath?: string; repositoryPath: string } = defaultLedgerPath()
+    location?: string | { legacyPath?: string; repositoryPath: string }
   ) {
     const resolved: { dbPath: string; legacyPath?: string; repoRoot?: string } =
-      typeof location === 'string'
+      location === undefined
+        ? defaultLedgerLocation()
+        : typeof location === 'string'
         ? { dbPath: location }
         : (() => {
             const repository = repositoryLocation(location.repositoryPath)
@@ -3199,6 +3226,10 @@ export class DomainLedger {
   }
 
   recordAttestation(manifest: CompletionAttestationManifest): void {
+    if (manifest.version === '2.0.0') {
+      verifyCompletionAttestation(manifest)
+      this.verifyRetainedCompletionAttestation(manifest)
+    }
     this.#db
       .prepare(
         `INSERT INTO passed_attestations (
@@ -3218,6 +3249,68 @@ export class DomainLedger {
         manifest.coordinatorVersion,
         new Date().toISOString()
       )
+  }
+
+  verifyRetainedCompletionAttestation(manifest: PipelineCompletionAttestationManifest): void {
+    const problems: string[] = []
+    const expectedPlan = manifest.stagePlan.map((entry, position) => ({
+      position,
+      requirement: entry.requirement,
+      stage_id: entry.stage
+    }))
+    if (canonicalJson(this.stagePlan(manifest.runId)) !== canonicalJson(expectedPlan)) {
+      problems.push('frozen stage plan')
+    }
+
+    const expectedDispositions = manifest.stageDispositions.map((entry) => ({
+      disposition: entry.disposition,
+      evidence_sha256: entry.evidenceSha256 ?? null,
+      stage_id: entry.stage
+    }))
+    if (
+      canonicalJson(this.stageDispositions(manifest.runId)) !==
+      canonicalJson(expectedDispositions)
+    ) {
+      problems.push('stage dispositions')
+    }
+
+    const route = this.publicationRoute(manifest.runId)
+    const expectedRoute = {
+      base_branch: manifest.publicationRoute.baseBranch,
+      base_repository_id: manifest.publicationRoute.baseRepositoryId,
+      forge_host: manifest.publicationRoute.forgeHost,
+      head_branch: manifest.publicationRoute.headBranch,
+      head_owner: manifest.publicationRoute.headOwner,
+      head_repository_id: manifest.publicationRoute.headRepositoryId,
+      route_fingerprint: manifest.publicationRoute.routeFingerprint
+    }
+    if (canonicalJson(route) !== canonicalJson(expectedRoute)) {
+      problems.push('publication route')
+    }
+
+    const outcomes = this.listAttemptOutcomes(manifest.runId).map((row) => row.outcome_sha256)
+    if (canonicalJson(outcomes) !== canonicalJson(manifest.attemptOutcomeDigests)) {
+      problems.push('attempt outcomes')
+    }
+
+    const publication = this.remoteReceipt(manifest.runId, 'candidate-publication')
+    if (
+      publication?.receipt_sha256 !== manifest.candidatePublicationReceiptSha256 ||
+      publication.candidate_commit_oid !== manifest.candidateCommitOid
+    ) {
+      problems.push('candidate-publication receipt')
+    }
+    const pullRequest = this.remoteReceipt(manifest.runId, 'pull-request-binding')
+    if (
+      pullRequest?.receipt_sha256 !== manifest.pullRequestBindingReceiptSha256 ||
+      pullRequest.candidate_commit_oid !== manifest.candidateCommitOid
+    ) {
+      problems.push('pull-request-binding receipt')
+    }
+
+    if (problems.length > 0) {
+      throw new Error(`v2 attestation does not match retained ledger facts: ${problems.join(', ')}`)
+    }
   }
 
   getAttestation(ref: string): PassedAttestationManifest {

@@ -85,6 +85,28 @@ test('Release 2 ledger facts are immutable, append-only, and atomically checkpoi
       runId,
       startedAt: timestamp
     })
+    assert.throws(
+      () => ledger.recordRemoteObservation({
+        attemptId: 'attempt-1',
+        kind: 'publication-head',
+        observedAt: timestamp,
+        payload: { state: 'absent' },
+        runId: 'release-2-model-2',
+        subject: 'refs/heads/feature'
+      }),
+      /attempt does not belong to run/
+    )
+    assert.throws(
+      () => ledger.recordMutationIntent({
+        attemptId: 'attempt-1',
+        createdAt: timestamp,
+        kind: 'candidate-publication',
+        payload: { expected: 'absent', update: commit },
+        runId: 'release-2-model-2',
+        targetFingerprint: routeFingerprint
+      }),
+      /attempt does not belong to run/
+    )
     const failedOutcome = ledger.recordAttemptOutcome({
       actorIdentity: 'operator',
       attemptId: 'attempt-1',

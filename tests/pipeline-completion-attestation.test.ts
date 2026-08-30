@@ -45,6 +45,7 @@ function evidence(
 
 test('v2 completion attestations bind Release 2 facts without overstating assurance', async () => {
   const runId = 'pipeline-completion-v2'
+  const completionIntent = 'Verify Release 2 completion evidence.'
   const stageEvidence = evidence(runId)
   const publicationRoute = {
     baseBranch: 'main',
@@ -54,45 +55,6 @@ test('v2 completion attestations bind Release 2 facts without overstating assura
     headOwner: 'owner',
     headRepositoryId: 'R_head'
   }
-  const manifest = buildPipelineCompletionAttestation(stageEvidence, {
-    attemptOutcomeDigests: [sha256('failed-attempt'), sha256('passed-attempt')],
-    baseCommitOid: commit,
-    candidateCommitOid: commit,
-    candidatePublicationReceiptSha256: sha256('publication-receipt'),
-    custody: {
-      recoveryRef: `refs/no-mistakes/recover/${runId}`,
-      settlement: 'candidate preserved'
-    },
-    intent: 'Verify Release 2 completion evidence.',
-    policySha256: policy,
-    publicationRoute: {
-      ...publicationRoute,
-      routeFingerprint: sha256(canonicalJson(publicationRoute))
-    },
-    pullRequestBindingReceiptSha256: sha256('pr-receipt'),
-    runId,
-    stageDispositions: stageEvidence.map((entry) => ({
-      disposition: 'satisfied' as const,
-      evidenceSha256: entry.evidenceSha256,
-      stage: entry.stage
-    })),
-    stagePlan: stages.map((stage) => ({ requirement: 'required' as const, stage }))
-  })
-
-  verifyCompletionAttestation(manifest)
-  assert.equal(manifest.version, '2.0.0')
-  assert.deepEqual(manifest.assuranceClaims, [
-    'configured-pipeline-completed',
-    'candidate-publication-verified',
-    'pull-request-bound'
-  ])
-  assert.equal(manifest.assuranceClaims.includes('checks-passed' as never), false)
-  assert.equal(manifest.assuranceClaims.includes('Passed' as never), false)
-
-  const overstated = structuredClone(manifest)
-  overstated.assuranceClaims.push('checks-passed' as never)
-  assert.throws(() => verifyCompletionAttestation(overstated), /assurance claims/)
-
   const legacyMeta = {
     baseCommitOid: commit,
     candidateCommitOid: commit,
@@ -120,6 +82,180 @@ test('v2 completion attestations bind Release 2 facts without overstating assura
     ledger.startRun({
       baseBranch: 'main',
       branch: 'feature',
+      intent: completionIntent,
+      policySha256: policy,
+      repoRoot: '/repo',
+      runId,
+      stagePlan: stages.map((stageId) => ({ requirement: 'required' as const, stageId })),
+      submissionCommitOid: commit
+    })
+    for (const entry of stageEvidence) {
+      ledger.recordStageDisposition({
+        disposition: 'satisfied',
+        evidenceSha256: entry.evidenceSha256,
+        runId,
+        stageId: entry.stage
+      })
+    }
+    const routeFingerprint = ledger.recordPublicationRoute({
+      ...publicationRoute,
+      runId
+    })
+    ledger.startAttempt({
+      actorIdentity: 'operator',
+      attemptId: 'failed-attempt',
+      coordinatorIdentity: 'coordinator',
+      generationToken: 1,
+      runId,
+      startedAt: '2026-08-30T12:00:00.000Z'
+    })
+    const failedOutcome = ledger.recordAttemptOutcome({
+      actorIdentity: 'operator',
+      attemptId: 'failed-attempt',
+      candidateCommitOid: commit,
+      completedAt: '2026-08-30T12:00:01.000Z',
+      coordinatorIdentity: 'coordinator',
+      custody: { recoveryRef: `refs/no-mistakes/recover/${runId}` },
+      reason: 'publication interrupted',
+      receiptDigests: [],
+      resumeEligible: true,
+      runId,
+      stoppingFact: 'candidate-publication-pre-read',
+      verdict: 'failed'
+    })
+    ledger.startAttempt({
+      actorIdentity: 'operator',
+      attemptId: 'passed-attempt',
+      coordinatorIdentity: 'coordinator',
+      generationToken: 2,
+      runId,
+      startedAt: '2026-08-30T12:00:02.000Z'
+    })
+
+    const pushEvidence = stageEvidence.find((entry) => entry.stage === 'push')!
+    const pushObservation = ledger.recordRemoteObservation({
+      attemptId: 'passed-attempt',
+      kind: 'publication-head',
+      observedAt: '2026-08-30T12:00:03.000Z',
+      payload: { oid: commit },
+      runId,
+      subject: 'refs/heads/feature'
+    })
+    const publicationReceipt = ledger.settleRemoteStage({
+      checkpoint: { inputCommitOid: commit, outputCommitOid: commit, roundIndex: 6 },
+      evidence: {
+        artifactPath: path.join(home, 'push.json'),
+        artifactSha256: pushEvidence.artifactSha256,
+        baseCommitOid: commit,
+        candidateCommitOid: commit,
+        evidenceSha256: pushEvidence.evidenceSha256,
+        exitCode: 0,
+        roundIndex: pushEvidence.round,
+        runId,
+        stageId: 'push',
+        summary: pushEvidence.summary,
+        workerIdentity: pushEvidence.workerIdentity
+      },
+      receipt: {
+        authoritativePostObservationSha256: pushObservation,
+        candidateCommitOid: commit,
+        kind: 'candidate-publication',
+        payload: { routeFingerprint }
+      },
+      runId,
+      stageId: 'push'
+    }).receiptSha256
+
+    const prEvidence = stageEvidence.find((entry) => entry.stage === 'pr')!
+    const prObservation = ledger.recordRemoteObservation({
+      attemptId: 'passed-attempt',
+      kind: 'pull-request',
+      observedAt: '2026-08-30T12:00:04.000Z',
+      payload: { candidateCommitOid: commit, number: 77 },
+      runId,
+      subject: 'owner/repo#77'
+    })
+    const prReceipt = ledger.settleRemoteStage({
+      checkpoint: { inputCommitOid: commit, outputCommitOid: commit, roundIndex: 7 },
+      evidence: {
+        artifactPath: path.join(home, 'pr.json'),
+        artifactSha256: prEvidence.artifactSha256,
+        baseCommitOid: commit,
+        candidateCommitOid: commit,
+        evidenceSha256: prEvidence.evidenceSha256,
+        exitCode: 0,
+        roundIndex: prEvidence.round,
+        runId,
+        stageId: 'pr',
+        summary: prEvidence.summary,
+        workerIdentity: prEvidence.workerIdentity
+      },
+      receipt: {
+        authoritativePostObservationSha256: prObservation,
+        candidateCommitOid: commit,
+        kind: 'pull-request-binding',
+        payload: { number: 77, routeFingerprint }
+      },
+      runId,
+      stageId: 'pr'
+    }).receiptSha256
+    const passedOutcome = ledger.recordAttemptOutcome({
+      actorIdentity: 'operator',
+      attemptId: 'passed-attempt',
+      candidateCommitOid: commit,
+      completedAt: '2026-08-30T12:00:05.000Z',
+      coordinatorIdentity: 'coordinator',
+      custody: {
+        recoveryRef: `refs/no-mistakes/recover/${runId}`,
+        settlement: 'candidate preserved'
+      },
+      reason: 'pipeline completed',
+      receiptDigests: [publicationReceipt, prReceipt],
+      resumeEligible: false,
+      runId,
+      stoppingFact: 'pull-request-bound',
+      verdict: 'passed'
+    })
+    const manifest = buildPipelineCompletionAttestation(stageEvidence, {
+      attemptOutcomeDigests: [failedOutcome, passedOutcome],
+      baseCommitOid: commit,
+      candidateCommitOid: commit,
+      candidatePublicationReceiptSha256: publicationReceipt,
+      custody: {
+        recoveryRef: `refs/no-mistakes/recover/${runId}`,
+        settlement: 'candidate preserved'
+      },
+      intent: completionIntent,
+      policySha256: policy,
+      publicationRoute: { ...publicationRoute, routeFingerprint },
+      pullRequestBindingReceiptSha256: prReceipt,
+      runId,
+      stageDispositions: stageEvidence.map((entry) => ({
+        disposition: 'satisfied' as const,
+        evidenceSha256: entry.evidenceSha256,
+        stage: entry.stage
+      })),
+      stagePlan: stages.map((stage) => ({ requirement: 'required' as const, stage }))
+    })
+
+    verifyCompletionAttestation(manifest)
+    assert.equal(manifest.version, '2.0.0')
+    assert.deepEqual(manifest.assuranceClaims, [
+      'configured-pipeline-completed',
+      'candidate-publication-verified',
+      'pull-request-bound'
+    ])
+    assert.equal(manifest.assuranceClaims.includes('checks-passed' as never), false)
+    assert.equal(manifest.assuranceClaims.includes('Passed' as never), false)
+
+    const overstated = structuredClone(manifest)
+    overstated.assuranceClaims.push('checks-passed' as never)
+    assert.throws(() => verifyCompletionAttestation(overstated), /assurance claims/)
+
+    const missingFacts = new DomainLedger(':memory:')
+    missingFacts.startRun({
+      baseBranch: 'main',
+      branch: 'feature',
       intent: manifest.intent,
       policySha256: policy,
       repoRoot: '/repo',
@@ -127,6 +263,12 @@ test('v2 completion attestations bind Release 2 facts without overstating assura
       stagePlan: stages.map((stageId) => ({ requirement: 'required' as const, stageId })),
       submissionCommitOid: commit
     })
+    assert.throws(
+      () => missingFacts.recordAttestation(manifest),
+      /does not match retained ledger facts/
+    )
+    missingFacts.close()
+
     ledger.finishRun(runId, 'passed', commit)
     ledger.recordAttestation(manifest)
     ledger.close()

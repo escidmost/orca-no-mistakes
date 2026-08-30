@@ -10897,6 +10897,12 @@ async function reapMarkerWorkers(
 
 // `prune --stranded` reaps gate workspaces whose coordinator is dead. Every
 // doubt resolves towards retention: a reaped live run loses its workspace.
+function openRepositoryLedger(repositoryPath: string): DomainLedger {
+  return process.env.ORCA_NO_MISTAKES_HOME
+    ? new DomainLedger()
+    : new DomainLedger({ repositoryPath });
+}
+
 async function reapStrandedGates(repoRoot: string): Promise<void> {
   const markersDir = path.join(repoRoot, ".orca", "no-mistakes");
   let names: string[];
@@ -10907,7 +10913,7 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
     names = [];
   }
   const orcaCommand = resolveOrcaCommand();
-  const ledger = new DomainLedger();
+  const ledger = openRepositoryLedger(repoRoot);
   let reaped = 0;
   let retained = 0;
   try {
@@ -11554,7 +11560,7 @@ async function runPruneCommand(flags: RawCliFlags): Promise<void> {
     await reapStrandedGates(scanRoot);
     return;
   }
-  const ledger = new DomainLedger();
+  const ledger = openRepositoryLedger(repoRoot ?? process.cwd());
   let pruned = 0;
   let retained = 0;
   try {
@@ -11655,7 +11661,7 @@ Prune options:
   let rawIntent = stringFlag(parsed.flags, "intent");
   let resumeStartOid: string | undefined;
   if (resumeRunId) {
-    const resumeLedger = new DomainLedger();
+    const resumeLedger = openRepositoryLedger(repo);
     try {
       const resumedRun = resumeLedger.run(resumeRunId);
       if (!resumedRun) throw new Error(`run ${resumeRunId} does not exist`);
@@ -11773,7 +11779,7 @@ Prune options:
   let gateCleanupOid = await git.head();
   try {
     const userGlobalConfig = loadUserConfig();
-    ledger = new DomainLedger();
+    ledger = openRepositoryLedger(gatePath);
     await installAbortReaping({
       ...(gate ? { gate } : {}),
       ...(deliveryGit ? { deliveryGit } : {}),
@@ -11948,7 +11954,10 @@ async function runAttestationCommand(
     if (action === "export") {
       const manifest = ledger.getCompletionAttestation(ref);
       if (manifest.version === "1.3.0") verifyManifest(manifest, PIPELINE_STEPS);
-      else verifyCompletionAttestation(manifest);
+      else {
+        verifyCompletionAttestation(manifest);
+        ledger.verifyRetainedCompletionAttestation(manifest);
+      }
       assertStoredAttestationPassed(ledger, manifest);
       const output = `${JSON.stringify(manifest, null, 2)}\n`;
       const outPath = stringFlag(flags, "out");
@@ -12004,6 +12013,9 @@ async function runAttestationCommand(
       );
     }
     assertStoredAttestationPassed(ledger, manifest);
+    if (manifest.version === "2.0.0") {
+      ledger.verifyRetainedCompletionAttestation(manifest);
+    }
     const problems = ledger.verifyEvidence(manifest);
     if (problems.length > 0) {
       throw new Error(
