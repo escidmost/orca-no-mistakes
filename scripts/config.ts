@@ -302,6 +302,7 @@ export function resolveRoleConfig(
       }
     }
     merged = deepMerge(merged, config)
+    if (config.agent !== undefined) merged.agent = cloneSafe(config.agent)
     for (const key of selectionKeys) {
       if (config[key] !== undefined && name && source) selectionOrigins[key] = { name, source }
     }
