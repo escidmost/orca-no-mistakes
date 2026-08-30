@@ -782,15 +782,19 @@ export class StageLog {
       await assertPrivateRegularFile(file)
       const fileStat = await file.stat({ bigint: true })
       let existingBytes = Number(fileStat.size)
-      // Birth time distinguishes a replacement when the filesystem reuses its inode.
       const fileIdentity = `${fileStat.dev}:${fileStat.ino}:${fileStat.birthtimeNs}`
+      const canTrustFileIdentity =
+        fileStat.birthtimeNs > 0n && fileStat.birthtimeNs !== fileStat.ctimeNs
       await file.chmod(0o600)
       // The first `keep` bytes are the round's head and never change; whatever
       // follows is the previous worker's marker and tail, which this worker's
       // output replaces so the file ends with the round's final tail. Nothing
       // already on disk is parsed back, so worker text cannot forge accounting.
       const recorded = await this.#priorAccounting()
-      const prior = recorded?.fileIdentity === fileIdentity ? recorded : undefined
+      const prior =
+        canTrustFileIdentity && recorded?.fileIdentity === fileIdentity
+          ? recorded
+          : undefined
       this.#originalBytesKnown =
         existingBytes === 0 ||
         (prior !== undefined && prior.originalBytesKnown !== false)
