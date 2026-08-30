@@ -5,8 +5,32 @@ Orca No-Mistakes validates a proposed Git change before delivery. Its domain lan
 ## Language
 
 **Pipeline completion**:
-An execution result indicating that every configured stage reached completion under the runner's current rules. Pipeline completion alone is not `Passed`.
+The historical execution fact that every required stage in a run's frozen stage plan reached an accepted terminal disposition. Pipeline completion alone does not determine which assurance claims are available.
 _Avoid_: Passed, proven, safely merged
+
+**Run verdict**:
+The lowercase terminal status `passed`, `failed`, or `cancelled` recorded for a run against its frozen stage plan. A `passed` verdict is historical execution state, not the target `Passed` assurance claim.
+_Avoid_: Assurance level, guarantee, current-policy judgment
+
+**Frozen stage plan**:
+The immutable ordered stage identities and requirement levels captured when a run starts, together with the final disposition recorded for each stage. Later configuration or stage additions do not reinterpret it.
+_Avoid_: Current pipeline, latest configuration, inferred stage list
+
+**Assurance claim**:
+A versioned, closed-vocabulary statement derived from trusted policy and exact attested evidence. Claims state what a run proved independently of its run verdict.
+_Avoid_: Status label, stage-name inference, free-form badge
+
+**Local submission gate**:
+The repository-scoped Git endpoint that accepts one proposed feature-ref update with explicit intent as the primary pipeline ingress.
+_Avoid_: Publication remote, delivery branch, scheduler
+
+**Submission admission**:
+The durable normalization of one direct invocation or local-gate update into one exact run identity before pipeline execution begins.
+_Avoid_: Process launch, hook success, branch push
+
+**Accepted gate submission**:
+A gate submission whose exact proposed ref update is visible in permanent Git state and anchored to its admitted run. Coordinator launch alone does not make a gate submission accepted.
+_Avoid_: Pre-receive success, quarantined object, startup receipt
 
 **Passed**:
 The target terminal outcome proving that the exact delivered tree satisfied every required validation, review, pull-request, CI, and delivery policy. A required policy cannot be waived into Passed.
@@ -23,6 +47,54 @@ _Avoid_: Working tree, current files
 **Candidate commit**:
 The exact commit produced after rebase and any fix rounds, against which stage and CI evidence is evaluated.
 _Avoid_: Branch, latest HEAD
+
+**Candidate publication**:
+A guarded update that places the exact candidate commit on the remote pull-request head branch. It does not deliver the proposed change to the base branch or prove CI, merge, or Passed.
+_Avoid_: Delivery, merge, ordinary force-push
+
+**Publication route**:
+The immutable per-run identity of the base repository, head repository, head owner, head branch, and base branch used for candidate publication and pull-request binding.
+_Avoid_: Origin, current remotes, push URL
+
+**Publication head ref**:
+The fully qualified feature-branch ref in the publication route's head repository. It receives the candidate commit and becomes the pull request's head ref.
+_Avoid_: Remote HEAD, default branch, base branch
+
+**Publication baseline**:
+The exact remote pull-request head commit, or authoritative absence, recorded when a run starts. Candidate publication may replace only this recorded state.
+_Avoid_: Remote-tracking branch, latest fetched head, inferred lease
+
+**Candidate publication receipt**:
+A durable record that binds a publication route, publication baseline, candidate commit, immediate remote observations, and publication outcome. It proves only the observed pull-request head state, not final delivery.
+_Avoid_: Push log, delivery proof, PR URL
+
+**Forge repository identity**:
+The stable forge host, repository object identifiers, and fork-network identity used to distinguish a publication route from mutable repository names and URLs.
+_Avoid_: Owner/name string, remote URL, current repository
+
+**Forge authentication observation**:
+A time-bound record of the authenticated forge actor and the exact repositories that actor could access. It does not contain credentials or prove that a later mutation will remain authorized.
+_Avoid_: Token, login configuration, permanent permission
+
+**Forge authority observation**:
+A complete, typed, timestamped set of repository or pull-request facts obtained from an explicit forge host and validated against stable object identities.
+_Avoid_: CLI success, truncated summary, ambient repository, raw API payload
+
+**Pull-request binding**:
+The association of a publication route and candidate commit with one exact open pull request identified by stable forge repository, pull-request, base-ref, and head-ref identities.
+_Avoid_: PR URL, branch-name match, latest pull request
+
+**Human-owned pull-request content**:
+The pull-request title, body, and draft state after the pull request exists. Orca No-Mistakes may supply their initial values but does not subsequently normalize or overwrite them.
+_Avoid_: Generated PR state, managed summary, binding proof
+
+**Managed pull-request summary**:
+The single Orca No-Mistakes-owned forge comment that presents redacted run and stage information while authoritative evidence remains local.
+_Avoid_: Pull-request body, trust anchor, remote evidence store
+
+**Pull-request binding receipt**:
+A durable local record binding exact pull-request and managed-summary identities to the publication route, candidate commit, forge observations, and mutation outcome.
+_Avoid_: PR URL, comment text, create response
 
 **Required policy**:
 A validation or delivery rule that must be satisfied for Passed to be available.
@@ -80,9 +152,25 @@ _Avoid_: Timeout, automatic failure
 Captured facts and artifacts identifying a stage, round, candidate commit, actor, result, and output digest.
 _Avoid_: Console dump, task status
 
+**Run attempt**:
+One generation-fenced coordinator execution of a run. Explicit resume creates a new attempt under the same run identity without erasing earlier attempt outcomes.
+_Avoid_: New run, retry counter, worker session
+
+**Attempt outcome**:
+An immutable, digestible settlement record for one run attempt, including its verdict, stopping point, custody facts, remote-receipt references, actors, and timestamps.
+_Avoid_: Current status row, mutable failure message, console exit
+
+**Pipeline evidence root**:
+A deterministic root binding the frozen stage plan and evidence through candidate publication. It may be published in the managed pull-request summary before pull-request binding exists.
+_Avoid_: Completion-attestation root, remote trust anchor, raw evidence link
+
+**Pipeline completion attestation**:
+A portable, tamper-evident manifest for a run with a `passed` verdict. It binds the frozen stage plan, evidence, receipt and attempt-outcome digests, custody facts, and explicit assurance claims to the candidate commit. It proves historical observations, not current remote state or independent authenticity.
+_Avoid_: Passed, signature, live-status certificate
+
 **Passed attestation**:
-A portable, tamper-evident manifest binding target Passed evidence to the candidate and delivered commits. It does not independently prove authenticity unless a future trust anchor is added.
-_Avoid_: Signature, immutable certificate, badge
+A pipeline completion attestation carrying the target `Passed` assurance claim and binding its required evidence to the candidate and delivered commits. Release 2 cannot produce one.
+_Avoid_: Any passed-verdict attestation, signature, badge
 
 **Reconciliation snapshot**:
 A recorded set of pull-request, candidate-commit, and check-run facts queried against exact forge and Git object identifiers.
@@ -101,12 +189,12 @@ Post-delivery proof that the target branch contains the exact tested candidate t
 _Avoid_: PR merged, merge SHA recorded
 
 **Domain ledger**:
-The target durable store for proposed-change identity, leases, stage checkpoints, custody state, and evidence metadata.
+The repository-scoped durable store for proposed-change identity, leases, stage checkpoints, custody state, and evidence metadata.
 _Avoid_: Orca scheduler database, run cache
 
 **Branch semantic lease**:
 An exclusive reservation preventing concurrent pipeline ownership of one repository branch.
-_Avoid_: Worktree lock, process mutex
+_Avoid_: Worktree lock, process mutex, Git force-with-lease
 
 **Branch custody**:
 Responsibility for advancing and preserving the proposed-change branch while pipeline commits may be created.
