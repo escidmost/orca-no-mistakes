@@ -6,6 +6,7 @@ import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
 import type { GuardrailMode } from './config.ts'
+import type { PresentationSnapshot } from './presentation.ts'
 
 const { O_APPEND, O_CREAT, O_EXCL, O_NOFOLLOW, O_RDONLY, O_RDWR, O_WRONLY } = constants
 
@@ -1045,6 +1046,20 @@ CREATE INDEX IF NOT EXISTS idx_stage_evidence_stage
   ON stage_evidence(run_id, stage_id, round_index);
 CREATE INDEX IF NOT EXISTS idx_gate_audit_run ON gate_audit(run_id);
 
+CREATE TABLE IF NOT EXISTS presentation_snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  event_key TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  snapshot_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE (run_id, event_key),
+  UNIQUE (run_id, sequence)
+);
+
+CREATE INDEX IF NOT EXISTS idx_presentation_snapshots_run
+  ON presentation_snapshots(run_id, sequence);
+
 CREATE TABLE IF NOT EXISTS passed_attestations (
   run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE CASCADE,
   candidate_commit_oid TEXT NOT NULL,
@@ -1569,7 +1584,8 @@ export class DomainLedger {
   settleRun(
     runId: string,
     status: 'cancelled' | 'failed',
-    ownership?: { branch: string; generationToken?: number; repoRoot: string }
+    ownership?: { branch: string; generationToken?: number; repoRoot: string },
+    presentation?: { eventKey: string; snapshot: PresentationSnapshot }
   ): boolean {
     this.#db.exec('BEGIN IMMEDIATE')
     try {
@@ -1591,9 +1607,22 @@ export class DomainLedger {
         return false
       }
       const settled = this.finishRun(runId, status)
-      if (settled || run?.status === status) this.releaseLease(runId)
+      const alreadySettled = run?.status === status
+      if (settled || alreadySettled) this.releaseLease(runId)
+      let presentationRecorded: boolean | undefined
+      if (presentation && (settled || alreadySettled)) {
+        presentationRecorded = this.recordPresentationSnapshot(
+          runId,
+          presentation.eventKey,
+          presentation.snapshot
+        )
+        if (settled && !presentationRecorded) {
+          throw new Error(`presentation event ${presentation.eventKey} is already recorded`)
+        }
+      }
       this.#db.exec('COMMIT')
-      return ownership === undefined ? settled : settled || run?.status === status
+      if (presentation) return presentationRecorded ?? false
+      return ownership === undefined ? settled : settled || alreadySettled
     } catch (error) {
       this.#db.exec('ROLLBACK')
       throw error
@@ -1637,13 +1666,15 @@ export class DomainLedger {
     manifest: PassedAttestationManifest,
     terminalCommitOid: string,
     ownership: { branch: string; generationToken: number; repoRoot: string },
-    mutation: () => Promise<string>
+    mutation: () => Promise<string>,
+    presentation?: { eventKey: string; snapshot: PresentationSnapshot }
   ): Promise<string> {
     this.#db.exec('BEGIN IMMEDIATE')
     try {
       this.#requirePassedRunLease(manifest.runId, ownership)
       const result = await mutation()
       this.#completePassedRun(manifest, terminalCommitOid)
+      if (presentation) this.#recordPresentationMilestone(manifest.runId, presentation)
       this.#db.exec('COMMIT')
       return result
     } catch (error) {
@@ -1652,25 +1683,38 @@ export class DomainLedger {
     }
   }
 
-  recordCheckpoint(input: {
-    inputCommitOid: string
-    outputCommitOid: string
-    roundIndex: number
-    runId: string
-    stageId: string
-  }): void {
-    this.#db
-      .prepare(
-        'INSERT INTO stage_checkpoints (run_id, stage_id, round_index, input_commit_oid, output_commit_oid, created_at) VALUES (?, ?, ?, ?, ?, ?)'
-      )
-      .run(
-        input.runId,
-        input.stageId,
-        input.roundIndex,
-        input.inputCommitOid,
-        input.outputCommitOid,
-        new Date().toISOString()
-      )
+  recordCheckpoint(
+    input: {
+      inputCommitOid: string
+      outputCommitOid: string
+      roundIndex: number
+      runId: string
+      stageId: string
+    },
+    presentation?: { eventKey: string; snapshot: PresentationSnapshot }
+  ): void {
+    if (presentation) this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      this.#db
+        .prepare(
+          'INSERT INTO stage_checkpoints (run_id, stage_id, round_index, input_commit_oid, output_commit_oid, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+        )
+        .run(
+          input.runId,
+          input.stageId,
+          input.roundIndex,
+          input.inputCommitOid,
+          input.outputCommitOid,
+          new Date().toISOString()
+        )
+      if (presentation) {
+        this.#recordPresentationMilestone(input.runId, presentation)
+        this.#db.exec('COMMIT')
+      }
+    } catch (error) {
+      if (presentation) this.#db.exec('ROLLBACK')
+      throw error
+    }
   }
 
   recordEvidence(input: {
@@ -2132,6 +2176,58 @@ export class DomainLedger {
       this.#db.exec('ROLLBACK')
       throw error
     }
+  }
+
+  recordPresentationSnapshot(
+    runId: string,
+    eventKey: string,
+    snapshot: PresentationSnapshot
+  ): boolean {
+    if (snapshot.runId !== runId) throw new Error('presentation snapshot run ID mismatch')
+    const result = this.#db
+      .prepare(
+        `INSERT OR IGNORE INTO presentation_snapshots (
+           run_id, event_key, sequence, snapshot_json, created_at
+         ) VALUES (?, ?, ?, ?, ?)`
+      )
+      .run(runId, eventKey, snapshot.sequence, JSON.stringify(snapshot), snapshot.updatedAt)
+    if (Number(result.changes) > 0) return true
+    const replay = this.#db
+      .prepare(
+        'SELECT sequence FROM presentation_snapshots WHERE run_id = ? AND event_key = ?'
+      )
+      .get(runId, eventKey) as { sequence: number } | undefined
+    if (replay) return false
+    const conflict = this.#db
+      .prepare(
+        'SELECT event_key FROM presentation_snapshots WHERE run_id = ? AND sequence = ?'
+      )
+      .get(runId, snapshot.sequence) as { event_key: string } | undefined
+    if (conflict) {
+      throw new Error(
+        `presentation sequence ${snapshot.sequence} for run ${runId} is already held by event ${conflict.event_key}`
+      )
+    }
+    throw new Error(`presentation event ${eventKey} could not be recorded`)
+  }
+
+  #recordPresentationMilestone(
+    runId: string,
+    presentation: { eventKey: string; snapshot: PresentationSnapshot }
+  ): void {
+    if (!this.recordPresentationSnapshot(runId, presentation.eventKey, presentation.snapshot)) {
+      throw new Error(`presentation event ${presentation.eventKey} is already recorded`)
+    }
+  }
+
+  listPresentationSnapshots(runId: string): PresentationSnapshot[] {
+    return (
+      this.#db
+        .prepare(
+          'SELECT snapshot_json FROM presentation_snapshots WHERE run_id = ? ORDER BY sequence'
+        )
+        .all(runId) as { snapshot_json: string }[]
+    ).map(({ snapshot_json }) => JSON.parse(snapshot_json) as PresentationSnapshot)
   }
 
   runStatus(runId: string): RunStatus | undefined {

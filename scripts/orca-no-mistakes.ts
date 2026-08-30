@@ -61,6 +61,10 @@ import {
   type PolicyProvenance,
 } from "./policy.ts";
 import {
+  PlainStatusRenderer,
+  PresentationPublisher,
+} from "./presentation.ts";
+import {
   DomainLedger,
   RUN_ID_PATTERN,
   isWithin,
@@ -95,6 +99,7 @@ export {
   type PassedAttestationManifest,
   type StageEvidenceManifestEntry,
 } from "./ledger.ts";
+export * from "./presentation.ts";
 export type FindingAction = "ask-user" | "auto-fix" | "no-op";
 
 const FINDING_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
@@ -262,6 +267,7 @@ export type PipelineOptions = {
   intentTaskId?: string;
   intent: string;
   maxFixRounds?: number;
+  plainStatus?: boolean;
   resumeRunId?: string;
   userGlobalConfig?: OrcaNoMistakesConfig;
 };
@@ -609,6 +615,7 @@ type AbortReapState = {
   orchestrationRunId?: string;
   originWorktree?: string;
   pid?: number;
+  plainStatus?: boolean;
   resumeClaimId?: string;
   runId?: string;
   startupReceipt?: string;
@@ -1058,6 +1065,7 @@ export async function registerAbortRunContext(state: {
   generationToken?: number;
   ledger: DomainLedger;
   orchestrationRunId?: string;
+  plainStatus?: boolean;
   resumeClaimId?: string;
   runId: string;
 }): Promise<void> {
@@ -1130,17 +1138,46 @@ export async function reapAbortedRun(reason: string): Promise<void> {
   let shouldFailOrcaRun = false;
   if (preserved && abortReap.ledger && abortReap.runId) {
     try {
-      const run = abortReap.ledger.runIdentity(abortReap.runId);
-      cancelled =
-        run !== undefined &&
-        abortReap.ledger.settleRun(abortReap.runId, "cancelled", {
-          branch: run.branch,
-          generationToken: abortReap.generationToken,
-          repoRoot: run.repo_root,
-        });
-      const status = abortReap.ledger.runStatus(abortReap.runId);
+      const ledger = abortReap.ledger;
+      const runId = abortReap.runId;
+      const run = ledger.runIdentity(runId);
+      const presentation = new PresentationPublisher(
+        ledger,
+        runId,
+        abortReap.plainStatus
+          ? new PlainStatusRenderer(process.stderr)
+          : undefined,
+        () => new Date(),
+        (error) => abortLog(String(error)),
+      );
+      cancelled = run !== undefined;
+      if (run) {
+        const eventKey = `attempt:${presentation.current.attempt}:cancellation:cancel`;
+        presentation.publish(
+          eventKey,
+          { action: "cancel", kind: "cancellation-recorded" },
+          (snapshot) =>
+            (cancelled = ledger.settleRun(
+              runId,
+              "cancelled",
+              {
+                branch: run.branch,
+                generationToken: abortReap.generationToken,
+                repoRoot: run.repo_root,
+              },
+              { eventKey, snapshot },
+            )),
+        );
+      }
+      const status = ledger.runStatus(runId);
       settled = status !== "in-progress";
       shouldFailOrcaRun = settled && status !== "passed";
+      if (cancelled) {
+        presentation.publish(
+          `attempt:${presentation.current.attempt}:run:completed:cancelled`,
+          { kind: "run-completed", status: "cancelled" },
+        );
+      }
     } catch (error) {
       abortLog(
         `warning: abort could not settle the run: ${String(error)}`,
@@ -1366,11 +1403,14 @@ function settleRunOrThrow(
   outcome: "cancelled" | "failed",
   originalError: unknown,
   ownership?: Parameters<DomainLedger["settleRun"]>[2],
-): void {
+  presentation?: Parameters<DomainLedger["settleRun"]>[3],
+): boolean {
   try {
-    if (!ledger.settleRun(runId, outcome, ownership)) {
+    const settled = ledger.settleRun(runId, outcome, ownership, presentation);
+    if (!settled && ledger.runStatus(runId) !== outcome) {
       throw new Error(`run ${runId} no longer owns its branch lease`);
     }
+    return settled;
   } catch (settlementError) {
     throw new RunSettlementError(
       runId,
@@ -1458,6 +1498,8 @@ export async function runPipeline(
   const policySha256Value = await git.policySha256(repo.base);
   let domainRunStarted = false;
   let generationToken: number | undefined;
+  let presentation!: PresentationPublisher;
+  let presentationReady = false;
   let resumeClaimId: string | undefined;
   let resumeCheckpoint: StageCheckpointRow | undefined;
   const { artifactsDir, runId } = await withGateMutation(async () => {
@@ -1519,11 +1561,6 @@ export async function runPipeline(
         resumeCheckpoint = resumed.checkpoint;
         generationToken = resumed.generationToken;
         domainRunStarted = true;
-        await deliveryGit.anchorRecoveryRef(
-          runId,
-          resumeCheckpoint.output_commit_oid,
-          generationToken,
-        );
       } else {
         ledger.startRun({
           baseBranch: deliveryRepo.base,
@@ -1535,6 +1572,43 @@ export async function runPipeline(
           submissionCommitOid: deliveryRepo.head,
         });
         domainRunStarted = true;
+      }
+      presentation = new PresentationPublisher(
+        ledger,
+        runId,
+        options.plainStatus ? new PlainStatusRenderer(process.stderr) : undefined,
+        () => new Date(),
+        (error) =>
+          console.error(`warning: plain status renderer failed: ${String(error)}`),
+      );
+      presentationReady = true;
+      if (!options.resumeRunId) {
+        presentation.publish("run:started", { kind: "run-started" });
+      }
+      const attempt = presentation.nextAttempt();
+      presentation.publish(`attempt:${attempt}:started`, {
+        attempt,
+        kind: "attempt-started",
+      });
+      if (
+        attempt === 1 ||
+        presentation.current.mode.autoFix !== pipelineConfig.auto_fix.enabled
+      ) {
+        presentation.publish(
+          `attempt:${attempt}:mode:${pipelineConfig.auto_fix.enabled ? "on" : "off"}`,
+          {
+            enabled: pipelineConfig.auto_fix.enabled,
+            kind: "mode-changed",
+          },
+        );
+      }
+      if (options.resumeRunId) {
+        await deliveryGit.anchorRecoveryRef(
+          runId,
+          resumeCheckpoint!.output_commit_oid,
+          generationToken!,
+        );
+      } else {
         generationToken = ledger.acquireLease({
           branch: deliveryRepo.branch,
           force: options.forceLease === true,
@@ -1548,24 +1622,47 @@ export async function runPipeline(
         git,
         ledger,
         orchestrationRunId,
+        plainStatus: options.plainStatus,
         resumeClaimId,
         runId,
       });
     } catch (error) {
       if (domainRunStarted) {
-        settleRunOrThrow(
-          ledger,
-          runId,
-          "failed",
-          error,
-          generationToken === undefined
-            ? undefined
-            : {
-                branch: deliveryRepo.branch,
-                generationToken,
-                repoRoot: deliveryRepo.root,
-              },
-        );
+        const ownership = generationToken === undefined
+          ? undefined
+          : {
+              branch: deliveryRepo.branch,
+              generationToken,
+              repoRoot: deliveryRepo.root,
+            };
+        if (presentationReady) {
+          const eventKey = `attempt:${presentation.current.attempt}:error:setup`;
+          presentation.publish(
+            eventKey,
+            {
+              kind: "error-recorded",
+              resumable: ledger.listCheckpoints(runId).length > 0,
+            },
+            (snapshot) =>
+              settleRunOrThrow(
+                ledger,
+                runId,
+                "failed",
+                error,
+                ownership,
+                { eventKey, snapshot },
+              ),
+          );
+          presentation.publish(
+            `attempt:${presentation.current.attempt}:run:completed:failed`,
+            {
+              kind: "run-completed",
+              status: "failed",
+            },
+          );
+        } else {
+          settleRunOrThrow(ledger, runId, "failed", error, ownership);
+        }
       }
       throw error;
     }
@@ -1821,6 +1918,13 @@ export async function runPipeline(
         effectivePolicyHash: effectiveProvenance.effectivePolicyHash,
         baseRefSha: effectiveProvenance.baseRefSha,
       });
+      presentation.publish(`findings:${entry.evidenceSha256}`, {
+        actionable: actionableFindings(report).length,
+        kind: "findings-recorded",
+        round,
+        stage,
+        total: report.findings.length,
+      });
       stageEntries.push(entry);
       latestEntryByStage.set(stage, entry);
     };
@@ -1862,6 +1966,10 @@ export async function runPipeline(
         "in-progress",
       );
       let round = priorRoundByStage.get(stage) ?? 0;
+      presentation.publish(
+        `attempt:${presentation.current.attempt}:stage:${stage}:started`,
+        { kind: "stage-started", stage },
+      );
       let attempt = 0;
       const resumedEvidence = latestEvidenceByStage.get(stage);
       let resumedFixDecision =
@@ -1883,6 +1991,10 @@ export async function runPipeline(
       let inheritedFallback:
         { attempts: FallbackAttempt[]; resolvedAgent: string } | undefined;
       const runStage = async () => {
+        presentation.publish(
+          `attempt:${presentation.current.attempt}:stage:${stage}:round:${round}:started`,
+          { kind: "round-started", round, stage },
+        );
         const execution = await executeStage(
           stage,
           attempt++,
@@ -2033,6 +2145,12 @@ export async function runPipeline(
               runId,
               stageId: stage,
             });
+            presentation.publish(`gate:${gateId}:opened`, {
+              gateId,
+              kind: "gate-opened",
+              round,
+              stage,
+            });
             gateAudited = true;
           };
           const gateId = await orca.createGate(
@@ -2059,6 +2177,13 @@ export async function runPipeline(
               gateOptions,
             ),
             stageId: stage,
+          });
+          presentation.publish(`gate:${gateId}:resolved`, {
+            decision: decision.action,
+            gateId,
+            kind: "gate-resolved",
+            round,
+            stage,
           });
           if (
             decision.action !== "unknown" &&
@@ -2110,6 +2235,10 @@ export async function runPipeline(
         }
 
         round += 1;
+        presentation.publish(
+          `attempt:${presentation.current.attempt}:stage:${stage}:round:${round}:started`,
+          { kind: "round-started", round, stage },
+        );
         ledger.heartbeatLease(deliveryRepo.root, deliveryRepo.branch, runId);
         const fixerRoles = pipelineConfig.stages[stage].fixer;
         if (fixerSession && !fixerSessionMatchesRole(fixerSession, fixerRoles)) {
@@ -2248,13 +2377,23 @@ export async function runPipeline(
         report = await runStage();
       }
 
-      ledger.recordCheckpoint({
-        inputCommitOid: stageInputCommitOid,
-        outputCommitOid: await git.head(),
-        roundIndex: round,
-        runId,
-        stageId: stage,
-      });
+      const stageOutputCommitOid = await git.head();
+      const eventKey = `stage:${stage}:round:${round}:completed:${stageOutputCommitOid}`;
+      presentation.publish(
+        eventKey,
+        { kind: "stage-completed", round, stage },
+        (snapshot) =>
+          ledger.recordCheckpoint(
+            {
+              inputCommitOid: stageInputCommitOid,
+              outputCommitOid: stageOutputCommitOid,
+              roundIndex: round,
+              runId,
+              stageId: stage,
+            },
+            { eventKey, snapshot },
+          ),
+      );
       await orca.completeTask(taskId, report);
     }
 
@@ -2297,45 +2436,50 @@ export async function runPipeline(
         runId,
       });
       verifyManifest(attestation, PIPELINE_STEPS);
-      const custodyNote = await ledger.finalizePassedRunWithLeaseMutation(
-        attestation,
-        terminalCommitOid,
-        {
-          branch: deliveryRepo.branch,
-          generationToken: generationToken!,
-          repoRoot: deliveryRepo.root,
-        },
-        async () => {
-          if (deliveryGit === git && operatorHead === terminalCommitOid) {
-            return operatorHead === submissionCommitOid
-              ? `branch ${deliveryRepo.branch} already at submission commit ${submissionCommitOid}`
-              : `branch ${deliveryRepo.branch} carries the terminal commit ${terminalCommitOid}`;
-          }
-          const recoverRef = recoveryRefFor(runId);
-          let advanced = false;
-          let transferFailure: string | undefined;
-          if (deliveryGit !== git && operatorHead === submissionCommitOid) {
-            try {
-              advanced = await deliveryGit.applyWorktreeCommits(
-                repo.root,
-                submissionCommitOid,
-                terminalCommitOid,
-                leaseFence,
-              );
-            } catch (error) {
-              if (error instanceof PostMutationCustodyError) throw error;
-              transferFailure =
-                error instanceof Error ? error.message : String(error);
+      const eventKey = "run:completed:passed";
+      const custodyNote = await presentation.publishAsync(
+        { kind: "run-completed", status: "passed" },
+        (snapshot) => ledger.finalizePassedRunWithLeaseMutation(
+          attestation,
+          terminalCommitOid,
+          {
+            branch: deliveryRepo.branch,
+            generationToken: generationToken!,
+            repoRoot: deliveryRepo.root,
+          },
+          async () => {
+            if (deliveryGit === git && operatorHead === terminalCommitOid) {
+              return operatorHead === submissionCommitOid
+                ? `branch ${deliveryRepo.branch} already at submission commit ${submissionCommitOid}`
+                : `branch ${deliveryRepo.branch} carries the terminal commit ${terminalCommitOid}`;
             }
-          }
-          return advanced
-            ? `advanced branch ${deliveryRepo.branch} from submission to terminal commit ${terminalCommitOid}`
-            : transferFailure
-              ? `custody transfer failed on the pipeline side (${transferFailure}); ` +
-                recoveryInstructions(recoverRef)
-              : "operator checkout diverged or carries uncommitted changes; " +
-                recoveryInstructions(recoverRef);
-        },
+            const recoverRef = recoveryRefFor(runId);
+            let advanced = false;
+            let transferFailure: string | undefined;
+            if (deliveryGit !== git && operatorHead === submissionCommitOid) {
+              try {
+                advanced = await deliveryGit.applyWorktreeCommits(
+                  repo.root,
+                  submissionCommitOid,
+                  terminalCommitOid,
+                  leaseFence,
+                );
+              } catch (error) {
+                if (error instanceof PostMutationCustodyError) throw error;
+                transferFailure =
+                  error instanceof Error ? error.message : String(error);
+              }
+            }
+            return advanced
+              ? `advanced branch ${deliveryRepo.branch} from submission to terminal commit ${terminalCommitOid}`
+              : transferFailure
+                ? `custody transfer failed on the pipeline side (${transferFailure}); ` +
+                  recoveryInstructions(recoverRef)
+                : "operator checkout diverged or carries uncommitted changes; " +
+                  recoveryInstructions(recoverRef);
+          },
+          { eventKey, snapshot },
+        ),
       );
       return { attestation, custodyNote };
     });
@@ -2384,11 +2528,55 @@ export async function runPipeline(
         }
       }
       if (!anchorError) {
-        settleRunOrThrow(ledger, runId, outcome, failure, {
-          branch: deliveryRepo.branch,
-          generationToken,
-          repoRoot: deliveryRepo.root,
-        });
+        if (outcome === "cancelled") {
+          const eventKey = `attempt:${presentation.current.attempt}:cancellation:gate-stop`;
+          presentation.publish(
+            eventKey,
+            { action: "gate-stop", kind: "cancellation-recorded" },
+            (snapshot) =>
+              settleRunOrThrow(
+                ledger,
+                runId,
+                outcome,
+                failure,
+                {
+                  branch: deliveryRepo.branch,
+                  generationToken,
+                  repoRoot: deliveryRepo.root,
+                },
+                { eventKey, snapshot },
+              ),
+          );
+        } else {
+          const eventKey = `attempt:${presentation.current.attempt}:error`;
+          presentation.publish(
+            eventKey,
+            {
+              kind: "error-recorded",
+              resumable: ledger.listCheckpoints(runId).length > 0,
+            },
+            (snapshot) =>
+              settleRunOrThrow(
+                ledger,
+                runId,
+                outcome,
+                failure,
+                {
+                  branch: deliveryRepo.branch,
+                  generationToken,
+                  repoRoot: deliveryRepo.root,
+                },
+                { eventKey, snapshot },
+              ),
+          );
+        }
+        presentation.publish(
+          `attempt:${presentation.current.attempt}:run:completed:${outcome}`,
+          {
+            kind: "run-completed",
+            status: outcome,
+          },
+        );
       }
       const message =
         failure instanceof Error ? failure.message : String(failure);
@@ -8276,6 +8464,7 @@ const BOOLEAN_FLAGS = new Set([
   "allow-local-config",
   "attached",
   "force-lease",
+  "no-tui",
   "stranded",
 ]);
 const VALUE_FLAGS = new Set([
@@ -8307,6 +8496,7 @@ const COMMAND_FLAGS: Record<string, Set<string>> = {
     "head",
     "intent",
     "max-fix-rounds",
+    "no-tui",
     "notify",
     "repo",
     "resume",
@@ -11383,6 +11573,7 @@ Run options:
   --reviewer-model <model>
   --fixer-model <model> --fixer-effort <level>
   --max-fix-rounds <count>
+  --no-tui (emit semantic run progress on stderr)
   --resume <run-id> (continue a failed run from its last checkpoint)
   --allow-local-config
   --config <path>
@@ -11539,6 +11730,7 @@ Prune options:
           gate?.kind === "configured" ? gate.intentTaskId : undefined,
         intent,
         maxFixRounds,
+        plainStatus: parsed.flags["no-tui"] === true,
         resumeRunId,
         userGlobalConfig,
       },
