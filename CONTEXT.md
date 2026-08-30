@@ -165,7 +165,7 @@ A deterministic root binding the frozen stage plan and evidence through candidat
 _Avoid_: Completion-attestation root, remote trust anchor, raw evidence link
 
 **Pipeline completion attestation**:
-A portable, tamper-evident manifest for a run with a `passed` verdict. It binds the frozen stage plan, evidence, receipt and attempt-outcome digests, custody facts, and explicit assurance claims to the candidate commit. It proves historical observations, not current remote state or independent authenticity.
+A portable, tamper-evident manifest for a run with a `passed` verdict. It binds the frozen stage plan, evidence, receipt and prior attempt-outcome digests, custody facts, and explicit assurance claims to the candidate commit. It proves historical observations, not current remote state or independent authenticity.
 _Avoid_: Passed, signature, live-status certificate
 
 **Passed attestation**:
