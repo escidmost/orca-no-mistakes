@@ -132,6 +132,26 @@ _Avoid_: Informational note, console message
 A blocking Orca checkpoint awaiting one explicit authorized resolution.
 _Avoid_: Pause, prompt, implicit approval
 
+**Run TUI**:
+An optional, human-facing terminal interface for observing and safely controlling one pipeline run. Direct invocations select it with `--tui`; Orca-native launches select it by default.
+_Avoid_: Multi-run dashboard, worker shell, policy editor
+
+**Plain status renderer**:
+A non-interactive, line-oriented view of meaningful transitions in one pipeline run, used when the Run TUI is disabled or unavailable.
+_Avoid_: Raw subprocess stream, static final report, screen-reader-only mode
+
+**Auto-fix mode**:
+A durable run-level mode that may be changed while a run is active and automatically starts fix rounds for future findings classified as eligible for automatic repair. Resumed attempts inherit the run's latest setting. It never waives required policy or answers decision gates that require human judgment.
+_Avoid_: YOLO mode, unattended approval, policy bypass
+
+**Run cancellation**:
+The terminal outcome when an operator stops a run before it passes or fails. Cancel requests an orderly stop; Force stop escalates immediately. Both produce the same outcome, while retaining which action occurred as evidence.
+_Avoid_: Abort status, failed run
+
+**Resumable error**:
+An error the pipeline explicitly identifies as safe to continue from a durable checkpoint. Operators may resume only when the pipeline declares this condition.
+_Avoid_: Retry any error, restart stage
+
 **Approval**:
 An authorized decision satisfying a policy that explicitly requires human judgment. Approval is not a waiver of a failed required policy.
 _Avoid_: Override, bypass
