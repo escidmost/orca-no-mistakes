@@ -309,7 +309,8 @@ export class RailTuiRenderer implements PresentationRenderer {
   }
 
   #showGate(): void {
-    if (!this.#snapshot?.gate?.options?.length || this.#gateVisible) return;
+    const gate = this.#snapshot?.gate;
+    if (gate?.state !== "open" || !gate.options?.length || this.#gateVisible) return;
     this.#gateReturn = {
       activityIndex: this.#activityIndex,
       focus: this.#focus,
@@ -658,8 +659,9 @@ export class RailTuiRenderer implements PresentationRenderer {
         this.#inputBuffer = "";
         if (this.#closed) return;
         try {
-          if (this.#gateVisible) this.#leaveGate();
-          else this.#returnToRail();
+          if (this.#gateVisible) {
+            if (!this.#gateSubmitting) this.#leaveGate();
+          } else this.#returnToRail();
           this.#draw();
         } catch {
           this.close();
