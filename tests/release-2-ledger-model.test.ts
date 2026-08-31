@@ -287,6 +287,8 @@ test('Release 2 ledger facts are immutable, append-only, and atomically checkpoi
       () => ledger.settleRemoteStage({ ...settlement, evidence: conflictingEvidence }),
       /push round 0 is already settled with different facts/
     )
+    assert.equal(ledger.listEvidence(runId).length, 1)
+    assert.equal(ledger.listCheckpoints(runId).length, 1)
     assert.equal(
       ledger.remoteReceipt(runId, 'candidate-publication')?.receipt_sha256,
       receiptDigest
