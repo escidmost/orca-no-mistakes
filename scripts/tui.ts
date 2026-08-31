@@ -8,6 +8,7 @@ import {
   type StageLog,
 } from "./ledger.ts";
 import type {
+  GateResolver,
   PresentationRenderer,
   PresentationSnapshot,
   PresentationTransition,
@@ -35,6 +36,14 @@ type Output = {
 
 type Region = "activity" | "logs" | "rail";
 
+type GateReturnState = {
+  activityIndex: number;
+  focus: Region;
+  logOffset: number;
+  pinnedStage?: StageName;
+  selectedStage: number;
+};
+
 const REGIONS: readonly Region[] = ["rail", "activity", "logs"];
 const MIN_COLUMNS = 72;
 const MIN_ROWS = 18;
@@ -47,7 +56,9 @@ function title(stage: StageName): string {
 
 function fit(text: string, width: number): string {
   if (width <= 0) return "";
-  const value = text.replaceAll("\t", "  ");
+  const value = text
+    .replaceAll("\t", "  ")
+    .replaceAll(new RegExp("[\\x00-\\x1f\\x7f-\\x9f]", "gu"), "?");
   if (value.length > width) {
     return width === 1 ? value.slice(0, 1) : `${value.slice(0, width - 1)}~`;
   }
@@ -122,6 +133,36 @@ function activity(transition: PresentationTransition): string {
   }
 }
 
+function gateConsequence(option: string, stage?: StageName): string {
+  switch (option) {
+    case "approve":
+      return "Continue with an audited approval.";
+    case "fix":
+      return stage === "rebase"
+        ? "Retry the rebase after conflicts are resolved."
+        : "Fix all findings, then recheck this stage.";
+    case "skip":
+      return "Continue with an audited waiver.";
+    case "stop":
+      return "Stop and cancel this run.";
+    default:
+      return "Resolve the canonical gate with this choice.";
+  }
+}
+
+function wrap(text: string, width: number): string[] {
+  const lines: string[] = [];
+  let rest = text.replace(/\s+/gu, " ").trim();
+  while (rest.length > width) {
+    const space = rest.lastIndexOf(" ", width);
+    const end = space > 0 ? space : width;
+    lines.push(rest.slice(0, end));
+    rest = rest.slice(end).trimStart();
+  }
+  if (rest) lines.push(rest);
+  return lines;
+}
+
 function transitionStage(
   transition: PresentationTransition,
 ): StageName | undefined {
@@ -150,11 +191,18 @@ export class RailTuiRenderer implements PresentationRenderer {
   readonly #inputWasPaused: boolean;
   readonly #inputWasRaw: boolean;
   readonly #output: Output;
+  readonly #resolveGate?: GateResolver;
   readonly #stageLogs: ReadonlyMap<string, StageLog>;
   #activityIndex = 0;
   #closed = false;
   #escapeTimer?: ReturnType<typeof setTimeout>;
   #focus: Region = "rail";
+  #gateChoice = 0;
+  #gateConfirm = false;
+  #gateMessage?: string;
+  #gateReturn?: GateReturnState;
+  #gateSubmitting = false;
+  #gateVisible = false;
   #inputBuffer = "";
   #lastFrame?: string;
   #logOffset = 0;
@@ -185,11 +233,13 @@ export class RailTuiRenderer implements PresentationRenderer {
     output: Output,
     artifactsDir: string,
     stageLogs: ReadonlyMap<string, StageLog> = new Map(),
+    resolveGate?: GateResolver,
   ) {
     this.#input = input;
     this.#output = output;
     this.#artifactsDir = path.resolve(artifactsDir);
     this.#stageLogs = stageLogs;
+    this.#resolveGate = resolveGate;
     this.#inputWasPaused = input.isPaused();
     this.#inputWasRaw = input.isRaw === true;
     try {
@@ -232,14 +282,23 @@ export class RailTuiRenderer implements PresentationRenderer {
   render(snapshot: PresentationSnapshot): void {
     if (this.#closed) return;
     try {
+      const opensGate =
+        snapshot.transition.kind === "gate-opened" &&
+        snapshot.gate?.state === "open";
+      const settlesGate =
+        this.#gateVisible &&
+        (snapshot.gate?.state !== "open" ||
+          snapshot.gate.id !== this.#snapshot?.gate?.id);
       this.#snapshot = snapshot;
+      if (opensGate) this.#showGate();
       this.#activities.push({
         label: activity(snapshot.transition),
         stage: transitionStage(snapshot.transition),
       });
       if (this.#activities.length > 50) this.#activities.shift();
       this.#activityIndex = this.#activities.length - 1;
-      if (!this.#pinnedStage && snapshot.currentStage) {
+      if (settlesGate) this.#leaveGate();
+      if (!opensGate && !settlesGate && !this.#pinnedStage && snapshot.currentStage) {
         this.#selectedStage = PIPELINE_STEPS.indexOf(snapshot.currentStage);
       }
       this.#draw();
@@ -247,6 +306,69 @@ export class RailTuiRenderer implements PresentationRenderer {
       this.close();
       throw error;
     }
+  }
+
+  #showGate(): void {
+    const gate = this.#snapshot?.gate;
+    if (gate?.state !== "open" || !gate.options?.length || this.#gateVisible) return;
+    this.#gateReturn = {
+      activityIndex: this.#activityIndex,
+      focus: this.#focus,
+      logOffset: this.#logOffset,
+      pinnedStage: this.#pinnedStage,
+      selectedStage: this.#selectedStage,
+    };
+    this.#gateChoice = 0;
+    this.#gateConfirm = false;
+    this.#gateMessage = undefined;
+    this.#gateSubmitting = false;
+    this.#gateVisible = true;
+  }
+
+  #leaveGate(): void {
+    if (this.#gateReturn) {
+      this.#activityIndex = this.#gateReturn.activityIndex;
+      this.#focus = this.#gateReturn.focus;
+      this.#logOffset = this.#gateReturn.logOffset;
+      this.#pinnedStage = this.#gateReturn.pinnedStage;
+      this.#selectedStage = this.#gateReturn.selectedStage;
+    }
+    this.#gateReturn = undefined;
+    this.#gateVisible = false;
+    this.#gateConfirm = false;
+    this.#gateMessage = undefined;
+    this.#gateSubmitting = false;
+  }
+
+  #submitGate(): void {
+    const gate = this.#snapshot?.gate;
+    const resolution = gate?.options?.[this.#gateChoice];
+    if (!gate || gate.state !== "open" || !resolution) return;
+    if (!this.#resolveGate) {
+      this.#gateConfirm = false;
+      this.#gateMessage = "Inline resolution is unavailable.";
+      return;
+    }
+    this.#gateConfirm = false;
+    this.#gateSubmitting = true;
+    this.#gateMessage = "Submitting canonical gate decision...";
+    this.#draw();
+    void this.#resolveGate(gate.id, resolution).then(
+      () => {
+        if (this.#gateVisible && this.#snapshot?.gate?.id === gate.id) {
+          this.#gateMessage = "Decision sent; waiting for settlement.";
+          this.#draw();
+        }
+      },
+      (error) => {
+        if (this.#gateVisible && this.#snapshot?.gate?.id === gate.id) {
+          this.#gateSubmitting = false;
+          this.#gateConfirm = false;
+          this.#gateMessage = `Could not resolve gate: ${String(error)}`;
+          this.#draw();
+        }
+      },
+    );
   }
 
   #draw(): void {
@@ -288,10 +410,22 @@ export class RailTuiRenderer implements PresentationRenderer {
 
   #full(columns: number, rows: number): string[] {
     const railWidth = 25;
-    const activityWidth = 31;
-    const logWidth = columns - railWidth - activityWidth - 6;
     const bodyRows = rows - 3;
     const rail = this.#rail(bodyRows, railWidth);
+    if (this.#gateVisible) {
+      const gate = this.#gatePanel(bodyRows, columns - railWidth - 3);
+      return [
+        this.#header(columns),
+        fit("=".repeat(columns), columns),
+        ...Array.from(
+          { length: bodyRows },
+          (_, index) => `${rail[index]} | ${gate[index]}`,
+        ),
+        this.#footer(columns),
+      ];
+    }
+    const activityWidth = 31;
+    const logWidth = columns - railWidth - activityWidth - 6;
     const recent = this.#recent(bodyRows, activityWidth);
     const logs = this.#logs(bodyRows, logWidth);
     return [
@@ -310,8 +444,9 @@ export class RailTuiRenderer implements PresentationRenderer {
     const detailWidth = columns - railWidth - 3;
     const bodyRows = rows - 3;
     const rail = this.#rail(bodyRows, railWidth);
-    const detail =
-      this.#focus === "activity"
+    const detail = this.#gateVisible
+      ? this.#gatePanel(bodyRows, detailWidth)
+      : this.#focus === "activity"
         ? this.#recent(bodyRows, detailWidth)
         : this.#logs(bodyRows, detailWidth);
     return [
@@ -343,6 +478,47 @@ export class RailTuiRenderer implements PresentationRenderer {
               : " ";
       const selected = index === this.#selectedStage ? ">" : " ";
       lines.push(`${selected} [${marker}] ${index + 1}. ${title(stage)}`);
+    }
+    return Array.from({ length: rows }, (_, index) => fit(lines[index] ?? "", width));
+  }
+
+  #gatePanel(rows: number, width: number): string[] {
+    const gate = this.#snapshot?.gate;
+    if (!gate) return Array.from({ length: rows }, () => fit("", width));
+    const options = gate.options ?? [];
+    const choice = options[this.#gateChoice];
+    const question = wrap(gate.question ?? "Human decision required.", width).slice(
+      0,
+      2,
+    );
+    const lines = [
+      fit("> DECISION REQUIRED", width),
+      fit(
+        `${title(gate.stage ?? this.#snapshot!.currentStage ?? "intent")} round ${gate.round ?? 0} | ${gate.id}`,
+        width,
+      ),
+      ...question.map((line) => fit(line, width)),
+      fit("Canonical choices:", width),
+    ];
+    for (const [index, option] of options.entries()) {
+      lines.push(fit(`${index === this.#gateChoice ? ">" : " "} ${option}`, width));
+      lines.push(fit(`  ${gateConsequence(option, gate.stage)}`, width));
+    }
+    lines.push(
+      fit(
+        this.#gateConfirm
+          ? `Confirm ${choice}? Press Enter again.`
+          : this.#gateMessage ?? "Enter selects. Esc returns unanswered.",
+        width,
+      ),
+    );
+    if (this.#gateConfirm || this.#gateSubmitting) {
+      lines.push(
+        fit(
+          this.#gateMessage ?? "Esc returns without resolving the gate.",
+          width,
+        ),
+      );
     }
     return Array.from({ length: rows }, (_, index) => fit(lines[index] ?? "", width));
   }
@@ -397,10 +573,19 @@ export class RailTuiRenderer implements PresentationRenderer {
   }
 
   #footer(width: number): string {
+    if (this.#gateVisible) {
+      return fit(
+        this.#gateSubmitting
+          ? "Waiting for canonical gate settlement"
+          : "Up/Down choice | Enter select/confirm | Esc return unanswered",
+        width,
+      );
+    }
     const keys = ["Tab/Shift-Tab region"];
     if (this.#focus === "logs") keys.push("Up/Down scroll");
     else keys.push("Up/Down move", "Enter open");
     if (this.#pinnedStage || this.#focus === "logs") keys.push("Esc return");
+    if (this.#snapshot?.gate?.state === "open") keys.push("G open gate");
     return fit(keys.join(" | "), width);
   }
 
@@ -421,19 +606,49 @@ export class RailTuiRenderer implements PresentationRenderer {
     this.#inputBuffer = incomplete ? this.#inputBuffer.slice(-incomplete) : "";
     const keys =
       complete.match(
-        new RegExp("\\x03|\\x1b\\[Z|\\x1b\\[[ABCD]|\\r|\\n|\\t|\\x1b", "g"),
+        new RegExp(
+          "\\x03|\\x1b\\[Z|\\x1b\\[[ABCD]|\\r|\\n|\\t|\\x1b|[gG]",
+          "g",
+        ),
       ) ?? [];
     for (const key of keys) {
       if (key === "\u0003") {
         this.close();
         process.kill(process.pid, "SIGINT");
         return;
+      } else if (this.#gateVisible) {
+        if (key === "\u001b" && !this.#gateSubmitting) {
+          this.#leaveGate();
+        } else if (!this.#gateSubmitting && (key === "\r" || key === "\n")) {
+          if (this.#gateConfirm) this.#submitGate();
+          else {
+            this.#gateConfirm = true;
+            break;
+          }
+        } else if (
+          !this.#gateSubmitting &&
+          (key === "\u001b[A" ||
+            key === "\u001b[D" ||
+            key === "\u001b[B" ||
+            key === "\u001b[C")
+        ) {
+          const direction = key === "\u001b[A" || key === "\u001b[D" ? -1 : 1;
+          const count = this.#snapshot?.gate?.options?.length ?? 0;
+          this.#gateChoice = Math.max(
+            0,
+            Math.min(count - 1, this.#gateChoice + direction),
+          );
+          this.#gateConfirm = false;
+          this.#gateMessage = undefined;
+        }
       } else if (key === "\t" || key === "\u001b[Z") {
         const direction = key === "\t" ? 1 : -1;
         const index = REGIONS.indexOf(this.#focus);
         this.#focus = REGIONS[(index + direction + REGIONS.length) % REGIONS.length];
       } else if (key === "\u001b") {
         this.#returnToRail();
+      } else if (key === "g" || key === "G") {
+        this.#showGate();
       } else if (key === "\r" || key === "\n") {
         this.#open();
       } else if (key === "\u001b[A" || key === "\u001b[D") {
@@ -448,7 +663,9 @@ export class RailTuiRenderer implements PresentationRenderer {
         this.#inputBuffer = "";
         if (this.#closed) return;
         try {
-          this.#returnToRail();
+          if (this.#gateVisible) {
+            if (!this.#gateSubmitting) this.#leaveGate();
+          } else this.#returnToRail();
           this.#draw();
         } catch {
           this.close();
@@ -498,10 +715,17 @@ export function createRailTuiRenderer(
   output: Output,
   artifactsDir: string,
   stageLogs?: ReadonlyMap<string, StageLog>,
+  resolveGate?: GateResolver,
 ): RailTuiRenderer | undefined {
   if (!supportsRailTui(input, output)) return undefined;
   try {
-    return new RailTuiRenderer(input, output, artifactsDir, stageLogs);
+    return new RailTuiRenderer(
+      input,
+      output,
+      artifactsDir,
+      stageLogs,
+      resolveGate,
+    );
   } catch {
     return undefined;
   }

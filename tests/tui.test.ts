@@ -41,21 +41,70 @@ function snapshot(stage: StageName, sequence: number): PresentationSnapshot {
   };
 }
 
+function gateSnapshot(
+  state: "open" | "resolved",
+  sequence: number,
+  decision?: string,
+): PresentationSnapshot {
+  const base = snapshot("review", sequence);
+  const options = ["approve", "fix", "skip", "stop"];
+  return {
+    ...base,
+    gate: {
+      decision,
+      id: "gate-review",
+      options,
+      question: "Choose how to handle the unresolved review findings.",
+      round: 1,
+      stage: "review",
+      state,
+    },
+    stages: base.stages.map((stage) =>
+      stage.id === "review"
+        ? { ...stage, status: state === "open" ? "blocked" : "active" }
+        : stage,
+    ),
+    transition:
+      state === "open"
+        ? {
+            gateId: "gate-review",
+            kind: "gate-opened",
+            options,
+            question: "Choose how to handle the unresolved review findings.",
+            round: 1,
+            stage: "review",
+          }
+        : {
+            decision: decision ?? "approve",
+            gateId: "gate-review",
+            kind: "gate-resolved",
+            round: 1,
+            stage: "review",
+          },
+  };
+}
+
 async function runFixture(): Promise<void> {
   const artifactsDir = process.env.TUI_ARTIFACTS!;
   const logPath = path.join(artifactsDir, "review_r1.log");
   const log = new StageLog(logPath);
   await log.append("review token=[REDACTED]\n");
   const before = `${process.stdin.isRaw === true}:${process.stdin.isPaused()}`;
-  const renderer = new RailTuiRenderer(
+  let renderer!: RailTuiRenderer;
+  renderer = new RailTuiRenderer(
     process.stdin,
     process.stderr,
     artifactsDir,
     new Map([[path.resolve(logPath), log]]),
+    async (gateId, resolution) => {
+      process.stdout.write(`\nGATE ANSWER ${gateId} ${resolution}\n`);
+      renderer.render(gateSnapshot("resolved", 3, resolution));
+    },
   );
   renderer.render(snapshot("review", 1));
   process.stdin.on("data", (chunk) => {
     const input = chunk.toString();
+    if (input.includes("d")) renderer.render(gateSnapshot("open", 2));
     if (input.includes("n")) renderer.render(snapshot("lint", 2));
     if (input.includes("q")) {
       renderer.close();
@@ -170,8 +219,93 @@ if (process.env.TUI_FIXTURE === "1") {
     renderer.close();
   });
 
+  test("inline decision gate preserves the pin and requires explicit confirmation", async () => {
+    const input = new FakeInput();
+    const output = new FakeOutput();
+    const resolutions: [string, string][] = [];
+    const renderer = new RailTuiRenderer(
+      input,
+      output,
+      "/unused",
+      new Map(),
+      async (gateId, resolution) => {
+        resolutions.push([gateId, resolution]);
+      },
+    );
+    const screen = (): string => cleanScreen(output.writes.at(-1) ?? "");
+
+    renderer.render(snapshot("review", 1));
+    input.emit("data", "\r");
+    renderer.render(gateSnapshot("open", 2));
+    assert.match(screen(), /DECISION REQUIRED/u);
+    assert.match(screen(), /pinned Review/u);
+    assert.match(screen(), /approve.*audited approval/su);
+    assert.match(screen(), /skip.*audited waiver/su);
+    assert.match(screen(), /stop.*cancel this run/su);
+
+    input.emit("data", "\r");
+    assert.deepEqual(resolutions, []);
+    assert.match(screen(), /Confirm approve\? Press Enter again/u);
+    input.emit("data", "\u001b");
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    assert.deepEqual(resolutions, []);
+    assert.doesNotMatch(screen(), /DECISION REQUIRED/u);
+    assert.match(screen(), /pinned Review/u);
+
+    input.emit("data", "g\u001b[B\r\r");
+    assert.deepEqual(resolutions, []);
+    assert.match(screen(), /Confirm fix\? Press Enter again/u);
+    input.emit("data", "\r");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(resolutions, [["gate-review", "fix"]]);
+    input.emit("data", "\u001bg\r");
+    assert.equal(resolutions.length, 1);
+    assert.match(screen(), /Waiting for canonical gate settlement/u);
+    renderer.render(gateSnapshot("resolved", 3, "fix"));
+    assert.doesNotMatch(screen(), /DECISION REQUIRED/u);
+    assert.match(screen(), /pinned Review/u);
+    renderer.close();
+  });
+
+  test("external resolution race closes the decision gate without duplicate submission", async () => {
+    const input = new FakeInput();
+    const output = new FakeOutput();
+    const resolutions: [string, string][] = [];
+    let settle!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      settle = resolve;
+    });
+    const renderer = new RailTuiRenderer(
+      input,
+      output,
+      "/unused",
+      new Map(),
+      async (gateId, resolution) => {
+        resolutions.push([gateId, resolution]);
+        await pending;
+      },
+    );
+    const screen = (): string => cleanScreen(output.writes.at(-1) ?? "");
+
+    renderer.render(snapshot("review", 1));
+    input.emit("data", "\r");
+    renderer.render(gateSnapshot("open", 2));
+    input.emit("data", "\r\r");
+    assert.deepEqual(resolutions, []);
+    input.emit("data", "\r");
+    assert.deepEqual(resolutions, [["gate-review", "approve"]]);
+    renderer.render(gateSnapshot("resolved", 3, "stop"));
+    settle();
+    await pending;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(resolutions.length, 1);
+    assert.doesNotMatch(screen(), /DECISION REQUIRED/u);
+    assert.match(screen(), /pinned Review/u);
+    renderer.close();
+  });
+
   test(
-    "PTY Rail follows, pins, navigates, resizes, and restores the terminal",
+    "PTY decision gate confirms, restores the pin, and restores the terminal",
     { timeout: 10_000 },
     async () => {
       const artifactsDir = mkdtempSync(path.join(tmpdir(), "orca-tui-"));
@@ -244,6 +378,29 @@ if (process.env.TUI_FIXTURE === "1") {
           () =>
             screen().includes("pinned Review") &&
             screen().includes("review token=[REDACTED]"),
+        );
+        terminal.write("d");
+        await waitFor(
+          () =>
+            screen().includes("DECISION REQUIRED") &&
+            screen().includes("pinned Review"),
+        );
+        terminal.write("\r");
+        await waitFor(() => screen().includes("Confirm approve? Press Enter again"));
+        terminal.write("\u001b");
+        await waitFor(
+          () =>
+            !screen().includes("DECISION REQUIRED") &&
+            screen().includes("pinned Review"),
+        );
+        terminal.write("g\u001b[B\r\r");
+        await waitFor(() => screen().includes("Confirm fix? Press Enter again"));
+        terminal.write("\r");
+        await waitFor(
+          () =>
+            output.includes("GATE ANSWER gate-review fix") &&
+            !screen().includes("DECISION REQUIRED") &&
+            screen().includes("pinned Review"),
         );
         terminal.write("n");
         await waitFor(

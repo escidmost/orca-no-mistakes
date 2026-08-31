@@ -6,6 +6,8 @@ export type PresentationStatus =
   | "failed"
   | "cancelled";
 
+export type GateResolver = (gateId: string, resolution: string) => Promise<void>;
+
 export type PresentationTransition =
   | { kind: "run-started" }
   | { attempt: number; kind: "attempt-started" }
@@ -19,7 +21,14 @@ export type PresentationTransition =
       stage: StageName;
       total: number;
     }
-  | { gateId: string; kind: "gate-opened"; round: number; stage: StageName }
+  | {
+      gateId: string;
+      kind: "gate-opened";
+      options: string[];
+      question: string;
+      round: number;
+      stage: StageName;
+    }
   | {
       decision: string;
       gateId: string;
@@ -46,7 +55,11 @@ export type PresentationSnapshot = {
   gate?: {
     decision?: string;
     id: string;
+    options?: readonly string[];
+    question?: string;
+    round?: number;
     state: "open" | "resolved";
+    stage?: StageName;
   };
   mode: { autoFix: boolean };
   runId: string;
@@ -177,7 +190,14 @@ function nextSnapshot(
     case "gate-opened":
       next = {
         ...next,
-        gate: { id: transition.gateId, state: "open" },
+        gate: {
+          id: transition.gateId,
+          options: transition.options,
+          question: transition.question,
+          round: transition.round,
+          stage: transition.stage,
+          state: "open",
+        },
         stages: updateStage(next, transition.stage, { status: "blocked" }),
       };
       break;
@@ -185,6 +205,7 @@ function nextSnapshot(
       next = {
         ...next,
         gate: {
+          ...next.gate,
           decision: transition.decision,
           id: transition.gateId,
           state: "resolved",
