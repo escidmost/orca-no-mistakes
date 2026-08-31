@@ -39,7 +39,7 @@ Useful direct-run options:
 --reviewer-model <model>
 --fixer-model <model> --fixer-effort <level>
 --max-fix-rounds <count>
---tui                   render an interactive Rail with inline decision-gate resolution when the terminal supports it
+--tui                   render an interactive Rail with inline decision-gate resolution; default for detached runs
 --no-tui                emit line-oriented semantic progress on stderr
 --resume <failed-run-id>
 --allow-local-config
