@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process'
-import path from 'node:path'
+import { realpath } from 'node:fs/promises'
 import { z } from 'zod'
 
 import type {
@@ -652,7 +652,14 @@ export async function resolveGithubPublicationRoute(input: {
 }): Promise<RepositoryPublicationRouteInput & { routeFingerprint: string }> {
   const env = { ...(input.env ?? process.env) }
   const runner = input.commandRunner ?? runCommand
-  const repoRoot = path.resolve(input.repoPath)
+  // Key the route by the same canonical repository root run admission uses
+  // (realpath of `git rev-parse --show-toplevel`), never the raw CLI argument.
+  const repoRoot = await realpath(await gitValue(
+    runner,
+    ['-C', input.repoPath, 'rev-parse', '--path-format=absolute', '--show-toplevel'],
+    env,
+    'resolve repository root'
+  ))
   const upstream = input.upstream ?? await gitValue(
     runner,
     ['-C', repoRoot, 'remote', 'get-url', 'origin'],

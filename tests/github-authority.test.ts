@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, realpath, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -364,6 +364,8 @@ test('authentication and route identity checks allow redirects but reject author
 
 test('route resolution canonicalizes same-repository and fork routes without persisting secrets', async () => {
   const temp = await mkdtemp(path.join(tmpdir(), 'onm-github-route-'))
+  // Git reports the canonical toplevel; the route must key on it, not repoPath.
+  const canonicalTemp = await realpath(temp)
   const ledger = new DomainLedger(path.join(temp, 'ledger.sqlite'))
   try {
     let currentUser = user
@@ -386,7 +388,11 @@ test('route resolution canonicalizes same-repository and fork routes without per
     const git: CommandRunner = async (_executable, args) => ({
       code: 0,
       stderr: '',
-      stdout: args.includes('get-url') ? 'git@github.com:upstream/project.git\n' : 'feature\n'
+      stdout: args.includes('get-url')
+        ? 'git@github.com:upstream/project.git\n'
+        : args.includes('rev-parse')
+          ? `${canonicalTemp}\n`
+          : 'feature\n'
     })
     const same = await resolveGithubPublicationRoute({
       commandRunner: git,
@@ -397,6 +403,7 @@ test('route resolution canonicalizes same-repository and fork routes without per
     assert.equal(same.baseRepositoryId, same.headRepositoryId)
     assert.equal(same.baseBranch, 'main')
     assert.equal(same.headBranch, 'feature')
+    assert.equal(same.repoRoot, canonicalTemp)
 
     const fork = await resolveGithubPublicationRoute({
       commandRunner: git,
@@ -408,7 +415,7 @@ test('route resolution canonicalizes same-repository and fork routes without per
     assert.equal(fork.baseRepositoryId, '10')
     assert.equal(fork.headRepositoryId, '20')
     assert.equal(fork.networkRootRepositoryId, '10')
-    assert.doesNotMatch(JSON.stringify(ledger.repositoryPublicationRoute(path.resolve(temp))), /do-not-persist/)
+    assert.doesNotMatch(JSON.stringify(ledger.repositoryPublicationRoute(canonicalTemp)), /do-not-persist/)
     currentUser = { ...user, id: 6, node_id: 'U_6' }
     await assert.rejects(
       () => resolveGithubPublicationRoute({
