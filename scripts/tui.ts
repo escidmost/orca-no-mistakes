@@ -1,4 +1,4 @@
-import { closeSync, fstatSync, openSync, readSync } from "node:fs";
+import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
 import path from "node:path";
 
 import { PIPELINE_STEPS, type StageName } from "./config.ts";
@@ -50,14 +50,38 @@ function fit(text: string, width: number): string {
   return value.padEnd(width);
 }
 
-function logTail(filePath: string): string[] {
+function logTail(artifactsDir: string, fileName: string): string[] {
   let descriptor: number | undefined;
   try {
-    descriptor = openSync(filePath, "r");
-    const size = fstatSync(descriptor).size;
+    const root = path.resolve(artifactsDir);
+    const filePath = path.resolve(root, fileName);
+    const relative = path.relative(root, filePath);
+    if (relative.startsWith("..") || path.isAbsolute(relative)) {
+      throw new Error("log path escapes artifact root");
+    }
+    descriptor = openSync(
+      filePath,
+      constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW,
+    );
+    const info = fstatSync(descriptor);
+    if (!info.isFile() || info.nlink !== 1) {
+      throw new Error("log path must be a private regular file");
+    }
+    const size = info.size;
     const length = Math.min(size, LOG_BYTES);
     const buffer = Buffer.alloc(length);
-    const bytesRead = readSync(descriptor, buffer, 0, length, size - length);
+    let bytesRead = 0;
+    while (bytesRead < length) {
+      const count = readSync(
+        descriptor,
+        buffer,
+        bytesRead,
+        length - bytesRead,
+        size - length + bytesRead,
+      );
+      if (count === 0) break;
+      bytesRead += count;
+    }
     const content = buffer
       .subarray(0, bytesRead)
       .toString("utf8")
@@ -138,7 +162,9 @@ export class RailTuiRenderer implements PresentationRenderer {
   readonly #output: Output;
   #activityIndex = 0;
   #closed = false;
+  #escapeTimer?: ReturnType<typeof setTimeout>;
   #focus: Region = "rail";
+  #inputBuffer = "";
   #logOffset = 0;
   #pinnedStage?: StageName;
   #selectedStage = 0;
@@ -184,6 +210,8 @@ export class RailTuiRenderer implements PresentationRenderer {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
+    if (this.#escapeTimer) clearTimeout(this.#escapeTimer);
+    this.#inputBuffer = "";
     this.#input.off("data", this.#onData);
     this.#output.off("error", this.#onError);
     this.#output.off("resize", this.#onResize);
@@ -330,11 +358,8 @@ export class RailTuiRenderer implements PresentationRenderer {
   #logs(rows: number, width: number): string[] {
     const snapshot = this.#snapshot!;
     const stage = this.#pinnedStage ?? PIPELINE_STEPS[this.#selectedStage];
-    const round = Math.max(
-      1,
-      snapshot.stages.find((item) => item.id === stage)?.round ?? 0,
-    );
-    const all = logTail(path.join(this.#artifactsDir, `${stage}_r${round}.log`));
+    const round = snapshot.stages.find((item) => item.id === stage)?.round ?? 0;
+    const all = logTail(this.#artifactsDir, `${stage}_r${round}.log`);
     const room = Math.max(0, rows - 1);
     this.#logOffset = Math.min(
       this.#logOffset,
@@ -366,8 +391,22 @@ export class RailTuiRenderer implements PresentationRenderer {
   }
 
   #handleInput(input: string): void {
+    if (this.#escapeTimer) {
+      clearTimeout(this.#escapeTimer);
+      this.#escapeTimer = undefined;
+    }
+    this.#inputBuffer += input;
+    const incomplete = this.#inputBuffer.endsWith("\u001b[")
+      ? 2
+      : this.#inputBuffer.endsWith("\u001b")
+        ? 1
+        : 0;
+    const complete = incomplete
+      ? this.#inputBuffer.slice(0, -incomplete)
+      : this.#inputBuffer;
+    this.#inputBuffer = incomplete ? this.#inputBuffer.slice(-incomplete) : "";
     const keys =
-      input.match(
+      complete.match(
         new RegExp("\\x03|\\x1b\\[Z|\\x1b\\[[ABCD]|\\r|\\n|\\t|\\x1b", "g"),
       ) ?? [];
     for (const key of keys) {
@@ -380,10 +419,7 @@ export class RailTuiRenderer implements PresentationRenderer {
         const index = REGIONS.indexOf(this.#focus);
         this.#focus = REGIONS[(index + direction + REGIONS.length) % REGIONS.length];
       } else if (key === "\u001b") {
-        this.#pinnedStage = undefined;
-        this.#focus = "rail";
-        const current = this.#snapshot?.currentStage;
-        if (current) this.#selectedStage = PIPELINE_STEPS.indexOf(current);
+        this.#returnToRail();
       } else if (key === "\r" || key === "\n") {
         this.#open();
       } else if (key === "\u001b[A" || key === "\u001b[D") {
@@ -392,7 +428,27 @@ export class RailTuiRenderer implements PresentationRenderer {
         this.#move(1);
       }
     }
+    if (this.#inputBuffer) {
+      this.#escapeTimer = setTimeout(() => {
+        this.#escapeTimer = undefined;
+        this.#inputBuffer = "";
+        if (this.#closed) return;
+        try {
+          this.#returnToRail();
+          this.#draw();
+        } catch {
+          this.close();
+        }
+      }, 100);
+    }
     this.#draw();
+  }
+
+  #returnToRail(): void {
+    this.#pinnedStage = undefined;
+    this.#focus = "rail";
+    const current = this.#snapshot?.currentStage;
+    if (current) this.#selectedStage = PIPELINE_STEPS.indexOf(current);
   }
 
   #move(direction: -1 | 1): void {
