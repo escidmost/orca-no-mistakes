@@ -2281,6 +2281,7 @@ export async function runPipeline(
           stageLogs,
           stageLogPath(artifactsDir, stage, round),
         );
+        let handoffFixerLog = false;
         try {
           nextFixer = await withTimeout(
             fixerRoles.timeout_ms ?? defaultWorkerTimeoutMs(),
@@ -2305,6 +2306,7 @@ export async function runPipeline(
                 fence,
               ),
           );
+          handoffFixerLog = true;
         } catch (error) {
           if (
             !(error instanceof FixerPolicyViolationError) &&
@@ -2351,7 +2353,7 @@ export async function runPipeline(
           );
           continue;
         } finally {
-          await fixerLog.close().catch((error) => {
+          await fixerLog.close({ handoff: handoffFixerLog }).catch((error) => {
             console.error(
               `warning: could not close ${stage} fixer log: ${String(error)}`,
             );

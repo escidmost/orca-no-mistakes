@@ -624,9 +624,8 @@ export class StageLog {
   inheritTail(previous: StageLog): void {
     const keep = STAGE_LOG_TAIL_BYTES + knownSecretPrefixBytes()
     this.#tail = Buffer.from(previous.tail(keep))
-    const text = this.#tail.toString('utf8')
-    const hold = pendingSecretPrefix(text, knownSecrets())
-    this.#handoffCarry = hold > 0 ? text.slice(text.length - hold) : ''
+    this.#handoffCarry = previous.#handoffCarry
+    previous.#handoffCarry = ''
   }
 
   async #append(chunk: string, source: symbol): Promise<void> {
@@ -651,14 +650,17 @@ export class StageLog {
     await this.#absorb(redacted.slice(0, redacted.length - hold))
   }
 
-  async close(): Promise<void> {
+  async close(options: { handoff?: boolean } = {}): Promise<void> {
     try {
       await this.#pending
       if (this.#carries.size > 0) {
         const carried = [...this.#carries.values()]
         this.#carries.clear()
-        await this.#start()
-        for (const chunk of carried) await this.#absorb(redactKnownSecrets(chunk))
+        if (options.handoff) this.#handoffCarry = carried.join('')
+        else {
+          await this.#start()
+          for (const chunk of carried) await this.#absorb(redactKnownSecrets(chunk))
+        }
       }
       // A silent instance never opens the log, so it cannot disturb what the
       // round already recorded.

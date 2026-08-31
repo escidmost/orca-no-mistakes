@@ -14,7 +14,7 @@ test("registered StageLog preserves the prior in-memory tail", async () => {
   try {
     const fixerLog = registeredStageLog(stageLogs, logPath);
     await fixerLog.append("fixer output\n");
-    await fixerLog.close();
+    await fixerLog.close({ handoff: true });
     await writeFile(logPath, "worker-writable pathname content\n");
 
     const reviewerLog = registeredStageLog(stageLogs, logPath);
@@ -43,7 +43,7 @@ test("registered StageLog redacts a secret split across handoff", async () => {
   try {
     const fixerLog = registeredStageLog(stageLogs, logPath);
     await fixerLog.append("abcd");
-    await fixerLog.close();
+    await fixerLog.close({ handoff: true });
 
     const reviewerLog = registeredStageLog(stageLogs, logPath);
     await reviewerLog.append("1234\n");
@@ -51,6 +51,7 @@ test("registered StageLog redacts a secret split across handoff", async () => {
 
     const content = await readFile(logPath, "utf8");
     assert.doesNotMatch(content, /abcd1234/u);
+    assert.doesNotMatch(content, /abcd|1234/u);
     assert.match(content, /\[REDACTED\]/u);
   } finally {
     if (previousSecret === undefined) delete process.env[secretName];
