@@ -68,6 +68,7 @@ import {
 import { createRailTuiRenderer } from "./tui.ts";
 import {
   DomainLedger,
+  LegacyActiveMigrationError,
   RUN_ID_PATTERN,
   isWithin,
   StageLog,
@@ -10912,7 +10913,10 @@ function openRepositoryLedger(
   return new DomainLedger({ repositoryPath });
 }
 
-async function reapStrandedGates(repoRoot: string): Promise<void> {
+async function reapStrandedGates(
+  repoRoot: string,
+  recoverLegacyActive = false,
+): Promise<void> {
   const markersDir = path.join(repoRoot, ".orca", "no-mistakes");
   let names: string[];
   try {
@@ -10922,7 +10926,14 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
     names = [];
   }
   const orcaCommand = resolveOrcaCommand();
-  const ledger = openRepositoryLedger(repoRoot);
+  let ledger: DomainLedger;
+  try {
+    ledger = openRepositoryLedger(repoRoot);
+  } catch (error) {
+    if (!recoverLegacyActive || !(error instanceof LegacyActiveMigrationError))
+      throw error;
+    ledger = new DomainLedger(legacyLedgerPath());
+  }
   let reaped = 0;
   let retained = 0;
   try {
@@ -11573,7 +11584,7 @@ async function runPruneCommand(flags: RawCliFlags): Promise<void> {
     // Stranded reaping scans one repository's gate markers; without --repo
     // the current directory is the repository to scan.
     const scanRoot = repoRoot ?? (await canonicalPath(process.cwd()));
-    await reapStrandedGates(scanRoot);
+    await reapStrandedGates(scanRoot, repoRoot !== undefined);
     return;
   }
   const missingRepoRoot = repoRoot !== undefined && !existsSync(repoRoot);

@@ -13,6 +13,8 @@ const { O_APPEND, O_CREAT, O_EXCL, O_NOFOLLOW, O_RDONLY, O_RDWR, O_WRONLY } = co
 
 export type RunStatus = 'in-progress' | 'passed' | 'failed' | 'cancelled'
 
+export class LegacyActiveMigrationError extends Error {}
+
 export type StageRequirement = 'disabled' | 'optional' | 'required'
 
 export type StagePlanEntryRow = {
@@ -2088,8 +2090,8 @@ export class DomainLedger {
         const problem = active.has_lease
           ? `run ${active.run_id} still holds a live semantic lease`
           : `run ${active.run_id} is still in-progress`
-        throw new Error(
-          `cannot migrate repository state: ${problem}; finish, cancel, or recover it through the legacy ledger before retrying migration`
+        throw new LegacyActiveMigrationError(
+          `cannot migrate repository state: ${problem}; recover it with "orca-no-mistakes prune --stranded --repo <repo>" before retrying migration`
         )
       }
 
