@@ -8539,7 +8539,7 @@ const VALUE_FLAGS = new Set([
   "reviewer-model",
 ]);
 const COMMAND_FLAGS: Record<string, Set<string>> = {
-  attestation: new Set(["out"]),
+  attestation: new Set(["out", "repo"]),
   prune: new Set(["before", "repo", "stranded"]),
   run: new Set([
     "allow-local-config",
@@ -11645,8 +11645,8 @@ export async function main(argv: string[]): Promise<void> {
   ) {
     console.log(`Usage:
   orca-no-mistakes run (--intent <text> | --resume <run-id>) [--repo <path>] [--base <branch>] [--head <sha>] [--force-lease]
-  orca-no-mistakes attestation export <run-id|commit-sha> [--out <path>]
-  orca-no-mistakes attestation verify <manifest-file|run-id|commit-sha>
+  orca-no-mistakes attestation export <run-id|commit-sha> [--out <path>] [--repo <path>]
+  orca-no-mistakes attestation verify <manifest-file|run-id|commit-sha> [--repo <path>]
   orca-no-mistakes prune [--before <date>] [--repo <path>]
   orca-no-mistakes prune --stranded [--repo <path>]
 
@@ -11969,7 +11969,7 @@ async function runAttestationCommand(
     throw new Error(
       `attestation ${action} requires a run ID, commit SHA, or manifest file`,
     );
-  const ledger = new DomainLedger();
+  const ledger = openRepositoryLedger(stringFlag(flags, "repo") ?? process.cwd());
   try {
     if (action === "export") {
       const manifest = ledger.getCompletionAttestation(ref);

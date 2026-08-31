@@ -2114,7 +2114,7 @@ export class DomainLedger {
         ).all() as { name: string }[])
           .map(({ name }) => name)
           .filter((name) => destinationColumns.has(name) &&
-            !(table === 'stage_checkpoints' && name === 'id'))
+            !(table === 'presentation_snapshots' && name === 'id'))
         if (columns.length === 0) return
         const names = columns.join(', ')
         const selections = columns.map((name) =>
@@ -2160,6 +2160,7 @@ export class DomainLedger {
         'stage_checkpoints',
         'stage_evidence',
         'gate_audit',
+        'presentation_snapshots',
         'passed_attestations'
       ]) {
         copy(table, 'WHERE run_id IN (SELECT run_id FROM legacy.runs WHERE repo_root = ?)')
