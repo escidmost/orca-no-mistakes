@@ -12186,7 +12186,7 @@ Run options:
   --force-lease (reclaim a stranded branch lease)
 
 Prune options:
-  --stranded (reap gate workspaces whose coordinator terminal died; cannot be combined with --before)`);
+  --stranded (reap stranded gate and direct-run resources whose coordinator died; cannot be combined with --before)`);
     return;
   }
   const parsed = parseCli(argv);
