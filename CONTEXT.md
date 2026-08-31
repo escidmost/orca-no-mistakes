@@ -56,6 +56,10 @@ _Avoid_: Delivery, merge, ordinary force-push
 The immutable per-run identity of the base repository, head repository, head owner, head branch, and base branch used for candidate publication and pull-request binding.
 _Avoid_: Origin, current remotes, push URL
 
+**Repository publication route**:
+The durable, mutable publication route persisted once per repository and bound to the authenticated actor and backend. It is guarded against authenticated-actor drift and against change while active runs depend on it, and each run snapshots it as its immutable per-run Publication route.
+_Avoid_: Per-run route, origin, ambient remote
+
 **Publication head ref**:
 The fully qualified feature-branch ref in the publication route's head repository. It receives the candidate commit and becomes the pull request's head ref.
 _Avoid_: Remote HEAD, default branch, base branch
