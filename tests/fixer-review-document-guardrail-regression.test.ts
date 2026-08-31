@@ -11,7 +11,7 @@ function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 }
 
-test("fixer guardrails do not treat documentation examples as co-located tests", async () => {
+test("fixer guardrails allow prose edits but retain documentation assertions", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-document-guardrail-"));
   const repo = path.join(temp, "repo");
   const worker = path.join(temp, "worker");
@@ -45,6 +45,21 @@ test("fixer guardrails do not treat documentation examples as co-located tests",
         git(worker, "rev-parse", "HEAD"),
       ),
       { changed: true, guardrailViolations: [] },
+    );
+
+    await writeFile(
+      path.join(worker, "docs/current-architecture.md"),
+      "# Current Architecture\n\nChai supports `value.should.equal(...)` assertions.\n",
+    );
+    git(worker, "add", "docs/current-architecture.md");
+    git(worker, "commit", "-m", "weaken documented assertion");
+    await assert.rejects(
+      new GitShell({ repo }).assertFixerChangesAllowed(
+        worker,
+        expectedHead,
+        git(worker, "rev-parse", "HEAD"),
+      ),
+      /fixer modified co-located test assertions or skip markers/,
     );
   } finally {
     await rm(temp, { recursive: true, force: true });

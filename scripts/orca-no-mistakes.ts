@@ -7102,21 +7102,23 @@ function isTestPath(filePath: string): boolean {
 function weakensInlineTestValidation(
   expectedSource: string,
   source: string | undefined,
+  freezeDeclaredTestFile = true,
 ): boolean {
   if (source === expectedSource) return false;
   const qualifiedTestDeclaration = /(?<![.\w$])(?:Deno|vitest)\.test(?:\.[A-Za-z_$][\w$]*)*\s*\(/u;
   // Context chains are limited to known test modifiers so same-named object
   // calls stay fixable; the character class avoids matching this regex itself.
   const testDeclaration = /(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|rstest|(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test)\s*\]|@(?:[A-Za-z_][\w]*\.)*(?:ParameterizedTest|Test|TestMethod|DataTestMethod)\b|\[(?:(?:[A-Za-z_][\w]*\.)*(?:Fact|Test|Theory|TestMethod|DataTestMethod)|(?:[A-Za-z_][\w]*\.)*TestCase(?:\([^\]\n]*\))?)\]|(?<![.\w$])(?:(?:describe|it|test)(?:\.[A-Za-z_$][\w$]*)*|conte[x]t(?:\.(?:skip|only|todo|each|failing|fails|concurrent|sequential|shuffle|extend|describe|fixme|slow|if|runIf|skipIf))*)\s*\(|\b(?:SCENARIO|TEMPLATE_TEST_CASE|TEST_CASE|TEST_F|TEST_P|TYPED_TEST|TYPED_TEST_P)\s*\(|\btest\s+"(?:[^"\\]|\\.)*"\s*\{|(?:^|\n)\s*(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(|\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b)/iu;
-  const inlineAssertion = /(?:(?:^|\n)\s*assert\s+\S|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\b(?:CHECK|REQUIRE)(?:_[A-Z0-9_]+)?\s*\(|\b(?:[A-Za-z_][\w]*\.)*Assert\.[A-Za-z_][\w]*\s*\(|\.should\.(?:deep\.)?(?:equal|eql|match|throw)\s*\(|\b(?:deepStrictEqual|strictEqual|notDeepStrictEqual|notStrictEqual|doesNotReject|doesNotThrow|ifError|rejects|throws)\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|(?<![.\w$])assert[A-Z][A-Za-z0-9_$]*\s*\(|\bstd\.testing\.expect[A-Za-z0-9_]*\s*\(|\bexpect(?:\.(?:poll|soft))?\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
+  const inlineAssertion = /(?:(?:^|\n)\s*assert\s+\S|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\b(?:CHECK|REQUIRE)(?:_[A-Z0-9_]+)?\s*\(|\b(?:[A-Za-z_][\w]*\.)*Assert\.[A-Za-z_][\w]*\s*\(|\.should(?:\.[A-Za-z_$][\w$]*)+\s*\(|\b(?:deepStrictEqual|strictEqual|notDeepStrictEqual|notStrictEqual|doesNotReject|doesNotThrow|ifError|rejects|throws)\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|(?<![.\w$])assert[A-Z][A-Za-z0-9_$]*\s*\(|\bstd\.testing\.expect[A-Za-z0-9_]*\s*\(|\bexpect(?:\.(?:poll|soft))?\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
   const doctestPrompt = /^\s*>>>/u;
   const nodeAssertImport = /(?:from\s+["'](?:node:)?assert(?:\/strict)?["']|require\s*\(\s*["'](?:node:)?assert(?:\/strict)?["']\s*\))/u;
   if (
-    qualifiedTestDeclaration.test(expectedSource) ||
-    testDeclaration.test(expectedSource) ||
-    /\.should(?:\.[A-Za-z_$][\w$]*)+/u.test(expectedSource) ||
-    nodeAssertImport.test(expectedSource) ||
-    importsAssertionFrameworkApi(expectedSource)
+    freezeDeclaredTestFile &&
+    (qualifiedTestDeclaration.test(expectedSource) ||
+      testDeclaration.test(expectedSource) ||
+      /\.should(?:\.[A-Za-z_$][\w$]*)+/u.test(expectedSource) ||
+      nodeAssertImport.test(expectedSource) ||
+      importsAssertionFrameworkApi(expectedSource))
   ) {
     return true;
   }
@@ -7974,8 +7976,11 @@ export class GitShell implements GitOperations {
         }
         const source = await this.showFile(sourceHead, filePath);
         if (
-          !/\.(?:adoc|md|mdx|rst)$/iu.test(filePath) &&
-          weakensInlineTestValidation(expectedSource, source)
+          weakensInlineTestValidation(
+            expectedSource,
+            source,
+            !/\.(?:adoc|md|mdx|rst)$/iu.test(filePath),
+          )
         ) {
           protectedInlineTests.push(filePath);
         }
