@@ -653,9 +653,13 @@ export function verifyCompletionAttestation(manifest: CompletionAttestationManif
     const evidence = evidenceByDigest.get(disposition.evidenceSha256 ?? '')
     if (
       disposition.disposition === 'satisfied' &&
-      evidence?.stage !== plan.stage
+      (evidence?.stage !== plan.stage ||
+        evidence.exitCode !== 0 ||
+        !isAuthoritativeStageEvidence(evidence.workerIdentity))
     ) {
-      throw new Error(`attestation stage ${plan.stage} disposition does not bind its evidence`)
+      throw new Error(
+        `attestation stage ${plan.stage} disposition does not bind successful authoritative evidence`
+      )
     }
     if (disposition.disposition !== 'satisfied' && disposition.evidenceSha256 !== undefined) {
       throw new Error(`attestation stage ${plan.stage} has unexpected evidence`)
@@ -1416,6 +1420,18 @@ export type PrunableRun = {
   run_id: string
 }
 
+const RELEASE_2_FACT_TABLES = [
+  'stage_plan_entries',
+  'stage_dispositions',
+  'publication_routes',
+  'publication_baselines',
+  'run_attempts',
+  'attempt_outcomes',
+  'remote_observations',
+  'mutation_intents',
+  'remote_receipts'
+] as const
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS runs (
   run_id TEXT PRIMARY KEY,
@@ -1837,6 +1853,14 @@ export class DomainLedger {
       }
     }
     this.#db.exec(SCHEMA)
+    for (const table of RELEASE_2_FACT_TABLES) {
+      this.#db.exec(`CREATE TRIGGER IF NOT EXISTS fence_terminal_${table}
+        BEFORE INSERT ON ${table}
+        WHEN EXISTS (
+          SELECT 1 FROM runs WHERE run_id = NEW.run_id AND status != 'in-progress'
+        )
+        BEGIN SELECT RAISE(ABORT, 'cannot add Release 2 facts to a terminal run'); END;`)
+    }
     // ponytail: nullable columns added post-release use the idempotent ALTER
     // path. Only the expected duplicate-column failure is tolerated.
     for (const [table, column] of [
@@ -1958,9 +1982,16 @@ export class DomainLedger {
             !(table === 'stage_checkpoints' && name === 'id'))
         if (columns.length === 0) return
         const names = columns.join(', ')
+        const selections = columns.map((name) =>
+          table === 'runs' && name === 'status'
+            ? "'in-progress'"
+            : table === 'runs' && name === 'completed_at'
+            ? 'NULL'
+            : name
+        ).join(', ')
         this.#db.prepare(
           `INSERT INTO main.${table} (${names})
-           SELECT ${names} FROM legacy.${table} ${where}`
+           SELECT ${selections} FROM legacy.${table} ${where}`
         ).run(repoRoot)
       }
 
@@ -1992,6 +2023,22 @@ export class DomainLedger {
       for (const [position, stage] of LEGACY_STAGE_PLAN.entries()) {
         addLegacyStage.run(position, stage, repoRoot)
       }
+      this.#db.prepare(
+        `UPDATE main.runs AS destination
+         SET status = (
+               SELECT source.status FROM legacy.runs AS source
+               WHERE source.run_id = destination.run_id
+             ),
+             completed_at = (
+               SELECT source.completed_at FROM legacy.runs AS source
+               WHERE source.run_id = destination.run_id
+             )
+         WHERE destination.repo_root = ?
+           AND EXISTS (
+             SELECT 1 FROM legacy.runs AS source
+             WHERE source.run_id = destination.run_id
+           )`
+      ).run(repoRoot)
       this.#db.prepare(
         `INSERT INTO repository_migrations
            (source_path, repo_root, source_present, completed_at)
@@ -2491,6 +2538,11 @@ export class DomainLedger {
       return preRead.kind === 'publication-head' && preRead.subject === subject &&
         observation.kind === 'publication-head' && observation.subject === subject &&
         routeFactsMatch(prePayload) && routeFactsMatch(payload) && preReadMatches &&
+        receipt.outcome === (baseline.authoritative_absence === 1
+          ? 'created'
+          : baseline.head_commit_oid === input.candidateCommitOid
+          ? 'unchanged'
+          : 'updated') &&
         hasOnlyOwnProperties(payload, new Set([
           'forgeHost', 'headBranch', 'headOwner', 'oid', 'repositoryId'
         ])) && payload.oid === input.candidateCommitOid &&
@@ -3523,6 +3575,7 @@ export class DomainLedger {
   }
 
   verifyRetainedCompletionAttestation(manifest: PipelineCompletionAttestationManifest): void {
+    verifyCompletionAttestation(manifest)
     const problems: string[] = []
     const retainedEvidence = this.#verifyEvidence(manifest.runId, manifest.stageEvidence)
     problems.push(...retainedEvidence.problems.map((problem) => `stage evidence: ${problem}`))
