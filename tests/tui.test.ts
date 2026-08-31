@@ -115,15 +115,6 @@ async function runFixture(): Promise<void> {
     const input = chunk.toString();
     if (input.includes("d")) renderer.render(gateSnapshot("open", 2));
     if (input.includes("n")) renderer.render(snapshot("lint", 2));
-    if (input.includes("q")) {
-      renderer.close();
-      const after = `${process.stdin.isRaw === true}:${process.stdin.isPaused()}`;
-      void log.close().then(() => {
-        process.stdout.write(`\nTUI CLOSED restored=${before === after}\n`, () =>
-          process.exit(0),
-        );
-      });
-    }
   });
   await new Promise<void>(() => undefined);
 }

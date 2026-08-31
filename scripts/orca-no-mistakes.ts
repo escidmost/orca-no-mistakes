@@ -3571,8 +3571,11 @@ async function validateReport(
         typeof finding.description === "string" && finding.description.trim()
           ? finding.description
           : [title, message].filter(Boolean).join(": ");
+      const action =
+        finding.action === undefined ? "ask-user" : finding.action;
       return {
         ...finding,
+        action,
         description,
         id:
           typeof finding.id === "string" &&
@@ -3585,7 +3588,7 @@ async function validateReport(
                     finding.file,
                     finding.line,
                     description,
-                    finding.action,
+                    action,
                     finding.severity,
                   ]),
                 )

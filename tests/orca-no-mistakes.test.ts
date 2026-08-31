@@ -2228,6 +2228,28 @@ test("malformed reviewer findings fail closed and still clean up the worker", as
   assert.equal(orca.removedWorktrees.length, 1);
 });
 
+test("reviewer findings without an action are conservatively escalated", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "missing-action",
+          severity: "info",
+          description: "The reviewer omitted its action classification.",
+        } as unknown as Finding,
+      ],
+      summary: "review needs classification",
+    },
+  ]);
+
+  await runPipeline({ intent: "Validate incomplete reviewer reports." }, orca, git);
+
+  assert.equal(orca.gates.length, 1);
+  assert.match(orca.gates[0].question, /"action":"ask-user"/);
+});
+
 test("a failed reviewer outcome cannot complete the stage", async () => {
   const git = new FakeGit();
   class FailedOutcomeOrca extends FakeOrca {
