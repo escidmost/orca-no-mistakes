@@ -109,6 +109,12 @@ async function completionFixture(options: { exerciseRemoteRejections?: boolean; 
     summary: pushEntry.summary,
     workerIdentity: pushEntry.workerIdentity
   }
+  ledger.recordPublicationBaseline({
+    headCommitOid: null,
+    observedAt: '2026-08-30T12:00:00.000Z',
+    routeFingerprint,
+    runId
+  })
   if (options.exerciseRemoteRejections) {
     const unboundPostRead = ledger.recordRemoteObservation({
       attemptId,
@@ -143,12 +149,6 @@ async function completionFixture(options: { exerciseRemoteRejections?: boolean; 
       stageId: 'push'
     }), /does not match/)
   }
-  ledger.recordPublicationBaseline({
-    headCommitOid: null,
-    observedAt: '2026-08-30T12:00:01.000Z',
-    routeFingerprint,
-    runId
-  })
   const preRead = ledger.recordRemoteObservation({
     attemptId,
     kind: 'publication-head',

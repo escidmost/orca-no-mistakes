@@ -81,9 +81,13 @@ test('prune uses a surviving sibling ledger for an asserted missing root', async
     rmSync(root, { force: true, recursive: true })
   })
 
-  execFileSync('git', ['init', '-b', 'main', mainRepo], { stdio: 'ignore' })
+  execFileSync('git', ['-c', 'init.templateDir=', 'init', '-b', 'main', mainRepo], {
+    stdio: 'ignore'
+  })
   execFileSync('git', ['-C', mainRepo, 'config', 'user.email', 'test@example.com'])
   execFileSync('git', ['-C', mainRepo, 'config', 'user.name', 'Test User'])
+  execFileSync('git', ['-C', mainRepo, 'config', 'core.hooksPath', '/dev/null'])
+  execFileSync('git', ['-C', mainRepo, 'config', 'commit.gpgsign', 'false'])
   writeFileSync(path.join(mainRepo, 'README.md'), 'test\n')
   execFileSync('git', ['-C', mainRepo, 'add', 'README.md'])
   execFileSync('git', ['-C', mainRepo, 'commit', '-m', 'initial'], { stdio: 'ignore' })

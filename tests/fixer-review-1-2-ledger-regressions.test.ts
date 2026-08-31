@@ -188,7 +188,7 @@ test('migration fails closed on semantic-key conflicts', async () => {
 
     assert.throws(
       () => new DomainLedger({ legacyPath, repositoryPath: repo }),
-      /UNIQUE constraint failed/
+      /cannot migrate repository state: run ID conflicting-run already belongs to .* with different history/
     )
     const repository = new DatabaseSync(repositoryLedgerPath(repo))
     const marker = repository.prepare(

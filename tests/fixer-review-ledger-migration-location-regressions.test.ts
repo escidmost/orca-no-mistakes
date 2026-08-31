@@ -59,9 +59,8 @@ test("migration commits its copy before legacy cleanup", async () => {
       BEGIN SELECT RAISE(ABORT, 'simulated cleanup crash'); END;`);
     source.close();
 
-    assert.throws(
-      () => new DomainLedger({ legacyPath, repositoryPath: repo }),
-      /simulated cleanup crash/,
+    assert.doesNotThrow(() =>
+      new DomainLedger({ legacyPath, repositoryPath: repo }).close(),
     );
 
     const destination = new DatabaseSync(repositoryLedgerPath(repo));

@@ -17,6 +17,8 @@ export class DestinationActiveMigrationError extends Error {}
 
 export class LegacyActiveMigrationError extends Error {}
 
+export class RepositoryMigrationConflictError extends Error {}
+
 export type StageRequirement = 'disabled' | 'optional' | 'required'
 
 export type StagePlanEntryRow = {
@@ -1964,6 +1966,7 @@ export class DomainLedger {
       )
       BEGIN SELECT RAISE(ABORT, 'receipt is not from the current branch lease generation'); END;`)
     for (const table of RELEASE_2_FACT_TABLES) {
+      this.#db.exec(`DROP TRIGGER IF EXISTS fence_terminal_${table}`)
       this.#db.exec(`CREATE TRIGGER IF NOT EXISTS fence_terminal_${table}
         BEFORE INSERT ON ${table}
         WHEN EXISTS (
@@ -2055,8 +2058,14 @@ export class DomainLedger {
         source.exec('COMMIT')
         cleanupTransaction = false
       } catch (error) {
-        if (cleanupTransaction) source.exec('ROLLBACK')
-        throw error
+        if (cleanupTransaction) {
+          try {
+            source.exec('ROLLBACK')
+          } catch {}
+        }
+        console.error(
+          `no-mistakes: repository migration committed, but legacy archive cleanup remains pending: ${String(error)}`
+        )
       } finally {
         source.close()
       }
@@ -2290,6 +2299,21 @@ export class DomainLedger {
       cleanupMigratedSourceRuns(runIds)
     } catch (error) {
       if (transaction) this.#db.exec('ROLLBACK')
+      if (
+        error instanceof Error &&
+        /UNIQUE constraint failed: (?:main\.)?runs\.run_id/i.test(error.message)
+      ) {
+        const conflict = this.#db.prepare(
+          `SELECT source.run_id, destination.repo_root AS destination_repo_root
+             FROM legacy.runs AS source
+             JOIN main.runs AS destination ON destination.run_id = source.run_id
+            WHERE source.repo_root = ?
+            LIMIT 1`
+        ).get(repoRoot) as { destination_repo_root: string; run_id: string } | undefined
+        throw new RepositoryMigrationConflictError(
+          `cannot migrate repository state: run ID ${conflict?.run_id ?? 'conflict'} already belongs to ${conflict?.destination_repo_root ?? 'the repository ledger'} with different history; reconcile the conflicting ledger rows before retrying migration`
+        )
+      }
       throw error
     } finally {
       if (sourcePresent) this.#db.exec('DETACH DATABASE legacy')
@@ -2958,7 +2982,7 @@ export class DomainLedger {
               receipt_json, receipt_sha256, created_at
        FROM remote_receipts
        WHERE run_id = ? AND kind = ? AND (? IS NULL OR receipt_sha256 = ?)
-       ORDER BY created_at DESC
+       ORDER BY created_at DESC, rowid DESC
        LIMIT 1`
     ).get(runId, kind, receiptSha256 ?? null, receiptSha256 ?? null) as
       | RemoteReceiptRow

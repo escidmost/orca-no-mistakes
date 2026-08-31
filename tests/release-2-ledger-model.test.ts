@@ -11,6 +11,45 @@ const commit = 'a'.repeat(40)
 const policy = 'b'.repeat(64)
 const timestamp = '2026-08-30T12:00:00.000Z'
 
+test('reopening replaces stale terminal fact triggers', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'onm-release-2-trigger-'))
+  const dbPath = path.join(temp, 'ledger.sqlite')
+  try {
+    new DomainLedger(dbPath).close()
+    const database = new DatabaseSync(dbPath)
+    database.exec(`DROP TRIGGER fence_terminal_publication_routes;
+      CREATE TRIGGER fence_terminal_publication_routes
+      BEFORE INSERT ON publication_routes
+      WHEN 0
+      BEGIN SELECT RAISE(ABORT, 'stale trigger'); END;`)
+    database.close()
+
+    const ledger = new DomainLedger(dbPath)
+    ledger.startRun({
+      baseBranch: 'main',
+      branch: 'feature',
+      intent: 'Reject terminal Release 2 facts.',
+      policySha256: policy,
+      repoRoot: '/repo',
+      runId: 'terminal-trigger-upgrade',
+      submissionCommitOid: commit
+    })
+    ledger.finishRun('terminal-trigger-upgrade', 'failed')
+    assert.throws(() => ledger.recordPublicationRoute({
+      baseBranch: 'main',
+      baseRepositoryId: 'R_base',
+      forgeHost: 'github.com',
+      headBranch: 'feature',
+      headOwner: 'owner',
+      headRepositoryId: 'R_head',
+      runId: 'terminal-trigger-upgrade'
+    }), /cannot add Release 2 facts to a terminal run/)
+    ledger.close()
+  } finally {
+    await rm(temp, { force: true, recursive: true })
+  }
+})
+
 test('Release 2 ledger facts are immutable, append-only, and atomically checkpointed', async () => {
   const temp = await mkdtemp(path.join(tmpdir(), 'onm-release-2-ledger-'))
   const dbPath = path.join(temp, 'ledger.sqlite')

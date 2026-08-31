@@ -11626,8 +11626,8 @@ async function runPruneCommand(flags: RawCliFlags): Promise<void> {
   }
   let pruned = 0;
   let retained = 0;
-  for (const ledger of ledgers) {
-    try {
+  try {
+    for (const ledger of ledgers) {
       for (const run of ledger.prunableRuns({
         before,
         repoRoot: missingRepoRoot ? undefined : repoRoot,
@@ -11679,8 +11679,14 @@ async function runPruneCommand(flags: RawCliFlags): Promise<void> {
           recursive: true,
         });
       }
-    } finally {
-      ledger.close();
+    }
+  } finally {
+    for (const ledger of ledgers) {
+      try {
+        ledger.close();
+      } catch (error) {
+        console.error(`warning: could not close ledger ${ledger.path}: ${String(error)}`);
+      }
     }
   }
   console.log(
