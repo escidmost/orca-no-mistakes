@@ -13,6 +13,8 @@ const { O_APPEND, O_CREAT, O_EXCL, O_NOFOLLOW, O_RDONLY, O_RDWR, O_WRONLY } = co
 
 export type RunStatus = 'in-progress' | 'passed' | 'failed' | 'cancelled'
 
+export class DestinationActiveMigrationError extends Error {}
+
 export class LegacyActiveMigrationError extends Error {}
 
 export type StageRequirement = 'disabled' | 'optional' | 'required'
@@ -2069,7 +2071,7 @@ export class DomainLedger {
         const problem = destinationActive.has_lease
           ? `run ${destinationActive.run_id} still holds a live semantic lease`
           : `run ${destinationActive.run_id} is still in-progress`
-        throw new Error(
+        throw new DestinationActiveMigrationError(
           `cannot migrate repository state: ${problem}; finish, cancel, or recover it through the repository ledger before retrying migration`
         )
       }

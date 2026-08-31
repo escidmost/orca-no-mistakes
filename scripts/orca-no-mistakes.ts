@@ -67,6 +67,7 @@ import {
 } from "./presentation.ts";
 import { createRailTuiRenderer } from "./tui.ts";
 import {
+  DestinationActiveMigrationError,
   DomainLedger,
   LegacyActiveMigrationError,
   RUN_ID_PATTERN,
@@ -10915,7 +10916,7 @@ function openRepositoryLedger(
 
 async function reapStrandedGates(
   repoRoot: string,
-  recoverLegacyActive = false,
+  recoverActiveMigration = false,
 ): Promise<void> {
   const markersDir = path.join(repoRoot, ".orca", "no-mistakes");
   let names: string[];
@@ -10930,9 +10931,14 @@ async function reapStrandedGates(
   try {
     ledger = openRepositoryLedger(repoRoot);
   } catch (error) {
-    if (!recoverLegacyActive || !(error instanceof LegacyActiveMigrationError))
+    if (!recoverActiveMigration) throw error;
+    if (error instanceof LegacyActiveMigrationError) {
+      ledger = new DomainLedger(legacyLedgerPath());
+    } else if (error instanceof DestinationActiveMigrationError) {
+      ledger = new DomainLedger(repositoryLedgerPath(repoRoot));
+    } else {
       throw error;
-    ledger = new DomainLedger(legacyLedgerPath());
+    }
   }
   let reaped = 0;
   let retained = 0;
@@ -11601,7 +11607,11 @@ async function runPruneCommand(flags: RawCliFlags): Promise<void> {
       try {
         ledgers.push(new DomainLedger({ repositoryPath: survivingRepository }));
       } catch (error) {
-        if (!(error instanceof LegacyActiveMigrationError)) throw error;
+        if (
+          !(error instanceof LegacyActiveMigrationError) &&
+          !(error instanceof DestinationActiveMigrationError)
+        )
+          throw error;
       }
     }
   }
