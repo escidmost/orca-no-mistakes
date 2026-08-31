@@ -1609,20 +1609,29 @@ export async function runPipeline(
         });
         domainRunStarted = true;
       }
+      const statusRenderer = options.rendererFactory?.(
+        artifactsDir,
+        stageLogs!,
+        orca.resolveGate?.bind(orca),
+      ) ??
+        (options.plainStatus
+          ? new PlainStatusRenderer(process.stderr)
+          : undefined);
       presentation = new PresentationPublisher(
         ledger,
         runId,
-        options.rendererFactory?.(
-          artifactsDir,
-          stageLogs!,
-          orca.resolveGate?.bind(orca),
-        ) ??
-          (options.plainStatus
-            ? new PlainStatusRenderer(process.stderr)
-            : undefined),
+        statusRenderer,
         () => new Date(),
         (error) =>
           console.error(`warning: presentation renderer failed: ${String(error)}`),
+        statusRenderer
+          ? () => {
+              try {
+                (statusRenderer as { close?: () => void }).close?.();
+              } catch {}
+              return new PlainStatusRenderer(process.stderr);
+            }
+          : undefined,
       );
       presentationReady = true;
       if (!options.resumeRunId) {
