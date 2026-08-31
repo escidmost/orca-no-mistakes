@@ -2165,13 +2165,20 @@ export class DomainLedger {
       ]) {
         copy(table, 'WHERE run_id IN (SELECT run_id FROM legacy.runs WHERE repo_root = ?)')
       }
-      const addLegacyStage = this.#db.prepare(
-        `INSERT OR IGNORE INTO stage_plan_entries (run_id, position, stage_id, requirement)
-         SELECT run_id, ?, ?, 'required' FROM legacy.runs WHERE repo_root = ?`
-      )
-      for (const [position, stage] of LEGACY_STAGE_PLAN.entries()) {
-        addLegacyStage.run(position, stage, repoRoot)
-      }
+      const legacyStages = LEGACY_STAGE_PLAN.flatMap((stage, position) => [position, stage])
+      this.#db.prepare(
+        `WITH legacy_stages(position, stage_id) AS (
+           VALUES ${LEGACY_STAGE_PLAN.map(() => '(?, ?)').join(', ')}
+         )
+         INSERT OR IGNORE INTO stage_plan_entries (run_id, position, stage_id, requirement)
+         SELECT source.run_id, legacy_stages.position, legacy_stages.stage_id, 'required'
+         FROM legacy.runs AS source CROSS JOIN legacy_stages
+         WHERE source.repo_root = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM main.stage_plan_entries AS retained
+             WHERE retained.run_id = source.run_id
+           )`
+      ).run(...legacyStages, repoRoot)
       this.#db.prepare(
         `UPDATE main.runs AS destination
          SET status = (

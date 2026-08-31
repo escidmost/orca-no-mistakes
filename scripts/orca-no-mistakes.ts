@@ -10899,10 +10899,14 @@ async function reapMarkerWorkers(
 
 // `prune --stranded` reaps gate workspaces whose coordinator is dead. Every
 // doubt resolves towards retention: a reaped live run loses its workspace.
-function openRepositoryLedger(repositoryPath: string): DomainLedger {
+function openRepositoryLedger(
+  repositoryPath: string,
+  allowLegacyFallback = true,
+): DomainLedger {
   try {
     repositoryLedgerPath(repositoryPath);
-  } catch {
+  } catch (error) {
+    if (!allowLegacyFallback) throw error;
     return new DomainLedger(legacyLedgerPath());
   }
   return new DomainLedger({ repositoryPath });
@@ -11572,61 +11576,73 @@ async function runPruneCommand(flags: RawCliFlags): Promise<void> {
     await reapStrandedGates(scanRoot);
     return;
   }
-  const ledger = openRepositoryLedger(
-    repoRoot !== undefined && !existsSync(repoRoot) ? process.cwd() : repoRoot ?? process.cwd(),
-  );
+  const missingRepoRoot = repoRoot !== undefined && !existsSync(repoRoot);
+  const ledgers = missingRepoRoot
+    ? [new DomainLedger(legacyLedgerPath())]
+    : [openRepositoryLedger(repoRoot ?? process.cwd())];
+  if (missingRepoRoot) {
+    let survivingRepository: string | undefined;
+    try {
+      repositoryLedgerPath(process.cwd());
+      survivingRepository = process.cwd();
+    } catch {}
+    if (survivingRepository)
+      ledgers.push(new DomainLedger({ repositoryPath: survivingRepository }));
+  }
   let pruned = 0;
   let retained = 0;
-  try {
-    for (const run of ledger.prunableRuns({ before })) {
-      if (
-        assertedRepoRoots !== undefined &&
-        !assertedRepoRoots.has(path.resolve(run.repo_root))
-      ) {
-        continue;
-      }
-      if (!RUN_ID_PATTERN.test(run.run_id)) {
-        retained += 1;
-        console.error(
-          `no-mistakes: retained ${run.run_id}; its artifact directory is unsafe to remove`,
+  for (const ledger of ledgers) {
+    try {
+      for (const run of ledger.prunableRuns({ before })) {
+        if (
+          assertedRepoRoots !== undefined &&
+          !assertedRepoRoots.has(path.resolve(run.repo_root))
+        ) {
+          continue;
+        }
+        if (!RUN_ID_PATTERN.test(run.run_id)) {
+          retained += 1;
+          console.error(
+            `no-mistakes: retained ${run.run_id}; its artifact directory is unsafe to remove`,
+          );
+          continue;
+        }
+        const state = await recoveryHeadState(
+          run,
+          assertedRepoRoots?.has(path.resolve(run.repo_root)) ?? false,
         );
-        continue;
+        if (state !== "contained") {
+          retained += 1;
+          console.error(
+            state === "missing-repo"
+              ? `no-mistakes: retained ${run.run_id}; repository root ${run.repo_root} is unavailable (pass --repo=${run.repo_root} to assert it is gone)`
+              : `no-mistakes: retained ${run.run_id}; its recovery refs are not all contained in ${run.branch} or ${run.base_branch}`,
+          );
+          continue;
+        }
+        // The row goes first because prune() re-checks the lease inside its
+        // transaction and refuses a run that acquired one since selection.
+        // Removing the artifacts first would destroy the evidence of a run the
+        // ledger then declines to delete. The cost is that a failure to remove
+        // the directory leaves it orphaned, which spends disk rather than
+        // evidence.
+        const removed = ledger.prune([run.run_id]);
+        if (removed === 0) {
+          retained += 1;
+          console.error(
+            `no-mistakes: retained ${run.run_id}; it was leased again while pruning`,
+          );
+          continue;
+        }
+        pruned += removed;
+        await rm(path.join(artifactsRoot(), run.run_id), {
+          force: true,
+          recursive: true,
+        });
       }
-      const state = await recoveryHeadState(
-        run,
-        assertedRepoRoots?.has(path.resolve(run.repo_root)) ?? false,
-      );
-      if (state !== "contained") {
-        retained += 1;
-        console.error(
-          state === "missing-repo"
-            ? `no-mistakes: retained ${run.run_id}; repository root ${run.repo_root} is unavailable (pass --repo=${run.repo_root} to assert it is gone)`
-            : `no-mistakes: retained ${run.run_id}; its recovery refs are not all contained in ${run.branch} or ${run.base_branch}`,
-        );
-        continue;
-      }
-      // The row goes first because prune() re-checks the lease inside its
-      // transaction and refuses a run that acquired one since selection.
-      // Removing the artifacts first would destroy the evidence of a run the
-      // ledger then declines to delete. The cost is that a failure to remove
-      // the directory leaves it orphaned, which spends disk rather than
-      // evidence.
-      const removed = ledger.prune([run.run_id]);
-      if (removed === 0) {
-        retained += 1;
-        console.error(
-          `no-mistakes: retained ${run.run_id}; it was leased again while pruning`,
-        );
-        continue;
-      }
-      pruned += removed;
-      await rm(path.join(artifactsRoot(), run.run_id), {
-        force: true,
-        recursive: true,
-      });
+    } finally {
+      ledger.close();
     }
-  } finally {
-    ledger.close();
   }
   console.log(
     `Pruned ${pruned} run(s)` +
@@ -11969,7 +11985,8 @@ async function runAttestationCommand(
     throw new Error(
       `attestation ${action} requires a run ID, commit SHA, or manifest file`,
     );
-  const ledger = openRepositoryLedger(stringFlag(flags, "repo") ?? process.cwd());
+  const repo = stringFlag(flags, "repo");
+  const ledger = openRepositoryLedger(repo ?? process.cwd(), repo === undefined);
   try {
     if (action === "export") {
       const manifest = ledger.getCompletionAttestation(ref);
