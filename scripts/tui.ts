@@ -1,12 +1,3 @@
-import {
-  closeSync,
-  constants,
-  fstatSync,
-  lstatSync,
-  openSync,
-  readSync,
-  realpathSync,
-} from "node:fs";
 import path from "node:path";
 
 import { PIPELINE_STEPS, type StageName } from "./config.ts";
@@ -63,29 +54,11 @@ function fit(text: string, width: number): string {
   return value.padEnd(width);
 }
 
-function artifactDirectoryIdentity(artifactsDir: string): string | undefined {
-  try {
-    const directory = path.resolve(artifactsDir);
-    const root = path.dirname(directory);
-    return [root, directory]
-      .flatMap((entry) => {
-        const info = lstatSync(entry, { bigint: true });
-        if (info.isSymbolicLink() || !info.isDirectory()) throw new Error();
-        return [realpathSync(entry), info.dev, info.ino, info.birthtimeNs];
-      })
-      .join("\0");
-  } catch {
-    return undefined;
-  }
-}
-
 function logTail(
   artifactsDir: string,
-  artifactsIdentity: string | undefined,
   fileName: string,
-  stageLogs?: ReadonlyMap<string, StageLog>,
+  stageLogs: ReadonlyMap<string, StageLog>,
 ): string[] {
-  let descriptor: number | undefined;
   try {
     const root = path.resolve(artifactsDir);
     const filePath = path.resolve(root, fileName);
@@ -93,45 +66,9 @@ function logTail(
     if (relative.startsWith("..") || path.isAbsolute(relative)) {
       throw new Error("log path escapes artifact root");
     }
-    let buffer: Buffer;
-    if (stageLogs) {
-      const log = stageLogs.get(filePath);
-      if (!log) throw new Error("log is not coordinator-owned");
-      buffer = log.tail(STAGE_LOG_TAIL_BYTES + knownSecretPrefixBytes());
-    } else {
-      if (
-        artifactsIdentity === undefined ||
-        artifactDirectoryIdentity(artifactsDir) !== artifactsIdentity
-      ) {
-        throw new Error("artifact directory identity changed");
-      }
-      descriptor = openSync(
-        filePath,
-        constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW,
-      );
-      const info = fstatSync(descriptor);
-      if (!info.isFile() || info.nlink !== 1) {
-        throw new Error("log path must be a private regular file");
-      }
-      const length = Math.min(
-        info.size,
-        STAGE_LOG_TAIL_BYTES + knownSecretPrefixBytes(),
-      );
-      buffer = Buffer.alloc(length);
-      let bytesRead = 0;
-      while (bytesRead < length) {
-        const count = readSync(
-          descriptor,
-          buffer,
-          bytesRead,
-          length - bytesRead,
-          info.size - length + bytesRead,
-        );
-        if (count === 0) break;
-        bytesRead += count;
-      }
-      buffer = buffer.subarray(0, bytesRead);
-    }
+    const log = stageLogs.get(filePath);
+    if (!log) throw new Error("log is not coordinator-owned");
+    const buffer = log.tail(STAGE_LOG_TAIL_BYTES + knownSecretPrefixBytes());
     const sanitized = Array.from(
       buffer
         .toString("utf8")
@@ -150,8 +87,6 @@ function logTail(
     return content.split("\n");
   } catch {
     return ["No log output yet."];
-  } finally {
-    if (descriptor !== undefined) closeSync(descriptor);
   }
 }
 
@@ -208,12 +143,11 @@ export function supportsRailTui(
 export class RailTuiRenderer implements PresentationRenderer {
   readonly #activities: { label: string; stage?: StageName }[] = [];
   readonly #artifactsDir: string;
-  readonly #artifactsIdentity: string | undefined;
   readonly #input: Input;
   readonly #inputWasPaused: boolean;
   readonly #inputWasRaw: boolean;
   readonly #output: Output;
-  readonly #stageLogs?: ReadonlyMap<string, StageLog>;
+  readonly #stageLogs: ReadonlyMap<string, StageLog>;
   #activityIndex = 0;
   #closed = false;
   #escapeTimer?: ReturnType<typeof setTimeout>;
@@ -246,14 +180,11 @@ export class RailTuiRenderer implements PresentationRenderer {
     input: Input,
     output: Output,
     artifactsDir: string,
-    stageLogs?: ReadonlyMap<string, StageLog>,
+    stageLogs: ReadonlyMap<string, StageLog> = new Map(),
   ) {
     this.#input = input;
     this.#output = output;
     this.#artifactsDir = path.resolve(artifactsDir);
-    this.#artifactsIdentity = stageLogs
-      ? undefined
-      : artifactDirectoryIdentity(this.#artifactsDir);
     this.#stageLogs = stageLogs;
     this.#inputWasPaused = input.isPaused();
     this.#inputWasRaw = input.isRaw === true;
@@ -432,7 +363,6 @@ export class RailTuiRenderer implements PresentationRenderer {
     const round = snapshot.stages.find((item) => item.id === stage)?.round ?? 0;
     const all = logTail(
       this.#artifactsDir,
-      this.#artifactsIdentity,
       `${stage}_r${round}.log`,
       this.#stageLogs,
     );

@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
 import { PIPELINE_STEPS } from "../scripts/config.ts";
+import { StageLog } from "../scripts/ledger.ts";
 import type { PresentationSnapshot } from "../scripts/presentation.ts";
 import { RailTuiRenderer } from "../scripts/tui.ts";
 
@@ -71,24 +72,29 @@ function snapshot(): PresentationSnapshot {
 test("live log redraws reuse StageLog redaction and stop on close", async () => {
   const artifactsDir = mkdtempSync(path.join(tmpdir(), "orca-tui-refresh-"));
   const logPath = path.join(artifactsDir, "review_r0.log");
+  const log = new StageLog(logPath);
   const input = new FakeInput();
   const output = new FakeOutput();
-  const renderer = new RailTuiRenderer(input, output, artifactsDir);
   const secretName = "TUI_REDACTION_TEST_TOKEN";
   const secret = "stage-log-boundary-secret-value";
   const previous = process.env[secretName];
   process.env[secretName] = secret;
+  await log.append(
+    `${"x".repeat(100)}${secret}${"y".repeat(64 * 1024 - 16)}`,
+  );
+  const renderer = new RailTuiRenderer(
+    input,
+    output,
+    artifactsDir,
+    new Map([[path.resolve(logPath), log]]),
+  );
   try {
-    writeFileSync(
-      logPath,
-      `${"x".repeat(100)}${secret}${"y".repeat(64 * 1024 - 16)}`,
-    );
     renderer.render(snapshot());
     const initial = output.writes.at(-1) ?? "";
     assert.doesNotMatch(initial, new RegExp(secret, "u"));
     assert.match(initial, /\[REDACTED\]/u);
 
-    writeFileSync(logPath, "updated while running\n");
+    await log.append("\nupdated while running\n");
     const deadline = Date.now() + 1_000;
     while (!(output.writes.at(-1) ?? "").includes("updated while running")) {
       assert.ok(Date.now() < deadline, "live log did not refresh");
@@ -97,11 +103,12 @@ test("live log redraws reuse StageLog redaction and stop on close", async () => 
 
     renderer.close();
     const writesAfterClose = output.writes.length;
-    writeFileSync(logPath, "must not redraw\n");
+    await log.append("must not redraw\n");
     await delay(300);
     assert.equal(output.writes.length, writesAfterClose);
   } finally {
     renderer.close();
+    await log.close();
     if (previous === undefined) delete process.env[secretName];
     else process.env[secretName] = previous;
     rmSync(artifactsDir, { force: true, recursive: true });

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,6 +9,7 @@ import test from "node:test";
 import { spawn } from "node-pty";
 
 import { PIPELINE_STEPS, type StageName } from "../scripts/config.ts";
+import { StageLog } from "../scripts/ledger.ts";
 import type { PresentationSnapshot } from "../scripts/presentation.ts";
 import {
   createRailTuiRenderer,
@@ -42,11 +43,15 @@ function snapshot(stage: StageName, sequence: number): PresentationSnapshot {
 
 async function runFixture(): Promise<void> {
   const artifactsDir = process.env.TUI_ARTIFACTS!;
+  const logPath = path.join(artifactsDir, "review_r1.log");
+  const log = new StageLog(logPath);
+  await log.append("review token=[REDACTED]\n");
   const before = `${process.stdin.isRaw === true}:${process.stdin.isPaused()}`;
   const renderer = new RailTuiRenderer(
     process.stdin,
     process.stderr,
     artifactsDir,
+    new Map([[path.resolve(logPath), log]]),
   );
   renderer.render(snapshot("review", 1));
   process.stdin.on("data", (chunk) => {
@@ -55,9 +60,11 @@ async function runFixture(): Promise<void> {
     if (input.includes("q")) {
       renderer.close();
       const after = `${process.stdin.isRaw === true}:${process.stdin.isPaused()}`;
-      process.stdout.write(`\nTUI CLOSED restored=${before === after}\n`, () =>
-        process.exit(0),
-      );
+      void log.close().then(() => {
+        process.stdout.write(`\nTUI CLOSED restored=${before === after}\n`, () =>
+          process.exit(0),
+        );
+      });
     }
   });
   await new Promise<void>(() => undefined);
@@ -154,10 +161,6 @@ if (process.env.TUI_FIXTURE === "1") {
     async () => {
       const artifactsDir = mkdtempSync(path.join(tmpdir(), "orca-tui-"));
       ensurePtyHelperExecutable();
-      writeFileSync(
-        path.join(artifactsDir, "review_r1.log"),
-        "review token=[REDACTED]\n",
-      );
       const env = Object.fromEntries(
         Object.entries(process.env).filter(
           (entry): entry is [string, string] => entry[1] !== undefined,

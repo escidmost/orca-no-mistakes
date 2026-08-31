@@ -1,21 +1,12 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import fs, {
-  linkSync,
-  mkdtempSync,
-  rmSync,
-  symlinkSync,
-  unlinkSync,
-  writeFileSync,
-} from "node:fs";
-import { syncBuiltinESMExports } from "node:module";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { PIPELINE_STEPS } from "../scripts/config.ts";
+import { StageLog } from "../scripts/ledger.ts";
 import type { PresentationSnapshot } from "../scripts/presentation.ts";
 import { RailTuiRenderer } from "../scripts/tui.ts";
 
@@ -81,10 +72,13 @@ function screen(output: FakeOutput): string {
   return output.writes.at(-1) ?? "";
 }
 
-function renderOnce(artifactsDir: string): string {
+function renderOnce(
+  artifactsDir: string,
+  stageLogs: ReadonlyMap<string, StageLog> = new Map(),
+): string {
   const input = new FakeInput();
   const output = new FakeOutput();
-  const renderer = new RailTuiRenderer(input, output, artifactsDir);
+  const renderer = new RailTuiRenderer(input, output, artifactsDir, stageLogs);
   try {
     renderer.render(snapshot(0));
     return screen(output);
@@ -93,71 +87,26 @@ function renderOnce(artifactsDir: string): string {
   }
 }
 
-if (process.env.TUI_FIFO_FIXTURE === "1") {
-  renderOnce(process.env.TUI_ARTIFACTS!);
-} else {
-  test("round zero logs reject worker-replaced paths", (context) => {
+test("only coordinator-owned logs are displayed", async () => {
     const artifactsDir = mkdtempSync(path.join(tmpdir(), "orca-tui-reader-"));
     const logPath = path.join(artifactsDir, "review_r0.log");
-    const secretPath = path.join(artifactsDir, "secret.txt");
+    const log = new StageLog(logPath);
     try {
-      writeFileSync(logPath, "round zero transcript\n");
-      assert.match(renderOnce(artifactsDir), /round zero transcript/u);
-
-      unlinkSync(logPath);
-      writeFileSync(secretPath, "must not display\n");
-      symlinkSync(secretPath, logPath);
-      assert.doesNotMatch(renderOnce(artifactsDir), /must not display/u);
-
-      unlinkSync(logPath);
-      linkSync(secretPath, logPath);
-      assert.doesNotMatch(renderOnce(artifactsDir), /must not display/u);
-
-      unlinkSync(logPath);
-      writeFileSync(logPath, "first\nsecond\nthird\n");
-      const originalReadSync = fs.readSync;
-      context.mock.method(
-        fs,
-        "readSync",
-        (descriptor, buffer, offset, length, position) =>
-          originalReadSync(
-            descriptor,
-            buffer,
-            offset,
-            Math.min(length, 3),
-            position,
-          ),
+      writeFileSync(logPath, "unregistered transcript\n");
+      assert.doesNotMatch(renderOnce(artifactsDir), /unregistered transcript/u);
+      rmSync(logPath);
+      await log.append("coordinator transcript\n");
+      assert.match(
+        renderOnce(artifactsDir, new Map([[path.resolve(logPath), log]])),
+        /coordinator transcript/u,
       );
-      syncBuiltinESMExports();
-      assert.match(renderOnce(artifactsDir), /third/u);
-      context.mock.restoreAll();
-      syncBuiltinESMExports();
     } finally {
-      context.mock.restoreAll();
-      syncBuiltinESMExports();
+      await log.close();
       rmSync(artifactsDir, { force: true, recursive: true });
     }
-  });
+});
 
-  test("FIFO logs cannot block rendering", { skip: process.platform === "win32" }, () => {
-    const artifactsDir = mkdtempSync(path.join(tmpdir(), "orca-tui-fifo-"));
-    try {
-      execFileSync("mkfifo", [path.join(artifactsDir, "review_r0.log")]);
-      const result = spawnSync(process.execPath, [fileURLToPath(import.meta.url)], {
-        env: {
-          ...process.env,
-          TUI_ARTIFACTS: artifactsDir,
-          TUI_FIFO_FIXTURE: "1",
-        },
-        timeout: 2_000,
-      });
-      assert.equal(result.status, 0, result.error?.message);
-    } finally {
-      rmSync(artifactsDir, { force: true, recursive: true });
-    }
-  });
-
-  test("split escape sequences remain single navigation keys", () => {
+test("split escape sequences remain single navigation keys", () => {
     const artifactsDir = mkdtempSync(path.join(tmpdir(), "orca-tui-input-"));
     const input = new FakeInput();
     const output = new FakeOutput();
@@ -177,5 +126,4 @@ if (process.env.TUI_FIFO_FIXTURE === "1") {
       renderer.close();
       rmSync(artifactsDir, { force: true, recursive: true });
     }
-  });
-}
+});

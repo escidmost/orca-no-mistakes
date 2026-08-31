@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,6 +9,7 @@ import test from "node:test";
 import { spawn } from "node-pty";
 
 import { PIPELINE_STEPS } from "../scripts/config.ts";
+import { StageLog } from "../scripts/ledger.ts";
 import type { PresentationSnapshot } from "../scripts/presentation.ts";
 import { RailTuiRenderer } from "../scripts/tui.ts";
 
@@ -112,15 +113,19 @@ async function runCtrlCFixture(): Promise<void> {
 if (process.env.TUI_CTRL_C_FIXTURE === "1") {
   await runCtrlCFixture();
 } else {
-  test("full rows and local viewports stay within bounds", () => {
+  test("full rows and local viewports stay within bounds", async () => {
     const artifactsDir = mkdtempSync(path.join(tmpdir(), "orca-tui-regression-"));
+    const logPath = path.join(artifactsDir, "review_r1.log");
+    const log = new StageLog(logPath);
     const input = new FakeInput();
     const output = new FakeOutput();
-    writeFileSync(
-      path.join(artifactsDir, "review_r1.log"),
-      "first line\nsecond line\nthird line\n",
+    await log.append("first line\nsecond line\nthird line\n");
+    const renderer = new RailTuiRenderer(
+      input,
+      output,
+      artifactsDir,
+      new Map([[path.resolve(logPath), log]]),
     );
-    const renderer = new RailTuiRenderer(input, output, artifactsDir);
     try {
       for (let sequence = 1; sequence <= 30; sequence += 1) {
         renderer.render(snapshot(sequence));
@@ -142,6 +147,7 @@ if (process.env.TUI_CTRL_C_FIXTURE === "1") {
       assert.match(screen(output), /third line/u);
     } finally {
       renderer.close();
+      await log.close();
       rmSync(artifactsDir, { force: true, recursive: true });
     }
   });

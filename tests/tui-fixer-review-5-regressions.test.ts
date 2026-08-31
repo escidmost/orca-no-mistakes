@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
 import { PIPELINE_STEPS } from "../scripts/config.ts";
+import { StageLog } from "../scripts/ledger.ts";
 import type { PresentationSnapshot } from "../scripts/presentation.ts";
 import { RailTuiRenderer } from "../scripts/tui.ts";
 
@@ -88,26 +89,31 @@ test("terminal output restoration survives input cleanup failures", () => {
   }
 });
 
-test("terminal controls cannot reconstruct a known secret", () => {
+test("terminal controls cannot reconstruct a known secret", async () => {
   const artifactsDir = mkdtempSync(path.join(tmpdir(), "orca-tui-controls-"));
+  const logPath = path.join(artifactsDir, "review_r0.log");
+  const log = new StageLog(logPath);
   const input = new FakeInput();
   const output = new FakeOutput();
-  const renderer = new RailTuiRenderer(input, output, artifactsDir);
   const secretName = "TUI_ANSI_REDACTION_TEST_TOKEN";
   const secret = "abcd1234";
   const previous = process.env[secretName];
   process.env[secretName] = secret;
+  await log.append("abcd\u001b[31m1234\n");
+  const renderer = new RailTuiRenderer(
+    input,
+    output,
+    artifactsDir,
+    new Map([[path.resolve(logPath), log]]),
+  );
   try {
-    writeFileSync(
-      path.join(artifactsDir, "review_r0.log"),
-      "abcd\u001b[31m1234\n",
-    );
     renderer.render(snapshot());
     const screen = output.writes.at(-1) ?? "";
     assert.doesNotMatch(screen, new RegExp(secret, "u"));
     assert.match(screen, /abcd\?1234/u);
   } finally {
     renderer.close();
+    await log.close();
     if (previous === undefined) delete process.env[secretName];
     else process.env[secretName] = previous;
     rmSync(artifactsDir, { force: true, recursive: true });

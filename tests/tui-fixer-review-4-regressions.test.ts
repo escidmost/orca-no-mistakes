@@ -14,6 +14,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { PIPELINE_STEPS } from "../scripts/config.ts";
+import { StageLog } from "../scripts/ledger.ts";
 import type { PresentationSnapshot } from "../scripts/presentation.ts";
 import { RailTuiRenderer } from "../scripts/tui.ts";
 
@@ -75,7 +76,7 @@ function snapshot(sequence: number): PresentationSnapshot {
   };
 }
 
-test("log reads reject replaced artifact ancestors", () => {
+test("log reads stay bound when artifact ancestors are replaced", async () => {
   const temp = mkdtempSync(path.join(tmpdir(), "orca-tui-identity-"));
   const artifactRoot = path.join(temp, "artifacts");
   const artifactsDir = path.join(artifactRoot, "run");
@@ -84,11 +85,18 @@ test("log reads reject replaced artifact ancestors", () => {
   const outsideRun = path.join(outsideRoot, "run");
   mkdirSync(artifactsDir, { recursive: true });
   mkdirSync(outsideRun, { recursive: true });
-  writeFileSync(path.join(artifactsDir, "review_r0.log"), "trusted log\n");
+  const logPath = path.join(artifactsDir, "review_r0.log");
+  const log = new StageLog(logPath);
+  await log.append("trusted log\n");
   writeFileSync(path.join(outsideRun, "review_r0.log"), "escaped log\n");
   const input = new FakeInput();
   const output = new FakeOutput();
-  const renderer = new RailTuiRenderer(input, output, artifactsDir);
+  const renderer = new RailTuiRenderer(
+    input,
+    output,
+    artifactsDir,
+    new Map([[path.resolve(logPath), log]]),
+  );
   try {
     renderer.render(snapshot(1));
     assert.match(output.writes.at(-1) ?? "", /trusted log/u);
@@ -96,6 +104,7 @@ test("log reads reject replaced artifact ancestors", () => {
     renameSync(artifactRoot, movedRoot);
     symlinkSync(outsideRoot, artifactRoot);
     renderer.render(snapshot(2));
+    assert.match(output.writes.at(-1) ?? "", /trusted log/u);
     assert.doesNotMatch(output.writes.at(-1) ?? "", /escaped log/u);
 
     unlinkSync(artifactRoot);
@@ -105,6 +114,7 @@ test("log reads reject replaced artifact ancestors", () => {
     assert.doesNotMatch(output.writes.at(-1) ?? "", /replacement log/u);
   } finally {
     renderer.close();
+    await log.close();
     rmSync(temp, { force: true, recursive: true });
   }
 });
