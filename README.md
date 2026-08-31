@@ -39,6 +39,7 @@ Useful direct-run options:
 --reviewer-model <model>
 --fixer-model <model> --fixer-effort <level>
 --max-fix-rounds <count>
+--tui                   render an interactive read-only Rail when the terminal supports it
 --no-tui                emit line-oriented semantic progress on stderr
 --resume <failed-run-id>
 --allow-local-config
