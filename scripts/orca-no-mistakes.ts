@@ -1,9 +1,24 @@
 #!/usr/bin/env node
 
 import { AsyncLocalStorage } from "node:async_hooks";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, readdirSync } from "node:fs";
+import {
+  appendFileSync,
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import {
   chmod,
   lstat,
@@ -112,6 +127,7 @@ export {
 export * from "./presentation.ts";
 export type FindingAction = "ask-user" | "auto-fix" | "no-op";
 
+const { O_APPEND, O_NOFOLLOW, O_WRONLY } = constants;
 const FINDING_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
 
 export type Finding = {
@@ -544,6 +560,7 @@ type GateWorktree =
 
 type GateRunMarker = {
   allocationProtocol?: "gated-v1";
+  cancellationAction?: "force-stop";
   cleanupPending?: boolean;
   createdAt: string;
   domainRunId?: string;
@@ -556,9 +573,16 @@ type GateRunMarker = {
   runId?: string;
   startupReceipt?: string;
   terminalHandle?: string;
+  workerAllocationNames?: Record<string, string>;
   workerAllocations?: string[];
   workerAllocationPids?: Record<string, number[]>;
   workers?: WorkerResource[];
+};
+
+type DirectRunMarker = Omit<GateRunMarker, "gate" | "runId"> & {
+  headOid: string;
+  kind: "direct-run";
+  runId: string;
 };
 
 type ConfiguredLauncherMarker = {
@@ -606,18 +630,37 @@ type WorkerResource = Pick<
 >;
 
 function isConfiguredLauncherMarker(
-  marker: GateRunMarker | ConfiguredLauncherMarker | OrcaLauncherMarker,
+  marker:
+    | DirectRunMarker
+    | GateRunMarker
+    | ConfiguredLauncherMarker
+    | OrcaLauncherMarker,
 ): marker is ConfiguredLauncherMarker {
   return (marker as ConfiguredLauncherMarker).kind === "configured-launcher";
 }
 
 function isOrcaLauncherMarker(
-  marker: GateRunMarker | ConfiguredLauncherMarker | OrcaLauncherMarker,
+  marker:
+    | DirectRunMarker
+    | GateRunMarker
+    | ConfiguredLauncherMarker
+    | OrcaLauncherMarker,
 ): marker is OrcaLauncherMarker {
   return (marker as OrcaLauncherMarker).kind === "orca-launcher";
 }
 
+function isDirectRunMarker(
+  marker:
+    | DirectRunMarker
+    | GateRunMarker
+    | ConfiguredLauncherMarker
+    | OrcaLauncherMarker,
+): marker is DirectRunMarker {
+  return (marker as DirectRunMarker).kind === "direct-run";
+}
+
 type AbortReapState = {
+  artifactsDir?: string;
   cleanupPending?: boolean;
   deliveryGit?: GitOperations;
   gate?: GateWorktree;
@@ -637,12 +680,14 @@ type AbortReapState = {
   runId?: string;
   startupReceipt?: string;
   terminalHandle?: string;
+  workerAllocationNames: Map<string, string>;
   workerAllocations: Set<string>;
   workerAllocationPids: Map<string, Set<number>>;
   workers: Set<WorkerResult>;
 };
 
 const abortReap: AbortReapState = {
+  workerAllocationNames: new Map(),
   workerAllocations: new Set(),
   workerAllocationPids: new Map(),
   workers: new Set(),
@@ -706,12 +751,16 @@ function registerAbortWorker(
   worker: WorkerResult,
   allocationId: string,
 ): WorkerRegistration {
+  const allocationName = abortReap.workerAllocationNames.get(allocationId);
   abortReap.workers.add(worker);
   abortReap.workerAllocations.delete(allocationId);
   abortReap.workerAllocationPids.delete(allocationId);
+  abortReap.workerAllocationNames.delete(allocationId);
   const ready = refreshGateMarker().catch((error) => {
     abortReap.workers.delete(worker);
     abortReap.workerAllocations.add(allocationId);
+    if (allocationName)
+      abortReap.workerAllocationNames.set(allocationId, allocationName);
     throw error;
   });
   return Object.assign(() => unregisterAbortWorker(worker), {
@@ -720,12 +769,17 @@ function registerAbortWorker(
   });
 }
 
-async function registerAbortWorkerAllocation(allocationId: string): Promise<void> {
+async function registerAbortWorkerAllocation(
+  allocationId: string,
+  name: string,
+): Promise<void> {
   abortReap.workerAllocations.add(allocationId);
+  abortReap.workerAllocationNames.set(allocationId, name);
   try {
     await refreshGateMarker();
   } catch (error) {
     abortReap.workerAllocations.delete(allocationId);
+    abortReap.workerAllocationNames.delete(allocationId);
     throw error;
   }
 }
@@ -733,12 +787,15 @@ async function registerAbortWorkerAllocation(allocationId: string): Promise<void
 async function clearAbortWorkerAllocation(allocationId: string): Promise<void> {
   if (!abortReap.workerAllocations.delete(allocationId)) return;
   const pids = abortReap.workerAllocationPids.get(allocationId);
+  const name = abortReap.workerAllocationNames.get(allocationId);
   abortReap.workerAllocationPids.delete(allocationId);
+  abortReap.workerAllocationNames.delete(allocationId);
   try {
     await refreshGateMarker();
   } catch (error) {
     abortReap.workerAllocations.add(allocationId);
     if (pids) abortReap.workerAllocationPids.set(allocationId, pids);
+    if (name) abortReap.workerAllocationNames.set(allocationId, name);
     throw error;
   }
 }
@@ -895,6 +952,10 @@ function gateMarkerPath(originWorktree: string, gateId: string): string {
   );
 }
 
+function directRunMarkerPath(originWorktree: string, runId: string): string {
+  return gateMarkerPath(originWorktree, `direct-run:${runId}`);
+}
+
 function startupReceiptPath(markerPath: string): string {
   return `${markerPath}.startup`;
 }
@@ -969,6 +1030,53 @@ function configuredLauncherObjective(
   return `[no-mistakes-launcher:${launcherId}] ${intent}`;
 }
 
+function abortWorkerMarkerState(): Pick<
+  GateRunMarker,
+  | "allocationProtocol"
+  | "workerAllocationNames"
+  | "workerAllocationPids"
+  | "workerAllocations"
+  | "workers"
+> {
+  const state: ReturnType<typeof abortWorkerMarkerState> = {};
+  if (abortReap.workerAllocations.size > 0) {
+    state.allocationProtocol = "gated-v1";
+    state.workerAllocations = [...abortReap.workerAllocations];
+    state.workerAllocationNames = Object.fromEntries(
+      [...abortReap.workerAllocationNames].filter(([allocationId]) =>
+        abortReap.workerAllocations.has(allocationId),
+      ),
+    );
+    const pids = Object.fromEntries(
+      [...abortReap.workerAllocationPids]
+        .filter(([, values]) => values.size > 0)
+        .map(([allocationId, values]) => [allocationId, [...values]]),
+    );
+    if (Object.keys(pids).length > 0) state.workerAllocationPids = pids;
+  }
+  const workers = [...abortReap.workers].map(
+    ({
+      dispatchId,
+      processReceipt,
+      taskId,
+      terminalHandle,
+      worktreeBranch,
+      worktreeId,
+      worktreePath,
+    }): WorkerResource => ({
+      dispatchId,
+      ...(processReceipt ? { processReceipt } : {}),
+      taskId,
+      ...(terminalHandle ? { terminalHandle } : {}),
+      ...(worktreeBranch ? { worktreeBranch } : {}),
+      ...(worktreeId ? { worktreeId } : {}),
+      ...(worktreePath ? { worktreePath } : {}),
+    }),
+  );
+  if (workers.length > 0) state.workers = workers;
+  return state;
+}
+
 async function refreshGateMarker(): Promise<void> {
   const { gate, originWorktree } = abortReap;
   if (!gate || !originWorktree) return;
@@ -1002,42 +1110,17 @@ async function refreshGateMarker(): Promise<void> {
   if (abortReap.startupReceipt !== undefined)
     marker.startupReceipt = abortReap.startupReceipt;
   if (terminalHandle !== undefined) marker.terminalHandle = terminalHandle;
-  if (abortReap.workerAllocations.size > 0) {
-    marker.allocationProtocol = "gated-v1";
-    marker.workerAllocations = [...abortReap.workerAllocations];
-    const pids = Object.fromEntries(
-      [...abortReap.workerAllocationPids]
-        .filter(([, values]) => values.size > 0)
-        .map(([allocationId, values]) => [allocationId, [...values]]),
-    );
-    if (Object.keys(pids).length > 0) marker.workerAllocationPids = pids;
-  }
-  const workers = [...abortReap.workers].map(
-    ({
-      dispatchId,
-      processReceipt,
-      taskId,
-      terminalHandle: workerTerminalHandle,
-      worktreeBranch,
-      worktreeId,
-      worktreePath,
-    }): WorkerResource => ({
-      dispatchId,
-      ...(processReceipt ? { processReceipt } : {}),
-      taskId,
-      ...(workerTerminalHandle ? { terminalHandle: workerTerminalHandle } : {}),
-      ...(worktreeBranch ? { worktreeBranch } : {}),
-      ...(worktreeId ? { worktreeId } : {}),
-      ...(worktreePath ? { worktreePath } : {}),
-    }),
-  );
-  if (workers.length > 0) marker.workers = workers;
+  Object.assign(marker, abortWorkerMarkerState());
   await writeMarker(markerPath, marker);
 }
 
 async function writeMarker(
   markerPath: string,
-  marker: GateRunMarker | ConfiguredLauncherMarker | OrcaLauncherMarker,
+  marker:
+    | DirectRunMarker
+    | GateRunMarker
+    | ConfiguredLauncherMarker
+    | OrcaLauncherMarker,
 ): Promise<void> {
   const temporaryPath = `${markerPath}.${randomUUID()}.tmp`;
   await mkdir(path.dirname(markerPath), { recursive: true });
@@ -1092,6 +1175,7 @@ async function writeLauncherGateMarker(
 // Called by runPipeline once the run row and lease exist: from here an abort
 // has a recovery ref to anchor and a lease to release.
 export async function registerAbortRunContext(state: {
+  artifactsDir?: string;
   deliveryGit: GitOperations;
   git: GitOperations;
   generationToken?: number;
@@ -1107,6 +1191,135 @@ export async function registerAbortRunContext(state: {
   if (state.resumeClaimId) {
     state.ledger.clearResumeClaim(state.runId, state.resumeClaimId);
   }
+}
+
+function writeMarkerSync(
+  markerPath: string,
+  marker: DirectRunMarker | GateRunMarker,
+): void {
+  const directory = path.dirname(markerPath);
+  const temporaryPath = `${markerPath}.${randomUUID()}.tmp`;
+  mkdirSync(directory, { recursive: true });
+  try {
+    writeFileSync(temporaryPath, `${JSON.stringify(marker, null, 2)}\n`, {
+      flag: "wx",
+      flush: true,
+      mode: 0o600,
+    });
+    renameSync(temporaryPath, markerPath);
+    const directoryHandle = openSync(directory, "r");
+    try {
+      fsyncSync(directoryHandle);
+    } finally {
+      closeSync(directoryHandle);
+    }
+  } finally {
+    rmSync(temporaryPath, { force: true });
+  }
+}
+
+function writeForceStopMarker(): void {
+  const { gate, originWorktree } = abortReap;
+  if (gate && originWorktree) {
+    const markerPath = gateMarkerPath(originWorktree, gateMarkerId(gate));
+    const marker = JSON.parse(readFileSync(markerPath, "utf8")) as GateRunMarker;
+    marker.cancellationAction = "force-stop";
+    marker.cleanupPending = true;
+    writeMarkerSync(markerPath, marker);
+    return;
+  }
+  const { generationToken, ledger, orchestrationRunId, pid, runId } = abortReap;
+  if (!ledger || !runId) return;
+  const run = ledger.runIdentity(runId);
+  if (!run) return;
+  const headOid = execFileSync(
+    "git",
+    ["-C", run.repo_root, "rev-parse", "--verify", "HEAD"],
+    { encoding: "utf8" },
+  ).trim();
+  if (!COMMIT_OID.test(headOid)) throw new Error("direct run HEAD is invalid");
+  const marker: DirectRunMarker = {
+    ...abortWorkerMarkerState(),
+    cancellationAction: "force-stop",
+    cleanupPending: true,
+    createdAt: new Date().toISOString(),
+    generationToken,
+    headOid,
+    kind: "direct-run",
+    originWorktree: run.repo_root,
+    pid: pid ?? process.pid,
+    runId: orchestrationRunId ?? runId,
+    ...(orchestrationRunId && orchestrationRunId !== runId
+      ? { domainRunId: runId }
+      : {}),
+  };
+  writeMarkerSync(directRunMarkerPath(run.repo_root, runId), marker);
+}
+
+function markStageLogIncomplete(filePath: string): void {
+  const resolved = path.resolve(filePath);
+  const directory = path.dirname(resolved);
+  if (!lstatSync(directory).isDirectory())
+    throw new Error(`stage log directory is not private: ${directory}`);
+  const before = lstatSync(resolved);
+  if (!before.isFile() || before.nlink !== 1)
+    throw new Error(`stage log is not a private regular file: ${resolved}`);
+  const file = openSync(resolved, O_APPEND | O_WRONLY | O_NOFOLLOW);
+  try {
+    const opened = fstatSync(file);
+    if (
+      !opened.isFile() ||
+      opened.nlink !== 1 ||
+      opened.dev !== before.dev ||
+      opened.ino !== before.ino
+    ) {
+      throw new Error(`stage log changed before force-stop marking: ${resolved}`);
+    }
+    appendFileSync(file, "\n[no-mistakes: log incomplete due to force stop]\n", {
+      flush: true,
+    });
+  } finally {
+    closeSync(file);
+  }
+}
+
+function forceStopAbortedRun(signal: "SIGHUP" | "SIGINT" | "SIGTERM"): void {
+  abortRequested = true;
+  runAbortPresentationCleanup();
+  const { artifactsDir, ledger, runId } = abortReap;
+  try {
+    if (ledger && runId) {
+      const presentation = new PresentationPublisher(ledger, runId);
+      const stage = presentation.current.currentStage;
+      if (artifactsDir && stage) {
+        const round =
+          presentation.current.stages.find((item) => item.id === stage)?.round ?? 0;
+        try {
+          markStageLogIncomplete(
+            path.join(artifactsDir, `${stage}_r${round}.log`),
+          );
+        } catch (error) {
+          abortLog(`warning: force stop could not mark the active log: ${String(error)}`);
+        }
+      }
+      const status = ledger.runStatus(runId);
+      if (status === "in-progress" || status === "cancelled") {
+        presentation.publish(
+          `attempt:${presentation.current.attempt}:cancellation:force-stop`,
+          { action: "force-stop", kind: "cancellation-recorded" },
+        );
+      }
+    }
+  } catch (error) {
+    abortLog(`warning: force stop could not record run evidence: ${String(error)}`);
+  }
+  abortReap.cleanupPending = true;
+  try {
+    writeForceStopMarker();
+  } catch (error) {
+    abortLog(`warning: force stop could not record marker evidence: ${String(error)}`);
+  }
+  abortLog(`no-mistakes: received ${signal} again; force stopping`);
 }
 
 export async function reapAbortedRun(reason: string): Promise<void> {
@@ -1311,12 +1524,14 @@ export async function reapAbortedRun(reason: string): Promise<void> {
 }
 
 function onAbortSignal(signal: "SIGHUP" | "SIGINT" | "SIGTERM"): void {
-  // A second signal means the reap is wedged; die immediately.
-  if (abortReapStarted) process.exit(1);
-  abortReapStarted = true;
-  runAbortPresentationCleanup();
   const exitCode =
     signal === "SIGINT" ? 130 : signal === "SIGTERM" ? 143 : 129;
+  if (abortReapStarted) {
+    forceStopAbortedRun(signal);
+    process.exit(exitCode);
+  }
+  abortReapStarted = true;
+  runAbortPresentationCleanup();
   void reapAbortedRun(`received ${signal}`).finally(() =>
     process.exit(exitCode),
   );
@@ -1325,13 +1540,17 @@ function onAbortSignal(signal: "SIGHUP" | "SIGINT" | "SIGTERM"): void {
 export async function installAbortReaping(
   state: Omit<
     AbortReapState,
-    "workerAllocations" | "workerAllocationPids" | "workers"
+    | "workerAllocationNames"
+    | "workerAllocations"
+    | "workerAllocationPids"
+    | "workers"
   >,
 ): Promise<void> {
   // Replace, never merge: a stale gate or runId from an earlier registration
   // must not leak into this run's reap.
   for (const key of Object.keys(abortReap) as (keyof AbortReapState)[]) {
     if (
+      key !== "workerAllocationNames" &&
       key !== "workerAllocations" &&
       key !== "workerAllocationPids" &&
       key !== "workers"
@@ -1339,10 +1558,12 @@ export async function installAbortReaping(
       delete abortReap[key];
     }
   }
+  abortReap.workerAllocationNames.clear();
   abortReap.workerAllocations.clear();
   abortReap.workerAllocationPids.clear();
   abortReap.workers.clear();
   abortAllocations.clear();
+  abortReapStarted = false;
   abortRequested = false;
   gateMutationTail = Promise.resolve();
   Object.assign(abortReap, state);
@@ -1669,6 +1890,7 @@ export async function runPipeline(
         });
       }
       await registerAbortRunContext({
+        artifactsDir,
         deliveryGit,
         generationToken: generationToken!,
         git,
@@ -2787,7 +3009,7 @@ export async function startWorkerWithFallback(
     const finishAllocation = beginAbortAllocation();
     const allocationId = randomUUID();
     try {
-      await registerAbortWorkerAllocation(allocationId);
+      await registerAbortWorkerAllocation(allocationId, launch.name);
     } catch (error) {
       finishAllocation();
       throw error;
@@ -3454,8 +3676,11 @@ async function validateReport(
         typeof finding.description === "string" && finding.description.trim()
           ? finding.description
           : [title, message].filter(Boolean).join(": ");
+      const action =
+        finding.action === undefined ? "ask-user" : finding.action;
       return {
         ...finding,
+        action,
         description,
         id:
           typeof finding.id === "string" &&
@@ -3468,7 +3693,7 @@ async function validateReport(
                     finding.file,
                     finding.line,
                     description,
-                    finding.action,
+                    action,
                     finding.severity,
                   ]),
                 )
@@ -8716,6 +8941,7 @@ async function configuredWorktreeRoot(
 
 type OrcaWorktreeIdentity = {
   branch?: unknown;
+  displayName?: unknown;
   head?: unknown;
   id?: unknown;
   parentWorktreeId?: unknown;
@@ -10125,6 +10351,7 @@ async function reapConfiguredGate(
         gateTerminals,
         repoRoot,
         orcaCommand,
+        gate,
       )) ||
       !(await reapMarkerWorkers(
         markerFile,
@@ -10132,6 +10359,7 @@ async function reapConfiguredGate(
         workerWorktrees,
         repoRoot,
         orcaCommand,
+        gate,
       ))
     ) {
       console.error(
@@ -10638,11 +10866,13 @@ function strandedWorkerId(identity: string): string {
 
 async function discoverMarkerWorkers(
   markerFile: string,
-  marker: GateRunMarker,
+  marker: DirectRunMarker | GateRunMarker,
   worktrees: OrcaWorktreeIdentity[],
   gateTerminals: GateTerminal[],
   repoRoot: string,
   orcaCommand: string,
+  parent: GateWorktree,
+  scanParentTerminals = true,
 ): Promise<boolean> {
   if (marker.workers !== undefined && !Array.isArray(marker.workers)) {
     return false;
@@ -10658,6 +10888,27 @@ async function discoverMarkerWorkers(
     return false;
   }
   const allocationIds = new Set(marker.workerAllocations ?? []);
+  const allocationNames = marker.workerAllocationNames;
+  if (
+    allocationNames !== undefined &&
+    (typeof allocationNames !== "object" ||
+      Array.isArray(allocationNames) ||
+      allocationNames === null ||
+      Object.entries(allocationNames).some(
+        ([allocationId, name]) =>
+          !allocationIds.has(allocationId) ||
+          typeof name !== "string" ||
+          name.length === 0,
+      ))
+  ) {
+    return false;
+  }
+  if (
+    isDirectRunMarker(marker) &&
+    [...allocationIds].some((allocationId) => !allocationNames?.[allocationId])
+  ) {
+    return false;
+  }
   let allocationsQuiescent = allocationIds.size === 0;
   if (allocationIds.size > 0 && marker.allocationProtocol === "gated-v1") {
     const entries = marker.workerAllocationPids;
@@ -10689,7 +10940,9 @@ async function discoverMarkerWorkers(
   if (allocationIds.size > 0 && allocationsQuiescent) {
     const [currentWorktrees, currentGateTerminals] = await Promise.all([
       listOrcaWorktrees(orcaCommand, repoRoot),
-      listGateTerminals(marker.gate.path, orcaCommand, repoRoot),
+      scanParentTerminals
+        ? listGateTerminals(parent.path, orcaCommand, repoRoot)
+        : Promise.resolve([]),
     ]);
     if (currentWorktrees === undefined || currentGateTerminals === undefined) {
       return false;
@@ -10699,12 +10952,18 @@ async function discoverMarkerWorkers(
   }
   const resources = Array.isArray(marker.workers) ? [...marker.workers] : [];
   const worktreeIds = new Set(resources.map((worker) => worker.worktreeId));
+  const pendingNames = new Set(Object.values(allocationNames ?? {}));
   const terminalHandles = new Set(
-    resources.map((worker) => worker.terminalHandle).filter(Boolean),
+    resources
+      .map((worker) => worker.terminalHandle)
+      .filter((handle): handle is string => typeof handle === "string"),
   );
   const ownedTerminalHandles = new Set(
     gateTerminals.map((terminal) => terminal.handle),
   );
+  if (!scanParentTerminals) {
+    for (const handle of terminalHandles) ownedTerminalHandles.add(handle);
+  }
   const addTerminal = (handle: string): void => {
     if (terminalHandles.has(handle)) return;
     const dispatchId = strandedWorkerId(handle);
@@ -10716,12 +10975,20 @@ async function discoverMarkerWorkers(
     terminalHandles.add(handle);
   };
   const childWorktrees = worktrees.filter((worktree) => {
-    if (marker.gate.kind === "orca") {
-      return worktree.parentWorktreeId === marker.gate.id;
+    if (
+      isDirectRunMarker(marker) &&
+      (typeof worktree.id !== "string" || !worktreeIds.has(worktree.id)) &&
+      (typeof worktree.displayName !== "string" ||
+        !pendingNames.has(worktree.displayName))
+    ) {
+      return false;
+    }
+    if (parent.kind === "orca") {
+      return worktree.parentWorktreeId === parent.id;
     }
     return (
       typeof worktree.parentWorktreeId === "string" &&
-      worktree.parentWorktreeId.endsWith(`::${marker.gate.path}`)
+      worktree.parentWorktreeId.endsWith(`::${parent.path}`)
     );
   });
   for (const worktree of childWorktrees) {
@@ -10791,6 +11058,7 @@ async function discoverMarkerWorkers(
   marker.workers = resources;
   if (allocationsQuiescent) {
     delete marker.workerAllocations;
+    delete marker.workerAllocationNames;
     delete marker.workerAllocationPids;
   }
   try {
@@ -10803,10 +11071,11 @@ async function discoverMarkerWorkers(
 
 async function reapMarkerWorkers(
   markerFile: string,
-  marker: GateRunMarker,
+  marker: DirectRunMarker | GateRunMarker,
   worktrees: OrcaWorktreeIdentity[],
   repoRoot: string,
   orcaCommand: string,
+  parent: GateWorktree,
 ): Promise<boolean> {
   if (marker.workers === undefined) return true;
   if (!Array.isArray(marker.workers) || !marker.runId) return false;
@@ -10860,9 +11129,9 @@ async function reapMarkerWorkers(
     );
     const workerRepoId = worker.worktreeId.split("::", 1)[0];
     const expectedParentId =
-      marker.gate.kind === "orca"
-        ? marker.gate.id
-        : `${workerRepoId}::${marker.gate.path}`;
+      parent.kind === "orca"
+        ? parent.id
+        : `${workerRepoId}::${parent.path}`;
     if (
       actual !== undefined &&
       (actual.path !== worker.worktreePath ||
@@ -10948,7 +11217,162 @@ async function reapMarkerWorkers(
   return true;
 }
 
-// `prune --stranded` reaps gate workspaces whose coordinator is dead. Every
+function settleStrandedCancellation(
+  ledger: DomainLedger,
+  runId: string,
+  ownership: { branch: string; generationToken: number; repoRoot: string },
+): boolean {
+  const presentation = new PresentationPublisher(ledger, runId);
+  const eventKey = `attempt:${presentation.current.attempt}:run:completed:cancelled`;
+  let settled = false;
+  presentation.publish(
+    eventKey,
+    { kind: "run-completed", status: "cancelled" },
+    (snapshot) =>
+      (settled = ledger.settleRun(runId, "cancelled", ownership, {
+        eventKey,
+        snapshot,
+      })),
+  );
+  return settled;
+}
+
+async function reapDirectRun(
+  markerFile: string,
+  marker: DirectRunMarker,
+  repoRoot: string,
+  orcaCommand: string,
+  ledger: DomainLedger,
+): Promise<boolean> {
+  const domainRunId = marker.domainRunId ?? marker.runId;
+  if (
+    marker.originWorktree !== repoRoot ||
+    path.basename(markerFile) !==
+      path.basename(directRunMarkerPath(repoRoot, domainRunId)) ||
+    !RUN_ID_PATTERN.test(marker.runId) ||
+    !RUN_ID_PATTERN.test(domainRunId) ||
+    !COMMIT_OID.test(marker.headOid) ||
+    marker.cancellationAction !== "force-stop" ||
+    marker.cleanupPending !== true ||
+    (marker.generationToken !== undefined &&
+      (!Number.isSafeInteger(marker.generationToken) ||
+        marker.generationToken < 1))
+  ) {
+    return false;
+  }
+  if (await coordinatorIsLive(marker, orcaCommand, repoRoot, markerFile)) {
+    return false;
+  }
+  const run = ledger.runIdentity(domainRunId);
+  if (!run || run.repo_root !== repoRoot) return false;
+  let lease = ledger.leaseFor(repoRoot, run.branch);
+  let generationToken = await cleanupGenerationToken(
+    repoRoot,
+    domainRunId,
+    marker.generationToken,
+    lease,
+  );
+  if (run.status === "in-progress") {
+    if (lease === undefined) {
+      if (generationToken !== undefined) return false;
+      try {
+        generationToken = ledger.acquireLease({
+          branch: run.branch,
+          repoRoot,
+          runId: domainRunId,
+        });
+      } catch {
+        return false;
+      }
+      lease = ledger.leaseFor(repoRoot, run.branch);
+    }
+    if (
+      generationToken === undefined ||
+      lease?.run_id !== domainRunId ||
+      lease.generation_token !== generationToken
+    ) {
+      return false;
+    }
+    if (marker.generationToken === undefined) {
+      marker.generationToken = generationToken;
+      await writeMarker(markerFile, marker);
+    }
+  }
+  const worktrees = await listOrcaWorktrees(orcaCommand, repoRoot);
+  const origin = worktrees?.find((worktree) => worktree.path === repoRoot);
+  if (!worktrees || typeof origin?.id !== "string") return false;
+  const parent: Extract<GateWorktree, { kind: "orca" }> = {
+    branch: run.branch,
+    id: origin.id,
+    kind: "orca",
+    path: repoRoot,
+  };
+  if (
+    (marker.workers !== undefined || marker.workerAllocations !== undefined) &&
+    (!(await discoverMarkerWorkers(
+      markerFile,
+      marker,
+      worktrees,
+      [],
+      repoRoot,
+      orcaCommand,
+      parent,
+      false,
+    )) ||
+      !(await reapMarkerWorkers(
+        markerFile,
+        marker,
+        worktrees,
+        repoRoot,
+        orcaCommand,
+        parent,
+      )) ||
+      (marker.workerAllocations?.length ?? 0) > 0)
+  ) {
+    return false;
+  }
+  if (run.status === "in-progress") {
+    await anchorRecoveryCommit(
+      repoRoot,
+      domainRunId,
+      marker.headOid,
+      generationToken,
+    );
+    if (
+      !settleStrandedCancellation(ledger, domainRunId, {
+        branch: run.branch,
+        generationToken: generationToken!,
+        repoRoot,
+      })
+    ) {
+      return false;
+    }
+  } else {
+    const recovery = await command(
+      "git",
+      ["-C", repoRoot, "rev-parse", "--verify", recoveryRefFor(domainRunId)],
+      repoRoot,
+      { allowFailure: true },
+    );
+    if (recovery.code !== 0 || recovery.stdout.trim() !== marker.headOid) {
+      return false;
+    }
+  }
+  try {
+    await new CliOrca({
+      command: orcaCommand,
+      cwd: repoRoot,
+      runId: marker.runId,
+    }).failRun("Coordinator terminated before cleanup completed");
+  } catch {
+    return false;
+  }
+  await rm(markerFile);
+  console.error(`no-mistakes: reaped stranded direct run ${domainRunId}`);
+  return true;
+}
+
+// `prune --stranded` reaps run resources whose coordinator is dead. Every
 // doubt resolves towards retention: a reaped live run loses its workspace.
 function openRepositoryLedger(
   repositoryPath: string,
@@ -10998,17 +11422,38 @@ async function reapStrandedGates(
       try {
         const markerFile = path.join(markersDir, name);
         let marker:
+          | DirectRunMarker
           | GateRunMarker
           | ConfiguredLauncherMarker
           | OrcaLauncherMarker;
         try {
           marker = JSON.parse(await readFile(markerFile, "utf8")) as
+            | DirectRunMarker
             | GateRunMarker
             | ConfiguredLauncherMarker
             | OrcaLauncherMarker;
         } catch {
           retained += 1;
           console.error(`no-mistakes: retained ${name}; its marker is unreadable`);
+          continue;
+        }
+        if (isDirectRunMarker(marker)) {
+          if (
+            await reapDirectRun(
+              markerFile,
+              marker,
+              repoRoot,
+              orcaCommand,
+              ledger,
+            )
+          ) {
+            reaped += 1;
+          } else {
+            retained += 1;
+            console.error(
+              `no-mistakes: retained stranded direct run ${marker.domainRunId ?? marker.runId}; cleanup did not converge`,
+            );
+          }
           continue;
         }
         if (isConfiguredLauncherMarker(marker)) {
@@ -11233,6 +11678,7 @@ async function reapStrandedGates(
                 [],
                 repoRoot,
                 orcaCommand,
+                gate,
               )) ||
               !(await reapMarkerWorkers(
                 markerFile,
@@ -11240,6 +11686,7 @@ async function reapStrandedGates(
                 worktrees,
                 repoRoot,
                 orcaCommand,
+                gate,
               ))
             ) {
               retained += 1;
@@ -11406,6 +11853,7 @@ async function reapStrandedGates(
             gateTerminals,
             repoRoot,
             orcaCommand,
+            gate,
           )) ||
           !(await reapMarkerWorkers(
             markerFile,
@@ -11413,6 +11861,7 @@ async function reapStrandedGates(
             worktrees,
             repoRoot,
             orcaCommand,
+            gate,
           ))
         ) {
           retained += 1;
@@ -11510,9 +11959,9 @@ async function reapStrandedGates(
             }
             if (
               run?.status === "in-progress" &&
-              !ledger.settleRun(domainRunId, "cancelled", {
+              !settleStrandedCancellation(ledger, domainRunId, {
                 branch: run.branch,
-                generationToken,
+                generationToken: generationToken!,
                 repoRoot,
               })
             ) {
@@ -11608,7 +12057,7 @@ async function reapStrandedGates(
     ledger.close();
   }
   console.log(
-    `Reaped ${reaped} stranded gate workspace(s)` +
+    `Reaped ${reaped} stranded run resource set(s)` +
       (retained > 0 ? `; retained ${retained}` : ""),
   );
 }
@@ -11636,7 +12085,7 @@ async function runPruneCommand(flags: RawCliFlags): Promise<void> {
   if (flags.stranded === true) {
     if (before !== undefined)
       throw new Error("--before cannot be combined with --stranded");
-    // Stranded reaping scans one repository's gate markers; without --repo
+    // Stranded reaping scans one repository's recovery markers; without --repo
     // the current directory is the repository to scan.
     const scanRoot = repoRoot ?? (await canonicalPath(process.cwd()));
     await reapStrandedGates(scanRoot, repoRoot !== undefined);
@@ -11763,7 +12212,7 @@ Run options:
   --force-lease (reclaim a stranded branch lease)
 
 Prune options:
-  --stranded (reap gate workspaces whose coordinator terminal died; cannot be combined with --before)`);
+  --stranded (reap stranded gate and direct-run resources whose coordinator died; cannot be combined with --before)`);
     return;
   }
   const parsed = parseCli(argv);

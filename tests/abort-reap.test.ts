@@ -14,6 +14,7 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   DomainLedger,
@@ -27,7 +28,8 @@ import {
   type OrcaOperations,
   type WorkerResult,
 } from "../scripts/orca-no-mistakes.ts";
-import { legacyLedgerPath } from "../scripts/ledger.ts";
+import { artifactsRoot, legacyLedgerPath } from "../scripts/ledger.ts";
+import { PresentationPublisher } from "../scripts/presentation.ts";
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
@@ -37,6 +39,10 @@ function git(cwd: string, ...args: string[]): string {
 function markerPath(origin: string, gateId: string): string {
   const digest = createHash("sha256").update(gateId).digest("hex").slice(0, 32);
   return path.join(origin, ".orca", "no-mistakes", `gate-${digest}.json`);
+}
+
+function directMarkerPath(origin: string, runId: string): string {
+  return markerPath(origin, `direct-run:${runId}`);
 }
 
 // Records what the abort reaper asks Orca to do instead of driving real
@@ -220,6 +226,103 @@ const reviewerLaunch = {
   worktree: "new-child",
 } as const;
 
+async function runForceStopFixture(): Promise<void> {
+  const origin = process.env.FORCE_STOP_ORIGIN!;
+  const runId = process.env.FORCE_STOP_RUN_ID!;
+  const gate = process.env.FORCE_STOP_GATE
+    ? (JSON.parse(process.env.FORCE_STOP_GATE) as {
+        branch: string;
+        id: string;
+        kind: "orca";
+        path: string;
+      })
+    : undefined;
+  const blockedGit = {
+    head: () => new Promise<string>(() => undefined),
+  } as unknown as GitShell;
+  const ledger = new DomainLedger({ repositoryPath: origin });
+  const preLease = process.env.FORCE_STOP_PRELEASE === "1";
+  await installAbortReaping({
+    artifactsDir: process.env.FORCE_STOP_ARTIFACTS!,
+    deliveryGit: blockedGit,
+    gate,
+    git: blockedGit,
+    ledger,
+    orcaCommand: process.env.ORCA_CLI_COMMAND,
+    originWorktree: origin,
+    pid: process.pid,
+    ...(preLease ? { runId } : {}),
+    terminalHandle: "term-force-stop",
+  });
+  if (!preLease) {
+    await registerAbortRunContext({
+      artifactsDir: process.env.FORCE_STOP_ARTIFACTS!,
+      deliveryGit: blockedGit,
+      git: blockedGit,
+      ledger,
+      generationToken: Number(process.env.FORCE_STOP_GENERATION),
+      runId,
+    });
+  }
+  process.stdout.write("FORCE STOP READY\n");
+  setInterval(() => undefined, 60_000);
+}
+
+async function forceStopChild(options: {
+  artifactsDir: string;
+  generationToken?: number;
+  origin: string;
+  preLease?: boolean;
+  runId: string;
+}): Promise<void> {
+  const env = Object.fromEntries(
+    Object.entries(process.env).filter(
+      (entry): entry is [string, string] => entry[1] !== undefined,
+    ),
+  );
+  const child = spawn(process.execPath, [fileURLToPath(import.meta.url)], {
+    cwd: process.cwd(),
+    env: {
+      ...env,
+      FORCE_STOP_ARTIFACTS: options.artifactsDir,
+      FORCE_STOP_FIXTURE: "1",
+      ...(options.generationToken === undefined
+        ? {}
+        : { FORCE_STOP_GENERATION: String(options.generationToken) }),
+      FORCE_STOP_ORIGIN: options.origin,
+      ...(options.preLease ? { FORCE_STOP_PRELEASE: "1" } : {}),
+      FORCE_STOP_RUN_ID: options.runId,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let output = "";
+  child.stdout!.on("data", (chunk) => (output += chunk.toString()));
+  child.stderr!.on("data", (chunk) => (output += chunk.toString()));
+  const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+    (resolve) => child.once("exit", (code, signal) => resolve({ code, signal })),
+  );
+  const waitFor = async (text: string): Promise<void> => {
+    const deadline = Date.now() + 5_000;
+    while (!output.includes(text)) {
+      if (Date.now() >= deadline) assert.fail(`Timed out waiting for ${text}:\n${output}`);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  };
+  try {
+    await waitFor("FORCE STOP READY");
+    child.kill("SIGINT");
+    await waitFor("reaping this run's resources");
+    child.kill("SIGINT");
+    assert.deepEqual(await exited, { code: 130, signal: null });
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  }
+}
+
+if (process.env.FORCE_STOP_FIXTURE === "1") {
+  await runForceStopFixture();
+} else {
+
 test("an aborted run reaps its workers and gate workspace and preserves its commits", async () => {
   const seeded = await seedRun("onm-abort-reap-");
   const restore = withEnv({
@@ -301,6 +404,12 @@ test("an aborted run reaps its workers and gate workspace and preserves its comm
       "the worker's last commit must survive at its own recovery ref",
     );
     assert.equal(ledger.runStatus(runId), "cancelled");
+    const snapshots = ledger.listPresentationSnapshots(runId);
+    assert.equal(snapshots.at(-2)?.cancellation?.action, "cancel");
+    assert.deepEqual(snapshots.at(-1)?.transition, {
+      kind: "run-completed",
+      status: "cancelled",
+    });
     assert.equal(
       existsSync(markerPath(seeded.origin, seeded.gate.id)),
       false,
@@ -334,6 +443,325 @@ test("an aborted run reaps its workers and gate workspace and preserves its comm
     await rm(seeded.temp, { force: true, recursive: true });
   }
 });
+
+test(
+  "a second SIGINT records Force stop before stranded cleanup settles cancellation",
+  { timeout: 15_000 },
+  async () => {
+    const seeded = await seedRun("onm-force-stop-");
+    const home = path.join(seeded.temp, "home");
+    const restore = withEnv({
+      ORCA_CLI_COMMAND: seeded.fakeOrca,
+      ORCA_NO_MISTAKES_HOME: home,
+    });
+    const runId = "run-force-stop";
+    let child: ReturnType<typeof spawn> | undefined;
+    try {
+      const ledger = new DomainLedger({ repositoryPath: seeded.origin });
+      ledger.startRun({
+        baseBranch: "feature",
+        branch: "feature",
+        intent: "force stop",
+        policySha256: "f".repeat(64),
+        repoRoot: seeded.origin,
+        runId,
+        submissionCommitOid: seeded.baseOid,
+      });
+      const generationToken = ledger.acquireLease({
+        branch: "feature",
+        repoRoot: seeded.origin,
+        runId,
+      });
+      const presentation = new PresentationPublisher(ledger, runId);
+      presentation.publish("run:started", { kind: "run-started" });
+      presentation.publish("attempt:1:started", {
+        attempt: 1,
+        kind: "attempt-started",
+      });
+      presentation.publish("attempt:1:stage:review:started", {
+        kind: "stage-started",
+        stage: "review",
+      });
+      presentation.publish("attempt:1:stage:review:round:1", {
+        kind: "round-started",
+        round: 1,
+        stage: "review",
+      });
+      const artifactsDir = path.join(artifactsRoot(), runId);
+      await mkdir(artifactsDir, { recursive: true });
+      const logPath = path.join(artifactsDir, "review_r1.log");
+      await writeFile(logPath, "review running\n");
+      ledger.close();
+
+      const env = Object.fromEntries(
+        Object.entries(process.env).filter(
+          (entry): entry is [string, string] => entry[1] !== undefined,
+        ),
+      );
+      child = spawn(process.execPath, [fileURLToPath(import.meta.url)], {
+        cwd: process.cwd(),
+        env: {
+          ...env,
+          FORCE_STOP_ARTIFACTS: artifactsDir,
+          FORCE_STOP_FIXTURE: "1",
+          FORCE_STOP_GENERATION: String(generationToken),
+          FORCE_STOP_GATE: JSON.stringify(seeded.gate),
+          FORCE_STOP_ORIGIN: seeded.origin,
+          FORCE_STOP_RUN_ID: runId,
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let output = "";
+      child.stdout!.on("data", (chunk) => {
+        output += chunk.toString();
+      });
+      child.stderr!.on("data", (chunk) => {
+        output += chunk.toString();
+      });
+      const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+        (resolve) => child!.once("exit", (code, signal) => resolve({ code, signal })),
+      );
+      const waitFor = async (text: string): Promise<void> => {
+        const deadline = Date.now() + 5_000;
+        while (!output.includes(text)) {
+          if (Date.now() >= deadline) assert.fail(`Timed out waiting for ${text}:\n${output}`);
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      };
+
+      await waitFor("FORCE STOP READY");
+      child.kill("SIGINT");
+      await waitFor("reaping this run's resources");
+      child.kill("SIGINT");
+      assert.deepEqual(await exited, { code: 130, signal: null });
+      assert.match(output, /force stopping/u);
+
+      const forced = new DomainLedger({ repositoryPath: seeded.origin });
+      assert.equal(forced.runStatus(runId), "in-progress");
+      const cancellation = forced
+        .listPresentationSnapshots(runId)
+        .filter((item) => item.transition.kind === "cancellation-recorded");
+      assert.equal(cancellation.length, 1);
+      assert.equal(cancellation[0].cancellation?.action, "force-stop");
+      forced.close();
+      const marker = JSON.parse(
+        await readFile(markerPath(seeded.origin, seeded.gate.id), "utf8"),
+      ) as Record<string, unknown>;
+      assert.equal(marker.cancellationAction, "force-stop");
+      assert.equal(marker.cleanupPending, true);
+      assert.match(await readFile(logPath, "utf8"), /log incomplete due to force stop/u);
+
+      await main(["prune", "--stranded", `--repo=${seeded.origin}`]);
+
+      const settled = new DomainLedger({ repositoryPath: seeded.origin });
+      assert.equal(settled.runStatus(runId), "cancelled");
+      assert.equal(
+        settled
+          .listPresentationSnapshots(runId)
+          .filter((item) => item.transition.kind === "cancellation-recorded").length,
+        1,
+      );
+      assert.equal(
+        settled
+          .listPresentationSnapshots(runId)
+          .filter(
+            (item) =>
+              item.transition.kind === "run-completed" &&
+              item.transition.status === "cancelled",
+          ).length,
+        1,
+      );
+      settled.close();
+      assert.equal(existsSync(seeded.gatePath), false);
+      assert.equal(existsSync(markerPath(seeded.origin, seeded.gate.id)), false);
+    } finally {
+      if (child && child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+      }
+      restore();
+      await rm(seeded.temp, { force: true, recursive: true });
+    }
+  },
+);
+
+test(
+  "a direct Force stop leaves recoverable state that prune settles cancelled",
+  { timeout: 15_000 },
+  async () => {
+    const seeded = await seedRun("onm-direct-force-stop-");
+    const home = path.join(seeded.temp, "home");
+    const restore = withEnv({
+      ORCA_CLI_COMMAND: seeded.fakeOrca,
+      ORCA_NO_MISTAKES_HOME: home,
+    });
+    const runId = "run-direct-force-stop";
+    try {
+      const ledger = new DomainLedger({ repositoryPath: seeded.origin });
+      ledger.startRun({
+        baseBranch: "feature",
+        branch: "feature",
+        intent: "direct force stop",
+        policySha256: "f".repeat(64),
+        repoRoot: seeded.origin,
+        runId,
+        submissionCommitOid: seeded.baseOid,
+      });
+      const generationToken = ledger.acquireLease({
+        branch: "feature",
+        repoRoot: seeded.origin,
+        runId,
+      });
+      new PresentationPublisher(ledger, runId).publish("run:started", {
+        kind: "run-started",
+      });
+      ledger.close();
+
+      await forceStopChild({
+        artifactsDir: path.join(artifactsRoot(), runId),
+        generationToken,
+        origin: seeded.origin,
+        runId,
+      });
+
+      const markerFile = directMarkerPath(seeded.origin, runId);
+      const marker = JSON.parse(await readFile(markerFile, "utf8")) as Record<
+        string,
+        unknown
+      >;
+      assert.equal(marker.kind, "direct-run");
+      assert.equal(marker.headOid, seeded.baseOid);
+      assert.equal(marker.cancellationAction, "force-stop");
+      const forced = new DomainLedger({ repositoryPath: seeded.origin });
+      assert.equal(forced.runStatus(runId), "in-progress");
+      forced.close();
+
+      await main(["prune", "--stranded", `--repo=${seeded.origin}`]);
+
+      const settled = new DomainLedger({ repositoryPath: seeded.origin });
+      assert.equal(settled.runStatus(runId), "cancelled");
+      assert.equal(
+        settled
+          .listPresentationSnapshots(runId)
+          .filter((item) => item.transition.kind === "cancellation-recorded").length,
+        1,
+      );
+      assert.equal(
+        settled
+          .listPresentationSnapshots(runId)
+          .filter(
+            (item) =>
+              item.transition.kind === "run-completed" &&
+              item.transition.status === "cancelled",
+          ).length,
+        1,
+      );
+      settled.startRun({
+        baseBranch: "feature",
+        branch: "feature",
+        intent: "after direct force stop",
+        policySha256: "f".repeat(64),
+        repoRoot: seeded.origin,
+        runId: "run-after-direct-force-stop",
+        submissionCommitOid: seeded.baseOid,
+      });
+      assert.doesNotThrow(() =>
+        settled.acquireLease({
+          branch: "feature",
+          repoRoot: seeded.origin,
+          runId: "run-after-direct-force-stop",
+        }),
+      );
+      settled.close();
+      assert.equal(
+        execFileSync("git", ["rev-parse", `refs/no-mistakes/recover/${runId}`], {
+          cwd: seeded.origin,
+          encoding: "utf8",
+        }).trim(),
+        seeded.baseOid,
+      );
+      assert.equal(existsSync(markerFile), false);
+      assert.equal(
+        existsSync(seeded.gate.path),
+        true,
+        "direct recovery must not remove unrelated child worktrees",
+      );
+    } finally {
+      restore();
+      await rm(seeded.temp, { force: true, recursive: true });
+    }
+  },
+);
+
+test(
+  "direct Force stop before lease registration acquires recovery ownership",
+  { timeout: 15_000 },
+  async () => {
+    const seeded = await seedRun("onm-direct-prelease-force-stop-");
+    const restore = withEnv({
+      ORCA_CLI_COMMAND: seeded.fakeOrca,
+      ORCA_NO_MISTAKES_HOME: path.join(seeded.temp, "home"),
+    });
+    const runId = "run-direct-prelease-force-stop";
+    try {
+      const ledger = new DomainLedger({ repositoryPath: seeded.origin });
+      ledger.startRun({
+        baseBranch: "feature",
+        branch: "feature",
+        intent: "direct prelease force stop",
+        policySha256: "f".repeat(64),
+        repoRoot: seeded.origin,
+        runId,
+        submissionCommitOid: seeded.baseOid,
+      });
+      new PresentationPublisher(ledger, runId).publish("run:started", {
+        kind: "run-started",
+      });
+      ledger.close();
+
+      await forceStopChild({
+        artifactsDir: path.join(artifactsRoot(), runId),
+        origin: seeded.origin,
+        preLease: true,
+        runId,
+      });
+
+      const markerFile = directMarkerPath(seeded.origin, runId);
+      const marker = JSON.parse(await readFile(markerFile, "utf8")) as Record<
+        string,
+        unknown
+      >;
+      assert.equal(marker.generationToken, undefined);
+
+      await main(["prune", "--stranded", `--repo=${seeded.origin}`]);
+
+      const settled = new DomainLedger({ repositoryPath: seeded.origin });
+      assert.equal(settled.runStatus(runId), "cancelled");
+      assert.equal(settled.leaseFor(seeded.origin, "feature"), undefined);
+      assert.equal(
+        settled
+          .listPresentationSnapshots(runId)
+          .filter(
+            (item) =>
+              item.transition.kind === "run-completed" &&
+              item.transition.status === "cancelled",
+          ).length,
+        1,
+      );
+      settled.close();
+      assert.equal(
+        execFileSync("git", ["rev-parse", `refs/no-mistakes/recover/${runId}`], {
+          cwd: seeded.origin,
+          encoding: "utf8",
+        }).trim(),
+        seeded.baseOid,
+      );
+      assert.equal(existsSync(markerFile), false);
+    } finally {
+      restore();
+      await rm(seeded.temp, { force: true, recursive: true });
+    }
+  },
+);
 
 test("a worker released before the abort is not released again", async () => {
   const orca = new ReapOrca();
@@ -599,3 +1027,6 @@ test("prune --stranded retains a gate whose commits cannot be anchored", async (
     await rm(seeded.temp, { force: true, recursive: true });
   }
 });
+
+test.after(() => console.log("ABORT REAP CANCELLATION PASSED"));
+}

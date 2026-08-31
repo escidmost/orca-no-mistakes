@@ -7,6 +7,7 @@ export type PresentationStatus =
   | "cancelled";
 
 export type GateResolver = (gateId: string, resolution: string) => Promise<void>;
+export type CancellationAction = "cancel" | "force-stop" | "gate-stop";
 
 export type PresentationTransition =
   | { kind: "run-started" }
@@ -39,7 +40,7 @@ export type PresentationTransition =
   | { kind: "stage-completed"; round: number; stage: StageName }
   | { kind: "error-recorded"; resumable: boolean }
   | {
-      action: "cancel" | "gate-stop";
+      action: CancellationAction;
       kind: "cancellation-recorded";
     }
   | {
@@ -49,7 +50,7 @@ export type PresentationTransition =
 
 export type PresentationSnapshot = {
   attempt: number;
-  cancellation?: { action: "cancel" | "gate-stop" };
+  cancellation?: { action: CancellationAction };
   currentStage?: StageName;
   error?: { resumable: boolean };
   gate?: {

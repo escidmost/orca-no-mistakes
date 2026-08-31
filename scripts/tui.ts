@@ -192,9 +192,11 @@ export class RailTuiRenderer implements PresentationRenderer {
   readonly #inputWasPaused: boolean;
   readonly #inputWasRaw: boolean;
   readonly #output: Output;
+  readonly #requestCancel: () => void;
   readonly #resolveGate?: GateResolver;
   readonly #stageLogs: ReadonlyMap<string, StageLog>;
   #activityIndex = 0;
+  #cancelVisible = false;
   #closed = false;
   #escapeTimer?: ReturnType<typeof setTimeout>;
   #focus: Region = "rail";
@@ -235,12 +237,14 @@ export class RailTuiRenderer implements PresentationRenderer {
     artifactsDir: string,
     stageLogs: ReadonlyMap<string, StageLog> = new Map(),
     resolveGate?: GateResolver,
+    requestCancel: () => void = () => process.kill(process.pid, "SIGINT"),
   ) {
     this.#input = input;
     this.#output = output;
     this.#artifactsDir = path.resolve(artifactsDir);
     this.#stageLogs = stageLogs;
     this.#resolveGate = resolveGate;
+    this.#requestCancel = requestCancel;
     this.#inputWasPaused = input.isPaused();
     this.#inputWasRaw = input.isRaw === true;
     try {
@@ -413,14 +417,16 @@ export class RailTuiRenderer implements PresentationRenderer {
     const railWidth = 25;
     const bodyRows = rows - 3;
     const rail = this.#rail(bodyRows, railWidth);
-    if (this.#gateVisible) {
-      const gate = this.#gatePanel(bodyRows, columns - railWidth - 3);
+    if (this.#cancelVisible || this.#gateVisible) {
+      const detail = this.#cancelVisible
+        ? this.#cancelPanel(bodyRows, columns - railWidth - 3)
+        : this.#gatePanel(bodyRows, columns - railWidth - 3);
       return [
         this.#header(columns),
         fit("=".repeat(columns), columns),
         ...Array.from(
           { length: bodyRows },
-          (_, index) => `${rail[index]} | ${gate[index]}`,
+          (_, index) => `${rail[index]} | ${detail[index]}`,
         ),
         this.#footer(columns),
       ];
@@ -445,11 +451,13 @@ export class RailTuiRenderer implements PresentationRenderer {
     const detailWidth = columns - railWidth - 3;
     const bodyRows = rows - 3;
     const rail = this.#rail(bodyRows, railWidth);
-    const detail = this.#gateVisible
-      ? this.#gatePanel(bodyRows, detailWidth)
-      : this.#focus === "activity"
-        ? this.#recent(bodyRows, detailWidth)
-        : this.#logs(bodyRows, detailWidth);
+    const detail = this.#cancelVisible
+      ? this.#cancelPanel(bodyRows, detailWidth)
+      : this.#gateVisible
+        ? this.#gatePanel(bodyRows, detailWidth)
+        : this.#focus === "activity"
+          ? this.#recent(bodyRows, detailWidth)
+          : this.#logs(bodyRows, detailWidth);
     return [
       this.#header(columns),
       fit("=".repeat(columns), columns),
@@ -524,6 +532,26 @@ export class RailTuiRenderer implements PresentationRenderer {
     return Array.from({ length: rows }, (_, index) => fit(lines[index] ?? "", width));
   }
 
+  #cancelPanel(rows: number, width: number): string[] {
+    const stage = this.#snapshot?.currentStage;
+    const lines = [
+      fit("> CANCEL RUN?", width),
+      fit(
+        `${stage ? `${title(stage)} | ` : ""}${this.#snapshot?.status ?? "in-progress"}`,
+        width,
+      ),
+      "",
+      ...wrap(
+        "Cancel stops new work, preserves recovery evidence, and cleans up resources.",
+        width,
+      ),
+      "",
+      fit("Press Enter to confirm Cancel.", width),
+      fit("Press Esc to keep the run active.", width),
+    ];
+    return Array.from({ length: rows }, (_, index) => fit(lines[index] ?? "", width));
+  }
+
   #recent(rows: number, width: number): string[] {
     const lines = [this.#regionTitle("RECENT ACTIVITY", "activity", width)];
     const room = Math.max(0, rows - 1);
@@ -574,11 +602,14 @@ export class RailTuiRenderer implements PresentationRenderer {
   }
 
   #footer(width: number): string {
+    if (this.#cancelVisible) {
+      return fit("Enter confirm Cancel | Esc keep running", width);
+    }
     if (this.#gateVisible) {
       return fit(
         this.#gateSubmitting
-          ? "Waiting for canonical gate settlement"
-          : "Up/Down choice | Enter select/confirm | Esc return unanswered",
+          ? "Waiting for canonical gate settlement | C Cancel"
+          : "Up/Down choice | Enter select/confirm | Esc return unanswered | C Cancel",
         width,
       );
     }
@@ -587,6 +618,7 @@ export class RailTuiRenderer implements PresentationRenderer {
     else keys.push("Up/Down move", "Enter open");
     if (this.#pinnedStage || this.#focus === "logs") keys.push("Esc return");
     if (this.#snapshot?.gate?.state === "open") keys.push("G open gate");
+    keys.push("C Cancel");
     return fit(keys.join(" | "), width);
   }
 
@@ -608,15 +640,22 @@ export class RailTuiRenderer implements PresentationRenderer {
     const keys =
       complete.match(
         new RegExp(
-          "\\x03|\\x1b\\[Z|\\x1b\\[[ABCD]|\\r|\\n|\\t|\\x1b|[gG]",
+          "\\x03|\\x1b\\[Z|\\x1b\\[[ABCD]|\\r|\\n|\\t|\\x1b|[cCgG]",
           "g",
         ),
       ) ?? [];
     for (const key of keys) {
       if (key === "\u0003") {
-        this.close();
-        process.kill(process.pid, "SIGINT");
+        this.#cancelRun();
         return;
+      } else if (this.#cancelVisible) {
+        if (key === "\u001b") this.#cancelVisible = false;
+        else if (key === "\r" || key === "\n") {
+          this.#cancelRun();
+          return;
+        }
+      } else if (key === "c" || key === "C") {
+        this.#cancelVisible = true;
       } else if (this.#gateVisible) {
         if (key === "\u001b" && !this.#gateSubmitting) {
           this.#leaveGate();
@@ -664,7 +703,8 @@ export class RailTuiRenderer implements PresentationRenderer {
         this.#inputBuffer = "";
         if (this.#closed) return;
         try {
-          if (this.#gateVisible) {
+          if (this.#cancelVisible) this.#cancelVisible = false;
+          else if (this.#gateVisible) {
             if (!this.#gateSubmitting) this.#leaveGate();
           } else this.#returnToRail();
           this.#draw();
@@ -674,6 +714,11 @@ export class RailTuiRenderer implements PresentationRenderer {
       }, 100);
     }
     this.#draw();
+  }
+
+  #cancelRun(): void {
+    this.close();
+    this.#requestCancel();
   }
 
   #returnToRail(): void {
@@ -717,6 +762,7 @@ export function createRailTuiRenderer(
   artifactsDir: string,
   stageLogs?: ReadonlyMap<string, StageLog>,
   resolveGate?: GateResolver,
+  requestCancel?: () => void,
 ): RailTuiRenderer | undefined {
   if (!supportsRailTui(input, output)) return undefined;
   try {
@@ -726,6 +772,7 @@ export function createRailTuiRenderer(
       artifactsDir,
       stageLogs,
       resolveGate,
+      requestCancel,
     );
   } catch {
     return undefined;
@@ -738,6 +785,7 @@ export function createRunRenderer(
   artifactsDir: string,
   stageLogs?: ReadonlyMap<string, StageLog>,
   resolveGate?: GateResolver,
+  requestCancel?: () => void,
 ): PresentationRenderer & { close?: () => void } {
   return (
     createRailTuiRenderer(
@@ -746,6 +794,7 @@ export function createRunRenderer(
       artifactsDir,
       stageLogs,
       resolveGate,
+      requestCancel,
     ) ?? new PlainStatusRenderer(output)
   );
 }
