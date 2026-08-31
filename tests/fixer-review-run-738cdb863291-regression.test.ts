@@ -142,6 +142,48 @@ test("missing repositories require an exact --repo assertion", async () => {
   }
 });
 
+test("missing repository prune ignores unrelated active migration", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-prune-active-survivor-"));
+  const home = path.join(temp, "home");
+  const previousCwd = process.cwd();
+  const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
+  process.env.ORCA_NO_MISTAKES_HOME = home;
+  try {
+    const { repo } = await repository(temp);
+    const missingRepo = path.join(temp, "gone");
+    const missingRunId = "run-gone-active-survivor";
+    completedRun(missingRepo, missingRunId);
+
+    const activeRunId = "run-active-survivor";
+    const legacy = new DomainLedger(legacyLedgerPath());
+    legacy.startRun({
+      baseBranch: "main",
+      branch: "feature",
+      intent: activeRunId,
+      policySha256: "f".repeat(64),
+      repoRoot: repo,
+      runId: activeRunId,
+      submissionCommitOid: "a".repeat(40),
+    });
+    legacy.acquireLease({ branch: "feature", repoRoot: repo, runId: activeRunId });
+    legacy.close();
+
+    process.chdir(repo);
+    await main(["prune", "--before=2999-01-01", `--repo=${missingRepo}`]);
+
+    const reopened = new DomainLedger(legacyLedgerPath());
+    assert.equal(reopened.runStatus(missingRunId), undefined);
+    assert.equal(reopened.runStatus(activeRunId), "in-progress");
+    assert.equal(reopened.leaseFor(repo, "feature")?.run_id, activeRunId);
+    reopened.close();
+  } finally {
+    process.chdir(previousCwd);
+    if (previousHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME;
+    else process.env.ORCA_NO_MISTAKES_HOME = previousHome;
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test("a feature branch deleted after merge still prunes against its base", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "onm-prune-gone-branch-"));
   const home = path.join(temp, "home");

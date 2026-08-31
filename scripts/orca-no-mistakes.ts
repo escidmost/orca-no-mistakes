@@ -11597,8 +11597,13 @@ async function runPruneCommand(flags: RawCliFlags): Promise<void> {
       repositoryLedgerPath(process.cwd());
       survivingRepository = process.cwd();
     } catch {}
-    if (survivingRepository)
-      ledgers.push(new DomainLedger({ repositoryPath: survivingRepository }));
+    if (survivingRepository) {
+      try {
+        ledgers.push(new DomainLedger({ repositoryPath: survivingRepository }));
+      } catch (error) {
+        if (!(error instanceof LegacyActiveMigrationError)) throw error;
+      }
+    }
   }
   let pruned = 0;
   let retained = 0;

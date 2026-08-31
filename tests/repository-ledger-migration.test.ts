@@ -41,7 +41,7 @@ test('repository ledger migration is transactional, idempotent, and preserves Re
     })
     assert.throws(
       () => new DomainLedger({ legacyPath, repositoryPath: repo }),
-      /finish, cancel, or recover it through the legacy ledger before retrying migration/
+      /orca-no-mistakes prune --stranded --repo <repo>/
     )
 
     legacy.finishRun('active-run', 'failed')
