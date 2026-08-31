@@ -79,6 +79,6 @@ orca-no-mistakes prune [--before <date>] [--repo <path>]
 orca-no-mistakes prune --stranded [--repo <path>]
 ```
 
-`prune --stranded` reaps gate resources only when their owning coordinator is proven gone. When a run ID exists, it first anchors the gate HEAD at `refs/no-mistakes/recover/<run-id>` and retains the gate if ownership or preservation cannot be verified.
+`prune --stranded` reaps gate or direct-run resources only when their owning coordinator is proven gone. It first anchors the recorded HEAD at `refs/no-mistakes/recover/<run-id>` and retains the marker if ownership or preservation cannot be verified; direct recovery never removes the operator checkout or branch.
 
 On failure, report the error and Orca Run ID when available; retry only after addressing the blocker or receiving the user's decision.
