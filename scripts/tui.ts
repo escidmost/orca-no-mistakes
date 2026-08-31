@@ -349,6 +349,7 @@ export class RailTuiRenderer implements PresentationRenderer {
       this.#gateMessage = "Inline resolution is unavailable.";
       return;
     }
+    this.#gateConfirm = false;
     this.#gateSubmitting = true;
     this.#gateMessage = "Submitting canonical gate decision...";
     this.#draw();
@@ -620,7 +621,10 @@ export class RailTuiRenderer implements PresentationRenderer {
           this.#leaveGate();
         } else if (!this.#gateSubmitting && (key === "\r" || key === "\n")) {
           if (this.#gateConfirm) this.#submitGate();
-          else this.#gateConfirm = true;
+          else {
+            this.#gateConfirm = true;
+            break;
+          }
         } else if (
           !this.#gateSubmitting &&
           (key === "\u001b[A" ||

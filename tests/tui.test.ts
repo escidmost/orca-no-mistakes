@@ -253,6 +253,9 @@ if (process.env.TUI_FIXTURE === "1") {
     assert.match(screen(), /pinned Review/u);
 
     input.emit("data", "g\u001b[B\r\r");
+    assert.deepEqual(resolutions, []);
+    assert.match(screen(), /Confirm fix\? Press Enter again/u);
+    input.emit("data", "\r");
     await new Promise((resolve) => setImmediate(resolve));
     assert.deepEqual(resolutions, [["gate-review", "fix"]]);
     input.emit("data", "\u001bg\r");
@@ -288,6 +291,8 @@ if (process.env.TUI_FIXTURE === "1") {
     input.emit("data", "\r");
     renderer.render(gateSnapshot("open", 2));
     input.emit("data", "\r\r");
+    assert.deepEqual(resolutions, []);
+    input.emit("data", "\r");
     assert.deepEqual(resolutions, [["gate-review", "approve"]]);
     renderer.render(gateSnapshot("resolved", 3, "stop"));
     settle();
@@ -389,6 +394,8 @@ if (process.env.TUI_FIXTURE === "1") {
             screen().includes("pinned Review"),
         );
         terminal.write("g\u001b[B\r\r");
+        await waitFor(() => screen().includes("Confirm fix? Press Enter again"));
+        terminal.write("\r");
         await waitFor(
           () =>
             output.includes("GATE ANSWER gate-review fix") &&

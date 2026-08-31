@@ -129,6 +129,8 @@ test("lone Escape cannot reopen a submitting gate", async () => {
     input.emit("data", "\r");
     renderer.render(gateSnapshot("open", 1));
     input.emit("data", "\r\r");
+    assert.deepEqual(resolutions, []);
+    input.emit("data", "\r");
     input.emit("data", "\u001b");
     await new Promise((resolve) => setTimeout(resolve, 120));
     input.emit("data", "g\r\r");

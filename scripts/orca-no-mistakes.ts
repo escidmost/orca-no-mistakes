@@ -6278,7 +6278,24 @@ export class CliOrca implements OrcaOperations {
         );
         continue;
       }
-      await this.resolveGate(responseGateId, response.resolution.trim());
+      try {
+        await this.resolveGate(responseGateId, response.resolution.trim());
+      } catch (error) {
+        const current = await this.#json<{
+          gates: { id: string; status: string }[];
+        }>([
+          "orchestration",
+          "gate-list",
+          ...(this.#runId ? ["--run", this.#runId] : []),
+          "--json",
+        ]);
+        if (
+          current.gates.find((gate) => gate.id === responseGateId)?.status !==
+          "resolved"
+        ) {
+          throw error;
+        }
+      }
       pendingGateIds.delete(responseGateId);
     }
     if (result.deliveryId) {

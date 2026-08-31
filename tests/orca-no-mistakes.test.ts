@@ -2890,7 +2890,7 @@ console.log(JSON.stringify({ result: { gate: { id: 'gate-review', status: 'resol
   }
 });
 
-test("CliOrca processes a complete gate-response delivery before acknowledgement", async () => {
+test("CliOrca accepts a Rail resolution racing a complete gate-response delivery", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-gate-response-"));
   const fakeOrca = path.join(temp, "orca");
   const callsPath = path.join(temp, "calls.jsonl");
@@ -2916,6 +2916,7 @@ if (args[1] === 'run-create') {
     { id: 'gate-other', status: 'pending' }
   ] })
 } else if (args[1] === 'check' && args.includes('--unread')) {
+  fs.writeFileSync(${JSON.stringify(resolvedPath)}, 'rail')
   out({ deliveryId: 'gate-delivery', messages: [
     { id: 'response-message', type: 'question', from_handle: 'originating-opencode', subject: 'no-mistakes gate response', body: JSON.stringify({ gateId: 'gate-review', resolution: 'fix: verified' }) },
     { id: 'duplicate-response', type: 'question', from_handle: 'originating-opencode', subject: 'no-mistakes gate response', body: JSON.stringify({ gateId: 'gate-review', resolution: 'approve' }) },
@@ -2925,7 +2926,10 @@ if (args[1] === 'run-create') {
   ] })
 } else if (args[1] === 'gate-resolve') {
   const id = args[args.indexOf('--id') + 1]
-  if (id === 'gate-review') fs.writeFileSync(${JSON.stringify(resolvedPath)}, 'yes')
+  if (id === 'gate-review' && fs.existsSync(${JSON.stringify(resolvedPath)})) {
+    console.error(JSON.stringify({ error: { code: 'gate_already_resolved', message: 'Gate is already resolved.' } }))
+    process.exit(1)
+  }
   out({ gate: { id, status: 'resolved' } })
 } else if (args[1] === 'check' && args.includes('--ack')) {
   if (fs.existsSync(${JSON.stringify(failAckPath)})) {
