@@ -340,3 +340,53 @@ test('remote receipt upgrades add the composite observation key before rebuildin
     await rm(temp, { force: true, recursive: true })
   }
 })
+
+test('route migration keeps the destination route when a legacy archive appears later', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'onm-route-migration-'))
+  const repo = path.join(temp, 'repo')
+  const legacyPath = path.join(temp, 'legacy', 'ledger.db')
+  try {
+    execFileSync('git', ['-c', 'init.templateDir=', 'init', '-b', 'main', repo])
+    const repoRoot = git(repo, 'rev-parse', '--show-toplevel')
+    const route = (headBranch: string) => ({
+      actorId: '5',
+      actorLogin: 'operator',
+      actorNodeId: 'U_5',
+      backend: 'gh' as const,
+      backendVersion: 'gh version 2.97.0',
+      baseBranch: 'main',
+      baseRepositoryId: '10',
+      baseRepositoryName: 'upstream/project',
+      baseRepositoryNodeId: 'R_10',
+      credentialSource: 'stored-account' as const,
+      forgeHost: 'github.com' as const,
+      headBranch,
+      headOwner: 'fork-owner',
+      headRepositoryId: '20',
+      headRepositoryName: 'fork-owner/project',
+      headRepositoryNodeId: 'R_20',
+      networkRootRepositoryId: '10',
+      observedAt: '2026-08-31T12:00:00.000Z',
+      repoRoot
+    })
+
+    // First open without a legacy archive records source_present = 0, then
+    // stores the repository route.
+    const destination = new DomainLedger({ legacyPath, repositoryPath: repo })
+    destination.setRepositoryPublicationRoute(route('feature'))
+    const destinationFingerprint = destination.repositoryPublicationRoute(repoRoot)?.route_fingerprint
+    destination.close()
+
+    // A legacy archive appearing later carries a different route for the
+    // same repository root; migration must keep the destination route.
+    const legacy = new DomainLedger(legacyPath)
+    legacy.setRepositoryPublicationRoute(route('legacy-feature'))
+    legacy.close()
+
+    const migrated = new DomainLedger({ legacyPath, repositoryPath: repo })
+    assert.equal(migrated.repositoryPublicationRoute(repoRoot)?.route_fingerprint, destinationFingerprint)
+    migrated.close()
+  } finally {
+    await rm(temp, { force: true, recursive: true })
+  }
+})

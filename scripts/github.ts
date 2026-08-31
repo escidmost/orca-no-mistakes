@@ -52,18 +52,32 @@ export type CommandRunner = (
   options: { cwd?: string; env: NodeJS.ProcessEnv; input?: string }
 ) => Promise<CommandResult>
 
+const COMMAND_TIMEOUT_MS = 120_000
+
 export const runCommand: CommandRunner = (executable, args, options) => new Promise((resolve) => {
   const child = spawn(executable, args, {
     cwd: options.cwd,
     env: options.env,
-    stdio: ['pipe', 'pipe', 'pipe']
+    stdio: ['pipe', 'pipe', 'pipe'],
+    timeout: COMMAND_TIMEOUT_MS
   })
   let stdout = ''
   let stderr = ''
   child.stdout.on('data', (chunk) => { stdout += chunk.toString() })
   child.stderr.on('data', (chunk) => { stderr += chunk.toString() })
-  child.on('error', () => resolve({ code: 127, stderr: 'command unavailable', stdout: '' }))
-  child.on('close', (code) => resolve({ code: code ?? 1, stderr, stdout }))
+  child.on('error', (error) => {
+    const timedOut = (error as NodeJS.ErrnoException).code === 'ETIMEDOUT'
+    // Timeout and signal kills surface as the retryable `unavailable` class.
+    resolve({ code: timedOut ? 124 : 127, stderr: timedOut ? 'command timed out' : 'command unavailable', stdout: '' })
+  })
+  child.on('close', (code, signal) => resolve({
+    code: code ?? (signal ? 124 : 1),
+    stderr: code === null && signal ? `terminated by ${signal}` : stderr,
+    stdout
+  }))
+  // ponytail: a child that closes stdin early must not crash the coordinator
+  // with an uncaught EPIPE; the classified close result carries the failure.
+  child.stdin.on('error', () => {})
   child.stdin.end(options.input)
 })
 
@@ -213,10 +227,10 @@ type AuthorityOptions = {
   sleep?: (milliseconds: number) => Promise<void>
 }
 
-const PULL_REQUESTS_QUERY = `query PullRequests($owner: String!, $name: String!, $cursor: String) {
+const PULL_REQUESTS_QUERY = `query PullRequests($owner: String!, $name: String!, $baseBranch: String!, $headBranch: String!, $cursor: String) {
   repository(owner: $owner, name: $name) {
     id
-    pullRequests(states: [OPEN, CLOSED, MERGED], first: 100, after: $cursor, orderBy: {field: CREATED_AT, direction: ASC}) {
+    pullRequests(states: [OPEN, CLOSED, MERGED], baseRefName: $baseBranch, headRefName: $headBranch, first: 100, after: $cursor, orderBy: {field: CREATED_AT, direction: ASC}) {
       nodes {
         id number url state isDraft baseRefName baseRefOid headRefName headRefOid
         baseRepository { databaseId id nameWithOwner }
@@ -355,7 +369,9 @@ export class GithubAuthority {
       const data = await this.#graphqlRead(
         'observe-pull-requests',
         PULL_REQUESTS_QUERY,
-        { cursor, name, owner },
+      // Branch names narrow the server response; fork disambiguation and the
+      // exact route tuple stay client-side.
+        { baseBranch: input.baseBranch, cursor, headBranch: input.headBranch, name, owner },
         PullRequestPageSchema
       )
       if (!data.repository) {

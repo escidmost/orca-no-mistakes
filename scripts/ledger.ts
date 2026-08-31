@@ -2285,12 +2285,18 @@ export class DomainLedger {
         const exactRow = columns.map(
           (name) => `destination.${name} IS source.${name}`
         ).join(' AND ')
+        // ponytail: the destination ledger is authoritative; an older legacy
+        // route for the same repository must not abort migration on the
+        // repository_publication_routes primary key.
+        const conflictClause = table === 'repository_publication_routes'
+          ? ' ON CONFLICT(repo_root) DO NOTHING'
+          : ''
         this.#db.prepare(
           `INSERT INTO main.${table} (${names})
            SELECT ${selections} FROM legacy.${table} AS source ${where}
            AND NOT EXISTS (
              SELECT 1 FROM main.${table} AS destination WHERE ${exactRow}
-           )`
+           )${conflictClause}`
         ).run(repoRoot)
       }
 

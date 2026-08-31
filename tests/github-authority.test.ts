@@ -11,6 +11,7 @@ import {
   GithubAuthorityError,
   parseGithubRepositoryReference,
   resolveGithubPublicationRoute,
+  runCommand,
   type CommandRunner,
   type CommandResult
 } from '../scripts/github.ts'
@@ -229,7 +230,12 @@ test('GraphQL reads reject partial responses and pagination that does not advanc
 test('pull request observation is exhaustive, exact, and reports near matches', async () => {
   const pages = [
     {
-      nodes: [pullRequest({ id: 'PR_near', number: 1, headBranch: 'other' })],
+      // Branch-name filters narrow the server response; the remaining near
+      // match is another fork's pull request for the same branch names.
+      nodes: [{
+        ...pullRequest({ id: 'PR_near', number: 1 }),
+        headRepository: { databaseId: 30, id: 'R_30', nameWithOwner: 'stranger/project' }
+      }],
       pageInfo: { endCursor: 'page-2', hasNextPage: true }
     },
     {
@@ -240,7 +246,11 @@ test('pull request observation is exhaustive, exact, and reports near matches', 
   let page = 0
   const provider = await GithubAuthority.connect({
     runner: githubRunner((_executable, _args, options) => {
-      assert.match(options.input ?? '', /states: \[OPEN, CLOSED, MERGED\]/)
+      const request = JSON.parse(options.input ?? '{}') as { query: string; variables: Record<string, unknown> }
+      assert.match(request.query, /states: \[OPEN, CLOSED, MERGED\]/)
+      assert.match(request.query, /baseRefName: \$baseBranch, headRefName: \$headBranch/)
+      assert.equal(request.variables.baseBranch, 'main')
+      assert.equal(request.variables.headBranch, 'feature')
       return json({ data: { repository: { id: 'R_10', pullRequests: pages[page++] } } })
     })
   })
@@ -258,6 +268,16 @@ test('pull request observation is exhaustive, exact, and reports near matches', 
   assert.equal(result.exact?.headOid, 'b'.repeat(40))
   assert.equal(result.exact?.state, 'OPEN')
   assert.deepEqual(result.nearMatches.map((item) => item.id), ['PR_near'])
+})
+
+test('runCommand pipes stdin, survives early stdin close, and classifies failures', async () => {
+  const ok = await runCommand('sh', ['-c', 'cat; exit 7'], { env: {}, input: 'payload' })
+  assert.equal(ok.code, 7)
+  assert.equal(ok.stdout, 'payload')
+  // The child exits before the large write drains; stdin EPIPE must not
+  // crash the process, and the close result carries the classification.
+  const closed = await runCommand('sh', ['-c', 'exit 0'], { env: {}, input: 'x'.repeat(1 << 20) })
+  assert.equal(closed.code, 0)
 })
 
 test('issue comment observation exhausts every page', async () => {
