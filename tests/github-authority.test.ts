@@ -271,12 +271,18 @@ test('pull request observation is exhaustive, exact, and reports near matches', 
 })
 
 test('runCommand pipes stdin, survives early stdin close, and classifies failures', async () => {
-  const ok = await runCommand('sh', ['-c', 'cat; exit 7'], { env: {}, input: 'payload' })
+  const ok = await runCommand(process.execPath, [
+    '-e',
+    'process.stdin.pipe(process.stdout); process.stdin.on("end", () => { process.exitCode = 7 })'
+  ], { env: {}, input: 'payload' })
   assert.equal(ok.code, 7)
   assert.equal(ok.stdout, 'payload')
   // The child exits before the large write drains; stdin EPIPE must not
   // crash the process, and the close result carries the classification.
-  const closed = await runCommand('sh', ['-c', 'exit 0'], { env: {}, input: 'x'.repeat(1 << 20) })
+  const closed = await runCommand(process.execPath, ['-e', 'process.exit(0)'], {
+    env: {},
+    input: 'x'.repeat(1 << 20)
+  })
   assert.equal(closed.code, 0)
 })
 
