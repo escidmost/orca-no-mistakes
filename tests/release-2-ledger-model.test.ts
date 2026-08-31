@@ -50,6 +50,77 @@ test('reopening replaces stale terminal fact triggers', async () => {
   }
 })
 
+test('repository publication routes update safely and snapshot into runs', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'onm-repository-route-'))
+  const dbPath = path.join(temp, 'ledger.sqlite')
+  const ledger = new DomainLedger(dbPath)
+  const route = {
+    actorId: 'U_1',
+    actorLogin: 'operator',
+    backend: 'gh' as const,
+    backendVersion: '2.97.0',
+    baseBranch: 'main',
+    baseRepositoryId: '1',
+    baseRepositoryName: 'upstream/project',
+    baseRepositoryNodeId: 'R_base',
+    credentialSource: 'stored-account' as const,
+    forgeHost: 'github.com' as const,
+    headBranch: 'feature',
+    headOwner: 'upstream',
+    headRepositoryId: '1',
+    headRepositoryName: 'upstream/project',
+    headRepositoryNodeId: 'R_base',
+    networkRootRepositoryId: '1',
+    observedAt: timestamp,
+    repoRoot: '/repo'
+  }
+  try {
+    const fingerprint = ledger.setRepositoryPublicationRoute(route)
+    ledger.startRun({
+      baseBranch: 'main',
+      branch: 'feature',
+      intent: 'Use the configured publication route.',
+      policySha256: policy,
+      repoRoot: '/repo',
+      runId: 'route-run',
+      submissionCommitOid: commit
+    })
+    assert.equal(ledger.publicationRoute('route-run')?.route_fingerprint, fingerprint)
+
+    const renamed = {
+      ...route,
+      actorLogin: 'renamed-operator',
+      baseRepositoryName: 'renamed/project',
+      headRepositoryName: 'renamed/project',
+      observedAt: '2026-08-31T12:00:00.000Z'
+    }
+    assert.equal(ledger.setRepositoryPublicationRoute(renamed), fingerprint)
+    assert.equal(ledger.repositoryPublicationRoute('/repo')?.actor_login, 'renamed-operator')
+
+    assert.throws(
+      () => ledger.setRepositoryPublicationRoute({
+        ...renamed,
+        headBranch: 'different-feature'
+      }),
+      /cannot change publication route while 1 active run\(s\) depend on it/
+    )
+    ledger.finishRun('route-run', 'cancelled')
+    const changed = ledger.setRepositoryPublicationRoute({
+      ...renamed,
+      headBranch: 'different-feature'
+    })
+    assert.notEqual(changed, fingerprint)
+    assert.equal(ledger.repositoryPublicationRoute('/repo')?.head_branch, 'different-feature')
+    assert.throws(
+      () => ledger.recordStoredPublicationRoute('route-run', '/another-repo'),
+      /does not belong to repository/
+    )
+  } finally {
+    ledger.close()
+    await rm(temp, { force: true, recursive: true })
+  }
+})
+
 test('Release 2 ledger facts are immutable, append-only, and atomically checkpointed', async () => {
   const temp = await mkdtemp(path.join(tmpdir(), 'onm-release-2-ledger-'))
   const dbPath = path.join(temp, 'ledger.sqlite')

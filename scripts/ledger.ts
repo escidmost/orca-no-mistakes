@@ -19,6 +19,50 @@ export class LegacyActiveMigrationError extends Error {}
 
 export class RepositoryMigrationConflictError extends Error {}
 
+export type RepositoryPublicationRouteInput = {
+  actorId: string
+  actorLogin: string
+  backend: 'gh' | 'gh-axi'
+  backendVersion: string
+  baseBranch: string
+  baseRepositoryId: string
+  baseRepositoryName: string
+  baseRepositoryNodeId: string
+  credentialSource: 'GH_TOKEN' | 'GITHUB_TOKEN' | 'stored-account'
+  forgeHost: 'github.com'
+  headBranch: string
+  headOwner: string
+  headRepositoryId: string
+  headRepositoryName: string
+  headRepositoryNodeId: string
+  networkRootRepositoryId: string
+  observedAt: string
+  repoRoot: string
+}
+
+export type RepositoryPublicationRouteRow = {
+  actor_id: string
+  actor_login: string
+  backend: 'gh' | 'gh-axi'
+  backend_version: string
+  base_branch: string
+  base_repository_id: string
+  base_repository_name: string
+  base_repository_node_id: string
+  credential_source: 'GH_TOKEN' | 'GITHUB_TOKEN' | 'stored-account'
+  forge_host: 'github.com'
+  head_branch: string
+  head_owner: string
+  head_repository_id: string
+  head_repository_name: string
+  head_repository_node_id: string
+  network_root_repository_id: string
+  observed_at: string
+  repo_root: string
+  route_fingerprint: string
+  updated_at: string
+}
+
 export type StageRequirement = 'disabled' | 'optional' | 'required'
 
 export type StagePlanEntryRow = {
@@ -1473,6 +1517,29 @@ CREATE TABLE IF NOT EXISTS repository_migration_imports (
   repo_root TEXT PRIMARY KEY
 );
 
+CREATE TABLE IF NOT EXISTS repository_publication_routes (
+  repo_root TEXT PRIMARY KEY,
+  route_fingerprint TEXT NOT NULL,
+  forge_host TEXT NOT NULL CHECK(forge_host = 'github.com'),
+  base_repository_id TEXT NOT NULL,
+  base_repository_node_id TEXT NOT NULL,
+  base_repository_name TEXT NOT NULL,
+  head_repository_id TEXT NOT NULL,
+  head_repository_node_id TEXT NOT NULL,
+  head_repository_name TEXT NOT NULL,
+  network_root_repository_id TEXT NOT NULL,
+  head_owner TEXT NOT NULL,
+  head_branch TEXT NOT NULL,
+  base_branch TEXT NOT NULL,
+  actor_id TEXT NOT NULL,
+  actor_login TEXT NOT NULL,
+  credential_source TEXT NOT NULL CHECK(credential_source IN ('GH_TOKEN', 'GITHUB_TOKEN', 'stored-account')),
+  backend TEXT NOT NULL CHECK(backend IN ('gh', 'gh-axi')),
+  backend_version TEXT NOT NULL,
+  observed_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS stage_plan_entries (
   run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
   position INTEGER NOT NULL CHECK(position >= 0),
@@ -2226,6 +2293,7 @@ export class DomainLedger {
       this.#db.prepare(
         'INSERT INTO repository_migration_imports (repo_root) VALUES (?)'
       ).run(repoRoot)
+      copy('repository_publication_routes', 'WHERE repo_root = ?')
       copy('runs', 'WHERE repo_root = ?')
       this.#db.prepare(
         `UPDATE main.runs SET status = 'in-progress', completed_at = NULL
@@ -2372,6 +2440,8 @@ export class DomainLedger {
       for (const [position, entry] of plan.entries()) {
         insert.run(input.runId, position, entry.stageId, entry.requirement)
       }
+      const route = this.repositoryPublicationRoute(input.repoRoot)
+      if (route) this.#recordStoredPublicationRoute(input.runId, route)
       this.#db.exec('COMMIT')
     } catch (error) {
       this.#db.exec('ROLLBACK')
@@ -2412,6 +2482,141 @@ export class DomainLedger {
        JOIN stage_plan_entries p ON p.run_id = d.run_id AND p.stage_id = d.stage_id
        WHERE d.run_id = ? ORDER BY p.position`
     ).all(runId) as StageDispositionRow[]
+  }
+
+  setRepositoryPublicationRoute(input: RepositoryPublicationRouteInput): string {
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      const fingerprint = this.#setRepositoryPublicationRoute(input)
+      this.#db.exec('COMMIT')
+      return fingerprint
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  #setRepositoryPublicationRoute(input: RepositoryPublicationRouteInput): string {
+    const route = {
+      baseBranch: input.baseBranch,
+      baseRepositoryId: input.baseRepositoryId,
+      forgeHost: input.forgeHost,
+      headBranch: input.headBranch,
+      headOwner: input.headOwner,
+      headRepositoryId: input.headRepositoryId
+    }
+    const fingerprint = sha256(canonicalJson(route))
+    const existing = this.repositoryPublicationRoute(input.repoRoot)
+    if (existing && existing.route_fingerprint !== fingerprint) {
+      const active = this.#db.prepare(
+        `SELECT COUNT(*) AS count
+         FROM runs r
+         JOIN publication_routes p ON p.run_id = r.run_id
+         WHERE r.repo_root = ? AND r.status = 'in-progress' AND p.route_fingerprint = ?`
+      ).get(input.repoRoot, existing.route_fingerprint) as { count: number }
+      if (active.count > 0) {
+        throw new Error(
+          `cannot change publication route while ${active.count} active run(s) depend on it`
+        )
+      }
+    }
+
+    const now = new Date().toISOString()
+    this.#db.prepare(
+      `INSERT INTO repository_publication_routes (
+         repo_root, route_fingerprint, forge_host, base_repository_id,
+         base_repository_node_id, base_repository_name, head_repository_id,
+         head_repository_node_id, head_repository_name, network_root_repository_id,
+         head_owner, head_branch, base_branch, actor_id, actor_login,
+         credential_source, backend, backend_version, observed_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(repo_root) DO UPDATE SET
+         route_fingerprint = excluded.route_fingerprint,
+         forge_host = excluded.forge_host,
+         base_repository_id = excluded.base_repository_id,
+         base_repository_node_id = excluded.base_repository_node_id,
+         base_repository_name = excluded.base_repository_name,
+         head_repository_id = excluded.head_repository_id,
+         head_repository_node_id = excluded.head_repository_node_id,
+         head_repository_name = excluded.head_repository_name,
+         network_root_repository_id = excluded.network_root_repository_id,
+         head_owner = excluded.head_owner,
+         head_branch = excluded.head_branch,
+         base_branch = excluded.base_branch,
+         actor_id = excluded.actor_id,
+         actor_login = excluded.actor_login,
+         credential_source = excluded.credential_source,
+         backend = excluded.backend,
+         backend_version = excluded.backend_version,
+         observed_at = excluded.observed_at,
+         updated_at = excluded.updated_at`
+    ).run(
+      input.repoRoot,
+      fingerprint,
+      input.forgeHost,
+      input.baseRepositoryId,
+      input.baseRepositoryNodeId,
+      input.baseRepositoryName,
+      input.headRepositoryId,
+      input.headRepositoryNodeId,
+      input.headRepositoryName,
+      input.networkRootRepositoryId,
+      input.headOwner,
+      input.headBranch,
+      input.baseBranch,
+      input.actorId,
+      input.actorLogin,
+      input.credentialSource,
+      input.backend,
+      input.backendVersion,
+      input.observedAt,
+      now
+    )
+    return fingerprint
+  }
+
+  repositoryPublicationRoute(repoRoot: string): RepositoryPublicationRouteRow | undefined {
+    return this.#db.prepare(
+      `SELECT repo_root, route_fingerprint, forge_host, base_repository_id,
+              base_repository_node_id, base_repository_name, head_repository_id,
+              head_repository_node_id, head_repository_name, network_root_repository_id,
+              head_owner, head_branch, base_branch, actor_id, actor_login,
+              credential_source, backend, backend_version, observed_at, updated_at
+       FROM repository_publication_routes WHERE repo_root = ?`
+    ).get(repoRoot) as RepositoryPublicationRouteRow | undefined
+  }
+
+  recordStoredPublicationRoute(runId: string, repoRoot: string): string {
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      const run = this.run(runId)
+      if (!run || run.repo_root !== repoRoot) {
+        throw new Error(`run ${runId} does not belong to repository ${repoRoot}`)
+      }
+      const route = this.repositoryPublicationRoute(repoRoot)
+      if (!route) throw new Error(`repository ${repoRoot} has no publication route`)
+      const fingerprint = this.#recordStoredPublicationRoute(runId, route)
+      this.#db.exec('COMMIT')
+      return fingerprint
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  #recordStoredPublicationRoute(
+    runId: string,
+    route: RepositoryPublicationRouteRow
+  ): string {
+    return this.recordPublicationRoute({
+      baseBranch: route.base_branch,
+      baseRepositoryId: route.base_repository_id,
+      forgeHost: route.forge_host,
+      headBranch: route.head_branch,
+      headOwner: route.head_owner,
+      headRepositoryId: route.head_repository_id,
+      runId
+    })
   }
 
   recordPublicationRoute(input: {
