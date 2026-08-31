@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { constants, mkdirSync, readFileSync, statSync } from 'node:fs'
+import { constants, fstatSync, mkdirSync, readFileSync, readSync, statSync } from 'node:fs'
 import { chmod, lstat, mkdir, open, realpath, rename, rm } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
@@ -456,6 +456,7 @@ export function verifyManifest(
 }
 
 export const MAX_LOG_BYTES = 50 * 1024 * 1024
+export const STAGE_LOG_TAIL_BYTES = 64 * 1024
 const LOG_MARKER_RESERVE_BYTES = 512
 
 /**
@@ -596,6 +597,8 @@ export class StageLog {
   #file?: Awaited<ReturnType<typeof open>>
   #hasNewOutput = false
   #compacted = false
+  #closedTail: Buffer = Buffer.alloc(0)
+  #retainedTailBytes = 0
   #pending = Promise.resolve()
 
   constructor(filePath: string, maxBytes = MAX_LOG_BYTES) {
@@ -612,6 +615,33 @@ export class StageLog {
     const pending = this.#pending.then(() => this.#append(chunk, source))
     this.#pending = pending.catch(() => {})
     return pending
+  }
+
+  tail(maxBytes: number): Buffer {
+    this.#retainedTailBytes = Math.max(this.#retainedTailBytes, maxBytes)
+    const file = this.#file
+    if (!file) return this.#closedTail.subarray(-maxBytes)
+    try {
+      const size = fstatSync(file.fd).size
+      const length = Math.min(size, maxBytes)
+      const buffer = Buffer.alloc(length)
+      let bytesRead = 0
+      while (bytesRead < length) {
+        const count = readSync(
+          file.fd,
+          buffer,
+          bytesRead,
+          length - bytesRead,
+          size - length + bytesRead,
+        )
+        if (count === 0) break
+        bytesRead += count
+      }
+      return buffer.subarray(0, bytesRead)
+    }
+    catch {
+      return Buffer.alloc(0)
+    }
   }
 
   async #append(chunk: string, source: symbol): Promise<void> {
@@ -655,6 +685,9 @@ export class StageLog {
       await this.#recordOriginalBytes()
     } finally {
       const file = this.#file
+      if (file && this.#retainedTailBytes > 0) {
+        this.#closedTail = this.tail(this.#retainedTailBytes)
+      }
       this.#file = undefined
       if (file) await file.close()
     }

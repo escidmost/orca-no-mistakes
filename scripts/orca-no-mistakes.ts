@@ -69,6 +69,7 @@ import { createRailTuiRenderer } from "./tui.ts";
 import {
   DomainLedger,
   RUN_ID_PATTERN,
+  STAGE_LOG_TAIL_BYTES,
   isWithin,
   StageLog,
   artifactsRoot,
@@ -77,6 +78,7 @@ import {
   evidenceSha256,
   gateAuditMatchesEvidence,
   isAuthoritativeStageEvidence,
+  knownSecretPrefixBytes,
   normalizeIntent,
   noMistakesHome,
   sha256,
@@ -270,7 +272,10 @@ export type PipelineOptions = {
   intent: string;
   maxFixRounds?: number;
   plainStatus?: boolean;
-  rendererFactory?: (artifactsDir: string) => PresentationRenderer;
+  rendererFactory?: (
+    artifactsDir: string,
+    stageLogs: ReadonlyMap<string, StageLog>,
+  ) => PresentationRenderer;
   resumeRunId?: string;
   userGlobalConfig?: OrcaNoMistakesConfig;
 };
@@ -1459,6 +1464,9 @@ export async function runPipeline(
   git: GitOperations,
   ledger: DomainLedger = new DomainLedger(":memory:"),
 ): Promise<PipelineResult> {
+  const stageLogs = options.rendererFactory
+    ? new Map<string, StageLog>()
+    : undefined;
   const intent = normalizeIntent(options.intent);
   const maxFixRounds = options.maxFixRounds;
   if (
@@ -1596,7 +1604,7 @@ export async function runPipeline(
       presentation = new PresentationPublisher(
         ledger,
         runId,
-        options.rendererFactory?.(artifactsDir) ??
+        options.rendererFactory?.(artifactsDir, stageLogs!) ??
           (options.plainStatus
             ? new PlainStatusRenderer(process.stderr)
             : undefined),
@@ -2029,6 +2037,7 @@ export async function runPipeline(
           orca,
           git,
           pipelineConfig.stages[stage],
+          stageLogs,
           decisionHistory(),
         );
         if (inheritedFallback) {
@@ -2270,7 +2279,8 @@ export async function runPipeline(
           await releaseFixerSession(staleSession, orca);
         }
         let nextFixer: Awaited<ReturnType<typeof runFixer>>;
-        const fixerLog = new StageLog(
+        const fixerLog = registeredStageLog(
+          stageLogs,
           stageLogPath(artifactsDir, stage, round),
         );
         try {
@@ -2865,9 +2875,13 @@ async function executeStage(
   orca: OrcaOperations,
   git: GitOperations,
   roles: StageRoles,
+  stageLogs: Map<string, StageLog> | undefined,
   decisionHistory: string,
 ): Promise<StageExecution> {
-  const stageLog = new StageLog(stageLogPath(evidenceDir, stage, round));
+  const stageLog = registeredStageLog(
+    stageLogs,
+    stageLogPath(evidenceDir, stage, round),
+  );
   try {
     if (stage === "intent") {
       const report: StageReport = {
@@ -2927,6 +2941,18 @@ function stageLogPath(
   round: number,
 ): string {
   return path.join(artifactsDir, `${stage}_r${round}.log`);
+}
+
+function registeredStageLog(
+  stageLogs: Map<string, StageLog> | undefined,
+  filePath: string,
+): StageLog {
+  const log = new StageLog(filePath);
+  if (stageLogs) {
+    log.tail(STAGE_LOG_TAIL_BYTES + knownSecretPrefixBytes());
+    stageLogs.set(path.resolve(filePath), log);
+  }
+  return log;
 }
 
 function exitCodeFor(report: StageReport): number {
@@ -11777,12 +11803,13 @@ Prune options:
         plainStatus: parsed.flags["no-tui"] === true,
         rendererFactory:
           parsed.flags.tui === true
-            ? (artifactsDir) => {
+            ? (artifactsDir, stageLogs) => {
                 renderer =
                   createRailTuiRenderer(
                     process.stdin,
                     process.stderr,
                     artifactsDir,
+                    stageLogs,
                   ) ?? new PlainStatusRenderer(process.stderr);
                 setAbortPresentationCleanup(closeRenderer);
                 return renderer;

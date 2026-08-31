@@ -10,7 +10,12 @@ import {
 import path from "node:path";
 
 import { PIPELINE_STEPS, type StageName } from "./config.ts";
-import { knownSecretPrefixBytes, redactKnownSecrets } from "./ledger.ts";
+import {
+  knownSecretPrefixBytes,
+  redactKnownSecrets,
+  STAGE_LOG_TAIL_BYTES,
+  type StageLog,
+} from "./ledger.ts";
 import type {
   PresentationRenderer,
   PresentationSnapshot,
@@ -44,7 +49,6 @@ const MIN_COLUMNS = 72;
 const MIN_ROWS = 18;
 const FULL_COLUMNS = 100;
 const FULL_ROWS = 24;
-const LOG_BYTES = 64 * 1024;
 
 function title(stage: StageName): string {
   return `${stage[0].toUpperCase()}${stage.slice(1)}`;
@@ -79,47 +83,57 @@ function logTail(
   artifactsDir: string,
   artifactsIdentity: string | undefined,
   fileName: string,
+  stageLogs?: ReadonlyMap<string, StageLog>,
 ): string[] {
   let descriptor: number | undefined;
   try {
-    if (
-      artifactsIdentity === undefined ||
-      artifactDirectoryIdentity(artifactsDir) !== artifactsIdentity
-    ) {
-      throw new Error("artifact directory identity changed");
-    }
     const root = path.resolve(artifactsDir);
     const filePath = path.resolve(root, fileName);
     const relative = path.relative(root, filePath);
     if (relative.startsWith("..") || path.isAbsolute(relative)) {
       throw new Error("log path escapes artifact root");
     }
-    descriptor = openSync(
-      filePath,
-      constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW,
-    );
-    const info = fstatSync(descriptor);
-    if (!info.isFile() || info.nlink !== 1) {
-      throw new Error("log path must be a private regular file");
-    }
-    const size = info.size;
-    const length = Math.min(size, LOG_BYTES + knownSecretPrefixBytes());
-    const buffer = Buffer.alloc(length);
-    let bytesRead = 0;
-    while (bytesRead < length) {
-      const count = readSync(
-        descriptor,
-        buffer,
-        bytesRead,
-        length - bytesRead,
-        size - length + bytesRead,
+    let buffer: Buffer;
+    if (stageLogs) {
+      const log = stageLogs.get(filePath);
+      if (!log) throw new Error("log is not coordinator-owned");
+      buffer = log.tail(STAGE_LOG_TAIL_BYTES + knownSecretPrefixBytes());
+    } else {
+      if (
+        artifactsIdentity === undefined ||
+        artifactDirectoryIdentity(artifactsDir) !== artifactsIdentity
+      ) {
+        throw new Error("artifact directory identity changed");
+      }
+      descriptor = openSync(
+        filePath,
+        constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW,
       );
-      if (count === 0) break;
-      bytesRead += count;
+      const info = fstatSync(descriptor);
+      if (!info.isFile() || info.nlink !== 1) {
+        throw new Error("log path must be a private regular file");
+      }
+      const length = Math.min(
+        info.size,
+        STAGE_LOG_TAIL_BYTES + knownSecretPrefixBytes(),
+      );
+      buffer = Buffer.alloc(length);
+      let bytesRead = 0;
+      while (bytesRead < length) {
+        const count = readSync(
+          descriptor,
+          buffer,
+          bytesRead,
+          length - bytesRead,
+          info.size - length + bytesRead,
+        );
+        if (count === 0) break;
+        bytesRead += count;
+      }
+      buffer = buffer.subarray(0, bytesRead);
     }
     const sanitized = Array.from(
       buffer
-        .subarray(0, bytesRead)
         .toString("utf8")
         .replaceAll(new RegExp("\\x1b\\[[0-?]*[ -/]*[@-~]", "gu"), "?"),
       (character) => {
@@ -131,7 +145,7 @@ function logTail(
       },
     ).join("");
     const content = Buffer.from(redactKnownSecrets(sanitized))
-      .subarray(-LOG_BYTES)
+      .subarray(-STAGE_LOG_TAIL_BYTES)
       .toString("utf8");
     return content.split("\n");
   } catch {
@@ -199,6 +213,7 @@ export class RailTuiRenderer implements PresentationRenderer {
   readonly #inputWasPaused: boolean;
   readonly #inputWasRaw: boolean;
   readonly #output: Output;
+  readonly #stageLogs?: ReadonlyMap<string, StageLog>;
   #activityIndex = 0;
   #closed = false;
   #escapeTimer?: ReturnType<typeof setTimeout>;
@@ -227,11 +242,19 @@ export class RailTuiRenderer implements PresentationRenderer {
     }
   };
 
-  constructor(input: Input, output: Output, artifactsDir: string) {
+  constructor(
+    input: Input,
+    output: Output,
+    artifactsDir: string,
+    stageLogs?: ReadonlyMap<string, StageLog>,
+  ) {
     this.#input = input;
     this.#output = output;
     this.#artifactsDir = path.resolve(artifactsDir);
-    this.#artifactsIdentity = artifactDirectoryIdentity(this.#artifactsDir);
+    this.#artifactsIdentity = stageLogs
+      ? undefined
+      : artifactDirectoryIdentity(this.#artifactsDir);
+    this.#stageLogs = stageLogs;
     this.#inputWasPaused = input.isPaused();
     this.#inputWasRaw = input.isRaw === true;
     try {
@@ -411,6 +434,7 @@ export class RailTuiRenderer implements PresentationRenderer {
       this.#artifactsDir,
       this.#artifactsIdentity,
       `${stage}_r${round}.log`,
+      this.#stageLogs,
     );
     const room = Math.max(0, rows - 1);
     this.#logOffset = Math.min(
@@ -535,10 +559,11 @@ export function createRailTuiRenderer(
   input: Input,
   output: Output,
   artifactsDir: string,
+  stageLogs?: ReadonlyMap<string, StageLog>,
 ): RailTuiRenderer | undefined {
   if (!supportsRailTui(input, output)) return undefined;
   try {
-    return new RailTuiRenderer(input, output, artifactsDir);
+    return new RailTuiRenderer(input, output, artifactsDir, stageLogs);
   } catch {
     return undefined;
   }
