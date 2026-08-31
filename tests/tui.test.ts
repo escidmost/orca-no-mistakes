@@ -245,7 +245,11 @@ if (process.env.TUI_FIXTURE === "1") {
     assert.match(screen(), /run-tui-test.*in-progress/u);
     assert.match(screen(), /3\. Review/u);
     input.emit("data", "\u001b");
-    await new Promise((resolve) => setTimeout(resolve, 120));
+    const deadline = Date.now() + 1_000;
+    while (/CANCEL RUN\?/u.test(screen())) {
+      if (Date.now() >= deadline) assert.fail("Cancel panel did not close");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
     assert.doesNotMatch(screen(), /CANCEL RUN\?/u);
     assert.match(screen(), /DECISION REQUIRED/u);
 

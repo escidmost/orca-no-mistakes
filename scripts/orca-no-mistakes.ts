@@ -11254,8 +11254,9 @@ async function reapDirectRun(
     !COMMIT_OID.test(marker.headOid) ||
     marker.cancellationAction !== "force-stop" ||
     marker.cleanupPending !== true ||
-    !Number.isSafeInteger(marker.generationToken) ||
-    marker.generationToken! < 1
+    (marker.generationToken !== undefined &&
+      (!Number.isSafeInteger(marker.generationToken) ||
+        marker.generationToken < 1))
   ) {
     return false;
   }
@@ -11264,13 +11265,38 @@ async function reapDirectRun(
   }
   const run = ledger.runIdentity(domainRunId);
   if (!run || run.repo_root !== repoRoot) return false;
-  const lease = ledger.leaseFor(repoRoot, run.branch);
-  if (
-    run.status === "in-progress" &&
-    (lease?.run_id !== domainRunId ||
-      lease.generation_token !== marker.generationToken)
-  ) {
-    return false;
+  let lease = ledger.leaseFor(repoRoot, run.branch);
+  let generationToken = await cleanupGenerationToken(
+    repoRoot,
+    domainRunId,
+    marker.generationToken,
+    lease,
+  );
+  if (run.status === "in-progress") {
+    if (lease === undefined) {
+      if (generationToken !== undefined) return false;
+      try {
+        generationToken = ledger.acquireLease({
+          branch: run.branch,
+          repoRoot,
+          runId: domainRunId,
+        });
+      } catch {
+        return false;
+      }
+      lease = ledger.leaseFor(repoRoot, run.branch);
+    }
+    if (
+      generationToken === undefined ||
+      lease?.run_id !== domainRunId ||
+      lease.generation_token !== generationToken
+    ) {
+      return false;
+    }
+    if (marker.generationToken === undefined) {
+      marker.generationToken = generationToken;
+      await writeMarker(markerFile, marker);
+    }
   }
   const worktrees = await listOrcaWorktrees(orcaCommand, repoRoot);
   const origin = worktrees?.find((worktree) => worktree.path === repoRoot);
@@ -11310,12 +11336,12 @@ async function reapDirectRun(
       repoRoot,
       domainRunId,
       marker.headOid,
-      marker.generationToken,
+      generationToken,
     );
     if (
       !settleStrandedCancellation(ledger, domainRunId, {
         branch: run.branch,
-        generationToken: marker.generationToken!,
+        generationToken: generationToken!,
         repoRoot,
       })
     ) {
