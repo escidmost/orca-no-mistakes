@@ -22,6 +22,7 @@ import {
   reapAbortedRun,
   registerAbortRunContext,
 } from "../scripts/orca-no-mistakes.ts";
+import { legacyLedgerPath } from "../scripts/ledger.ts";
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
@@ -101,7 +102,7 @@ function setHome(home: string, orcaCommand?: string): () => void {
 test("abort and stranded prune retain a gate branch owned by a raw worktree", async () => {
   const aborted = await seedGate("onm-abort-raw-gate-owner-");
   let restore = setHome(path.join(aborted.temp, "home"));
-  let ledger = new DomainLedger();
+  let ledger = new DomainLedger(legacyLedgerPath());
   try {
     const runId = "run-abort-raw-owner";
     ledger.startRun({
@@ -148,7 +149,7 @@ test("abort and stranded prune retain a gate branch owned by a raw worktree", as
 
   const stranded = await seedGate("onm-prune-raw-gate-owner-");
   restore = setHome(path.join(stranded.temp, "home"), stranded.fakeOrca);
-  ledger = new DomainLedger();
+  ledger = new DomainLedger(legacyLedgerPath());
   try {
     const runId = "run-prune-raw-owner";
     ledger.startRun({

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -75,9 +76,15 @@ test('v2 completion attestations bind Release 2 facts without overstating assura
 
   const home = await mkdtemp(path.join(tmpdir(), 'onm-v2-attestation-'))
   const offlineHome = await mkdtemp(path.join(tmpdir(), 'onm-v2-offline-'))
+  const repository = path.join(home, 'repo')
+  const offlineRepository = path.join(offlineHome, 'repo')
   const previousHome = process.env.ORCA_NO_MISTAKES_HOME
+  const previousCwd = process.cwd()
   try {
+    execFileSync('git', ['-c', 'init.templateDir=', 'init', '-b', 'main', repository])
+    execFileSync('git', ['-c', 'init.templateDir=', 'init', '-b', 'main', offlineRepository])
     process.env.ORCA_NO_MISTAKES_HOME = home
+    process.chdir(repository)
     const ledger = new DomainLedger()
     ledger.startRun({
       baseBranch: 'main',
@@ -118,11 +125,12 @@ test('v2 completion attestations bind Release 2 facts without overstating assura
       ...publicationRoute,
       runId
     })
+    const failedGeneration = ledger.acquireLease({ branch: 'feature', repoRoot: '/repo', runId })
     ledger.startAttempt({
       actorIdentity: 'operator',
       attemptId: 'failed-attempt',
       coordinatorIdentity: 'coordinator',
-      generationToken: 1,
+      generationToken: failedGeneration,
       runId,
       startedAt: '2026-08-30T12:00:00.000Z'
     })
@@ -140,11 +148,13 @@ test('v2 completion attestations bind Release 2 facts without overstating assura
       stoppingFact: 'candidate-publication-pre-read',
       verdict: 'failed'
     })
+    ledger.releaseLease(runId)
+    const passedGeneration = ledger.acquireLease({ branch: 'feature', repoRoot: '/repo', runId })
     ledger.startAttempt({
       actorIdentity: 'operator',
       attemptId: 'passed-attempt',
       coordinatorIdentity: 'coordinator',
-      generationToken: 2,
+      generationToken: passedGeneration,
       runId,
       startedAt: '2026-08-30T12:00:02.000Z'
     })
@@ -306,7 +316,7 @@ test('v2 completion attestations bind Release 2 facts without overstating assura
       stoppingFact: 'pull-request-bound',
       verdict: 'passed'
     })
-    const manifest = buildPipelineCompletionAttestation(stageEvidence, {
+    const completionMetadata = {
       attemptOutcomeDigests: [failedOutcome, passedOutcome],
       baseCommitOid: commit,
       candidateCommitOid: commit,
@@ -326,7 +336,14 @@ test('v2 completion attestations bind Release 2 facts without overstating assura
         stage: entry.stage
       })),
       stagePlan: stages.map((stage) => ({ requirement: 'required' as const, stage }))
+    }
+    const manifest = buildPipelineCompletionAttestation(stageEvidence, completionMetadata)
+    const alternateTerminalOutcome = buildPipelineCompletionAttestation(stageEvidence, {
+      ...completionMetadata,
+      attemptOutcomeDigests: [failedOutcome, sha256('alternate terminal outcome')]
     })
+    assert.equal(alternateTerminalOutcome.pipelineEvidenceRoot, manifest.pipelineEvidenceRoot)
+    assert.notEqual(alternateTerminalOutcome.merkleRoot, manifest.merkleRoot)
 
     verifyCompletionAttestation(manifest)
     assert.equal(manifest.version, '2.0.0')
@@ -368,8 +385,10 @@ test('v2 completion attestations bind Release 2 facts without overstating assura
     assert.deepEqual(JSON.parse(await readFile(exported, 'utf8')), manifest)
 
     process.env.ORCA_NO_MISTAKES_HOME = offlineHome
+    process.chdir(offlineRepository)
     await main(['attestation', 'verify', exported])
   } finally {
+    process.chdir(previousCwd)
     if (previousHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME
     else process.env.ORCA_NO_MISTAKES_HOME = previousHome
     await rm(home, { recursive: true, force: true })

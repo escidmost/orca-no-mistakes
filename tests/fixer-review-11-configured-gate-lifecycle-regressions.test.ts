@@ -253,7 +253,7 @@ test("cancelled and failed configured runs retry task settlement", async (t) => 
             terminalHandle: "term-configured",
           }),
         );
-        const ledger = new DomainLedger();
+        const ledger = new DomainLedger({ repositoryPath: seeded.repo });
         ledger.startRun({
           baseBranch: "main",
           branch: "feature",
@@ -274,7 +274,7 @@ test("cancelled and failed configured runs retry task settlement", async (t) => 
         await main(["prune", "--stranded", `--repo=${seeded.repo}`]);
         assert.equal(existsSync(gate.path), true);
         assert.equal(existsSync(marker), true);
-        const retained = new DomainLedger();
+        const retained = new DomainLedger({ repositoryPath: seeded.repo });
         assert.equal(
           retained.runStatus(gate.runId),
           initialStatus === "in-progress" ? "cancelled" : "failed",

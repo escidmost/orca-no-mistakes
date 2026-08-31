@@ -407,7 +407,7 @@ async function pruneCrashRemnant(
   process.env.ORCA_CLI_COMMAND = seeded.fakeOrca;
   let status: string | undefined;
   try {
-    const ledger = new DomainLedger();
+    const ledger = new DomainLedger({ repositoryPath: seeded.origin });
     seedLedger(ledger, seeded.origin);
     ledger.close();
     await writeStrandedMarker(seeded, runId);
@@ -430,7 +430,7 @@ async function pruneCrashRemnant(
         seeded.gateHead,
       );
     }
-    const reopened = new DomainLedger();
+    const reopened = new DomainLedger({ repositoryPath: seeded.origin });
     status = reopened.runStatus(runId);
     reopened.close();
   } finally {

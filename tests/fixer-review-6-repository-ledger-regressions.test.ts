@@ -91,6 +91,14 @@ test('attempt facts and receipt settlement require the current lease generation'
       routeFingerprint,
       runId
     })
+    assert.throws(() => ledger.startAttempt({
+      actorIdentity: 'operator',
+      attemptId: 'unowned-attempt',
+      coordinatorIdentity: 'coordinator',
+      generationToken: 1,
+      runId,
+      startedAt: '2026-08-31T11:59:59.000Z'
+    }), /current branch lease generation/)
     const firstGeneration = ledger.acquireLease({ branch: 'feature', repoRoot: '/repo', runId })
     ledger.startAttempt({
       actorIdentity: 'operator',
@@ -137,6 +145,14 @@ test('attempt facts and receipt settlement require the current lease generation'
       subject: 'github.com/R_head:refs/heads/feature'
     })
     ledger.releaseLease(runId)
+    assert.throws(() => ledger.recordRemoteObservation({
+      attemptId: 'stale-attempt',
+      kind: 'publication-head',
+      observedAt: '2026-08-31T12:00:04.000Z',
+      payload: {},
+      runId,
+      subject: 'unowned'
+    }), /current branch lease generation/)
     const currentGeneration = ledger.acquireLease({ branch: 'feature', repoRoot: '/repo', runId })
     assert.notEqual(currentGeneration, firstGeneration)
 

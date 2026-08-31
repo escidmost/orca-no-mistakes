@@ -24,11 +24,12 @@ test('attempt outcomes retain their starting identities', () => {
       runId,
       submissionCommitOid: commit
     })
+    const generationToken = ledger.acquireLease({ branch: 'feature', repoRoot: root, runId })
     ledger.startAttempt({
       actorIdentity: 'actor-a',
       attemptId: 'attempt-1',
       coordinatorIdentity: 'coordinator-a',
-      generationToken: 1,
+      generationToken,
       runId,
       startedAt: '2026-08-30T12:00:01.000Z'
     })

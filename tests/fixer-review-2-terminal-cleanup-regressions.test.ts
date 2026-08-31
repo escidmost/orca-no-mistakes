@@ -24,6 +24,7 @@ import {
   reapAbortedRun,
   registerAbortRunContext,
 } from "../scripts/orca-no-mistakes.ts";
+import { legacyLedgerPath } from "../scripts/ledger.ts";
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
@@ -174,7 +175,7 @@ for (const kind of ["configured", "orca"] as const) {
     });
     const home = path.join(seeded.temp, "home");
     const restore = setEnv(home, fake.command);
-    const ledger = new DomainLedger();
+    const ledger = new DomainLedger(legacyLedgerPath());
     const gate =
       kind === "configured"
         ? {
@@ -212,7 +213,7 @@ for (const kind of ["configured", "orca"] as const) {
 
       await main(["prune", "--stranded", "--repo", seeded.repo]);
 
-      const reopened = new DomainLedger();
+      const reopened = new DomainLedger(legacyLedgerPath());
       try {
         assert.equal(reopened.runStatus(runId), "passed");
       } finally {

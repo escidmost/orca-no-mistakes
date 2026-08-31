@@ -16,6 +16,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { DomainLedger, main } from "../scripts/orca-no-mistakes.ts";
+import { legacyLedgerPath } from "../scripts/ledger.ts";
 
 test("configured launcher rejects a run owned by another repository", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "onm-launcher-owner-"));
@@ -73,7 +74,7 @@ process.exit(1)
   const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
   process.env.ORCA_CLI_COMMAND = command;
   process.env.ORCA_NO_MISTAKES_HOME = path.join(temp, "home");
-  const ledger = new DomainLedger();
+  const ledger = new DomainLedger(legacyLedgerPath());
   ledger.startRun({
     baseBranch: "main",
     branch: "feature",
@@ -166,7 +167,7 @@ process.exit(1)
     const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
     process.env.ORCA_CLI_COMMAND = command;
     process.env.ORCA_NO_MISTAKES_HOME = path.join(temp, "home");
-    const ledger = new DomainLedger();
+    const ledger = new DomainLedger(legacyLedgerPath());
     ledger.startRun({
       baseBranch: "main",
       branch: "feature",

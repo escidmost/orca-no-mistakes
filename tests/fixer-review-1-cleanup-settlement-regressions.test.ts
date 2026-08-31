@@ -16,6 +16,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { DomainLedger, main } from "../scripts/orca-no-mistakes.ts";
+import { legacyLedgerPath } from "../scripts/ledger.ts";
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
@@ -210,7 +211,7 @@ else out({ accepted: true })
   const restore = setEnv(path.join(seeded.temp, "home"), orcaCommand);
   const marker = markerPath(seeded.repo, gate.id);
   try {
-    const ledger = new DomainLedger();
+    const ledger = new DomainLedger(legacyLedgerPath());
     ledger.startRun({
       baseBranch: "main",
       branch: "feature",
@@ -242,7 +243,7 @@ else out({ accepted: true })
     );
     assert.equal(existsSync(marker), true);
     assert.equal(existsSync(gate.path), true);
-    const reopened = new DomainLedger();
+    const reopened = new DomainLedger(legacyLedgerPath());
     try {
       assert.equal(reopened.runStatus(runId), "failed");
     } finally {

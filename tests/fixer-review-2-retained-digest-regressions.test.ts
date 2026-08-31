@@ -62,6 +62,7 @@ async function createCompletion(
     stagePlan: stages.map((stageId) => ({ requirement: 'required', stageId })),
     submissionCommitOid: base
   })
+  const generationToken = ledger.acquireLease({ branch: 'feature', repoRoot, runId })
   for (const entry of evidence) {
     ledger.recordStageDisposition({
       disposition: 'satisfied',
@@ -85,7 +86,7 @@ async function createCompletion(
     actorIdentity: 'operator',
     attemptId,
     coordinatorIdentity: 'coordinator',
-    generationToken: 1,
+    generationToken,
     runId,
     startedAt: '2026-08-30T12:00:00.000Z'
   })
@@ -219,6 +220,7 @@ async function createCompletion(
     verdict: 'passed'
   })
   ledger.finishRun(runId, 'passed', candidate)
+  ledger.releaseLease(runId)
   return buildPipelineCompletionAttestation(evidence.map((entry) => ({
     artifactSha256: entry.artifactSha256,
     baseCommitOid: entry.baseCommitOid,

@@ -9,6 +9,7 @@ import {
   DomainLedger,
   buildAttestation,
   evidenceSha256,
+  legacyLedgerPath,
   manifestLeaves,
   merkleRoot,
   sha256,
@@ -22,9 +23,11 @@ const policySha256 = 'b'.repeat(64)
 
 test('offline verification rejects a manifest for a failed local run', async () => {
   const home = await mkdtemp(path.join(tmpdir(), 'onm-failed-offline-'))
+  const previousCwd = process.cwd()
   const previousHome = process.env.ORCA_NO_MISTAKES_HOME
   process.env.ORCA_NO_MISTAKES_HOME = home
   try {
+    process.chdir(home)
     const runId = 'failed-offline-run'
     const manifest = buildAttestation(fullStageEvidence({ baseCommitOid: commit, candidateCommitOid: commit, runId }), {
       baseCommitOid: commit,
@@ -34,7 +37,7 @@ test('offline verification rejects a manifest for a failed local run', async () 
       policySha256,
       runId
     })
-    const ledger = new DomainLedger()
+    const ledger = new DomainLedger(legacyLedgerPath())
     ledger.startRun({
       baseBranch: 'main',
       branch: 'feature',
@@ -54,6 +57,7 @@ test('offline verification rejects a manifest for a failed local run', async () 
       /has no passed attestation \(status: failed\)/
     )
   } finally {
+    process.chdir(previousCwd)
     if (previousHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME
     else process.env.ORCA_NO_MISTAKES_HOME = previousHome
     await rm(home, { recursive: true, force: true })

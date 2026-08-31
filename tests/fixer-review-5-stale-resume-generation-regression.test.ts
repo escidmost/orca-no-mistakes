@@ -8,6 +8,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { DomainLedger, GitShell, main } from "../scripts/orca-no-mistakes.ts";
+import { legacyLedgerPath } from "../scripts/ledger.ts";
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
@@ -57,7 +58,7 @@ test("stale terminal cleanup cannot replace newer resume recovery custody", asyn
     const marker = markerPath(repo, gateId);
 
     process.env.ORCA_NO_MISTAKES_HOME = home;
-    const ledger = new DomainLedger();
+    const ledger = new DomainLedger(legacyLedgerPath());
     try {
       ledger.startRun({
         baseBranch: "main",

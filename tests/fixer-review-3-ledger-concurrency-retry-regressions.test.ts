@@ -124,6 +124,7 @@ async function completionFixture(startNewerAttempt: boolean) {
     ],
     submissionCommitOid: submission
   })
+  const publicationGeneration = ledger.acquireLease({ branch: 'feature', repoRoot: '/repo', runId })
   for (const entry of entries.toReversed()) {
     ledger.recordStageDisposition({
       disposition: 'satisfied',
@@ -151,7 +152,7 @@ async function completionFixture(startNewerAttempt: boolean) {
     actorIdentity: 'operator',
     attemptId: 'publication-attempt',
     coordinatorIdentity: 'coordinator',
-    generationToken: 1,
+    generationToken: publicationGeneration,
     runId,
     startedAt: '2026-08-30T12:00:00.000Z'
   })
@@ -239,11 +240,13 @@ async function completionFixture(startNewerAttempt: boolean) {
     stoppingFact: 'candidate-publication-verified',
     verdict: 'failed'
   })
+  ledger.releaseLease(runId)
+  const completionGeneration = ledger.acquireLease({ branch: 'feature', repoRoot: '/repo', runId })
   ledger.startAttempt({
     actorIdentity: 'operator',
     attemptId: 'completion-attempt',
     coordinatorIdentity: 'coordinator',
-    generationToken: 2,
+    generationToken: completionGeneration,
     runId,
     startedAt: '2026-08-30T12:00:05.000Z'
   })
@@ -316,11 +319,13 @@ async function completionFixture(startNewerAttempt: boolean) {
     verdict: 'passed'
   })
   if (startNewerAttempt) {
+    ledger.releaseLease(runId)
+    const newerGeneration = ledger.acquireLease({ branch: 'feature', repoRoot: '/repo', runId })
     ledger.startAttempt({
       actorIdentity: 'operator',
       attemptId: 'newer-attempt',
       coordinatorIdentity: 'coordinator',
-      generationToken: 3,
+      generationToken: newerGeneration,
       runId,
       startedAt: '2026-08-30T12:00:09.000Z'
     })

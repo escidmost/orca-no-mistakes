@@ -130,7 +130,7 @@ test("stranded cleanup retains a live worker allocation", async () => {
       workerAllocations: ["pending"],
     }),
   );
-  const ledger = new DomainLedger(path.join(home, "ledger.db"));
+  const ledger = new DomainLedger({ repositoryPath: seeded.repo });
   ledger.startRun({
     baseBranch: "main",
     branch: "feature",

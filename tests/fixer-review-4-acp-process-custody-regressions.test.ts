@@ -24,6 +24,7 @@ import {
   releaseWorker,
   startWorkerWithFallback,
 } from "../scripts/orca-no-mistakes.ts";
+import { legacyLedgerPath } from "../scripts/ledger.ts";
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
@@ -213,7 +214,7 @@ else if (args[0] === "worktree" && args[1] === "rm") {
   );
   await chmod(command, 0o755);
   const restore = setEnv(path.join(seeded.temp, "home"), command);
-  const ledger = new DomainLedger();
+  const ledger = new DomainLedger(legacyLedgerPath());
   try {
     ledger.startRun({
       baseBranch: "main",

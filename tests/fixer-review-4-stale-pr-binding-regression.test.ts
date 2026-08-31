@@ -78,11 +78,12 @@ test('retained completion rejects a stale pull request binding receipt', async (
       routeFingerprint,
       runId
     })
+    const staleGeneration = ledger.acquireLease({ branch: 'feature', repoRoot: '/repo', runId })
     ledger.startAttempt({
       actorIdentity: 'operator',
       attemptId: 'stale-attempt',
       coordinatorIdentity: 'coordinator',
-      generationToken: 1,
+      generationToken: staleGeneration,
       runId,
       startedAt: '2026-08-30T12:00:00.000Z'
     })
@@ -214,11 +215,13 @@ test('retained completion rejects a stale pull request binding receipt', async (
       stoppingFact: 'retry-required',
       verdict: 'failed'
     })
+    ledger.releaseLease(runId)
+    const passedGeneration = ledger.acquireLease({ branch: 'feature', repoRoot: '/repo', runId })
     ledger.startAttempt({
       actorIdentity: 'operator',
       attemptId: 'passed-attempt',
       coordinatorIdentity: 'coordinator',
-      generationToken: 2,
+      generationToken: passedGeneration,
       runId,
       startedAt: '2026-08-30T12:00:07.000Z'
     })

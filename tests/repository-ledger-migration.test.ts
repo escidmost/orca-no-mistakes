@@ -212,3 +212,131 @@ test('default and explicit repository commands open the selected repository ledg
     await rm(temp, { recursive: true, force: true })
   }
 })
+
+test('migration refuses active destination state when a legacy source appears later', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'onm-ledger-destination-active-'))
+  const repo = path.join(temp, 'repo')
+  const legacyPath = path.join(temp, 'legacy', 'ledger.db')
+  try {
+    execFileSync('git', ['-c', 'init.templateDir=', 'init', '-b', 'main', repo])
+    const repoRoot = git(repo, 'rev-parse', '--show-toplevel')
+    const destination = new DomainLedger({ legacyPath, repositoryPath: repo })
+    destination.startRun({
+      baseBranch: 'main',
+      branch: 'feature',
+      intent: 'Keep destination migration fenced.',
+      policySha256: policy,
+      repoRoot,
+      runId: 'destination-active',
+      submissionCommitOid: commit
+    })
+    destination.acquireLease({ branch: 'feature', repoRoot, runId: 'destination-active' })
+    destination.close()
+
+    const legacy = new DomainLedger(legacyPath)
+    legacy.startRun({
+      baseBranch: 'main',
+      branch: 'historical',
+      intent: 'Historical source appears later.',
+      policySha256: policy,
+      repoRoot,
+      runId: 'legacy-history',
+      submissionCommitOid: commit
+    })
+    legacy.finishRun('legacy-history', 'failed')
+    legacy.close()
+
+    assert.throws(
+      () => new DomainLedger({ legacyPath, repositoryPath: repo }),
+      /destination-active still holds a live semantic lease/
+    )
+  } finally {
+    await rm(temp, { force: true, recursive: true })
+  }
+})
+
+test('remote receipt upgrades add the composite observation key before rebuilding', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'onm-ledger-receipt-upgrade-'))
+  const dbPath = path.join(temp, 'ledger.db')
+  try {
+    const old = new DatabaseSync(dbPath)
+    old.exec(`
+      CREATE TABLE remote_observations (
+        observation_id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        attempt_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        observed_at TEXT NOT NULL,
+        observation_sha256 TEXT NOT NULL UNIQUE
+      );
+      CREATE TABLE remote_receipts (
+        receipt_id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        candidate_commit_oid TEXT NOT NULL,
+        authoritative_post_observation_sha256 TEXT NOT NULL,
+        receipt_json TEXT NOT NULL,
+        receipt_sha256 TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL,
+        UNIQUE (run_id, kind)
+      );
+    `)
+    old.close()
+
+    const ledger = new DomainLedger(dbPath)
+    ledger.startRun({
+      baseBranch: 'main',
+      branch: 'feature',
+      intent: 'Upgrade receipt foreign keys safely.',
+      policySha256: policy,
+      repoRoot: '/repo',
+      runId: 'receipt-upgrade',
+      submissionCommitOid: commit
+    })
+    const generationToken = ledger.acquireLease({
+      branch: 'feature',
+      repoRoot: '/repo',
+      runId: 'receipt-upgrade'
+    })
+    ledger.startAttempt({
+      actorIdentity: 'operator',
+      attemptId: 'attempt',
+      coordinatorIdentity: 'coordinator',
+      generationToken,
+      runId: 'receipt-upgrade',
+      startedAt: '2026-08-31T00:00:00.000Z'
+    })
+    const observation = ledger.recordRemoteObservation({
+      attemptId: 'attempt',
+      kind: 'post-read',
+      observedAt: '2026-08-31T00:00:01.000Z',
+      payload: { candidateCommitOid: commit },
+      runId: 'receipt-upgrade',
+      subject: 'receipt-upgrade'
+    })
+    ledger.close()
+
+    const upgraded = new DatabaseSync(dbPath)
+    upgraded.exec('PRAGMA foreign_keys = ON')
+    assert.doesNotThrow(() => upgraded.prepare(
+      `INSERT INTO remote_receipts (
+         receipt_id, run_id, kind, candidate_commit_oid,
+         authoritative_post_observation_sha256, receipt_json, receipt_sha256, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      'receipt',
+      'receipt-upgrade',
+      'candidate-publication',
+      commit,
+      observation,
+      '{}',
+      'd'.repeat(64),
+      '2026-08-31T00:00:02.000Z'
+    ))
+    upgraded.close()
+  } finally {
+    await rm(temp, { force: true, recursive: true })
+  }
+})

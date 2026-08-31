@@ -9,6 +9,7 @@ import {
   DomainLedger,
   buildAttestation,
   evidenceSha256,
+  legacyLedgerPath,
   manifestLeaves,
   merkleRoot,
   sha256,
@@ -22,12 +23,14 @@ const commit = 'a'.repeat(40)
 const policySha256 = 'b'.repeat(64)
 
 test('stored attestations require a passed run for verify and export', async () => {
+  const previousCwd = process.cwd()
   const previousHome = process.env.ORCA_NO_MISTAKES_HOME
   try {
     for (const status of ['in-progress', 'failed'] as const) {
       const home = await mkdtemp(path.join(tmpdir(), `onm-${status}-attestation-`))
       process.env.ORCA_NO_MISTAKES_HOME = home
       try {
+        process.chdir(home)
         const runId = `${status}-attestation`
         const manifest = buildAttestation(fullStageEvidence({ baseCommitOid: commit, candidateCommitOid: commit, runId }), {
           baseCommitOid: commit,
@@ -37,7 +40,7 @@ test('stored attestations require a passed run for verify and export', async () 
           policySha256,
           runId
         })
-        const ledger = new DomainLedger()
+        const ledger = new DomainLedger(legacyLedgerPath())
         ledger.startRun({
           baseBranch: 'main',
           branch: 'feature',
@@ -62,6 +65,7 @@ test('stored attestations require a passed run for verify and export', async () 
           new RegExp(`status is ${status}`)
         )
       } finally {
+        process.chdir(previousCwd)
         await rm(home, { recursive: true, force: true })
       }
     }

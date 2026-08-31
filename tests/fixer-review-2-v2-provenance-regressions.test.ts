@@ -53,6 +53,7 @@ async function completionFixture(options: { exerciseRemoteRejections?: boolean; 
     stagePlan: stages.map((stageId) => ({ requirement: 'required', stageId })),
     submissionCommitOid: submission
   })
+  const generationToken = ledger.acquireLease({ branch: 'feature', repoRoot: '/repo', runId })
   for (const entry of entries) {
     ledger.recordStageDisposition({
       disposition: 'satisfied',
@@ -89,7 +90,7 @@ async function completionFixture(options: { exerciseRemoteRejections?: boolean; 
     actorIdentity: 'operator',
     attemptId: `${runId}-attempt`,
     coordinatorIdentity: 'coordinator',
-    generationToken: 1,
+    generationToken,
     runId,
     startedAt: '2026-08-30T12:00:00.000Z'
   })

@@ -118,14 +118,20 @@ test('terminal runs reject new Release 2 facts after migration', async () => {
       ],
       submissionCommitOid: candidate
     })
+    const generationToken = legacy.acquireLease({
+      branch: 'feature',
+      repoRoot,
+      runId: 'terminal-run'
+    })
     legacy.startAttempt({
       actorIdentity: 'operator',
       attemptId: 'original-attempt',
       coordinatorIdentity: 'coordinator',
-      generationToken: 1,
+      generationToken,
       runId: 'terminal-run',
       startedAt: '2026-08-30T12:00:00.000Z'
     })
+    legacy.releaseLease('terminal-run')
     assert.equal(legacy.finishRun('terminal-run', 'failed'), true)
     legacy.close()
 
@@ -199,11 +205,12 @@ test('candidate publication outcome matches the authoritative baseline', () => {
       routeFingerprint,
       runId
     })
+    const generationToken = ledger.acquireLease({ branch: 'feature', repoRoot: '/repo', runId })
     ledger.startAttempt({
       actorIdentity: 'operator',
       attemptId: 'attempt',
       coordinatorIdentity: 'coordinator',
-      generationToken: 1,
+      generationToken,
       runId,
       startedAt: '2026-08-30T12:00:00.000Z'
     })

@@ -83,7 +83,7 @@ test("stale resume claims release their dead gate resources", async () => {
       );
 
       process.env.ORCA_NO_MISTAKES_HOME = home;
-      const ledger = new DomainLedger();
+      const ledger = new DomainLedger({ repositoryPath: repo });
       let currentGeneration: number;
       let currentHead: string;
       try {
@@ -212,7 +212,7 @@ else if (args[0] === "worktree" && args[1] === "list") {
 
       await main(["prune", "--stranded", "--repo", repo]);
 
-      const reopened = new DomainLedger();
+      const reopened = new DomainLedger({ repositoryPath: repo });
       try {
         assert.equal(reopened.runStatus(domainRunId), "in-progress");
         const lease = reopened.leaseFor(repo, "feature");

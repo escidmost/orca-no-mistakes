@@ -481,7 +481,7 @@ function pipelineEvidencePayload(manifest: PipelineCompletionAttestationManifest
   const pushIndex = manifest.stagePlan.findIndex((entry) => entry.stage === 'push')
   const prePrStages = new Set(manifest.stagePlan.slice(0, pushIndex + 1).map((entry) => entry.stage))
   return {
-    attemptOutcomeDigests: manifest.attemptOutcomeDigests,
+    attemptOutcomeDigests: manifest.attemptOutcomeDigests.slice(0, -1),
     baseCommitOid: manifest.baseCommitOid,
     candidateCommitOid: manifest.candidateCommitOid,
     candidatePublicationReceiptSha256: manifest.candidatePublicationReceiptSha256,
@@ -1455,6 +1455,10 @@ CREATE TABLE IF NOT EXISTS repository_migrations (
   PRIMARY KEY (source_path, repo_root)
 );
 
+CREATE TABLE IF NOT EXISTS repository_migration_imports (
+  repo_root TEXT PRIMARY KEY
+);
+
 CREATE TABLE IF NOT EXISTS stage_plan_entries (
   run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
   position INTEGER NOT NULL CHECK(position >= 0),
@@ -1629,6 +1633,8 @@ CREATE INDEX IF NOT EXISTS idx_stage_checkpoints_run ON stage_checkpoints(run_id
 CREATE INDEX IF NOT EXISTS idx_stage_plan_run ON stage_plan_entries(run_id, position);
 CREATE INDEX IF NOT EXISTS idx_attempt_outcomes_run ON attempt_outcomes(run_id, completed_at);
 CREATE INDEX IF NOT EXISTS idx_remote_observations_run ON remote_observations(run_id, observed_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_remote_observations_run_digest
+  ON remote_observations(run_id, observation_sha256);
 CREATE INDEX IF NOT EXISTS idx_mutation_intents_run ON mutation_intents(run_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_stage_evidence_run ON stage_evidence(run_id);
 CREATE INDEX IF NOT EXISTS idx_stage_evidence_stage
@@ -1856,6 +1862,8 @@ export class DomainLedger {
     if (singleRemoteReceipt?.sql.includes('UNIQUE (run_id, kind)')) {
       this.#db.exec('BEGIN IMMEDIATE')
       try {
+        this.#db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_remote_observations_run_digest
+          ON remote_observations(run_id, observation_sha256)`)
         this.#db.exec(`DROP TRIGGER IF EXISTS immutable_remote_receipts;
           DROP TRIGGER IF EXISTS immutable_remote_receipts_delete;
           DROP TRIGGER IF EXISTS enforce_remote_receipt_observation;
@@ -1877,47 +1885,55 @@ export class DomainLedger {
       }
     }
     this.#db.exec(SCHEMA)
+    this.#db.exec('DROP TRIGGER IF EXISTS fence_run_attempt_generation')
     this.#db.exec(`CREATE TRIGGER IF NOT EXISTS fence_run_attempt_generation
       BEFORE INSERT ON run_attempts
-      WHEN EXISTS (
-        SELECT 1 FROM runs r
-        JOIN branch_leases l ON l.repo_root = r.repo_root AND l.branch = r.branch
-        WHERE r.run_id = NEW.run_id
-      ) AND NOT EXISTS (
+      WHEN NOT EXISTS (
         SELECT 1 FROM runs r
         JOIN branch_leases l ON l.repo_root = r.repo_root AND l.branch = r.branch
         WHERE r.run_id = NEW.run_id AND l.run_id = NEW.run_id
           AND l.generation_token = NEW.generation_token
+      ) AND NOT EXISTS (
+        SELECT 1 FROM runs r
+        JOIN repository_migration_imports m ON m.repo_root = r.repo_root
+        WHERE r.run_id = NEW.run_id
       )
       BEGIN SELECT RAISE(ABORT, 'attempt is not from the current branch lease generation'); END;`)
     for (const table of ['attempt_outcomes', 'remote_observations', 'mutation_intents']) {
+      this.#db.exec(`DROP TRIGGER IF EXISTS fence_current_${table}`)
       this.#db.exec(`CREATE TRIGGER IF NOT EXISTS fence_current_${table}
         BEFORE INSERT ON ${table}
-        WHEN NOT EXISTS (
+        WHEN EXISTS (
+          SELECT 1 FROM run_attempts
+          WHERE attempt_id = NEW.attempt_id AND run_id = NEW.run_id
+        ) AND NOT EXISTS (
           SELECT 1 FROM run_attempts a
           JOIN runs r ON r.run_id = a.run_id
-          LEFT JOIN branch_leases l ON l.repo_root = r.repo_root AND l.branch = r.branch
+          JOIN branch_leases l ON l.repo_root = r.repo_root AND l.branch = r.branch
           WHERE a.attempt_id = NEW.attempt_id AND a.run_id = NEW.run_id
-            AND ((l.run_id = NEW.run_id AND l.generation_token = a.generation_token)
-              OR (l.run_id IS NULL AND a.generation_token = (
-                SELECT MAX(generation_token) FROM run_attempts WHERE run_id = NEW.run_id
-              )))
+            AND l.run_id = NEW.run_id AND l.generation_token = a.generation_token
+        ) AND NOT EXISTS (
+          SELECT 1 FROM runs r
+          JOIN repository_migration_imports m ON m.repo_root = r.repo_root
+          WHERE r.run_id = NEW.run_id
         )
         BEGIN SELECT RAISE(ABORT, 'attempt is not from the current branch lease generation'); END;`)
     }
+    this.#db.exec('DROP TRIGGER IF EXISTS fence_current_remote_receipts')
     this.#db.exec(`CREATE TRIGGER IF NOT EXISTS fence_current_remote_receipts
       BEFORE INSERT ON remote_receipts
       WHEN NOT EXISTS (
         SELECT 1 FROM remote_observations o
         JOIN run_attempts a ON a.attempt_id = o.attempt_id AND a.run_id = o.run_id
         JOIN runs r ON r.run_id = o.run_id
-        LEFT JOIN branch_leases l ON l.repo_root = r.repo_root AND l.branch = r.branch
+        JOIN branch_leases l ON l.repo_root = r.repo_root AND l.branch = r.branch
         WHERE o.run_id = NEW.run_id
           AND o.observation_sha256 = NEW.authoritative_post_observation_sha256
-          AND ((l.run_id = NEW.run_id AND l.generation_token = a.generation_token)
-            OR (l.run_id IS NULL AND a.generation_token = (
-              SELECT MAX(generation_token) FROM run_attempts WHERE run_id = NEW.run_id
-            )))
+          AND l.run_id = NEW.run_id AND l.generation_token = a.generation_token
+      ) AND NOT EXISTS (
+        SELECT 1 FROM runs r
+        JOIN repository_migration_imports m ON m.repo_root = r.repo_root
+        WHERE r.run_id = NEW.run_id
       )
       BEGIN SELECT RAISE(ABORT, 'receipt is not from the current branch lease generation'); END;`)
     for (const table of RELEASE_2_FACT_TABLES) {
@@ -2008,6 +2024,27 @@ export class DomainLedger {
         transaction = false
         return
       }
+      const destinationActive = this.#db.prepare(
+        `SELECT r.run_id, r.status,
+                EXISTS(SELECT 1 FROM main.branch_leases l WHERE l.run_id = r.run_id) AS has_lease
+           FROM main.runs r
+          WHERE r.repo_root = ?
+            AND (r.status = 'in-progress' OR EXISTS(
+              SELECT 1 FROM main.branch_leases l WHERE l.run_id = r.run_id
+            ))
+          ORDER BY r.created_at, r.rowid
+          LIMIT 1`
+      ).get(repoRoot) as
+        | { has_lease: number; run_id: string; status: RunStatus }
+        | undefined
+      if (destinationActive) {
+        const problem = destinationActive.has_lease
+          ? `run ${destinationActive.run_id} still holds a live semantic lease`
+          : `run ${destinationActive.run_id} is still in-progress`
+        throw new Error(
+          `cannot migrate repository state: ${problem}; finish, cancel, or recover it through the repository ledger before retrying migration`
+        )
+      }
       const active = this.#db.prepare(
         `SELECT r.run_id, r.status,
                 EXISTS(SELECT 1 FROM legacy.branch_leases l WHERE l.run_id = r.run_id) AS has_lease
@@ -2037,6 +2074,37 @@ export class DomainLedger {
       )
       const copy = (table: string, where: string): void => {
         if (!sourceTables.has(table)) return
+        if (table === 'lease_generations') {
+          this.#db.prepare(
+            `INSERT INTO main.lease_generations (repo_root, next_token)
+             SELECT repo_root, next_token FROM legacy.lease_generations WHERE repo_root = ?
+             ON CONFLICT(repo_root) DO UPDATE SET
+               next_token = MAX(main.lease_generations.next_token, excluded.next_token)`
+          ).run(repoRoot)
+          return
+        }
+        if (table === 'stage_checkpoints') {
+          this.#db.prepare(
+            `INSERT INTO main.stage_checkpoints (
+               run_id, stage_id, round_index, input_commit_oid, output_commit_oid, created_at
+             )
+             SELECT source.run_id, source.stage_id, source.round_index,
+                    source.input_commit_oid, source.output_commit_oid, source.created_at
+             FROM legacy.stage_checkpoints AS source
+             WHERE source.run_id IN (
+               SELECT run_id FROM legacy.runs WHERE repo_root = ?
+             ) AND NOT EXISTS (
+               SELECT 1 FROM main.stage_checkpoints AS destination
+               WHERE destination.run_id = source.run_id
+                 AND destination.stage_id = source.stage_id
+                 AND destination.round_index = source.round_index
+                 AND destination.input_commit_oid = source.input_commit_oid
+                 AND destination.output_commit_oid = source.output_commit_oid
+                 AND destination.created_at = source.created_at
+             )`
+          ).run(repoRoot)
+          return
+        }
         const destinationColumns = new Set(
           (this.#db.prepare(`PRAGMA main.table_info(${table})`).all() as { name: string }[])
             .map(({ name }) => name)
@@ -2054,15 +2122,28 @@ export class DomainLedger {
             ? "'in-progress'"
             : table === 'runs' && name === 'completed_at'
             ? 'NULL'
-            : name
+            : `source.${name}`
         ).join(', ')
+        const exactRow = columns.map(
+          (name) => `destination.${name} IS source.${name}`
+        ).join(' AND ')
         this.#db.prepare(
           `INSERT INTO main.${table} (${names})
-           SELECT ${selections} FROM legacy.${table} ${where}`
+           SELECT ${selections} FROM legacy.${table} AS source ${where}
+           AND NOT EXISTS (
+             SELECT 1 FROM main.${table} AS destination WHERE ${exactRow}
+           )`
         ).run(repoRoot)
       }
 
+      this.#db.prepare(
+        'INSERT INTO repository_migration_imports (repo_root) VALUES (?)'
+      ).run(repoRoot)
       copy('runs', 'WHERE repo_root = ?')
+      this.#db.prepare(
+        `UPDATE main.runs SET status = 'in-progress', completed_at = NULL
+         WHERE run_id IN (SELECT run_id FROM legacy.runs WHERE repo_root = ?)`
+      ).run(repoRoot)
       copy('stage_plan_entries', 'WHERE run_id IN (SELECT run_id FROM legacy.runs WHERE repo_root = ?)')
       copy('branch_leases', 'WHERE repo_root = ?')
       copy('lease_generations', 'WHERE repo_root = ?')
@@ -2085,7 +2166,7 @@ export class DomainLedger {
       }
       const addLegacyStage = this.#db.prepare(
         `INSERT OR IGNORE INTO stage_plan_entries (run_id, position, stage_id, requirement)
-         SELECT run_id, ?, ?, 'required' FROM runs WHERE repo_root = ?`
+         SELECT run_id, ?, ?, 'required' FROM legacy.runs WHERE repo_root = ?`
       )
       for (const [position, stage] of LEGACY_STAGE_PLAN.entries()) {
         addLegacyStage.run(position, stage, repoRoot)
@@ -2114,6 +2195,9 @@ export class DomainLedger {
            source_present = excluded.source_present,
            completed_at = excluded.completed_at`
       ).run(sourcePath, repoRoot, new Date().toISOString())
+      this.#db.prepare(
+        'DELETE FROM repository_migration_imports WHERE repo_root = ?'
+      ).run(repoRoot)
       this.#db.exec('COMMIT')
       transaction = false
     } catch (error) {
@@ -3793,6 +3877,9 @@ export class DomainLedger {
       }
     })
     if (!passedOutcome) problems.push('passed attempt outcome')
+    if (passedOutcome?.outcome_sha256 !== manifest.attemptOutcomeDigests.at(-1)) {
+      problems.push('terminal attempt outcome ordering')
+    }
 
     const publication = this.remoteReceipt(
       manifest.runId,

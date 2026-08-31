@@ -77,11 +77,12 @@ test('Release 2 ledger facts are immutable, append-only, and atomically checkpoi
       runId
     })
 
+    const generationToken = ledger.acquireLease({ branch: 'feature', repoRoot: '/repo', runId })
     ledger.startAttempt({
       actorIdentity: 'operator',
       attemptId: 'attempt-1',
       coordinatorIdentity: 'orca-run-1',
-      generationToken: 1,
+      generationToken,
       runId,
       startedAt: timestamp
     })

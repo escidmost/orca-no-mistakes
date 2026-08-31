@@ -80,7 +80,10 @@ test('v2 attestations select one digest from repeated stage rounds', () => {
   verifyCompletionAttestation(manifest)
   const wrongStage = structuredClone(manifest)
   wrongStage.stageDispositions[0].evidenceSha256 = entries[2].evidenceSha256
-  assert.throws(() => verifyCompletionAttestation(wrongStage), /does not bind its evidence/)
+  assert.throws(
+    () => verifyCompletionAttestation(wrongStage),
+    /does not bind successful authoritative evidence/
+  )
 
   const incompleteRoute = structuredClone(manifest)
   incompleteRoute.publicationRoute = {

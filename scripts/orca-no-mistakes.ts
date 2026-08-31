@@ -79,6 +79,8 @@ import {
   isAuthoritativeStageEvidence,
   normalizeIntent,
   noMistakesHome,
+  legacyLedgerPath,
+  repositoryLedgerPath,
   sha256,
   verifyCompletionAttestation,
   verifyManifest,
@@ -10898,6 +10900,11 @@ async function reapMarkerWorkers(
 // `prune --stranded` reaps gate workspaces whose coordinator is dead. Every
 // doubt resolves towards retention: a reaped live run loses its workspace.
 function openRepositoryLedger(repositoryPath: string): DomainLedger {
+  try {
+    repositoryLedgerPath(repositoryPath);
+  } catch {
+    return new DomainLedger(legacyLedgerPath());
+  }
   return new DomainLedger({ repositoryPath });
 }
 

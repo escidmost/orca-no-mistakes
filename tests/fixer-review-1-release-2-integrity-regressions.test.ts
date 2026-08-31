@@ -58,6 +58,7 @@ function completionFacts(
     stagePlan: evidence.map((entry) => ({ requirement: 'required', stageId: entry.stage })),
     submissionCommitOid: commit
   })
+  const generationToken = ledger.acquireLease({ branch: 'feature', repoRoot: '/repo', runId })
   for (const entry of evidence) {
     ledger.recordStageDisposition({
       disposition: 'satisfied',
@@ -87,7 +88,7 @@ function completionFacts(
     actorIdentity: 'operator',
     attemptId,
     coordinatorIdentity: 'coordinator',
-    generationToken: 1,
+    generationToken,
     runId,
     startedAt: '2026-08-30T12:00:00.000Z'
   })
@@ -255,6 +256,7 @@ function completionFacts(
     verdict
   })
   assert.equal(ledger.finishRun(runId, 'passed', commit), true)
+  ledger.releaseLease(runId)
   return {
     manifest: buildPipelineCompletionAttestation(evidence, {
       attemptOutcomeDigests: [outcome],

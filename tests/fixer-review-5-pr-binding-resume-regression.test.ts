@@ -72,6 +72,7 @@ test('resumed attempt refreshes pull request binding after receipt schema upgrad
       routeFingerprint,
       runId
     })
+    const firstGeneration = ledger.acquireLease({ branch: 'feature', repoRoot: '/repo', runId })
     const evidenceFor = (stage: 'pr' | 'push', round?: number) => {
       const entry = entries.find((candidateEntry) =>
         candidateEntry.stage === stage && (round === undefined || candidateEntry.round === round)
@@ -94,7 +95,7 @@ test('resumed attempt refreshes pull request binding after receipt schema upgrad
       actorIdentity: 'operator',
       attemptId: 'first-attempt',
       coordinatorIdentity: 'coordinator',
-      generationToken: 1,
+      generationToken: firstGeneration,
       runId,
       startedAt: '2026-08-30T12:00:00.000Z'
     })
@@ -210,6 +211,7 @@ test('resumed attempt refreshes pull request binding after receipt schema upgrad
       stoppingFact: 'retry-required',
       verdict: 'failed'
     })
+    ledger.releaseLease(runId)
     ledger.close()
 
     const oldSchema = new DatabaseSync(dbPath)
@@ -240,11 +242,12 @@ test('resumed attempt refreshes pull request binding after receipt schema upgrad
 
     ledger = new DomainLedger(dbPath)
     assert.doesNotMatch(ledger.tableDefinition('remote_receipts')!, /UNIQUE \(run_id, kind\)/)
+    const passedGeneration = ledger.acquireLease({ branch: 'feature', repoRoot: '/repo', runId })
     ledger.startAttempt({
       actorIdentity: 'operator',
       attemptId: 'passed-attempt',
       coordinatorIdentity: 'coordinator',
-      generationToken: 2,
+      generationToken: passedGeneration,
       runId,
       startedAt: '2026-08-30T12:00:07.000Z'
     })

@@ -9,6 +9,7 @@ import {
   DomainLedger,
   buildAttestation,
   evidenceSha256,
+  legacyLedgerPath,
   sha256,
   type StageEvidenceManifestEntry,
 } from "../scripts/ledger.ts";
@@ -91,9 +92,11 @@ test("evidence verification rejects unattested ledger rows", async () => {
 
 test("manifest-file verification rejects a forged manifest for a recorded run", async () => {
   const home = await mkdtemp(path.join(tmpdir(), "orca-complete-manifest-"));
+  const previousCwd = process.cwd();
   const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
   process.env.ORCA_NO_MISTAKES_HOME = home;
   try {
+    process.chdir(home);
     const runId = "complete-manifest-run";
     const manifest = buildAttestation(fullStageEvidence({ baseCommitOid: commit, candidateCommitOid: commit, runId }), {
       baseCommitOid: commit,
@@ -103,7 +106,7 @@ test("manifest-file verification rejects a forged manifest for a recorded run", 
       policySha256: policy,
       runId,
     });
-    const ledger = new DomainLedger();
+    const ledger = new DomainLedger(legacyLedgerPath());
     startRun(ledger, runId);
     ledger.recordAttestation(manifest);
     ledger.close();
@@ -137,6 +140,7 @@ test("manifest-file verification rejects a forged manifest for a recorded run", 
       /commit OIDs/,
     );
   } finally {
+    process.chdir(previousCwd);
     if (previousHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME;
     else process.env.ORCA_NO_MISTAKES_HOME = previousHome;
     await rm(home, { recursive: true, force: true });

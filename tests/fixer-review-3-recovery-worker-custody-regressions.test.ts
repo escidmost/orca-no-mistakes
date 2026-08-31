@@ -117,7 +117,7 @@ test("absent configured gate requires recovery custody", async () => {
         runId,
       }),
     );
-    const ledger = new DomainLedger(path.join(home, "ledger.db"));
+    const ledger = new DomainLedger({ repositoryPath: seeded.repo });
     ledger.startRun({
       baseBranch: "main",
       branch: "feature",
@@ -135,7 +135,7 @@ test("absent configured gate requires recovery custody", async () => {
 
     await main(["prune", "--stranded", "--repo", seeded.repo]);
 
-    const retained = new DomainLedger(path.join(home, "ledger.db"));
+    const retained = new DomainLedger({ repositoryPath: seeded.repo });
     try {
       assert.equal(existsSync(marker), true);
       assert.equal(retained.runIdentity(runId)?.status, "in-progress");
@@ -187,7 +187,7 @@ test("configured resume cleanup separates orchestration and domain run IDs", asy
       `refs/no-mistakes/recover/${domainRunId}`,
       head,
     );
-    const ledger = new DomainLedger(path.join(home, "ledger.db"));
+    const ledger = new DomainLedger({ repositoryPath: seeded.repo });
     ledger.startRun({
       baseBranch: "main",
       branch: "feature",
@@ -205,7 +205,7 @@ test("configured resume cleanup separates orchestration and domain run IDs", asy
 
     await main(["prune", "--stranded", "--repo", seeded.repo]);
 
-    const reaped = new DomainLedger(path.join(home, "ledger.db"));
+    const reaped = new DomainLedger({ repositoryPath: seeded.repo });
     try {
       assert.equal(existsSync(marker), false);
       assert.equal(reaped.runIdentity(domainRunId)?.status, "cancelled");
