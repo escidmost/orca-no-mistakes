@@ -1,0 +1,52 @@
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import test from "node:test";
+
+import { GitShell } from "../scripts/orca-no-mistakes.ts";
+
+function git(cwd: string, ...args: string[]): string {
+  return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+}
+
+test("fixer guardrails do not treat documentation examples as co-located tests", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-document-guardrail-"));
+  const repo = path.join(temp, "repo");
+  const worker = path.join(temp, "worker");
+  try {
+    await mkdir(repo);
+    git(repo, "init", "-b", "feature");
+    git(repo, "config", "user.email", "test@example.com");
+    git(repo, "config", "user.name", "Test User");
+    git(repo, "config", "core.hooksPath", "/dev/null");
+    await mkdir(path.join(repo, "docs"));
+    await writeFile(
+      path.join(repo, "docs/current-architecture.md"),
+      "# Architecture\n\nChai supports `value.should.not.equal(...)` assertions.\n",
+    );
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "document test syntax");
+    const expectedHead = git(repo, "rev-parse", "HEAD");
+
+    git(repo, "worktree", "add", "--detach", worker, expectedHead);
+    await writeFile(
+      path.join(worker, "docs/current-architecture.md"),
+      "# Current Architecture\n\nChai supports `value.should.not.equal(...)` assertions.\n",
+    );
+    git(worker, "add", "docs/current-architecture.md");
+    git(worker, "commit", "-m", "clarify architecture heading");
+
+    assert.deepEqual(
+      await new GitShell({ repo }).assertFixerChangesAllowed(
+        worker,
+        expectedHead,
+        git(worker, "rev-parse", "HEAD"),
+      ),
+      { changed: true, guardrailViolations: [] },
+    );
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});

@@ -53,11 +53,13 @@ Workers launch with the `opencode` agent on the agent's own default model by def
 ## Attestations and retention
 
 ```bash
-orca-no-mistakes attestation export <run-id-or-commit-sha> [--out manifest.json]
-orca-no-mistakes attestation verify <manifest-file|run-id|commit-sha>
+orca-no-mistakes attestation export <run-id-or-commit-sha> [--out manifest.json] [--repo <path>]
+orca-no-mistakes attestation verify <manifest-file|run-id|commit-sha> [--repo <path>]
 orca-no-mistakes prune [--before <date>] [--repo <path>]
 orca-no-mistakes prune --stranded [--repo <path>]
 ```
+
+Both attestation commands accept `--repo <path>` to name the repository ledger; passing `--repo` fails closed rather than falling back to the legacy archive.
 
 `verify` recomputes every stage-evidence hash, rebuilds the Merkle root over the manifest header and every stage digest, and cross-checks the intent hash — rewriting a stage hash, a commit SHA, the policy hash, or the run ID fails loudly and exits non-zero. An exported manifest is self-verifying, so it can be carried to a machine that never ran the pipeline and checked there — it is tamper-evident, not signed, so that check proves internal integrity rather than authorship; where the local ledger does hold the run, `verify` additionally requires the stored record to match and re-reads each retained stage log to recompute its artifact digest. Evidence is retained indefinitely — nothing is evicted by age or count — until you explicitly `prune` it. `prune` deletes completed runs matching the filters (`--repo` names a checkout, matching that root and anything nested under it) together with their artifact directories. It never touches Git history: preserved commits under `refs/no-mistakes/recover/` outlive the runs that produced them. It keeps any run that still holds a branch lease, any run whose repository root is unavailable unless `--repo` names that exact root, and any run with a recovery ref — including a fixer round's `-fixer-<stage>-<round>` child — whose commits are not yet contained in its branch or base — those are the runs whose ledger row is the operator's only record of preserved work. `prune --stranded` cannot be combined with `--before`; it instead scans the repository's gate markers (`.orca/no-mistakes/gate-*.json`) and reaps gate workspaces whose coordinator terminal or process is dead — anchoring the run's last committed HEAD to its recovery ref, releasing the branch lease, and removing the worktree, gate branch, terminal, and marker. Anything it cannot prove safe to reap (live pid, live terminal, unreadable marker, or an in-progress run whose gate ownership is absent or unverifiable) is retained, so it cannot tear down a live run. For terminal runs, including passed, failed, and cancelled runs, prune preserves the ledger outcome while finishing any stranded resource cleanup that a prior attempt left incomplete; it removes without `--force`, so Orca refuses a workspace that became live mid-reap instead of tearing it down.
 

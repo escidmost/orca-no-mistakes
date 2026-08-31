@@ -7973,7 +7973,10 @@ export class GitShell implements GitOperations {
           throw new Error(`could not read pre-round source file ${filePath}`);
         }
         const source = await this.showFile(sourceHead, filePath);
-        if (weakensInlineTestValidation(expectedSource, source)) {
+        if (
+          !/\.(?:adoc|md|mdx|rst)$/iu.test(filePath) &&
+          weakensInlineTestValidation(expectedSource, source)
+        ) {
           protectedInlineTests.push(filePath);
         }
       }

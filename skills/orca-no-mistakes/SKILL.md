@@ -73,8 +73,8 @@ On direct success the CLI prints JSON containing the attestation manifest:
 Export and verify attestations, and prune retained evidence:
 
 ```bash
-orca-no-mistakes attestation export <run-id-or-commit-sha> [--out manifest.json]
-orca-no-mistakes attestation verify <manifest-file|run-id|commit-sha>
+orca-no-mistakes attestation export <run-id-or-commit-sha> [--out manifest.json] [--repo <path>]
+orca-no-mistakes attestation verify <manifest-file|run-id|commit-sha> [--repo <path>]
 orca-no-mistakes prune [--before <date>] [--repo <path>]
 orca-no-mistakes prune --stranded [--repo <path>]
 ```
