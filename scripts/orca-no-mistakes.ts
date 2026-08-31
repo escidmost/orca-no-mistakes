@@ -3,7 +3,22 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, readdirSync } from "node:fs";
+import {
+  appendFileSync,
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import {
   chmod,
   lstat,
@@ -112,6 +127,7 @@ export {
 export * from "./presentation.ts";
 export type FindingAction = "ask-user" | "auto-fix" | "no-op";
 
+const { O_APPEND, O_NOFOLLOW, O_WRONLY } = constants;
 const FINDING_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
 
 export type Finding = {
@@ -544,6 +560,7 @@ type GateWorktree =
 
 type GateRunMarker = {
   allocationProtocol?: "gated-v1";
+  cancellationAction?: "force-stop";
   cleanupPending?: boolean;
   createdAt: string;
   domainRunId?: string;
@@ -618,6 +635,7 @@ function isOrcaLauncherMarker(
 }
 
 type AbortReapState = {
+  artifactsDir?: string;
   cleanupPending?: boolean;
   deliveryGit?: GitOperations;
   gate?: GateWorktree;
@@ -1092,6 +1110,7 @@ async function writeLauncherGateMarker(
 // Called by runPipeline once the run row and lease exist: from here an abort
 // has a recovery ref to anchor and a lease to release.
 export async function registerAbortRunContext(state: {
+  artifactsDir?: string;
   deliveryGit: GitOperations;
   git: GitOperations;
   generationToken?: number;
@@ -1107,6 +1126,100 @@ export async function registerAbortRunContext(state: {
   if (state.resumeClaimId) {
     state.ledger.clearResumeClaim(state.runId, state.resumeClaimId);
   }
+}
+
+function writeForceStopMarker(): void {
+  const { gate, originWorktree } = abortReap;
+  if (!gate || !originWorktree) return;
+  const markerPath = gateMarkerPath(originWorktree, gateMarkerId(gate));
+  const marker = JSON.parse(readFileSync(markerPath, "utf8")) as GateRunMarker;
+  marker.cancellationAction = "force-stop";
+  marker.cleanupPending = true;
+  const directory = path.dirname(markerPath);
+  const temporaryPath = `${markerPath}.${randomUUID()}.tmp`;
+  mkdirSync(directory, { recursive: true });
+  try {
+    writeFileSync(temporaryPath, `${JSON.stringify(marker, null, 2)}\n`, {
+      flag: "wx",
+      flush: true,
+      mode: 0o600,
+    });
+    renameSync(temporaryPath, markerPath);
+    const directoryHandle = openSync(directory, "r");
+    try {
+      fsyncSync(directoryHandle);
+    } finally {
+      closeSync(directoryHandle);
+    }
+  } finally {
+    rmSync(temporaryPath, { force: true });
+  }
+}
+
+function markStageLogIncomplete(filePath: string): void {
+  const resolved = path.resolve(filePath);
+  const directory = path.dirname(resolved);
+  if (!lstatSync(directory).isDirectory())
+    throw new Error(`stage log directory is not private: ${directory}`);
+  const before = lstatSync(resolved);
+  if (!before.isFile() || before.nlink !== 1)
+    throw new Error(`stage log is not a private regular file: ${resolved}`);
+  const file = openSync(resolved, O_APPEND | O_WRONLY | O_NOFOLLOW);
+  try {
+    const opened = fstatSync(file);
+    if (
+      !opened.isFile() ||
+      opened.nlink !== 1 ||
+      opened.dev !== before.dev ||
+      opened.ino !== before.ino
+    ) {
+      throw new Error(`stage log changed before force-stop marking: ${resolved}`);
+    }
+    appendFileSync(file, "\n[no-mistakes: log incomplete due to force stop]\n", {
+      flush: true,
+    });
+  } finally {
+    closeSync(file);
+  }
+}
+
+function forceStopAbortedRun(signal: "SIGHUP" | "SIGINT" | "SIGTERM"): void {
+  abortRequested = true;
+  runAbortPresentationCleanup();
+  const { artifactsDir, ledger, runId } = abortReap;
+  try {
+    if (ledger && runId) {
+      const presentation = new PresentationPublisher(ledger, runId);
+      const stage = presentation.current.currentStage;
+      if (artifactsDir && stage) {
+        const round =
+          presentation.current.stages.find((item) => item.id === stage)?.round ?? 0;
+        try {
+          markStageLogIncomplete(
+            path.join(artifactsDir, `${stage}_r${round}.log`),
+          );
+        } catch (error) {
+          abortLog(`warning: force stop could not mark the active log: ${String(error)}`);
+        }
+      }
+      const status = ledger.runStatus(runId);
+      if (status === "in-progress" || status === "cancelled") {
+        presentation.publish(
+          `attempt:${presentation.current.attempt}:cancellation:force-stop`,
+          { action: "force-stop", kind: "cancellation-recorded" },
+        );
+      }
+    }
+  } catch (error) {
+    abortLog(`warning: force stop could not record run evidence: ${String(error)}`);
+  }
+  abortReap.cleanupPending = true;
+  try {
+    writeForceStopMarker();
+  } catch (error) {
+    abortLog(`warning: force stop could not record marker evidence: ${String(error)}`);
+  }
+  abortLog(`no-mistakes: received ${signal} again; force stopping`);
 }
 
 export async function reapAbortedRun(reason: string): Promise<void> {
@@ -1311,12 +1424,14 @@ export async function reapAbortedRun(reason: string): Promise<void> {
 }
 
 function onAbortSignal(signal: "SIGHUP" | "SIGINT" | "SIGTERM"): void {
-  // A second signal means the reap is wedged; die immediately.
-  if (abortReapStarted) process.exit(1);
-  abortReapStarted = true;
-  runAbortPresentationCleanup();
   const exitCode =
     signal === "SIGINT" ? 130 : signal === "SIGTERM" ? 143 : 129;
+  if (abortReapStarted) {
+    forceStopAbortedRun(signal);
+    process.exit(exitCode);
+  }
+  abortReapStarted = true;
+  runAbortPresentationCleanup();
   void reapAbortedRun(`received ${signal}`).finally(() =>
     process.exit(exitCode),
   );
@@ -1343,6 +1458,7 @@ export async function installAbortReaping(
   abortReap.workerAllocationPids.clear();
   abortReap.workers.clear();
   abortAllocations.clear();
+  abortReapStarted = false;
   abortRequested = false;
   gateMutationTail = Promise.resolve();
   Object.assign(abortReap, state);
@@ -1669,6 +1785,7 @@ export async function runPipeline(
         });
       }
       await registerAbortRunContext({
+        artifactsDir,
         deliveryGit,
         generationToken: generationToken!,
         git,

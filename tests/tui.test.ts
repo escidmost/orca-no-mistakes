@@ -101,6 +101,14 @@ async function runFixture(): Promise<void> {
       process.stdout.write(`\nGATE ANSWER ${gateId} ${resolution}\n`);
       renderer.render(gateSnapshot("resolved", 3, resolution));
     },
+    () => {
+      const after = `${process.stdin.isRaw === true}:${process.stdin.isPaused()}`;
+      void log.close().then(() => {
+        process.stdout.write(`\nCANCEL REQUESTED restored=${before === after}\n`, () =>
+          process.exit(0),
+        );
+      });
+    },
   );
   renderer.render(snapshot("review", 1));
   process.stdin.on("data", (chunk) => {
@@ -223,6 +231,62 @@ if (process.env.TUI_FIXTURE === "1") {
     renderer.close();
   });
 
+  test("C confirms Cancel without hiding the run and Ctrl-C cancels immediately", async () => {
+    const input = new FakeInput();
+    const output = new FakeOutput();
+    let cancellations = 0;
+    const renderer = new RailTuiRenderer(
+      input,
+      output,
+      "/unused",
+      new Map(),
+      undefined,
+      () => {
+        cancellations += 1;
+      },
+    );
+    const screen = (): string => cleanScreen(output.writes.at(-1) ?? "");
+
+    renderer.render(gateSnapshot("open", 0));
+    input.emit("data", "c");
+    assert.equal(cancellations, 0);
+    assert.match(screen(), /CANCEL RUN\?/u);
+    assert.match(screen(), /run-tui-test.*in-progress/u);
+    assert.match(screen(), /3\. Review/u);
+    input.emit("data", "\u001b");
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    assert.doesNotMatch(screen(), /CANCEL RUN\?/u);
+    assert.match(screen(), /DECISION REQUIRED/u);
+
+    renderer.render(snapshot("review", 1));
+    input.emit("data", "C\r");
+    assert.equal(cancellations, 1);
+    assert.equal(input.isRaw, false);
+    assert.equal(input.isPaused(), true);
+    assert.equal(
+      output.writes.filter((write) => write === "\u001b[?25h\u001b[?1049l").length,
+      1,
+    );
+
+    const signalInput = new FakeInput();
+    const signalOutput = new FakeOutput();
+    const signalRenderer = new RailTuiRenderer(
+      signalInput,
+      signalOutput,
+      "/unused",
+      new Map(),
+      undefined,
+      () => {
+        cancellations += 1;
+      },
+    );
+    signalRenderer.render(snapshot("review", 1));
+    signalInput.emit("data", "\u0003");
+    assert.equal(cancellations, 2);
+    assert.equal(signalInput.isRaw, false);
+    assert.equal(signalInput.isPaused(), true);
+  });
+
   test("inline decision gate preserves the pin and requires explicit confirmation", async () => {
     const input = new FakeInput();
     const output = new FakeOutput();
@@ -309,7 +373,7 @@ if (process.env.TUI_FIXTURE === "1") {
   });
 
   test(
-    "PTY decision gate confirms, restores the pin, and restores the terminal",
+    "PTY gates and Cancel preserve state and restore the terminal",
     { timeout: 10_000 },
     async () => {
       const artifactsDir = mkdtempSync(path.join(tmpdir(), "orca-tui-"));
@@ -442,9 +506,23 @@ if (process.env.TUI_FIXTURE === "1") {
           () =>
             screen().includes("RAIL") && !screen().includes("RECENT ACTIVITY"),
         );
-        terminal.write("q");
+        terminal.write("c");
+        await waitFor(
+          () =>
+            screen().includes("CANCEL RUN?") &&
+            screen().includes("run-tui-test") &&
+            screen().includes("in-progress") &&
+            screen().includes("3. Review"),
+        );
+        terminal.write("\u001b");
+        await waitFor(
+          () =>
+            !screen().includes("CANCEL RUN?") &&
+            screen().includes("Review LOG (PINNED)"),
+        );
+        terminal.write("C\r");
         assert.equal(await exited, 0);
-        assert.match(output, /TUI CLOSED restored=true/u);
+        assert.match(output, /CANCEL REQUESTED restored=true/u);
         assert.ok(output.includes("\u001b[?25h\u001b[?1049l"));
       } finally {
         if (!hasExited) terminal.kill("SIGKILL");
@@ -453,5 +531,8 @@ if (process.env.TUI_FIXTURE === "1") {
     },
   );
 
-  test.after(() => console.log("TUI INTEGRATION PASSED"));
+  test.after(() => {
+    console.log("TUI CANCELLATION CONTROLS PASSED");
+    console.log("ONM-87 PTY AND SIGNAL TESTS PASSED");
+  });
 }
