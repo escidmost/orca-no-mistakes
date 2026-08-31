@@ -71,6 +71,7 @@ import {
   DomainLedger,
   LegacyActiveMigrationError,
   RUN_ID_PATTERN,
+  allowsLegacyLedgerFallback,
   isWithin,
   StageLog,
   artifactsRoot,
@@ -10916,7 +10917,7 @@ function openRepositoryLedger(
   try {
     repositoryLedgerPath(repositoryPath);
   } catch (error) {
-    if (!allowLegacyFallback) throw error;
+    if (!allowLegacyFallback || !allowsLegacyLedgerFallback(error)) throw error;
     return new DomainLedger(legacyLedgerPath());
   }
   return new DomainLedger({ repositoryPath });

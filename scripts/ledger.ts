@@ -1376,17 +1376,24 @@ function repositoryLocation(repositoryPath: string): { ledgerPath: string; repoR
   const repoRoot = execFileSync(
     'git',
     ['-C', repositoryPath, 'rev-parse', '--path-format=absolute', '--show-toplevel'],
-    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }
   ).trim()
   const commonDir = execFileSync(
     'git',
     ['-C', repositoryPath, 'rev-parse', '--path-format=absolute', '--git-common-dir'],
-    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }
   ).trim()
   return {
     ledgerPath: path.join(commonDir, 'orca-no-mistakes', 'ledger.sqlite'),
     repoRoot
   }
+}
+
+export function allowsLegacyLedgerFallback(error: unknown): boolean {
+  if (!(error instanceof Error) || !('status' in error) || error.status !== 128) return false
+  const stderr = 'stderr' in error ? String(error.stderr ?? '') : ''
+  return /not a git repository/i.test(stderr) ||
+    (/cannot change to/i.test(stderr) && /No such file or directory/i.test(stderr))
 }
 
 export function repositoryLedgerPath(repositoryPath = process.cwd()): string {
@@ -1401,7 +1408,8 @@ function defaultLedgerLocation(): { dbPath: string; legacyPath?: string; repoRoo
       legacyPath: legacyLedgerPath(),
       repoRoot: repository.repoRoot
     }
-  } catch {
+  } catch (error) {
+    if (!allowsLegacyLedgerFallback(error)) throw error
     return { dbPath: legacyLedgerPath() }
   }
 }
@@ -2021,15 +2029,38 @@ export class DomainLedger {
   #migrateLegacyRepository(repoRoot: string, sourcePath: string): void {
     const sourcePresent = existsSync(sourcePath)
     if (sourcePresent) this.#db.prepare('ATTACH DATABASE ? AS legacy').run(sourcePath)
-    const deleteMigratedSourceRuns = sourcePresent
-      ? this.#db.prepare(
-          `DELETE FROM legacy.runs
-           WHERE repo_root = ?
-             AND run_id IN (
-               SELECT run_id FROM main.runs WHERE repo_root = ?
-             )`
-        )
-      : undefined
+    const migratedSourceRunIds = (): string[] =>
+      sourcePresent
+        ? (this.#db.prepare(
+            `SELECT source.run_id
+             FROM legacy.runs AS source
+             WHERE source.repo_root = ?
+               AND EXISTS (
+                 SELECT 1 FROM main.runs AS destination
+                 WHERE destination.repo_root = ?
+                   AND destination.run_id = source.run_id
+               )`
+          ).all(repoRoot, repoRoot) as { run_id: string }[]).map(({ run_id }) => run_id)
+        : []
+    const cleanupMigratedSourceRuns = (runIds: string[]): void => {
+      if (runIds.length === 0) return
+      const source = new DatabaseSync(sourcePath, { timeout: 5_000 })
+      let cleanupTransaction = false
+      try {
+        source.exec('PRAGMA foreign_keys = ON')
+        source.exec('BEGIN IMMEDIATE')
+        cleanupTransaction = true
+        const deleteRun = source.prepare('DELETE FROM runs WHERE repo_root = ? AND run_id = ?')
+        for (const runId of runIds) deleteRun.run(repoRoot, runId)
+        source.exec('COMMIT')
+        cleanupTransaction = false
+      } catch (error) {
+        if (cleanupTransaction) source.exec('ROLLBACK')
+        throw error
+      } finally {
+        source.close()
+      }
+    }
     const migrationMarker = this.#db.prepare(
       'SELECT source_present FROM repository_migrations WHERE source_path = ? AND repo_root = ?'
     )
@@ -2046,6 +2077,8 @@ export class DomainLedger {
             'SELECT 1 FROM legacy.runs WHERE repo_root = ? LIMIT 1'
           ).get(repoRoot)
         ) return
+        cleanupMigratedSourceRuns(migratedSourceRunIds())
+        return
       }
       this.#db.exec('BEGIN IMMEDIATE')
       transaction = true
@@ -2053,10 +2086,10 @@ export class DomainLedger {
         | { source_present: number }
         | undefined
       if (lockedMarker && (lockedMarker.source_present === 1 || !sourcePresent)) {
-        if (lockedMarker.source_present === 1)
-          deleteMigratedSourceRuns?.run(repoRoot, repoRoot)
+        const runIds = lockedMarker.source_present === 1 ? migratedSourceRunIds() : []
         this.#db.exec('COMMIT')
         transaction = false
+        cleanupMigratedSourceRuns(runIds)
         return
       }
       if (!sourcePresent) {
@@ -2240,7 +2273,7 @@ export class DomainLedger {
              WHERE source.run_id = destination.run_id
            )`
       ).run(repoRoot)
-      deleteMigratedSourceRuns?.run(repoRoot, repoRoot)
+      const runIds = migratedSourceRunIds()
       this.#db.prepare(
         `INSERT INTO repository_migrations
            (source_path, repo_root, source_present, completed_at)
@@ -2254,6 +2287,7 @@ export class DomainLedger {
       ).run(repoRoot)
       this.#db.exec('COMMIT')
       transaction = false
+      cleanupMigratedSourceRuns(runIds)
     } catch (error) {
       if (transaction) this.#db.exec('ROLLBACK')
       throw error
