@@ -396,6 +396,11 @@ class FakeOrca implements OrcaOperations {
     return this.gateResolution;
   }
 
+  async resolveGate(gateId: string, resolution: string): Promise<void> {
+    this.calls.push(`resolve-gate:${gateId}:${resolution}`);
+    this.gateResolution = resolution;
+  }
+
   async setWorktreeStatus(comment: string, status?: string): Promise<void> {
     this.calls.push(`status:${status ?? ""}:${comment}`);
   }
@@ -1946,6 +1951,63 @@ test("unexplained policy relaxations pause the pipeline at a decision gate", asy
   assert.ok(result.attestation);
 });
 
+test("inline resolver settles the canonical gate audit and resumes once", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-inline-gate-"));
+  const ledger = new DomainLedger(path.join(temp, "ledger.db"));
+  try {
+    const git = new FakeGit();
+    const orca = new FakeOrca(git, "inline-gate-audit");
+    orca.reports.set("review", [
+      {
+        findings: [
+          {
+            action: "ask-user",
+            description: "A human judgment is required.",
+            id: "judgment-required",
+            severity: "error",
+          },
+        ],
+        summary: "review needs a decision",
+      },
+    ]);
+    const offered: string[][] = [];
+
+    const result = await runPipeline(
+      {
+        intent: "Resolve the existing gate from the TUI.",
+        rendererFactory: (_artifactsDir, _stageLogs, resolveGate) => ({
+          render(presentation) {
+            if (presentation.transition.kind !== "gate-opened") return;
+            offered.push(presentation.transition.options);
+            void resolveGate!(presentation.transition.gateId, "approve");
+          },
+        }),
+      },
+      orca,
+      git,
+      ledger,
+    );
+
+    assert.deepEqual(offered, [["approve", "fix", "skip", "stop"]]);
+    assert.deepEqual(
+      orca.calls.filter((call) => call.startsWith("resolve-gate:")),
+      ["resolve-gate:gate-1:approve"],
+    );
+    const audit = ledger.listGateAudit("inline-gate-audit");
+    assert.equal(audit.length, 1);
+    assert.equal(audit[0].decision, "approve");
+    assert.equal(audit[0].resolution, "approve");
+    assert.equal(
+      orca.completedStages.filter((stage) => stage === "review").length,
+      1,
+    );
+    assert.ok(result.attestation);
+  } finally {
+    ledger.close();
+    await rm(temp, { force: true, recursive: true });
+  }
+});
+
 test("assertion updates documented in intent stay informational and never open gates", async () => {
   const git = new FakeGit();
   const orca = new FakeOrca(git);
@@ -2786,6 +2848,44 @@ console.log(JSON.stringify({ result }))
   } finally {
     if (previousHandle === undefined) delete process.env.ORCA_TERMINAL_HANDLE;
     else process.env.ORCA_TERMINAL_HANDLE = previousHandle;
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("CliOrca inline canonical gate resolver uses gate-resolve", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-inline-gate-resolve-"));
+  const fakeOrca = path.join(temp, "orca");
+  const callsPath = path.join(temp, "calls.jsonl");
+  try {
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(process.argv.slice(2)) + '\\n')
+console.log(JSON.stringify({ result: { gate: { id: 'gate-review', status: 'resolved' } } }))
+`,
+    );
+    await chmod(fakeOrca, 0o755);
+    const orca = new CliOrca({ command: fakeOrca, cwd: temp });
+
+    await orca.resolveGate("gate-review", "fix");
+
+    const calls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    assert.deepEqual(calls, [
+      [
+        "orchestration",
+        "gate-resolve",
+        "--id",
+        "gate-review",
+        "--resolution",
+        "fix",
+        "--json",
+      ],
+    ]);
+  } finally {
     await rm(temp, { recursive: true, force: true });
   }
 });

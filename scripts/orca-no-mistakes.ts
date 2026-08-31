@@ -63,6 +63,7 @@ import {
 import {
   PlainStatusRenderer,
   PresentationPublisher,
+  type GateResolver,
   type PresentationRenderer,
 } from "./presentation.ts";
 import { createRailTuiRenderer } from "./tui.ts";
@@ -203,6 +204,7 @@ export interface OrcaOperations {
     options?: string[],
     onCreated?: (gateId: string) => void,
   ): Promise<string>;
+  resolveGate?(gateId: string, resolution: string): Promise<void>;
   waitForGate(gateId: string): Promise<string>;
   setWorktreeStatus(comment: string, status?: string): Promise<void>;
 }
@@ -273,6 +275,7 @@ export type PipelineOptions = {
   rendererFactory?: (
     artifactsDir: string,
     stageLogs: ReadonlyMap<string, StageLog>,
+    resolveGate?: GateResolver,
   ) => PresentationRenderer;
   resumeRunId?: string;
   userGlobalConfig?: OrcaNoMistakesConfig;
@@ -1602,7 +1605,11 @@ export async function runPipeline(
       presentation = new PresentationPublisher(
         ledger,
         runId,
-        options.rendererFactory?.(artifactsDir, stageLogs!) ??
+        options.rendererFactory?.(
+          artifactsDir,
+          stageLogs!,
+          orca.resolveGate?.bind(orca),
+        ) ??
           (options.plainStatus
             ? new PlainStatusRenderer(process.stderr)
             : undefined),
@@ -2178,6 +2185,8 @@ export async function runPipeline(
             presentation.publish(`gate:${gateId}:opened`, {
               gateId,
               kind: "gate-opened",
+              options: gateOptions,
+              question,
               round,
               stage,
             });
@@ -6197,6 +6206,18 @@ export class CliOrca implements OrcaOperations {
     }
   }
 
+  async resolveGate(gateId: string, resolution: string): Promise<void> {
+    await this.#json([
+      "orchestration",
+      "gate-resolve",
+      "--id",
+      gateId,
+      "--resolution",
+      resolution,
+      "--json",
+    ]);
+  }
+
   async #applyGateResponses(pendingGateIds: Set<string>): Promise<void> {
     if (!this.#runId) return;
     const result = await this.#json<{
@@ -6257,15 +6278,7 @@ export class CliOrca implements OrcaOperations {
         );
         continue;
       }
-      await this.#json([
-        "orchestration",
-        "gate-resolve",
-        "--id",
-        responseGateId,
-        "--resolution",
-        response.resolution.trim(),
-        "--json",
-      ]);
+      await this.resolveGate(responseGateId, response.resolution.trim());
       pendingGateIds.delete(responseGateId);
     }
     if (result.deliveryId) {
@@ -11805,13 +11818,14 @@ Prune options:
         plainStatus: parsed.flags["no-tui"] === true,
         rendererFactory:
           parsed.flags.tui === true
-            ? (artifactsDir, stageLogs) => {
+            ? (artifactsDir, stageLogs, resolveGate) => {
                 renderer =
                   createRailTuiRenderer(
                     process.stdin,
                     process.stderr,
                     artifactsDir,
                     stageLogs,
+                    resolveGate,
                   ) ?? new PlainStatusRenderer(process.stderr);
                 setAbortPresentationCleanup(closeRenderer);
                 return renderer;

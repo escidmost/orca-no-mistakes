@@ -65,6 +65,8 @@ test("presentation snapshots are durable, ordered, immutable, and resume without
     publisher.publish("gate:review:opened", {
       gateId: "gate-review",
       kind: "gate-opened",
+      options: ["approve", "stop"],
+      question: "Choose a review action.",
       round: 1,
       stage: "review",
     });
