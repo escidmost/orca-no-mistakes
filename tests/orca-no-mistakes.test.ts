@@ -6014,9 +6014,13 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await assertWorkerChangesAllowed();
 
     git(worker, "reset", "--hard", featureHead);
+    const preflight = coordinatorSource.match(
+      /^(\s*)const (repo|repoState) = await git\.assertReady\(\);$/mu,
+    );
+    assert.ok(preflight, "mutation setup failed: runtime preflight was not found");
     const relocatedPreflight = coordinatorSource.replace(
-      "    const repoState = await git.assertReady();",
-      "      const repoState = await git.assertReady();",
+      preflight[0],
+      `${preflight[1]}  const ${preflight[2]} = await git.assertReady();`,
     );
     assert.notEqual(
       relocatedPreflight,
