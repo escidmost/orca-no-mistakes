@@ -420,7 +420,7 @@ if (args[0] === "terminal" && args[1] === "show") {
         path: gatePath,
       },
     ]);
-    const ledger = new DomainLedger();
+    const ledger = new DomainLedger({ repositoryPath: temp });
     seedRun(ledger, "run-gate-cas", temp);
     ledger.close();
     const marker = path.join(

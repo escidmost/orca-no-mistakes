@@ -10,6 +10,7 @@ import {
   DomainLedger,
   buildAttestation,
   evidenceSha256,
+  legacyLedgerPath,
   sha256,
   type StageEvidenceManifestEntry,
 } from "../scripts/ledger.ts";
@@ -67,9 +68,11 @@ async function recordStageEvidence(
 
 test("manifest-file verification verifies offline, then requires an intact stored attestation", async () => {
   const home = await mkdtemp(path.join(tmpdir(), "orca-attestation-verify-"));
+  const previousCwd = process.cwd();
   const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
   process.env.ORCA_NO_MISTAKES_HOME = home;
   try {
+    process.chdir(home);
     const manifest = buildAttestation(fullStageEvidence({ baseCommitOid: commit, candidateCommitOid: commit, runId: "missing-run" }), {
       baseCommitOid: commit,
       candidateCommitOid: commit,
@@ -84,7 +87,7 @@ test("manifest-file verification verifies offline, then requires an intact store
     // No ledger record for this run: the manifest still proves itself.
     await main(["attestation", "verify", manifestPath]);
 
-    const ledger = new DomainLedger();
+    const ledger = new DomainLedger(legacyLedgerPath());
     startRun(ledger, manifest.runId);
     ledger.recordAttestation(manifest);
     ledger.close();
@@ -100,6 +103,7 @@ test("manifest-file verification verifies offline, then requires an intact store
       /stored attestation manifest does not match the ledger Merkle root/,
     );
   } finally {
+    process.chdir(previousCwd);
     if (previousHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME;
     else process.env.ORCA_NO_MISTAKES_HOME = previousHome;
     await rm(home, { recursive: true, force: true });

@@ -24,6 +24,7 @@ import {
   type OrcaOperations,
   type WorkerResult,
 } from "../scripts/orca-no-mistakes.ts";
+import { legacyLedgerPath } from "../scripts/ledger.ts";
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
@@ -228,7 +229,7 @@ test("stranded prune removes an unowned branch at the recovery OID", async () =>
     }),
   );
   const restore = setEnv(home, path.join(seeded.temp, "orca"));
-  const ledger = new DomainLedger();
+  const ledger = new DomainLedger(legacyLedgerPath());
   try {
     ledger.startRun({
       baseBranch: "main",

@@ -27,6 +27,7 @@ import {
   type OrcaOperations,
   type WorkerResult,
 } from "../scripts/orca-no-mistakes.ts";
+import { legacyLedgerPath } from "../scripts/ledger.ts";
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
@@ -225,7 +226,7 @@ test("an aborted run reaps its workers and gate workspace and preserves its comm
     ORCA_NO_MISTAKES_HOME: path.join(seeded.temp, "home"),
   });
   const runId = "run-aborted";
-  const ledger = new DomainLedger();
+  const ledger = new DomainLedger(legacyLedgerPath());
   const notifications: string[] = [];
   try {
     const orca = new ReapOrca();
@@ -374,7 +375,7 @@ test("prune --stranded reaps a dead coordinator's gate workspace", async () => {
   });
   const runId = "run-dead";
   try {
-    const ledger = new DomainLedger();
+    const ledger = new DomainLedger({ repositoryPath: seeded.origin });
     ledger.startRun({
       baseBranch: "feature",
       branch: "feature",
@@ -414,7 +415,7 @@ test("prune --stranded reaps a dead coordinator's gate workspace", async () => {
       "prune must preserve the dead run's last commit before reaping",
     );
     assert.equal(existsSync(markerPath(seeded.origin, seeded.gate.id)), false);
-    const reopened = new DomainLedger();
+    const reopened = new DomainLedger({ repositoryPath: seeded.origin });
     assert.equal(reopened.runStatus(runId), "cancelled");
     reopened.startRun({
       baseBranch: "feature",
@@ -445,7 +446,7 @@ test("prune --stranded retains a live coordinator's gate workspace", async () =>
   });
   const runId = "run-live";
   try {
-    const ledger = new DomainLedger();
+    const ledger = new DomainLedger({ repositoryPath: seeded.origin });
     ledger.startRun({
       baseBranch: "feature",
       branch: "feature",
@@ -486,7 +487,7 @@ test("prune --stranded retains a live coordinator's gate workspace", async () =>
       "",
       "nothing is anchored for a run that is still alive",
     );
-    const reopened = new DomainLedger();
+    const reopened = new DomainLedger({ repositoryPath: seeded.origin });
     assert.equal(reopened.runStatus(runId), "in-progress");
     reopened.close();
   } finally {
@@ -538,7 +539,7 @@ test("prune --stranded retains a gate whose commits cannot be anchored", async (
   });
   const runId = "run-dead";
   try {
-    const ledger = new DomainLedger();
+    const ledger = new DomainLedger({ repositoryPath: seeded.origin });
     ledger.startRun({
       baseBranch: "feature",
       branch: "feature",
@@ -590,7 +591,7 @@ test("prune --stranded retains a gate whose commits cannot be anchored", async (
       "an unanchored branch stays",
     );
     assert.ok(existsSync(markerPath(seeded.origin, seeded.gate.id)));
-    const reopened = new DomainLedger();
+    const reopened = new DomainLedger({ repositoryPath: seeded.origin });
     assert.equal(reopened.runStatus(runId), "in-progress");
     reopened.close();
   } finally {

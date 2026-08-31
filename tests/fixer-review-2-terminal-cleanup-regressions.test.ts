@@ -174,7 +174,7 @@ for (const kind of ["configured", "orca"] as const) {
     });
     const home = path.join(seeded.temp, "home");
     const restore = setEnv(home, fake.command);
-    const ledger = new DomainLedger();
+    const ledger = new DomainLedger({ repositoryPath: seeded.repo });
     const gate =
       kind === "configured"
         ? {
@@ -212,7 +212,7 @@ for (const kind of ["configured", "orca"] as const) {
 
       await main(["prune", "--stranded", "--repo", seeded.repo]);
 
-      const reopened = new DomainLedger();
+      const reopened = new DomainLedger({ repositoryPath: seeded.repo });
       try {
         assert.equal(reopened.runStatus(runId), "passed");
       } finally {

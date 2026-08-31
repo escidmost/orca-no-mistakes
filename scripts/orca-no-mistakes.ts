@@ -68,8 +68,11 @@ import {
 } from "./presentation.ts";
 import { createRailTuiRenderer } from "./tui.ts";
 import {
+  DestinationActiveMigrationError,
   DomainLedger,
+  LegacyActiveMigrationError,
   RUN_ID_PATTERN,
+  allowsLegacyLedgerFallback,
   isWithin,
   StageLog,
   artifactsRoot,
@@ -80,8 +83,12 @@ import {
   isAuthoritativeStageEvidence,
   normalizeIntent,
   noMistakesHome,
+  legacyLedgerPath,
+  repositoryLedgerPath,
   sha256,
+  verifyCompletionAttestation,
   verifyManifest,
+  type CompletionAttestationManifest,
   type FindingDecisionRow,
   type PassedAttestationManifest,
   type PrunableRun,
@@ -7126,21 +7133,23 @@ function isTestPath(filePath: string): boolean {
 function weakensInlineTestValidation(
   expectedSource: string,
   source: string | undefined,
+  freezeDeclaredTestFile = true,
 ): boolean {
   if (source === expectedSource) return false;
   const qualifiedTestDeclaration = /(?<![.\w$])(?:Deno|vitest)\.test(?:\.[A-Za-z_$][\w$]*)*\s*\(/u;
   // Context chains are limited to known test modifiers so same-named object
   // calls stay fixable; the character class avoids matching this regex itself.
   const testDeclaration = /(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|rstest|(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test)\s*\]|@(?:[A-Za-z_][\w]*\.)*(?:ParameterizedTest|Test|TestMethod|DataTestMethod)\b|\[(?:(?:[A-Za-z_][\w]*\.)*(?:Fact|Test|Theory|TestMethod|DataTestMethod)|(?:[A-Za-z_][\w]*\.)*TestCase(?:\([^\]\n]*\))?)\]|(?<![.\w$])(?:(?:describe|it|test)(?:\.[A-Za-z_$][\w$]*)*|conte[x]t(?:\.(?:skip|only|todo|each|failing|fails|concurrent|sequential|shuffle|extend|describe|fixme|slow|if|runIf|skipIf))*)\s*\(|\b(?:SCENARIO|TEMPLATE_TEST_CASE|TEST_CASE|TEST_F|TEST_P|TYPED_TEST|TYPED_TEST_P)\s*\(|\btest\s+"(?:[^"\\]|\\.)*"\s*\{|(?:^|\n)\s*(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(|\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b)/iu;
-  const inlineAssertion = /(?:(?:^|\n)\s*assert\s+\S|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\b(?:CHECK|REQUIRE)(?:_[A-Z0-9_]+)?\s*\(|\b(?:[A-Za-z_][\w]*\.)*Assert\.[A-Za-z_][\w]*\s*\(|\.should\.(?:deep\.)?(?:equal|eql|match|throw)\s*\(|\b(?:deepStrictEqual|strictEqual|notDeepStrictEqual|notStrictEqual|doesNotReject|doesNotThrow|ifError|rejects|throws)\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|(?<![.\w$])assert[A-Z][A-Za-z0-9_$]*\s*\(|\bstd\.testing\.expect[A-Za-z0-9_]*\s*\(|\bexpect(?:\.(?:poll|soft))?\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
+  const inlineAssertion = /(?:(?:^|\n)\s*assert\s+\S|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\b(?:CHECK|REQUIRE)(?:_[A-Z0-9_]+)?\s*\(|\b(?:[A-Za-z_][\w]*\.)*Assert\.[A-Za-z_][\w]*\s*\(|\.should(?:\.[A-Za-z_$][\w$]*)+\s*\(|\b(?:deepStrictEqual|strictEqual|notDeepStrictEqual|notStrictEqual|doesNotReject|doesNotThrow|ifError|rejects|throws)\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|(?<![.\w$])assert[A-Z][A-Za-z0-9_$]*\s*\(|\bstd\.testing\.expect[A-Za-z0-9_]*\s*\(|\bexpect(?:\.(?:poll|soft))?\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
   const doctestPrompt = /^\s*>>>/u;
   const nodeAssertImport = /(?:from\s+["'](?:node:)?assert(?:\/strict)?["']|require\s*\(\s*["'](?:node:)?assert(?:\/strict)?["']\s*\))/u;
   if (
-    qualifiedTestDeclaration.test(expectedSource) ||
-    testDeclaration.test(expectedSource) ||
-    /\.should(?:\.[A-Za-z_$][\w$]*)+/u.test(expectedSource) ||
-    nodeAssertImport.test(expectedSource) ||
-    importsAssertionFrameworkApi(expectedSource)
+    freezeDeclaredTestFile &&
+    (qualifiedTestDeclaration.test(expectedSource) ||
+      testDeclaration.test(expectedSource) ||
+      /\.should(?:\.[A-Za-z_$][\w$]*)+/u.test(expectedSource) ||
+      nodeAssertImport.test(expectedSource) ||
+      importsAssertionFrameworkApi(expectedSource))
   ) {
     return true;
   }
@@ -7997,7 +8006,13 @@ export class GitShell implements GitOperations {
           throw new Error(`could not read pre-round source file ${filePath}`);
         }
         const source = await this.showFile(sourceHead, filePath);
-        if (weakensInlineTestValidation(expectedSource, source)) {
+        if (
+          weakensInlineTestValidation(
+            expectedSource,
+            source,
+            !/\.(?:adoc|md|mdx|rst)$/iu.test(filePath),
+          )
+        ) {
           protectedInlineTests.push(filePath);
         }
       }
@@ -8565,7 +8580,7 @@ const VALUE_FLAGS = new Set([
   "reviewer-model",
 ]);
 const COMMAND_FLAGS: Record<string, Set<string>> = {
-  attestation: new Set(["out"]),
+  attestation: new Set(["out", "repo"]),
   prune: new Set(["before", "repo", "stranded"]),
   run: new Set([
     "allow-local-config",
@@ -10925,7 +10940,23 @@ async function reapMarkerWorkers(
 
 // `prune --stranded` reaps gate workspaces whose coordinator is dead. Every
 // doubt resolves towards retention: a reaped live run loses its workspace.
-async function reapStrandedGates(repoRoot: string): Promise<void> {
+function openRepositoryLedger(
+  repositoryPath: string,
+  allowLegacyFallback = true,
+): DomainLedger {
+  try {
+    repositoryLedgerPath(repositoryPath);
+  } catch (error) {
+    if (!allowLegacyFallback || !allowsLegacyLedgerFallback(error)) throw error;
+    return new DomainLedger(legacyLedgerPath());
+  }
+  return new DomainLedger({ repositoryPath });
+}
+
+async function reapStrandedGates(
+  repoRoot: string,
+  recoverActiveMigration = false,
+): Promise<void> {
   const markersDir = path.join(repoRoot, ".orca", "no-mistakes");
   let names: string[];
   try {
@@ -10935,7 +10966,19 @@ async function reapStrandedGates(repoRoot: string): Promise<void> {
     names = [];
   }
   const orcaCommand = resolveOrcaCommand();
-  const ledger = new DomainLedger();
+  let ledger: DomainLedger;
+  try {
+    ledger = openRepositoryLedger(repoRoot);
+  } catch (error) {
+    if (!recoverActiveMigration) throw error;
+    if (error instanceof LegacyActiveMigrationError) {
+      ledger = new DomainLedger(legacyLedgerPath());
+    } else if (error instanceof DestinationActiveMigrationError) {
+      ledger = new DomainLedger(repositoryLedgerPath(repoRoot));
+    } else {
+      throw error;
+    }
+  }
   let reaped = 0;
   let retained = 0;
   try {
@@ -11573,62 +11616,108 @@ async function runPruneCommand(flags: RawCliFlags): Promise<void> {
   // canonicalised before it can match one.
   const repoRoot =
     repoFlag === undefined ? undefined : await canonicalPath(repoFlag);
+  const assertedRepoRoots =
+    repoFlag === undefined
+      ? undefined
+      : new Set([
+          repoRoot as string,
+          await canonicalPathFromExistingAncestor(repoFlag),
+        ]);
   if (flags.stranded === true) {
     if (before !== undefined)
       throw new Error("--before cannot be combined with --stranded");
     // Stranded reaping scans one repository's gate markers; without --repo
     // the current directory is the repository to scan.
     const scanRoot = repoRoot ?? (await canonicalPath(process.cwd()));
-    await reapStrandedGates(scanRoot);
+    await reapStrandedGates(scanRoot, repoRoot !== undefined);
     return;
   }
-  const ledger = new DomainLedger();
+  const missingRepoRoot = repoRoot !== undefined && !existsSync(repoRoot);
+  const ledgers = missingRepoRoot
+    ? [new DomainLedger(legacyLedgerPath())]
+    : [openRepositoryLedger(repoRoot ?? process.cwd())];
+  if (missingRepoRoot) {
+    let survivingRepository: string | undefined;
+    try {
+      repositoryLedgerPath(process.cwd());
+      survivingRepository = process.cwd();
+    } catch {}
+    if (survivingRepository) {
+      try {
+        ledgers.push(new DomainLedger({ repositoryPath: survivingRepository }));
+      } catch (error) {
+        if (
+          !(error instanceof LegacyActiveMigrationError) &&
+          !(error instanceof DestinationActiveMigrationError)
+        )
+          throw error;
+      }
+    }
+  }
   let pruned = 0;
   let retained = 0;
   try {
-    for (const run of ledger.prunableRuns({ before, repoRoot })) {
-      if (!RUN_ID_PATTERN.test(run.run_id)) {
-        retained += 1;
-        console.error(
-          `no-mistakes: retained ${run.run_id}; its artifact directory is unsafe to remove`,
+    for (const ledger of ledgers) {
+      for (const run of ledger.prunableRuns({
+        before,
+        repoRoot: missingRepoRoot ? undefined : repoRoot,
+      })) {
+        if (
+          missingRepoRoot &&
+          assertedRepoRoots !== undefined &&
+          !assertedRepoRoots.has(path.resolve(run.repo_root))
+        ) {
+          continue;
+        }
+        if (!RUN_ID_PATTERN.test(run.run_id)) {
+          retained += 1;
+          console.error(
+            `no-mistakes: retained ${run.run_id}; its artifact directory is unsafe to remove`,
+          );
+          continue;
+        }
+        const state = await recoveryHeadState(
+          run,
+          assertedRepoRoots?.has(path.resolve(run.repo_root)) ?? false,
         );
-        continue;
+        if (state !== "contained") {
+          retained += 1;
+          console.error(
+            state === "missing-repo"
+              ? `no-mistakes: retained ${run.run_id}; repository root ${run.repo_root} is unavailable (pass --repo=${run.repo_root} to assert it is gone)`
+              : `no-mistakes: retained ${run.run_id}; its recovery refs are not all contained in ${run.branch} or ${run.base_branch}`,
+          );
+          continue;
+        }
+        // The row goes first because prune() re-checks the lease inside its
+        // transaction and refuses a run that acquired one since selection.
+        // Removing the artifacts first would destroy the evidence of a run the
+        // ledger then declines to delete. The cost is that a failure to remove
+        // the directory leaves it orphaned, which spends disk rather than
+        // evidence.
+        const removed = ledger.prune([run.run_id]);
+        if (removed === 0) {
+          retained += 1;
+          console.error(
+            `no-mistakes: retained ${run.run_id}; it was leased again while pruning`,
+          );
+          continue;
+        }
+        pruned += removed;
+        await rm(path.join(artifactsRoot(), run.run_id), {
+          force: true,
+          recursive: true,
+        });
       }
-      const state = await recoveryHeadState(
-        run,
-        repoRoot !== undefined && repoRoot === path.resolve(run.repo_root),
-      );
-      if (state !== "contained") {
-        retained += 1;
-        console.error(
-          state === "missing-repo"
-            ? `no-mistakes: retained ${run.run_id}; repository root ${run.repo_root} is unavailable (pass --repo=${run.repo_root} to assert it is gone)`
-            : `no-mistakes: retained ${run.run_id}; its recovery refs are not all contained in ${run.branch} or ${run.base_branch}`,
-        );
-        continue;
-      }
-      // The row goes first because prune() re-checks the lease inside its
-      // transaction and refuses a run that acquired one since selection.
-      // Removing the artifacts first would destroy the evidence of a run the
-      // ledger then declines to delete. The cost is that a failure to remove
-      // the directory leaves it orphaned, which spends disk rather than
-      // evidence.
-      const removed = ledger.prune([run.run_id]);
-      if (removed === 0) {
-        retained += 1;
-        console.error(
-          `no-mistakes: retained ${run.run_id}; it was leased again while pruning`,
-        );
-        continue;
-      }
-      pruned += removed;
-      await rm(path.join(artifactsRoot(), run.run_id), {
-        force: true,
-        recursive: true,
-      });
     }
   } finally {
-    ledger.close();
+    for (const ledger of ledgers) {
+      try {
+        ledger.close();
+      } catch (error) {
+        console.error(`warning: could not close ledger ${ledger.path}: ${String(error)}`);
+      }
+    }
   }
   console.log(
     `Pruned ${pruned} run(s)` +
@@ -11647,8 +11736,8 @@ export async function main(argv: string[]): Promise<void> {
   ) {
     console.log(`Usage:
   orca-no-mistakes run (--intent <text> | --resume <run-id>) [--repo <path>] [--base <branch>] [--head <sha>] [--force-lease]
-  orca-no-mistakes attestation export <run-id|commit-sha> [--out <path>]
-  orca-no-mistakes attestation verify <manifest-file|run-id|commit-sha>
+  orca-no-mistakes attestation export <run-id|commit-sha> [--out <path>] [--repo <path>]
+  orca-no-mistakes attestation verify <manifest-file|run-id|commit-sha> [--repo <path>]
   orca-no-mistakes prune [--before <date>] [--repo <path>]
   orca-no-mistakes prune --stranded [--repo <path>]
 
@@ -11683,7 +11772,7 @@ Prune options:
   let rawIntent = stringFlag(parsed.flags, "intent");
   let resumeStartOid: string | undefined;
   if (resumeRunId) {
-    const resumeLedger = new DomainLedger();
+    const resumeLedger = openRepositoryLedger(repo);
     try {
       const resumedRun = resumeLedger.run(resumeRunId);
       if (!resumedRun) throw new Error(`run ${resumeRunId} does not exist`);
@@ -11801,7 +11890,7 @@ Prune options:
   let gateCleanupOid = await git.head();
   try {
     const userGlobalConfig = loadUserConfig();
-    ledger = new DomainLedger();
+    ledger = openRepositoryLedger(originWorktree ?? gatePath);
     await installAbortReaping({
       ...(gate ? { gate } : {}),
       ...(deliveryGit ? { deliveryGit } : {}),
@@ -11902,12 +11991,18 @@ Prune options:
         );
       }
     }
-    await orca.notifyRunResult(
-      outcome,
-      recoverRef
-        ? `No-mistakes ${outcome}: ${message}\n${recoveryInstructions(recoverRef)}`
-        : `No-mistakes ${outcome}: ${message}`,
-    );
+    try {
+      await orca.notifyRunResult(
+        outcome,
+        recoverRef
+          ? `No-mistakes ${outcome}: ${message}\n${recoveryInstructions(recoverRef)}`
+          : `No-mistakes ${outcome}: ${message}`,
+      );
+    } catch (notificationError) {
+      console.error(
+        `warning: could not notify Orca about the failed run: ${String(notificationError)}`,
+      );
+    }
     throw error;
   } finally {
     await withGateMutation(async () => {
@@ -11923,12 +12018,19 @@ Prune options:
       } finally {
         if (gate && !retainGate) {
           if (gate.kind === "configured") await markGateCleanupPending();
-          const removed = await removeGateWorktree(
-            gate,
-            originWorktree!,
-            resolveOrcaCommand(),
-            gateCleanupOid,
-          );
+          let removed = false;
+          try {
+            removed = await removeGateWorktree(
+              gate,
+              originWorktree!,
+              resolveOrcaCommand(),
+              gateCleanupOid,
+            );
+          } catch (cleanupError) {
+            console.error(
+              `warning: could not clean up gate worktree ${gate.path}: ${String(cleanupError)}`,
+            );
+          }
           if (removed && gate.kind === "configured") {
             const closed = await closeTerminalOrProveStale(
               process.env.ORCA_TERMINAL_HANDLE,
@@ -11950,7 +12052,7 @@ Prune options:
 
 function assertStoredAttestationPassed(
   ledger: DomainLedger,
-  manifest: PassedAttestationManifest,
+  manifest: CompletionAttestationManifest,
 ): void {
   const status = ledger.runStatus(manifest.runId);
   if (status !== "passed") {
@@ -11972,11 +12074,16 @@ async function runAttestationCommand(
     throw new Error(
       `attestation ${action} requires a run ID, commit SHA, or manifest file`,
     );
-  const ledger = new DomainLedger();
+  const repo = stringFlag(flags, "repo");
+  const ledger = openRepositoryLedger(repo ?? process.cwd(), repo === undefined);
   try {
     if (action === "export") {
-      const manifest = ledger.getAttestation(ref);
-      verifyManifest(manifest, PIPELINE_STEPS);
+      const manifest = ledger.getCompletionAttestation(ref);
+      if (manifest.version === "1.3.0") verifyManifest(manifest, PIPELINE_STEPS);
+      else {
+        verifyCompletionAttestation(manifest);
+        ledger.verifyRetainedCompletionAttestation(manifest);
+      }
       assertStoredAttestationPassed(ledger, manifest);
       const output = `${JSON.stringify(manifest, null, 2)}\n`;
       const outPath = stringFlag(flags, "out");
@@ -12001,9 +12108,10 @@ async function runAttestationCommand(
     }
     const manifest =
       raw === undefined
-        ? ledger.getAttestation(ref)
-        : (JSON.parse(raw) as PassedAttestationManifest);
-    verifyManifest(manifest, PIPELINE_STEPS);
+        ? ledger.getCompletionAttestation(ref)
+        : (JSON.parse(raw) as CompletionAttestationManifest);
+    if (manifest.version === "1.3.0") verifyManifest(manifest, PIPELINE_STEPS);
+    else verifyCompletionAttestation(manifest);
     // The manifest is self-verifying: the Merkle root covers its header and
     // every stage digest, so a manifest carried to a machine that never ran the
     // pipeline still proves its own integrity. It is tamper-evident, not
@@ -12031,6 +12139,9 @@ async function runAttestationCommand(
       );
     }
     assertStoredAttestationPassed(ledger, manifest);
+    if (manifest.version === "2.0.0") {
+      ledger.verifyRetainedCompletionAttestation(manifest);
+    }
     const problems = ledger.verifyEvidence(manifest);
     if (problems.length > 0) {
       throw new Error(

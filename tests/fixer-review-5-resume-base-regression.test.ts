@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { DomainLedger, main } from "../scripts/orca-no-mistakes.ts";
+import { legacyLedgerPath } from "../scripts/ledger.ts";
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
@@ -80,7 +81,7 @@ console.log(JSON.stringify({ result }))
 
     const canonicalRepo = await realpath(repo);
     const featureHead = git(repo, "rev-parse", "HEAD");
-    const ledger = new DomainLedger();
+    const ledger = new DomainLedger(legacyLedgerPath());
     try {
       ledger.startRun({
         baseBranch: "release",

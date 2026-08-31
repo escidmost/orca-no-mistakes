@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { constants, mkdirSync, readFileSync, statSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { constants, existsSync, mkdirSync, readFileSync, statSync } from 'node:fs'
 import { chmod, lstat, mkdir, open, realpath, rename, rm } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
@@ -11,6 +12,65 @@ import type { PresentationSnapshot } from './presentation.ts'
 const { O_APPEND, O_CREAT, O_EXCL, O_NOFOLLOW, O_RDONLY, O_RDWR, O_WRONLY } = constants
 
 export type RunStatus = 'in-progress' | 'passed' | 'failed' | 'cancelled'
+
+export class DestinationActiveMigrationError extends Error {}
+
+export class LegacyActiveMigrationError extends Error {}
+
+export class RepositoryMigrationConflictError extends Error {}
+
+export type StageRequirement = 'disabled' | 'optional' | 'required'
+
+export type StagePlanEntryRow = {
+  position: number
+  requirement: StageRequirement
+  stage_id: string
+}
+
+export type StageDisposition = 'disabled' | 'failed' | 'satisfied' | 'skipped' | 'waived'
+
+export type StageDispositionRow = {
+  disposition: StageDisposition
+  evidence_sha256: string | null
+  stage_id: string
+}
+
+export type RemoteReceiptKind = 'candidate-publication' | 'pull-request-binding'
+
+export type RemoteReceiptRow = {
+  authoritative_post_observation_sha256: string
+  candidate_commit_oid: string
+  created_at: string
+  kind: RemoteReceiptKind
+  receipt_json: string
+  receipt_sha256: string
+}
+
+export type RecordEvidenceInput = {
+  artifactPath: string
+  artifactSha256: string
+  baseCommitOid: string
+  candidateCommitOid: string
+  evidenceSha256: string
+  exitCode: number
+  findingsJson?: string
+  roundIndex: number
+  runId: string
+  stageId: string
+  summary: string
+  workerIdentity: string
+  effectivePolicyHash?: string
+  baseRefSha?: string
+}
+
+export const LEGACY_STAGE_PLAN = [
+  'intent',
+  'rebase',
+  'review',
+  'test',
+  'document',
+  'lint'
+] as const
 
 export type GateKind = 'exhaustion' | 'finding' | 'guardrail'
 
@@ -124,8 +184,68 @@ export type PassedAttestationManifest = {
   createdAt: string
 }
 
+export type AssuranceClaim =
+  | 'configured-pipeline-completed'
+  | 'candidate-publication-verified'
+  | 'pull-request-bound'
+
+export type PipelineCompletionAttestationManifest = {
+  version: '2.0.0'
+  runId: string
+  candidateCommitOid: string
+  baseCommitOid: string
+  policySha256: string
+  intent: string
+  intentHash: string
+  stagePlan: { requirement: StageRequirement; stage: string }[]
+  stageDispositions: {
+    disposition: StageDisposition
+    evidenceSha256?: string
+    stage: string
+  }[]
+  stageEvidence: StageEvidenceManifestEntry[]
+  publicationRoute: {
+    baseBranch: string
+    baseRepositoryId: string
+    forgeHost: string
+    headBranch: string
+    headOwner: string
+    headRepositoryId: string
+    routeFingerprint: string
+  }
+  attemptOutcomeDigests: string[]
+  candidatePublicationReceiptSha256: string
+  pullRequestBindingReceiptSha256: string
+  custody: Record<string, unknown>
+  assuranceClaims: AssuranceClaim[]
+  pipelineEvidenceRoot: string
+  merkleRoot: string
+  coordinatorVersion: string
+  createdAt: string
+}
+
+export type CompletionAttestationManifest =
+  | PassedAttestationManifest
+  | PipelineCompletionAttestationManifest
+
 export function sha256(value: string | Buffer): string {
   return createHash('sha256').update(value).digest('hex')
+}
+
+export function canonicalJson(value: unknown): string {
+  const normalize = (item: unknown): unknown => {
+    if (Array.isArray(item)) return item.map(normalize)
+    if (item && typeof item === 'object') {
+      return Object.fromEntries(
+        Object.entries(item as Record<string, unknown>)
+          .filter(([, child]) => child !== undefined)
+          .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+          .map(([key, child]) => [key, normalize(child)])
+      )
+    }
+    return item
+  }
+  return JSON.stringify(normalize(value))
 }
 
 export function intentHash(intent: string): string {
@@ -164,6 +284,28 @@ const MANIFEST_PROPERTIES = new Set([
   'stageEvidence',
   'version'
 ])
+const V2_MANIFEST_PROPERTIES = new Set([
+  'assuranceClaims',
+  'attemptOutcomeDigests',
+  'baseCommitOid',
+  'candidateCommitOid',
+  'candidatePublicationReceiptSha256',
+  'coordinatorVersion',
+  'createdAt',
+  'custody',
+  'intent',
+  'intentHash',
+  'merkleRoot',
+  'pipelineEvidenceRoot',
+  'policySha256',
+  'publicationRoute',
+  'pullRequestBindingReceiptSha256',
+  'runId',
+  'stageDispositions',
+  'stageEvidence',
+  'stagePlan',
+  'version'
+])
 const STAGE_EVIDENCE_PROPERTIES = new Set([
   'artifactSha256',
   'baseCommitOid',
@@ -175,6 +317,15 @@ const STAGE_EVIDENCE_PROPERTIES = new Set([
   'summary',
   'waiverOrApproval',
   'workerIdentity'
+])
+const PUBLICATION_ROUTE_PROPERTIES = new Set([
+  'baseBranch',
+  'baseRepositoryId',
+  'forgeHost',
+  'headBranch',
+  'headOwner',
+  'headRepositoryId',
+  'routeFingerprint'
 ])
 const WAIVER_PROPERTIES = new Set(['decision', 'gateId', 'resolvedAt'])
 
@@ -324,6 +475,252 @@ export function buildAttestation(
   manifest.merkleRoot = merkleRoot(manifestLeaves(manifest))
   verifyManifest(manifest)
   return manifest
+}
+
+const V2_ASSURANCE_CLAIMS: AssuranceClaim[] = [
+  'configured-pipeline-completed',
+  'candidate-publication-verified',
+  'pull-request-bound'
+]
+
+function pipelineEvidencePayload(manifest: PipelineCompletionAttestationManifest): unknown {
+  const pushIndex = manifest.stagePlan.findIndex((entry) => entry.stage === 'push')
+  const prePrStages = new Set(manifest.stagePlan.slice(0, pushIndex + 1).map((entry) => entry.stage))
+  return {
+    attemptOutcomeDigests: manifest.attemptOutcomeDigests.slice(0, -1),
+    baseCommitOid: manifest.baseCommitOid,
+    candidateCommitOid: manifest.candidateCommitOid,
+    candidatePublicationReceiptSha256: manifest.candidatePublicationReceiptSha256,
+    intentHash: manifest.intentHash,
+    policySha256: manifest.policySha256,
+    publicationRoute: manifest.publicationRoute,
+    runId: manifest.runId,
+    stageDispositions: manifest.stageDispositions.filter((entry) => prePrStages.has(entry.stage)),
+    stageEvidence: manifest.stageEvidence.filter((entry) => prePrStages.has(entry.stage)),
+    stagePlan: manifest.stagePlan.slice(0, pushIndex + 1)
+  }
+}
+
+function v2MerkleRoot(manifest: PipelineCompletionAttestationManifest): string {
+  const { merkleRoot: _merkleRoot, ...payload } = manifest
+  return merkleRoot([sha256(canonicalJson(payload))])
+}
+
+export function buildPipelineCompletionAttestation(
+  entries: StageEvidenceManifestEntry[],
+  meta: Omit<
+    PipelineCompletionAttestationManifest,
+    | 'assuranceClaims'
+    | 'coordinatorVersion'
+    | 'createdAt'
+    | 'intentHash'
+    | 'merkleRoot'
+    | 'pipelineEvidenceRoot'
+    | 'stageEvidence'
+    | 'version'
+  >
+): PipelineCompletionAttestationManifest {
+  const manifest: PipelineCompletionAttestationManifest = {
+    version: '2.0.0',
+    ...meta,
+    intentHash: intentHash(meta.intent),
+    stageEvidence: entries,
+    assuranceClaims: [...V2_ASSURANCE_CLAIMS],
+    pipelineEvidenceRoot: '',
+    merkleRoot: '',
+    coordinatorVersion: COORDINATOR_VERSION,
+    createdAt: new Date().toISOString()
+  }
+  manifest.pipelineEvidenceRoot = merkleRoot([
+    sha256(canonicalJson(pipelineEvidencePayload(manifest)))
+  ])
+  manifest.merkleRoot = v2MerkleRoot(manifest)
+  verifyCompletionAttestation(manifest)
+  return manifest
+}
+
+export function assuranceClaimsFor(manifest: CompletionAttestationManifest): string[] {
+  if (manifest.version === '1.3.0') {
+    verifyManifest(manifest, LEGACY_STAGE_PLAN)
+    return ['legacy-local-pipeline-passed']
+  }
+  verifyCompletionAttestation(manifest)
+  return [...manifest.assuranceClaims]
+}
+
+export function verifyCompletionAttestation(manifest: CompletionAttestationManifest): void {
+  if (manifest?.version === '1.3.0') {
+    verifyManifest(manifest)
+    return
+  }
+  if (!manifest || manifest.version !== '2.0.0') {
+    throw new Error('attestation version is not supported')
+  }
+  if (!hasOnlyOwnProperties(manifest, V2_MANIFEST_PROPERTIES)) {
+    throw new Error('attestation manifest has unknown properties')
+  }
+  if (typeof manifest.runId !== 'string' || !RUN_ID_PATTERN.test(manifest.runId)) {
+    throw new Error('attestation run ID is invalid')
+  }
+  if (
+    typeof manifest.coordinatorVersion !== 'string' ||
+    manifest.coordinatorVersion.trim() === '' ||
+    !isCanonicalTimestamp(manifest.createdAt)
+  ) {
+    throw new Error('attestation metadata is invalid')
+  }
+  if (
+    !COMMIT_OID.test(manifest.candidateCommitOid) ||
+    !COMMIT_OID.test(manifest.baseCommitOid)
+  ) {
+    throw new Error('attestation commit OIDs are not 40- or 64-character hex values')
+  }
+  if (!HEX_64.test(manifest.policySha256)) {
+    throw new Error('attestation policy hash is not a SHA-256')
+  }
+  if (
+    normalizeIntent(manifest.intent) !== manifest.intent ||
+    manifest.intentHash !== intentHash(manifest.intent)
+  ) {
+    throw new Error('attestation intent is invalid')
+  }
+
+  const legacyEvidenceView: PassedAttestationManifest = {
+    baseCommitOid: manifest.baseCommitOid,
+    candidateCommitOid: manifest.candidateCommitOid,
+    coordinatorVersion: manifest.coordinatorVersion,
+    createdAt: manifest.createdAt,
+    guardrailMode: 'strict',
+    intent: manifest.intent,
+    intentHash: manifest.intentHash,
+    merkleRoot: '',
+    policySha256: manifest.policySha256,
+    runId: manifest.runId,
+    stageEvidence: manifest.stageEvidence,
+    version: '1.3.0'
+  }
+  legacyEvidenceView.merkleRoot = merkleRoot(manifestLeaves(legacyEvidenceView))
+  verifyManifest(legacyEvidenceView)
+
+  if (!Array.isArray(manifest.stagePlan) || manifest.stagePlan.length === 0) {
+    throw new Error('attestation stage plan is invalid')
+  }
+  const planStages = new Set<string>()
+  for (const entry of manifest.stagePlan) {
+    if (
+      !entry ||
+      !hasOnlyOwnProperties(entry, new Set(['requirement', 'stage'])) ||
+      typeof entry.stage !== 'string' ||
+      entry.stage.trim() === '' ||
+      !['required', 'optional', 'disabled'].includes(entry.requirement) ||
+      planStages.has(entry.stage)
+    ) {
+      throw new Error('attestation stage plan is invalid')
+    }
+    planStages.add(entry.stage)
+  }
+  const pushIndex = manifest.stagePlan.findIndex((entry) => entry.stage === 'push')
+  const prIndex = manifest.stagePlan.findIndex((entry) => entry.stage === 'pr')
+  if (pushIndex < 0 || prIndex !== pushIndex + 1 || prIndex !== manifest.stagePlan.length - 1) {
+    throw new Error('attestation stage plan must end with push then pr')
+  }
+  if (
+    !Array.isArray(manifest.stageDispositions) ||
+    manifest.stageDispositions.length !== manifest.stagePlan.length
+  ) {
+    throw new Error('attestation stage dispositions do not match the stage plan')
+  }
+  const evidenceByDigest = new Map(
+    manifest.stageEvidence.map((entry) => [entry.evidenceSha256, entry])
+  )
+  if (evidenceByDigest.size !== manifest.stageEvidence.length) {
+    throw new Error('attestation stage evidence contains duplicate entries')
+  }
+  for (const [index, disposition] of manifest.stageDispositions.entries()) {
+    const plan = manifest.stagePlan[index]
+    if (
+      !disposition ||
+      !hasOnlyOwnProperties(disposition, new Set(['disposition', 'evidenceSha256', 'stage'])) ||
+      disposition.stage !== plan.stage ||
+      !['satisfied', 'failed', 'skipped', 'waived', 'disabled'].includes(
+        disposition.disposition
+      )
+    ) {
+      throw new Error('attestation stage dispositions do not match the stage plan')
+    }
+    const completed =
+      (plan.requirement === 'required' && disposition.disposition === 'satisfied') ||
+      (plan.requirement === 'optional' &&
+        ['satisfied', 'skipped', 'waived'].includes(disposition.disposition)) ||
+      (plan.requirement === 'disabled' && disposition.disposition === 'disabled')
+    if (!completed) {
+      throw new Error(`attestation stage ${plan.stage} is not conclusively disposed`)
+    }
+    const evidence = evidenceByDigest.get(disposition.evidenceSha256 ?? '')
+    if (
+      disposition.disposition === 'satisfied' &&
+      (evidence?.stage !== plan.stage ||
+        evidence.exitCode !== 0 ||
+        !isAuthoritativeStageEvidence(evidence.workerIdentity))
+    ) {
+      throw new Error(
+        `attestation stage ${plan.stage} disposition does not bind successful authoritative evidence`
+      )
+    }
+    if (disposition.disposition !== 'satisfied' && disposition.evidenceSha256 !== undefined) {
+      throw new Error(`attestation stage ${plan.stage} has unexpected evidence`)
+    }
+  }
+  if (manifest.stageEvidence.some((entry) => !planStages.has(entry.stage))) {
+    throw new Error('attestation stage evidence is outside the frozen plan')
+  }
+
+  const route = manifest.publicationRoute
+  if (
+    !route ||
+    Reflect.ownKeys(route).length !== PUBLICATION_ROUTE_PROPERTIES.size ||
+    !hasOnlyOwnProperties(route, PUBLICATION_ROUTE_PROPERTIES) ||
+    Object.entries(route).some(([key, value]) => key !== 'routeFingerprint' &&
+      (typeof value !== 'string' || value.trim() === ''))
+  ) {
+    throw new Error('attestation publication route is invalid')
+  }
+  const { routeFingerprint, ...routeIdentity } = route
+  if (!HEX_64.test(routeFingerprint) || sha256(canonicalJson(routeIdentity)) !== routeFingerprint) {
+    throw new Error('attestation publication route fingerprint is invalid')
+  }
+  if (
+    !Array.isArray(manifest.attemptOutcomeDigests) ||
+    manifest.attemptOutcomeDigests.length === 0 ||
+    manifest.attemptOutcomeDigests.some((digest) => !HEX_64.test(digest)) ||
+    !HEX_64.test(manifest.candidatePublicationReceiptSha256) ||
+    !HEX_64.test(manifest.pullRequestBindingReceiptSha256)
+  ) {
+    throw new Error('attestation attempt or remote receipt digest is invalid')
+  }
+  if (
+    !manifest.custody ||
+    typeof manifest.custody !== 'object' ||
+    Array.isArray(manifest.custody) ||
+    Object.keys(manifest.custody).length === 0
+  ) {
+    throw new Error('attestation custody facts are invalid')
+  }
+  if (
+    !Array.isArray(manifest.assuranceClaims) ||
+    canonicalJson(manifest.assuranceClaims) !== canonicalJson(V2_ASSURANCE_CLAIMS)
+  ) {
+    throw new Error('attestation assurance claims are invalid')
+  }
+  const expectedPipelineRoot = merkleRoot([
+    sha256(canonicalJson(pipelineEvidencePayload(manifest)))
+  ])
+  if (manifest.pipelineEvidenceRoot !== expectedPipelineRoot) {
+    throw new Error('attestation pipeline evidence root is invalid')
+  }
+  if (manifest.merkleRoot !== v2MerkleRoot(manifest)) {
+    throw new Error('attestation Merkle root does not match its completion evidence')
+  }
 }
 
 /**
@@ -973,8 +1370,54 @@ export function noMistakesHome(): string {
   return process.env.ORCA_NO_MISTAKES_HOME ?? path.join(homedir(), '.orca-no-mistakes')
 }
 
-export function defaultLedgerPath(): string {
+export function legacyLedgerPath(): string {
   return path.join(noMistakesHome(), 'ledger.db')
+}
+
+function repositoryLocation(repositoryPath: string): { ledgerPath: string; repoRoot: string } {
+  const repoRoot = execFileSync(
+    'git',
+    ['-C', repositoryPath, 'rev-parse', '--path-format=absolute', '--show-toplevel'],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }
+  ).trim()
+  const commonDir = execFileSync(
+    'git',
+    ['-C', repositoryPath, 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }
+  ).trim()
+  return {
+    ledgerPath: path.join(commonDir, 'orca-no-mistakes', 'ledger.sqlite'),
+    repoRoot
+  }
+}
+
+export function allowsLegacyLedgerFallback(error: unknown): boolean {
+  if (!(error instanceof Error) || !('status' in error) || error.status !== 128) return false
+  const stderr = 'stderr' in error ? String(error.stderr ?? '') : ''
+  return /not a git repository/i.test(stderr) ||
+    (/cannot change to/i.test(stderr) && /No such file or directory/i.test(stderr))
+}
+
+export function repositoryLedgerPath(repositoryPath = process.cwd()): string {
+  return repositoryLocation(repositoryPath).ledgerPath
+}
+
+function defaultLedgerLocation(): { dbPath: string; legacyPath?: string; repoRoot?: string } {
+  try {
+    const repository = repositoryLocation(process.cwd())
+    return {
+      dbPath: repository.ledgerPath,
+      legacyPath: legacyLedgerPath(),
+      repoRoot: repository.repoRoot
+    }
+  } catch (error) {
+    if (!allowsLegacyLedgerFallback(error)) throw error
+    return { dbPath: legacyLedgerPath() }
+  }
+}
+
+export function defaultLedgerPath(): string {
+  return defaultLedgerLocation().dbPath
 }
 
 export function artifactsRoot(): string {
@@ -990,6 +1433,18 @@ export type PrunableRun = {
   run_id: string
 }
 
+const RELEASE_2_FACT_TABLES = [
+  'stage_plan_entries',
+  'stage_dispositions',
+  'publication_routes',
+  'publication_baselines',
+  'run_attempts',
+  'attempt_outcomes',
+  'remote_observations',
+  'mutation_intents',
+  'remote_receipts'
+] as const
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS runs (
   run_id TEXT PRIMARY KEY,
@@ -1004,6 +1459,121 @@ CREATE TABLE IF NOT EXISTS runs (
   status TEXT NOT NULL CHECK(status IN ('in-progress', 'passed', 'failed', 'cancelled')),
   created_at TEXT NOT NULL,
   completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS repository_migrations (
+  source_path TEXT NOT NULL,
+  repo_root TEXT NOT NULL,
+  source_present INTEGER NOT NULL CHECK(source_present IN (0, 1)),
+  completed_at TEXT NOT NULL,
+  PRIMARY KEY (source_path, repo_root)
+);
+
+CREATE TABLE IF NOT EXISTS repository_migration_imports (
+  repo_root TEXT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS stage_plan_entries (
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  position INTEGER NOT NULL CHECK(position >= 0),
+  stage_id TEXT NOT NULL,
+  requirement TEXT NOT NULL CHECK(requirement IN ('required', 'optional', 'disabled')),
+  PRIMARY KEY (run_id, position),
+  UNIQUE (run_id, stage_id)
+);
+
+CREATE TABLE IF NOT EXISTS stage_dispositions (
+  run_id TEXT NOT NULL,
+  stage_id TEXT NOT NULL,
+  disposition TEXT NOT NULL CHECK(disposition IN ('satisfied', 'failed', 'skipped', 'waived', 'disabled')),
+  evidence_sha256 TEXT,
+  recorded_at TEXT NOT NULL,
+  PRIMARY KEY (run_id, stage_id),
+  FOREIGN KEY (run_id, stage_id) REFERENCES stage_plan_entries(run_id, stage_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS publication_routes (
+  run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE CASCADE,
+  route_fingerprint TEXT NOT NULL,
+  forge_host TEXT NOT NULL,
+  base_repository_id TEXT NOT NULL,
+  head_repository_id TEXT NOT NULL,
+  head_owner TEXT NOT NULL,
+  head_branch TEXT NOT NULL,
+  base_branch TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS publication_baselines (
+  run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE CASCADE,
+  route_fingerprint TEXT NOT NULL,
+  head_commit_oid TEXT,
+  authoritative_absence INTEGER NOT NULL CHECK(authoritative_absence IN (0, 1)),
+  observed_at TEXT NOT NULL,
+  CHECK((head_commit_oid IS NULL) = authoritative_absence)
+);
+
+CREATE TABLE IF NOT EXISTS run_attempts (
+  attempt_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  generation_token INTEGER NOT NULL,
+  coordinator_identity TEXT NOT NULL,
+  actor_identity TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  UNIQUE (run_id, generation_token)
+);
+
+CREATE TABLE IF NOT EXISTS attempt_outcomes (
+  outcome_id TEXT PRIMARY KEY,
+  attempt_id TEXT NOT NULL UNIQUE REFERENCES run_attempts(attempt_id) ON DELETE CASCADE,
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  verdict TEXT NOT NULL CHECK(verdict IN ('passed', 'failed', 'cancelled')),
+  stopping_fact TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  candidate_commit_oid TEXT NOT NULL,
+  coordinator_identity TEXT NOT NULL,
+  actor_identity TEXT NOT NULL,
+  custody_json TEXT NOT NULL,
+  receipt_digests_json TEXT NOT NULL,
+  resume_eligible INTEGER NOT NULL CHECK(resume_eligible IN (0, 1)),
+  completed_at TEXT NOT NULL,
+  outcome_sha256 TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS remote_observations (
+  observation_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  attempt_id TEXT NOT NULL REFERENCES run_attempts(attempt_id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  observed_at TEXT NOT NULL,
+  observation_sha256 TEXT NOT NULL UNIQUE,
+  UNIQUE (run_id, observation_sha256)
+);
+
+CREATE TABLE IF NOT EXISTS mutation_intents (
+  mutation_intent_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  attempt_id TEXT NOT NULL REFERENCES run_attempts(attempt_id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK(kind IN ('candidate-publication', 'pull-request', 'managed-comment')),
+  target_fingerprint TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  intent_sha256 TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS remote_receipts (
+  receipt_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK(kind IN ('candidate-publication', 'pull-request-binding')),
+  candidate_commit_oid TEXT NOT NULL,
+  authoritative_post_observation_sha256 TEXT NOT NULL,
+  receipt_json TEXT NOT NULL,
+  receipt_sha256 TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (run_id, authoritative_post_observation_sha256)
+    REFERENCES remote_observations(run_id, observation_sha256) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS branch_leases (
@@ -1074,6 +1644,12 @@ CREATE TABLE IF NOT EXISTS gate_audit (
 );
 
 CREATE INDEX IF NOT EXISTS idx_stage_checkpoints_run ON stage_checkpoints(run_id);
+CREATE INDEX IF NOT EXISTS idx_stage_plan_run ON stage_plan_entries(run_id, position);
+CREATE INDEX IF NOT EXISTS idx_attempt_outcomes_run ON attempt_outcomes(run_id, completed_at);
+CREATE INDEX IF NOT EXISTS idx_remote_observations_run ON remote_observations(run_id, observed_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_remote_observations_run_digest
+  ON remote_observations(run_id, observation_sha256);
+CREATE INDEX IF NOT EXISTS idx_mutation_intents_run ON mutation_intents(run_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_stage_evidence_run ON stage_evidence(run_id);
 CREATE INDEX IF NOT EXISTS idx_stage_evidence_stage
   ON stage_evidence(run_id, stage_id, round_index);
@@ -1108,19 +1684,156 @@ CREATE TABLE IF NOT EXISTS passed_attestations (
 
 CREATE INDEX IF NOT EXISTS idx_passed_attestations_candidate
   ON passed_attestations(candidate_commit_oid, created_at);
+
+CREATE TRIGGER IF NOT EXISTS immutable_stage_plan_entries
+BEFORE UPDATE ON stage_plan_entries
+BEGIN SELECT RAISE(ABORT, 'stage_plan_entries rows are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_stage_dispositions
+BEFORE UPDATE ON stage_dispositions
+BEGIN SELECT RAISE(ABORT, 'stage_dispositions rows are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_publication_routes
+BEFORE UPDATE ON publication_routes
+BEGIN SELECT RAISE(ABORT, 'publication_routes rows are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_publication_baselines
+BEFORE UPDATE ON publication_baselines
+BEGIN SELECT RAISE(ABORT, 'publication_baselines rows are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_run_attempts
+BEFORE UPDATE ON run_attempts
+BEGIN SELECT RAISE(ABORT, 'run_attempts rows are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_attempt_outcomes
+BEFORE UPDATE ON attempt_outcomes
+BEGIN SELECT RAISE(ABORT, 'attempt_outcomes rows are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_remote_observations
+BEFORE UPDATE ON remote_observations
+BEGIN SELECT RAISE(ABORT, 'remote_observations rows are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_mutation_intents
+BEFORE UPDATE ON mutation_intents
+BEGIN SELECT RAISE(ABORT, 'mutation_intents rows are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_remote_receipts
+BEFORE UPDATE ON remote_receipts
+BEGIN SELECT RAISE(ABORT, 'remote_receipts rows are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_stage_plan_entries_delete
+BEFORE DELETE ON stage_plan_entries
+WHEN EXISTS (SELECT 1 FROM runs WHERE run_id = OLD.run_id)
+BEGIN SELECT RAISE(ABORT, 'stage_plan_entries rows are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_stage_dispositions_delete
+BEFORE DELETE ON stage_dispositions
+WHEN EXISTS (SELECT 1 FROM runs WHERE run_id = OLD.run_id)
+BEGIN SELECT RAISE(ABORT, 'stage_dispositions rows are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_publication_routes_delete
+BEFORE DELETE ON publication_routes
+WHEN EXISTS (SELECT 1 FROM runs WHERE run_id = OLD.run_id)
+BEGIN SELECT RAISE(ABORT, 'publication_routes rows are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_publication_baselines_delete
+BEFORE DELETE ON publication_baselines
+WHEN EXISTS (SELECT 1 FROM runs WHERE run_id = OLD.run_id)
+BEGIN SELECT RAISE(ABORT, 'publication_baselines rows are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_run_attempts_delete
+BEFORE DELETE ON run_attempts
+WHEN EXISTS (SELECT 1 FROM runs WHERE run_id = OLD.run_id)
+BEGIN SELECT RAISE(ABORT, 'run_attempts rows are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_attempt_outcomes_delete
+BEFORE DELETE ON attempt_outcomes
+WHEN EXISTS (SELECT 1 FROM runs WHERE run_id = OLD.run_id)
+BEGIN SELECT RAISE(ABORT, 'attempt_outcomes rows are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_remote_observations_delete
+BEFORE DELETE ON remote_observations
+WHEN EXISTS (SELECT 1 FROM runs WHERE run_id = OLD.run_id)
+BEGIN SELECT RAISE(ABORT, 'remote_observations rows are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_mutation_intents_delete
+BEFORE DELETE ON mutation_intents
+WHEN EXISTS (SELECT 1 FROM runs WHERE run_id = OLD.run_id)
+BEGIN SELECT RAISE(ABORT, 'mutation_intents rows are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_remote_receipts_delete
+BEFORE DELETE ON remote_receipts
+WHEN EXISTS (SELECT 1 FROM runs WHERE run_id = OLD.run_id)
+BEGIN SELECT RAISE(ABORT, 'remote_receipts rows are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS enforce_remote_observation_attempt
+BEFORE INSERT ON remote_observations
+WHEN NOT EXISTS (
+  SELECT 1 FROM run_attempts
+  WHERE attempt_id = NEW.attempt_id AND run_id = NEW.run_id
+)
+BEGIN SELECT RAISE(ABORT, 'attempt does not belong to run'); END;
+
+CREATE TRIGGER IF NOT EXISTS enforce_mutation_intent_attempt
+BEFORE INSERT ON mutation_intents
+WHEN NOT EXISTS (
+  SELECT 1 FROM run_attempts
+  WHERE attempt_id = NEW.attempt_id AND run_id = NEW.run_id
+)
+BEGIN SELECT RAISE(ABORT, 'attempt does not belong to run'); END;
+
+CREATE TRIGGER IF NOT EXISTS enforce_remote_receipt_observation
+BEFORE INSERT ON remote_receipts
+WHEN NOT EXISTS (
+  SELECT 1 FROM remote_observations
+  WHERE run_id = NEW.run_id
+    AND observation_sha256 = NEW.authoritative_post_observation_sha256
+)
+BEGIN SELECT RAISE(ABORT, 'receipt observation does not belong to run'); END;
 `
 
 export class DomainLedger {
   readonly #db: DatabaseSync
   readonly #path: string
 
-  constructor(dbPath: string = defaultLedgerPath()) {
+  constructor(
+    location?: string | { legacyPath?: string; repositoryPath: string }
+  ) {
+    const resolved: { dbPath: string; legacyPath?: string; repoRoot?: string } =
+      location === undefined
+        ? defaultLedgerLocation()
+        : typeof location === 'string'
+        ? { dbPath: location }
+        : (() => {
+            const repository = repositoryLocation(location.repositoryPath)
+            return {
+              dbPath: repository.ledgerPath,
+              legacyPath: location.legacyPath ?? legacyLedgerPath(),
+              repoRoot: repository.repoRoot
+            }
+          })()
+    const dbPath = resolved.dbPath
     if (dbPath !== ':memory:') {
       mkdirSync(path.dirname(dbPath), { recursive: true })
     }
     this.#path = dbPath
     this.#db = new DatabaseSync(dbPath, { timeout: 5_000 })
-    this.#db.exec('PRAGMA journal_mode = WAL')
+    const walDeadline = Date.now() + 5_000
+    const walWait = new Int32Array(new SharedArrayBuffer(4))
+    for (;;) {
+      try {
+        this.#db.exec('PRAGMA journal_mode = WAL')
+        break
+      } catch (error) {
+        if (
+          !(error instanceof Error && 'errcode' in error && error.errcode === 5) ||
+          Date.now() >= walDeadline
+        ) {
+          throw error
+        }
+        Atomics.wait(walWait, 0, 0, 10)
+      }
+    }
     this.#db.exec('PRAGMA foreign_keys = ON')
     // ponytail: pre-release rebuild — legacy ledgers keyed attestations by candidate OID,
     // which let a repeat attestation overwrite the original run's lookup.
@@ -1172,7 +1885,95 @@ export class DomainLedger {
         throw error
       }
     }
+    const singleRemoteReceipt = this.#db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'remote_receipts'")
+      .get() as { sql: string } | undefined
+    if (singleRemoteReceipt?.sql.includes('UNIQUE (run_id, kind)')) {
+      this.#db.exec('BEGIN IMMEDIATE')
+      try {
+        this.#db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_remote_observations_run_digest
+          ON remote_observations(run_id, observation_sha256)`)
+        this.#db.exec(`DROP TRIGGER IF EXISTS immutable_remote_receipts;
+          DROP TRIGGER IF EXISTS immutable_remote_receipts_delete;
+          DROP TRIGGER IF EXISTS enforce_remote_receipt_observation;
+          DROP TRIGGER IF EXISTS fence_terminal_remote_receipts;
+          ALTER TABLE remote_receipts RENAME TO remote_receipts_legacy`)
+        this.#db.exec(SCHEMA)
+        this.#db.exec(`INSERT INTO remote_receipts (
+            receipt_id, run_id, kind, candidate_commit_oid,
+            authoritative_post_observation_sha256, receipt_json, receipt_sha256, created_at
+          )
+          SELECT receipt_id, run_id, kind, candidate_commit_oid,
+                 authoritative_post_observation_sha256, receipt_json, receipt_sha256, created_at
+          FROM remote_receipts_legacy`)
+        this.#db.exec('DROP TABLE remote_receipts_legacy')
+        this.#db.exec('COMMIT')
+      } catch (error) {
+        this.#db.exec('ROLLBACK')
+        throw error
+      }
+    }
     this.#db.exec(SCHEMA)
+    this.#db.exec('DROP TRIGGER IF EXISTS fence_run_attempt_generation')
+    this.#db.exec(`CREATE TRIGGER IF NOT EXISTS fence_run_attempt_generation
+      BEFORE INSERT ON run_attempts
+      WHEN NOT EXISTS (
+        SELECT 1 FROM runs r
+        JOIN branch_leases l ON l.repo_root = r.repo_root AND l.branch = r.branch
+        WHERE r.run_id = NEW.run_id AND l.run_id = NEW.run_id
+          AND l.generation_token = NEW.generation_token
+      ) AND NOT EXISTS (
+        SELECT 1 FROM runs r
+        JOIN repository_migration_imports m ON m.repo_root = r.repo_root
+        WHERE r.run_id = NEW.run_id
+      )
+      BEGIN SELECT RAISE(ABORT, 'attempt is not from the current branch lease generation'); END;`)
+    for (const table of ['attempt_outcomes', 'remote_observations', 'mutation_intents']) {
+      this.#db.exec(`DROP TRIGGER IF EXISTS fence_current_${table}`)
+      this.#db.exec(`CREATE TRIGGER IF NOT EXISTS fence_current_${table}
+        BEFORE INSERT ON ${table}
+        WHEN EXISTS (
+          SELECT 1 FROM run_attempts
+          WHERE attempt_id = NEW.attempt_id AND run_id = NEW.run_id
+        ) AND NOT EXISTS (
+          SELECT 1 FROM run_attempts a
+          JOIN runs r ON r.run_id = a.run_id
+          JOIN branch_leases l ON l.repo_root = r.repo_root AND l.branch = r.branch
+          WHERE a.attempt_id = NEW.attempt_id AND a.run_id = NEW.run_id
+            AND l.run_id = NEW.run_id AND l.generation_token = a.generation_token
+        ) AND NOT EXISTS (
+          SELECT 1 FROM runs r
+          JOIN repository_migration_imports m ON m.repo_root = r.repo_root
+          WHERE r.run_id = NEW.run_id
+        )
+        BEGIN SELECT RAISE(ABORT, 'attempt is not from the current branch lease generation'); END;`)
+    }
+    this.#db.exec('DROP TRIGGER IF EXISTS fence_current_remote_receipts')
+    this.#db.exec(`CREATE TRIGGER IF NOT EXISTS fence_current_remote_receipts
+      BEFORE INSERT ON remote_receipts
+      WHEN NOT EXISTS (
+        SELECT 1 FROM remote_observations o
+        JOIN run_attempts a ON a.attempt_id = o.attempt_id AND a.run_id = o.run_id
+        JOIN runs r ON r.run_id = o.run_id
+        JOIN branch_leases l ON l.repo_root = r.repo_root AND l.branch = r.branch
+        WHERE o.run_id = NEW.run_id
+          AND o.observation_sha256 = NEW.authoritative_post_observation_sha256
+          AND l.run_id = NEW.run_id AND l.generation_token = a.generation_token
+      ) AND NOT EXISTS (
+        SELECT 1 FROM runs r
+        JOIN repository_migration_imports m ON m.repo_root = r.repo_root
+        WHERE r.run_id = NEW.run_id
+      )
+      BEGIN SELECT RAISE(ABORT, 'receipt is not from the current branch lease generation'); END;`)
+    for (const table of RELEASE_2_FACT_TABLES) {
+      this.#db.exec(`DROP TRIGGER IF EXISTS fence_terminal_${table}`)
+      this.#db.exec(`CREATE TRIGGER IF NOT EXISTS fence_terminal_${table}
+        BEFORE INSERT ON ${table}
+        WHEN EXISTS (
+          SELECT 1 FROM runs WHERE run_id = NEW.run_id AND status != 'in-progress'
+        )
+        BEGIN SELECT RAISE(ABORT, 'cannot add Release 2 facts to a terminal run'); END;`)
+    }
     // ponytail: nullable columns added post-release use the idempotent ALTER
     // path. Only the expected duplicate-column failure is tolerated.
     for (const [table, column] of [
@@ -1223,6 +2024,300 @@ export class DomainLedger {
         throw error
       }
     }
+    if (resolved.repoRoot && resolved.legacyPath && path.resolve(resolved.legacyPath) !== path.resolve(dbPath)) {
+      this.#migrateLegacyRepository(resolved.repoRoot, resolved.legacyPath)
+    }
+  }
+
+  #migrateLegacyRepository(repoRoot: string, sourcePath: string): void {
+    const sourcePresent = existsSync(sourcePath)
+    if (sourcePresent) this.#db.prepare('ATTACH DATABASE ? AS legacy').run(sourcePath)
+    const migratedSourceRunIds = (): string[] =>
+      sourcePresent
+        ? (this.#db.prepare(
+            `SELECT source.run_id
+             FROM legacy.runs AS source
+             WHERE source.repo_root = ?
+               AND EXISTS (
+                 SELECT 1 FROM main.runs AS destination
+                 WHERE destination.repo_root = ?
+                   AND destination.run_id = source.run_id
+               )`
+          ).all(repoRoot, repoRoot) as { run_id: string }[]).map(({ run_id }) => run_id)
+        : []
+    const cleanupMigratedSourceRuns = (runIds: string[]): void => {
+      if (runIds.length === 0) return
+      const source = new DatabaseSync(sourcePath, { timeout: 5_000 })
+      let cleanupTransaction = false
+      try {
+        source.exec('PRAGMA foreign_keys = ON')
+        source.exec('BEGIN IMMEDIATE')
+        cleanupTransaction = true
+        const deleteRun = source.prepare('DELETE FROM runs WHERE repo_root = ? AND run_id = ?')
+        for (const runId of runIds) deleteRun.run(repoRoot, runId)
+        source.exec('COMMIT')
+        cleanupTransaction = false
+      } catch (error) {
+        if (cleanupTransaction) {
+          try {
+            source.exec('ROLLBACK')
+          } catch {}
+        }
+        console.error(
+          `no-mistakes: repository migration committed, but legacy archive cleanup remains pending: ${String(error)}`
+        )
+      } finally {
+        source.close()
+      }
+    }
+    const migrationMarker = this.#db.prepare(
+      'SELECT source_present FROM repository_migrations WHERE source_path = ? AND repo_root = ?'
+    )
+    let transaction = false
+    try {
+      const marker = migrationMarker.get(sourcePath, repoRoot) as
+        | { source_present: number }
+        | undefined
+      if (marker && (marker.source_present === 1 || !sourcePresent)) {
+        if (
+          marker.source_present !== 1 ||
+          !sourcePresent ||
+          !this.#db.prepare(
+            'SELECT 1 FROM legacy.runs WHERE repo_root = ? LIMIT 1'
+          ).get(repoRoot)
+        ) return
+        cleanupMigratedSourceRuns(migratedSourceRunIds())
+        return
+      }
+      this.#db.exec('BEGIN IMMEDIATE')
+      transaction = true
+      const lockedMarker = migrationMarker.get(sourcePath, repoRoot) as
+        | { source_present: number }
+        | undefined
+      if (lockedMarker && (lockedMarker.source_present === 1 || !sourcePresent)) {
+        const runIds = lockedMarker.source_present === 1 ? migratedSourceRunIds() : []
+        this.#db.exec('COMMIT')
+        transaction = false
+        cleanupMigratedSourceRuns(runIds)
+        return
+      }
+      if (!sourcePresent) {
+        this.#db.prepare(
+          `INSERT INTO repository_migrations
+             (source_path, repo_root, source_present, completed_at)
+           VALUES (?, ?, 0, ?)`
+        ).run(sourcePath, repoRoot, new Date().toISOString())
+        this.#db.exec('COMMIT')
+        transaction = false
+        return
+      }
+      const destinationActive = this.#db.prepare(
+        `SELECT r.run_id, r.status,
+                EXISTS(SELECT 1 FROM main.branch_leases l WHERE l.run_id = r.run_id) AS has_lease
+           FROM main.runs r
+          WHERE r.repo_root = ?
+            AND (r.status = 'in-progress' OR EXISTS(
+              SELECT 1 FROM main.branch_leases l WHERE l.run_id = r.run_id
+            ))
+          ORDER BY r.created_at, r.rowid
+          LIMIT 1`
+      ).get(repoRoot) as
+        | { has_lease: number; run_id: string; status: RunStatus }
+        | undefined
+      if (destinationActive) {
+        const problem = destinationActive.has_lease
+          ? `run ${destinationActive.run_id} still holds a live semantic lease`
+          : `run ${destinationActive.run_id} is still in-progress`
+        throw new DestinationActiveMigrationError(
+          `cannot migrate repository state: ${problem}; finish, cancel, or recover it through the repository ledger before retrying migration`
+        )
+      }
+      const active = this.#db.prepare(
+        `SELECT r.run_id, r.status,
+                EXISTS(SELECT 1 FROM legacy.branch_leases l WHERE l.run_id = r.run_id) AS has_lease
+           FROM legacy.runs r
+          WHERE r.repo_root = ?
+            AND (r.status = 'in-progress' OR EXISTS(
+              SELECT 1 FROM legacy.branch_leases l WHERE l.run_id = r.run_id
+            ))
+          ORDER BY r.created_at, r.rowid
+          LIMIT 1`
+      ).get(repoRoot) as
+        | { has_lease: number; run_id: string; status: RunStatus }
+        | undefined
+      if (active) {
+        const problem = active.has_lease
+          ? `run ${active.run_id} still holds a live semantic lease`
+          : `run ${active.run_id} is still in-progress`
+        throw new LegacyActiveMigrationError(
+          `cannot migrate repository state: ${problem}; recover it with "orca-no-mistakes prune --stranded --repo <repo>" before retrying migration`
+        )
+      }
+
+      const sourceTables = new Set(
+        (this.#db.prepare(
+          "SELECT name FROM legacy.sqlite_master WHERE type = 'table'"
+        ).all() as { name: string }[]).map(({ name }) => name)
+      )
+      const copy = (table: string, where: string): void => {
+        if (!sourceTables.has(table)) return
+        if (table === 'lease_generations') {
+          this.#db.prepare(
+            `INSERT INTO main.lease_generations (repo_root, next_token)
+             SELECT repo_root, next_token FROM legacy.lease_generations WHERE repo_root = ?
+             ON CONFLICT(repo_root) DO UPDATE SET
+               next_token = MAX(main.lease_generations.next_token, excluded.next_token)`
+          ).run(repoRoot)
+          return
+        }
+        if (table === 'stage_checkpoints') {
+          this.#db.prepare(
+            `INSERT INTO main.stage_checkpoints (
+               run_id, stage_id, round_index, input_commit_oid, output_commit_oid, created_at
+             )
+             SELECT source.run_id, source.stage_id, source.round_index,
+                    source.input_commit_oid, source.output_commit_oid, source.created_at
+             FROM legacy.stage_checkpoints AS source
+             WHERE source.run_id IN (
+               SELECT run_id FROM legacy.runs WHERE repo_root = ?
+             ) AND NOT EXISTS (
+               SELECT 1 FROM main.stage_checkpoints AS destination
+               WHERE destination.run_id = source.run_id
+                 AND destination.stage_id = source.stage_id
+                 AND destination.round_index = source.round_index
+                 AND destination.input_commit_oid = source.input_commit_oid
+                 AND destination.output_commit_oid = source.output_commit_oid
+                 AND destination.created_at = source.created_at
+             )`
+          ).run(repoRoot)
+          return
+        }
+        const destinationColumns = new Set(
+          (this.#db.prepare(`PRAGMA main.table_info(${table})`).all() as { name: string }[])
+            .map(({ name }) => name)
+        )
+        const columns = (this.#db.prepare(
+          `PRAGMA legacy.table_info(${table})`
+        ).all() as { name: string }[])
+          .map(({ name }) => name)
+          .filter((name) => destinationColumns.has(name) &&
+            !(table === 'presentation_snapshots' && name === 'id'))
+        if (columns.length === 0) return
+        const names = columns.join(', ')
+        const selections = columns.map((name) =>
+          table === 'runs' && name === 'status'
+            ? "'in-progress'"
+            : table === 'runs' && name === 'completed_at'
+            ? 'NULL'
+            : `source.${name}`
+        ).join(', ')
+        const exactRow = columns.map(
+          (name) => `destination.${name} IS source.${name}`
+        ).join(' AND ')
+        this.#db.prepare(
+          `INSERT INTO main.${table} (${names})
+           SELECT ${selections} FROM legacy.${table} AS source ${where}
+           AND NOT EXISTS (
+             SELECT 1 FROM main.${table} AS destination WHERE ${exactRow}
+           )`
+        ).run(repoRoot)
+      }
+
+      this.#db.prepare(
+        'INSERT INTO repository_migration_imports (repo_root) VALUES (?)'
+      ).run(repoRoot)
+      copy('runs', 'WHERE repo_root = ?')
+      this.#db.prepare(
+        `UPDATE main.runs SET status = 'in-progress', completed_at = NULL
+         WHERE run_id IN (SELECT run_id FROM legacy.runs WHERE repo_root = ?)`
+      ).run(repoRoot)
+      copy('stage_plan_entries', 'WHERE run_id IN (SELECT run_id FROM legacy.runs WHERE repo_root = ?)')
+      copy('branch_leases', 'WHERE repo_root = ?')
+      copy('lease_generations', 'WHERE repo_root = ?')
+      for (const table of [
+        'resume_claims',
+        'stage_dispositions',
+        'publication_routes',
+        'publication_baselines',
+        'run_attempts',
+        'attempt_outcomes',
+        'remote_observations',
+        'mutation_intents',
+        'remote_receipts',
+        'stage_checkpoints',
+        'stage_evidence',
+        'gate_audit',
+        'presentation_snapshots',
+        'passed_attestations'
+      ]) {
+        copy(table, 'WHERE run_id IN (SELECT run_id FROM legacy.runs WHERE repo_root = ?)')
+      }
+      const legacyStages = LEGACY_STAGE_PLAN.flatMap((stage, position) => [position, stage])
+      this.#db.prepare(
+        `WITH legacy_stages(position, stage_id) AS (
+           VALUES ${LEGACY_STAGE_PLAN.map(() => '(?, ?)').join(', ')}
+         )
+         INSERT OR IGNORE INTO stage_plan_entries (run_id, position, stage_id, requirement)
+         SELECT source.run_id, legacy_stages.position, legacy_stages.stage_id, 'required'
+         FROM legacy.runs AS source CROSS JOIN legacy_stages
+         WHERE source.repo_root = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM main.stage_plan_entries AS retained
+             WHERE retained.run_id = source.run_id
+           )`
+      ).run(...legacyStages, repoRoot)
+      this.#db.prepare(
+        `UPDATE main.runs AS destination
+         SET status = (
+               SELECT source.status FROM legacy.runs AS source
+               WHERE source.run_id = destination.run_id
+             ),
+             completed_at = (
+               SELECT source.completed_at FROM legacy.runs AS source
+               WHERE source.run_id = destination.run_id
+             )
+         WHERE destination.repo_root = ?
+           AND EXISTS (
+             SELECT 1 FROM legacy.runs AS source
+             WHERE source.run_id = destination.run_id
+           )`
+      ).run(repoRoot)
+      const runIds = migratedSourceRunIds()
+      this.#db.prepare(
+        `INSERT INTO repository_migrations
+           (source_path, repo_root, source_present, completed_at)
+         VALUES (?, ?, 1, ?)
+         ON CONFLICT(source_path, repo_root) DO UPDATE SET
+           source_present = excluded.source_present,
+           completed_at = excluded.completed_at`
+      ).run(sourcePath, repoRoot, new Date().toISOString())
+      this.#db.prepare(
+        'DELETE FROM repository_migration_imports WHERE repo_root = ?'
+      ).run(repoRoot)
+      this.#db.exec('COMMIT')
+      transaction = false
+      cleanupMigratedSourceRuns(runIds)
+    } catch (error) {
+      if (transaction) this.#db.exec('ROLLBACK')
+      if (
+        error instanceof Error &&
+        /UNIQUE constraint failed: (?:main\.)?runs\.run_id/i.test(error.message)
+      ) {
+        const conflict = this.#db.prepare(
+          `SELECT source.run_id, destination.repo_root AS destination_repo_root
+             FROM legacy.runs AS source
+             JOIN main.runs AS destination ON destination.run_id = source.run_id
+            WHERE source.repo_root = ?
+            LIMIT 1`
+        ).get(repoRoot) as { destination_repo_root: string; run_id: string } | undefined
+        throw new RepositoryMigrationConflictError(
+          `cannot migrate repository state: run ID ${conflict?.run_id ?? 'conflict'} already belongs to ${conflict?.destination_repo_root ?? 'the repository ledger'} with different history; reconcile the conflicting ledger rows before retrying migration`
+        )
+      }
+      throw error
+    } finally {
+      if (sourcePresent) this.#db.exec('DETACH DATABASE legacy')
+    }
   }
 
   tableDefinition(tableName: string): string | undefined {
@@ -1243,26 +2338,724 @@ export class DomainLedger {
     policySha256: string
     repoRoot: string
     runId: string
+    stagePlan?: readonly { requirement: StageRequirement; stageId: string }[]
     submissionCommitOid: string
   }): void {
-    this.#db
-      .prepare(
-        `INSERT INTO runs (
-           run_id, repo_root, branch, base_branch, submission_commit_oid, terminal_commit_oid,
-           intent, intent_hash, policy_sha256, status, created_at, completed_at
-         ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, 'in-progress', ?, NULL)`
+    const plan = input.stagePlan ?? LEGACY_STAGE_PLAN.map((stageId) => ({
+      requirement: 'required' as const,
+      stageId
+    }))
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      this.#db
+        .prepare(
+          `INSERT INTO runs (
+             run_id, repo_root, branch, base_branch, submission_commit_oid, terminal_commit_oid,
+             intent, intent_hash, policy_sha256, status, created_at, completed_at
+           ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, 'in-progress', ?, NULL)`
+        )
+        .run(
+          input.runId,
+          input.repoRoot,
+          input.branch,
+          input.baseBranch,
+          input.submissionCommitOid,
+          input.intent,
+          intentHash(input.intent),
+          input.policySha256,
+          new Date().toISOString()
+        )
+      const insert = this.#db.prepare(
+        `INSERT INTO stage_plan_entries (run_id, position, stage_id, requirement)
+         VALUES (?, ?, ?, ?)`
       )
-      .run(
+      for (const [position, entry] of plan.entries()) {
+        insert.run(input.runId, position, entry.stageId, entry.requirement)
+      }
+      this.#db.exec('COMMIT')
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  stagePlan(runId: string): StagePlanEntryRow[] {
+    return this.#db.prepare(
+      `SELECT position, stage_id, requirement
+       FROM stage_plan_entries WHERE run_id = ? ORDER BY position`
+    ).all(runId) as StagePlanEntryRow[]
+  }
+
+  recordStageDisposition(input: {
+    disposition: StageDisposition
+    evidenceSha256?: string
+    runId: string
+    stageId: string
+  }): void {
+    this.#db.prepare(
+      `INSERT INTO stage_dispositions
+         (run_id, stage_id, disposition, evidence_sha256, recorded_at)
+       VALUES (?, ?, ?, ?, ?)`
+    ).run(
+      input.runId,
+      input.stageId,
+      input.disposition,
+      input.evidenceSha256 ?? null,
+      new Date().toISOString()
+    )
+  }
+
+  stageDispositions(runId: string): StageDispositionRow[] {
+    return this.#db.prepare(
+      `SELECT d.stage_id, d.disposition, d.evidence_sha256
+       FROM stage_dispositions d
+       JOIN stage_plan_entries p ON p.run_id = d.run_id AND p.stage_id = d.stage_id
+       WHERE d.run_id = ? ORDER BY p.position`
+    ).all(runId) as StageDispositionRow[]
+  }
+
+  recordPublicationRoute(input: {
+    baseBranch: string
+    baseRepositoryId: string
+    forgeHost: string
+    headBranch: string
+    headOwner: string
+    headRepositoryId: string
+    runId: string
+  }): string {
+    const route = {
+      baseBranch: input.baseBranch,
+      baseRepositoryId: input.baseRepositoryId,
+      forgeHost: input.forgeHost,
+      headBranch: input.headBranch,
+      headOwner: input.headOwner,
+      headRepositoryId: input.headRepositoryId
+    }
+    const fingerprint = sha256(canonicalJson(route))
+    this.#db.prepare(
+      `INSERT INTO publication_routes (
+         run_id, route_fingerprint, forge_host, base_repository_id, head_repository_id,
+         head_owner, head_branch, base_branch, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      input.runId,
+      fingerprint,
+      input.forgeHost,
+      input.baseRepositoryId,
+      input.headRepositoryId,
+      input.headOwner,
+      input.headBranch,
+      input.baseBranch,
+      new Date().toISOString()
+    )
+    return fingerprint
+  }
+
+  publicationRoute(runId: string): {
+    base_branch: string
+    base_repository_id: string
+    forge_host: string
+    head_branch: string
+    head_owner: string
+    head_repository_id: string
+    route_fingerprint: string
+  } | undefined {
+    return this.#db.prepare(
+      `SELECT route_fingerprint, forge_host, base_repository_id, head_repository_id,
+              head_owner, head_branch, base_branch
+       FROM publication_routes WHERE run_id = ?`
+    ).get(runId) as ReturnType<DomainLedger['publicationRoute']>
+  }
+
+  recordPublicationBaseline(input: {
+    headCommitOid: string | null
+    observedAt: string
+    routeFingerprint: string
+    runId: string
+  }): void {
+    const route = this.publicationRoute(input.runId)
+    if (!route || route.route_fingerprint !== input.routeFingerprint) {
+      throw new Error(`run ${input.runId} has no matching publication route`)
+    }
+    this.#db.prepare(
+      `INSERT INTO publication_baselines (
+         run_id, route_fingerprint, head_commit_oid, authoritative_absence, observed_at
+       ) VALUES (?, ?, ?, ?, ?)`
+    ).run(
+      input.runId,
+      input.routeFingerprint,
+      input.headCommitOid,
+      input.headCommitOid === null ? 1 : 0,
+      input.observedAt
+    )
+  }
+
+  publicationBaseline(runId: string): {
+    authoritative_absence: number
+    head_commit_oid: string | null
+    observed_at: string
+    route_fingerprint: string
+  } | undefined {
+    return this.#db.prepare(
+      `SELECT route_fingerprint, head_commit_oid, authoritative_absence, observed_at
+       FROM publication_baselines WHERE run_id = ?`
+    ).get(runId) as ReturnType<DomainLedger['publicationBaseline']>
+  }
+
+  startAttempt(input: {
+    actorIdentity: string
+    attemptId: string
+    coordinatorIdentity: string
+    generationToken: number
+    runId: string
+    startedAt: string
+  }): void {
+    this.#db.prepare(
+      `INSERT INTO run_attempts (
+         attempt_id, run_id, generation_token, coordinator_identity, actor_identity, started_at
+       ) VALUES (?, ?, ?, ?, ?, ?)`
+    ).run(
+      input.attemptId,
+      input.runId,
+      input.generationToken,
+      input.coordinatorIdentity,
+      input.actorIdentity,
+      input.startedAt
+    )
+  }
+
+  recordAttemptOutcome(input: {
+    actorIdentity: string
+    attemptId: string
+    candidateCommitOid: string
+    completedAt: string
+    coordinatorIdentity: string
+    custody: Record<string, unknown>
+    reason: string
+    receiptDigests: string[]
+    resumeEligible: boolean
+    runId: string
+    stoppingFact: string
+    verdict: Exclude<RunStatus, 'in-progress'>
+  }): string {
+    const attempt = this.#db.prepare(
+      `SELECT run_id, actor_identity, coordinator_identity
+       FROM run_attempts WHERE attempt_id = ?`
+    ).get(input.attemptId) as
+      | { actor_identity: string; coordinator_identity: string; run_id: string }
+      | undefined
+    if (attempt?.run_id !== input.runId) {
+      throw new Error(`attempt ${input.attemptId} does not belong to run ${input.runId}`)
+    }
+    if (attempt.actor_identity !== input.actorIdentity ||
+        attempt.coordinator_identity !== input.coordinatorIdentity) {
+      throw new Error(`attempt ${input.attemptId} identity does not match its outcome`)
+    }
+    const outcome = {
+      actorIdentity: input.actorIdentity,
+      attemptId: input.attemptId,
+      candidateCommitOid: input.candidateCommitOid,
+      completedAt: input.completedAt,
+      coordinatorIdentity: input.coordinatorIdentity,
+      custody: input.custody,
+      reason: input.reason,
+      receiptDigests: input.receiptDigests,
+      resumeEligible: input.resumeEligible,
+      runId: input.runId,
+      stoppingFact: input.stoppingFact,
+      verdict: input.verdict
+    }
+    const outcomeSha256 = sha256(canonicalJson(outcome))
+    this.#db.prepare(
+      `INSERT INTO attempt_outcomes (
+         outcome_id, attempt_id, run_id, verdict, stopping_fact, reason, candidate_commit_oid,
+         coordinator_identity, actor_identity, custody_json, receipt_digests_json,
+         resume_eligible, completed_at, outcome_sha256
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      randomUUID(),
+      input.attemptId,
+      input.runId,
+      input.verdict,
+      input.stoppingFact,
+      input.reason,
+      input.candidateCommitOid,
+      input.coordinatorIdentity,
+      input.actorIdentity,
+      canonicalJson(input.custody),
+      canonicalJson(input.receiptDigests),
+      input.resumeEligible ? 1 : 0,
+      input.completedAt,
+      outcomeSha256
+    )
+    return outcomeSha256
+  }
+
+  listAttemptOutcomes(runId: string): { outcome_sha256: string }[] {
+    return this.#db.prepare(
+      'SELECT outcome_sha256 FROM attempt_outcomes WHERE run_id = ? ORDER BY completed_at, rowid'
+    ).all(runId) as { outcome_sha256: string }[]
+  }
+
+  recordRemoteObservation(input: {
+    attemptId: string
+    kind: string
+    observedAt: string
+    payload: Record<string, unknown>
+    runId: string
+    subject: string
+  }): string {
+    const observation = {
+      attemptId: input.attemptId,
+      kind: input.kind,
+      observedAt: input.observedAt,
+      payload: input.payload,
+      runId: input.runId,
+      subject: input.subject
+    }
+    const observationSha256 = sha256(canonicalJson(observation))
+    this.#db.prepare(
+      `INSERT INTO remote_observations (
+         observation_id, run_id, attempt_id, kind, subject, payload_json,
+         observed_at, observation_sha256
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      randomUUID(),
+      input.runId,
+      input.attemptId,
+      input.kind,
+      input.subject,
+      canonicalJson(input.payload),
+      input.observedAt,
+      observationSha256
+    )
+    return observationSha256
+  }
+
+  listRemoteObservations(runId: string): { observation_sha256: string }[] {
+    return this.#db.prepare(
+      `SELECT observation_sha256 FROM remote_observations
+       WHERE run_id = ? ORDER BY observed_at, rowid`
+    ).all(runId) as { observation_sha256: string }[]
+  }
+
+  recordMutationIntent(input: {
+    attemptId: string
+    createdAt: string
+    kind: 'candidate-publication' | 'managed-comment' | 'pull-request'
+    payload: Record<string, unknown>
+    runId: string
+    targetFingerprint: string
+  }): string {
+    const mutation = {
+      attemptId: input.attemptId,
+      createdAt: input.createdAt,
+      kind: input.kind,
+      payload: input.payload,
+      runId: input.runId,
+      targetFingerprint: input.targetFingerprint
+    }
+    const intentSha256 = sha256(canonicalJson(mutation))
+    this.#db.prepare(
+      `INSERT INTO mutation_intents (
+         mutation_intent_id, run_id, attempt_id, kind, target_fingerprint,
+         payload_json, created_at, intent_sha256
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      randomUUID(),
+      input.runId,
+      input.attemptId,
+      input.kind,
+      input.targetFingerprint,
+      canonicalJson(input.payload),
+      input.createdAt,
+      intentSha256
+    )
+    return intentSha256
+  }
+
+  listMutationIntents(runId: string): { intent_sha256: string }[] {
+    return this.#db.prepare(
+      'SELECT intent_sha256 FROM mutation_intents WHERE run_id = ? ORDER BY created_at, rowid'
+    ).all(runId) as { intent_sha256: string }[]
+  }
+
+  #remoteObservationMatches(input: {
+    allowHistoricalAttempt?: boolean
+    candidateCommitOid: string
+    kind: RemoteReceiptKind
+    observationSha256: string
+    receiptPayload: Record<string, unknown>
+    runId: string
+  }): boolean {
+    const route = this.publicationRoute(input.runId)
+    if (!route || input.receiptPayload.routeFingerprint !== route.route_fingerprint) return false
+    const observation = this.#db.prepare(
+      `SELECT o.attempt_id, o.kind, o.subject, o.payload_json, o.observed_at, a.generation_token
+       FROM remote_observations o
+       JOIN run_attempts a ON a.attempt_id = o.attempt_id AND a.run_id = o.run_id
+       WHERE o.run_id = ? AND o.observation_sha256 = ?`
+    ).get(input.runId, input.observationSha256) as
+      | {
+          attempt_id: string
+          generation_token: number | bigint
+          kind: string
+          observed_at: string
+          payload_json: string
+          subject: string
+        }
+      | undefined
+    if (!observation) return false
+    if (!input.allowHistoricalAttempt) {
+      const latest = this.#db.prepare(
+        'SELECT MAX(generation_token) AS generation_token FROM run_attempts WHERE run_id = ?'
+      ).get(input.runId) as { generation_token: number | bigint | null }
+      if (latest.generation_token === null ||
+          Number(observation.generation_token) !== Number(latest.generation_token)) return false
+    }
+    const baseline = this.publicationBaseline(input.runId)
+    if (!baseline || baseline.route_fingerprint !== route.route_fingerprint) return false
+    let payload: Record<string, unknown>
+    try {
+      payload = JSON.parse(observation.payload_json) as Record<string, unknown>
+    } catch {
+      return false
+    }
+    if (sha256(canonicalJson({
+      attemptId: observation.attempt_id,
+      kind: observation.kind,
+      observedAt: observation.observed_at,
+      payload,
+      runId: input.runId,
+      subject: observation.subject
+    })) !== input.observationSha256) return false
+    if (input.kind === 'candidate-publication') {
+      const receipt = input.receiptPayload
+      if (!hasOnlyOwnProperties(receipt, new Set([
+        'mutationIntent', 'outcome', 'postRead', 'preRead', 'routeFingerprint'
+      ])) ||
+          !['created', 'updated', 'unchanged'].includes(String(receipt.outcome)) ||
+          typeof receipt.preRead !== 'string' || typeof receipt.mutationIntent !== 'string' ||
+          receipt.postRead !== input.observationSha256) return false
+      const preRead = this.#db.prepare(
+        `SELECT attempt_id, kind, subject, payload_json, observed_at
+         FROM remote_observations WHERE run_id = ? AND observation_sha256 = ?`
+      ).get(input.runId, receipt.preRead) as
+        | { attempt_id: string; kind: string; observed_at: string; payload_json: string; subject: string }
+        | undefined
+      const mutation = this.#db.prepare(
+        `SELECT attempt_id, kind, target_fingerprint, payload_json, created_at
+         FROM mutation_intents WHERE run_id = ? AND intent_sha256 = ?`
+      ).get(input.runId, receipt.mutationIntent) as
+        | {
+            attempt_id: string
+            created_at: string
+            kind: string
+            payload_json: string
+            target_fingerprint: string
+          }
+        | undefined
+      if (!preRead || !mutation || preRead.attempt_id !== observation.attempt_id ||
+          mutation.attempt_id !== observation.attempt_id ||
+          mutation.kind !== 'candidate-publication' ||
+          mutation.target_fingerprint !== route.route_fingerprint ||
+          preRead.observed_at > mutation.created_at || mutation.created_at > observation.observed_at) {
+        return false
+      }
+      let prePayload: Record<string, unknown>
+      let mutationPayload: Record<string, unknown>
+      try {
+        prePayload = JSON.parse(preRead.payload_json) as Record<string, unknown>
+        mutationPayload = JSON.parse(mutation.payload_json) as Record<string, unknown>
+      } catch {
+        return false
+      }
+      if (sha256(canonicalJson({
+        attemptId: preRead.attempt_id,
+        kind: preRead.kind,
+        observedAt: preRead.observed_at,
+        payload: prePayload,
+        runId: input.runId,
+        subject: preRead.subject
+      })) !== receipt.preRead || sha256(canonicalJson({
+        attemptId: mutation.attempt_id,
+        createdAt: mutation.created_at,
+        kind: mutation.kind,
+        payload: mutationPayload,
+        runId: input.runId,
+        targetFingerprint: mutation.target_fingerprint
+      })) !== receipt.mutationIntent) return false
+      const subject = `${route.forge_host}/${route.head_repository_id}:refs/heads/${route.head_branch}`
+      const routeFactsMatch = (candidate: Record<string, unknown>): boolean =>
+        candidate.forgeHost === route.forge_host &&
+        candidate.repositoryId === route.head_repository_id &&
+        candidate.headOwner === route.head_owner &&
+        candidate.headBranch === route.head_branch
+      const preReadMatches = baseline.authoritative_absence === 1
+        ? hasOnlyOwnProperties(prePayload, new Set([
+            'forgeHost', 'headBranch', 'headOwner', 'repositoryId', 'state'
+          ])) && prePayload.state === 'absent'
+        : hasOnlyOwnProperties(prePayload, new Set([
+            'forgeHost', 'headBranch', 'headOwner', 'oid', 'repositoryId'
+          ])) && prePayload.oid === baseline.head_commit_oid
+      return preRead.kind === 'publication-head' && preRead.subject === subject &&
+        observation.kind === 'publication-head' && observation.subject === subject &&
+        routeFactsMatch(prePayload) && routeFactsMatch(payload) && preReadMatches &&
+        receipt.outcome === (baseline.authoritative_absence === 1
+          ? 'created'
+          : baseline.head_commit_oid === input.candidateCommitOid
+          ? 'unchanged'
+          : 'updated') &&
+        hasOnlyOwnProperties(payload, new Set([
+          'forgeHost', 'headBranch', 'headOwner', 'oid', 'repositoryId'
+        ])) && payload.oid === input.candidateCommitOid &&
+        hasOnlyOwnProperties(mutationPayload, new Set(['expected', 'update'])) &&
+        mutationPayload.expected === (baseline.authoritative_absence === 1
+          ? 'absent'
+          : baseline.head_commit_oid) &&
+        mutationPayload.update === input.candidateCommitOid
+    }
+    const receipt = input.receiptPayload
+    if (!hasOnlyOwnProperties(receipt, new Set([
+      'mutationIntent', 'number', 'outcome', 'postRead', 'routeFingerprint'
+    ])) || !Number.isInteger(receipt.number) || Number(receipt.number) <= 0 ||
+        !['created', 'updated', 'unchanged'].includes(String(receipt.outcome)) ||
+        typeof receipt.mutationIntent !== 'string' ||
+        receipt.postRead !== input.observationSha256) return false
+    const mutation = this.#db.prepare(
+      `SELECT attempt_id, kind, target_fingerprint, payload_json, created_at
+       FROM mutation_intents WHERE run_id = ? AND intent_sha256 = ?`
+    ).get(input.runId, receipt.mutationIntent) as
+      | {
+          attempt_id: string
+          created_at: string
+          kind: string
+          payload_json: string
+          target_fingerprint: string
+        }
+      | undefined
+    const publication = this.remoteReceipt(input.runId, 'candidate-publication')
+    if (!mutation || !publication || publication.candidate_commit_oid !== input.candidateCommitOid ||
+        mutation.attempt_id !== observation.attempt_id || mutation.kind !== 'pull-request' ||
+        mutation.target_fingerprint !== route.route_fingerprint ||
+        mutation.created_at > observation.observed_at) return false
+    let mutationPayload: Record<string, unknown>
+    try {
+      mutationPayload = JSON.parse(mutation.payload_json) as Record<string, unknown>
+    } catch {
+      return false
+    }
+    if (sha256(canonicalJson({
+      attemptId: mutation.attempt_id,
+      createdAt: mutation.created_at,
+      kind: mutation.kind,
+      payload: mutationPayload,
+      runId: input.runId,
+      targetFingerprint: mutation.target_fingerprint
+    })) !== receipt.mutationIntent) return false
+    const routeFacts = {
+      baseBranch: route.base_branch,
+      baseRepositoryId: route.base_repository_id,
+      candidateCommitOid: input.candidateCommitOid,
+      forgeHost: route.forge_host,
+      headBranch: route.head_branch,
+      headOwner: route.head_owner,
+      headRepositoryId: route.head_repository_id
+    }
+    return observation.kind === 'pull-request' &&
+      observation.subject === `${route.forge_host}/${route.base_repository_id}#${String(receipt.number)}` &&
+      hasOnlyOwnProperties(payload, new Set([
+        ...Object.keys(routeFacts), 'number', 'state'
+      ])) &&
+      hasOnlyOwnProperties(mutationPayload, new Set([
+        ...Object.keys(routeFacts), 'action'
+      ])) &&
+      Object.entries(routeFacts).every(([key, value]) =>
+        payload[key] === value && mutationPayload[key] === value
+      ) &&
+      payload.number === receipt.number && payload.state === 'open' &&
+      mutationPayload.action === 'ensure-open'
+  }
+
+  settleRemoteStage(input: {
+    checkpoint: {
+      inputCommitOid: string
+      outputCommitOid: string
+      roundIndex: number
+    }
+    evidence: RecordEvidenceInput
+    receipt: {
+      authoritativePostObservationSha256: string
+      candidateCommitOid: string
+      kind: RemoteReceiptKind
+      payload: Record<string, unknown>
+    }
+    runId: string
+    stageId: 'pr' | 'push'
+  }): { evidenceId: string; receiptSha256: string } {
+    const expectedKind: RemoteReceiptKind =
+      input.stageId === 'push' ? 'candidate-publication' : 'pull-request-binding'
+    if (input.receipt.kind !== expectedKind) {
+      throw new Error(`${input.stageId} requires a ${expectedKind} receipt`)
+    }
+    if (
+      input.evidence.runId !== input.runId ||
+      input.evidence.stageId !== input.stageId ||
+      input.evidence.candidateCommitOid !== input.receipt.candidateCommitOid ||
+      input.checkpoint.inputCommitOid !== input.receipt.candidateCommitOid ||
+      input.checkpoint.outputCommitOid !== input.receipt.candidateCommitOid
+    ) {
+      throw new Error(`${input.stageId} receipt, evidence, and checkpoint must bind the same candidate`)
+    }
+    const expectedEvidenceSha256 = evidenceSha256({
+      artifactSha256: input.evidence.artifactSha256,
+      baseCommitOid: input.evidence.baseCommitOid,
+      candidateCommitOid: input.evidence.candidateCommitOid,
+      exitCode: input.evidence.exitCode,
+      round: input.evidence.roundIndex,
+      runId: input.runId,
+      stage: input.stageId,
+      summary: input.evidence.summary,
+      workerIdentity: input.evidence.workerIdentity
+    })
+    if (input.evidence.evidenceSha256 !== expectedEvidenceSha256) {
+      throw new Error(`${input.stageId} evidence digest does not match its recorded fields`)
+    }
+    if (!this.#remoteObservationMatches({
+      candidateCommitOid: input.receipt.candidateCommitOid,
+      kind: input.receipt.kind,
+      observationSha256: input.receipt.authoritativePostObservationSha256,
+      receiptPayload: input.receipt.payload,
+      runId: input.runId
+    })) {
+      throw new Error(`${input.stageId} receipt does not match its authoritative post-read observation`)
+    }
+
+    const receiptJson = canonicalJson(input.receipt.payload)
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      const existingEvidence = this.#db.prepare(
+        `SELECT evidence_id
+         FROM stage_evidence
+         WHERE run_id = ? AND stage_id = ? AND round_index = ?
+           AND candidate_commit_oid = ? AND base_commit_oid = ?
+           AND worker_identity = ? AND exit_code = ? AND evidence_sha256 = ?
+           AND artifact_path = ? AND artifact_sha256 IS ? AND summary = ?
+           AND findings_json IS ? AND effective_policy_hash IS ? AND base_ref_sha IS ?
+         LIMIT 1`
+      ).get(
         input.runId,
-        input.repoRoot,
-        input.branch,
-        input.baseBranch,
-        input.submissionCommitOid,
-        input.intent,
-        intentHash(input.intent),
-        input.policySha256,
-        new Date().toISOString()
+        input.stageId,
+        input.evidence.roundIndex,
+        input.evidence.candidateCommitOid,
+        input.evidence.baseCommitOid,
+        input.evidence.workerIdentity,
+        input.evidence.exitCode,
+        input.evidence.evidenceSha256,
+        input.evidence.artifactPath,
+        input.evidence.artifactSha256,
+        input.evidence.summary,
+        input.evidence.findingsJson ?? null,
+        input.evidence.effectivePolicyHash ?? null,
+        input.evidence.baseRefSha ?? null
+      ) as { evidence_id: string } | undefined
+      const existingCheckpoint = this.#db.prepare(
+        `SELECT 1
+         FROM stage_checkpoints
+         WHERE run_id = ? AND stage_id = ? AND round_index = ?
+           AND input_commit_oid = ? AND output_commit_oid = ?
+         LIMIT 1`
+      ).get(
+        input.runId,
+        input.stageId,
+        input.checkpoint.roundIndex,
+        input.checkpoint.inputCommitOid,
+        input.checkpoint.outputCommitOid
       )
+      const existingReceipt = this.#db.prepare(
+        `SELECT receipt_sha256
+         FROM remote_receipts
+         WHERE run_id = ? AND kind = ? AND candidate_commit_oid = ?
+           AND authoritative_post_observation_sha256 = ? AND receipt_json = ?
+         ORDER BY created_at DESC, rowid DESC
+         LIMIT 1`
+      ).get(
+        input.runId,
+        input.receipt.kind,
+        input.receipt.candidateCommitOid,
+        input.receipt.authoritativePostObservationSha256,
+        receiptJson
+      ) as { receipt_sha256: string } | undefined
+      const priorEvidence = this.#db.prepare(
+        'SELECT 1 FROM stage_evidence WHERE run_id = ? AND stage_id = ? AND round_index = ? LIMIT 1'
+      ).get(input.runId, input.stageId, input.evidence.roundIndex)
+      const priorCheckpoint = this.#db.prepare(
+        'SELECT 1 FROM stage_checkpoints WHERE run_id = ? AND stage_id = ? AND round_index = ? LIMIT 1'
+      ).get(input.runId, input.stageId, input.checkpoint.roundIndex)
+      if (priorEvidence !== undefined || priorCheckpoint !== undefined) {
+        if (existingEvidence && existingCheckpoint && existingReceipt) {
+          this.#db.exec('COMMIT')
+          return {
+            evidenceId: existingEvidence.evidence_id,
+            receiptSha256: existingReceipt.receipt_sha256
+          }
+        }
+        throw new Error(`${input.stageId} round ${input.checkpoint.roundIndex} is already settled with different facts`)
+      }
+
+      const createdAt = new Date().toISOString()
+      const receiptSha256 = sha256(canonicalJson({
+        authoritativePostObservationSha256: input.receipt.authoritativePostObservationSha256,
+        candidateCommitOid: input.receipt.candidateCommitOid,
+        createdAt,
+        kind: input.receipt.kind,
+        payload: input.receipt.payload,
+        runId: input.runId
+      }))
+      this.#db.prepare(
+        `INSERT INTO remote_receipts (
+           receipt_id, run_id, kind, candidate_commit_oid,
+           authoritative_post_observation_sha256, receipt_json, receipt_sha256, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        randomUUID(),
+        input.runId,
+        input.receipt.kind,
+        input.receipt.candidateCommitOid,
+        input.receipt.authoritativePostObservationSha256,
+        receiptJson,
+        receiptSha256,
+        createdAt
+      )
+      const evidenceId = this.#recordEvidence(input.evidence)
+      this.#recordCheckpoint({
+        ...input.checkpoint,
+        runId: input.runId,
+        stageId: input.stageId
+      })
+      this.#db.exec('COMMIT')
+      return { evidenceId, receiptSha256 }
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  remoteReceipt(
+    runId: string,
+    kind: RemoteReceiptKind,
+    receiptSha256?: string
+  ): RemoteReceiptRow | undefined {
+    return this.#db.prepare(
+      `SELECT kind, candidate_commit_oid, authoritative_post_observation_sha256,
+              receipt_json, receipt_sha256, created_at
+       FROM remote_receipts
+       WHERE run_id = ? AND kind = ? AND (? IS NULL OR receipt_sha256 = ?)
+       ORDER BY created_at DESC, rowid DESC
+       LIMIT 1`
+    ).get(runId, kind, receiptSha256 ?? null, receiptSha256 ?? null) as
+      | RemoteReceiptRow
+      | undefined
   }
 
   prepareResume(input: {
@@ -1671,7 +3464,7 @@ export class DomainLedger {
     }
   }
 
-  #completePassedRun(manifest: PassedAttestationManifest, terminalCommitOid: string): void {
+  #completePassedRun(manifest: CompletionAttestationManifest, terminalCommitOid: string): void {
     if (!this.finishRun(manifest.runId, 'passed', terminalCommitOid)) {
       throw new Error(`run ${manifest.runId} is already settled`)
     }
@@ -1680,7 +3473,7 @@ export class DomainLedger {
   }
 
   finalizePassedRun(
-    manifest: PassedAttestationManifest,
+    manifest: CompletionAttestationManifest,
     terminalCommitOid: string,
     ownership?: { branch: string; generationToken: number; repoRoot: string }
   ): void {
@@ -1696,7 +3489,7 @@ export class DomainLedger {
   }
 
   async finalizePassedRunWithLeaseMutation(
-    manifest: PassedAttestationManifest,
+    manifest: CompletionAttestationManifest,
     terminalCommitOid: string,
     ownership: { branch: string; generationToken: number; repoRoot: string },
     mutation: () => Promise<string>,
@@ -1728,18 +3521,7 @@ export class DomainLedger {
   ): void {
     if (presentation) this.#db.exec('BEGIN IMMEDIATE')
     try {
-      this.#db
-        .prepare(
-          'INSERT INTO stage_checkpoints (run_id, stage_id, round_index, input_commit_oid, output_commit_oid, created_at) VALUES (?, ?, ?, ?, ?, ?)'
-        )
-        .run(
-          input.runId,
-          input.stageId,
-          input.roundIndex,
-          input.inputCommitOid,
-          input.outputCommitOid,
-          new Date().toISOString()
-        )
+      this.#recordCheckpoint(input)
       if (presentation) {
         this.#recordPresentationMilestone(input.runId, presentation)
         this.#db.exec('COMMIT')
@@ -1750,22 +3532,32 @@ export class DomainLedger {
     }
   }
 
-  recordEvidence(input: {
-    artifactPath: string
-    artifactSha256: string
-    baseCommitOid: string
-    candidateCommitOid: string
-    evidenceSha256: string
-    exitCode: number
-    findingsJson?: string
+  #recordCheckpoint(input: {
+    inputCommitOid: string
+    outputCommitOid: string
     roundIndex: number
     runId: string
     stageId: string
-    summary: string
-    workerIdentity: string
-    effectivePolicyHash?: string
-    baseRefSha?: string
-  }): string {
+  }): void {
+    this.#db
+      .prepare(
+        'INSERT INTO stage_checkpoints (run_id, stage_id, round_index, input_commit_oid, output_commit_oid, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+      )
+      .run(
+        input.runId,
+        input.stageId,
+        input.roundIndex,
+        input.inputCommitOid,
+        input.outputCommitOid,
+        new Date().toISOString()
+      )
+  }
+
+  recordEvidence(input: RecordEvidenceInput): string {
+    return this.#recordEvidence(input)
+  }
+
+  #recordEvidence(input: RecordEvidenceInput): string {
     const evidenceId = randomUUID()
     this.#db
       .prepare(
@@ -2097,10 +3889,14 @@ export class DomainLedger {
       )
   }
 
-  recordAttestation(manifest: PassedAttestationManifest): void {
+  recordAttestation(manifest: CompletionAttestationManifest): void {
+    if (manifest.version === '2.0.0') {
+      verifyCompletionAttestation(manifest)
+      this.verifyRetainedCompletionAttestation(manifest)
+    }
     this.#db
       .prepare(
-        `INSERT OR REPLACE INTO passed_attestations (
+        `INSERT INTO passed_attestations (
            run_id, candidate_commit_oid, base_commit_oid, policy_sha256, intent, intent_hash,
            merkle_root, manifest_json, coordinator_version, created_at
          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
@@ -2119,8 +3915,217 @@ export class DomainLedger {
       )
   }
 
+  verifyRetainedCompletionAttestation(manifest: PipelineCompletionAttestationManifest): void {
+    verifyCompletionAttestation(manifest)
+    const problems: string[] = []
+    const retainedEvidence = this.#verifyEvidence(manifest.runId, manifest.stageEvidence)
+    problems.push(...retainedEvidence.problems.map((problem) => `stage evidence: ${problem}`))
+    const retainedRun = this.#db.prepare(
+      `SELECT status, terminal_commit_oid, intent, intent_hash, policy_sha256
+       FROM runs WHERE run_id = ?`
+    ).get(manifest.runId) as
+      | {
+          intent: string
+          intent_hash: string
+          policy_sha256: string
+          status: RunStatus
+          terminal_commit_oid: string | null
+        }
+      | undefined
+    if (!retainedRun || retainedRun.status !== 'passed' ||
+        retainedRun.terminal_commit_oid !== manifest.candidateCommitOid ||
+        retainedRun.intent !== manifest.intent || retainedRun.intent_hash !== manifest.intentHash ||
+        retainedRun.policy_sha256 !== manifest.policySha256) {
+      problems.push('passed run')
+    }
+    const expectedPlan = manifest.stagePlan.map((entry, position) => ({
+      position,
+      requirement: entry.requirement,
+      stage_id: entry.stage
+    }))
+    if (canonicalJson(this.stagePlan(manifest.runId)) !== canonicalJson(expectedPlan)) {
+      problems.push('frozen stage plan')
+    }
+
+    const expectedDispositions = manifest.stageDispositions.map((entry) => ({
+      disposition: entry.disposition,
+      evidence_sha256: entry.evidenceSha256 ?? null,
+      stage_id: entry.stage
+    }))
+    if (
+      canonicalJson(this.stageDispositions(manifest.runId)) !==
+      canonicalJson(expectedDispositions)
+    ) {
+      problems.push('stage dispositions')
+    }
+    const finalDisposition = manifest.stageDispositions.findLast(
+      (disposition) => disposition.evidenceSha256 !== undefined
+    )
+    const finalEvidence = manifest.stageEvidence.find(
+      (evidence) => evidence.evidenceSha256 === finalDisposition?.evidenceSha256
+    )
+    const retainedFinalEvidence = retainedEvidence.rows.find(
+      (row) => row.evidence_sha256 === finalEvidence?.evidenceSha256
+    )
+    if (!retainedFinalEvidence || retainedFinalEvidence.base_commit_oid !== manifest.baseCommitOid) {
+      problems.push('base commit evidence')
+    }
+
+    const route = this.publicationRoute(manifest.runId)
+    const expectedRoute = {
+      base_branch: manifest.publicationRoute.baseBranch,
+      base_repository_id: manifest.publicationRoute.baseRepositoryId,
+      forge_host: manifest.publicationRoute.forgeHost,
+      head_branch: manifest.publicationRoute.headBranch,
+      head_owner: manifest.publicationRoute.headOwner,
+      head_repository_id: manifest.publicationRoute.headRepositoryId,
+      route_fingerprint: manifest.publicationRoute.routeFingerprint
+    }
+    if (canonicalJson(route) !== canonicalJson(expectedRoute)) {
+      problems.push('publication route')
+    }
+
+    const retainedOutcomes = this.#db.prepare(
+      `SELECT o.attempt_id, o.run_id, o.verdict, o.stopping_fact, o.reason,
+              o.candidate_commit_oid, o.coordinator_identity, o.actor_identity,
+              o.custody_json, o.receipt_digests_json, o.resume_eligible,
+              o.completed_at, o.outcome_sha256, a.generation_token
+       FROM attempt_outcomes o
+       JOIN run_attempts a ON a.run_id = o.run_id AND a.attempt_id = o.attempt_id
+       WHERE o.run_id = ? ORDER BY o.completed_at, o.rowid`
+    ).all(manifest.runId) as {
+      actor_identity: string
+      attempt_id: string
+      candidate_commit_oid: string
+      completed_at: string
+      coordinator_identity: string
+      custody_json: string
+      generation_token: number | bigint
+      outcome_sha256: string
+      reason: string
+      receipt_digests_json: string
+      resume_eligible: number | bigint
+      run_id: string
+      stopping_fact: string
+      verdict: Exclude<RunStatus, 'in-progress'>
+    }[]
+    const outcomes = retainedOutcomes.map((row) => {
+      try {
+        const digest = sha256(canonicalJson({
+          actorIdentity: row.actor_identity,
+          attemptId: row.attempt_id,
+          candidateCommitOid: row.candidate_commit_oid,
+          completedAt: row.completed_at,
+          coordinatorIdentity: row.coordinator_identity,
+          custody: JSON.parse(row.custody_json) as unknown,
+          reason: row.reason,
+          receiptDigests: JSON.parse(row.receipt_digests_json) as unknown,
+          resumeEligible: Number(row.resume_eligible) === 1,
+          runId: row.run_id,
+          stoppingFact: row.stopping_fact,
+          verdict: row.verdict
+        }))
+        return digest === row.outcome_sha256 ? digest : ''
+      } catch {
+        return ''
+      }
+    })
+    if (canonicalJson(outcomes) !== canonicalJson(manifest.attemptOutcomeDigests)) {
+      problems.push('attempt outcomes')
+    }
+
+    const expectedReceiptDigests = [
+      manifest.candidatePublicationReceiptSha256,
+      manifest.pullRequestBindingReceiptSha256
+    ].sort()
+    const latestAttempt = this.#db.prepare(
+      'SELECT MAX(generation_token) AS generation_token FROM run_attempts WHERE run_id = ?'
+    ).get(manifest.runId) as { generation_token: number | bigint | null }
+    const passedOutcome = retainedOutcomes.find((row) => {
+      if (row.verdict !== 'passed' || row.candidate_commit_oid !== manifest.candidateCommitOid) {
+        return false
+      }
+      if (latestAttempt.generation_token === null ||
+          Number(row.generation_token) !== Number(latestAttempt.generation_token)) return false
+      try {
+        const custody = JSON.parse(row.custody_json) as unknown
+        const receipts = JSON.parse(row.receipt_digests_json) as unknown
+        return canonicalJson(custody) === canonicalJson(manifest.custody) &&
+          Array.isArray(receipts) &&
+          canonicalJson([...receipts].sort()) === canonicalJson(expectedReceiptDigests)
+      } catch {
+        return false
+      }
+    })
+    if (!passedOutcome) problems.push('passed attempt outcome')
+    if (passedOutcome?.outcome_sha256 !== manifest.attemptOutcomeDigests.at(-1)) {
+      problems.push('terminal attempt outcome ordering')
+    }
+
+    const publication = this.remoteReceipt(
+      manifest.runId,
+      'candidate-publication',
+      manifest.candidatePublicationReceiptSha256
+    )
+    if (
+      publication?.receipt_sha256 !== manifest.candidatePublicationReceiptSha256 ||
+      publication.candidate_commit_oid !== manifest.candidateCommitOid
+    ) {
+      problems.push('candidate-publication receipt')
+    }
+    const pullRequest = this.remoteReceipt(
+      manifest.runId,
+      'pull-request-binding',
+      manifest.pullRequestBindingReceiptSha256
+    )
+    if (
+      pullRequest?.receipt_sha256 !== manifest.pullRequestBindingReceiptSha256 ||
+      pullRequest.candidate_commit_oid !== manifest.candidateCommitOid
+    ) {
+      problems.push('pull-request-binding receipt')
+    }
+    for (const receipt of [publication, pullRequest]) {
+      if (!receipt) continue
+      let payload: Record<string, unknown>
+      try {
+        payload = JSON.parse(receipt.receipt_json) as Record<string, unknown>
+      } catch {
+        problems.push(`${receipt.kind} observation`)
+        continue
+      }
+      if (sha256(canonicalJson({
+        authoritativePostObservationSha256: receipt.authoritative_post_observation_sha256,
+        candidateCommitOid: receipt.candidate_commit_oid,
+        createdAt: receipt.created_at,
+        kind: receipt.kind,
+        payload,
+        runId: manifest.runId
+      })) !== receipt.receipt_sha256) {
+        problems.push(`${receipt.kind} receipt digest`)
+      }
+      if (!this.#remoteObservationMatches({
+        allowHistoricalAttempt: receipt.kind === 'candidate-publication',
+        candidateCommitOid: receipt.candidate_commit_oid,
+        kind: receipt.kind,
+        observationSha256: receipt.authoritative_post_observation_sha256,
+        receiptPayload: payload,
+        runId: manifest.runId
+      })) {
+        problems.push(`${receipt.kind} observation`)
+      }
+    }
+
+    if (problems.length > 0) {
+      throw new Error(`v2 attestation does not match retained ledger facts: ${problems.join(', ')}`)
+    }
+  }
+
   getAttestation(ref: string): PassedAttestationManifest {
-    const manifest = this.findAttestation(ref)
+    return this.getCompletionAttestation(ref) as PassedAttestationManifest
+  }
+
+  getCompletionAttestation(ref: string): CompletionAttestationManifest {
+    const manifest = this.findCompletionAttestation(ref)
     if (!manifest) throw new Error(`no passed attestation found for ${ref}`)
     return manifest
   }
@@ -2133,6 +4138,10 @@ export class DomainLedger {
    * not absence.
    */
   findAttestation(ref: string): PassedAttestationManifest | undefined {
+    return this.findCompletionAttestation(ref) as PassedAttestationManifest | undefined
+  }
+
+  findCompletionAttestation(ref: string): CompletionAttestationManifest | undefined {
     const row = (this.#db
       .prepare('SELECT manifest_json, merkle_root FROM passed_attestations WHERE run_id = ?')
       .get(ref)
@@ -2142,7 +4151,7 @@ export class DomainLedger {
         )
         .get(ref)) as { manifest_json: string; merkle_root: string } | undefined
     if (!row) return undefined
-    const manifest = JSON.parse(row.manifest_json) as PassedAttestationManifest
+    const manifest = JSON.parse(row.manifest_json) as CompletionAttestationManifest
     if (manifest.merkleRoot !== row.merkle_root) {
       throw new Error('stored attestation manifest does not match the ledger Merkle root')
     }

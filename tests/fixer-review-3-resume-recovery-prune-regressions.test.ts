@@ -86,7 +86,7 @@ test("prune retains unmerged resume-generation custody", async () => {
     git(repo, "checkout", "feature");
 
     const runId = "prune-resume-generation";
-    const ledger = new DomainLedger();
+    const ledger = new DomainLedger({ repositoryPath: repo });
     ledger.startRun({
       baseBranch: "main",
       branch: "feature",
@@ -110,14 +110,14 @@ test("prune retains unmerged resume-generation custody", async () => {
     await writeFile(path.join(artifacts, "review.log"), "evidence\n");
 
     await main(["prune", "--before=2999-01-01", `--repo=${repo}`]);
-    let reopened = new DomainLedger();
+    let reopened = new DomainLedger({ repositoryPath: repo });
     assert.equal(reopened.runStatus(runId), "passed");
     reopened.close();
     assert.equal(existsSync(artifacts), true);
 
     git(repo, "merge", "--ff-only", unmerged);
     await main(["prune", "--before=2999-01-01", `--repo=${repo}`]);
-    reopened = new DomainLedger();
+    reopened = new DomainLedger({ repositoryPath: repo });
     assert.equal(reopened.runStatus(runId), undefined);
     reopened.close();
     assert.equal(existsSync(artifacts), false);

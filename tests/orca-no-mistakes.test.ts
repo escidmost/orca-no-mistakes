@@ -59,7 +59,12 @@ import {
   classifyPreflightFailure,
   shellQuote,
 } from "../scripts/adapters.ts";
-import { StageLog, artifactsRoot, evidenceSha256 } from "../scripts/ledger.ts";
+import {
+  StageLog,
+  artifactsRoot,
+  evidenceSha256,
+  legacyLedgerPath,
+} from "../scripts/ledger.ts";
 import { loadUserConfig } from "../scripts/config.ts";
 import { effectivePolicyHash } from "../scripts/policy.ts";
 
@@ -9909,7 +9914,7 @@ test("prune drops merged runs with their artifacts and retains unmerged recovery
     git(repo, "checkout", "feature");
     git(repo, "branch", "-D", "stray");
 
-    const ledger = new DomainLedger();
+    const ledger = new DomainLedger({ repositoryPath: repo });
     // A run whose checkout no longer exists has nothing left to preserve.
     ledger.startRun({
       baseBranch: "main",
@@ -9946,7 +9951,7 @@ test("prune drops merged runs with their artifacts and retains unmerged recovery
 
     await main(["prune", "--before=2999-01-01", `--repo=${repo}`]);
 
-    const reopened = new DomainLedger();
+    const reopened = new DomainLedger({ repositoryPath: repo });
     assert.equal(reopened.runStatus("run-merged"), undefined);
     // A repository root that is gone is not proof that nothing was preserved:
     // it is retained until --repo names that exact root.
@@ -10009,7 +10014,7 @@ test("the domain ledger auto-initializes at the default path and records submiss
   process.env.ORCA_NO_MISTAKES_HOME = temp;
   try {
     const ledgerPath = path.join(temp, "ledger.db");
-    const ledger = new DomainLedger();
+    const ledger = new DomainLedger(legacyLedgerPath());
     let result: PipelineResult;
     try {
       assert.equal(ledger.path, ledgerPath);
@@ -10067,12 +10072,14 @@ test("the domain ledger auto-initializes at the default path and records submiss
 
 test("CLI exports, verifies, and prunes attestations through the domain ledger", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "onm-cli-attest-"));
+  const previousCwd = process.cwd();
   const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
   process.env.ORCA_NO_MISTAKES_HOME = temp;
   try {
+    process.chdir(temp);
     const git = new FakeGit();
     const orca = new FakeOrca(git);
-    const ledger = new DomainLedger();
+    const ledger = new DomainLedger(legacyLedgerPath());
     const result = await runPipeline(
       { intent: "Attest through the CLI." },
       orca,
@@ -10110,13 +10117,14 @@ test("CLI exports, verifies, and prunes attestations through the domain ledger",
     // The fake repo root never existed on disk, so prune needs the operator's
     // explicit assertion that the checkout is gone.
     await main(["prune", "--before=2999-01-01", "--repo=/repo"]);
-    const reopened = new DomainLedger();
+    const reopened = new DomainLedger(legacyLedgerPath());
     assert.throws(
       () => reopened.getAttestation(result.runId),
       /no passed attestation/,
     );
     reopened.close();
   } finally {
+    process.chdir(previousCwd);
     if (previousHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME;
     else process.env.ORCA_NO_MISTAKES_HOME = previousHome;
     await rm(temp, { recursive: true, force: true });
@@ -10190,14 +10198,16 @@ test("a manifest missing a declared field is rejected before it is hashed", () =
 test("an exported manifest verifies offline against a ledger that never ran it", async () => {
   const origin = await mkdtemp(path.join(tmpdir(), "onm-attest-origin-"));
   const elsewhere = await mkdtemp(path.join(tmpdir(), "onm-attest-elsewhere-"));
+  const previousCwd = process.cwd();
   const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
   process.env.ORCA_NO_MISTAKES_HOME = origin;
   const manifestPath = path.join(origin, "manifest.json");
   let runId: string;
   try {
+    process.chdir(origin);
     const git = new FakeGit();
     const orca = new FakeOrca(git);
-    const ledger = new DomainLedger();
+    const ledger = new DomainLedger(legacyLedgerPath());
     const result = await runPipeline(
       { intent: "Attest for another machine." },
       orca,
@@ -10211,6 +10221,7 @@ test("an exported manifest verifies offline against a ledger that never ran it",
     // Another machine: the manifest travels, the ledger and its stage artifacts
     // do not.
     process.env.ORCA_NO_MISTAKES_HOME = elsewhere;
+    process.chdir(elsewhere);
     await main(["attestation", "verify", manifestPath]);
     await assert.rejects(
       main(["attestation", "verify", runId]),
@@ -10233,6 +10244,7 @@ test("an exported manifest verifies offline against a ledger that never ran it",
       /JSON/,
     );
   } finally {
+    process.chdir(previousCwd);
     if (previousHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME;
     else process.env.ORCA_NO_MISTAKES_HOME = previousHome;
     await rm(origin, { recursive: true, force: true });
@@ -10242,11 +10254,13 @@ test("an exported manifest verifies offline against a ledger that never ran it",
 
 test("verification fails closed when the local run has no passed attestation", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "onm-attest-local-run-"));
+  const previousCwd = process.cwd();
   const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
   process.env.ORCA_NO_MISTAKES_HOME = temp;
   const manifestPath = path.join(temp, "manifest.json");
   try {
-    const ledger = new DomainLedger();
+    process.chdir(temp);
+    const ledger = new DomainLedger(legacyLedgerPath());
     ledger.startRun({
       baseBranch: "main",
       branch: "feature",
@@ -10274,6 +10288,7 @@ test("verification fails closed when the local run has no passed attestation", a
       /run run-local has no passed attestation/,
     );
   } finally {
+    process.chdir(previousCwd);
     if (previousHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME;
     else process.env.ORCA_NO_MISTAKES_HOME = previousHome;
     await rm(temp, { recursive: true, force: true });

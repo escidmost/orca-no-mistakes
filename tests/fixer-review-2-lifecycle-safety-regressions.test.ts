@@ -490,7 +490,7 @@ test("stranded cleanup settles before removal and retries partial removal", asyn
         path: gate.path,
       },
     ]);
-    const ledger = new DomainLedger();
+    const ledger = new DomainLedger({ repositoryPath: temp });
     runRow(ledger, "run-stranded-retry", temp);
     ledger.acquireLease({
       branch: "main",
@@ -503,7 +503,7 @@ test("stranded cleanup settles before removal and retries partial removal", asyn
     process.env.FAKE_RM_FAIL = "1";
     await main(["prune", "--stranded", "--repo", temp]);
     assert.ok(existsSync(marker));
-    const settled = new DomainLedger();
+    const settled = new DomainLedger({ repositoryPath: temp });
     assert.equal(settled.runStatus("run-stranded-retry"), "cancelled");
     assert.equal(settled.leaseFor(temp, "main"), undefined);
     settled.close();

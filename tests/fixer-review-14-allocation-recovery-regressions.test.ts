@@ -200,7 +200,7 @@ test("stranded cleanup durably discovers an unrecorded worker", async () => {
       workerAllocations: ["allocation-missing"],
     }),
   );
-  const ledger = new DomainLedger(path.join(home, "ledger.db"));
+  const ledger = new DomainLedger({ repositoryPath: seeded.repo });
   ledger.startRun({
     baseBranch: "main",
     branch: "feature",

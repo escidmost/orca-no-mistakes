@@ -2,7 +2,7 @@
 status: accepted
 date: 2026-08-20
 scope: target architecture
-implementation: not implemented
+implementation: partially implemented (Release 1)
 ---
 
 # Coordinator Recovery Model

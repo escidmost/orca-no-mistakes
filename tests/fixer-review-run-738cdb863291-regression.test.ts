@@ -14,6 +14,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { DomainLedger, main } from "../scripts/orca-no-mistakes.ts";
+import { legacyLedgerPath } from "../scripts/ledger.ts";
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
@@ -42,7 +43,9 @@ async function repository(root: string): Promise<{
 }
 
 function completedRun(repo: string, runId: string): void {
-  const ledger = new DomainLedger();
+  const ledger = existsSync(repo)
+    ? new DomainLedger({ repositoryPath: repo })
+    : new DomainLedger(legacyLedgerPath());
   ledger.startRun({
     baseBranch: "main",
     branch: "feature",
@@ -82,14 +85,14 @@ test("prune retains unmerged fixer refs and never deletes contained refs", async
     await writeFile(path.join(artifacts, "review.log"), "output\n");
 
     await main(["prune", "--before=2999-01-01", `--repo=${repo}`]);
-    let ledger = new DomainLedger();
+    let ledger = new DomainLedger({ repositoryPath: repo });
     assert.equal(ledger.runStatus(runId), "failed");
     ledger.close();
     assert.equal(existsSync(artifacts), true);
 
     git(repo, "update-ref", childRef, feature);
     await main(["prune", "--before=2999-01-01", `--repo=${repo}`]);
-    ledger = new DomainLedger();
+    ledger = new DomainLedger({ repositoryPath: repo });
     assert.equal(ledger.runStatus(runId), undefined);
     ledger.close();
     assert.equal(existsSync(artifacts), false);
@@ -105,9 +108,11 @@ test("prune retains unmerged fixer refs and never deletes contained refs", async
 test("missing repositories require an exact --repo assertion", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "onm-prune-missing-repo-"));
   const home = path.join(temp, "home");
+  const previousCwd = process.cwd();
   const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
   process.env.ORCA_NO_MISTAKES_HOME = home;
   try {
+    process.chdir(temp);
     const missingRepo = path.join(temp, "gone");
     const runId = "run-gone";
     completedRun(missingRepo, runId);
@@ -115,7 +120,7 @@ test("missing repositories require an exact --repo assertion", async () => {
     await mkdir(artifacts, { recursive: true });
 
     await main(["prune", "--before=2999-01-01"]);
-    let ledger = new DomainLedger();
+    let ledger = new DomainLedger(legacyLedgerPath());
     assert.equal(ledger.runStatus(runId), "failed");
     ledger.close();
     assert.equal(existsSync(artifacts), true);
@@ -125,11 +130,54 @@ test("missing repositories require an exact --repo assertion", async () => {
       "--before=2999-01-01",
       `--repo=${missingRepo}`,
     ]);
-    ledger = new DomainLedger();
+    ledger = new DomainLedger(legacyLedgerPath());
     assert.equal(ledger.runStatus(runId), undefined);
     ledger.close();
     assert.equal(existsSync(artifacts), false);
   } finally {
+    process.chdir(previousCwd);
+    if (previousHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME;
+    else process.env.ORCA_NO_MISTAKES_HOME = previousHome;
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("missing repository prune ignores unrelated active migration", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-prune-active-survivor-"));
+  const home = path.join(temp, "home");
+  const previousCwd = process.cwd();
+  const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
+  process.env.ORCA_NO_MISTAKES_HOME = home;
+  try {
+    const { repo } = await repository(temp);
+    const missingRepo = path.join(temp, "gone");
+    const missingRunId = "run-gone-active-survivor";
+    completedRun(missingRepo, missingRunId);
+
+    const activeRunId = "run-active-survivor";
+    const legacy = new DomainLedger(legacyLedgerPath());
+    legacy.startRun({
+      baseBranch: "main",
+      branch: "feature",
+      intent: activeRunId,
+      policySha256: "f".repeat(64),
+      repoRoot: repo,
+      runId: activeRunId,
+      submissionCommitOid: "a".repeat(40),
+    });
+    legacy.acquireLease({ branch: "feature", repoRoot: repo, runId: activeRunId });
+    legacy.close();
+
+    process.chdir(repo);
+    await main(["prune", "--before=2999-01-01", `--repo=${missingRepo}`]);
+
+    const reopened = new DomainLedger(legacyLedgerPath());
+    assert.equal(reopened.runStatus(missingRunId), undefined);
+    assert.equal(reopened.runStatus(activeRunId), "in-progress");
+    assert.equal(reopened.leaseFor(repo, "feature")?.run_id, activeRunId);
+    reopened.close();
+  } finally {
+    process.chdir(previousCwd);
     if (previousHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME;
     else process.env.ORCA_NO_MISTAKES_HOME = previousHome;
     await rm(temp, { recursive: true, force: true });
@@ -155,9 +203,9 @@ test("a feature branch deleted after merge still prunes against its base", async
     const artifacts = path.join(home, "artifacts", runId);
     await mkdir(artifacts, { recursive: true });
 
-    await main(["prune", "--before=2999-01-01"]);
+    await main(["prune", "--before=2999-01-01", `--repo=${repo}`]);
 
-    const ledger = new DomainLedger();
+    const ledger = new DomainLedger({ repositoryPath: repo });
     assert.equal(ledger.runStatus(runId), undefined);
     ledger.close();
     assert.equal(existsSync(artifacts), false);
@@ -198,7 +246,7 @@ test("recovery ref inspection exits 124 and 128 abort prune", async () => {
       `#!${process.execPath}
 const { spawnSync } = require("node:child_process");
 const args = process.argv.slice(2);
-if (args.includes("rev-parse")) process.exit(Number(process.env.ONM_TEST_GIT_EXIT));
+if (args.includes("rev-parse") && !args.includes("--show-toplevel") && !args.includes("--git-common-dir")) process.exit(Number(process.env.ONM_TEST_GIT_EXIT));
 const result = spawnSync(process.env.ONM_TEST_REAL_GIT, args, { encoding: "utf8" });
 process.stdout.write(result.stdout ?? "");
 process.stderr.write(result.stderr ?? "");
@@ -228,7 +276,7 @@ process.exit(result.status ?? 1);
         },
       );
     }
-    const ledger = new DomainLedger();
+    const ledger = new DomainLedger({ repositoryPath: repo });
     assert.equal(ledger.runStatus(runId), "failed");
     ledger.close();
     assert.equal(existsSync(artifacts), true);
@@ -270,7 +318,7 @@ test("artifact removal failure surfaces after the ledger row is gone", {
     );
     // The row is deleted first, so the operator loses the directory, not the
     // record of what the directory held.
-    const ledger = new DomainLedger();
+    const ledger = new DomainLedger({ repositoryPath: repo });
     assert.equal(ledger.runStatus(runId), undefined);
     ledger.close();
   } finally {

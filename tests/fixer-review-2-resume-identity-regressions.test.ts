@@ -17,6 +17,7 @@ import {
   DomainLedger,
   evidenceSha256,
   gateAuditMatchesEvidence,
+  legacyLedgerPath,
   type StageEvidenceManifestEntry,
 } from "../scripts/ledger.ts";
 import { main, sha256, type Finding } from "../scripts/orca-no-mistakes.ts";
@@ -300,7 +301,7 @@ test("resumed Orca worktree setup starts at the checkpoint", async () => {
     process.env.ORCA_CLI_COMMAND = fakeOrca;
     process.env.ORCA_TERMINAL_HANDLE = "origin-terminal";
     process.env.ORCA_NO_MISTAKES_HOME = home;
-    const ledger = new DomainLedger();
+    const ledger = new DomainLedger(legacyLedgerPath());
     ledger.startRun({
       baseBranch: "main",
       branch: "feature",

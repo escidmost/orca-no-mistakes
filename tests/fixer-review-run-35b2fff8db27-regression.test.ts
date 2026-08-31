@@ -39,7 +39,7 @@ async function completedRun(
   repo: string,
   runId: string,
 ): Promise<string> {
-  const ledger = new DomainLedger();
+  const ledger = new DomainLedger({ repositoryPath: repo });
   ledger.startRun({
     baseBranch: "main",
     branch: "feature",
@@ -112,9 +112,9 @@ test("a same-named tag cannot substitute for a deleted feature branch", async ()
       recoveryOid,
     );
 
-    await main(["prune", "--before=2999-01-01"]);
+    await main(["prune", "--before=2999-01-01", `--repo=${repo}`]);
 
-    const ledger = new DomainLedger();
+    const ledger = new DomainLedger({ repositoryPath: repo });
     assert.equal(ledger.runStatus(runId), "failed");
     ledger.close();
     assert.equal(existsSync(artifacts), true);
@@ -128,33 +128,38 @@ test("a same-named tag cannot substitute for a deleted feature branch", async ()
 test("an unrelated repository at the recorded path requires --repo", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "onm-prune-reused-path-"));
   const home = path.join(temp, "home");
+  const previousCwd = process.cwd();
   const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
   process.env.ORCA_NO_MISTAKES_HOME = home;
   try {
+    process.chdir(temp);
     const repo = await repository(path.join(temp, "repo"));
     const recoveryOid = git(repo, "rev-parse", "HEAD");
     const runId = "run-reused-path";
     const recoveryRef = `refs/no-mistakes/recover/${runId}`;
-    const artifacts = await completedRun(home, repo, runId);
     git(repo, "update-ref", recoveryRef, recoveryOid);
 
     const movedRepo = path.join(temp, "original-repo");
     await rename(repo, movedRepo);
     await repository(repo);
+    const artifacts = await completedRun(home, repo, runId);
 
+    process.env.ORCA_NO_MISTAKES_HOME = path.join(temp, "unrelated-home");
     await main(["prune", "--before=2999-01-01"]);
-    let ledger = new DomainLedger();
+    process.env.ORCA_NO_MISTAKES_HOME = home;
+    let ledger = new DomainLedger({ repositoryPath: repo });
     assert.equal(ledger.runStatus(runId), "failed");
     ledger.close();
     assert.equal(existsSync(artifacts), true);
 
     await main(["prune", "--before=2999-01-01", `--repo=${repo}`]);
-    ledger = new DomainLedger();
+    ledger = new DomainLedger({ repositoryPath: repo });
     assert.equal(ledger.runStatus(runId), undefined);
     ledger.close();
     assert.equal(existsSync(artifacts), false);
     assert.equal(git(movedRepo, "rev-parse", recoveryRef), recoveryOid);
   } finally {
+    process.chdir(previousCwd);
     if (previousHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME;
     else process.env.ORCA_NO_MISTAKES_HOME = previousHome;
     await rm(temp, { recursive: true, force: true });
@@ -174,11 +179,11 @@ test("a recovery ref that does not resolve to a commit aborts prune", async () =
     git(repo, "update-ref", `refs/no-mistakes/recover/${runId}`, blob);
 
     await assert.rejects(
-      main(["prune", "--before=2999-01-01"]),
+      main(["prune", "--before=2999-01-01", `--repo=${repo}`]),
       /git rev-parse failed/,
     );
 
-    const ledger = new DomainLedger();
+    const ledger = new DomainLedger({ repositoryPath: repo });
     assert.equal(ledger.runStatus(runId), "failed");
     ledger.close();
     assert.equal(existsSync(artifacts), true);

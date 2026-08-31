@@ -22,6 +22,7 @@ import {
   reapAbortedRun,
   registerAbortRunContext,
 } from "../scripts/orca-no-mistakes.ts";
+import { legacyLedgerPath } from "../scripts/ledger.ts";
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
@@ -104,7 +105,7 @@ test(
   async () => {
   const seeded = await seedGate("onm-marker-refresh-failure-");
   const restore = setHome(path.join(seeded.temp, "home"));
-  const ledger = new DomainLedger();
+  const ledger = new DomainLedger(legacyLedgerPath());
   const marker = markerPath(seeded.origin, seeded.gate.id);
   const markerDirectory = path.dirname(marker);
   try {
@@ -139,7 +140,7 @@ test(
 test("a raw worktree racing branch deletion gets its branch restored", async () => {
   const seeded = await seedGate("onm-gate-delete-race-");
   const restore = setHome(path.join(seeded.temp, "home"));
-  const ledger = new DomainLedger();
+  const ledger = new DomainLedger(legacyLedgerPath());
   const previousPath = process.env.PATH;
   const rawPath = path.join(seeded.temp, "raw-gate-owner");
   const gitWrapperDirectory = path.join(seeded.temp, "bin");
