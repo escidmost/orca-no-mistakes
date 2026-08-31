@@ -5837,7 +5837,7 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     );
     assert.equal(git(repo, "rev-parse", "HEAD"), featureHead);
   } finally {
-    await rm(temp, { recursive: true, force: true });
+    await rm(temp, { recursive: true, force: true, maxRetries: 3 });
   }
 });
 
