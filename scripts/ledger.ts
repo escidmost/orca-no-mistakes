@@ -620,6 +620,11 @@ export class StageLog {
     return this.#tail.subarray(-maxBytes)
   }
 
+  inheritTail(previous: StageLog): void {
+    const keep = STAGE_LOG_TAIL_BYTES + knownSecretPrefixBytes()
+    this.#tail = Buffer.from(previous.tail(keep))
+  }
+
   async #append(chunk: string, source: symbol): Promise<void> {
     if (chunk.length === 0) return
     await this.#start()

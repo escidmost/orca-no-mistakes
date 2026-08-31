@@ -69,7 +69,6 @@ import { createRailTuiRenderer } from "./tui.ts";
 import {
   DomainLedger,
   RUN_ID_PATTERN,
-  STAGE_LOG_TAIL_BYTES,
   isWithin,
   StageLog,
   artifactsRoot,
@@ -78,7 +77,6 @@ import {
   evidenceSha256,
   gateAuditMatchesEvidence,
   isAuthoritativeStageEvidence,
-  knownSecretPrefixBytes,
   normalizeIntent,
   noMistakesHome,
   sha256,
@@ -2943,14 +2941,16 @@ function stageLogPath(
   return path.join(artifactsDir, `${stage}_r${round}.log`);
 }
 
-function registeredStageLog(
+export function registeredStageLog(
   stageLogs: Map<string, StageLog> | undefined,
   filePath: string,
 ): StageLog {
+  const resolvedPath = path.resolve(filePath);
   const log = new StageLog(filePath);
   if (stageLogs) {
-    log.tail(STAGE_LOG_TAIL_BYTES + knownSecretPrefixBytes());
-    stageLogs.set(path.resolve(filePath), log);
+    const previous = stageLogs.get(resolvedPath);
+    if (previous) log.inheritTail(previous);
+    stageLogs.set(resolvedPath, log);
   }
   return log;
 }
