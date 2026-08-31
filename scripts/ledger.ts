@@ -1804,7 +1804,22 @@ export class DomainLedger {
     }
     this.#path = dbPath
     this.#db = new DatabaseSync(dbPath, { timeout: 5_000 })
-    this.#db.exec('PRAGMA journal_mode = WAL')
+    const walDeadline = Date.now() + 5_000
+    const walWait = new Int32Array(new SharedArrayBuffer(4))
+    for (;;) {
+      try {
+        this.#db.exec('PRAGMA journal_mode = WAL')
+        break
+      } catch (error) {
+        if (
+          !(error instanceof Error && 'errcode' in error && error.errcode === 5) ||
+          Date.now() >= walDeadline
+        ) {
+          throw error
+        }
+        Atomics.wait(walWait, 0, 0, 10)
+      }
+    }
     this.#db.exec('PRAGMA foreign_keys = ON')
     // ponytail: pre-release rebuild — legacy ledgers keyed attestations by candidate OID,
     // which let a repeat attestation overwrite the original run's lookup.

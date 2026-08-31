@@ -14,7 +14,7 @@ New runs require an explicit single-line `--intent`; `--resume <run-id>` instead
 
 ## Domain ledger
 
-All identity and provenance state lives in SQLite at `~/.orca-no-mistakes/ledger.db` (WAL mode, foreign keys on), created via `node:sqlite`. Tables:
+Each repository's identity and provenance state lives in SQLite at `<git-common-dir>/orca-no-mistakes/ledger.sqlite` (WAL mode, foreign keys on), created via `node:sqlite`. On first use, a repository transactionally imports its retained run graph from the legacy `~/.orca-no-mistakes/ledger.db` compatibility archive when present. Tables:
 
 - `runs` — one row per pipeline attempt with submission commit OID, base branch/OID, intent + intent hash, trusted-policy hash, and terminal status (`in-progress`, `passed`, `failed`, `cancelled`).
 - `branch_leases` — one exclusive semantic lease per `(repo_root, branch)` with a monotonically increasing generation token and heartbeat timestamp. A second run on a leased branch fails closed; `--force-lease` reclaims it. The lease heartbeat is checked before every stage and each fix round; losing the lease aborts the run. The lease is released when the run passes or fails.
@@ -24,7 +24,7 @@ All identity and provenance state lives in SQLite at `~/.orca-no-mistakes/ledger
 - `presentation_snapshots` — append-only immutable projections of run attempts, mode, stage, round, finding counts, gates, errors, cancellation, and terminal outcomes. Settlement, checkpoint, and passed-terminal snapshots commit in the same transaction as their domain milestones; finding and gate snapshots follow their durable ledger rows, while start and round transitions are durable presentation events themselves. Resume loads the latest projection without replaying completed transitions. Transient elapsed time, cursor state, pane state, activity previews, and raw worker output are never stored.
 - `passed_attestations` — one row per passed run keyed by run ID, holding the manifest JSON and Merkle root; lookups by candidate commit OID return the most recent attestation.
 
-Set `ORCA_NO_MISTAKES_HOME` to relocate `~/.orca-no-mistakes` (used by tests and sandboxes).
+Set `ORCA_NO_MISTAKES_HOME` to relocate artifacts and the legacy migration-source archive (used by tests and sandboxes). It does not relocate repository ledgers.
 
 ## Orchestration
 

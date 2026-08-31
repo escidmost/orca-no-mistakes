@@ -17,7 +17,6 @@ import path from "node:path";
 import test from "node:test";
 
 import { DomainLedger, main } from "../scripts/orca-no-mistakes.ts";
-import { legacyLedgerPath } from "../scripts/ledger.ts";
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
@@ -90,7 +89,7 @@ else out({ accepted: true })
   );
   await chmod(orcaCommand, 0o755);
   const restore = setEnv(path.join(temp, "home"), orcaCommand);
-  const ledger = new DomainLedger(legacyLedgerPath());
+  const ledger = new DomainLedger({ repositoryPath: canonicalRepo });
   ledger.startRun({
     baseBranch: "main",
     branch: "feature",
@@ -132,7 +131,7 @@ for (const status of ["passed", "failed"] as const) {
     try {
       await main(["prune", "--stranded", "--repo", seeded.repo]);
 
-      const ledger = new DomainLedger(legacyLedgerPath());
+      const ledger = new DomainLedger({ repositoryPath: seeded.repo });
       try {
         assert.equal(ledger.runStatus(seeded.runId), status);
       } finally {
