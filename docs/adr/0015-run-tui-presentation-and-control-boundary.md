@@ -2,7 +2,7 @@
 status: accepted
 date: 2026-08-30
 scope: target architecture
-implementation: not implemented
+implementation: partially implemented
 ---
 
 # Run TUI Presentation and Control Boundary

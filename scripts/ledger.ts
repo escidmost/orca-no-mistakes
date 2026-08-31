@@ -456,6 +456,7 @@ export function verifyManifest(
 }
 
 export const MAX_LOG_BYTES = 50 * 1024 * 1024
+export const STAGE_LOG_TAIL_BYTES = 64 * 1024
 const LOG_MARKER_RESERVE_BYTES = 512
 
 /**
@@ -482,8 +483,15 @@ function applyRedaction(content: string, secrets: string[]): string {
   return redacted
 }
 
-function redactKnownSecrets(content: string): string {
+export function redactKnownSecrets(content: string): string {
   return applyRedaction(content, knownSecrets())
+}
+
+export function knownSecretPrefixBytes(): number {
+  return Math.max(
+    0,
+    ...knownSecrets().map((secret) => Buffer.byteLength(secret) - 1),
+  )
 }
 
 /**
@@ -589,6 +597,8 @@ export class StageLog {
   #file?: Awaited<ReturnType<typeof open>>
   #hasNewOutput = false
   #compacted = false
+  #handoffCarry = ''
+  #tail = Buffer.alloc(0)
   #pending = Promise.resolve()
 
   constructor(filePath: string, maxBytes = MAX_LOG_BYTES) {
@@ -607,12 +617,25 @@ export class StageLog {
     return pending
   }
 
+  tail(maxBytes: number): Buffer {
+    return this.#tail.subarray(-maxBytes)
+  }
+
+  inheritTail(previous: StageLog): void {
+    const keep = STAGE_LOG_TAIL_BYTES + knownSecretPrefixBytes()
+    this.#tail = Buffer.from(previous.tail(keep))
+    this.#handoffCarry = previous.#handoffCarry
+    previous.#handoffCarry = ''
+  }
+
   async #append(chunk: string, source: symbol): Promise<void> {
     if (chunk.length === 0) return
     await this.#start()
     const secrets = knownSecrets()
+    const handoffCarry = this.#handoffCarry
+    this.#handoffCarry = ''
     const redacted = applyRedaction(
-      `${this.#carries.get(source) ?? ''}${chunk}`,
+      `${handoffCarry}${this.#carries.get(source) ?? ''}${chunk}`,
       secrets,
     )
     // Hold back only a trailing partial secret, so a credential split across two
@@ -627,14 +650,17 @@ export class StageLog {
     await this.#absorb(redacted.slice(0, redacted.length - hold))
   }
 
-  async close(): Promise<void> {
+  async close(options: { handoff?: boolean } = {}): Promise<void> {
     try {
       await this.#pending
       if (this.#carries.size > 0) {
         const carried = [...this.#carries.values()]
         this.#carries.clear()
-        await this.#start()
-        for (const chunk of carried) await this.#absorb(redactKnownSecrets(chunk))
+        if (options.handoff) this.#handoffCarry = carried.join('')
+        else {
+          await this.#start()
+          for (const chunk of carried) await this.#absorb(redactKnownSecrets(chunk))
+        }
       }
       // A silent instance never opens the log, so it cannot disturb what the
       // round already recorded.
@@ -930,9 +956,16 @@ export class StageLog {
     return `\n[no-mistakes: log truncated; dropped ${dropped} bytes; original bytes ${originalBytes}; retained ranges ${ranges.join(', ') || 'none'}]\n`
   }
 
-  async #write(data: string | Buffer): Promise<void> {
+  async #write(data: Buffer): Promise<void> {
     if (!this.#file) throw new Error('stage log is not open')
     await this.#file.writeFile(data)
+    const keep = STAGE_LOG_TAIL_BYTES + knownSecretPrefixBytes()
+    this.#tail = data.length >= keep
+      ? Buffer.from(data.subarray(-keep))
+      : Buffer.concat([
+          this.#tail.subarray(Math.max(0, this.#tail.length + data.length - keep)),
+          data,
+        ])
   }
 }
 

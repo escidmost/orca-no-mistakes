@@ -63,7 +63,9 @@ import {
 import {
   PlainStatusRenderer,
   PresentationPublisher,
+  type PresentationRenderer,
 } from "./presentation.ts";
+import { createRailTuiRenderer } from "./tui.ts";
 import {
   DomainLedger,
   RUN_ID_PATTERN,
@@ -268,6 +270,10 @@ export type PipelineOptions = {
   intent: string;
   maxFixRounds?: number;
   plainStatus?: boolean;
+  rendererFactory?: (
+    artifactsDir: string,
+    stageLogs: ReadonlyMap<string, StageLog>,
+  ) => PresentationRenderer;
   resumeRunId?: string;
   userGlobalConfig?: OrcaNoMistakesConfig;
 };
@@ -616,6 +622,7 @@ type AbortReapState = {
   originWorktree?: string;
   pid?: number;
   plainStatus?: boolean;
+  presentationCleanup?: () => void;
   resumeClaimId?: string;
   runId?: string;
   startupReceipt?: string;
@@ -663,6 +670,21 @@ function abortLog(message: string): void {
   try {
     console.error(message);
   } catch {}
+}
+
+function setAbortPresentationCleanup(cleanup?: () => void): void {
+  if (cleanup) abortReap.presentationCleanup = cleanup;
+  else delete abortReap.presentationCleanup;
+}
+
+function runAbortPresentationCleanup(): void {
+  const cleanup = abortReap.presentationCleanup;
+  delete abortReap.presentationCleanup;
+  try {
+    cleanup?.();
+  } catch (error) {
+    abortLog(`warning: presentation renderer cleanup failed: ${String(error)}`);
+  }
 }
 
 async function unregisterAbortWorker(worker: WorkerResult): Promise<void> {
@@ -1282,6 +1304,7 @@ function onAbortSignal(signal: "SIGHUP" | "SIGINT" | "SIGTERM"): void {
   // A second signal means the reap is wedged; die immediately.
   if (abortReapStarted) process.exit(1);
   abortReapStarted = true;
+  runAbortPresentationCleanup();
   const exitCode =
     signal === "SIGINT" ? 130 : signal === "SIGTERM" ? 143 : 129;
   void reapAbortedRun(`received ${signal}`).finally(() =>
@@ -1439,6 +1462,9 @@ export async function runPipeline(
   git: GitOperations,
   ledger: DomainLedger = new DomainLedger(":memory:"),
 ): Promise<PipelineResult> {
+  const stageLogs = options.rendererFactory
+    ? new Map<string, StageLog>()
+    : undefined;
   const intent = normalizeIntent(options.intent);
   const maxFixRounds = options.maxFixRounds;
   if (
@@ -1576,10 +1602,13 @@ export async function runPipeline(
       presentation = new PresentationPublisher(
         ledger,
         runId,
-        options.plainStatus ? new PlainStatusRenderer(process.stderr) : undefined,
+        options.rendererFactory?.(artifactsDir, stageLogs!) ??
+          (options.plainStatus
+            ? new PlainStatusRenderer(process.stderr)
+            : undefined),
         () => new Date(),
         (error) =>
-          console.error(`warning: plain status renderer failed: ${String(error)}`),
+          console.error(`warning: presentation renderer failed: ${String(error)}`),
       );
       presentationReady = true;
       if (!options.resumeRunId) {
@@ -2006,6 +2035,7 @@ export async function runPipeline(
           orca,
           git,
           pipelineConfig.stages[stage],
+          stageLogs,
           decisionHistory(),
         );
         if (inheritedFallback) {
@@ -2247,9 +2277,11 @@ export async function runPipeline(
           await releaseFixerSession(staleSession, orca);
         }
         let nextFixer: Awaited<ReturnType<typeof runFixer>>;
-        const fixerLog = new StageLog(
+        const fixerLog = registeredStageLog(
+          stageLogs,
           stageLogPath(artifactsDir, stage, round),
         );
+        let handoffFixerLog = false;
         try {
           nextFixer = await withTimeout(
             fixerRoles.timeout_ms ?? defaultWorkerTimeoutMs(),
@@ -2274,6 +2306,7 @@ export async function runPipeline(
                 fence,
               ),
           );
+          handoffFixerLog = true;
         } catch (error) {
           if (
             !(error instanceof FixerPolicyViolationError) &&
@@ -2320,7 +2353,7 @@ export async function runPipeline(
           );
           continue;
         } finally {
-          await fixerLog.close().catch((error) => {
+          await fixerLog.close({ handoff: handoffFixerLog }).catch((error) => {
             console.error(
               `warning: could not close ${stage} fixer log: ${String(error)}`,
             );
@@ -2842,9 +2875,13 @@ async function executeStage(
   orca: OrcaOperations,
   git: GitOperations,
   roles: StageRoles,
+  stageLogs: Map<string, StageLog> | undefined,
   decisionHistory: string,
 ): Promise<StageExecution> {
-  const stageLog = new StageLog(stageLogPath(evidenceDir, stage, round));
+  const stageLog = registeredStageLog(
+    stageLogs,
+    stageLogPath(evidenceDir, stage, round),
+  );
   try {
     if (stage === "intent") {
       const report: StageReport = {
@@ -2904,6 +2941,20 @@ function stageLogPath(
   round: number,
 ): string {
   return path.join(artifactsDir, `${stage}_r${round}.log`);
+}
+
+export function registeredStageLog(
+  stageLogs: Map<string, StageLog> | undefined,
+  filePath: string,
+): StageLog {
+  const resolvedPath = path.resolve(filePath);
+  const log = new StageLog(filePath);
+  if (stageLogs) {
+    const previous = stageLogs.get(resolvedPath);
+    if (previous) log.inheritTail(previous);
+    stageLogs.set(resolvedPath, log);
+  }
+  return log;
 }
 
 function exitCodeFor(report: StageReport): number {
@@ -8466,6 +8517,7 @@ const BOOLEAN_FLAGS = new Set([
   "force-lease",
   "no-tui",
   "stranded",
+  "tui",
 ]);
 const VALUE_FLAGS = new Set([
   "base",
@@ -8501,6 +8553,7 @@ const COMMAND_FLAGS: Record<string, Set<string>> = {
     "repo",
     "resume",
     "reviewer-model",
+    "tui",
   ]),
 };
 
@@ -11573,6 +11626,7 @@ Run options:
   --reviewer-model <model>
   --fixer-model <model> --fixer-effort <level>
   --max-fix-rounds <count>
+  --tui (render an interactive read-only Rail when the terminal supports it)
   --no-tui (emit semantic run progress on stderr)
   --resume <run-id> (continue a failed run from its last checkpoint)
   --allow-local-config
@@ -11615,6 +11669,9 @@ Prune options:
     }
   }
   if (!rawIntent) throw new Error("run requires --intent or --resume");
+  if (parsed.flags.tui === true && parsed.flags["no-tui"] === true) {
+    throw new Error("--tui cannot be combined with --no-tui");
+  }
   const intent = normalizeIntent(rawIntent);
   parsed.flags.intent = intent;
   const maxFixRoundsValue = parsed.flags["max-fix-rounds"];
@@ -11695,6 +11752,21 @@ Prune options:
       })
     : undefined;
   let ledger: DomainLedger | undefined;
+  let renderer:
+    | (PresentationRenderer & { close?: () => void })
+    | undefined;
+  const closeRenderer = (): void => {
+    const current = renderer;
+    renderer = undefined;
+    setAbortPresentationCleanup();
+    try {
+      current?.close?.();
+    } catch (error) {
+      console.error(
+        `warning: presentation renderer cleanup failed: ${String(error)}`,
+      );
+    }
+  };
   let retainGate = false;
   let gateCleanupOid = await git.head();
   try {
@@ -11731,6 +11803,20 @@ Prune options:
         intent,
         maxFixRounds,
         plainStatus: parsed.flags["no-tui"] === true,
+        rendererFactory:
+          parsed.flags.tui === true
+            ? (artifactsDir, stageLogs) => {
+                renderer =
+                  createRailTuiRenderer(
+                    process.stdin,
+                    process.stderr,
+                    artifactsDir,
+                    stageLogs,
+                  ) ?? new PlainStatusRenderer(process.stderr);
+                setAbortPresentationCleanup(closeRenderer);
+                return renderer;
+              }
+            : undefined,
         resumeRunId,
         userGlobalConfig,
       },
@@ -11738,6 +11824,7 @@ Prune options:
       git,
       ledger,
     );
+    closeRenderer();
     gateCleanupOid = result.attestation?.candidateCommitOid ?? gateCleanupOid;
     await orca.notifyRunResult(
       "passed",
@@ -11751,6 +11838,7 @@ Prune options:
     );
     console.log(JSON.stringify(result));
   } catch (error) {
+    closeRenderer();
     const retainedOutcome =
       error instanceof RecoveryAnchorError || error instanceof RunSettlementError
         ? error.outcome
