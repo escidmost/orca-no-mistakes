@@ -84,6 +84,25 @@ import {
 } from "./presentation.ts";
 import { createRunRenderer } from "./tui.ts";
 import {
+  admissionReadinessPath,
+  anchorPermanentRef,
+  beginGateAdmission,
+  decodeIntentPushOption,
+  deriveAdmissionId,
+  initializeLocalGate,
+  launchDetachedCoordinator,
+  parseReceiveUpdates,
+  readGateMetadata,
+  repositoryGatePaths,
+  validateQuarantinedCommit,
+  validateReceiveUpdate,
+  waitForLaunchReadiness,
+  waitForPermanentRef,
+  writeLaunchReadiness,
+  type GateMetadata,
+  type ReceiveUpdate,
+} from "./admission.ts";
+import {
   DestinationActiveMigrationError,
   DomainLedger,
   LegacyActiveMigrationError,
@@ -93,6 +112,7 @@ import {
   StageLog,
   artifactsRoot,
   buildAttestation,
+  canonicalJson,
   capLog,
   evidenceSha256,
   gateAuditMatchesEvidence,
@@ -112,6 +132,7 @@ import {
   type StageCheckpointRow,
   type StageEvidenceRow,
   type StageEvidenceManifestEntry,
+  type SubmissionAdmissionRow,
 } from "./ledger.ts";
 export {
   DomainLedger,
@@ -126,6 +147,7 @@ export {
   type PassedAttestationManifest,
   type StageEvidenceManifestEntry,
 } from "./ledger.ts";
+export * from "./admission.ts";
 export * from "./presentation.ts";
 export type FindingAction = "ask-user" | "auto-fix" | "no-op";
 
@@ -287,6 +309,12 @@ export interface GitOperations {
 }
 
 export type PipelineOptions = {
+  admission?: {
+    admissionId: string;
+    newOid: string;
+    runId?: string;
+    source: "direct" | "gate";
+  };
   allowLocalConfig?: boolean;
   cliFlags?: CliFlags;
   configPath?: string;
@@ -1784,6 +1812,22 @@ export async function runPipeline(
     ? "[uncertified: local config bypass] "
     : "";
   const policySha256Value = await git.policySha256(repo.base);
+  const admission = options.admission
+    ? ledger.submissionAdmission(options.admission.admissionId)
+    : undefined;
+  if (options.admission && !admission) {
+    throw new Error(`unknown submission admission ${options.admission.admissionId}`);
+  }
+  if (
+    options.admission &&
+    admission &&
+    (admission.new_oid !== options.admission.newOid ||
+      (options.admission.runId !== undefined &&
+        admission.run_id !== options.admission.runId) ||
+      (options.admission.source === "gate" && admission.status !== "accepted"))
+  ) {
+    throw new Error("submission admission is not ready for pipeline execution");
+  }
   let domainRunStarted = false;
   let generationToken: number | undefined;
   let presentation!: PresentationPublisher;
@@ -1820,7 +1864,8 @@ export async function runPipeline(
     });
   };
   const { artifactsDir, runId } = await withGateMutation(async () => {
-    const orchestrationRunId = await orca.createRun(`no-mistakes: ${intent}`);
+    const orchestrationRunId =
+      options.admission?.runId ?? (await orca.createRun(`no-mistakes: ${intent}`));
     const runId = options.resumeRunId ?? orchestrationRunId;
     const artifactsBase = artifactsRoot();
     const artifactsDir = path.resolve(artifactsBase, runId);
@@ -1886,9 +1931,19 @@ export async function runPipeline(
           policySha256: policySha256Value,
           repoRoot: deliveryRepo.root,
           runId,
-          submissionCommitOid: deliveryRepo.head,
+          submissionCommitOid: options.admission?.newOid ?? deliveryRepo.head,
         });
         domainRunStarted = true;
+        if (options.admission) {
+          ledger.bindSubmissionAdmission(options.admission.admissionId, runId);
+          if (options.admission.source === "direct") {
+            ledger.markSubmissionAccepted({
+              acceptedOid: options.admission.newOid,
+              admissionId: options.admission.admissionId,
+              runId,
+            });
+          }
+        }
       }
       const statusRenderer = options.rendererFactory?.(
         artifactsDir,
@@ -9230,6 +9285,7 @@ const VALUE_FLAGS = new Set([
   "base",
   "before",
   "config",
+  "admission-id",
   "fixer-effort",
   "fixer-model",
   "head",
@@ -9240,11 +9296,17 @@ const VALUE_FLAGS = new Set([
   "repo",
   "resume",
   "reviewer-model",
+  "readiness",
+  "run-id",
+  "gate",
 ]);
 const COMMAND_FLAGS: Record<string, Set<string>> = {
   attestation: new Set(["out", "repo"]),
+  gate: new Set(["admission-id", "gate", "readiness", "run-id"]),
+  init: new Set(["repo"]),
   prune: new Set(["before", "repo", "stranded"]),
   run: new Set([
+    "admission-id",
     "allow-local-config",
     "attached",
     "base",
@@ -9260,6 +9322,7 @@ const COMMAND_FLAGS: Record<string, Set<string>> = {
     "repo",
     "resume",
     "reviewer-model",
+    "run-id",
     "tui",
   ]),
 };
@@ -9298,8 +9361,11 @@ function parseCli(argv: string[]): {
     flags[name] = value;
     if (inlineValue === undefined) index += 1;
   }
-  if (subcommand !== "attestation" && positionals.length > 0) {
+  if (subcommand !== "attestation" && subcommand !== "gate" && positionals.length > 0) {
     throw new Error(`${subcommand} does not accept positional arguments`);
+  }
+  if (subcommand === "gate" && positionals.length !== 1) {
+    throw new Error("gate requires exactly one action: admit or coordinator");
   }
   return { command: subcommand, flags, positionals };
 }
@@ -9772,12 +9838,14 @@ async function launchDetachedRun(
   flags: RawCliFlags,
   userGlobalConfig: OrcaNoMistakesConfig,
   resumeStartOid?: string,
+  admissionId?: string,
 ): Promise<string> {
   const orcaCommand = resolveOrcaCommand();
   const root = await configuredWorktreeRoot(
     repo.root,
     userGlobalConfig.worktree_roots,
   );
+  const existingRunId = stringFlag(flags, "run-id");
   let configuredOrca: CliOrca | undefined;
   let intentTaskId = "";
   let terminalHandle = "";
@@ -9967,26 +10035,29 @@ async function launchDetachedRun(
       }
       launcherMarker.terminalHandle = terminalHandle;
       await finishLauncherAllocation(launcherMarker);
-      const runReceipt = unwrapJson<{ run: { id: string } }>(
-        (
-          await withLauncherAllocation(launcherMarker, () =>
-            command(
-              orcaCommand,
-              [
-                "orchestration",
-                "run-create",
-                "--objective",
-                runObjective,
-                "--from",
-                terminalHandle,
-                "--json",
-              ],
-              repo.root,
-            ),
-          )
-        ).stdout,
-      );
-      const runId = runReceipt.run?.id ?? "";
+      const createdRun = existingRunId
+        ? undefined
+        : unwrapJson<{ run: { id: string } }>(
+            (
+              await withLauncherAllocation(launcherMarker, () =>
+                command(
+                  orcaCommand,
+                  [
+                    "orchestration",
+                    "run-create",
+                    "--objective",
+                    runObjective,
+                    "--from",
+                    terminalHandle,
+                    "--json",
+                  ],
+                  repo.root,
+                ),
+              )
+            ).stdout,
+          );
+      const runId = existingRunId ?? createdRun?.run?.id ?? "";
+      if (!runId) throw new Error("orchestration run-create returned no run ID");
       configuredRunPath(root, runId);
       configuredOrca = new CliOrca({
         command: orcaCommand,
@@ -10156,6 +10227,7 @@ async function launchDetachedRun(
     const value = stringFlag(flags, name);
     if (value !== undefined) attachedArgs.push(`--${name}`, value);
   }
+  if (admissionId) attachedArgs.push("--admission-id", admissionId);
   if (flags.tui !== true && flags["no-tui"] !== true) attachedArgs.push("--tui");
   const notifyHandle =
     stringFlag(flags, "notify") ?? process.env.ORCA_TERMINAL_HANDLE;
@@ -12614,6 +12686,179 @@ async function runPruneCommand(flags: RawCliFlags): Promise<void> {
   );
 }
 
+async function runInitCommand(flags: RawCliFlags): Promise<void> {
+  const repo = stringFlag(flags, "repo") ?? process.cwd();
+  const metadata = await initializeLocalGate(
+    repo,
+    path.resolve(process.argv[1] ?? fileURLToPath(import.meta.url)),
+  );
+  console.log(
+    JSON.stringify({
+      gate: metadata.gatePath,
+      remote: metadata.remoteName,
+      repo: metadata.repoRoot,
+    }),
+  );
+}
+
+async function readStandardInput(): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function runGateAdmitCommand(flags: RawCliFlags): Promise<void> {
+  const gatePath = stringFlag(flags, "gate");
+  if (!gatePath) throw new Error("gate admit requires --gate");
+  const metadata = await readGateMetadata(gatePath);
+  if (path.resolve(metadata.gatePath) !== path.resolve(gatePath)) {
+    throw new Error("gate metadata does not match the requested gate");
+  }
+  const updates = parseReceiveUpdates(await readStandardInput());
+  const intent = decodeIntentPushOption(process.env);
+  const validated = validateReceiveUpdate(updates, metadata.defaultBranch, intent);
+  if (validated.noEvent) {
+    console.log(JSON.stringify({ accepted: true, noEvent: true }));
+    return;
+  }
+  validateQuarantinedCommit(metadata.gatePath, validated.newOid);
+
+  const ledger = openRepositoryLedger(metadata.repoRoot, false);
+  try {
+    const admission = beginGateAdmission(ledger, metadata, validated);
+    if (admission.status === "failed" || admission.status === "superseded") {
+      throw new Error(`submission admission ${admission.admission_id} is ${admission.status}`);
+    }
+    if (admission.run_id && admission.status !== "pending") {
+      console.log(
+        JSON.stringify({
+          admissionId: admission.admission_id,
+          replayed: true,
+          runId: admission.run_id,
+        }),
+      );
+      return;
+    }
+    const readinessPath = admissionReadinessPath(metadata, admission.admission_id);
+    const launchLock = `${readinessPath}.lock`;
+    let ownsLaunch = false;
+    await mkdir(path.dirname(readinessPath), { recursive: true });
+    try {
+      await mkdir(launchLock);
+      ownsLaunch = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    try {
+      if (ownsLaunch) {
+        await launchDetachedCoordinator({
+          args: [
+            "gate",
+            "coordinator",
+            "--gate",
+            metadata.gatePath,
+            "--admission-id",
+            admission.admission_id,
+            "--readiness",
+            readinessPath,
+          ],
+          cwd: metadata.repoRoot,
+          entrypoint: path.resolve(process.argv[1] ?? fileURLToPath(import.meta.url)),
+        });
+      }
+      const readiness = await waitForLaunchReadiness(readinessPath);
+      const current = ledger.submissionAdmission(admission.admission_id);
+      if (!current?.run_id || readiness.runId !== current.run_id) {
+        throw new Error("coordinator readiness did not bind the admitted run");
+      }
+      console.log(
+        JSON.stringify({
+          admissionId: current.admission_id,
+          followUp: `orca-no-mistakes run --resume ${current.run_id}`,
+          runId: current.run_id,
+        }),
+      );
+    } finally {
+      if (ownsLaunch) await rm(launchLock, { recursive: true, force: true });
+    }
+  } finally {
+    ledger.close();
+  }
+}
+
+async function runGateCoordinatorCommand(flags: RawCliFlags): Promise<void> {
+  const gatePath = stringFlag(flags, "gate");
+  const admissionId = stringFlag(flags, "admission-id");
+  const requestedReadiness = stringFlag(flags, "readiness");
+  if (!gatePath || !admissionId || !requestedReadiness) {
+    throw new Error("gate coordinator requires --gate, --admission-id, and --readiness");
+  }
+  const metadata = await readGateMetadata(gatePath);
+  const readinessPath = admissionReadinessPath(metadata, admissionId);
+  if (path.resolve(requestedReadiness) !== path.resolve(readinessPath)) {
+    throw new Error("coordinator readiness path does not match the admission");
+  }
+  const ledger = openRepositoryLedger(metadata.repoRoot, false);
+  let runId: string | undefined;
+  let orca: CliOrca | undefined;
+  let accepted = false;
+  try {
+    const admission = ledger.submissionAdmission(admissionId);
+    if (!admission) throw new Error(`unknown submission admission ${admissionId}`);
+    orca = new CliOrca({ cwd: metadata.repoRoot, runId: admission.run_id ?? undefined });
+    runId = admission.run_id ?? (await orca.createRun(`no-mistakes: ${admission.intent}`));
+    ledger.bindSubmissionAdmission(admissionId, runId);
+    await writeLaunchReadiness(readinessPath, { runId, state: "ready" });
+    const update: ReceiveUpdate = {
+      newOid: admission.new_oid,
+      oldOid: admission.old_oid,
+      refName: admission.ref_name,
+    };
+    await waitForPermanentRef(metadata, update, 100);
+    anchorPermanentRef(metadata, update, runId);
+    ledger.markSubmissionAccepted({
+      acceptedOid: admission.new_oid,
+      admissionId,
+      runId,
+    });
+    accepted = true;
+    await main([
+      "run",
+      "--repo",
+      metadata.repoRoot,
+      "--head",
+      admission.new_oid,
+      "--intent",
+      admission.intent,
+      "--admission-id",
+      admissionId,
+      "--run-id",
+      runId,
+    ]);
+  } catch (error) {
+    await writeLaunchReadiness(readinessPath, {
+      error: error instanceof Error ? error.message : String(error),
+      state: "failed",
+    }).catch(() => undefined);
+    if (!accepted) {
+      ledger.failSubmissionAdmission(
+        admissionId,
+        error instanceof Error && error.message.includes("superseded")
+          ? "superseded"
+          : "failed",
+      );
+      if (runId && orca) {
+        await orca.failRun(`Admission coordinator failed: ${error instanceof Error ? error.message : String(error)}`).catch(
+          () => undefined,
+        );
+      }
+    }
+    throw error;
+  } finally {
+    ledger.close();
+  }
+}
+
 export async function main(argv: string[]): Promise<void> {
   if (
     argv.length === 0 ||
@@ -12623,6 +12868,9 @@ export async function main(argv: string[]): Promise<void> {
   ) {
     console.log(`Usage:
   orca-no-mistakes run (--intent <text> | --resume <run-id>) [--repo <path>] [--base <branch>] [--head <sha>] [--force-lease]
+  orca-no-mistakes init [--repo <path>]
+  orca-no-mistakes gate admit --gate <path>
+  orca-no-mistakes gate coordinator --gate <path> --admission-id <id> --readiness <path>
   orca-no-mistakes attestation export <run-id|commit-sha> [--out <path>] [--repo <path>]
   orca-no-mistakes attestation verify <manifest-file|run-id|commit-sha> [--repo <path>]
   orca-no-mistakes prune [--before <date>] [--repo <path>]
@@ -12639,11 +12887,30 @@ Run options:
   --config <path>
   --force-lease (reclaim a stranded branch lease)
 
-Prune options:
-  --stranded (reap stranded gate and direct-run resources whose coordinator died; cannot be combined with --before)`);
+ Prune options:
+  --stranded (reap stranded gate and direct-run resources whose coordinator died; cannot be combined with --before)
+
+ Gate options:
+  init installs or refreshes the repository-local bare gate and managed remote
+  admit accepts one feature ref update with one encoded intent push option`);
     return;
   }
   const parsed = parseCli(argv);
+  if (parsed.command === "init") {
+    await runInitCommand(parsed.flags);
+    return;
+  }
+  if (parsed.command === "gate") {
+    if (parsed.positionals[0] === "admit") {
+      await runGateAdmitCommand(parsed.flags);
+      return;
+    }
+    if (parsed.positionals[0] === "coordinator") {
+      await runGateCoordinatorCommand(parsed.flags);
+      return;
+    }
+    throw new Error(`unknown gate action: ${parsed.positionals[0]}`);
+  }
   if (parsed.command === "attestation") {
     await runAttestationCommand(parsed.positionals, parsed.flags);
     return;
@@ -12696,16 +12963,83 @@ Prune options:
     base: stringFlag(parsed.flags, "base"),
     expectedHead: stringFlag(parsed.flags, "head"),
   });
-  if (parsed.flags.attached !== true) {
-    const repoState = await git.assertReady();
-    const userGlobalConfig = loadUserConfig();
-    const terminalHandle = await launchDetachedRun(
-      repoState,
-      parsed.flags,
-      userGlobalConfig,
-      resumeStartOid,
+  const suppliedAdmissionId = stringFlag(parsed.flags, "admission-id");
+  const isGateChild = Boolean(
+    process.env.NO_MISTAKES_ORIGIN_WORKTREE &&
+      (process.env.NO_MISTAKES_GATE_WORKTREE_ID ||
+        process.env.NO_MISTAKES_GATE_WORKTREE_ROOT),
+  );
+  let admissionRow: SubmissionAdmissionRow | undefined;
+  let admissionLedger: DomainLedger | undefined;
+  let launchRepoState: RepoSnapshot | undefined;
+  if (suppliedAdmissionId) {
+    admissionLedger = openRepositoryLedger(
+      process.env.NO_MISTAKES_ORIGIN_WORKTREE ?? repo,
+      false,
     );
-    console.log(JSON.stringify({ detached: true, terminalHandle }));
+    admissionRow = admissionLedger.submissionAdmission(suppliedAdmissionId);
+    if (!admissionRow) {
+      admissionLedger.close();
+      throw new Error(`unknown submission admission ${suppliedAdmissionId}`);
+    }
+    if (admissionRow.intent !== intent) {
+      admissionLedger.close();
+      throw new Error("run intent does not match the submission admission");
+    }
+  } else if (!resumeRunId && !isGateChild) {
+    launchRepoState = await git.assertReady();
+    const gatePaths = repositoryGatePaths(launchRepoState.root);
+    let gateIdentity = sha256(
+      canonicalJson({ gatePath: gatePaths.gatePath, repoRoot: gatePaths.repoRoot }),
+    );
+    if (existsSync(path.join(gatePaths.stateDir, "gate.json"))) {
+      try {
+        gateIdentity = (await readGateMetadata(gatePaths.gatePath)).gateIdentity;
+      } catch {
+        // A malformed gate is not needed for direct admission; init will repair it.
+      }
+    }
+    admissionLedger = openRepositoryLedger(launchRepoState.root, false);
+    admissionRow = admissionLedger.beginSubmissionAdmission({
+      admissionId: deriveAdmissionId({
+        gateIdentity,
+        intent,
+        newOid: launchRepoState.head,
+        oldOid: launchRepoState.head,
+        refName: `refs/heads/${launchRepoState.branch}`,
+      }),
+      gateIdentity,
+      intent,
+      newOid: launchRepoState.head,
+      oldOid: launchRepoState.head,
+      refName: `refs/heads/${launchRepoState.branch}`,
+      repoRoot: launchRepoState.root,
+      source: "direct",
+    });
+  }
+  if (parsed.flags.attached !== true) {
+    const repoState = launchRepoState ?? (await git.assertReady());
+    const userGlobalConfig = loadUserConfig();
+    try {
+      const terminalHandle = await launchDetachedRun(
+        repoState,
+        parsed.flags,
+        userGlobalConfig,
+        resumeStartOid,
+        admissionRow?.admission_id,
+      );
+      if (admissionRow?.source === "direct" && admissionLedger) {
+        admissionLedger.markSubmissionLaunched(admissionRow.admission_id);
+      }
+      console.log(JSON.stringify({ detached: true, terminalHandle }));
+    } catch (error) {
+      if (admissionRow && admissionLedger) {
+        admissionLedger.failSubmissionAdmission(admissionRow.admission_id);
+      }
+      throw error;
+    } finally {
+      admissionLedger?.close();
+    }
     return;
   }
   const reviewerModel = stringFlag(parsed.flags, "reviewer-model");
@@ -12748,7 +13082,10 @@ Prune options:
     cwd: gatePath,
     notifyHandle: stringFlag(parsed.flags, "notify"),
     parentWorktree: gate?.kind === "configured" ? originWorktree : undefined,
-    runId: gate?.kind === "configured" ? gate.runId : undefined,
+    runId:
+      gate?.kind === "configured"
+        ? gate.runId
+        : admissionRow?.run_id ?? stringFlag(parsed.flags, "run-id"),
   });
   const deliveryGit = gate
     ? new GitShell({
@@ -12757,7 +13094,7 @@ Prune options:
         repo: originWorktree!,
       })
     : undefined;
-  let ledger: DomainLedger | undefined;
+  let ledger: DomainLedger | undefined = admissionLedger;
   let renderer:
     | (PresentationRenderer & { close?: () => void })
     | undefined;
@@ -12777,7 +13114,7 @@ Prune options:
   let gateCleanupOid = await git.head();
   try {
     const userGlobalConfig = loadUserConfig();
-    ledger = openRepositoryLedger(originWorktree ?? gatePath);
+    ledger ??= openRepositoryLedger(originWorktree ?? gatePath);
     await installAbortReaping({
       ...(gate ? { gate } : {}),
       ...(deliveryGit ? { deliveryGit } : {}),
@@ -12801,6 +13138,16 @@ Prune options:
         allowLocalConfig: parsed.flags["allow-local-config"] === true,
         cliFlags,
         configPath: stringFlag(parsed.flags, "config"),
+        admission: admissionRow
+          ? {
+              admissionId: admissionRow.admission_id,
+              newOid: admissionRow.new_oid,
+              runId:
+                admissionRow.run_id ??
+                (gate?.kind === "configured" ? gate.runId : undefined),
+              source: admissionRow.source,
+            }
+          : undefined,
         deliveryBranch: process.env.NO_MISTAKES_DELIVERY_BRANCH,
         deliveryGit,
         forceLease: parsed.flags["force-lease"] === true,
