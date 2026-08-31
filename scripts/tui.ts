@@ -2,6 +2,7 @@ import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
 import path from "node:path";
 
 import { PIPELINE_STEPS, type StageName } from "./config.ts";
+import { knownSecretPrefixBytes, redactKnownSecrets } from "./ledger.ts";
 import type {
   PresentationRenderer,
   PresentationSnapshot,
@@ -68,7 +69,7 @@ function logTail(artifactsDir: string, fileName: string): string[] {
       throw new Error("log path must be a private regular file");
     }
     const size = info.size;
-    const length = Math.min(size, LOG_BYTES);
+    const length = Math.min(size, LOG_BYTES + knownSecretPrefixBytes());
     const buffer = Buffer.alloc(length);
     let bytesRead = 0;
     while (bytesRead < length) {
@@ -82,8 +83,10 @@ function logTail(artifactsDir: string, fileName: string): string[] {
       if (count === 0) break;
       bytesRead += count;
     }
-    const content = buffer
-      .subarray(0, bytesRead)
+    const content = Buffer.from(
+      redactKnownSecrets(buffer.subarray(0, bytesRead).toString("utf8")),
+    )
+      .subarray(-LOG_BYTES)
       .toString("utf8")
       .replaceAll(new RegExp("\\x1b\\[[0-?]*[ -/]*[@-~]", "gu"), "");
     return Array.from(content, (character) => {
@@ -167,6 +170,7 @@ export class RailTuiRenderer implements PresentationRenderer {
   #inputBuffer = "";
   #logOffset = 0;
   #pinnedStage?: StageName;
+  #refreshTimer?: ReturnType<typeof setInterval>;
   #selectedStage = 0;
   #snapshot?: PresentationSnapshot;
 
@@ -201,6 +205,8 @@ export class RailTuiRenderer implements PresentationRenderer {
       output.on("resize", this.#onResize);
       process.once("exit", this.#onExit);
       output.write("\u001b[?1049h\u001b[?25l");
+      this.#refreshTimer = setInterval(this.#onResize, 250);
+      this.#refreshTimer.unref();
     } catch (error) {
       this.close();
       throw error;
@@ -211,6 +217,7 @@ export class RailTuiRenderer implements PresentationRenderer {
     if (this.#closed) return;
     this.#closed = true;
     if (this.#escapeTimer) clearTimeout(this.#escapeTimer);
+    if (this.#refreshTimer) clearInterval(this.#refreshTimer);
     this.#inputBuffer = "";
     this.#input.off("data", this.#onData);
     this.#output.off("error", this.#onError);

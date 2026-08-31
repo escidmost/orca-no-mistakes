@@ -482,8 +482,15 @@ function applyRedaction(content: string, secrets: string[]): string {
   return redacted
 }
 
-function redactKnownSecrets(content: string): string {
+export function redactKnownSecrets(content: string): string {
   return applyRedaction(content, knownSecrets())
+}
+
+export function knownSecretPrefixBytes(): number {
+  return Math.max(
+    0,
+    ...knownSecrets().map((secret) => Buffer.byteLength(secret) - 1),
+  )
 }
 
 /**
