@@ -117,22 +117,23 @@ function logTail(
       if (count === 0) break;
       bytesRead += count;
     }
-    const content = Buffer.from(
-      redactKnownSecrets(buffer.subarray(0, bytesRead).toString("utf8")),
-    )
+    const sanitized = Array.from(
+      buffer
+        .subarray(0, bytesRead)
+        .toString("utf8")
+        .replaceAll(new RegExp("\\x1b\\[[0-?]*[ -/]*[@-~]", "gu"), "?"),
+      (character) => {
+        if (character === "\t") return "  ";
+        return character === "\n" ||
+            (character >= " " && character <= "~")
+          ? character
+          : "?";
+      },
+    ).join("");
+    const content = Buffer.from(redactKnownSecrets(sanitized))
       .subarray(-LOG_BYTES)
-      .toString("utf8")
-      .replaceAll(new RegExp("\\x1b\\[[0-?]*[ -/]*[@-~]", "gu"), "");
-    return Array.from(content, (character) => {
-      if (character === "\t") return "  ";
-      return character === "\n" || character === "\r" ||
-          (character >= " " && character <= "~")
-        ? character
-        : "?";
-    })
-      .join("")
-      .replaceAll("\r", "")
-      .split("\n");
+      .toString("utf8");
+    return content.split("\n");
   } catch {
     return ["No log output yet."];
   } finally {
@@ -261,7 +262,11 @@ export class RailTuiRenderer implements PresentationRenderer {
     process.off("exit", this.#onExit);
     try {
       this.#input.setRawMode?.(this.#inputWasRaw);
+    } catch {}
+    try {
       if (this.#inputWasPaused) this.#input.pause();
+    } catch {}
+    try {
       this.#output.write("\u001b[?25h\u001b[?1049l");
     } catch {}
   }
