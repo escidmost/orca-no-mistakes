@@ -11593,8 +11593,12 @@ async function runPruneCommand(flags: RawCliFlags): Promise<void> {
   let retained = 0;
   for (const ledger of ledgers) {
     try {
-      for (const run of ledger.prunableRuns({ before })) {
+      for (const run of ledger.prunableRuns({
+        before,
+        repoRoot: missingRepoRoot ? undefined : repoRoot,
+      })) {
         if (
+          missingRepoRoot &&
           assertedRepoRoots !== undefined &&
           !assertedRepoRoots.has(path.resolve(run.repo_root))
         ) {

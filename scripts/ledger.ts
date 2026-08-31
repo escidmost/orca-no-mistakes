@@ -2002,6 +2002,15 @@ export class DomainLedger {
   #migrateLegacyRepository(repoRoot: string, sourcePath: string): void {
     const sourcePresent = existsSync(sourcePath)
     if (sourcePresent) this.#db.prepare('ATTACH DATABASE ? AS legacy').run(sourcePath)
+    const deleteMigratedSourceRuns = sourcePresent
+      ? this.#db.prepare(
+          `DELETE FROM legacy.runs
+           WHERE repo_root = ?
+             AND run_id IN (
+               SELECT run_id FROM main.runs WHERE repo_root = ?
+             )`
+        )
+      : undefined
     let transaction = false
     try {
       this.#db.exec('BEGIN IMMEDIATE')
@@ -2010,6 +2019,8 @@ export class DomainLedger {
         'SELECT source_present FROM repository_migrations WHERE source_path = ? AND repo_root = ?'
       ).get(sourcePath, repoRoot) as { source_present: number } | undefined
       if (marker && (marker.source_present === 1 || !sourcePresent)) {
+        if (marker.source_present === 1)
+          deleteMigratedSourceRuns?.run(repoRoot, repoRoot)
         this.#db.exec('COMMIT')
         transaction = false
         return
@@ -2195,6 +2206,7 @@ export class DomainLedger {
              WHERE source.run_id = destination.run_id
            )`
       ).run(repoRoot)
+      deleteMigratedSourceRuns?.run(repoRoot, repoRoot)
       this.#db.prepare(
         `INSERT INTO repository_migrations
            (source_path, repo_root, source_present, completed_at)
