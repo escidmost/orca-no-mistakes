@@ -597,6 +597,7 @@ export class StageLog {
   #file?: Awaited<ReturnType<typeof open>>
   #hasNewOutput = false
   #compacted = false
+  #handoffCarry = ''
   #tail = Buffer.alloc(0)
   #pending = Promise.resolve()
 
@@ -623,14 +624,19 @@ export class StageLog {
   inheritTail(previous: StageLog): void {
     const keep = STAGE_LOG_TAIL_BYTES + knownSecretPrefixBytes()
     this.#tail = Buffer.from(previous.tail(keep))
+    const text = this.#tail.toString('utf8')
+    const hold = pendingSecretPrefix(text, knownSecrets())
+    this.#handoffCarry = hold > 0 ? text.slice(text.length - hold) : ''
   }
 
   async #append(chunk: string, source: symbol): Promise<void> {
     if (chunk.length === 0) return
     await this.#start()
     const secrets = knownSecrets()
+    const handoffCarry = this.#handoffCarry
+    this.#handoffCarry = ''
     const redacted = applyRedaction(
-      `${this.#carries.get(source) ?? ''}${chunk}`,
+      `${handoffCarry}${this.#carries.get(source) ?? ''}${chunk}`,
       secrets,
     )
     // Hold back only a trailing partial secret, so a credential split across two

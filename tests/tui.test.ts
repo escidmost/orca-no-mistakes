@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { chmodSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -97,11 +97,16 @@ class FakeInput extends EventEmitter {
 
 class FakeOutput extends EventEmitter {
   columns = 100;
+  failNextWrite = false;
   isTTY = true;
   rows = 24;
   readonly writes: string[] = [];
 
   write(chunk: string): boolean {
+    if (this.failNextWrite) {
+      this.failNextWrite = false;
+      throw new Error("write failed");
+    }
     this.writes.push(chunk);
     return true;
   }
@@ -120,15 +125,13 @@ function ensurePtyHelperExecutable(): void {
     path.dirname(fileURLToPath(import.meta.resolve("node-pty"))),
     "..",
   );
-  chmodSync(
-    path.join(
-      nodePtyDir,
-      "prebuilds",
-      `${process.platform}-${process.arch}`,
-      "spawn-helper",
-    ),
-    0o755,
+  const helper = path.join(
+    nodePtyDir,
+    "prebuilds",
+    `${process.platform}-${process.arch}`,
+    "spawn-helper",
   );
+  if (existsSync(helper)) chmodSync(helper, 0o755);
 }
 
 if (process.env.TUI_FIXTURE === "1") {
@@ -148,11 +151,23 @@ if (process.env.TUI_FIXTURE === "1") {
     const input = new FakeInput();
     const output = new FakeOutput();
     const renderer = new RailTuiRenderer(input, output, "/unused");
-    assert.throws(() => renderer.render({ ...snapshot("review", 1), stages: [] }));
+    output.failNextWrite = true;
+    assert.throws(() => renderer.render(snapshot("review", 1)));
     assert.equal(input.isRaw, false);
     assert.equal(input.isPaused(), true);
     assert.equal(output.writes[0], "\u001b[?1049h\u001b[?25l");
     assert.equal(output.writes.at(-1), "\u001b[?25h\u001b[?1049l");
+  });
+
+  test("unchanged refreshes do not repaint the terminal", () => {
+    const input = new FakeInput();
+    const output = new FakeOutput();
+    const renderer = new RailTuiRenderer(input, output, "/unused");
+    renderer.render(snapshot("review", 1));
+    const writes = output.writes.length;
+    output.emit("resize");
+    assert.equal(output.writes.length, writes);
+    renderer.close();
   });
 
   test(

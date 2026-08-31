@@ -69,10 +69,13 @@ function logTail(
     const log = stageLogs.get(filePath);
     if (!log) throw new Error("log is not coordinator-owned");
     const buffer = log.tail(STAGE_LOG_TAIL_BYTES + knownSecretPrefixBytes());
-    const sanitized = Array.from(
+    const redacted = redactKnownSecrets(
       buffer
         .toString("utf8")
-        .replaceAll(new RegExp("\\x1b\\[[0-?]*[ -/]*[@-~]", "gu"), "?"),
+        .replaceAll(new RegExp("\\x1b\\[[0-?]*[ -/]*[@-~]", "gu"), ""),
+    );
+    const sanitized = Array.from(
+      redacted,
       (character) => {
         if (character === "\t") return "  ";
         return character === "\n" ||
@@ -81,7 +84,7 @@ function logTail(
           : "?";
       },
     ).join("");
-    const content = Buffer.from(redactKnownSecrets(sanitized))
+    const content = Buffer.from(sanitized)
       .subarray(-STAGE_LOG_TAIL_BYTES)
       .toString("utf8");
     return content.split("\n");
@@ -153,6 +156,7 @@ export class RailTuiRenderer implements PresentationRenderer {
   #escapeTimer?: ReturnType<typeof setTimeout>;
   #focus: Region = "rail";
   #inputBuffer = "";
+  #lastFrame?: string;
   #logOffset = 0;
   #pinnedStage?: StageName;
   #refreshTimer?: ReturnType<typeof setInterval>;
@@ -255,7 +259,10 @@ export class RailTuiRenderer implements PresentationRenderer {
         : columns >= FULL_COLUMNS && rows >= FULL_ROWS
           ? this.#full(columns, rows)
           : this.#compact(columns, rows);
-    this.#output.write(`\u001b[H\u001b[2J${screen.join("\n")}`);
+    const frame = screen.join("\n");
+    if (frame === this.#lastFrame) return;
+    this.#output.write(`\u001b[H\u001b[2J${frame}`);
+    this.#lastFrame = frame;
   }
 
   #minimal(columns: number, rows: number): string[] {
@@ -322,15 +329,16 @@ export class RailTuiRenderer implements PresentationRenderer {
     const snapshot = this.#snapshot!;
     const lines = [this.#regionTitle("RAIL", "rail", width), ""];
     for (const [index, stage] of PIPELINE_STEPS.entries()) {
-      const state = snapshot.stages[index];
-      const active = snapshot.currentStage === stage && state.status === "active";
+      const status =
+        snapshot.stages.find((item) => item.id === stage)?.status ?? "pending";
+      const active = snapshot.currentStage === stage && status === "active";
       const marker = active
         ? ">"
-        : state.status === "passed"
+        : status === "passed"
           ? "x"
-          : state.status === "failed" || state.status === "cancelled"
+          : status === "failed" || status === "cancelled"
             ? "!"
-            : state.status === "blocked"
+            : status === "blocked"
               ? "-"
               : " ";
       const selected = index === this.#selectedStage ? ">" : " ";

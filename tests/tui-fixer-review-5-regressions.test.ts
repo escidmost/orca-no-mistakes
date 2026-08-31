@@ -110,7 +110,8 @@ test("terminal controls cannot reconstruct a known secret", async () => {
     renderer.render(snapshot());
     const screen = output.writes.at(-1) ?? "";
     assert.doesNotMatch(screen, new RegExp(secret, "u"));
-    assert.match(screen, /abcd\?1234/u);
+    assert.doesNotMatch(screen, /abcd|1234/u);
+    assert.match(screen, /\[REDACTED\]/u);
   } finally {
     renderer.close();
     await log.close();
