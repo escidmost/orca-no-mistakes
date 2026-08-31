@@ -252,7 +252,7 @@ export class RailTuiRenderer implements PresentationRenderer {
   #full(columns: number, rows: number): string[] {
     const railWidth = 25;
     const activityWidth = 31;
-    const logWidth = columns - railWidth - activityWidth - 4;
+    const logWidth = columns - railWidth - activityWidth - 6;
     const bodyRows = rows - 3;
     const rail = this.#rail(bodyRows, railWidth);
     const recent = this.#recent(bodyRows, activityWidth);
@@ -312,8 +312,15 @@ export class RailTuiRenderer implements PresentationRenderer {
   #recent(rows: number, width: number): string[] {
     const lines = [this.#regionTitle("RECENT ACTIVITY", "activity", width)];
     const room = Math.max(0, rows - 1);
-    const start = Math.max(0, this.#activities.length - room);
-    for (let index = start; index < this.#activities.length; index += 1) {
+    const start = Math.max(
+      0,
+      Math.min(this.#activityIndex, this.#activities.length - room),
+    );
+    for (
+      let index = start;
+      index < Math.min(this.#activities.length, start + room);
+      index += 1
+    ) {
       const selected = index === this.#activityIndex ? ">" : " ";
       lines.push(`${selected} ${this.#activities[index].label}`);
     }
@@ -329,6 +336,10 @@ export class RailTuiRenderer implements PresentationRenderer {
     );
     const all = logTail(path.join(this.#artifactsDir, `${stage}_r${round}.log`));
     const room = Math.max(0, rows - 1);
+    this.#logOffset = Math.min(
+      this.#logOffset,
+      Math.max(0, all.length - room),
+    );
     const bottom = Math.max(0, all.length - this.#logOffset);
     const visible = all.slice(Math.max(0, bottom - room), bottom);
     const lines = [
@@ -357,10 +368,14 @@ export class RailTuiRenderer implements PresentationRenderer {
   #handleInput(input: string): void {
     const keys =
       input.match(
-        new RegExp("\\x1b\\[Z|\\x1b\\[[ABCD]|\\r|\\n|\\t|\\x1b", "g"),
+        new RegExp("\\x03|\\x1b\\[Z|\\x1b\\[[ABCD]|\\r|\\n|\\t|\\x1b", "g"),
       ) ?? [];
     for (const key of keys) {
-      if (key === "\t" || key === "\u001b[Z") {
+      if (key === "\u0003") {
+        this.close();
+        process.kill(process.pid, "SIGINT");
+        return;
+      } else if (key === "\t" || key === "\u001b[Z") {
         const direction = key === "\t" ? 1 : -1;
         const index = REGIONS.indexOf(this.#focus);
         this.#focus = REGIONS[(index + direction + REGIONS.length) % REGIONS.length];
