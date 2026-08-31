@@ -678,7 +678,10 @@ export async function resolveGithubPublicationRoute(input: {
     : baseReference
   const authentication = await input.provider.observeAuthentication()
   const existing = input.ledger.repositoryPublicationRoute(repoRoot)
-  if (existing && existing.actor_id !== authentication.actor.id) {
+  if (existing && (
+    existing.actor_id !== authentication.actor.id ||
+    (existing.actor_node_id !== null && existing.actor_node_id !== authentication.actor.nodeId)
+  )) {
     throw new GithubAuthorityError(
       'identity-drift',
       'resolve-publication-route',
@@ -700,6 +703,7 @@ export async function resolveGithubPublicationRoute(input: {
   const route: RepositoryPublicationRouteInput = {
     actorId: authentication.actor.id,
     actorLogin: authentication.actor.login,
+    actorNodeId: authentication.actor.nodeId,
     backend: authentication.backend.kind,
     backendVersion: authentication.backend.version,
     baseBranch: input.baseBranch ?? baseRepository.defaultBranch,

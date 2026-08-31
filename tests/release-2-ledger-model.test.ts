@@ -57,6 +57,7 @@ test('repository publication routes update safely and snapshot into runs', async
   const route = {
     actorId: 'U_1',
     actorLogin: 'operator',
+    actorNodeId: 'U_node_1',
     backend: 'gh' as const,
     backendVersion: '2.97.0',
     baseBranch: 'main',
@@ -96,6 +97,7 @@ test('repository publication routes update safely and snapshot into runs', async
     }
     assert.equal(ledger.setRepositoryPublicationRoute(renamed), fingerprint)
     assert.equal(ledger.repositoryPublicationRoute('/repo')?.actor_login, 'renamed-operator')
+    assert.equal(ledger.repositoryPublicationRoute('/repo')?.actor_node_id, 'U_node_1')
 
     assert.throws(
       () => ledger.setRepositoryPublicationRoute({

@@ -316,6 +316,7 @@ test('authentication and route identity checks allow redirects but reject author
   const route = {
     actorId: '5',
     actorLogin: 'operator',
+    actorNodeId: 'U_5',
     backend: 'gh' as const,
     backendVersion: '2.97.0',
     baseBranch: 'main',
@@ -336,6 +337,7 @@ test('authentication and route identity checks allow redirects but reject author
   const stored = {
     actor_id: '5',
     actor_login: 'operator',
+    actor_node_id: 'U_5',
     backend: 'gh' as const,
     backend_version: '2.97.0',
     base_branch: 'main',
@@ -416,6 +418,18 @@ test('route resolution canonicalizes same-repository and fork routes without per
     assert.equal(fork.headRepositoryId, '20')
     assert.equal(fork.networkRootRepositoryId, '10')
     assert.doesNotMatch(JSON.stringify(ledger.repositoryPublicationRoute(canonicalTemp)), /do-not-persist/)
+    assert.equal(ledger.repositoryPublicationRoute(canonicalTemp)?.actor_node_id, 'U_5')
+    currentUser = { ...user, node_id: 'U_6' }
+    await assert.rejects(
+      () => resolveGithubPublicationRoute({
+        commandRunner: git,
+        fork: 'fork/project',
+        ledger,
+        provider: api,
+        repoPath: temp
+      }),
+      (error: unknown) => error instanceof GithubAuthorityError && error.kind === 'identity-drift'
+    )
     currentUser = { ...user, id: 6, node_id: 'U_6' }
     await assert.rejects(
       () => resolveGithubPublicationRoute({

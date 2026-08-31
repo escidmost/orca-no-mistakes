@@ -22,6 +22,7 @@ export class RepositoryMigrationConflictError extends Error {}
 export type RepositoryPublicationRouteInput = {
   actorId: string
   actorLogin: string
+  actorNodeId: string
   backend: 'gh' | 'gh-axi'
   backendVersion: string
   baseBranch: string
@@ -43,6 +44,7 @@ export type RepositoryPublicationRouteInput = {
 export type RepositoryPublicationRouteRow = {
   actor_id: string
   actor_login: string
+  actor_node_id: string | null
   backend: 'gh' | 'gh-axi'
   backend_version: string
   base_branch: string
@@ -1533,6 +1535,7 @@ CREATE TABLE IF NOT EXISTS repository_publication_routes (
   base_branch TEXT NOT NULL,
   actor_id TEXT NOT NULL,
   actor_login TEXT NOT NULL,
+  actor_node_id TEXT,
   credential_source TEXT NOT NULL CHECK(credential_source IN ('GH_TOKEN', 'GITHUB_TOKEN', 'stored-account')),
   backend TEXT NOT NULL CHECK(backend IN ('gh', 'gh-axi')),
   backend_version TEXT NOT NULL,
@@ -2049,7 +2052,8 @@ export class DomainLedger {
       ['stage_evidence', 'artifact_sha256 TEXT'],
       ['stage_evidence', 'findings_json TEXT'],
       ['gate_audit', 'selected_finding_ids TEXT'],
-      ['gate_audit', 'evidence_sha256 TEXT']
+      ['gate_audit', 'evidence_sha256 TEXT'],
+      ['repository_publication_routes', 'actor_node_id TEXT']
     ]) {
       try {
         this.#db.exec(`ALTER TABLE ${table} ADD COLUMN ${column}`)
@@ -2527,9 +2531,9 @@ export class DomainLedger {
          repo_root, route_fingerprint, forge_host, base_repository_id,
          base_repository_node_id, base_repository_name, head_repository_id,
          head_repository_node_id, head_repository_name, network_root_repository_id,
-         head_owner, head_branch, base_branch, actor_id, actor_login,
+         head_owner, head_branch, base_branch, actor_id, actor_login, actor_node_id,
          credential_source, backend, backend_version, observed_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(repo_root) DO UPDATE SET
          route_fingerprint = excluded.route_fingerprint,
          forge_host = excluded.forge_host,
@@ -2545,6 +2549,7 @@ export class DomainLedger {
          base_branch = excluded.base_branch,
          actor_id = excluded.actor_id,
          actor_login = excluded.actor_login,
+         actor_node_id = excluded.actor_node_id,
          credential_source = excluded.credential_source,
          backend = excluded.backend,
          backend_version = excluded.backend_version,
@@ -2566,6 +2571,7 @@ export class DomainLedger {
       input.baseBranch,
       input.actorId,
       input.actorLogin,
+      input.actorNodeId,
       input.credentialSource,
       input.backend,
       input.backendVersion,
@@ -2580,7 +2586,7 @@ export class DomainLedger {
       `SELECT repo_root, route_fingerprint, forge_host, base_repository_id,
               base_repository_node_id, base_repository_name, head_repository_id,
               head_repository_node_id, head_repository_name, network_root_repository_id,
-              head_owner, head_branch, base_branch, actor_id, actor_login,
+              head_owner, head_branch, base_branch, actor_id, actor_login, actor_node_id,
               credential_source, backend, backend_version, observed_at, updated_at
        FROM repository_publication_routes WHERE repo_root = ?`
     ).get(repoRoot) as RepositoryPublicationRouteRow | undefined
