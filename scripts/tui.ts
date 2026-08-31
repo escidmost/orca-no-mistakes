@@ -1,4 +1,12 @@
-import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readSync,
+  realpathSync,
+} from "node:fs";
 import path from "node:path";
 
 import { PIPELINE_STEPS, type StageName } from "./config.ts";
@@ -51,9 +59,35 @@ function fit(text: string, width: number): string {
   return value.padEnd(width);
 }
 
-function logTail(artifactsDir: string, fileName: string): string[] {
+function artifactDirectoryIdentity(artifactsDir: string): string | undefined {
+  try {
+    const directory = path.resolve(artifactsDir);
+    const root = path.dirname(directory);
+    return [root, directory]
+      .flatMap((entry) => {
+        const info = lstatSync(entry, { bigint: true });
+        if (info.isSymbolicLink() || !info.isDirectory()) throw new Error();
+        return [realpathSync(entry), info.dev, info.ino, info.birthtimeNs];
+      })
+      .join("\0");
+  } catch {
+    return undefined;
+  }
+}
+
+function logTail(
+  artifactsDir: string,
+  artifactsIdentity: string | undefined,
+  fileName: string,
+): string[] {
   let descriptor: number | undefined;
   try {
+    if (
+      artifactsIdentity === undefined ||
+      artifactDirectoryIdentity(artifactsDir) !== artifactsIdentity
+    ) {
+      throw new Error("artifact directory identity changed");
+    }
     const root = path.resolve(artifactsDir);
     const filePath = path.resolve(root, fileName);
     const relative = path.relative(root, filePath);
@@ -159,6 +193,7 @@ export function supportsRailTui(
 export class RailTuiRenderer implements PresentationRenderer {
   readonly #activities: { label: string; stage?: StageName }[] = [];
   readonly #artifactsDir: string;
+  readonly #artifactsIdentity: string | undefined;
   readonly #input: Input;
   readonly #inputWasPaused: boolean;
   readonly #inputWasRaw: boolean;
@@ -194,7 +229,8 @@ export class RailTuiRenderer implements PresentationRenderer {
   constructor(input: Input, output: Output, artifactsDir: string) {
     this.#input = input;
     this.#output = output;
-    this.#artifactsDir = artifactsDir;
+    this.#artifactsDir = path.resolve(artifactsDir);
+    this.#artifactsIdentity = artifactDirectoryIdentity(this.#artifactsDir);
     this.#inputWasPaused = input.isPaused();
     this.#inputWasRaw = input.isRaw === true;
     try {
@@ -366,7 +402,11 @@ export class RailTuiRenderer implements PresentationRenderer {
     const snapshot = this.#snapshot!;
     const stage = this.#pinnedStage ?? PIPELINE_STEPS[this.#selectedStage];
     const round = snapshot.stages.find((item) => item.id === stage)?.round ?? 0;
-    const all = logTail(this.#artifactsDir, `${stage}_r${round}.log`);
+    const all = logTail(
+      this.#artifactsDir,
+      this.#artifactsIdentity,
+      `${stage}_r${round}.log`,
+    );
     const room = Math.max(0, rows - 1);
     this.#logOffset = Math.min(
       this.#logOffset,
