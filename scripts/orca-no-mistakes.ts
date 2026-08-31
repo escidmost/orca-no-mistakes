@@ -66,7 +66,7 @@ import {
   type GateResolver,
   type PresentationRenderer,
 } from "./presentation.ts";
-import { createRailTuiRenderer } from "./tui.ts";
+import { createRunRenderer } from "./tui.ts";
 import {
   DestinationActiveMigrationError,
   DomainLedger,
@@ -9493,6 +9493,7 @@ async function launchDetachedRun(
     const value = stringFlag(flags, name);
     if (value !== undefined) attachedArgs.push(`--${name}`, value);
   }
+  if (flags.tui !== true && flags["no-tui"] !== true) attachedArgs.push("--tui");
   const notifyHandle =
     stringFlag(flags, "notify") ?? process.env.ORCA_TERMINAL_HANDLE;
   if (notifyHandle) attachedArgs.push("--notify", notifyHandle);
@@ -11745,7 +11746,7 @@ Run options:
   --reviewer-model <model>
   --fixer-model <model> --fixer-effort <level>
   --max-fix-rounds <count>
-  --tui (render an interactive Rail with inline decision-gate resolution when the terminal supports it)
+  --tui (render an interactive Rail with inline decision-gate resolution; default for detached runs)
   --no-tui (emit semantic run progress on stderr)
   --resume <run-id> (continue a failed run from its last checkpoint)
   --allow-local-config
@@ -11925,14 +11926,13 @@ Prune options:
         rendererFactory:
           parsed.flags.tui === true
             ? (artifactsDir, stageLogs, resolveGate) => {
-                renderer =
-                  createRailTuiRenderer(
-                    process.stdin,
-                    process.stderr,
-                    artifactsDir,
-                    stageLogs,
-                    resolveGate,
-                  ) ?? new PlainStatusRenderer(process.stderr);
+                renderer = createRunRenderer(
+                  process.stdin,
+                  process.stderr,
+                  artifactsDir,
+                  stageLogs,
+                  resolveGate,
+                );
                 setAbortPresentationCleanup(closeRenderer);
                 return renderer;
               }

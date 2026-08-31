@@ -7,11 +7,12 @@ import {
   STAGE_LOG_TAIL_BYTES,
   type StageLog,
 } from "./ledger.ts";
-import type {
-  GateResolver,
-  PresentationRenderer,
-  PresentationSnapshot,
-  PresentationTransition,
+import {
+  PlainStatusRenderer,
+  type GateResolver,
+  type PresentationRenderer,
+  type PresentationSnapshot,
+  type PresentationTransition,
 } from "./presentation.ts";
 
 type Input = {
@@ -729,4 +730,22 @@ export function createRailTuiRenderer(
   } catch {
     return undefined;
   }
+}
+
+export function createRunRenderer(
+  input: Input,
+  output: Output & ConstructorParameters<typeof PlainStatusRenderer>[0],
+  artifactsDir: string,
+  stageLogs?: ReadonlyMap<string, StageLog>,
+  resolveGate?: GateResolver,
+): PresentationRenderer & { close?: () => void } {
+  return (
+    createRailTuiRenderer(
+      input,
+      output,
+      artifactsDir,
+      stageLogs,
+      resolveGate,
+    ) ?? new PlainStatusRenderer(output)
+  );
 }
