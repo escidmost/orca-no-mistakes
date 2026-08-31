@@ -3752,7 +3752,7 @@ export class DomainLedger {
         problems.push(`${receipt.kind} receipt digest`)
       }
       if (!this.#remoteObservationMatches({
-        allowHistoricalAttempt: true,
+        allowHistoricalAttempt: receipt.kind === 'candidate-publication',
         candidateCommitOid: receipt.candidate_commit_oid,
         kind: receipt.kind,
         observationSha256: receipt.authoritative_post_observation_sha256,
