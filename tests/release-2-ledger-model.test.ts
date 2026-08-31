@@ -262,8 +262,31 @@ test('Release 2 ledger facts are immutable, append-only, and atomically checkpoi
     const cleanupDb = new DatabaseSync(dbPath)
     cleanupDb.exec('DROP TRIGGER reject_remote_checkpoint')
     cleanupDb.close()
-    const receiptDigest = ledger.settleRemoteStage(settlement).receiptSha256
+    const firstSettlement = ledger.settleRemoteStage(settlement)
+    const receiptDigest = firstSettlement.receiptSha256
     assert.match(receiptDigest, /^[0-9a-f]{64}$/)
+    assert.deepEqual(ledger.settleRemoteStage(settlement), firstSettlement)
+    assert.equal(ledger.listEvidence(runId).length, 1)
+    assert.equal(ledger.listCheckpoints(runId).length, 1)
+    const conflictingEvidence = {
+      ...evidence,
+      evidenceSha256: evidenceSha256({
+        artifactSha256: evidence.artifactSha256,
+        baseCommitOid: evidence.baseCommitOid,
+        candidateCommitOid: evidence.candidateCommitOid,
+        exitCode: evidence.exitCode,
+        round: evidence.roundIndex,
+        runId,
+        stage: 'push',
+        summary: 'different successful evidence',
+        workerIdentity: evidence.workerIdentity
+      }),
+      summary: 'different successful evidence'
+    }
+    assert.throws(
+      () => ledger.settleRemoteStage({ ...settlement, evidence: conflictingEvidence }),
+      /push round 0 is already settled with different facts/
+    )
     assert.equal(
       ledger.remoteReceipt(runId, 'candidate-publication')?.receipt_sha256,
       receiptDigest

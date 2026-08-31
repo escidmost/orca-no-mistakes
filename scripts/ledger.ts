@@ -2931,18 +2931,87 @@ export class DomainLedger {
       throw new Error(`${input.stageId} receipt does not match its authoritative post-read observation`)
     }
 
-    const createdAt = new Date().toISOString()
     const receiptJson = canonicalJson(input.receipt.payload)
-    const receiptSha256 = sha256(canonicalJson({
-      authoritativePostObservationSha256: input.receipt.authoritativePostObservationSha256,
-      candidateCommitOid: input.receipt.candidateCommitOid,
-      createdAt,
-      kind: input.receipt.kind,
-      payload: input.receipt.payload,
-      runId: input.runId
-    }))
     this.#db.exec('BEGIN IMMEDIATE')
     try {
+      const existingEvidence = this.#db.prepare(
+        `SELECT evidence_id
+         FROM stage_evidence
+         WHERE run_id = ? AND stage_id = ? AND round_index = ?
+           AND candidate_commit_oid = ? AND base_commit_oid = ?
+           AND worker_identity = ? AND exit_code = ? AND evidence_sha256 = ?
+           AND artifact_path = ? AND artifact_sha256 IS ? AND summary = ?
+           AND findings_json IS ? AND effective_policy_hash IS ? AND base_ref_sha IS ?
+         LIMIT 1`
+      ).get(
+        input.runId,
+        input.stageId,
+        input.evidence.roundIndex,
+        input.evidence.candidateCommitOid,
+        input.evidence.baseCommitOid,
+        input.evidence.workerIdentity,
+        input.evidence.exitCode,
+        input.evidence.evidenceSha256,
+        input.evidence.artifactPath,
+        input.evidence.artifactSha256,
+        input.evidence.summary,
+        input.evidence.findingsJson ?? null,
+        input.evidence.effectivePolicyHash ?? null,
+        input.evidence.baseRefSha ?? null
+      ) as { evidence_id: string } | undefined
+      const existingCheckpoint = this.#db.prepare(
+        `SELECT 1
+         FROM stage_checkpoints
+         WHERE run_id = ? AND stage_id = ? AND round_index = ?
+           AND input_commit_oid = ? AND output_commit_oid = ?
+         LIMIT 1`
+      ).get(
+        input.runId,
+        input.stageId,
+        input.checkpoint.roundIndex,
+        input.checkpoint.inputCommitOid,
+        input.checkpoint.outputCommitOid
+      )
+      const existingReceipt = this.#db.prepare(
+        `SELECT receipt_sha256
+         FROM remote_receipts
+         WHERE run_id = ? AND kind = ? AND candidate_commit_oid = ?
+           AND authoritative_post_observation_sha256 = ? AND receipt_json = ?
+         ORDER BY created_at DESC, rowid DESC
+         LIMIT 1`
+      ).get(
+        input.runId,
+        input.receipt.kind,
+        input.receipt.candidateCommitOid,
+        input.receipt.authoritativePostObservationSha256,
+        receiptJson
+      ) as { receipt_sha256: string } | undefined
+      const priorEvidence = this.#db.prepare(
+        'SELECT 1 FROM stage_evidence WHERE run_id = ? AND stage_id = ? AND round_index = ? LIMIT 1'
+      ).get(input.runId, input.stageId, input.evidence.roundIndex)
+      const priorCheckpoint = this.#db.prepare(
+        'SELECT 1 FROM stage_checkpoints WHERE run_id = ? AND stage_id = ? AND round_index = ? LIMIT 1'
+      ).get(input.runId, input.stageId, input.checkpoint.roundIndex)
+      if (priorEvidence !== undefined || priorCheckpoint !== undefined) {
+        if (existingEvidence && existingCheckpoint && existingReceipt) {
+          this.#db.exec('COMMIT')
+          return {
+            evidenceId: existingEvidence.evidence_id,
+            receiptSha256: existingReceipt.receipt_sha256
+          }
+        }
+        throw new Error(`${input.stageId} round ${input.checkpoint.roundIndex} is already settled with different facts`)
+      }
+
+      const createdAt = new Date().toISOString()
+      const receiptSha256 = sha256(canonicalJson({
+        authoritativePostObservationSha256: input.receipt.authoritativePostObservationSha256,
+        candidateCommitOid: input.receipt.candidateCommitOid,
+        createdAt,
+        kind: input.receipt.kind,
+        payload: input.receipt.payload,
+        runId: input.runId
+      }))
       this.#db.prepare(
         `INSERT INTO remote_receipts (
            receipt_id, run_id, kind, candidate_commit_oid,
