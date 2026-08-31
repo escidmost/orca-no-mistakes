@@ -1555,7 +1555,6 @@ CREATE TABLE IF NOT EXISTS remote_receipts (
   receipt_json TEXT NOT NULL,
   receipt_sha256 TEXT NOT NULL UNIQUE,
   created_at TEXT NOT NULL,
-  UNIQUE (run_id, kind),
   FOREIGN KEY (run_id, authoritative_post_observation_sha256)
     REFERENCES remote_observations(run_id, observation_sha256) ON DELETE CASCADE
 );
@@ -1847,6 +1846,32 @@ export class DomainLedger {
         this.#db.exec('DROP TABLE gate_audit_legacy')
         this.#db.exec('COMMIT')
         console.error('no-mistakes: rebuilt gate_audit with durable gate events; existing rows preserved')
+      } catch (error) {
+        this.#db.exec('ROLLBACK')
+        throw error
+      }
+    }
+    const singleRemoteReceipt = this.#db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'remote_receipts'")
+      .get() as { sql: string } | undefined
+    if (singleRemoteReceipt?.sql.includes('UNIQUE (run_id, kind)')) {
+      this.#db.exec('BEGIN IMMEDIATE')
+      try {
+        this.#db.exec(`DROP TRIGGER IF EXISTS immutable_remote_receipts;
+          DROP TRIGGER IF EXISTS immutable_remote_receipts_delete;
+          DROP TRIGGER IF EXISTS enforce_remote_receipt_observation;
+          DROP TRIGGER IF EXISTS fence_terminal_remote_receipts;
+          ALTER TABLE remote_receipts RENAME TO remote_receipts_legacy`)
+        this.#db.exec(SCHEMA)
+        this.#db.exec(`INSERT INTO remote_receipts (
+            receipt_id, run_id, kind, candidate_commit_oid,
+            authoritative_post_observation_sha256, receipt_json, receipt_sha256, created_at
+          )
+          SELECT receipt_id, run_id, kind, candidate_commit_oid,
+                 authoritative_post_observation_sha256, receipt_json, receipt_sha256, created_at
+          FROM remote_receipts_legacy`)
+        this.#db.exec('DROP TABLE remote_receipts_legacy')
+        this.#db.exec('COMMIT')
       } catch (error) {
         this.#db.exec('ROLLBACK')
         throw error
@@ -2709,12 +2734,21 @@ export class DomainLedger {
     }
   }
 
-  remoteReceipt(runId: string, kind: RemoteReceiptKind): RemoteReceiptRow | undefined {
+  remoteReceipt(
+    runId: string,
+    kind: RemoteReceiptKind,
+    receiptSha256?: string
+  ): RemoteReceiptRow | undefined {
     return this.#db.prepare(
       `SELECT kind, candidate_commit_oid, authoritative_post_observation_sha256,
               receipt_json, receipt_sha256, created_at
-       FROM remote_receipts WHERE run_id = ? AND kind = ?`
-    ).get(runId, kind) as RemoteReceiptRow | undefined
+       FROM remote_receipts
+       WHERE run_id = ? AND kind = ? AND (? IS NULL OR receipt_sha256 = ?)
+       ORDER BY created_at DESC
+       LIMIT 1`
+    ).get(runId, kind, receiptSha256 ?? null, receiptSha256 ?? null) as
+      | RemoteReceiptRow
+      | undefined
   }
 
   prepareResume(input: {
@@ -3718,14 +3752,22 @@ export class DomainLedger {
     })
     if (!passedOutcome) problems.push('passed attempt outcome')
 
-    const publication = this.remoteReceipt(manifest.runId, 'candidate-publication')
+    const publication = this.remoteReceipt(
+      manifest.runId,
+      'candidate-publication',
+      manifest.candidatePublicationReceiptSha256
+    )
     if (
       publication?.receipt_sha256 !== manifest.candidatePublicationReceiptSha256 ||
       publication.candidate_commit_oid !== manifest.candidateCommitOid
     ) {
       problems.push('candidate-publication receipt')
     }
-    const pullRequest = this.remoteReceipt(manifest.runId, 'pull-request-binding')
+    const pullRequest = this.remoteReceipt(
+      manifest.runId,
+      'pull-request-binding',
+      manifest.pullRequestBindingReceiptSha256
+    )
     if (
       pullRequest?.receipt_sha256 !== manifest.pullRequestBindingReceiptSha256 ||
       pullRequest.candidate_commit_oid !== manifest.candidateCommitOid
