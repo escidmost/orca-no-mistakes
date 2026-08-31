@@ -1390,7 +1390,6 @@ export function repositoryLedgerPath(repositoryPath = process.cwd()): string {
 }
 
 function defaultLedgerLocation(): { dbPath: string; legacyPath?: string; repoRoot?: string } {
-  if (process.env.ORCA_NO_MISTAKES_HOME) return { dbPath: legacyLedgerPath() }
   try {
     const repository = repositoryLocation(process.cwd())
     return {
@@ -1878,6 +1877,49 @@ export class DomainLedger {
       }
     }
     this.#db.exec(SCHEMA)
+    this.#db.exec(`CREATE TRIGGER IF NOT EXISTS fence_run_attempt_generation
+      BEFORE INSERT ON run_attempts
+      WHEN EXISTS (
+        SELECT 1 FROM runs r
+        JOIN branch_leases l ON l.repo_root = r.repo_root AND l.branch = r.branch
+        WHERE r.run_id = NEW.run_id
+      ) AND NOT EXISTS (
+        SELECT 1 FROM runs r
+        JOIN branch_leases l ON l.repo_root = r.repo_root AND l.branch = r.branch
+        WHERE r.run_id = NEW.run_id AND l.run_id = NEW.run_id
+          AND l.generation_token = NEW.generation_token
+      )
+      BEGIN SELECT RAISE(ABORT, 'attempt is not from the current branch lease generation'); END;`)
+    for (const table of ['attempt_outcomes', 'remote_observations', 'mutation_intents']) {
+      this.#db.exec(`CREATE TRIGGER IF NOT EXISTS fence_current_${table}
+        BEFORE INSERT ON ${table}
+        WHEN NOT EXISTS (
+          SELECT 1 FROM run_attempts a
+          JOIN runs r ON r.run_id = a.run_id
+          LEFT JOIN branch_leases l ON l.repo_root = r.repo_root AND l.branch = r.branch
+          WHERE a.attempt_id = NEW.attempt_id AND a.run_id = NEW.run_id
+            AND ((l.run_id = NEW.run_id AND l.generation_token = a.generation_token)
+              OR (l.run_id IS NULL AND a.generation_token = (
+                SELECT MAX(generation_token) FROM run_attempts WHERE run_id = NEW.run_id
+              )))
+        )
+        BEGIN SELECT RAISE(ABORT, 'attempt is not from the current branch lease generation'); END;`)
+    }
+    this.#db.exec(`CREATE TRIGGER IF NOT EXISTS fence_current_remote_receipts
+      BEFORE INSERT ON remote_receipts
+      WHEN NOT EXISTS (
+        SELECT 1 FROM remote_observations o
+        JOIN run_attempts a ON a.attempt_id = o.attempt_id AND a.run_id = o.run_id
+        JOIN runs r ON r.run_id = o.run_id
+        LEFT JOIN branch_leases l ON l.repo_root = r.repo_root AND l.branch = r.branch
+        WHERE o.run_id = NEW.run_id
+          AND o.observation_sha256 = NEW.authoritative_post_observation_sha256
+          AND ((l.run_id = NEW.run_id AND l.generation_token = a.generation_token)
+            OR (l.run_id IS NULL AND a.generation_token = (
+              SELECT MAX(generation_token) FROM run_attempts WHERE run_id = NEW.run_id
+            )))
+      )
+      BEGIN SELECT RAISE(ABORT, 'receipt is not from the current branch lease generation'); END;`)
     for (const table of RELEASE_2_FACT_TABLES) {
       this.#db.exec(`CREATE TRIGGER IF NOT EXISTS fence_terminal_${table}
         BEFORE INSERT ON ${table}
@@ -3157,7 +3199,7 @@ export class DomainLedger {
     }
   }
 
-  #completePassedRun(manifest: PassedAttestationManifest, terminalCommitOid: string): void {
+  #completePassedRun(manifest: CompletionAttestationManifest, terminalCommitOid: string): void {
     if (!this.finishRun(manifest.runId, 'passed', terminalCommitOid)) {
       throw new Error(`run ${manifest.runId} is already settled`)
     }
@@ -3166,7 +3208,7 @@ export class DomainLedger {
   }
 
   finalizePassedRun(
-    manifest: PassedAttestationManifest,
+    manifest: CompletionAttestationManifest,
     terminalCommitOid: string,
     ownership?: { branch: string; generationToken: number; repoRoot: string }
   ): void {
@@ -3182,7 +3224,7 @@ export class DomainLedger {
   }
 
   async finalizePassedRunWithLeaseMutation(
-    manifest: PassedAttestationManifest,
+    manifest: CompletionAttestationManifest,
     terminalCommitOid: string,
     ownership: { branch: string; generationToken: number; repoRoot: string },
     mutation: () => Promise<string>,

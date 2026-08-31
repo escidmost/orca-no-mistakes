@@ -10898,9 +10898,7 @@ async function reapMarkerWorkers(
 // `prune --stranded` reaps gate workspaces whose coordinator is dead. Every
 // doubt resolves towards retention: a reaped live run loses its workspace.
 function openRepositoryLedger(repositoryPath: string): DomainLedger {
-  return process.env.ORCA_NO_MISTAKES_HOME
-    ? new DomainLedger()
-    : new DomainLedger({ repositoryPath });
+  return new DomainLedger({ repositoryPath });
 }
 
 async function reapStrandedGates(repoRoot: string): Promise<void> {
