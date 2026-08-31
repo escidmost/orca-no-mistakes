@@ -11954,12 +11954,18 @@ Prune options:
         );
       }
     }
-    await orca.notifyRunResult(
-      outcome,
-      recoverRef
-        ? `No-mistakes ${outcome}: ${message}\n${recoveryInstructions(recoverRef)}`
-        : `No-mistakes ${outcome}: ${message}`,
-    );
+    try {
+      await orca.notifyRunResult(
+        outcome,
+        recoverRef
+          ? `No-mistakes ${outcome}: ${message}\n${recoveryInstructions(recoverRef)}`
+          : `No-mistakes ${outcome}: ${message}`,
+      );
+    } catch (notificationError) {
+      console.error(
+        `warning: could not notify Orca about the failed run: ${String(notificationError)}`,
+      );
+    }
     throw error;
   } finally {
     await withGateMutation(async () => {
@@ -11975,12 +11981,19 @@ Prune options:
       } finally {
         if (gate && !retainGate) {
           if (gate.kind === "configured") await markGateCleanupPending();
-          const removed = await removeGateWorktree(
-            gate,
-            originWorktree!,
-            resolveOrcaCommand(),
-            gateCleanupOid,
-          );
+          let removed = false;
+          try {
+            removed = await removeGateWorktree(
+              gate,
+              originWorktree!,
+              resolveOrcaCommand(),
+              gateCleanupOid,
+            );
+          } catch (cleanupError) {
+            console.error(
+              `warning: could not clean up gate worktree ${gate.path}: ${String(cleanupError)}`,
+            );
+          }
           if (removed && gate.kind === "configured") {
             const closed = await closeTerminalOrProveStale(
               process.env.ORCA_TERMINAL_HANDLE,

@@ -290,6 +290,7 @@ test('attached linked worktrees migrate using the origin repository identity', a
     'NO_MISTAKES_GATE_BRANCH',
     'NO_MISTAKES_GATE_WORKTREE_ID',
     'NO_MISTAKES_ORIGIN_WORKTREE',
+    'ORCA_CLI_COMMAND',
     'ORCA_NO_MISTAKES_HOME'
   ] as const
   const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]))
@@ -318,7 +319,8 @@ test('attached linked worktrees migrate using the origin repository identity', a
     Object.assign(process.env, {
       NO_MISTAKES_GATE_BRANCH: 'gate-branch',
       NO_MISTAKES_GATE_WORKTREE_ID: 'gate-id',
-      NO_MISTAKES_ORIGIN_WORKTREE: origin
+      NO_MISTAKES_ORIGIN_WORKTREE: origin,
+      ORCA_CLI_COMMAND: 'orca-cli-that-does-not-exist'
     })
     await assert.rejects(
       main(['run', '--attached', `--repo=${gate}`, '--base=main', '--intent=Verify migration.']),
