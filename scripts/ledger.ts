@@ -2030,15 +2030,30 @@ export class DomainLedger {
              )`
         )
       : undefined
+    const migrationMarker = this.#db.prepare(
+      'SELECT source_present FROM repository_migrations WHERE source_path = ? AND repo_root = ?'
+    )
     let transaction = false
     try {
+      const marker = migrationMarker.get(sourcePath, repoRoot) as
+        | { source_present: number }
+        | undefined
+      if (marker && (marker.source_present === 1 || !sourcePresent)) {
+        if (
+          marker.source_present !== 1 ||
+          !sourcePresent ||
+          !this.#db.prepare(
+            'SELECT 1 FROM legacy.runs WHERE repo_root = ? LIMIT 1'
+          ).get(repoRoot)
+        ) return
+      }
       this.#db.exec('BEGIN IMMEDIATE')
       transaction = true
-      const marker = this.#db.prepare(
-        'SELECT source_present FROM repository_migrations WHERE source_path = ? AND repo_root = ?'
-      ).get(sourcePath, repoRoot) as { source_present: number } | undefined
-      if (marker && (marker.source_present === 1 || !sourcePresent)) {
-        if (marker.source_present === 1)
+      const lockedMarker = migrationMarker.get(sourcePath, repoRoot) as
+        | { source_present: number }
+        | undefined
+      if (lockedMarker && (lockedMarker.source_present === 1 || !sourcePresent)) {
+        if (lockedMarker.source_present === 1)
           deleteMigratedSourceRuns?.run(repoRoot, repoRoot)
         this.#db.exec('COMMIT')
         transaction = false
