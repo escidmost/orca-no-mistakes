@@ -2427,7 +2427,14 @@ test("CLI accepts equals syntax and preserves negative numeric values", async ()
   }
 });
 
-test("run starts its coordinator in a child gate worktree", async () => {
+test("conflicting renderer flags fail loudly", async () => {
+  await assert.rejects(
+    main(["run", "--intent=x", "--tui", "--no-tui"]),
+    /--tui cannot be combined with --no-tui/,
+  );
+});
+
+test("detached run selects the Run TUI by default and preserves explicit opt-out", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-detached-run-"));
   const origin = path.join(temp, "origin.git");
   const repo = path.join(temp, "repo");
@@ -2460,7 +2467,7 @@ if (args[0] === 'terminal' && args[1] === 'send') {
   const markerDirectory = ${JSON.stringify(path.join(repo, ".orca", "no-mistakes"))}
   const markerFile = fs.readdirSync(markerDirectory)
     .map((name) => markerDirectory + '/' + name)
-    .find((file) => file.endsWith('.json') && JSON.parse(fs.readFileSync(file, 'utf8')).startupReceipt)
+    .find((file) => file.endsWith('.json') && JSON.parse(fs.readFileSync(file, 'utf8')).launcherPid)
   const marker = JSON.parse(fs.readFileSync(markerFile, 'utf8'))
   delete marker.launcherPid
   marker.pid = process.ppid
@@ -2487,6 +2494,13 @@ console.log(JSON.stringify({ result }))
       "--intent=Validate detached coordination.",
       "--allow-local-config",
     ]);
+    await rm(path.join(repo, ".orca"), { recursive: true, force: true });
+    await main([
+      "run",
+      `--repo=${repo}`,
+      "--intent=Validate plain detached coordination.",
+      "--no-tui",
+    ]);
 
     const calls = (await readFile(callsPath, "utf8"))
       .trim()
@@ -2498,11 +2512,15 @@ console.log(JSON.stringify({ result }))
     const worktreeSet = calls.find(
       (args) => args[0] === "worktree" && args[1] === "set",
     );
-    const terminalSend = calls.find(
+    const terminalSends = calls.filter(
       (args) => args[0] === "terminal" && args[1] === "send",
     );
+    const terminalSend = terminalSends[0];
+    const plainTerminalSend = terminalSends[1];
     const commandText =
       terminalSend?.[terminalSend.indexOf("--text") + 1] ?? "";
+    const plainCommandText =
+      plainTerminalSend?.[plainTerminalSend.indexOf("--text") + 1] ?? "";
     const canonicalRepo = await realpath(repo);
     const terminalList = calls.find(
       (args) => args[0] === "terminal" && args[1] === "list",
@@ -2544,6 +2562,10 @@ console.log(JSON.stringify({ result }))
       commandText.includes("'--intent' 'Validate detached coordination.'"),
     );
     assert.ok(commandText.includes("'--allow-local-config'"));
+    assert.ok(commandText.includes("'--tui'"));
+    assert.ok(!commandText.includes("'--no-tui'"));
+    assert.ok(plainCommandText.includes("'--no-tui'"));
+    assert.ok(!plainCommandText.includes("'--tui'"));
     assert.ok(!calls.some((args) => args[0] === "orchestration"));
   } finally {
     if (previousCommand === undefined) delete process.env.ORCA_CLI_COMMAND;

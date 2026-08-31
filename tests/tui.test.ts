@@ -13,6 +13,7 @@ import { StageLog } from "../scripts/ledger.ts";
 import type { PresentationSnapshot } from "../scripts/presentation.ts";
 import {
   createRailTuiRenderer,
+  createRunRenderer,
   RailTuiRenderer,
   supportsRailTui,
 } from "../scripts/tui.ts";
@@ -186,14 +187,17 @@ function ensurePtyHelperExecutable(): void {
 if (process.env.TUI_FIXTURE === "1") {
   await runFixture();
 } else {
-  test("unsupported terminals fall back without terminal setup", () => {
+  test("unsupported terminals fall back to plain status without terminal setup", () => {
     const input = new FakeInput();
     const output = new FakeOutput();
     input.isTTY = false;
     assert.equal(supportsRailTui(input, output, "xterm-256color"), false);
     assert.equal(supportsRailTui(new FakeInput(), output, "dumb"), false);
-    assert.equal(createRailTuiRenderer(input, output, "/unused"), undefined);
-    assert.deepEqual(output.writes, []);
+    const renderer = createRunRenderer(input, output, "/unused");
+    renderer.render(snapshot("review", 1));
+    assert.deepEqual(output.writes, [
+      "no-mistakes run-tui-test stage 3/6 review started\n",
+    ]);
   });
 
   test("renderer errors restore raw mode, cursor, and alternate screen", () => {

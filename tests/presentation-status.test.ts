@@ -204,6 +204,51 @@ test("renderer failure does not stop durable publication", () => {
   assert.equal(failures.length, 1);
 });
 
+test("a failed renderer is replaced by the fallback and later status keeps rendering", () => {
+  const snapshots: PresentationSnapshot[] = [];
+  const failures: unknown[] = [];
+  const lines: string[] = [];
+  let fallbackBuilds = 0;
+  const publisher = new PresentationPublisher(
+    {
+      listPresentationSnapshots: () => snapshots,
+      recordPresentationSnapshot: (_runId, _eventKey, snapshot) => {
+        snapshots.push(snapshot);
+        return true;
+      },
+    },
+    "renderer-fallback",
+    {
+      render: () => {
+        throw new Error("closed stream");
+      },
+    },
+    () => new Date("2026-01-01T00:00:00.000Z"),
+    (error) => failures.push(error),
+    () => {
+      fallbackBuilds += 1;
+      return new PlainStatusRenderer({ write: (line) => lines.push(line) });
+    },
+  );
+
+  publisher.publish("run:started", { kind: "run-started" });
+  publisher.publish("attempt:1:started", {
+    attempt: 1,
+    kind: "attempt-started",
+  });
+  publisher.publish("attempt:1:stage:review:started", {
+    kind: "stage-started",
+    stage: "review",
+  });
+  assert.equal(snapshots.length, 3);
+  assert.equal(failures.length, 1);
+  assert.equal(fallbackBuilds, 1);
+  assert.deepEqual(lines, [
+    "no-mistakes renderer-fallback attempt 1 started\n",
+    "no-mistakes renderer-fallback stage 3/6 review started\n",
+  ]);
+});
+
 test("a new attempt clears unfinished stage progress", () => {
   const ledger = new DomainLedger(":memory:");
   try {

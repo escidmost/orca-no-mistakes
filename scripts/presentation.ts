@@ -258,6 +258,7 @@ function nextSnapshot(
 
 export class PresentationPublisher {
   #current: PresentationSnapshot;
+  #fallbackRenderer?: () => PresentationRenderer;
   #renderer?: PresentationRenderer;
   #rendererFailed = false;
   readonly clock: () => Date;
@@ -271,6 +272,7 @@ export class PresentationPublisher {
     renderer?: PresentationRenderer,
     clock: () => Date = () => new Date(),
     onRendererError: (error: unknown) => void = () => {},
+    fallbackRenderer?: () => PresentationRenderer,
   ) {
     this.clock = clock;
     this.onRendererError = onRendererError;
@@ -278,6 +280,7 @@ export class PresentationPublisher {
     this.store = store;
     const snapshots = store.listPresentationSnapshots(runId);
     this.#current = snapshots.at(-1) ?? initialSnapshot(runId);
+    this.#fallbackRenderer = fallbackRenderer;
     this.#renderer = renderer;
   }
 
@@ -297,6 +300,16 @@ export class PresentationPublisher {
       } catch (error) {
         this.#rendererFailed = true;
         this.onRendererError(error);
+        const fallback = this.#fallbackRenderer;
+        this.#fallbackRenderer = undefined;
+        if (fallback) {
+          try {
+            this.#renderer = fallback();
+            this.#rendererFailed = false;
+          } catch (fallbackError) {
+            this.onRendererError(fallbackError);
+          }
+        }
       }
     }
     return snapshot;
