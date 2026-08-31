@@ -11272,7 +11272,6 @@ async function reapDirectRun(
   ) {
     return false;
   }
-  if (run.status !== "in-progress" && run.status !== "cancelled") return false;
   const worktrees = await listOrcaWorktrees(orcaCommand, repoRoot);
   const origin = worktrees?.find((worktree) => worktree.path === repoRoot);
   if (!worktrees || typeof origin?.id !== "string") return false;
