@@ -2048,23 +2048,28 @@ export async function runPipeline(
     const priorRebase = latestEvidenceByStage.get("rebase");
     if (priorRebase) baseCommitOid = priorRebase.base_commit_oid;
 
+    const resolvedApprovalAudit = (
+      stage: StageName,
+      evidence: StageEvidenceRow,
+    ) =>
+      priorGateAudit.findLast(
+        (audit) =>
+          gateAuditMatchesEvidence(
+            audit,
+            stage,
+            evidence.round_index,
+            evidence.evidence_sha256,
+          ) &&
+          audit.resolved_at !== null &&
+          (audit.decision === "approve" || audit.decision === "skip"),
+      );
     let resumeStageIndex = 0;
     if (resumeCheckpoint) {
       for (const stage of PIPELINE_STEPS) {
         const evidence = latestEvidenceByStage.get(stage);
         if (!evidence) break;
         const findings = JSON.parse(evidence.findings_json ?? "[]") as Finding[];
-        const approved = priorGateAudit.findLast(
-          (audit) =>
-            gateAuditMatchesEvidence(
-              audit,
-              stage,
-              evidence.round_index,
-              evidence.evidence_sha256,
-            ) &&
-            audit.resolved_at !== null &&
-            (audit.decision === "approve" || audit.decision === "skip"),
-        );
+        const approved = resolvedApprovalAudit(stage, evidence);
         const complete =
           findings.every((finding) => finding.action === "no-op") ||
           approved !== undefined;
@@ -2081,6 +2086,28 @@ export async function runPipeline(
               resumeCheckpoint.output_commit_oid);
         if (!complete || !commitStillValid) break;
         resumeStageIndex += 1;
+      }
+      for (const stage of PIPELINE_STEPS.slice(0, resumeStageIndex)) {
+        const evidence = latestEvidenceByStage.get(stage)!;
+        const approval = resolvedApprovalAudit(stage, evidence);
+        if (
+          !approval ||
+          presentation.current.stages.find((item) => item.id === stage)
+            ?.status === "passed"
+        ) {
+          continue;
+        }
+        presentation.publish(`gate:${approval.gate_id}:resolved`, {
+          decision: approval.decision,
+          gateId: approval.gate_id,
+          kind: "gate-resolved",
+          round: evidence.round_index,
+          stage,
+        });
+        presentation.publish(
+          `stage:${stage}:round:${evidence.round_index}:completed:${evidence.candidate_commit_oid}`,
+          { kind: "stage-completed", round: evidence.round_index, stage },
+        );
       }
     }
     const stagesToRun = PIPELINE_STEPS.slice(resumeStageIndex);

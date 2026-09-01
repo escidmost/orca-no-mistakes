@@ -237,17 +237,22 @@ function nextSnapshot(
       next = {
         ...next,
         currentStage: transition.stage,
-        stages: updateStage(next, transition.stage, {
-          actionableFindings: open ?? transition.actionable,
-          approvedFindings: approved,
-          findings,
-          fixedFindings: fixed,
-          openFindings: open,
-          retainedFixer: transition.retainedFixer,
-          round: transition.round,
-          status: (open ?? transition.actionable) > 0 ? "blocked" : "active",
-          totalFindings: findings?.length ?? transition.total,
-        }),
+        stages: next.stages.map((item) =>
+          item.id === transition.stage
+            ? {
+                ...item,
+                actionableFindings: open ?? transition.actionable,
+                approvedFindings: approved,
+                findings,
+                fixedFindings: fixed,
+                openFindings: open,
+                retainedFixer: transition.retainedFixer,
+                round: transition.round,
+                status: (open ?? transition.actionable) > 0 ? "blocked" : "active",
+                totalFindings: findings?.length ?? transition.total,
+              }
+            : { ...item, retainedFixer: false },
+        ),
       };
       }
       break;
@@ -262,10 +267,11 @@ function nextSnapshot(
           stage: transition.stage,
           state: "open",
         },
-        stages: updateStage(next, transition.stage, {
-          retainedFixer: false,
-          status: "blocked",
-        }),
+        stages: next.stages.map((item) =>
+          item.id === transition.stage
+            ? { ...item, retainedFixer: false, status: "blocked" as const }
+            : { ...item, retainedFixer: false },
+        ),
       };
       break;
     case "gate-resolved":
