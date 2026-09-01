@@ -12414,7 +12414,7 @@ async function runGateAdmitCommand(flags: RawCliFlags): Promise<void> {
     if (admission.status === "failed" || admission.status === "superseded") {
       throw new Error(`submission admission ${admission.admission_id} is ${admission.status}`);
     }
-    if (admission.run_id && admission.status !== "pending") {
+    if (admission.status === "accepted" && admission.run_id) {
       console.log(
         JSON.stringify({
           admissionId: admission.admission_id,
@@ -12436,6 +12436,7 @@ async function runGateAdmitCommand(flags: RawCliFlags): Promise<void> {
     }
     try {
       if (ownsLaunch) {
+        await rm(readinessPath, { force: true });
         await launchDetachedCoordinator({
           args: [
             "gate",
@@ -12701,6 +12702,26 @@ Run options:
       repoRoot: launchRepoState.root,
       source: "direct",
     });
+    if (
+      admissionRow.status === "failed" ||
+      admissionRow.status === "superseded"
+    ) {
+      admissionLedger.close();
+      throw new Error(
+        `submission admission ${admissionRow.admission_id} is ${admissionRow.status}`,
+      );
+    }
+    if (admissionRow.status !== "pending") {
+      console.log(
+        JSON.stringify({
+          admissionId: admissionRow.admission_id,
+          replayed: true,
+          runId: admissionRow.run_id,
+        }),
+      );
+      admissionLedger.close();
+      return;
+    }
   }
   if (parsed.flags.attached !== true) {
     const repoState = launchRepoState ?? (await git.assertReady());

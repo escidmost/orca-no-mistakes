@@ -218,7 +218,13 @@ export async function initializeLocalGate(
     }
     if (!gateExisted) {
       await mkdir(paths.stateDir, { recursive: true })
-      gitSync(['init', '--bare', '--quiet', paths.gatePath])
+      gitSync([
+        'init',
+        '--bare',
+        '--quiet',
+        `--object-format=${gitSync(['-C', paths.repoRoot, 'rev-parse', '--show-object-format'])}`,
+        paths.gatePath
+      ])
     }
     await mkdir(path.join(paths.gatePath, 'hooks'), { recursive: true })
     gitSync(['--git-dir', paths.gatePath, 'config', 'core.hooksPath', path.join(paths.gatePath, 'hooks')])
@@ -469,7 +475,22 @@ function detectDefaultBranch(repoRoot: string): string {
       return candidate
     }
   }
-  return 'main'
+  const remoteBranches = (tryGitSync([
+    '-C',
+    repoRoot,
+    'for-each-ref',
+    '--format=%(refname:short)',
+    'refs/remotes/origin'
+  ]) ?? '')
+    .split('\n')
+    .filter((ref) => ref && ref !== 'origin/HEAD')
+    .map((ref) => ref.slice('origin/'.length))
+  if (remoteBranches.length === 1) return remoteBranches[0]
+  if (!remoteBranches.length) {
+    const localHead = tryGitSync(['-C', repoRoot, 'symbolic-ref', '--short', 'HEAD'])
+    if (localHead) return localHead
+  }
+  throw new Error('could not determine the default branch of the origin remote')
 }
 
 function managedHook(executablePath: string, gatePath: string): string {
