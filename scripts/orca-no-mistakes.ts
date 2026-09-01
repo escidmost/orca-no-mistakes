@@ -12756,27 +12756,51 @@ async function spawnAdmissionCoordinator(
 async function assertAdmittedCheckout(
   metadata: GateMetadata,
   admission: SubmissionAdmissionRow,
-): Promise<void> {
+): Promise<string> {
+  const expectedBranch = admission.ref_name
+  const worktrees = await listGitWorktrees(metadata.repoRoot)
+  const matchingWorktree = worktrees?.find(
+    (worktree) =>
+      worktree.branch === expectedBranch && worktree.head === admission.new_oid,
+  )
+  if (matchingWorktree) {
+    const checkout = await new GitShell({
+      expectedHead: admission.new_oid,
+      repo: matchingWorktree.path,
+    }).assertReady()
+    if (`refs/heads/${checkout.branch}` !== expectedBranch) {
+      throw new Error(
+        `the repository checkout is on ${checkout.branch} but the admission is for ${expectedBranch}`,
+      )
+    }
+    return matchingWorktree.path
+  }
+
   const checkout = await new GitShell({
-    expectedHead: admission.new_oid,
     repo: metadata.repoRoot,
   }).assertReady();
-  if (`refs/heads/${checkout.branch}` !== admission.ref_name) {
+  if (`refs/heads/${checkout.branch}` !== expectedBranch) {
     throw new Error(
-      `the repository checkout is on ${checkout.branch} but the admission is for ${admission.ref_name}`,
+      `the repository checkout is on ${checkout.branch} but the admission is for ${expectedBranch}`,
     );
   }
+  if (checkout.head !== admission.new_oid) {
+    throw new Error(
+      `the repository checkout is at ${checkout.head} but the admission is for ${admission.new_oid}`,
+    );
+  }
+  return metadata.repoRoot;
 }
 
 async function launchAdmittedPipeline(
-  metadata: GateMetadata,
+  checkoutPath: string,
   admission: SubmissionAdmissionRow,
   runId: string,
 ): Promise<void> {
   await main([
     "run",
     "--repo",
-    metadata.repoRoot,
+    checkoutPath,
     "--head",
     admission.new_oid,
     "--intent",
@@ -12912,8 +12936,8 @@ async function runGateCoordinatorCommand(flags: RawCliFlags): Promise<void> {
       anchorPermanentRef(metadata, custodyUpdate, admission.run_id);
       return;
     }
-    await assertAdmittedCheckout(metadata, admission);
-    orca = new CliOrca({ cwd: metadata.repoRoot, runId: admission.run_id ?? undefined });
+    const checkoutPath = await assertAdmittedCheckout(metadata, admission);
+    orca = new CliOrca({ cwd: checkoutPath, runId: admission.run_id ?? undefined });
     runId = admission.run_id ?? (await orca.createRun(`no-mistakes: ${admission.intent}`));
     await writeLaunchReadiness(readinessPath, { nonce: launchNonce, runId, state: "ready" });
     materialized = true;
@@ -12931,7 +12955,7 @@ async function runGateCoordinatorCommand(flags: RawCliFlags): Promise<void> {
       try {
         await waitForPermanentRef(metadata, update, 100);
         anchorPermanentRef(metadata, update, runId);
-        await launchAdmittedPipeline(metadata, admission, runId);
+        await launchAdmittedPipeline(checkoutPath, admission, runId);
         settled = true;
       } catch (error) {
         handoffError = error;
