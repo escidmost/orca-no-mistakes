@@ -1725,6 +1725,7 @@ test("a failed run surfaces retained fixer cleanup failure with the stage error 
   orca.reports.set("test", [
     { findings: [], summary: "" },
     { findings: [], summary: "" },
+    { findings: [], summary: "" },
   ]);
 
   await assert.rejects(
@@ -2414,6 +2415,17 @@ test("malformed reviewer findings fail closed and still clean up the worker", as
       ],
       summary: "malformed",
     },
+    {
+      findings: [
+        {
+          id: "bad-severity",
+          severity: "critical",
+          action: "auto-fix",
+          description: "This report is outside the schema.",
+        } as unknown as Finding,
+      ],
+      summary: "malformed",
+    },
   ]);
 
   await assert.rejects(
@@ -2422,7 +2434,7 @@ test("malformed reviewer findings fail closed and still clean up the worker", as
   );
 
   assert.ok(orca.calls.some((call) => call.startsWith("release:")));
-  assert.equal(orca.removedWorktrees.length, 2);
+  assert.equal(orca.removedWorktrees.length, 3);
 });
 
 test("a schema-invalid reviewer report gets one contract-repair retry", async () => {
@@ -2580,6 +2592,11 @@ test("reviewer artifacts must exist under the run evidence directory", async () 
       summary: "unsafe evidence",
       artifacts: ["/tmp/outside-evidence.log"],
     },
+    {
+      findings: [],
+      summary: "unsafe evidence",
+      artifacts: ["/tmp/outside-evidence.log"],
+    },
   ]);
 
   await assert.rejects(
@@ -2587,10 +2604,11 @@ test("reviewer artifacts must exist under the run evidence directory", async () 
     /review worker returned an unsafe artifact path/,
   );
   assert.ok(orca.calls.some((call) => call.startsWith("release:")));
-  assert.equal(orca.removedWorktrees.length, 2);
+  assert.equal(orca.removedWorktrees.length, 3);
 
   const missingOrca = new FakeOrca(git);
   missingOrca.reports.set("review", [
+    { findings: [], summary: "missing evidence", artifacts: ["missing.log"] },
     { findings: [], summary: "missing evidence", artifacts: ["missing.log"] },
     { findings: [], summary: "missing evidence", artifacts: ["missing.log"] },
   ]);
@@ -2599,7 +2617,7 @@ test("reviewer artifacts must exist under the run evidence directory", async () 
     /review worker returned a missing artifact/,
   );
   assert.ok(missingOrca.calls.some((call) => call.startsWith("release:")));
-  assert.equal(missingOrca.removedWorktrees.length, 2);
+  assert.equal(missingOrca.removedWorktrees.length, 3);
 });
 
 test("reviewer URL references are not treated as local artifacts", async () => {
@@ -2695,6 +2713,7 @@ test("detached run selects the Run TUI by default and preserves explicit opt-out
   const callsPath = path.join(temp, "calls.jsonl");
   const previousCommand = process.env.ORCA_CLI_COMMAND;
   const previousHandle = process.env.ORCA_TERMINAL_HANDLE;
+  const previousConfig = process.env.ORCA_NO_MISTAKES_USER_CONFIG;
   try {
     git(temp, "init", "--bare", origin);
     git(temp, "clone", origin, repo);
@@ -2739,6 +2758,10 @@ console.log(JSON.stringify({ result }))
     await chmod(fakeOrca, 0o755);
     process.env.ORCA_CLI_COMMAND = fakeOrca;
     process.env.ORCA_TERMINAL_HANDLE = "originating-opencode";
+    process.env.ORCA_NO_MISTAKES_USER_CONFIG = path.join(
+      temp,
+      "missing-user-config.yaml",
+    );
 
     await main([
       "run",
@@ -2824,6 +2847,9 @@ console.log(JSON.stringify({ result }))
     else process.env.ORCA_CLI_COMMAND = previousCommand;
     if (previousHandle === undefined) delete process.env.ORCA_TERMINAL_HANDLE;
     else process.env.ORCA_TERMINAL_HANDLE = previousHandle;
+    if (previousConfig === undefined)
+      delete process.env.ORCA_NO_MISTAKES_USER_CONFIG;
+    else process.env.ORCA_NO_MISTAKES_USER_CONFIG = previousConfig;
     await rm(temp, { recursive: true, force: true });
   }
 });
@@ -6267,6 +6293,7 @@ test("a failed fixer leaves its worktree commits anchored for recovery", async (
     },
     { findings: "bogus", summary: "x" } as unknown as StageReport,
     { findings: "bogus", summary: "x" } as unknown as StageReport,
+    { findings: "bogus", summary: "x" } as unknown as StageReport,
     pass("never reached"),
   ]);
   await assert.rejects(
@@ -8741,6 +8768,88 @@ test("an unreadable worker report gets one contract-repair retry", async () => {
   assert.equal(outcome.worker.report.summary, "review");
   assert.equal(orca.tasks.length, 2);
   assert.match(orca.launches[1].prompt, /create the report parent directory/);
+});
+
+test("CliOrca retries twice when repaired report files are also missing", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-real-report-retry-"));
+  const fakeOrca = path.join(temp, "orca");
+  const statePath = path.join(temp, "state");
+  const runId = `real-report-retry-${randomUUID()}`;
+  const reportPath = path.join(
+    artifactsRoot(),
+    runId,
+    "review.json",
+  );
+  try {
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+const statePath = ${JSON.stringify(statePath)}
+const reportPath = ${JSON.stringify(reportPath)}
+const increment = (key) => {
+  const state = fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, 'utf8')) : {}
+  state[key] = (state[key] ?? 0) + 1
+  fs.writeFileSync(statePath, JSON.stringify(state))
+  return state[key]
+}
+const out = (result) => console.log(JSON.stringify({ result }))
+if (args[0] === 'orchestration' && args[1] === 'run-create') {
+  out({ run: { id: ${JSON.stringify(runId)} } })
+} else if (args[0] === 'orchestration' && args[1] === 'task-create') {
+  out({ task: { id: 'task-' + increment('tasks') } })
+} else if (args[0] === 'terminal' && args[1] === 'create') {
+  out({ terminal: { handle: 'real-report-terminal' } })
+} else if (args[0] === 'terminal' && args[1] === 'show') {
+  out({ terminal: { connected: true, title: 'OpenCode', preview: 'ready' } })
+} else if (args[0] === 'terminal' && args[1] === 'send') {
+  out({ accepted: true })
+} else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
+  const dispatch = increment('dispatches')
+  out({ dispatch: { id: 'dispatch-' + dispatch, status: 'dispatched' }, injected: true, preamble: 'authenticated' })
+} else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
+  const check = increment('checks')
+  const attempt = Math.min(check, 3)
+  if (check === 3) {
+    fs.mkdirSync(${JSON.stringify(path.dirname(reportPath))}, { recursive: true })
+    fs.writeFileSync(reportPath, JSON.stringify({ findings: [], summary: 'repaired' }))
+  }
+  out({ deliveryId: 'delivery-' + attempt, messages: [{ type: 'worker_done', body: 'done', payload: JSON.stringify({ taskId: 'task-' + attempt, dispatchId: 'dispatch-' + attempt, outcome: 'succeeded', reportPath }) }] })
+} else {
+  out({ ok: true })
+}
+`,
+    );
+    await chmod(fakeOrca, 0o755);
+    const orca = new CliOrca({ command: fakeOrca, cwd: temp });
+    await orca.createRun("real report retry");
+    const outcome = await startWorkerWithFallback(
+      orca,
+      (launch) => orca.createTask(launch.prompt),
+      [
+        {
+          name: "real-report-retry",
+          prompt: "Review the change.",
+          role: "reviewer",
+          stage: "review",
+          worktree: "current",
+          reportPath,
+        },
+      ],
+    );
+    assert.equal(outcome.worker.report.summary, "repaired");
+    assert.equal(outcome.reportRetries, 2);
+    const state = JSON.parse(await readFile(statePath, "utf8")) as {
+      tasks: number;
+      dispatches: number;
+    };
+    assert.equal(state.tasks, 3);
+    assert.equal(state.dispatches, 3);
+  } finally {
+    await rm(path.join(artifactsRoot(), runId), { recursive: true, force: true });
+    await rm(temp, { recursive: true, force: true });
+  }
 });
 
 test("CliOrca extracts acp reports wrapped in closed JSON fences", async () => {

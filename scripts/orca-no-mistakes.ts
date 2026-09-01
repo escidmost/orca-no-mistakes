@@ -3163,8 +3163,8 @@ export type WorkerLaunchOutcome = {
   worker: WorkerResult;
 };
 
-// ponytail: one repair retry; repeated invalid or unreadable output remains a hard failure.
-const WORKER_REPORT_RETRY_LIMIT = 1;
+// ponytail: two repair retries; repeated invalid or unreadable output remains a hard failure.
+const WORKER_REPORT_RETRY_LIMIT = 2;
 
 function isRepairableWorkerReportError(error: unknown): boolean {
   return (
