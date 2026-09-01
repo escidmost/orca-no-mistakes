@@ -80,6 +80,7 @@ import {
   PresentationPublisher,
   type GateResolver,
   type PresentationRenderer,
+  type PresentationSnapshot,
 } from "./presentation.ts";
 import { createRunRenderer } from "./tui.ts";
 import {
@@ -300,6 +301,8 @@ export type PipelineOptions = {
     stageLogs: ReadonlyMap<string, StageLog>,
     resolveGate?: GateResolver,
     setAutoFix?: (enabled: boolean) => Promise<void> | void,
+    requestResume?: () => void,
+    onResumeAvailable?: () => void,
   ) => PresentationRenderer;
   resumeRunId?: string;
   userGlobalConfig?: OrcaNoMistakesConfig;
@@ -1676,6 +1679,21 @@ function settleRunOrThrow(
   }
 }
 
+function isResumablePipelineFailure(
+  failure: unknown,
+  outcome: "cancelled" | "failed",
+  checkpointCount: number,
+): boolean {
+  if (outcome !== "failed" || checkpointCount === 0) return false;
+  return !(
+    failure instanceof GateStopError ||
+    failure instanceof PostMutationCustodyError ||
+    failure instanceof RecoveryAnchorError ||
+    failure instanceof RunSettlementError ||
+    failure instanceof WorkerCleanupError
+  );
+}
+
 /**
  * Runs the configured validation and remediation pipeline for a repository.
  *
@@ -1761,6 +1779,30 @@ export async function runPipeline(
   let presentationReady = false;
   let resumeClaimId: string | undefined;
   let resumeCheckpoint: StageCheckpointRow | undefined;
+  let resumeControlAvailable = false;
+  let resumeRequested = false;
+  let resumingAttempt = options.resumeRunId !== undefined;
+  let attemptId: string | undefined;
+  const coordinatorIdentity = `no-mistakes:${process.pid}`;
+  const actorIdentity = coordinatorIdentity;
+  let resumeResolver: (() => void) | undefined;
+  const requestResume = (): void => {
+    resumeRequested = true;
+    resumeResolver?.();
+  };
+  const waitForResume = async (): Promise<void> => {
+    if (resumeRequested) {
+      resumeRequested = false;
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      resumeResolver = () => {
+        resumeRequested = false;
+        resumeResolver = undefined;
+        resolve();
+      };
+    });
+  };
   const { artifactsDir, runId } = await withGateMutation(async () => {
     const orchestrationRunId = await orca.createRun(`no-mistakes: ${intent}`);
     const runId = options.resumeRunId ?? orchestrationRunId;
@@ -1849,6 +1891,10 @@ export async function runPipeline(
           });
           if (committed) autoFixMode = enabled;
         },
+        requestResume,
+        () => {
+          resumeControlAvailable = true;
+        },
       ) ??
         (options.plainStatus
           ? new PlainStatusRenderer(process.stderr)
@@ -1873,13 +1919,13 @@ export async function runPipeline(
       const recordedAutoFixMode = ledger.latestAutoFixMode(runId);
       autoFixMode =
         recordedAutoFixMode ??
-        (options.resumeRunId
+        (resumingAttempt
           ? presentation.current.mode.autoFix
           : pipelineConfig.auto_fix.enabled);
       if (recordedAutoFixMode === undefined) {
         ledger.recordAutoFixMode(runId, autoFixMode, "initial");
       }
-      if (!options.resumeRunId) {
+      if (!resumingAttempt) {
         presentation.publish("run:started", { kind: "run-started" });
       }
       const attempt = presentation.nextAttempt();
@@ -1899,7 +1945,7 @@ export async function runPipeline(
           },
         );
       }
-      if (options.resumeRunId) {
+      if (resumingAttempt) {
         await deliveryGit.anchorRecoveryRef(
           runId,
           resumeCheckpoint!.output_commit_oid,
@@ -1913,6 +1959,15 @@ export async function runPipeline(
           runId,
         });
       }
+      attemptId = randomUUID();
+      ledger.startAttempt({
+        actorIdentity,
+        attemptId,
+        coordinatorIdentity,
+        generationToken: generationToken!,
+        runId,
+        startedAt: new Date().toISOString(),
+      });
       await registerAbortRunContext({
         artifactsDir,
         deliveryGit,
@@ -1939,17 +1994,34 @@ export async function runPipeline(
             eventKey,
             {
               kind: "error-recorded",
-              resumable: ledger.listCheckpoints(runId).length > 0,
+              resumable: false,
             },
-            (snapshot) =>
-              settleRunOrThrow(
+            (snapshot) => {
+              if (attemptId) {
+                ledger.recordAttemptOutcome({
+                  actorIdentity,
+                  attemptId,
+                  candidateCommitOid: repo.head,
+                  completedAt: new Date().toISOString(),
+                  coordinatorIdentity,
+                  custody: {},
+                  reason: error instanceof Error ? error.message : String(error),
+                  receiptDigests: [],
+                  resumeEligible: false,
+                  runId,
+                  stoppingFact: "attempt setup failed",
+                  verdict: "failed",
+                });
+              }
+              return settleRunOrThrow(
                 ledger,
                 runId,
                 "failed",
                 error,
                 ownership,
                 { eventKey, snapshot },
-              ),
+              );
+            },
           );
           presentation.publish(
             `attempt:${presentation.current.attempt}:run:completed:failed`,
@@ -1969,7 +2041,10 @@ export async function runPipeline(
   let baseCommitOid = repo.baseOid;
   let fixerSession: FixerSession | undefined;
 
-  try {
+  while (true) {
+    baseCommitOid = repo.baseOid;
+    fixerSession = undefined;
+    try {
     await writeFile(
       path.join(artifactsDir, "manifest.json"),
       JSON.stringify(
@@ -1987,11 +2062,11 @@ export async function runPipeline(
       ),
     );
 
-    const priorEvidence = options.resumeRunId ? ledger.listEvidence(runId) : [];
-    const priorCheckpoints = options.resumeRunId
+    const priorEvidence = resumingAttempt ? ledger.listEvidence(runId) : [];
+    const priorCheckpoints = resumingAttempt
       ? ledger.listCheckpoints(runId)
       : [];
-    const priorGateAudit = options.resumeRunId
+    const priorGateAudit = resumingAttempt
       ? ledger.listGateAudit(runId)
       : [];
     const stageEntries: StageEvidenceManifestEntry[] = priorEvidence.map(
@@ -2822,47 +2897,63 @@ export async function runPipeline(
       const eventKey = "run:completed:passed";
       const custodyNote = await presentation.publishAsync(
         { kind: "run-completed", status: "passed" },
-        (snapshot) => ledger.finalizePassedRunWithLeaseMutation(
-          attestation,
-          terminalCommitOid,
-          {
-            branch: deliveryRepo.branch,
-            generationToken: generationToken!,
-            repoRoot: deliveryRepo.root,
-          },
-          async () => {
-            if (deliveryGit === git && operatorHead === terminalCommitOid) {
-              return operatorHead === submissionCommitOid
-                ? `branch ${deliveryRepo.branch} already at submission commit ${submissionCommitOid}`
-                : `branch ${deliveryRepo.branch} carries the terminal commit ${terminalCommitOid}`;
-            }
-            const recoverRef = recoveryRefFor(runId);
-            let advanced = false;
-            let transferFailure: string | undefined;
-            if (deliveryGit !== git && operatorHead === submissionCommitOid) {
-              try {
-                advanced = await deliveryGit.applyWorktreeCommits(
-                  repo.root,
-                  submissionCommitOid,
-                  terminalCommitOid,
-                  leaseFence,
-                );
-              } catch (error) {
-                if (error instanceof PostMutationCustodyError) throw error;
-                transferFailure =
-                  error instanceof Error ? error.message : String(error);
+        (snapshot) =>
+          ledger.finalizePassedRunWithLeaseMutation(
+            attestation,
+            terminalCommitOid,
+            {
+              branch: deliveryRepo.branch,
+              generationToken: generationToken!,
+              repoRoot: deliveryRepo.root,
+            },
+            async () => {
+              if (!attemptId) throw new Error("pipeline attempt was not started");
+              ledger.recordAttemptOutcome({
+                actorIdentity,
+                attemptId,
+                candidateCommitOid: terminalCommitOid,
+                completedAt: new Date().toISOString(),
+                coordinatorIdentity,
+                custody: { terminalCommitOid },
+                reason: "pipeline completed",
+                receiptDigests: stageEntries.map((entry) => entry.evidenceSha256),
+                resumeEligible: false,
+                runId,
+                stoppingFact: "all pipeline stages passed",
+                verdict: "passed",
+              });
+              if (deliveryGit === git && operatorHead === terminalCommitOid) {
+                return operatorHead === submissionCommitOid
+                  ? `branch ${deliveryRepo.branch} already at submission commit ${submissionCommitOid}`
+                  : `branch ${deliveryRepo.branch} carries the terminal commit ${terminalCommitOid}`;
               }
-            }
-            return advanced
-              ? `advanced branch ${deliveryRepo.branch} from submission to terminal commit ${terminalCommitOid}`
-              : transferFailure
-                ? `custody transfer failed on the pipeline side (${transferFailure}); ` +
-                  recoveryInstructions(recoverRef)
-                : "operator checkout diverged or carries uncommitted changes; " +
-                  recoveryInstructions(recoverRef);
-          },
-          { eventKey, snapshot },
-        ),
+              const recoverRef = recoveryRefFor(runId);
+              let advanced = false;
+              let transferFailure: string | undefined;
+              if (deliveryGit !== git && operatorHead === submissionCommitOid) {
+                try {
+                  advanced = await deliveryGit.applyWorktreeCommits(
+                    repo.root,
+                    submissionCommitOid,
+                    terminalCommitOid,
+                    leaseFence,
+                  );
+                } catch (error) {
+                  if (error instanceof PostMutationCustodyError) throw error;
+                  transferFailure =
+                    error instanceof Error ? error.message : String(error);
+                }
+              }
+              return advanced
+                ? `advanced branch ${deliveryRepo.branch} from submission to terminal commit ${terminalCommitOid}`
+                : transferFailure
+                  ? `custody transfer failed on the pipeline side (${transferFailure}); ` +
+                    recoveryInstructions(recoverRef)
+                  : "operator checkout diverged or carries uncommitted changes; " +
+                    recoveryInstructions(recoverRef);
+            },
+            { eventKey, snapshot },
+          ),
       );
       return { attestation, custodyNote };
     });
@@ -2879,101 +2970,186 @@ export async function runPipeline(
       runId,
       steps: PIPELINE_STEPS,
     };
-  } catch (error) {
-    let failure: unknown = error;
-    if (fixerSession) {
-      const failedSession = fixerSession;
-      fixerSession = undefined;
-      try {
-        await releaseFixerSession(failedSession, orca);
-      } catch (cleanupError) {
-        failure = new WorkerCleanupError(
-          `retained fixer cleanup failed: ${String(cleanupError)}`,
-          { cause: error },
-        );
+    } catch (error) {
+      let failure: unknown = error;
+      if (fixerSession) {
+        const failedSession = fixerSession;
+        fixerSession = undefined;
+        try {
+          await releaseFixerSession(failedSession, orca);
+        } catch (cleanupError) {
+          failure = new WorkerCleanupError(
+            `retained fixer cleanup failed: ${String(cleanupError)}`,
+            { cause: error },
+          );
+        }
       }
+      const retry = await withGateMutation(async () => {
+        const outcome = error instanceof GateStopError ? "cancelled" : "failed";
+        let anchorError: unknown;
+        let anchoredOid: string | undefined;
+        try {
+          anchoredOid = await git.head();
+          await deliveryGit.anchorRecoveryRef(runId, anchoredOid, generationToken);
+        } catch (recoveryError) {
+          anchorError = recoveryError;
+          anchoredOid = undefined;
+        }
+        if (anchoredOid !== undefined && failure instanceof Error) {
+          const operatorHead = await deliveryGit.head().catch(() => undefined);
+          if (operatorHead !== anchoredOid) {
+            (failure as CustodyTaggedError).recoverRef = recoveryRefFor(runId);
+          }
+        }
+        const resumable = isResumablePipelineFailure(
+          failure,
+          outcome,
+          ledger.listCheckpoints(runId).length,
+        );
+        if (!anchorError) {
+          const ownership = {
+            branch: deliveryRepo.branch,
+            generationToken,
+            repoRoot: deliveryRepo.root,
+          };
+          const reason = failure instanceof Error ? failure.message : String(failure);
+          const persistOutcome = (eventKey: string) =>
+            (snapshot: PresentationSnapshot) => {
+              if (!attemptId || anchoredOid === undefined) {
+                throw new Error("pipeline attempt outcome lacks durable identity");
+              }
+              ledger.recordAttemptOutcome({
+                actorIdentity,
+                attemptId,
+                candidateCommitOid: anchoredOid,
+                completedAt: new Date().toISOString(),
+                coordinatorIdentity,
+                custody: {
+                  anchoredOid,
+                  recoverRef: (failure as CustodyTaggedError).recoverRef,
+                },
+                reason,
+                receiptDigests: [],
+                resumeEligible: resumable,
+                runId,
+                stoppingFact: `${outcome} during pipeline execution`,
+                verdict: outcome,
+              });
+              return settleRunOrThrow(
+                ledger,
+                runId,
+                outcome,
+                failure,
+                ownership,
+                { eventKey, snapshot },
+              );
+            };
+          if (outcome === "cancelled") {
+            const eventKey =
+              `attempt:${presentation.current.attempt}:cancellation:gate-stop`;
+            presentation.publish(
+              eventKey,
+              { action: "gate-stop", kind: "cancellation-recorded" },
+              persistOutcome(eventKey),
+            );
+          } else {
+            const eventKey = `attempt:${presentation.current.attempt}:error`;
+            presentation.publish(
+              eventKey,
+              { kind: "error-recorded", resumable },
+              persistOutcome(eventKey),
+            );
+          }
+          presentation.publish(
+            `attempt:${presentation.current.attempt}:run:completed:${outcome}`,
+            { kind: "run-completed", status: outcome },
+          );
+        }
+        const message =
+          failure instanceof Error ? failure.message : String(failure);
+        await orca
+          .setWorktreeStatus(
+            `${statusPrefix}no-mistakes stopped: ${message}`,
+            "in-review",
+          )
+          .catch(() => {});
+        if (anchorError) {
+          throw new RecoveryAnchorError(runId, outcome, failure, anchorError);
+        }
+        return resumable && resumeControlAvailable;
+      });
+      if (!retry) throw failure;
+
+      await waitForResume();
+      const resumeHead = await git.head();
+      const resumeClaim = ledger.prepareResume({
+        baseBranch: deliveryRepo.base,
+        baseRefSha: effectiveProvenance.baseRefSha,
+        branch: deliveryRepo.branch,
+        effectivePolicyHash: effectiveProvenance.effectivePolicyHash,
+        force: options.forceLease === true,
+        head: resumeHead,
+        intent,
+        policySha256: policySha256Value,
+        repoRoot: deliveryRepo.root,
+        runId,
+      });
+      resumeClaimId = resumeClaim.claimId;
+      generationToken = resumeClaim.generationToken;
+      const resumed = ledger.resumeRun({
+        baseBranch: deliveryRepo.base,
+        baseRefSha: effectiveProvenance.baseRefSha,
+        branch: deliveryRepo.branch,
+        claimId: resumeClaimId,
+        effectivePolicyHash: effectiveProvenance.effectivePolicyHash,
+        force: options.forceLease === true,
+        head: resumeHead,
+        intent,
+        policySha256: policySha256Value,
+        repoRoot: deliveryRepo.root,
+        runId,
+      });
+      resumeCheckpoint = resumed.checkpoint;
+      generationToken = resumed.generationToken;
+      resumingAttempt = true;
+      Object.assign(abortReap, {
+        generationToken,
+        resumeClaimId,
+        runId,
+      });
+      await refreshGateMarker();
+      const attempt = presentation.nextAttempt();
+      presentation.publish(`attempt:${attempt}:started`, {
+        attempt,
+        kind: "attempt-started",
+      });
+      await deliveryGit.anchorRecoveryRef(
+        runId,
+        resumeCheckpoint.output_commit_oid,
+        generationToken,
+      );
+      attemptId = randomUUID();
+      ledger.startAttempt({
+        actorIdentity,
+        attemptId,
+        coordinatorIdentity,
+        generationToken,
+        runId,
+        startedAt: new Date().toISOString(),
+      });
+      await registerAbortRunContext({
+        artifactsDir,
+        deliveryGit,
+        generationToken,
+        git,
+        ledger,
+        orchestrationRunId: abortReap.orchestrationRunId,
+        plainStatus: options.plainStatus,
+        resumeClaimId,
+        runId,
+      });
+      continue;
     }
-    return await withGateMutation(async () => {
-      const outcome = error instanceof GateStopError ? "cancelled" : "failed";
-      let anchorError: unknown;
-      let anchoredOid: string | undefined;
-      try {
-        anchoredOid = await git.head();
-        await deliveryGit.anchorRecoveryRef(runId, anchoredOid, generationToken);
-      } catch (recoveryError) {
-        anchorError = recoveryError;
-        anchoredOid = undefined;
-      }
-      if (anchoredOid !== undefined && failure instanceof Error) {
-        const operatorHead = await deliveryGit.head().catch(() => undefined);
-        if (operatorHead !== anchoredOid) {
-          (failure as CustodyTaggedError).recoverRef = recoveryRefFor(runId);
-        }
-      }
-      if (!anchorError) {
-        if (outcome === "cancelled") {
-          const eventKey = `attempt:${presentation.current.attempt}:cancellation:gate-stop`;
-          presentation.publish(
-            eventKey,
-            { action: "gate-stop", kind: "cancellation-recorded" },
-            (snapshot) =>
-              settleRunOrThrow(
-                ledger,
-                runId,
-                outcome,
-                failure,
-                {
-                  branch: deliveryRepo.branch,
-                  generationToken,
-                  repoRoot: deliveryRepo.root,
-                },
-                { eventKey, snapshot },
-              ),
-          );
-        } else {
-          const eventKey = `attempt:${presentation.current.attempt}:error`;
-          presentation.publish(
-            eventKey,
-            {
-              kind: "error-recorded",
-              resumable: ledger.listCheckpoints(runId).length > 0,
-            },
-            (snapshot) =>
-              settleRunOrThrow(
-                ledger,
-                runId,
-                outcome,
-                failure,
-                {
-                  branch: deliveryRepo.branch,
-                  generationToken,
-                  repoRoot: deliveryRepo.root,
-                },
-                { eventKey, snapshot },
-              ),
-          );
-        }
-        presentation.publish(
-          `attempt:${presentation.current.attempt}:run:completed:${outcome}`,
-          {
-            kind: "run-completed",
-            status: outcome,
-          },
-        );
-      }
-      const message =
-        failure instanceof Error ? failure.message : String(failure);
-      await orca
-        .setWorktreeStatus(
-          `${statusPrefix}no-mistakes stopped: ${message}`,
-          "in-review",
-        )
-        .catch(() => {});
-      if (anchorError) {
-        throw new RecoveryAnchorError(runId, outcome, failure, anchorError);
-      }
-      throw failure;
-    });
   }
 }
 
@@ -12496,7 +12672,14 @@ Prune options:
         plainStatus: parsed.flags["no-tui"] === true,
         rendererFactory:
           parsed.flags.tui === true
-            ? (artifactsDir, stageLogs, resolveGate, setAutoFix) => {
+            ? (
+                artifactsDir,
+                stageLogs,
+                resolveGate,
+                setAutoFix,
+                requestResume,
+                onResumeAvailable,
+              ) => {
                 renderer = createRunRenderer(
                   process.stdin,
                   process.stderr,
@@ -12505,6 +12688,8 @@ Prune options:
                   resolveGate,
                   undefined,
                   setAutoFix,
+                  requestResume,
+                  onResumeAvailable,
                 );
                 setAbortPresentationCleanup(closeRenderer);
                 return renderer;

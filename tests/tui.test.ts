@@ -279,6 +279,55 @@ if (process.env.TUI_FIXTURE === "1") {
     renderer.close();
   });
 
+  test("Resume is shown only for resumable errors and returns to the pipeline", () => {
+    const input = new FakeInput();
+    const output = new FakeOutput();
+    let requested = 0;
+    let available = 0;
+    const renderer = createRailTuiRenderer(
+      input,
+      output,
+      "/unused",
+      new Map(),
+      undefined,
+      undefined,
+      undefined,
+      () => {
+        requested += 1;
+      },
+      () => {
+        available += 1;
+      },
+    );
+    assert.ok(renderer);
+    const resumable = snapshot("test", 2);
+    renderer.render({
+      ...resumable,
+      currentStage: "test",
+      error: { resumable: true },
+      status: "failed",
+      transition: { kind: "error-recorded", resumable: true },
+    });
+    const screen = (): string => cleanScreen(output.writes.at(-1) ?? "");
+    assert.equal(available, 1);
+    assert.match(screen(), /RUN ERROR \(RESUMABLE\)/u);
+    assert.match(screen(), /R Resume/u);
+    input.emit("data", "R");
+    assert.equal(requested, 1);
+
+    renderer.render({
+      ...resumable,
+      currentStage: "test",
+      error: { resumable: false },
+      status: "failed",
+      transition: { kind: "error-recorded", resumable: false },
+    });
+    assert.doesNotMatch(screen(), /R Resume/u);
+    input.emit("data", "R");
+    assert.equal(requested, 1);
+    renderer.close();
+  });
+
   test("C confirms Cancel without hiding the run and Ctrl-C cancels immediately", async () => {
     const input = new FakeInput();
     const output = new FakeOutput();

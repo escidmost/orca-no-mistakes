@@ -915,6 +915,128 @@ test("a failed run resumes from its last checkpoint without repeating completed 
   });
 });
 
+test("same-process Resume retries repeated failures with one run and one attempt per failure", async () => {
+  const git = new FakeGit();
+  git.policyDigest = "f".repeat(64);
+  const deliveryGit = new FakeGit("/origin", "feature");
+  const runId = `same-process-resume-${randomUUID()}`;
+  class RepeatedFailureOrca extends FakeOrca {
+    override async startWorker(
+      taskId: string,
+      launch: WorkerLaunch,
+    ): Promise<WorkerResult> {
+      const testAttempts = this.launches.filter(
+        (candidate) => candidate.stage === "test",
+      ).length;
+      if (launch.stage === "test" && testAttempts < 2) {
+        this.launches.push(launch);
+        throw new Error(`test worker interrupted ${testAttempts + 1}`);
+      }
+      return await super.startWorker(taskId, launch);
+    }
+  }
+  const orca = new RepeatedFailureOrca(git, runId);
+  const ledger = new DomainLedger(":memory:");
+  const rendererFactory = (
+    _artifactsDir: string,
+    _stageLogs: ReadonlyMap<string, StageLog>,
+    _resolveGate: unknown,
+    _setAutoFix: unknown,
+    requestResume?: () => void,
+    onResumeAvailable?: () => void,
+  ) => {
+    onResumeAvailable?.();
+    return {
+      render(snapshot: { error?: { resumable: boolean }; transition: { kind: string } }) {
+        if (snapshot.transition.kind === "error-recorded" && snapshot.error?.resumable) {
+          requestResume?.();
+        }
+      },
+    };
+  };
+
+  const result = await runPipeline(
+    { deliveryGit, intent: "Resume repeated failures.", rendererFactory },
+    orca,
+    git,
+    ledger,
+  );
+
+  assert.equal(result.runId, runId);
+  assert.deepEqual(
+    orca.launches.map((launch) => launch.stage),
+    ["review", "test", "test", "test", "document", "lint"],
+  );
+  assert.equal(ledger.runStatus(runId), "passed");
+  assert.equal(ledger.listAttemptOutcomes(runId).length, 3);
+  assert.deepEqual(
+    ledger
+      .listPresentationSnapshots(runId)
+      .filter((snapshot) => snapshot.transition.kind === "attempt-started")
+      .map((snapshot) => snapshot.attempt),
+    [1, 2, 3],
+  );
+});
+
+test("unsafe failures do not expose or enter same-process Resume", async () => {
+  const git = new FakeGit();
+  git.policyDigest = "f".repeat(64);
+  const deliveryGit = new FakeGit("/origin", "feature");
+  const runId = `unsafe-resume-${randomUUID()}`;
+  class UnsafeOrca extends FakeOrca {
+    override async startWorker(
+      taskId: string,
+      launch: WorkerLaunch,
+    ): Promise<WorkerResult> {
+      if (launch.stage === "test") {
+        this.launches.push(launch);
+        throw new PostMutationCustodyError("custody transfer failed");
+      }
+      return await super.startWorker(taskId, launch);
+    }
+  }
+  const orca = new UnsafeOrca(git, runId);
+  const ledger = new DomainLedger(":memory:");
+  let requested = 0;
+  const rendererFactory = (
+    _artifactsDir: string,
+    _stageLogs: ReadonlyMap<string, StageLog>,
+    _resolveGate: unknown,
+    _setAutoFix: unknown,
+    requestResume?: () => void,
+    onResumeAvailable?: () => void,
+  ) => {
+    onResumeAvailable?.();
+    return {
+      render(snapshot: { error?: { resumable: boolean }; transition: { kind: string } }) {
+        if (snapshot.transition.kind === "error-recorded" && snapshot.error?.resumable) {
+          requested += 1;
+          requestResume?.();
+        }
+      },
+    };
+  };
+
+  await assert.rejects(
+    runPipeline(
+      { deliveryGit, intent: "Do not resume custody failures.", rendererFactory },
+      orca,
+      git,
+      ledger,
+    ),
+    /custody transfer failed/,
+  );
+  assert.equal(requested, 0);
+  assert.equal(ledger.runStatus(runId), "failed");
+  assert.deepEqual(
+    ledger
+      .listPresentationSnapshots(runId)
+      .filter((snapshot) => snapshot.transition.kind === "attempt-started")
+      .map((snapshot) => snapshot.attempt),
+    [1],
+  );
+});
+
 test("resume refuses when HEAD no longer matches the failed run checkpoint", async () => {
   const git = new FakeGit();
   git.policyDigest = "f".repeat(64);
