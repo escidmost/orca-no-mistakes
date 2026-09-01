@@ -318,3 +318,30 @@ test('legacy launch locks keep their historical readiness semantics', async () =
     await rm(temp, { force: true, recursive: true })
   }
 })
+
+test('legacy launch locks cannot authenticate successful readiness', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'onm-legacy-ready-'))
+  try {
+    const dir = await readinessDir(temp)
+    const readinessPath = admissionIdPath(dir)
+    await mkdir(launchLockPath(readinessPath))
+    await writeFile(
+      readinessPath,
+      `${JSON.stringify({ runId: 'stale-run', state: 'ready' })}\n`
+    )
+    const spawns: string[] = []
+    await rejects(
+      awaitAdmissionLaunch(
+        readinessPath,
+        async (nonce) => {
+          spawns.push(nonce)
+        },
+        150
+      ),
+      /not authenticated/
+    )
+    equal(spawns.length, 0)
+  } finally {
+    await rm(temp, { force: true, recursive: true })
+  }
+})

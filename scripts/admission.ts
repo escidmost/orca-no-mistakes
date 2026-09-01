@@ -543,7 +543,8 @@ export async function awaitAdmissionLaunch(
     }
     const existing = await readAdmissionLaunchClaim(lockPath)
     if (existing.nonce === undefined) {
-      return { readiness: await waitForLaunchReadiness(readinessPath, startupTimeoutMs) }
+      await waitForLaunchReadiness(readinessPath, startupTimeoutMs)
+      throw new Error('legacy coordinator readiness is not authenticated')
     }
     if (await reclaimIfAbandoned(lockPath)) continue
     try {
@@ -729,21 +730,34 @@ function validBranchName(branch: string): boolean {
 
 function detectDefaultBranch(repoRoot: string): string {
   const originUrl = tryGitSync(['-C', repoRoot, 'remote', 'get-url', 'origin'])
-  if (originUrl !== undefined && !localOriginUrl(originUrl)) {
-    return networkDefaultBranch(repoRoot)
+  if (originUrl === undefined) {
+    throw new Error('could not determine the default branch of the origin remote')
   }
-  const cached = cachedDefaultBranch(repoRoot)
-  if (cached !== undefined) {
-    const advertised = advertisedOriginDefaultBranch(repoRoot)
-    if (advertised !== undefined && advertised !== cached) {
+  const advertisement = originAdvertisement(repoRoot)
+  if (advertisement.defaultBranch !== undefined) {
+    const cached = cachedDefaultBranch(repoRoot)
+    if (cached !== undefined && cached !== advertisement.defaultBranch) {
       throw new Error(
-        `the origin default branch ${advertised} conflicts with local evidence ${cached}`
+        `the origin default branch ${advertisement.defaultBranch} conflicts with local evidence ${cached}`
       )
     }
-    return cached
+    return advertisement.defaultBranch
   }
-  const advertisedDefault = advertisedOriginDefaultBranch(repoRoot)
-  if (advertisedDefault) return advertisedDefault
+  if (!localOriginUrl(originUrl)) {
+    throw new Error(
+      advertisement.reachable
+        ? 'could not determine the default branch of the origin remote'
+        : 'could not verify the origin default branch: the origin remote is unreachable'
+    )
+  }
+  const localOriginBranches = (tryGitSync(['-C', repoRoot, 'ls-remote', '--heads', 'origin']) ?? '')
+    .split('\n')
+    .map((line) => line.split(/\s+/u)[1]?.replace(/^refs\/heads\//u, ''))
+    .filter((branch): branch is string => branch !== undefined && branch !== '')
+  if (localOriginBranches.length === 1) return localOriginBranches[0]
+  if (localOriginBranches.length > 1) {
+    throw new Error('could not determine the default branch of the origin remote')
+  }
   const localHead = tryGitSync(['-C', repoRoot, 'symbolic-ref', '--short', 'HEAD'])
   if (localHead) return localHead
   throw new Error('could not determine the default branch of the origin remote')
@@ -753,25 +767,6 @@ function localOriginUrl(url: string): boolean {
   if (/^file:\/\//u.test(url)) return true
   if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//u.test(url)) return false
   return !/^[^/\\]*:/u.test(url)
-}
-
-function networkDefaultBranch(repoRoot: string): string {
-  const advertisement = originAdvertisement(repoRoot)
-  if (!advertisement.reachable) {
-    throw new Error('could not verify the origin default branch: the origin remote is unreachable')
-  }
-  const cached = cachedDefaultBranch(repoRoot)
-  if (advertisement.defaultBranch !== undefined) {
-    if (cached !== undefined && cached !== advertisement.defaultBranch) {
-      throw new Error(
-        `the origin default branch ${advertisement.defaultBranch} conflicts with local evidence ${cached}`
-      )
-    }
-    return advertisement.defaultBranch
-  }
-  const localHead = tryGitSync(['-C', repoRoot, 'symbolic-ref', '--short', 'HEAD'])
-  if (localHead) return localHead
-  throw new Error('could not determine the default branch of the origin remote')
 }
 
 function originAdvertisement(repoRoot: string): { defaultBranch?: string; reachable: boolean } {
@@ -818,11 +813,6 @@ function cachedDefaultBranch(repoRoot: string): string | undefined {
     return remoteBranches[0]
   }
   return undefined
-}
-
-function advertisedOriginDefaultBranch(repoRoot: string): string | undefined {
-  const advertisement = originAdvertisement(repoRoot)
-  return advertisement.reachable ? advertisement.defaultBranch : undefined
 }
 
 function managedHook(executablePath: string, gatePath: string): string {

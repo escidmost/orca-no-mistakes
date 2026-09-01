@@ -106,6 +106,7 @@ import {
   waitForPermanentRef,
   writeLaunchReadiness,
   type GateMetadata,
+  type LaunchReadiness,
   type ReceiveUpdate,
 } from "./admission.ts";
 import {
@@ -12862,6 +12863,14 @@ async function runGateAdmitCommand(flags: RawCliFlags): Promise<void> {
         ),
       );
       try {
+        if (!custodyLaunch) {
+          const readiness = await readFile(replayReadinessPath, "utf8")
+            .then((contents) => JSON.parse(contents) as LaunchReadiness)
+            .catch(() => undefined);
+          if (readiness?.state !== "failed") {
+            throw new Error("accepted admission has no nonce-bound launch custody");
+          }
+        }
         if (custodyLaunch && custodyLaunch.readiness.runId !== admission.run_id) {
           throw new Error("coordinator readiness did not bind the admitted run");
         }
