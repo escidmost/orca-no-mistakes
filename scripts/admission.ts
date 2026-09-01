@@ -728,6 +728,67 @@ function validBranchName(branch: string): boolean {
 }
 
 function detectDefaultBranch(repoRoot: string): string {
+  const originUrl = tryGitSync(['-C', repoRoot, 'remote', 'get-url', 'origin'])
+  if (originUrl !== undefined && !localOriginUrl(originUrl)) {
+    return networkDefaultBranch(repoRoot)
+  }
+  const cached = cachedDefaultBranch(repoRoot)
+  if (cached !== undefined) {
+    const advertised = advertisedOriginDefaultBranch(repoRoot)
+    if (advertised !== undefined && advertised !== cached) {
+      throw new Error(
+        `the origin default branch ${advertised} conflicts with local evidence ${cached}`
+      )
+    }
+    return cached
+  }
+  const advertisedDefault = advertisedOriginDefaultBranch(repoRoot)
+  if (advertisedDefault) return advertisedDefault
+  const localHead = tryGitSync(['-C', repoRoot, 'symbolic-ref', '--short', 'HEAD'])
+  if (localHead) return localHead
+  throw new Error('could not determine the default branch of the origin remote')
+}
+
+function localOriginUrl(url: string): boolean {
+  if (/^file:\/\//u.test(url)) return true
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//u.test(url)) return false
+  return !/^[^/\\]*:/u.test(url)
+}
+
+function networkDefaultBranch(repoRoot: string): string {
+  const advertisement = originAdvertisement(repoRoot)
+  if (!advertisement.reachable) {
+    throw new Error('could not verify the origin default branch: the origin remote is unreachable')
+  }
+  const cached = cachedDefaultBranch(repoRoot)
+  if (advertisement.defaultBranch !== undefined) {
+    if (cached !== undefined && cached !== advertisement.defaultBranch) {
+      throw new Error(
+        `the origin default branch ${advertisement.defaultBranch} conflicts with local evidence ${cached}`
+      )
+    }
+    return advertisement.defaultBranch
+  }
+  const localHead = tryGitSync(['-C', repoRoot, 'symbolic-ref', '--short', 'HEAD'])
+  if (localHead) return localHead
+  throw new Error('could not determine the default branch of the origin remote')
+}
+
+function originAdvertisement(repoRoot: string): { defaultBranch?: string; reachable: boolean } {
+  let advertisement: string
+  try {
+    advertisement = gitSync(['-C', repoRoot, 'ls-remote', '--symref', 'origin', 'HEAD'])
+  } catch {
+    return { reachable: false }
+  }
+  const advertisedHead = /^ref: refs\/heads\/(\S+)\tHEAD$/m.exec(advertisement)
+  const advertisedOid = /^[0-9a-f]{40}(?:[0-9a-f]{24})?\tHEAD$/m.test(advertisement)
+  return advertisedHead && advertisedOid
+    ? { defaultBranch: advertisedHead[1], reachable: true }
+    : { reachable: true }
+}
+
+function cachedDefaultBranch(repoRoot: string): string | undefined {
   const remoteHead = tryGitSync([
     '-C',
     repoRoot,
@@ -736,11 +797,11 @@ function detectDefaultBranch(repoRoot: string): string {
     'refs/remotes/origin/HEAD'
   ])
   if (remoteHead?.startsWith('origin/')) {
-    return verifyOriginDefaultBranch(repoRoot, remoteHead.slice('origin/'.length))
+    return remoteHead.slice('origin/'.length)
   }
   for (const candidate of ['main', 'master']) {
     if (tryGitSync(['-C', repoRoot, 'show-ref', '--verify', `refs/remotes/origin/${candidate}`])) {
-      return verifyOriginDefaultBranch(repoRoot, candidate)
+      return candidate
     }
   }
   const remoteBranches = (tryGitSync([
@@ -754,33 +815,14 @@ function detectDefaultBranch(repoRoot: string): string {
     .filter((ref) => ref && ref !== 'origin/HEAD')
     .map((ref) => ref.slice('origin/'.length))
   if (remoteBranches.length === 1) {
-    return verifyOriginDefaultBranch(repoRoot, remoteBranches[0])
+    return remoteBranches[0]
   }
-  if (!remoteBranches.length) {
-    const advertisedDefault = advertisedOriginDefaultBranch(repoRoot)
-    if (advertisedDefault) return advertisedDefault
-    const localHead = tryGitSync(['-C', repoRoot, 'symbolic-ref', '--short', 'HEAD'])
-    if (localHead) return localHead
-  }
-  throw new Error('could not determine the default branch of the origin remote')
+  return undefined
 }
 
 function advertisedOriginDefaultBranch(repoRoot: string): string | undefined {
-  const advertisement =
-    tryGitSync(['-C', repoRoot, 'ls-remote', '--symref', 'origin', 'HEAD']) ?? ''
-  const advertisedHead = /^ref: refs\/heads\/(\S+)\tHEAD$/m.exec(advertisement)
-  const advertisedOid = /^[0-9a-f]{40}(?:[0-9a-f]{24})?\tHEAD$/m.test(advertisement)
-  return advertisedHead && advertisedOid ? advertisedHead[1] : undefined
-}
-
-function verifyOriginDefaultBranch(repoRoot: string, candidate: string): string {
-  const advertised = advertisedOriginDefaultBranch(repoRoot)
-  if (advertised !== undefined && advertised !== candidate) {
-    throw new Error(
-      `the origin default branch ${advertised} conflicts with local evidence ${candidate}`
-    )
-  }
-  return candidate
+  const advertisement = originAdvertisement(repoRoot)
+  return advertisement.reachable ? advertisement.defaultBranch : undefined
 }
 
 function managedHook(executablePath: string, gatePath: string): string {
