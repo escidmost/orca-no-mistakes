@@ -2,10 +2,11 @@ import { dirname } from 'node:path'
 import { mkdir, writeFile } from 'node:fs/promises'
 
 import type { CommandResult, CommandRunner } from './github.ts'
-import { runCommand } from './github.ts'
+import { parseGithubRepositoryReference, runCommand } from './github.ts'
 import {
   canonicalJson,
   evidenceSha256,
+  isAuthoritativeStageEvidence,
   sha256,
   type DomainLedger,
   type StageCheckpointRow
@@ -90,6 +91,18 @@ async function readHead(
   return { oid: match[1]! }
 }
 
+function transportIdentity(destination: string, forgeHost: string): string {
+  let reference: { name: string; owner: string }
+  try {
+    reference = parseGithubRepositoryReference(destination)
+  } catch {
+    throw new CandidatePublicationError(
+      'publication destination must identify a credential-free github.com repository'
+    )
+  }
+  return `${forgeHost}/${reference.owner}/${reference.name}`
+}
+
 function terminalCandidate(ledger: DomainLedger, runId: string): string {
   const run = ledger.run(runId)
   if (!run) throw new CandidatePublicationError(`run ${runId} does not exist`)
@@ -104,6 +117,9 @@ function terminalCandidate(ledger: DomainLedger, runId: string): string {
   ledger.listCheckpoints(runId).forEach((checkpoint, index) => {
     finalCheckpoint.set(checkpoint.stage_id, { checkpoint, index })
   })
+  const evidenceByDigest = new Map(
+    ledger.listEvidence(runId).map((row) => [row.evidence_sha256, row])
+  )
 
   let candidate = run.submission_commit_oid
   let checkpointIndex = -1
@@ -125,6 +141,18 @@ function terminalCandidate(ledger: DomainLedger, runId: string): string {
     if (!final || final.index <= checkpointIndex || final.checkpoint.input_commit_oid !== candidate) {
       throw new CandidatePublicationError(
         `stage ${stage.stage_id} does not extend the contiguous candidate chain`
+      )
+    }
+    const evidence = disposition.evidence_sha256
+      ? evidenceByDigest.get(disposition.evidence_sha256)
+      : undefined
+    if (
+      evidence?.stage_id !== stage.stage_id ||
+      evidence.exit_code !== 0 ||
+      !isAuthoritativeStageEvidence(evidence.worker_identity)
+    ) {
+      throw new CandidatePublicationError(
+        `satisfied stage ${stage.stage_id} does not bind successful authoritative evidence`
       )
     }
     candidate = final.checkpoint.output_commit_oid
@@ -157,6 +185,26 @@ export async function admitCandidatePublication(input: AdmissionInput): Promise<
   const run = input.ledger.run(input.runId)
   const route = input.ledger.publicationRoute(input.runId)
   if (!run || !route) throw new CandidatePublicationError(`run ${input.runId} has no publication route`)
+  const storedRoute = input.ledger.repositoryPublicationRoute(run.repo_root)
+  if (!storedRoute) {
+    throw new CandidatePublicationError(
+      `run ${input.runId} has no stored repository publication route to bind the transport`
+    )
+  }
+  if (route.route_fingerprint !== sha256(canonicalJson({
+    baseBranch: storedRoute.base_branch,
+    baseRepositoryId: storedRoute.base_repository_id,
+    forgeHost: storedRoute.forge_host,
+    headBranch: storedRoute.head_branch,
+    headOwner: storedRoute.head_owner,
+    headRepositoryId: storedRoute.head_repository_id
+  }))) {
+    throw new CandidatePublicationError('publication route does not match the stored repository route')
+  }
+  const transportUrl = transportIdentity(input.destination, storedRoute.forge_host)
+  if (transportUrl !== `${storedRoute.forge_host}/${storedRoute.head_repository_name}`) {
+    throw new CandidatePublicationError('publication destination does not name the stored head repository')
+  }
   const ref = headRef(route.head_branch)
   const head = await readHead(
     input.runner ?? runCommand,
@@ -168,7 +216,7 @@ export async function admitCandidatePublication(input: AdmissionInput): Promise<
   input.ledger.recordPublicationBaseline({
     runId: input.runId,
     routeFingerprint: route.route_fingerprint,
-    transportUrl: input.destination,
+    transportUrl,
     headCommitOid: head.oid,
     observedAt: input.observedAt ?? new Date().toISOString()
   })
@@ -189,7 +237,8 @@ export async function publishCandidate(input: PublicationInput): Promise<{
   if (!route || !baseline || !run) {
     throw new CandidatePublicationError(`run ${input.runId} has no admitted publication`)
   }
-  if (baseline.route_fingerprint !== route.route_fingerprint || baseline.transport_url !== input.destination) {
+  const transportUrl = transportIdentity(input.destination, route.forge_host)
+  if (baseline.route_fingerprint !== route.route_fingerprint || baseline.transport_url !== transportUrl) {
     throw new CandidatePublicationError('publication destination differs from the immutable admission route')
   }
   if (!input.ledger.ownsLease(input.runId, {
@@ -201,6 +250,27 @@ export async function publishCandidate(input: PublicationInput): Promise<{
   }
 
   const candidate = terminalCandidate(input.ledger, input.runId)
+  const settled = input.ledger.listEvidence(input.runId).find(
+    (row) => row.stage_id === 'push' && row.round_index === 0
+  )
+  if (settled) {
+    const receipt = input.ledger.remoteReceipt(input.runId, 'candidate-publication')
+    let outcome: 'created' | 'updated' | 'unchanged' | undefined
+    try {
+      const parsed = JSON.parse(receipt?.receipt_json ?? '') as { outcome?: unknown }
+      if (parsed.outcome === 'created' || parsed.outcome === 'updated' || parsed.outcome === 'unchanged') {
+        outcome = parsed.outcome
+      }
+    } catch {}
+    if (!receipt || outcome === undefined ||
+        settled.candidate_commit_oid !== candidate ||
+        receipt.candidate_commit_oid !== candidate ||
+        settled.exit_code !== 0 ||
+        !isAuthoritativeStageEvidence(settled.worker_identity)) {
+      throw new CandidatePublicationError('push round 0 is already settled with different facts')
+    }
+    return { candidateCommitOid: candidate, outcome, receiptSha256: receipt.receipt_sha256 }
+  }
   const ref = headRef(route.head_branch)
   const subject = `${route.forge_host}/${route.head_repository_id}:${ref}`
   const pre = await readHead(runner, input.destination, ref, run.repo_root, env)
