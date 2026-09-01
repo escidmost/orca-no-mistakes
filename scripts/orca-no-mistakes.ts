@@ -1793,8 +1793,10 @@ export async function runPipeline(
     admission &&
     (admission.new_oid !== options.admission.newOid ||
       (options.admission.runId !== undefined &&
+        admission.run_id !== null &&
         admission.run_id !== options.admission.runId) ||
-      (options.admission.source === "gate" && admission.status !== "accepted"))
+      admission.status === "failed" ||
+      admission.status === "superseded")
   ) {
     throw new Error("submission admission is not ready for pipeline execution");
   }
@@ -1878,13 +1880,11 @@ export async function runPipeline(
         domainRunStarted = true;
         if (options.admission) {
           ledger.bindSubmissionAdmission(options.admission.admissionId, runId);
-          if (options.admission.source === "direct") {
-            ledger.markSubmissionAccepted({
-              acceptedOid: options.admission.newOid,
-              admissionId: options.admission.admissionId,
-              runId,
-            });
-          }
+          ledger.markSubmissionAccepted({
+            acceptedOid: options.admission.newOid,
+            admissionId: options.admission.admissionId,
+            runId,
+          });
         }
       }
       const statusRenderer = options.rendererFactory?.(
@@ -12413,6 +12413,41 @@ async function spawnAdmissionCoordinator(
   });
 }
 
+async function assertAdmittedCheckout(
+  metadata: GateMetadata,
+  admission: SubmissionAdmissionRow,
+): Promise<void> {
+  const checkout = await new GitShell({
+    expectedHead: admission.new_oid,
+    repo: metadata.repoRoot,
+  }).assertReady();
+  if (`refs/heads/${checkout.branch}` !== admission.ref_name) {
+    throw new Error(
+      `the repository checkout is on ${checkout.branch} but the admission is for ${admission.ref_name}`,
+    );
+  }
+}
+
+async function launchAdmittedPipeline(
+  metadata: GateMetadata,
+  admission: SubmissionAdmissionRow,
+  runId: string,
+): Promise<void> {
+  await main([
+    "run",
+    "--repo",
+    metadata.repoRoot,
+    "--head",
+    admission.new_oid,
+    "--intent",
+    admission.intent,
+    "--admission-id",
+    admission.admission_id,
+    "--run-id",
+    runId,
+  ]);
+}
+
 async function runGateAdmitCommand(flags: RawCliFlags): Promise<void> {
   const gatePath = stringFlag(flags, "gate");
   if (!gatePath) throw new Error("gate admit requires --gate");
@@ -12486,14 +12521,14 @@ async function runGateAdmitCommand(flags: RawCliFlags): Promise<void> {
       }
       const readiness = await waitForLaunchReadiness(readinessPath);
       const current = ledger.submissionAdmission(admission.admission_id);
-      if (!current?.run_id || readiness.runId !== current.run_id) {
+      if (current?.run_id && readiness.runId !== current.run_id) {
         throw new Error("coordinator readiness did not bind the admitted run");
       }
       console.log(
         JSON.stringify({
-          admissionId: current.admission_id,
-          followUp: `orca-no-mistakes run --resume ${current.run_id}`,
-          runId: current.run_id,
+          admissionId: admission.admission_id,
+          followUp: `orca-no-mistakes run --resume ${readiness.runId}`,
+          runId: readiness.runId,
         }),
       );
     } finally {
@@ -12519,7 +12554,6 @@ async function runGateCoordinatorCommand(flags: RawCliFlags): Promise<void> {
   const ledger = openRepositoryLedger(metadata.repoRoot, false);
   let runId: string | undefined;
   let orca: CliOrca | undefined;
-  let accepted = false;
   try {
     const admission = ledger.submissionAdmission(admissionId);
     if (!admission) throw new Error(`unknown submission admission ${admissionId}`);
@@ -12534,18 +12568,9 @@ async function runGateCoordinatorCommand(flags: RawCliFlags): Promise<void> {
       anchorPermanentRef(metadata, custodyUpdate, admission.run_id);
       return;
     }
-    const checkout = await new GitShell({
-      expectedHead: admission.new_oid,
-      repo: metadata.repoRoot,
-    }).assertReady();
-    if (`refs/heads/${checkout.branch}` !== admission.ref_name) {
-      throw new Error(
-        `the repository checkout is on ${checkout.branch} but the admission is for ${admission.ref_name}`,
-      );
-    }
+    await assertAdmittedCheckout(metadata, admission);
     orca = new CliOrca({ cwd: metadata.repoRoot, runId: admission.run_id ?? undefined });
     runId = admission.run_id ?? (await orca.createRun(`no-mistakes: ${admission.intent}`));
-    ledger.bindSubmissionAdmission(admissionId, runId);
     await writeLaunchReadiness(readinessPath, { runId, state: "ready" });
     const update: ReceiveUpdate = {
       newOid: admission.new_oid,
@@ -12554,42 +12579,22 @@ async function runGateCoordinatorCommand(flags: RawCliFlags): Promise<void> {
     };
     await waitForPermanentRef(metadata, update, 100);
     anchorPermanentRef(metadata, update, runId);
-    ledger.markSubmissionAccepted({
-      acceptedOid: admission.new_oid,
-      admissionId,
-      runId,
-    });
-    accepted = true;
-    await main([
-      "run",
-      "--repo",
-      metadata.repoRoot,
-      "--head",
-      admission.new_oid,
-      "--intent",
-      admission.intent,
-      "--admission-id",
-      admissionId,
-      "--run-id",
-      runId,
-    ]);
+    await launchAdmittedPipeline(metadata, admission, runId);
   } catch (error) {
     await writeLaunchReadiness(readinessPath, {
       error: error instanceof Error ? error.message : String(error),
       state: "failed",
     }).catch(() => undefined);
-    if (!accepted) {
-      ledger.failSubmissionAdmission(
-        admissionId,
-        error instanceof Error && error.message.includes("superseded")
-          ? "superseded"
-          : "failed",
+    ledger.failSubmissionAdmission(
+      admissionId,
+      error instanceof Error && error.message.includes("superseded")
+        ? "superseded"
+        : "failed",
+    );
+    if (runId && orca) {
+      await orca.failRun(`Admission coordinator failed: ${error instanceof Error ? error.message : String(error)}`).catch(
+        () => undefined,
       );
-      if (runId && orca) {
-        await orca.failRun(`Admission coordinator failed: ${error instanceof Error ? error.message : String(error)}`).catch(
-          () => undefined,
-        );
-      }
     }
     throw error;
   } finally {

@@ -227,6 +227,15 @@ export async function initializeLocalGate(
         paths.gatePath
       ])
     } else {
+      const isBare = tryGitSync([
+        '--git-dir',
+        paths.gatePath,
+        'rev-parse',
+        '--is-bare-repository'
+      ])
+      if (isBare !== 'true') {
+        throw new Error('the existing gate path is not a bare repository')
+      }
       const gateFormat = tryGitSync(['--git-dir', paths.gatePath, 'rev-parse', '--show-object-format'])
       if (gateFormat !== objectFormat) {
         throw new Error(
@@ -482,10 +491,12 @@ function detectDefaultBranch(repoRoot: string): string {
     '--short',
     'refs/remotes/origin/HEAD'
   ])
-  if (remoteHead?.startsWith('origin/')) return remoteHead.slice('origin/'.length)
+  if (remoteHead?.startsWith('origin/')) {
+    return verifyOriginDefaultBranch(repoRoot, remoteHead.slice('origin/'.length))
+  }
   for (const candidate of ['main', 'master']) {
     if (tryGitSync(['-C', repoRoot, 'show-ref', '--verify', `refs/remotes/origin/${candidate}`])) {
-      return candidate
+      return verifyOriginDefaultBranch(repoRoot, candidate)
     }
   }
   const remoteBranches = (tryGitSync([
@@ -498,16 +509,34 @@ function detectDefaultBranch(repoRoot: string): string {
     .split('\n')
     .filter((ref) => ref && ref !== 'origin/HEAD')
     .map((ref) => ref.slice('origin/'.length))
-  if (remoteBranches.length === 1) return remoteBranches[0]
+  if (remoteBranches.length === 1) {
+    return verifyOriginDefaultBranch(repoRoot, remoteBranches[0])
+  }
   if (!remoteBranches.length) {
-    const advertisement =
-      tryGitSync(['-C', repoRoot, 'ls-remote', '--symref', 'origin', 'HEAD']) ?? ''
-    const advertised = /^ref: refs\/heads\/(\S+)\tHEAD$/m.exec(advertisement)
-    if (advertised) return advertised[1]
+    const advertisedDefault = advertisedOriginDefaultBranch(repoRoot)
+    if (advertisedDefault) return advertisedDefault
     const localHead = tryGitSync(['-C', repoRoot, 'symbolic-ref', '--short', 'HEAD'])
     if (localHead) return localHead
   }
   throw new Error('could not determine the default branch of the origin remote')
+}
+
+function advertisedOriginDefaultBranch(repoRoot: string): string | undefined {
+  const advertisement =
+    tryGitSync(['-C', repoRoot, 'ls-remote', '--symref', 'origin', 'HEAD']) ?? ''
+  const advertisedHead = /^ref: refs\/heads\/(\S+)\tHEAD$/m.exec(advertisement)
+  const advertisedOid = /^[0-9a-f]{40}(?:[0-9a-f]{24})?\tHEAD$/m.test(advertisement)
+  return advertisedHead && advertisedOid ? advertisedHead[1] : undefined
+}
+
+function verifyOriginDefaultBranch(repoRoot: string, candidate: string): string {
+  const advertised = advertisedOriginDefaultBranch(repoRoot)
+  if (advertised !== undefined && advertised !== candidate) {
+    throw new Error(
+      `the origin default branch ${advertised} conflicts with local evidence ${candidate}`
+    )
+  }
+  return candidate
 }
 
 function managedHook(executablePath: string, gatePath: string): string {
