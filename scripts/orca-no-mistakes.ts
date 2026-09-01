@@ -2996,8 +2996,28 @@ export async function runPipeline(
           );
         }
       }
+      const outcome = error instanceof GateStopError ? "cancelled" : "failed";
+      if (
+        isResumablePipelineFailure(
+          failure,
+          outcome,
+          ledger.listCheckpoints(runId).length,
+        ) &&
+        resumeControlAvailable
+      ) {
+        for (const worker of [...abortReap.workers]) {
+          try {
+            await releaseWorker(worker, orca);
+          } catch (cleanupError) {
+            failure = new WorkerCleanupError(
+              `failed-attempt worker cleanup failed: ${String(cleanupError)}`,
+              { cause: failure },
+            );
+            break;
+          }
+        }
+      }
       const retry = await withGateMutation(async () => {
-        const outcome = error instanceof GateStopError ? "cancelled" : "failed";
         let anchorError: unknown;
         let anchoredOid: string | undefined;
         try {
@@ -3092,25 +3112,37 @@ export async function runPipeline(
       });
       if (!retry) throw failure;
 
-      for (const worker of [...abortReap.workers]) {
-        try {
-          await releaseWorker(worker, orca);
-        } catch (cleanupError) {
-          throw new WorkerCleanupError(
-            `failed-attempt worker cleanup failed: ${String(cleanupError)}`,
-            { cause: failure },
-          );
-        }
-      }
-
       await waitForResume();
-      const resumeHead = await git.head();
-      let resumeClaim: ReturnType<DomainLedger["prepareResume"]>;
+      let resumeHead: string | undefined;
+      let resumedAttemptStarted = false;
       try {
-        resumeClaim = ledger.prepareResume({
+        resumeHead = await git.head();
+        let resumeClaim: ReturnType<DomainLedger["prepareResume"]>;
+        try {
+          resumeClaim = ledger.prepareResume({
+            baseBranch: deliveryRepo.base,
+            baseRefSha: effectiveProvenance.baseRefSha,
+            branch: deliveryRepo.branch,
+            effectivePolicyHash: effectiveProvenance.effectivePolicyHash,
+            force: options.forceLease === true,
+            head: resumeHead,
+            intent,
+            policySha256: policySha256Value,
+            repoRoot: deliveryRepo.root,
+            runId,
+          });
+        } catch (resumeError) {
+          const message =
+            resumeError instanceof Error ? resumeError.message : String(resumeError);
+          throw new Error(`resume rejected: ${message}`, { cause: failure });
+        }
+        resumeClaimId = resumeClaim.claimId;
+        generationToken = resumeClaim.generationToken;
+        const resumed = ledger.resumeRun({
           baseBranch: deliveryRepo.base,
           baseRefSha: effectiveProvenance.baseRefSha,
           branch: deliveryRepo.branch,
+          claimId: resumeClaimId,
           effectivePolicyHash: effectiveProvenance.effectivePolicyHash,
           force: options.forceLease === true,
           head: resumeHead,
@@ -3119,66 +3151,97 @@ export async function runPipeline(
           repoRoot: deliveryRepo.root,
           runId,
         });
-      } catch (resumeError) {
-        const message =
-          resumeError instanceof Error ? resumeError.message : String(resumeError);
-        throw new Error(`resume rejected: ${message}`, { cause: failure });
+        resumeCheckpoint = resumed.checkpoint;
+        generationToken = resumed.generationToken;
+        resumingAttempt = true;
+        Object.assign(abortReap, {
+          generationToken,
+          resumeClaimId,
+          runId,
+        });
+        await refreshGateMarker();
+        const attempt = presentation.nextAttempt();
+        presentation.publish(`attempt:${attempt}:started`, {
+          attempt,
+          kind: "attempt-started",
+        });
+        await deliveryGit.anchorRecoveryRef(
+          runId,
+          resumeCheckpoint.output_commit_oid,
+          generationToken,
+        );
+        attemptId = randomUUID();
+        ledger.startAttempt({
+          actorIdentity,
+          attemptId,
+          coordinatorIdentity,
+          generationToken,
+          runId,
+          startedAt: new Date().toISOString(),
+        });
+        resumedAttemptStarted = true;
+        await registerAbortRunContext({
+          artifactsDir,
+          deliveryGit,
+          generationToken,
+          git,
+          ledger,
+          orchestrationRunId: abortReap.orchestrationRunId,
+          plainStatus: options.plainStatus,
+          resumeClaimId,
+          runId,
+        });
+        continue;
+      } catch (setupError) {
+        await withGateMutation(async () => {
+          const ownership =
+            generationToken === undefined
+              ? undefined
+              : {
+                  branch: deliveryRepo.branch,
+                  generationToken,
+                  repoRoot: deliveryRepo.root,
+                };
+          const eventKey = `attempt:${presentation.current.attempt}:error:setup`;
+          presentation.publish(
+            eventKey,
+            { kind: "error-recorded", resumable: false },
+            (snapshot) =>
+              settleRunOrThrow(
+                ledger,
+                runId,
+                "failed",
+                setupError,
+                ownership,
+                { eventKey, snapshot },
+                resumedAttemptStarted && attemptId !== undefined
+                  ? {
+                      actorIdentity,
+                      attemptId,
+                      candidateCommitOid: resumeHead ?? repo.head,
+                      completedAt: new Date().toISOString(),
+                      coordinatorIdentity,
+                      custody: {},
+                      reason:
+                        setupError instanceof Error
+                          ? setupError.message
+                          : String(setupError),
+                      receiptDigests: [],
+                      resumeEligible: false,
+                      runId,
+                      stoppingFact: "resumed attempt setup failed",
+                      verdict: "failed",
+                    }
+                  : undefined,
+              ),
+          );
+          presentation.publish(
+            `attempt:${presentation.current.attempt}:run:completed:failed`,
+            { kind: "run-completed", status: "failed" },
+          );
+        }, true);
+        throw setupError;
       }
-      resumeClaimId = resumeClaim.claimId;
-      generationToken = resumeClaim.generationToken;
-      const resumed = ledger.resumeRun({
-        baseBranch: deliveryRepo.base,
-        baseRefSha: effectiveProvenance.baseRefSha,
-        branch: deliveryRepo.branch,
-        claimId: resumeClaimId,
-        effectivePolicyHash: effectiveProvenance.effectivePolicyHash,
-        force: options.forceLease === true,
-        head: resumeHead,
-        intent,
-        policySha256: policySha256Value,
-        repoRoot: deliveryRepo.root,
-        runId,
-      });
-      resumeCheckpoint = resumed.checkpoint;
-      generationToken = resumed.generationToken;
-      resumingAttempt = true;
-      Object.assign(abortReap, {
-        generationToken,
-        resumeClaimId,
-        runId,
-      });
-      await refreshGateMarker();
-      const attempt = presentation.nextAttempt();
-      presentation.publish(`attempt:${attempt}:started`, {
-        attempt,
-        kind: "attempt-started",
-      });
-      await deliveryGit.anchorRecoveryRef(
-        runId,
-        resumeCheckpoint.output_commit_oid,
-        generationToken,
-      );
-      attemptId = randomUUID();
-      ledger.startAttempt({
-        actorIdentity,
-        attemptId,
-        coordinatorIdentity,
-        generationToken,
-        runId,
-        startedAt: new Date().toISOString(),
-      });
-      await registerAbortRunContext({
-        artifactsDir,
-        deliveryGit,
-        generationToken,
-        git,
-        ledger,
-        orchestrationRunId: abortReap.orchestrationRunId,
-        plainStatus: options.plainStatus,
-        resumeClaimId,
-        runId,
-      });
-      continue;
     }
   }
 }
