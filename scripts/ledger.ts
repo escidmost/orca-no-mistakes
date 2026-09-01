@@ -1485,7 +1485,7 @@ function repositoryGitEnvironment(): NodeJS.ProcessEnv {
   const environment = { ...process.env }
   for (const key of Object.keys(environment)) {
     if (
-      /^GIT_(?:ALTERNATE_OBJECT_DIRECTORIES|CONFIG_|DIR$|INDEX_FILE$|OBJECT_DIRECTORY|PREFIX$|PUSH_OPTION|QUARANTINE_PATH|WORK_TREE$)/u.test(
+      /^GIT_(?:ALTERNATE_OBJECT_DIRECTORIES|CONFIG(?:_|$)|DIR$|INDEX_FILE$|OBJECT_DIRECTORY|PREFIX$|PUSH_OPTION|QUARANTINE_PATH|WORK_TREE$)/u.test(
         key
       )
     ) {

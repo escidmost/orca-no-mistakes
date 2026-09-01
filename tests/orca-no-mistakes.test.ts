@@ -1634,6 +1634,7 @@ test("an invalid fixer report preserves its error when cleanup also fails", asyn
       summary: "one defect",
     },
     { findings: [], summary: "" },
+    { findings: [], summary: "" },
   ]);
 
   await assert.rejects(
@@ -1721,7 +1722,10 @@ test("a failed run surfaces retained fixer cleanup failure with the stage error 
     pass("fix committed"),
     pass("clean rereview"),
   ]);
-  orca.reports.set("test", [{ findings: [], summary: "" }]);
+  orca.reports.set("test", [
+    { findings: [], summary: "" },
+    { findings: [], summary: "" },
+  ]);
 
   await assert.rejects(
     runPipeline({ intent: "Preserve stage and cleanup failures." }, orca, git),
@@ -2399,6 +2403,17 @@ test("malformed reviewer findings fail closed and still clean up the worker", as
       ],
       summary: "malformed",
     },
+    {
+      findings: [
+        {
+          id: "bad-severity",
+          severity: "critical",
+          action: "auto-fix",
+          description: "This report is outside the schema.",
+        } as unknown as Finding,
+      ],
+      summary: "malformed",
+    },
   ]);
 
   await assert.rejects(
@@ -2407,7 +2422,34 @@ test("malformed reviewer findings fail closed and still clean up the worker", as
   );
 
   assert.ok(orca.calls.some((call) => call.startsWith("release:")));
-  assert.equal(orca.removedWorktrees.length, 1);
+  assert.equal(orca.removedWorktrees.length, 2);
+});
+
+test("a schema-invalid reviewer report gets one contract-repair retry", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "bad-severity",
+          severity: "critical",
+          action: "auto-fix",
+          description: "This report is outside the schema.",
+        } as unknown as Finding,
+      ],
+      summary: "malformed",
+    },
+    pass("review repaired"),
+  ]);
+
+  await runPipeline({ intent: "Repair schema-invalid reviewer reports." }, orca, git);
+
+  const reviewLaunches = orca.launches.filter(
+    (launch) => launch.role === "reviewer" && launch.stage === "review",
+  );
+  assert.equal(reviewLaunches.length, 2);
+  assert.match(reviewLaunches[1].prompt, /REPORT REPAIR/);
 });
 
 test("reviewer findings without an action are conservatively escalated", async () => {
@@ -2533,6 +2575,11 @@ test("reviewer artifacts must exist under the run evidence directory", async () 
       summary: "unsafe evidence",
       artifacts: ["/tmp/outside-evidence.log"],
     },
+    {
+      findings: [],
+      summary: "unsafe evidence",
+      artifacts: ["/tmp/outside-evidence.log"],
+    },
   ]);
 
   await assert.rejects(
@@ -2540,10 +2587,11 @@ test("reviewer artifacts must exist under the run evidence directory", async () 
     /review worker returned an unsafe artifact path/,
   );
   assert.ok(orca.calls.some((call) => call.startsWith("release:")));
-  assert.equal(orca.removedWorktrees.length, 1);
+  assert.equal(orca.removedWorktrees.length, 2);
 
   const missingOrca = new FakeOrca(git);
   missingOrca.reports.set("review", [
+    { findings: [], summary: "missing evidence", artifacts: ["missing.log"] },
     { findings: [], summary: "missing evidence", artifacts: ["missing.log"] },
   ]);
   await assert.rejects(
@@ -2551,7 +2599,7 @@ test("reviewer artifacts must exist under the run evidence directory", async () 
     /review worker returned a missing artifact/,
   );
   assert.ok(missingOrca.calls.some((call) => call.startsWith("release:")));
-  assert.equal(missingOrca.removedWorktrees.length, 1);
+  assert.equal(missingOrca.removedWorktrees.length, 2);
 });
 
 test("reviewer URL references are not treated as local artifacts", async () => {
@@ -6218,6 +6266,7 @@ test("a failed fixer leaves its worktree commits anchored for recovery", async (
       summary: "one defect",
     },
     { findings: "bogus", summary: "x" } as unknown as StageReport,
+    { findings: "bogus", summary: "x" } as unknown as StageReport,
     pass("never reached"),
   ]);
   await assert.rejects(
@@ -6233,6 +6282,36 @@ test("a failed fixer leaves its worktree commits anchored for recovery", async (
     "the failed fixer's commits are anchored under a recovery ref",
   );
   assert.ok(orca.removedWorktrees.length > 0);
+});
+
+test("a schema-invalid fixer report gets one contract-repair retry", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  const orca = new FakeOrca(git);
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Repair the implementation.",
+        },
+      ],
+      summary: "one defect",
+    },
+    { findings: "bogus", summary: "x" } as unknown as StageReport,
+    pass("fix repaired"),
+    pass("clean rereview"),
+  ]);
+
+  await runPipeline({ intent: "Repair schema-invalid fixer reports." }, orca, git);
+
+  const fixerLaunches = orca.launches.filter(
+    (launch) => launch.role === "fixer" && launch.stage === "review",
+  );
+  assert.equal(fixerLaunches.length, 2);
+  assert.match(fixerLaunches[1].prompt, /REPORT REPAIR/);
 });
 
 test("stage evidence binds to the reviewer's pinned commit even if the branch advances", async () => {
@@ -8634,6 +8713,34 @@ test("an invalid worker report gets one contract-repair retry", async () => {
   assert.equal(outcome.worker.report.summary, "review");
   assert.equal(orca.tasks.length, 2);
   assert.match(orca.launches[1].prompt, /REPORT REPAIR/);
+});
+
+test("an unreadable worker report gets one contract-repair retry", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  orca.launchFailures.push(
+    new Error(
+      "worker dispatch-missing report could not be read: Error: ENOENT: no such file or directory",
+    ),
+  );
+
+  const outcome = await startWorkerWithFallback(
+    orca,
+    (launch) => orca.createTask(launch.prompt),
+    [
+      {
+        name: "missing-report-retry",
+        prompt: "Review the change.",
+        role: "reviewer",
+        stage: "review",
+        worktree: "current",
+      },
+    ],
+  );
+
+  assert.equal(outcome.worker.report.summary, "review");
+  assert.equal(orca.tasks.length, 2);
+  assert.match(orca.launches[1].prompt, /create the report parent directory/);
 });
 
 test("CliOrca extracts acp reports wrapped in closed JSON fences", async () => {

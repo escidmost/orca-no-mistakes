@@ -3158,15 +3158,21 @@ export type FallbackAttempt = {
 
 export type WorkerLaunchOutcome = {
   attempts: FallbackAttempt[];
+  reportRetries: number;
   resolvedAgent: string;
   worker: WorkerResult;
 };
 
-// ponytail: one repair retry; repeated malformed output remains a hard failure.
+// ponytail: one repair retry; repeated invalid or unreadable output remains a hard failure.
 const WORKER_REPORT_RETRY_LIMIT = 1;
 
-function isInvalidWorkerReportError(error: unknown): boolean {
-  return error instanceof Error && /returned an invalid report(?:$|:)/u.test(error.message);
+function isRepairableWorkerReportError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    /(?:returned an invalid report|report could not be read)(?:$|:)/u.test(
+      error.message,
+    )
+  );
 }
 
 function repairWorkerReportLaunch(launch: WorkerLaunch): WorkerLaunch {
@@ -3174,7 +3180,7 @@ function repairWorkerReportLaunch(launch: WorkerLaunch): WorkerLaunch {
     ...launch,
     prompt: `${launch.prompt}
 
-REPORT REPAIR: the previous response did not satisfy the report contract. Retry the task and write a complete JSON object with a nonempty string summary, a findings array, and any tested/artifacts arrays required by the task before reporting completion. Do not omit the summary.`,
+REPORT REPAIR: the previous response did not produce a readable report. Retry the task, create the report parent directory, and write a complete JSON object to the requested report path with a nonempty string summary, a findings array, and any tested/artifacts arrays required by the task before reporting completion. Do not report completion until the file exists and is readable; do not omit the summary.`,
     ...(launch.retainedWorktreeId || launch.terminal
       ? {
           retainedWorktreeId: undefined,
@@ -3188,8 +3194,9 @@ REPORT REPAIR: the previous response did not satisfy the report contract. Retry 
 
 // Iterates an ordered fallback chain. Only PreflightError (launch/readiness/
 // dispatch failures before a candidate accepts the task) advances to the next
-// candidate; execution-phase errors propagate immediately. A malformed report
-// gets one fresh task with an explicit contract reminder before it propagates.
+// candidate; execution-phase errors propagate immediately. An invalid or
+// unreadable report gets one fresh task with an explicit contract reminder
+// before it propagates.
 // Each candidate gets its own child task so the injected spec always carries
 // that candidate's delivery instructions.
 export async function startWorkerWithFallback(
@@ -3259,13 +3266,14 @@ export async function startWorkerWithFallback(
       await allocationRegistration?.ready;
       return {
         attempts,
+        reportRetries: reportRetry,
         resolvedAgent: launch.agent?.harness ?? DEFAULT_WORKER_AGENT,
         worker,
       };
     } catch (error) {
       finishAllocation();
       if (
-        isInvalidWorkerReportError(error) &&
+        isRepairableWorkerReportError(error) &&
         reportRetry < WORKER_REPORT_RETRY_LIMIT
       ) {
         await onReportRetry?.(launch);
@@ -3469,40 +3477,58 @@ async function runReviewer(
       worktree: "new-child",
     };
   });
-  const outcome = await startWorkerWithFallback(
-    orca,
-    (launch) =>
-      orca.createTask(`[${stage} check ${attempt + 1}]\n${launch.prompt}`, {
-        parent: parentTask,
-      }),
-    launches,
-    undefined,
-    fence,
-  );
-  const worker = outcome.worker;
-  try {
-    const validatedReport = await validateReport(
-      worker.report,
-      stage,
-      evidenceDir,
+  let retryLaunches = launches;
+  let reportRetry = 0;
+  for (;;) {
+    const outcome = await startWorkerWithFallback(
+      orca,
+      (launch) =>
+        orca.createTask(`[${stage} check ${attempt + 1}]\n${launch.prompt}`, {
+          parent: parentTask,
+        }),
+      retryLaunches,
+      undefined,
+      fence,
+      undefined,
+      reportRetry,
     );
-    if (worker.failedOutcome === true) {
-      throw new Error(
-        `${stage} worker failed after writing report: ${validatedReport.summary}`,
-      );
+    const worker = outcome.worker;
+    reportRetry = outcome.reportRetries;
+    try {
+      let validatedReport: StageReport;
+      try {
+        validatedReport = await validateReport(
+          worker.report,
+          stage,
+          evidenceDir,
+        );
+      } catch (error) {
+        if (reportRetry >= WORKER_REPORT_RETRY_LIMIT) throw error;
+        reportRetry += 1;
+        const launch =
+          retryLaunches[outcome.attempts.length] ?? retryLaunches[0];
+        if (!launch) throw error;
+        retryLaunches = [repairWorkerReportLaunch(launch)];
+        continue;
+      }
+      if (worker.failedOutcome === true) {
+        throw new Error(
+          `${stage} worker failed after writing report: ${validatedReport.summary}`,
+        );
+      }
+      return {
+        exitCode: exitCodeFor(validatedReport),
+        report: validatedReport,
+        workerIdentity: `reviewer:${worker.dispatchId}`,
+        resolvedAgent: outcome.resolvedAgent,
+        ...(outcome.attempts.length > 0
+          ? { fallbackAttempts: outcome.attempts }
+          : {}),
+        evidenceCommitOid: untrusted.headOid,
+      };
+    } finally {
+      await releaseReviewerWorker(worker, orca, stage);
     }
-    return {
-      exitCode: exitCodeFor(validatedReport),
-      report: validatedReport,
-      workerIdentity: `reviewer:${worker.dispatchId}`,
-      resolvedAgent: outcome.resolvedAgent,
-      ...(outcome.attempts.length > 0
-        ? { fallbackAttempts: outcome.attempts }
-        : {}),
-      evidenceCommitOid: untrusted.headOid,
-    };
-  } finally {
-    await releaseReviewerWorker(worker, orca, stage);
   }
 }
 
@@ -3715,134 +3741,154 @@ async function runFixer(
       worktree: reuseSession ? "current" : "new-child",
     };
   });
-  const outcome = await startWorkerWithFallback(
-    orca,
-    (launch) =>
-      orca.createTask(`[${stage} fix ${round}]\n${launch.prompt}`, {
-        parent: parentTask,
-      }),
-    launches,
-    async (index) => {
-      if (!sessionToReuse || index !== 0) return;
-      retainedSession = undefined;
-      await releaseFixerSession(sessionToReuse, orca);
-    },
-    fence,
-    async (launch) => {
-      if (
-        !sessionToReuse ||
-        launch.retainedWorktreeId !== sessionToReuse.worker.worktreeId
-      )
-        return;
-      const staleSession = sessionToReuse;
-      sessionToReuse = undefined;
-      retainedSession = undefined;
-      await releaseFixerSession(staleSession, orca);
-    },
-  );
-  const worker = outcome.worker;
-  const worktreePath =
-    worker.worktreePath ?? retainedSession?.worker.worktreePath;
-  const worktreeId = worker.worktreeId ?? retainedSession?.worker.worktreeId;
-  let workerHead: string | undefined;
-  let retainWorker = false;
-  let failure: unknown;
-  try {
-    const validatedReport = await validateFixerReport(
-      worker.report,
-      stage,
-      path.dirname(reportPath),
+  let retryLaunches = launches;
+  let reportRetry = 0;
+  for (;;) {
+    const outcome = await startWorkerWithFallback(
+      orca,
+      (launch) =>
+        orca.createTask(`[${stage} fix ${round}]\n${launch.prompt}`, {
+          parent: parentTask,
+        }),
+      retryLaunches,
+      async (index) => {
+        if (!sessionToReuse || index !== 0) return;
+        retainedSession = undefined;
+        await releaseFixerSession(sessionToReuse, orca);
+      },
+      fence,
+      async (launch) => {
+        if (
+          !sessionToReuse ||
+          launch.retainedWorktreeId !== sessionToReuse.worker.worktreeId
+        )
+          return;
+        const staleSession = sessionToReuse;
+        sessionToReuse = undefined;
+        retainedSession = undefined;
+        await releaseFixerSession(staleSession, orca);
+      },
+      reportRetry,
     );
-    if (!worktreePath) {
-      throw new Error(`${stage} fixer did not return a worktree path`);
-    }
-    workerHead = await git.headOf(worktreePath);
-    if (before === workerHead) {
-      throw new FixerNoChangeError(validatedReport, stage);
-    }
-    const verdict = await git.assertFixerChangesAllowed(
-      worktreePath,
-      before,
-      workerHead,
-      guardrails,
-    );
-    if (verdict !== undefined && !verdict.changed) {
-      throw new FixerNoChangeError(validatedReport, stage);
-    }
-    if (fence.aborted) {
-      // The execution timeout already failed this stage; refuse late mutations
-      // so a delayed worker cannot apply commits into a settled run.
-      throw new Error(`${stage} fixer timed out; commits were not applied`);
-    }
-    const expectedWorkerHead = workerHead;
-    const after = await withGateMutation(async () => {
-      if (
-        !(await git.applyWorktreeCommits(
-          worktreePath,
-          before,
-          expectedWorkerHead,
-          fence,
-        ))
-      ) {
-        throw new Error(`${stage} fixer could not apply its committed change`);
-      }
-      fence.deadlineSatisfied = true;
-      const after = await git.head();
-      if (after !== expectedWorkerHead) {
-        throw new PostMutationCustodyError(
-          `${stage} fixer custody ended at unexpected HEAD ${after}; expected ${expectedWorkerHead}`,
-        );
-      }
-      return after;
-    });
-    const terminalHandle =
-      worker.terminalHandle ?? retainedSession?.worker.terminalHandle;
-    if (terminalHandle && worktreeId) {
-      worker.terminalHandle = terminalHandle;
-      worker.worktreeId = worktreeId;
-      worker.worktreePath = worktreePath;
+    const worker = outcome.worker;
+    reportRetry = outcome.reportRetries;
+    const worktreePath =
+      worker.worktreePath ?? retainedSession?.worker.worktreePath;
+    const worktreeId = worker.worktreeId ?? retainedSession?.worker.worktreeId;
+    let workerHead: string | undefined;
+    let retainWorker = false;
+    let failure: unknown;
+    try {
+      let validatedReport: StageReport;
       try {
-        await orca.finishWorker(worker, "retain");
-        worker.deliveryId = undefined;
-        retainWorker = true;
-      } catch {
-        // The round succeeded, but this worker cannot safely be reused.
-      }
-    }
-    return {
-      after,
-      before,
-      guardrailViolations: verdict?.guardrailViolations ?? [],
-      resolvedAgent: outcome.resolvedAgent,
-      ...(retainWorker
-        ? {
-            session: {
-              agent: launches[outcome.attempts.length]?.agent,
-              roleKey: fixerRoleKey(role),
-              worker,
-            },
-          }
-        : {}),
-      ...(outcome.attempts.length > 0
-        ? { fallbackAttempts: outcome.attempts }
-        : {}),
-    };
-  } catch (error) {
-    failure = error;
-    throw error;
-  } finally {
-    if (worktreePath) {
-      try {
-        await git.anchorRecoveryRef(
-          `${runId}-fixer-${stage}-${round}`,
-          workerHead ?? (await git.headOf(worktreePath)),
+        validatedReport = await validateFixerReport(
+          worker.report,
+          stage,
+          path.dirname(reportPath),
         );
-      } catch {
-        // Recovery anchoring must never mask the stage outcome.
+      } catch (error) {
+        failure = error;
+        if (reportRetry >= WORKER_REPORT_RETRY_LIMIT) throw error;
+        reportRetry += 1;
+        sessionToReuse = undefined;
+        retainedSession = undefined;
+        const launch =
+          retryLaunches[outcome.attempts.length] ?? retryLaunches[0];
+        if (!launch) throw error;
+        retryLaunches = [repairWorkerReportLaunch(launch)];
+        continue;
       }
-    }
-    if (!retainWorker) {
-      await releaseFixerWorker(worker, orca, stage, failure);
+      if (!worktreePath) {
+        throw new Error(`${stage} fixer did not return a worktree path`);
+      }
+      workerHead = await git.headOf(worktreePath);
+      if (before === workerHead) {
+        throw new FixerNoChangeError(validatedReport, stage);
+      }
+      const verdict = await git.assertFixerChangesAllowed(
+        worktreePath,
+        before,
+        workerHead,
+        guardrails,
+      );
+      if (verdict !== undefined && !verdict.changed) {
+        throw new FixerNoChangeError(validatedReport, stage);
+      }
+      if (fence.aborted) {
+        // The execution timeout already failed this stage; refuse late mutations
+        // so a delayed worker cannot apply commits into a settled run.
+        throw new Error(`${stage} fixer timed out; commits were not applied`);
+      }
+      const expectedWorkerHead = workerHead;
+      const after = await withGateMutation(async () => {
+        if (
+          !(await git.applyWorktreeCommits(
+            worktreePath,
+            before,
+            expectedWorkerHead,
+            fence,
+          ))
+        ) {
+          throw new Error(`${stage} fixer could not apply its committed change`);
+        }
+        fence.deadlineSatisfied = true;
+        const after = await git.head();
+        if (after !== expectedWorkerHead) {
+          throw new PostMutationCustodyError(
+            `${stage} fixer custody ended at unexpected HEAD ${after}; expected ${expectedWorkerHead}`,
+          );
+        }
+        return after;
+      });
+      const terminalHandle =
+        worker.terminalHandle ?? retainedSession?.worker.terminalHandle;
+      if (terminalHandle && worktreeId) {
+        worker.terminalHandle = terminalHandle;
+        worker.worktreeId = worktreeId;
+        worker.worktreePath = worktreePath;
+        try {
+          await orca.finishWorker(worker, "retain");
+          worker.deliveryId = undefined;
+          retainWorker = true;
+        } catch {
+          // The round succeeded, but this worker cannot safely be reused.
+        }
+      }
+      return {
+        after,
+        before,
+        guardrailViolations: verdict?.guardrailViolations ?? [],
+        resolvedAgent: outcome.resolvedAgent,
+        ...(retainWorker
+          ? {
+              session: {
+                agent: retryLaunches[outcome.attempts.length]?.agent,
+                roleKey: fixerRoleKey(role),
+                worker,
+              },
+            }
+          : {}),
+        ...(outcome.attempts.length > 0
+          ? { fallbackAttempts: outcome.attempts }
+          : {}),
+      };
+    } catch (error) {
+      failure = error;
+      throw error;
+    } finally {
+      if (worktreePath) {
+        try {
+          await git.anchorRecoveryRef(
+            `${runId}-fixer-${stage}-${round}`,
+            workerHead ?? (await git.headOf(worktreePath)),
+          );
+        } catch {
+          // Recovery anchoring must never mask the stage outcome.
+        }
+      }
+      if (!retainWorker) {
+        await releaseFixerWorker(worker, orca, stage, failure);
+      }
     }
   }
 }
@@ -12718,10 +12764,14 @@ async function runGateCoordinatorCommand(flags: RawCliFlags): Promise<void> {
       nonce: launchNonce,
       state: "failed",
     }).catch(() => undefined);
-    if (!materialized || message.includes("superseded")) {
+    const admissionSettled = !materialized || message.includes("superseded");
+    if (admissionSettled) {
       ledger.failSubmissionAdmission(
         admissionId,
         message.includes("superseded") ? "superseded" : "failed",
+      );
+      await releaseAdmissionLaunch(launchLockPath(readinessPath)).catch(
+        () => undefined,
       );
     }
     if (runId && orca) {
