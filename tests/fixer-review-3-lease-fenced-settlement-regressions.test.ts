@@ -198,7 +198,7 @@ test('force-reclaiming the branch lease during the push prevents settlement', as
         runner,
         now: () => TIME
       }),
-      /current branch lease generation|owns the branch lease|no longer owned/
+      /attempt is not from the current branch lease generation/
     )
     const settled = ctx.ledger
       .listEvidence(ctx.runId)

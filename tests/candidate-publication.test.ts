@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -439,6 +439,10 @@ test('uncertain push results succeed only when the post-read proves the candidat
         const result = await publish(context, { runner })
         assert.equal(result.outcome, 'created')
         assert.equal(remoteHead(context), context.candidate)
+        const artifact = JSON.parse(await readFile(context.artifactPath, 'utf8')) as {
+          pushExitCode: number | null
+        }
+        assert.equal(artifact.pushExitCode, mode === 'timeout' ? 124 : null)
       } finally {
         context.ledger.close()
         await rm(context.temp, { force: true, recursive: true })

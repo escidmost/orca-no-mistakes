@@ -76,7 +76,8 @@ test('retained completion rejects a stale pull request binding receipt', async (
       headCommitOid: null,
       observedAt: '2026-08-30T12:00:00.000Z',
       routeFingerprint,
-      runId
+      runId,
+      transportUrl: 'github.com/owner/repo'
     })
     const staleGeneration = ledger.acquireLease({ branch: 'feature', repoRoot: '/repo', runId })
     ledger.startAttempt({
@@ -155,7 +156,8 @@ test('retained completion rejects a stale pull request binding receipt', async (
         }
       },
       runId,
-      stageId: 'push'
+      stageId: 'push',
+      ownership: { branch: 'feature', generationToken: staleGeneration, repoRoot: '/repo' }
     }).receiptSha256
     const prFacts = {
       baseBranch: 'main',
@@ -198,7 +200,8 @@ test('retained completion rejects a stale pull request binding receipt', async (
         }
       },
       runId,
-      stageId: 'pr'
+      stageId: 'pr',
+      ownership: { branch: 'feature', generationToken: staleGeneration, repoRoot: '/repo' }
     }).receiptSha256
     const custody = { recoveryRef: `refs/no-mistakes/recover/${runId}` }
     const staleOutcome = ledger.recordAttemptOutcome({

@@ -94,7 +94,8 @@ async function createCompletion(
     headCommitOid: null,
     observedAt: '2026-08-30T12:00:01.000Z',
     routeFingerprint,
-    runId
+    runId,
+    transportUrl: 'github.com/owner/repo'
   })
   const preRead = ledger.recordRemoteObservation({
     attemptId,
@@ -148,7 +149,8 @@ async function createCompletion(
       }
     },
     runId,
-    stageId: 'push'
+    stageId: 'push',
+    ownership: { branch: 'feature', generationToken, repoRoot }
   }).receiptSha256
 
   const pullRequestIntent = ledger.recordMutationIntent({
@@ -202,7 +204,8 @@ async function createCompletion(
       }
     },
     runId,
-    stageId: 'pr'
+    stageId: 'pr',
+    ownership: { branch: 'feature', generationToken, repoRoot }
   }).receiptSha256
   const custody = { recoveryRef: `refs/no-mistakes/recover/${runId}` }
   const outcome = ledger.recordAttemptOutcome({

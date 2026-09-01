@@ -375,6 +375,7 @@ test('publication pushes through the bound transport and settles the exact candi
           .find((row) => row.stage_id === 'push' && row.round_index === 0)
         assert.equal(settled?.candidate_commit_oid, context.candidate)
         assert.equal(settled?.exit_code, 0)
+        assert.equal(settled?.artifact_sha256, sha256(artifact))
       } finally {
         context.ledger.close()
         await rm(context.temp, { force: true, recursive: true })

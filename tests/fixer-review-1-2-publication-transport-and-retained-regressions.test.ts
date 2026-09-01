@@ -52,7 +52,10 @@ type Context = {
   ledger: DomainLedger
   lintArtifactPath: string
   pushArtifactPath: string
-  publish: (runner: CommandRunner) => Promise<{ outcome: string; receiptSha256: string }>
+  publish: (
+    runner: CommandRunner,
+    destination?: string
+  ) => Promise<{ outcome: string; receiptSha256: string }>
   runId: string
   temp: string
 }
@@ -163,13 +166,13 @@ async function fixture(name: string): Promise<Context> {
     ledger,
     lintArtifactPath,
     pushArtifactPath,
-    publish: (runner: CommandRunner) =>
+    publish: (runner: CommandRunner, publishDestination = destination) =>
       publishCandidate({
         ledger,
         runId,
         attemptId,
         generationToken,
-        destination,
+        destination: publishDestination,
         resolveRepositoryIdentity,
         artifactPath: pushArtifactPath,
         workerIdentity: 'publisher',
@@ -236,8 +239,9 @@ test('publication transport accepts only canonical https and git@github.com dest
     const context = await fixture('scp-git')
     try {
       const runner = fakeRemote(context.candidate)
-      await admit(context, runner, 'git@github.com:owner/repo.git')
-      const result = await context.publish(runner)
+      const destination = 'git@github.com:owner/repo.git'
+      await admit(context, runner, destination)
+      const result = await context.publish(runner, destination)
       assert.equal(result.outcome, 'created')
       assert.equal(runner.pushes(), 1)
     } finally {
@@ -250,8 +254,9 @@ test('publication transport accepts only canonical https and git@github.com dest
     const context = await fixture('ssh-git')
     try {
       const runner = fakeRemote(context.candidate)
-      await admit(context, runner, 'ssh://git@github.com/owner/repo.git')
-      const result = await context.publish(runner)
+      const destination = 'ssh://git@github.com/owner/repo.git'
+      await admit(context, runner, destination)
+      const result = await context.publish(runner, destination)
       assert.equal(result.outcome, 'created')
     } finally {
       context.ledger.close()

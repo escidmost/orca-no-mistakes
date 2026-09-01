@@ -2737,11 +2737,14 @@ export class DomainLedger {
     observedAt: string
     routeFingerprint: string
     runId: string
-    transportUrl?: string
+    transportUrl: string
   }): void {
     const route = this.publicationRoute(input.runId)
     if (!route || route.route_fingerprint !== input.routeFingerprint) {
       throw new Error(`run ${input.runId} has no matching publication route`)
+    }
+    if (input.transportUrl.trim() === '') {
+      throw new Error(`run ${input.runId} publication baseline requires a transport URL`)
     }
     this.#db.prepare(
       `INSERT INTO publication_baselines (
@@ -2750,7 +2753,7 @@ export class DomainLedger {
     ).run(
       input.runId,
       input.routeFingerprint,
-      input.transportUrl ?? null,
+      input.transportUrl,
       input.headCommitOid,
       input.headCommitOid === null ? 1 : 0,
       input.observedAt
@@ -3167,7 +3170,7 @@ export class DomainLedger {
     }
     runId: string
     stageId: 'pr' | 'push'
-    ownership?: { branch: string; generationToken?: number; repoRoot: string }
+    ownership: { branch: string; generationToken: number; repoRoot: string }
   }): { evidenceId: string; receiptSha256: string } {
     const expectedKind: RemoteReceiptKind =
       input.stageId === 'push' ? 'candidate-publication' : 'pull-request-binding'
@@ -3210,7 +3213,7 @@ export class DomainLedger {
     const receiptJson = canonicalJson(input.receipt.payload)
     this.#db.exec('BEGIN IMMEDIATE')
     try {
-      if (input.ownership !== undefined && !this.ownsLease(input.runId, input.ownership)) {
+      if (!this.ownsLease(input.runId, input.ownership)) {
         throw new Error(`run ${input.runId} no longer owns its branch lease`)
       }
       const existingEvidence = this.#db.prepare(

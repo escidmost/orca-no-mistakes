@@ -23,6 +23,7 @@ const resolveRepositoryIdentity = async () => ({ id: 'R_base', nodeId: 'RN_base'
 
 test('settled push evidence binds the checkpoint input, not the run submission', async () => {
   const temp = await mkdtemp(path.join(tmpdir(), 'onm-push-evidence-base-'))
+  const ledger = new DomainLedger(path.join(temp, 'ledger.sqlite'))
   try {
     const repoRoot = path.join(temp, 'source')
     await mkdir(repoRoot, { recursive: true })
@@ -50,7 +51,6 @@ test('settled push evidence binds the checkpoint input, not the run submission',
       observedAt: TIME,
       repoRoot
     }
-    const ledger = new DomainLedger(path.join(temp, 'ledger.sqlite'))
     const runId = 'run-push-evidence-base'
     ledger.setRepositoryPublicationRoute(route)
     ledger.startRun({
@@ -164,8 +164,8 @@ test('settled push evidence binds the checkpoint input, not the run submission',
       .find((row) => row.stage_id === 'push' && row.round_index === 0)
     assert.equal(checkpoint?.input_commit_oid, candidate)
     assert.equal(settled?.base_commit_oid, checkpoint?.input_commit_oid)
-    ledger.close()
   } finally {
+    ledger.close()
     await rm(temp, { force: true, recursive: true })
   }
 })

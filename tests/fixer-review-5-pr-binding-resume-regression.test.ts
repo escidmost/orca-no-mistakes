@@ -70,7 +70,8 @@ test('resumed attempt refreshes pull request binding after receipt schema upgrad
       headCommitOid: null,
       observedAt: '2026-08-30T12:00:00.000Z',
       routeFingerprint,
-      runId
+      runId,
+      transportUrl: 'github.com/owner/repo'
     })
     const firstGeneration = ledger.acquireLease({ branch: 'feature', repoRoot: '/repo', runId })
     const evidenceFor = (stage: 'pr' | 'push', round?: number) => {
@@ -150,6 +151,7 @@ test('resumed attempt refreshes pull request binding after receipt schema upgrad
           routeFingerprint
         }
       },
+      ownership: { branch: 'feature', generationToken: firstGeneration, repoRoot: '/repo' },
       runId,
       stageId: 'push'
     }).receiptSha256
@@ -194,7 +196,8 @@ test('resumed attempt refreshes pull request binding after receipt schema upgrad
         }
       },
       runId,
-      stageId: 'pr'
+      stageId: 'pr',
+      ownership: { branch: 'feature', generationToken: firstGeneration, repoRoot: '/repo' }
     }).receiptSha256
     const custody = { recoveryRef: `refs/no-mistakes/recover/${runId}` }
     const failedOutcome = ledger.recordAttemptOutcome({
@@ -292,7 +295,8 @@ test('resumed attempt refreshes pull request binding after receipt schema upgrad
         }
       },
       runId,
-      stageId: 'pr'
+      stageId: 'pr',
+      ownership: { branch: 'feature', generationToken: passedGeneration, repoRoot: '/repo' }
     }).receiptSha256
     const dispositionEntries = [
       entries.find((candidateEntry) => candidateEntry.stage === 'push')!,
