@@ -24,7 +24,7 @@ const OID = '0123456789abcdef'.repeat(3)
 function fakeRemote(candidate: string): CommandRunner & { pushes(): number } {
   let head: string | null = null
   let pushes = 0
-  const runner: CommandRunner & { pushes(): number } = async (_executable, args) => {
+  return Object.assign(async (_executable: string, args: readonly string[]) => {
     if (args[0] === 'config') return { code: 1, stdout: '', stderr: '' }
     if (args[0] === 'ls-remote') {
       if (head === null) return { code: 2, stdout: '', stderr: '' }
@@ -41,9 +41,7 @@ function fakeRemote(candidate: string): CommandRunner & { pushes(): number } {
       return { code: 0, stdout: '', stderr: '' }
     }
     return { code: 127, stdout: '', stderr: 'unexpected command' }
-  }
-  runner.pushes = () => pushes
-  return runner
+  }, { pushes: () => pushes }) satisfies CommandRunner & { pushes(): number }
 }
 
 type Context = {
