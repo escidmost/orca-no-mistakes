@@ -441,12 +441,7 @@ export async function recordCoordinatorLaunch(
   lockPath: string,
   expectedNonce?: string
 ): Promise<void> {
-  if (expectedNonce === undefined) {
-    try {
-      await writeFile(path.join(lockPath, 'coordinator'), `${process.pid}`, 'utf8')
-    } catch {}
-    return
-  }
+  if (expectedNonce === undefined) return
   const recordedNonce = await readFile(path.join(lockPath, 'nonce'), 'utf8')
     .then((text) => text.trim())
     .catch(() => undefined)
