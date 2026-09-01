@@ -133,15 +133,19 @@ test('init refuses to re-route the repository gate from a linked worktree', asyn
 
 test('direct submissions from a linked worktree follow the routed gate', async () => {
   const fixture = await gateFixture('onm-direct-route-', 'Route direct submissions through one worktree.')
+  const previousOrcaCommand = process.env.ORCA_CLI_COMMAND
+  process.env.ORCA_CLI_COMMAND = path.join(fixture.temp, 'missing-orca-cli')
   try {
     const worktree = path.join(fixture.temp, 'worktree-b')
     git(fixture.repo, 'worktree', 'add', '-b', 'feature-b', worktree, 'main')
     await rejects(
-      main(['run', '--repo', worktree, '--intent', fixture.intent]),
-      /the local gate is routed to/
+      main(['run', '--attached', '--repo', worktree, '--intent', fixture.intent]),
+      (error: unknown) => error instanceof Error && !/the local gate is routed to/u.test(error.message)
     )
   } finally {
     await rm(fixture.temp, { force: true, recursive: true })
+    if (previousOrcaCommand === undefined) delete process.env.ORCA_CLI_COMMAND
+    else process.env.ORCA_CLI_COMMAND = previousOrcaCommand
   }
 })
 
