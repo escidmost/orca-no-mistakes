@@ -12392,6 +12392,27 @@ async function readStandardInput(): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
+async function spawnAdmissionCoordinator(
+  metadata: GateMetadata,
+  admissionId: string,
+  readinessPath: string,
+): Promise<void> {
+  await launchDetachedCoordinator({
+    args: [
+      "gate",
+      "coordinator",
+      "--gate",
+      metadata.gatePath,
+      "--admission-id",
+      admissionId,
+      "--readiness",
+      readinessPath,
+    ],
+    cwd: metadata.repoRoot,
+    entrypoint: path.resolve(process.argv[1] ?? fileURLToPath(import.meta.url)),
+  });
+}
+
 async function runGateAdmitCommand(flags: RawCliFlags): Promise<void> {
   const gatePath = stringFlag(flags, "gate");
   if (!gatePath) throw new Error("gate admit requires --gate");
@@ -12415,6 +12436,30 @@ async function runGateAdmitCommand(flags: RawCliFlags): Promise<void> {
       throw new Error(`submission admission ${admission.admission_id} is ${admission.status}`);
     }
     if (admission.status === "accepted" && admission.run_id) {
+      const replayReadinessPath = admissionReadinessPath(metadata, admission.admission_id);
+      const replayLaunchLock = `${replayReadinessPath}.lock`;
+      await mkdir(path.dirname(replayReadinessPath), { recursive: true });
+      let ownsReplayLaunch = false;
+      try {
+        await mkdir(replayLaunchLock);
+        ownsReplayLaunch = true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      }
+      try {
+        if (ownsReplayLaunch) {
+          await rm(replayReadinessPath, { force: true });
+          await spawnAdmissionCoordinator(metadata, admission.admission_id, replayReadinessPath);
+          const readiness = await waitForLaunchReadiness(replayReadinessPath);
+          if (readiness.runId !== admission.run_id) {
+            throw new Error("coordinator readiness did not bind the admitted run");
+          }
+        }
+      } finally {
+        if (ownsReplayLaunch) {
+          await rm(replayLaunchLock, { recursive: true, force: true });
+        }
+      }
       console.log(
         JSON.stringify({
           admissionId: admission.admission_id,
@@ -12437,20 +12482,7 @@ async function runGateAdmitCommand(flags: RawCliFlags): Promise<void> {
     try {
       if (ownsLaunch) {
         await rm(readinessPath, { force: true });
-        await launchDetachedCoordinator({
-          args: [
-            "gate",
-            "coordinator",
-            "--gate",
-            metadata.gatePath,
-            "--admission-id",
-            admission.admission_id,
-            "--readiness",
-            readinessPath,
-          ],
-          cwd: metadata.repoRoot,
-          entrypoint: path.resolve(process.argv[1] ?? fileURLToPath(import.meta.url)),
-        });
+        await spawnAdmissionCoordinator(metadata, admission.admission_id, readinessPath);
       }
       const readiness = await waitForLaunchReadiness(readinessPath);
       const current = ledger.submissionAdmission(admission.admission_id);
@@ -12491,6 +12523,26 @@ async function runGateCoordinatorCommand(flags: RawCliFlags): Promise<void> {
   try {
     const admission = ledger.submissionAdmission(admissionId);
     if (!admission) throw new Error(`unknown submission admission ${admissionId}`);
+    if (admission.status === "accepted" && admission.run_id) {
+      const custodyUpdate: ReceiveUpdate = {
+        newOid: admission.new_oid,
+        oldOid: admission.old_oid,
+        refName: admission.ref_name,
+      };
+      await writeLaunchReadiness(readinessPath, { runId: admission.run_id, state: "ready" });
+      await waitForPermanentRef(metadata, custodyUpdate, 100);
+      anchorPermanentRef(metadata, custodyUpdate, admission.run_id);
+      return;
+    }
+    const checkout = await new GitShell({
+      expectedHead: admission.new_oid,
+      repo: metadata.repoRoot,
+    }).assertReady();
+    if (`refs/heads/${checkout.branch}` !== admission.ref_name) {
+      throw new Error(
+        `the repository checkout is on ${checkout.branch} but the admission is for ${admission.ref_name}`,
+      );
+    }
     orca = new CliOrca({ cwd: metadata.repoRoot, runId: admission.run_id ?? undefined });
     runId = admission.run_id ?? (await orca.createRun(`no-mistakes: ${admission.intent}`));
     ledger.bindSubmissionAdmission(admissionId, runId);
@@ -12734,9 +12786,6 @@ Run options:
         resumeStartOid,
         admissionRow?.admission_id,
       );
-      if (admissionRow?.source === "direct" && admissionLedger) {
-        admissionLedger.markSubmissionLaunched(admissionRow.admission_id);
-      }
       console.log(JSON.stringify({ detached: true, terminalHandle }));
     } catch (error) {
       if (admissionRow && admissionLedger) {
