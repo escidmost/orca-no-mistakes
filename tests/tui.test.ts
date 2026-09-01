@@ -317,6 +317,19 @@ if (process.env.TUI_FIXTURE === "1") {
 
     renderer.render({
       ...resumable,
+      attempt: 3,
+      currentStage: "test",
+      error: undefined,
+      status: "in-progress",
+      transition: { attempt: 3, kind: "attempt-started" },
+    });
+    assert.match(screen(), /RECENT ACTIVITY/u);
+    assert.match(screen(), /Test LOG/u);
+    input.emit("data", "R");
+    assert.equal(requested, 1);
+
+    renderer.render({
+      ...resumable,
       currentStage: "test",
       error: { resumable: false },
       status: "failed",

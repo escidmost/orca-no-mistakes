@@ -3082,18 +3082,25 @@ export async function runPipeline(
 
       await waitForResume();
       const resumeHead = await git.head();
-      const resumeClaim = ledger.prepareResume({
-        baseBranch: deliveryRepo.base,
-        baseRefSha: effectiveProvenance.baseRefSha,
-        branch: deliveryRepo.branch,
-        effectivePolicyHash: effectiveProvenance.effectivePolicyHash,
-        force: options.forceLease === true,
-        head: resumeHead,
-        intent,
-        policySha256: policySha256Value,
-        repoRoot: deliveryRepo.root,
-        runId,
-      });
+      let resumeClaim: ReturnType<DomainLedger["prepareResume"]>;
+      try {
+        resumeClaim = ledger.prepareResume({
+          baseBranch: deliveryRepo.base,
+          baseRefSha: effectiveProvenance.baseRefSha,
+          branch: deliveryRepo.branch,
+          effectivePolicyHash: effectiveProvenance.effectivePolicyHash,
+          force: options.forceLease === true,
+          head: resumeHead,
+          intent,
+          policySha256: policySha256Value,
+          repoRoot: deliveryRepo.root,
+          runId,
+        });
+      } catch (resumeError) {
+        const message =
+          resumeError instanceof Error ? resumeError.message : String(resumeError);
+        throw new Error(`resume rejected: ${message}`, { cause: failure });
+      }
       resumeClaimId = resumeClaim.claimId;
       generationToken = resumeClaim.generationToken;
       const resumed = ledger.resumeRun({
