@@ -745,17 +745,19 @@ export class RailTuiRenderer implements PresentationRenderer {
     if (!this.#setAutoFix || !this.#snapshot || this.#modeSubmitting) return;
     this.#modeSubmitting = true;
     const enabled = !this.#snapshot.mode.autoFix;
-    void Promise.resolve(this.#setAutoFix(enabled)).then(
-      () => {
-        this.#modeSubmitting = false;
-        this.#draw();
-      },
-      (error) => {
-        this.#modeSubmitting = false;
-        this.#activities.push({ label: `Auto-fix unchanged: ${String(error)}` });
-        this.#draw();
-      },
-    );
+    void Promise.resolve()
+      .then(() => this.#setAutoFix!(enabled))
+      .then(
+        () => {
+          this.#modeSubmitting = false;
+          this.#draw();
+        },
+        (error) => {
+          this.#modeSubmitting = false;
+          this.#activities.push({ label: `Auto-fix unchanged: ${String(error)}` });
+          this.#draw();
+        },
+      );
   }
 
   #returnToRail(): void {

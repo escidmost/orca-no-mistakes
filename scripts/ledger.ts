@@ -2290,6 +2290,24 @@ export class DomainLedger {
           ).run(repoRoot)
           return
         }
+        if (table === 'auto_fix_mode_events') {
+          this.#db.prepare(
+            `INSERT INTO main.auto_fix_mode_events (run_id, enabled, source, changed_at)
+             SELECT source.run_id, source.enabled, source.source, source.changed_at
+             FROM legacy.auto_fix_mode_events AS source
+             WHERE source.run_id IN (
+               SELECT run_id FROM legacy.runs WHERE repo_root = ?
+             ) AND NOT EXISTS (
+               SELECT 1 FROM main.auto_fix_mode_events AS destination
+               WHERE destination.run_id = source.run_id
+                 AND destination.enabled = source.enabled
+                 AND destination.source = source.source
+                 AND destination.changed_at = source.changed_at
+             )
+             ORDER BY source.id`
+          ).run(repoRoot)
+          return
+        }
         const destinationColumns = new Set(
           (this.#db.prepare(`PRAGMA main.table_info(${table})`).all() as { name: string }[])
             .map(({ name }) => name)
@@ -2352,6 +2370,7 @@ export class DomainLedger {
         'stage_checkpoints',
         'stage_evidence',
         'gate_audit',
+        'auto_fix_mode_events',
         'presentation_snapshots',
         'passed_attestations'
       ]) {
@@ -4509,14 +4528,36 @@ export class DomainLedger {
   recordAutoFixMode(
     runId: string,
     enabled: boolean,
-    source: AutoFixModeEvent['source']
-  ): void {
-    this.#db
-      .prepare(
-        `INSERT INTO auto_fix_mode_events (run_id, enabled, source, changed_at)
-         VALUES (?, ?, ?, ?)`
+    source: AutoFixModeEvent['source'],
+    presentation?: { eventKey: string; snapshot: PresentationSnapshot }
+  ): boolean {
+    const insert = this.#db.prepare(
+      `INSERT INTO auto_fix_mode_events (run_id, enabled, source, changed_at)
+       VALUES (?, ?, ?, ?)`
+    )
+    const values = [runId, enabled ? 1 : 0, source, new Date().toISOString()] as const
+    if (!presentation) {
+      insert.run(...values)
+      return true
+    }
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      insert.run(...values)
+      const recorded = this.recordPresentationSnapshot(
+        runId,
+        presentation.eventKey,
+        presentation.snapshot
       )
-      .run(runId, enabled ? 1 : 0, source, new Date().toISOString())
+      if (!recorded) {
+        this.#db.exec('ROLLBACK')
+        return false
+      }
+      this.#db.exec('COMMIT')
+      return true
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
   }
 
   latestAutoFixMode(runId: string): boolean | undefined {

@@ -1838,12 +1838,16 @@ export async function runPipeline(
         orca.resolveGate?.bind(orca),
         (enabled) => {
           if (enabled === autoFixMode) return;
-          ledger.recordAutoFixMode(runId, enabled, "operator");
-          autoFixMode = enabled;
-          presentation.publish(
-            `mode:${ledger.listAutoFixModeEvents(runId).length}:${enabled ? "on" : "off"}`,
-            { enabled, kind: "mode-changed" },
-          );
+          const eventKey = `mode:${ledger.listAutoFixModeEvents(runId).length + 1}:${enabled ? "on" : "off"}`;
+          let committed = false;
+          presentation.publish(eventKey, { enabled, kind: "mode-changed" }, (snapshot) => {
+            committed = ledger.recordAutoFixMode(runId, enabled, "operator", {
+              eventKey,
+              snapshot,
+            });
+            return committed;
+          });
+          if (committed) autoFixMode = enabled;
         },
       ) ??
         (options.plainStatus
@@ -2213,23 +2217,25 @@ export async function runPipeline(
         effectivePolicyHash: effectiveProvenance.effectivePolicyHash,
         baseRefSha: effectiveProvenance.baseRefSha,
       });
-      presentation.publish(`findings:${entry.evidenceSha256}`, {
-        actionable: actionableFindings(report).length,
-        findings: actionableFindings(report).map(
-          ({ description, file, id, line, severity }) => ({
-            description,
-            ...(file ? { file } : {}),
-            id,
-            ...(line ? { line } : {}),
-            severity,
-          }),
-        ),
-        kind: "findings-recorded",
-        retainedFixer: fixerSession !== undefined,
-        round,
-        stage,
-        total: report.findings.length,
-      });
+      if (isAuthoritativeStageEvidence(workerIdentity)) {
+        presentation.publish(`findings:${entry.evidenceSha256}`, {
+          actionable: actionableFindings(report).length,
+          findings: actionableFindings(report).map(
+            ({ description, file, id, line, severity }) => ({
+              description,
+              ...(file ? { file } : {}),
+              id,
+              ...(line ? { line } : {}),
+              severity,
+            }),
+          ),
+          kind: "findings-recorded",
+          retainedFixer: fixerSession !== undefined,
+          round,
+          stage,
+          total: report.findings.length,
+        });
+      }
       stageEntries.push(entry);
       latestEntryByStage.set(stage, entry);
       return autoFixModeAtFindings;

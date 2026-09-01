@@ -145,11 +145,16 @@ function updateFindings(
   previous: readonly PresentationFinding[],
   current: readonly Omit<PresentationFinding, "disposition">[],
 ): PresentationFinding[] {
-  const currentById = new Map(current.map((finding) => [finding.id, finding]));
+  const pending = new Map<string, Omit<PresentationFinding, "disposition">[]>();
+  for (const finding of current) {
+    const queue = pending.get(finding.id);
+    if (queue) queue.push(finding);
+    else pending.set(finding.id, [finding]);
+  }
   const next = previous.map((finding) => {
-    const reported = currentById.get(finding.id);
+    const reported = pending.get(finding.id)?.shift();
     if (reported) {
-      currentById.delete(finding.id);
+      if (pending.get(finding.id)?.length === 0) pending.delete(finding.id);
       return { ...reported, disposition: "open" as const };
     }
     return finding.disposition === "open"
@@ -158,7 +163,7 @@ function updateFindings(
   });
   return [
     ...next,
-    ...[...currentById.values()].map((finding) => ({
+    ...[...pending.values()].flat().map((finding) => ({
       ...finding,
       disposition: "open" as const,
     })),
