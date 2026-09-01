@@ -218,6 +218,7 @@ export type SubmissionAdmissionRow = {
   intent: string
   intent_hash: string
   launched_at: string | null
+  launcher_pid: number | null
   lease_token: string
   new_oid: string
   old_oid: string
@@ -2166,7 +2167,8 @@ export class DomainLedger {
       ['gate_audit', 'selected_finding_ids TEXT'],
       ['gate_audit', 'evidence_sha256 TEXT'],
       ['repository_publication_routes', 'actor_node_id TEXT'],
-      ['publication_baselines', 'transport_url TEXT']
+      ['publication_baselines', 'transport_url TEXT'],
+      ['submission_admissions', 'launcher_pid INTEGER']
     ]) {
       try {
         this.#db.exec(`ALTER TABLE ${table} ADD COLUMN ${column}`)
@@ -2237,8 +2239,14 @@ export class DomainLedger {
         source.exec('PRAGMA foreign_keys = ON')
         source.exec('BEGIN IMMEDIATE')
         cleanupTransaction = true
+        const deleteAdmissions = source.prepare(
+          'DELETE FROM submission_admissions WHERE run_id = ?'
+        )
         const deleteRun = source.prepare('DELETE FROM runs WHERE repo_root = ? AND run_id = ?')
-        for (const runId of runIds) deleteRun.run(repoRoot, runId)
+        for (const runId of runIds) {
+          deleteAdmissions.run(runId)
+          deleteRun.run(repoRoot, runId)
+        }
         source.exec('COMMIT')
         cleanupTransaction = false
       } catch (error) {
@@ -2596,7 +2604,7 @@ export class DomainLedger {
       .prepare(
         `SELECT admission_id, gate_identity, repo_root, ref_name, old_oid, new_oid,
                 intent, intent_hash, source, status, lease_token, run_id,
-                created_at, launched_at, accepted_oid, accepted_at
+                created_at, launched_at, launcher_pid, accepted_oid, accepted_at
          FROM submission_admissions WHERE admission_id = ?`
       )
       .get(admissionId) as SubmissionAdmissionRow | undefined
@@ -2614,7 +2622,7 @@ export class DomainLedger {
         .prepare(
           `SELECT admission_id, gate_identity, repo_root, ref_name, old_oid, new_oid,
                   intent, intent_hash, source, status, lease_token, run_id,
-                  created_at, launched_at, accepted_oid, accepted_at
+                  created_at, launched_at, launcher_pid, accepted_oid, accepted_at
            FROM submission_admissions
            WHERE admission_id = ?`
         )
@@ -2712,7 +2720,7 @@ export class DomainLedger {
     }
   }
 
-  markSubmissionLaunched(admissionId: string): SubmissionAdmissionRow {
+  markSubmissionLaunched(admissionId: string, launcherPid?: number): SubmissionAdmissionRow {
     this.#db.exec('BEGIN IMMEDIATE')
     try {
       const row = this.submissionAdmission(admissionId)
@@ -2721,15 +2729,62 @@ export class DomainLedger {
         this.#db
           .prepare(
             `UPDATE submission_admissions
-             SET status = 'launched', launched_at = COALESCE(launched_at, ?)
+             SET status = 'launched', launched_at = COALESCE(launched_at, ?),
+                 launcher_pid = COALESCE(?, launcher_pid)
              WHERE admission_id = ?`
           )
-          .run(new Date().toISOString(), admissionId)
+          .run(new Date().toISOString(), launcherPid ?? null, admissionId)
         if (row.source === 'direct') {
           this.#db
             .prepare('DELETE FROM pending_admission_leases WHERE admission_id = ?')
             .run(admissionId)
         }
+      }
+      this.#db.exec('COMMIT')
+      return this.submissionAdmission(admissionId)!
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  reclaimSubmissionAdmission(admissionId: string): SubmissionAdmissionRow | undefined {
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      const row = this.submissionAdmission(admissionId)
+      if (
+        !row ||
+        row.status === 'accepted' ||
+        row.status === 'failed' ||
+        row.status === 'superseded'
+      ) {
+        this.#db.exec('COMMIT')
+        return row
+      }
+      this.#db
+        .prepare(
+          `UPDATE submission_admissions
+           SET status = 'pending', run_id = NULL, launcher_pid = NULL, launched_at = NULL
+           WHERE admission_id = ?`
+        )
+        .run(admissionId)
+      const lease = this.#db
+        .prepare(
+          'SELECT admission_id FROM pending_admission_leases WHERE repo_root = ? AND ref_name = ?'
+        )
+        .get(row.repo_root, row.ref_name) as { admission_id: string } | undefined
+      if (!lease) {
+        this.#db
+          .prepare(
+            `INSERT INTO pending_admission_leases
+               (repo_root, ref_name, admission_id, acquired_at)
+             VALUES (?, ?, ?, ?)`
+          )
+          .run(row.repo_root, row.ref_name, admissionId, new Date().toISOString())
+      } else if (lease.admission_id !== admissionId) {
+        this.#db
+          .prepare(`UPDATE submission_admissions SET status = 'superseded' WHERE admission_id = ?`)
+          .run(admissionId)
       }
       this.#db.exec('COMMIT')
       return this.submissionAdmission(admissionId)!
@@ -4781,10 +4836,24 @@ export class DomainLedger {
     try {
       // One statement per id rather than an IN list: a long-lived ledger can
       // hold more completed runs than SQLite allows host parameters.
+      const removable = this.#db.prepare(
+        "SELECT 1 FROM runs WHERE run_id = ? AND status <> 'in-progress' AND run_id NOT IN (SELECT run_id FROM branch_leases)"
+      )
+      // Accepted admissions retain their run binding indefinitely, so the
+      // runs.delete would trip the run foreign key. The admission follows its
+      // run: without it the ledger would keep replay rows that can never
+      // resolve to the evidence an operator just asked to remove.
+      const removeAdmissions = this.#db.prepare(
+        'DELETE FROM submission_admissions WHERE run_id = ?'
+      )
       const remove = this.#db.prepare(
         "DELETE FROM runs WHERE run_id = ? AND status <> 'in-progress' AND run_id NOT IN (SELECT run_id FROM branch_leases)"
       )
-      for (const runId of runIds) pruned += Number(remove.run(runId).changes)
+      for (const runId of runIds) {
+        if (removable.get(runId) === undefined) continue
+        removeAdmissions.run(runId)
+        pruned += Number(remove.run(runId).changes)
+      }
       this.#db.exec('COMMIT')
       return pruned
     } catch (error) {

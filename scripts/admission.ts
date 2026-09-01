@@ -447,6 +447,31 @@ export async function recordCoordinatorLaunch(
     } catch {}
     return
   }
+  const recordedNonce = await readFile(path.join(lockPath, 'nonce'), 'utf8')
+    .then((text) => text.trim())
+    .catch(() => undefined)
+  if (recordedNonce !== expectedNonce) {
+    throw new Error('the admission launch generation changed before the coordinator started')
+  }
+  const fencePath = path.join(lockPath, 'coordinator-generation')
+  try {
+    const fence = await open(fencePath, 'wx')
+    try {
+      await fence.writeFile(expectedNonce, 'utf8')
+    } finally {
+      await fence.close()
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+    const fenced = await readFile(fencePath, 'utf8')
+      .then((text) => text.trim())
+      .catch(() => undefined)
+    // The lock nonce was just validated as ours, so a foreign fence can only
+    // be a leftover from a coordinator whose generation was reclaimed.
+    if (fenced !== expectedNonce) {
+      await writeFile(fencePath, expectedNonce, 'utf8')
+    }
+  }
   await writeFile(path.join(lockPath, 'coordinator'), `${process.pid}`, 'utf8')
   const claim = await readAdmissionLaunchClaim(lockPath)
   if (claim.nonce !== expectedNonce || claim.coordinatorPid !== process.pid) {
@@ -466,7 +491,11 @@ export async function readAdmissionLaunchClaim(
   }
   const nonce = await readValue('nonce')
   const ownerPid = await readValue('owner')
-  const coordinatorPid = await readValue('coordinator')
+  let coordinatorPid = await readValue('coordinator')
+  if (nonce !== undefined && coordinatorPid !== undefined) {
+    const fenced = await readValue('coordinator-generation')
+    if (fenced !== undefined && fenced !== nonce) coordinatorPid = undefined
+  }
   return {
     coordinatorPid: coordinatorPid === undefined ? undefined : Number(coordinatorPid),
     nonce,
