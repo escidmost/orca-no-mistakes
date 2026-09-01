@@ -196,7 +196,8 @@ export function sanitizeCoordinatorEnvironment(
     'USER',
     'XDG_CONFIG_HOME',
     'ORCA_CLI_COMMAND',
-    'ORCA_NO_MISTAKES_HOME'
+    'ORCA_NO_MISTAKES_HOME',
+    'ORCA_NO_MISTAKES_USER_CONFIG'
   ])
   const environment: NodeJS.ProcessEnv = {}
   for (const key of allowed) {
