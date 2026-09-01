@@ -86,17 +86,20 @@ import { createRunRenderer } from "./tui.ts";
 import {
   admissionReadinessPath,
   anchorPermanentRef,
+  awaitAdmissionLaunch,
   beginGateAdmission,
   decodeIntentPushOption,
   deriveAdmissionId,
+  ensureCustodyLaunch,
   initializeLocalGate,
   launchDetachedCoordinator,
+  launchLockPath,
   parseReceiveUpdates,
   readGateMetadata,
+  recordCoordinatorLaunch,
   repositoryGatePaths,
   validateQuarantinedCommit,
   validateReceiveUpdate,
-  waitForLaunchReadiness,
   waitForPermanentRef,
   writeLaunchReadiness,
   type GateMetadata,
@@ -9302,7 +9305,7 @@ const VALUE_FLAGS = new Set([
 ]);
 const COMMAND_FLAGS: Record<string, Set<string>> = {
   attestation: new Set(["out", "repo"]),
-  gate: new Set(["admission-id", "gate", "readiness", "run-id"]),
+  gate: new Set(["admission-id", "gate", "launch-nonce", "readiness", "run-id"]),
   init: new Set(["repo"]),
   prune: new Set(["before", "repo", "stranded"]),
   run: new Set([
@@ -12711,6 +12714,7 @@ async function spawnAdmissionCoordinator(
   metadata: GateMetadata,
   admissionId: string,
   readinessPath: string,
+  launchNonce: string,
 ): Promise<void> {
   await launchDetachedCoordinator({
     args: [
@@ -12722,6 +12726,8 @@ async function spawnAdmissionCoordinator(
       admissionId,
       "--readiness",
       readinessPath,
+      "--launch-nonce",
+      launchNonce,
     ],
     cwd: metadata.repoRoot,
     entrypoint: path.resolve(process.argv[1] ?? fileURLToPath(import.meta.url)),
@@ -12787,28 +12793,21 @@ async function runGateAdmitCommand(flags: RawCliFlags): Promise<void> {
     }
     if (admission.status === "accepted" && admission.run_id) {
       const replayReadinessPath = admissionReadinessPath(metadata, admission.admission_id);
-      const replayLaunchLock = `${replayReadinessPath}.lock`;
       await mkdir(path.dirname(replayReadinessPath), { recursive: true });
-      let ownsReplayLaunch = false;
+      const custodyLaunch = await ensureCustodyLaunch(replayReadinessPath, (nonce) =>
+        spawnAdmissionCoordinator(
+          metadata,
+          admission.admission_id,
+          replayReadinessPath,
+          nonce,
+        ),
+      );
       try {
-        await mkdir(replayLaunchLock);
-        ownsReplayLaunch = true;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      }
-      try {
-        if (ownsReplayLaunch) {
-          await rm(replayReadinessPath, { force: true });
-          await spawnAdmissionCoordinator(metadata, admission.admission_id, replayReadinessPath);
-          const readiness = await waitForLaunchReadiness(replayReadinessPath);
-          if (readiness.runId !== admission.run_id) {
-            throw new Error("coordinator readiness did not bind the admitted run");
-          }
+        if (custodyLaunch && custodyLaunch.readiness.runId !== admission.run_id) {
+          throw new Error("coordinator readiness did not bind the admitted run");
         }
       } finally {
-        if (ownsReplayLaunch) {
-          await rm(replayLaunchLock, { recursive: true, force: true });
-        }
+        await custodyLaunch?.releaseLaunch();
       }
       console.log(
         JSON.stringify({
@@ -12820,21 +12819,12 @@ async function runGateAdmitCommand(flags: RawCliFlags): Promise<void> {
       return;
     }
     const readinessPath = admissionReadinessPath(metadata, admission.admission_id);
-    const launchLock = `${readinessPath}.lock`;
-    let ownsLaunch = false;
     await mkdir(path.dirname(readinessPath), { recursive: true });
+    const launch = await awaitAdmissionLaunch(readinessPath, (nonce) =>
+      spawnAdmissionCoordinator(metadata, admission.admission_id, readinessPath, nonce),
+    );
     try {
-      await mkdir(launchLock);
-      ownsLaunch = true;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    }
-    try {
-      if (ownsLaunch) {
-        await rm(readinessPath, { force: true });
-        await spawnAdmissionCoordinator(metadata, admission.admission_id, readinessPath);
-      }
-      const readiness = await waitForLaunchReadiness(readinessPath);
+      const readiness = launch.readiness;
       const current = ledger.submissionAdmission(admission.admission_id);
       if (current?.run_id && readiness.runId !== current.run_id) {
         throw new Error("coordinator readiness did not bind the admitted run");
@@ -12847,7 +12837,7 @@ async function runGateAdmitCommand(flags: RawCliFlags): Promise<void> {
         }),
       );
     } finally {
-      if (ownsLaunch) await rm(launchLock, { recursive: true, force: true });
+      await launch.releaseLaunch?.();
     }
   } finally {
     ledger.close();
@@ -12866,6 +12856,8 @@ async function runGateCoordinatorCommand(flags: RawCliFlags): Promise<void> {
   if (path.resolve(requestedReadiness) !== path.resolve(readinessPath)) {
     throw new Error("coordinator readiness path does not match the admission");
   }
+  const launchNonce = stringFlag(flags, "launch-nonce");
+  await recordCoordinatorLaunch(launchLockPath(readinessPath));
   const ledger = openRepositoryLedger(metadata.repoRoot, false);
   let runId: string | undefined;
   let orca: CliOrca | undefined;
@@ -12878,7 +12870,11 @@ async function runGateCoordinatorCommand(flags: RawCliFlags): Promise<void> {
         oldOid: admission.old_oid,
         refName: admission.ref_name,
       };
-      await writeLaunchReadiness(readinessPath, { runId: admission.run_id, state: "ready" });
+      await writeLaunchReadiness(readinessPath, {
+        nonce: launchNonce,
+        runId: admission.run_id,
+        state: "ready",
+      });
       await waitForPermanentRef(metadata, custodyUpdate, 100);
       anchorPermanentRef(metadata, custodyUpdate, admission.run_id);
       return;
@@ -12886,7 +12882,7 @@ async function runGateCoordinatorCommand(flags: RawCliFlags): Promise<void> {
     await assertAdmittedCheckout(metadata, admission);
     orca = new CliOrca({ cwd: metadata.repoRoot, runId: admission.run_id ?? undefined });
     runId = admission.run_id ?? (await orca.createRun(`no-mistakes: ${admission.intent}`));
-    await writeLaunchReadiness(readinessPath, { runId, state: "ready" });
+    await writeLaunchReadiness(readinessPath, { nonce: launchNonce, runId, state: "ready" });
     const update: ReceiveUpdate = {
       newOid: admission.new_oid,
       oldOid: admission.old_oid,
@@ -12898,6 +12894,7 @@ async function runGateCoordinatorCommand(flags: RawCliFlags): Promise<void> {
   } catch (error) {
     await writeLaunchReadiness(readinessPath, {
       error: error instanceof Error ? error.message : String(error),
+      nonce: launchNonce,
       state: "failed",
     }).catch(() => undefined);
     ledger.failSubmissionAdmission(
