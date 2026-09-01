@@ -203,7 +203,8 @@ test('candidate publication outcome matches the authoritative baseline', () => {
       headCommitOid: null,
       observedAt: '2026-08-30T12:00:01.000Z',
       routeFingerprint,
-      runId
+      runId,
+      transportUrl: 'github.com/owner/repo'
     })
     const generationToken = ledger.acquireLease({ branch: 'feature', repoRoot: '/repo', runId })
     ledger.startAttempt({
@@ -285,7 +286,8 @@ test('candidate publication outcome matches the authoritative baseline', () => {
         }
       },
       runId,
-      stageId: 'push' as const
+      stageId: 'push' as const,
+      ownership: { branch: 'feature', generationToken, repoRoot: '/repo' }
     }
     assert.throws(
       () => ledger.settleRemoteStage(settlement),

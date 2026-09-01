@@ -146,7 +146,8 @@ async function completionFixture(startNewerAttempt: boolean) {
     headCommitOid: null,
     observedAt: '2026-08-30T12:00:00.000Z',
     routeFingerprint,
-    runId
+    runId,
+    transportUrl: 'github.com/owner/repo'
   })
   ledger.startAttempt({
     actorIdentity: 'operator',
@@ -224,7 +225,8 @@ async function completionFixture(startNewerAttempt: boolean) {
       }
     },
     runId,
-    stageId: 'push'
+    stageId: 'push',
+    ownership: { branch: 'feature', generationToken: publicationGeneration, repoRoot: '/repo' }
   }).receiptSha256
   const failedOutcome = ledger.recordAttemptOutcome({
     actorIdentity: 'operator',
@@ -301,7 +303,8 @@ async function completionFixture(startNewerAttempt: boolean) {
       }
     },
     runId,
-    stageId: 'pr'
+    stageId: 'pr',
+    ownership: { branch: 'feature', generationToken: completionGeneration, repoRoot: '/repo' }
   }).receiptSha256
   const custody = { recoveryRef: `refs/no-mistakes/recover/${runId}` }
   const passedOutcome = ledger.recordAttemptOutcome({

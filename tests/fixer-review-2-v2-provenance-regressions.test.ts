@@ -113,7 +113,8 @@ async function completionFixture(options: { exerciseRemoteRejections?: boolean; 
     headCommitOid: null,
     observedAt: '2026-08-30T12:00:00.000Z',
     routeFingerprint,
-    runId
+    runId,
+    transportUrl: 'github.com/owner/repo'
   })
   if (options.exerciseRemoteRejections) {
     const unboundPostRead = ledger.recordRemoteObservation({
@@ -145,6 +146,7 @@ async function completionFixture(options: { exerciseRemoteRejections?: boolean; 
           routeFingerprint
         }
       },
+      ownership: { branch: 'feature', generationToken, repoRoot: '/repo' },
       runId,
       stageId: 'push'
     }), /does not match/)
@@ -201,6 +203,7 @@ async function completionFixture(options: { exerciseRemoteRejections?: boolean; 
           routeFingerprint
         }
       },
+      ownership: { branch: 'feature', generationToken, repoRoot: '/repo' },
       runId,
       stageId: 'push'
     }), /does not match/)
@@ -234,6 +237,7 @@ async function completionFixture(options: { exerciseRemoteRejections?: boolean; 
         routeFingerprint
       }
     },
+    ownership: { branch: 'feature', generationToken, repoRoot: '/repo' },
     runId,
     stageId: 'push'
   }).receiptSha256
@@ -300,6 +304,7 @@ async function completionFixture(options: { exerciseRemoteRejections?: boolean; 
         routeFingerprint
       }
     },
+    ownership: { branch: 'feature', generationToken, repoRoot: '/repo' },
     runId,
     stageId: 'pr'
   }).receiptSha256

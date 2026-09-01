@@ -81,7 +81,8 @@ function completionFacts(
     headCommitOid: null,
     observedAt: '2026-08-30T12:00:01.000Z',
     routeFingerprint,
-    runId
+    runId,
+    transportUrl: 'github.com/owner/repo'
   })
   const attemptId = `${runId}-attempt`
   ledger.startAttempt({
@@ -157,7 +158,8 @@ function completionFacts(
       }
     },
     runId,
-    stageId: 'push'
+    stageId: 'push',
+    ownership: { branch: 'feature', generationToken, repoRoot: '/repo' }
   } as const
   assert.throws(
     () => ledger.settleRemoteStage(pushSettlement),
@@ -238,7 +240,8 @@ function completionFacts(
       }
     },
     runId,
-    stageId: 'pr'
+    stageId: 'pr',
+    ownership: { branch: 'feature', generationToken, repoRoot: '/repo' }
   }).receiptSha256
   const custody = { recoveryRef: `refs/no-mistakes/recover/${runId}` }
   const outcome = ledger.recordAttemptOutcome({

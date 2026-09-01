@@ -163,7 +163,8 @@ test('v2 completion attestations bind Release 2 facts without overstating assura
       headCommitOid: null,
       observedAt: '2026-08-30T12:00:03.000Z',
       routeFingerprint,
-      runId
+      runId,
+      transportUrl: 'github.com/owner/repo'
     })
     const preRead = ledger.recordRemoteObservation({
       attemptId: 'passed-attempt',
@@ -230,7 +231,8 @@ test('v2 completion attestations bind Release 2 facts without overstating assura
         }
       },
       runId,
-      stageId: 'push'
+      stageId: 'push',
+      ownership: { branch: 'feature', generationToken: passedGeneration, repoRoot: '/repo' }
     }).receiptSha256
 
     const prEvidence = stageEvidence.find((entry) => entry.stage === 'pr')!
@@ -297,7 +299,8 @@ test('v2 completion attestations bind Release 2 facts without overstating assura
         }
       },
       runId,
-      stageId: 'pr'
+      stageId: 'pr',
+      ownership: { branch: 'feature', generationToken: passedGeneration, repoRoot: '/repo' }
     }).receiptSha256
     const passedOutcome = ledger.recordAttemptOutcome({
       actorIdentity: 'operator',

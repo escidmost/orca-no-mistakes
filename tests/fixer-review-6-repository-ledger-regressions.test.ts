@@ -89,7 +89,8 @@ test('attempt facts and receipt settlement require the current lease generation'
       headCommitOid: null,
       observedAt: '2026-08-31T12:00:00.000Z',
       routeFingerprint,
-      runId
+      runId,
+      transportUrl: 'github.com/owner/repo'
     })
     assert.throws(() => ledger.startAttempt({
       actorIdentity: 'operator',
@@ -235,9 +236,10 @@ test('attempt facts and receipt settlement require the current lease generation'
           routeFingerprint
         }
       },
+      ownership: { branch: 'feature', generationToken: firstGeneration, repoRoot: '/repo' },
       runId,
       stageId: 'push'
-    }), /current branch lease generation/)
+    }), /no longer owns its branch lease/)
 
     ledger.startAttempt({
       actorIdentity: 'operator',

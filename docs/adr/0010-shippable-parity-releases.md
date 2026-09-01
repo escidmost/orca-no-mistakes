@@ -27,6 +27,10 @@ Release 2 still owns `--force-with-lease` candidate publication and pull-request
 
 The local v1.3 evidence manifest emitted at the end of Release 1, historically called a "Passed Attestation" by the current implementation, predates and does not satisfy the version 2 pipeline completion-attestation schema. It binds the recorded stage history and terminal candidate after every required *local* validation stage reaches an accepted terminal disposition; it does not prove that every stage ran against one unchanged candidate or prove delivery. Full "Passed" — including remote delivery, PR, and CI proof — remains reserved for Release 4.
 
+## Amendment 2026-09-01
+
+A focused, non-default publication API (`scripts/publication.ts`) pulled forward item 2's exact-head `--force-with-lease` publication primitive: it admits a custom plan whose final stage is `push` and enforces mandatory stable repository identity, transport-rewrite fencing, retained-evidence verification, authoritative post-read reconciliation, and durable receipts. It runs outside the default coordinator DAG, so the default six-stage plan remains local-only. Release 2 still owns automatic publication orchestration and pull-request creation.
+
 ## Consequences
 
 Before a release is marked complete, an automated end-to-end scenario must exercise its claimed Git, Orca, gate, failure, and recovery behavior. For what is implemented today, see [`docs/current-architecture.md`](../current-architecture.md).

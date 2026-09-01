@@ -186,7 +186,8 @@ test('Release 2 ledger facts are immutable, append-only, and atomically checkpoi
       headCommitOid: null,
       observedAt: timestamp,
       routeFingerprint,
-      runId
+      runId,
+      transportUrl: 'github.com/fork-owner/repo'
     })
 
     const generationToken = ledger.acquireLease({ branch: 'feature', repoRoot: '/repo', runId })
@@ -325,7 +326,8 @@ test('Release 2 ledger facts are immutable, append-only, and atomically checkpoi
         }
       },
       runId,
-      stageId: 'push' as const
+      stageId: 'push' as const,
+      ownership: { branch: 'feature', generationToken, repoRoot: '/repo' }
     }
     assert.throws(() => ledger.settleRemoteStage(settlement), /forced checkpoint failure/)
     assert.equal(ledger.remoteReceipt(runId, 'candidate-publication'), undefined)

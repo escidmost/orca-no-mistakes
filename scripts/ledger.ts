@@ -1584,6 +1584,7 @@ CREATE TABLE IF NOT EXISTS publication_routes (
 CREATE TABLE IF NOT EXISTS publication_baselines (
   run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE CASCADE,
   route_fingerprint TEXT NOT NULL,
+  transport_url TEXT,
   head_commit_oid TEXT,
   authoritative_absence INTEGER NOT NULL CHECK(authoritative_absence IN (0, 1)),
   observed_at TEXT NOT NULL,
@@ -2080,7 +2081,8 @@ export class DomainLedger {
       ['stage_evidence', 'findings_json TEXT'],
       ['gate_audit', 'selected_finding_ids TEXT'],
       ['gate_audit', 'evidence_sha256 TEXT'],
-      ['repository_publication_routes', 'actor_node_id TEXT']
+      ['repository_publication_routes', 'actor_node_id TEXT'],
+      ['publication_baselines', 'transport_url TEXT']
     ]) {
       try {
         this.#db.exec(`ALTER TABLE ${table} ADD COLUMN ${column}`)
@@ -2735,18 +2737,23 @@ export class DomainLedger {
     observedAt: string
     routeFingerprint: string
     runId: string
+    transportUrl: string
   }): void {
     const route = this.publicationRoute(input.runId)
     if (!route || route.route_fingerprint !== input.routeFingerprint) {
       throw new Error(`run ${input.runId} has no matching publication route`)
     }
+    if (input.transportUrl.trim() === '') {
+      throw new Error(`run ${input.runId} publication baseline requires a transport URL`)
+    }
     this.#db.prepare(
       `INSERT INTO publication_baselines (
-         run_id, route_fingerprint, head_commit_oid, authoritative_absence, observed_at
-       ) VALUES (?, ?, ?, ?, ?)`
+         run_id, route_fingerprint, transport_url, head_commit_oid, authoritative_absence, observed_at
+       ) VALUES (?, ?, ?, ?, ?, ?)`
     ).run(
       input.runId,
       input.routeFingerprint,
+      input.transportUrl,
       input.headCommitOid,
       input.headCommitOid === null ? 1 : 0,
       input.observedAt
@@ -2758,9 +2765,10 @@ export class DomainLedger {
     head_commit_oid: string | null
     observed_at: string
     route_fingerprint: string
+    transport_url: string | null
   } | undefined {
     return this.#db.prepare(
-      `SELECT route_fingerprint, head_commit_oid, authoritative_absence, observed_at
+      `SELECT route_fingerprint, transport_url, head_commit_oid, authoritative_absence, observed_at
        FROM publication_baselines WHERE run_id = ?`
     ).get(runId) as ReturnType<DomainLedger['publicationBaseline']>
   }
@@ -3054,17 +3062,24 @@ export class DomainLedger {
         candidate.repositoryId === route.head_repository_id &&
         candidate.headOwner === route.head_owner &&
         candidate.headBranch === route.head_branch
-      const preReadMatches = baseline.authoritative_absence === 1
+      const preReadMatchesBaseline = baseline.authoritative_absence === 1
         ? hasOnlyOwnProperties(prePayload, new Set([
             'forgeHost', 'headBranch', 'headOwner', 'repositoryId', 'state'
           ])) && prePayload.state === 'absent'
         : hasOnlyOwnProperties(prePayload, new Set([
             'forgeHost', 'headBranch', 'headOwner', 'oid', 'repositoryId'
           ])) && prePayload.oid === baseline.head_commit_oid
+      const reconciled = mutationPayload.reconciled === true
+      const preReadMatchesCandidate = hasOnlyOwnProperties(prePayload, new Set([
+        'forgeHost', 'headBranch', 'headOwner', 'oid', 'repositoryId'
+      ])) && prePayload.oid === input.candidateCommitOid
       return preRead.kind === 'publication-head' && preRead.subject === subject &&
         observation.kind === 'publication-head' && observation.subject === subject &&
-        routeFactsMatch(prePayload) && routeFactsMatch(payload) && preReadMatches &&
-        receipt.outcome === (baseline.authoritative_absence === 1
+        routeFactsMatch(prePayload) && routeFactsMatch(payload) &&
+        (preReadMatchesBaseline || (reconciled && preReadMatchesCandidate)) &&
+        receipt.outcome === (reconciled && !preReadMatchesBaseline
+          ? 'unchanged'
+          : baseline.authoritative_absence === 1
           ? 'created'
           : baseline.head_commit_oid === input.candidateCommitOid
           ? 'unchanged'
@@ -3072,7 +3087,7 @@ export class DomainLedger {
         hasOnlyOwnProperties(payload, new Set([
           'forgeHost', 'headBranch', 'headOwner', 'oid', 'repositoryId'
         ])) && payload.oid === input.candidateCommitOid &&
-        hasOnlyOwnProperties(mutationPayload, new Set(['expected', 'update'])) &&
+        hasOnlyOwnProperties(mutationPayload, new Set(['expected', 'reconciled', 'update'])) &&
         mutationPayload.expected === (baseline.authoritative_absence === 1
           ? 'absent'
           : baseline.head_commit_oid) &&
@@ -3155,6 +3170,7 @@ export class DomainLedger {
     }
     runId: string
     stageId: 'pr' | 'push'
+    ownership: { branch: string; generationToken: number; repoRoot: string }
   }): { evidenceId: string; receiptSha256: string } {
     const expectedKind: RemoteReceiptKind =
       input.stageId === 'push' ? 'candidate-publication' : 'pull-request-binding'
@@ -3197,6 +3213,9 @@ export class DomainLedger {
     const receiptJson = canonicalJson(input.receipt.payload)
     this.#db.exec('BEGIN IMMEDIATE')
     try {
+      if (!this.ownsLease(input.runId, input.ownership)) {
+        throw new Error(`run ${input.runId} no longer owns its branch lease`)
+      }
       const existingEvidence = this.#db.prepare(
         `SELECT evidence_id
          FROM stage_evidence
