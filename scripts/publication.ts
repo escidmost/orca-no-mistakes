@@ -28,7 +28,7 @@ type AdmissionInput = {
   ledger: DomainLedger
   runId: string
   destination: string
-  resolveRepositoryIdentity?: RepositoryIdentityResolver
+  resolveRepositoryIdentity: RepositoryIdentityResolver
   runner?: CommandRunner
   env?: NodeJS.ProcessEnv
   observedAt?: string
@@ -40,7 +40,7 @@ type PublicationInput = {
   attemptId: string
   generationToken: number
   destination: string
-  resolveRepositoryIdentity?: RepositoryIdentityResolver
+  resolveRepositoryIdentity: RepositoryIdentityResolver
   artifactPath: string
   workerIdentity: string
   reconcileExactCandidate?: boolean
@@ -76,6 +76,7 @@ async function readHead(
   if (!destination || destination.startsWith('-')) {
     throw new CandidatePublicationError('publication destination is invalid')
   }
+  await rejectUrlRewrite(runner, destination, cwd, env)
   const result = await runner(
     'git',
     ['ls-remote', '--exit-code', '--refs', destination, ref],
@@ -94,6 +95,30 @@ async function readHead(
     throw new CandidatePublicationError(`malformed publication head response for ${ref}`)
   }
   return { oid: match[1]! }
+}
+
+async function rejectUrlRewrite(
+  runner: CommandRunner,
+  destination: string,
+  cwd: string,
+  env: NodeJS.ProcessEnv
+): Promise<void> {
+  const result = await runner(
+    'git',
+    ['config', '--get-regexp', '^url\\..*\\..*insteadof$'],
+    { cwd, env }
+  )
+  if (result.code === 1 && result.stdout.trim() === '') return
+  if (result.code !== 0) {
+    throw new CandidatePublicationError('cannot verify publication transport URL rewrites')
+  }
+  const rewritten = result.stdout
+    .trim()
+    .split('\n')
+    .some((line) => destination.startsWith(line.replace(/^\S+\s+/, '')))
+  if (rewritten) {
+    throw new CandidatePublicationError('publication destination is redirected by Git url.* rewrite configuration')
+  }
 }
 
 function transportIdentity(destination: string, forgeHost: string): string {
@@ -127,7 +152,6 @@ async function requireStoredRepositoryIdentity(
   }
   if (
     storedRoute.head_repository_node_id !== null &&
-    identity.nodeId != null &&
     identity.nodeId !== storedRoute.head_repository_node_id
   ) {
     throw new CandidatePublicationError(
@@ -136,7 +160,11 @@ async function requireStoredRepositoryIdentity(
   }
 }
 
-function terminalCandidate(ledger: DomainLedger, runId: string): string {
+function terminalCandidate(
+  ledger: DomainLedger,
+  runId: string,
+  verifyRetainedArtifacts = true
+): string {
   const run = ledger.run(runId)
   if (!run) throw new CandidatePublicationError(`run ${runId} does not exist`)
   const plan = ledger.stagePlan(runId)
@@ -191,22 +219,12 @@ function terminalCandidate(ledger: DomainLedger, runId: string): string {
         `satisfied stage ${stage.stage_id} does not bind successful authoritative evidence`
       )
     }
-    if (
-      evidence.artifact_sha256 === null ||
-      evidenceSha256({
-        artifactSha256: evidence.artifact_sha256,
-        baseCommitOid: evidence.base_commit_oid,
-        candidateCommitOid: evidence.candidate_commit_oid,
-        exitCode: Number(evidence.exit_code),
-        round: Number(evidence.round_index),
-        runId,
-        stage: evidence.stage_id,
-        summary: evidence.summary,
-        workerIdentity: evidence.worker_identity
-      }) !== evidence.evidence_sha256
-    ) {
+    const evidenceProblems = verifyRetainedArtifacts
+      ? inputEvidenceProblems(ledger, runId, evidence)
+      : []
+    if (evidenceProblems.length > 0) {
       throw new CandidatePublicationError(
-        `satisfied stage ${stage.stage_id} retained evidence digest does not match its recorded fields`
+        `satisfied stage ${stage.stage_id} retained evidence is invalid: ${evidenceProblems.join('; ')}`
       )
     }
     candidate = final.checkpoint.output_commit_oid
@@ -217,6 +235,32 @@ function terminalCandidate(ledger: DomainLedger, runId: string): string {
     throw new CandidatePublicationError(`invalid terminal candidate OID: ${candidate}`)
   }
   return candidate
+}
+
+function inputEvidenceProblems(
+  ledger: DomainLedger,
+  runId: string,
+  evidence: NonNullable<ReturnType<DomainLedger['listEvidence']>[number]>
+): string[] {
+  if (evidence.artifact_sha256 === null) return ['artifact digest is missing']
+  const stageEvidence = ledger.listEvidence(runId).flatMap((row) =>
+    row.artifact_sha256 === null ? [] : [{
+      artifactSha256: row.artifact_sha256,
+      baseCommitOid: row.base_commit_oid,
+      candidateCommitOid: row.candidate_commit_oid,
+      evidenceSha256: row.evidence_sha256,
+      exitCode: row.exit_code,
+      round: row.round_index,
+      stage: row.stage_id,
+      summary: row.summary,
+      workerIdentity: row.worker_identity
+    }]
+  )
+  const prefix = `${evidence.stage_id} round ${evidence.round_index}:`
+  return ledger.verifyEvidence({
+    runId,
+    stageEvidence
+  }).filter((problem) => problem.startsWith(prefix))
 }
 
 function observationPayload(
@@ -252,13 +296,11 @@ export async function admitCandidatePublication(input: AdmissionInput): Promise<
   if (transportUrl !== `${storedRoute.forge_host}/${storedRoute.head_repository_name}`) {
     throw new CandidatePublicationError('publication destination does not name the stored head repository')
   }
-  if (input.resolveRepositoryIdentity) {
-    await requireStoredRepositoryIdentity(
-      input.resolveRepositoryIdentity,
-      transportUrl.split('/').slice(1).join('/'),
-      storedRoute
-    )
-  }
+  await requireStoredRepositoryIdentity(
+    input.resolveRepositoryIdentity,
+    transportUrl.split('/').slice(1).join('/'),
+    storedRoute
+  )
   const ref = headRef(route.head_branch)
   const head = await readHead(
     input.runner ?? runCommand,
@@ -302,13 +344,11 @@ export async function publishCandidate(input: PublicationInput): Promise<{
     )
   }
   const repositoryReference = transportUrl.split('/').slice(1).join('/')
-  if (input.resolveRepositoryIdentity) {
-    await requireStoredRepositoryIdentity(
-      input.resolveRepositoryIdentity,
-      repositoryReference,
-      storedRoute
-    )
-  }
+  await requireStoredRepositoryIdentity(
+    input.resolveRepositoryIdentity,
+    repositoryReference,
+    storedRoute
+  )
   if (!input.ledger.ownsLease(input.runId, {
     repoRoot: run.repo_root,
     branch: run.branch,
@@ -317,7 +357,7 @@ export async function publishCandidate(input: PublicationInput): Promise<{
     throw new CandidatePublicationError('publication lease is no longer owned by this run generation')
   }
 
-  const candidate = terminalCandidate(input.ledger, input.runId)
+  const candidate = terminalCandidate(input.ledger, input.runId, false)
   const settled = input.ledger.listEvidence(input.runId).find(
     (row) => row.stage_id === 'push' && row.round_index === 0
   )
@@ -339,6 +379,7 @@ export async function publishCandidate(input: PublicationInput): Promise<{
     }
     return { candidateCommitOid: candidate, outcome, receiptSha256: receipt.receipt_sha256 }
   }
+  terminalCandidate(input.ledger, input.runId)
   const ref = headRef(route.head_branch)
   const subject = `${route.forge_host}/${route.head_repository_id}:${ref}`
   const pre = await readHead(runner, input.destination, ref, run.repo_root, env)
@@ -380,6 +421,9 @@ export async function publishCandidate(input: PublicationInput): Promise<{
   let pushResult: CommandResult | null = null
   let pushError: unknown
   if (pre.oid !== candidate) {
+    if (terminalCandidate(input.ledger, input.runId) !== candidate) {
+      throw new CandidatePublicationError('terminal candidate changed before mutation')
+    }
     if (!input.ledger.ownsLease(input.runId, {
       repoRoot: run.repo_root,
       branch: run.branch,
@@ -387,6 +431,12 @@ export async function publishCandidate(input: PublicationInput): Promise<{
     })) {
       throw new CandidatePublicationError('publication lease was lost before mutation')
     }
+    await requireStoredRepositoryIdentity(
+      input.resolveRepositoryIdentity,
+      repositoryReference,
+      storedRoute
+    )
+    await rejectUrlRewrite(runner, input.destination, run.repo_root, env)
     try {
       pushResult = await runner('git', [
         'push',
@@ -408,6 +458,17 @@ export async function publishCandidate(input: PublicationInput): Promise<{
       `publication result is uncertain because the authoritative post-read failed: ${String(error)}`
     )
   }
+  try {
+    await requireStoredRepositoryIdentity(
+      input.resolveRepositoryIdentity,
+      repositoryReference,
+      storedRoute
+    )
+  } catch (error) {
+    throw new CandidatePublicationError(
+      `publication result is uncertain because the destination repository identity could not be re-verified: ${String(error)}`
+    )
+  }
   const postObservedAt = after(mutationCreatedAt, now())
   const postRead = input.ledger.recordRemoteObservation({
     runId: input.runId,
@@ -421,26 +482,12 @@ export async function publishCandidate(input: PublicationInput): Promise<{
     const transportFailure = pushError
       ? `; push threw ${String(pushError)}`
       : pushResult && pushResult.code !== 0
-        ? `; push exited ${pushResult.code}: ${pushResult.stderr.trim()}`
+        ? `; push exited ${pushResult.code}`
         : ''
     throw new CandidatePublicationError(
       `publication post-read did not prove the exact candidate${transportFailure}`
     )
   }
-  if (input.resolveRepositoryIdentity) {
-    try {
-      await requireStoredRepositoryIdentity(
-        input.resolveRepositoryIdentity,
-        repositoryReference,
-        storedRoute
-      )
-    } catch (error) {
-      throw new CandidatePublicationError(
-        `publication result is uncertain because the destination repository identity could not be re-verified: ${String(error)}`
-      )
-    }
-  }
-
   const artifactBytes = `${canonicalJson({
     candidateCommitOid: candidate,
     mutationIntent: mutation,

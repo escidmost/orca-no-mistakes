@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { existsSync } from 'node:fs'
-import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -14,7 +14,8 @@ import {
 } from '../scripts/ledger.ts'
 import {
   admitCandidatePublication,
-  publishCandidate
+  publishCandidate,
+  type RepositoryIdentityResolver
 } from '../scripts/publication.ts'
 
 const POLICY = 'f'.repeat(64)
@@ -35,6 +36,7 @@ type Context = {
   fork: boolean
   generationToken: number
   ledger: DomainLedger
+  resolveRepositoryIdentity: RepositoryIdentityResolver
   runId: string
   temp: string
   third: string
@@ -128,8 +130,11 @@ async function fixture(name: string, options: FixtureOptions = {}): Promise<Cont
     stageId: 'lint'
   })
   if (evidenceMode !== 'none') {
+    const artifact = 'lint evidence\n'
+    const artifactPath = path.join(temp, 'lint.json')
+    await writeFile(artifactPath, artifact)
     const entry = {
-      artifactSha256: 'e'.repeat(64),
+      artifactSha256: sha256(artifact),
       baseCommitOid: base,
       candidateCommitOid: evidenceMode === 'mismatched' ? third : candidate,
       exitCode: evidenceMode === 'failed' ? 1 : 0,
@@ -143,7 +148,7 @@ async function fixture(name: string, options: FixtureOptions = {}): Promise<Cont
     }
     const digest = evidenceSha256(entry)
     ledger.recordEvidence({
-      artifactPath: path.join(temp, 'lint.json'),
+      artifactPath,
       artifactSha256: entry.artifactSha256,
       baseCommitOid: entry.baseCommitOid,
       candidateCommitOid: entry.candidateCommitOid,
@@ -182,6 +187,10 @@ async function fixture(name: string, options: FixtureOptions = {}): Promise<Cont
     fork,
     generationToken,
     ledger,
+    resolveRepositoryIdentity: async () => ({
+      id: fork ? 'R_fork' : 'R_base',
+      nodeId: fork ? 'RN_fork' : 'RN_base'
+    }),
     runId,
     temp,
     third
@@ -198,6 +207,7 @@ function fakeRemote(initialHead: string | null): {
   let pushCount = 0
   const pushes: string[][] = []
   const runner: CommandRunner = async (_executable, args) => {
+    if (args[0] === 'config') return { code: 1, stdout: '', stderr: '' }
     if (args[0] === 'ls-remote') {
       reads += 1
       if (head === null) return { code: 2, stdout: '', stderr: '' }
@@ -228,6 +238,7 @@ async function admit(context: Context, remote: ReturnType<typeof fakeRemote>, de
     ledger: context.ledger,
     runId: context.runId,
     destination,
+    resolveRepositoryIdentity: context.resolveRepositoryIdentity,
     runner: remote.runner,
     observedAt: TIME
   })
@@ -244,6 +255,7 @@ async function publish(
     attemptId: context.attemptId,
     generationToken: context.generationToken,
     destination,
+    resolveRepositoryIdentity: context.resolveRepositoryIdentity,
     artifactPath: context.artifactPath,
     workerIdentity: 'publisher',
     runner: remote.runner,

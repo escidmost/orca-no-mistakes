@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -8,6 +8,7 @@ import type { CommandRunner } from '../scripts/github.ts'
 import {
   DomainLedger,
   evidenceSha256,
+  sha256,
   type RepositoryPublicationRouteInput
 } from '../scripts/ledger.ts'
 import {
@@ -18,6 +19,7 @@ import {
 const POLICY = 'f'.repeat(64)
 const TIME = '2026-09-01T12:00:00.000Z'
 const OID = '0123456789abcdef'.repeat(3)
+const resolveRepositoryIdentity = async () => ({ id: 'R_base', nodeId: 'RN_base' })
 
 test('settled push evidence binds the checkpoint input, not the run submission', async () => {
   const temp = await mkdtemp(path.join(tmpdir(), 'onm-push-evidence-base-'))
@@ -71,8 +73,11 @@ test('settled push evidence binds the checkpoint input, not the run submission',
       runId,
       stageId: 'lint'
     })
+    const lintArtifactPath = path.join(temp, 'lint.json')
+    const lintArtifact = 'lint evidence\n'
+    await writeFile(lintArtifactPath, lintArtifact)
     const lintEntry = {
-      artifactSha256: 'e'.repeat(64),
+      artifactSha256: sha256(lintArtifact),
       baseCommitOid: base,
       candidateCommitOid: candidate,
       exitCode: 0,
@@ -84,7 +89,7 @@ test('settled push evidence binds the checkpoint input, not the run submission',
     }
     const lintDigest = evidenceSha256(lintEntry)
     ledger.recordEvidence({
-      artifactPath: path.join(temp, 'lint.json'),
+      artifactPath: lintArtifactPath,
       artifactSha256: lintEntry.artifactSha256,
       baseCommitOid: base,
       candidateCommitOid: candidate,
@@ -115,6 +120,7 @@ test('settled push evidence binds the checkpoint input, not the run submission',
 
     let head: string | null = null
     const runner: CommandRunner = async (_executable, args) => {
+      if (args[0] === 'config') return { code: 1, stdout: '', stderr: '' }
       if (args[0] === 'ls-remote') {
         return head === null
           ? { code: 2, stdout: '', stderr: '' }
@@ -131,6 +137,7 @@ test('settled push evidence binds the checkpoint input, not the run submission',
       ledger,
       runId,
       destination,
+      resolveRepositoryIdentity,
       runner,
       observedAt: TIME
     })
@@ -140,6 +147,7 @@ test('settled push evidence binds the checkpoint input, not the run submission',
       attemptId,
       generationToken,
       destination,
+      resolveRepositoryIdentity,
       artifactPath: path.join(temp, 'artifacts', 'push.json'),
       workerIdentity: 'publisher',
       runner,

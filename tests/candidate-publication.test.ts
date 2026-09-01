@@ -1,15 +1,16 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 
 import { runCommand, type CommandRunner } from '../scripts/github.ts'
-import { DomainLedger, evidenceSha256 } from '../scripts/ledger.ts'
+import { DomainLedger, evidenceSha256, sha256 } from '../scripts/ledger.ts'
 import {
   admitCandidatePublication,
-  publishCandidate
+  publishCandidate,
+  type RepositoryIdentityResolver
 } from '../scripts/publication.ts'
 
 const POLICY = 'f'.repeat(64)
@@ -27,7 +28,10 @@ async function fixture(name: string): Promise<{
   destination: string
   generationToken: number
   ledger: DomainLedger
+  remote: string
   repo: string
+  resolveRepositoryIdentity: RepositoryIdentityResolver
+  runner: CommandRunner
   runId: string
   temp: string
   third: string
@@ -48,7 +52,6 @@ async function fixture(name: string): Promise<{
   git(repo, 'commit', '--allow-empty', '-m', 'third')
   const third = git(repo, 'rev-parse', 'HEAD')
   execFileSync('git', ['-c', 'init.templateDir=', 'init', '--bare', remote])
-  git(repo, 'config', `url.${remote}.insteadOf`, destination)
 
   const ledger = new DomainLedger(path.join(temp, 'ledger.sqlite'))
   const runId = `run-${name}`
@@ -94,8 +97,11 @@ async function fixture(name: string): Promise<{
     runId,
     stageId: 'lint'
   })
+  const lintArtifactPath = path.join(temp, 'lint.json')
+  const lintArtifact = 'lint passed\n'
+  await writeFile(lintArtifactPath, lintArtifact)
   const lintEvidence = {
-    artifactSha256: 'e'.repeat(64),
+    artifactSha256: sha256(lintArtifact),
     baseCommitOid: base,
     candidateCommitOid: candidate,
     exitCode: 0,
@@ -107,7 +113,7 @@ async function fixture(name: string): Promise<{
   }
   const lintEvidenceSha256 = evidenceSha256(lintEvidence)
   ledger.recordEvidence({
-    artifactPath: path.join(temp, 'lint.json'),
+    artifactPath: lintArtifactPath,
     artifactSha256: lintEvidence.artifactSha256,
     baseCommitOid: base,
     candidateCommitOid: candidate,
@@ -134,6 +140,15 @@ async function fixture(name: string): Promise<{
     runId,
     startedAt: TIME
   })
+  const resolveRepositoryIdentity: RepositoryIdentityResolver = async () => ({
+    id: fork ? 'R_fork' : 'R_base',
+    nodeId: fork ? 'RN_fork' : 'RN_base'
+  })
+  const runner: CommandRunner = (executable, args, options) => runCommand(
+    executable,
+    args.map((argument) => argument === destination ? remote : argument),
+    options
+  )
   return {
     artifactPath: path.join(temp, 'artifacts', 'push.json'),
     attemptId,
@@ -142,7 +157,10 @@ async function fixture(name: string): Promise<{
     destination,
     generationToken,
     ledger,
+    remote,
     repo,
+    resolveRepositoryIdentity,
+    runner,
     runId,
     temp,
     third
@@ -159,20 +177,35 @@ async function publish(
     attemptId: context.attemptId,
     generationToken: context.generationToken,
     destination: context.destination,
+    resolveRepositoryIdentity: context.resolveRepositoryIdentity,
     artifactPath: context.artifactPath,
     workerIdentity: 'publisher',
     reconcileExactCandidate: options.reconcileExactCandidate,
-    runner: options.runner,
+    runner: options.runner ?? context.runner,
     now: () => TIME
   })
 }
 
+async function admit(
+  context: Awaited<ReturnType<typeof fixture>>,
+  options: { runner?: CommandRunner } = {}
+) {
+  return admitCandidatePublication({
+    ledger: context.ledger,
+    runId: context.runId,
+    destination: context.destination,
+    resolveRepositoryIdentity: context.resolveRepositoryIdentity,
+    runner: options.runner ?? context.runner,
+    observedAt: TIME
+  })
+}
+
 function remoteHead(context: Awaited<ReturnType<typeof fixture>>): string {
-  return git(context.repo, 'ls-remote', '--refs', context.destination, 'refs/heads/feature').split('\t')[0]!
+  return git(context.repo, 'ls-remote', '--refs', context.remote, 'refs/heads/feature').split('\t')[0]!
 }
 
 function push(context: Awaited<ReturnType<typeof fixture>>, oid: string): void {
-  git(context.repo, 'push', '--force', context.destination, `${oid}:refs/heads/feature`)
+  git(context.repo, 'push', '--force', context.remote, `${oid}:refs/heads/feature`)
 }
 
 test('same-repository and fork publication create the exact absent head', async (t) => {
@@ -180,17 +213,12 @@ test('same-repository and fork publication create the exact absent head', async 
     await t.test(name, async () => {
       const context = await fixture(name)
       try {
-        const admission = await admitCandidatePublication({
-          ledger: context.ledger,
-          runId: context.runId,
-          destination: context.destination,
-          observedAt: TIME
-        })
+        const admission = await admit(context)
         assert.equal(admission.headCommitOid, null)
         let pushArgs: string[] | undefined
         const runner: CommandRunner = async (executable, args, options) => {
           if (args[0] === 'push') pushArgs = [...args]
-          return runCommand(executable, args, options)
+          return context.runner(executable, args, options)
         }
         const result = await publish(context, { runner })
         assert.equal(result.outcome, 'created')
@@ -218,16 +246,11 @@ test('replacement uses the exact fully qualified compare-and-swap arguments', as
   const context = await fixture('replace')
   try {
     push(context, context.base)
-    await admitCandidatePublication({
-      ledger: context.ledger,
-      runId: context.runId,
-      destination: context.destination,
-      observedAt: TIME
-    })
+    await admit(context)
     let pushArgs: string[] | undefined
     const runner: CommandRunner = async (executable, args, options) => {
       if (args[0] === 'push') pushArgs = [...args]
-      return runCommand(executable, args, options)
+      return context.runner(executable, args, options)
     }
     const result = await publish(context, { runner })
     assert.equal(result.outcome, 'updated')
@@ -249,16 +272,11 @@ test('an unchanged candidate is reconciled without a push', async () => {
   const context = await fixture('no-op')
   try {
     push(context, context.candidate)
-    await admitCandidatePublication({
-      ledger: context.ledger,
-      runId: context.runId,
-      destination: context.destination,
-      observedAt: TIME
-    })
+    await admit(context)
     let pushes = 0
     const runner: CommandRunner = async (executable, args, options) => {
       if (args[0] === 'push') pushes += 1
-      return runCommand(executable, args, options)
+      return context.runner(executable, args, options)
     }
     const result = await publish(context, { runner })
     assert.equal(result.outcome, 'unchanged')
@@ -275,19 +293,14 @@ test('stale creation, movement, and deletion reject without mutation', async (t)
       const context = await fixture(`stale-${scenario}`)
       try {
         if (scenario !== 'creation') push(context, context.base)
-        await admitCandidatePublication({
-          ledger: context.ledger,
-          runId: context.runId,
-          destination: context.destination,
-          observedAt: TIME
-        })
+        await admit(context)
         if (scenario === 'creation') push(context, context.base)
         if (scenario === 'movement') push(context, context.third)
-        if (scenario === 'deletion') git(context.repo, 'push', context.destination, ':refs/heads/feature')
+        if (scenario === 'deletion') git(context.repo, 'push', context.remote, ':refs/heads/feature')
         let pushes = 0
         const runner: CommandRunner = async (executable, args, options) => {
           if (args[0] === 'push') pushes += 1
-          return runCommand(executable, args, options)
+          return context.runner(executable, args, options)
         }
         await assert.rejects(publish(context, { runner }), /changed after admission/)
         assert.equal(pushes, 0)
@@ -303,12 +316,7 @@ test('publication rejects destination, branch-chain, and lease changes before mu
   await t.test('destination', async () => {
     const context = await fixture('destination-reject')
     try {
-      await admitCandidatePublication({
-        ledger: context.ledger,
-        runId: context.runId,
-        destination: context.destination,
-        observedAt: TIME
-      })
+      await admit(context)
       await assert.rejects(
         publishCandidate({
           ledger: context.ledger,
@@ -316,8 +324,10 @@ test('publication rejects destination, branch-chain, and lease changes before mu
           attemptId: context.attemptId,
           generationToken: context.generationToken,
           destination: `${context.destination}-changed`,
+          resolveRepositoryIdentity: context.resolveRepositoryIdentity,
           artifactPath: context.artifactPath,
-          workerIdentity: 'publisher'
+          workerIdentity: 'publisher',
+          runner: context.runner
         }),
         /differs from the immutable admission route/
       )
@@ -330,12 +340,7 @@ test('publication rejects destination, branch-chain, and lease changes before mu
   await t.test('lease', async () => {
     const context = await fixture('lease-reject')
     try {
-      await admitCandidatePublication({
-        ledger: context.ledger,
-        runId: context.runId,
-        destination: context.destination,
-        observedAt: TIME
-      })
+      await admit(context)
       await assert.rejects(
         publishCandidate({
           ledger: context.ledger,
@@ -343,8 +348,10 @@ test('publication rejects destination, branch-chain, and lease changes before mu
           attemptId: context.attemptId,
           generationToken: context.generationToken + 1,
           destination: context.destination,
+          resolveRepositoryIdentity: context.resolveRepositoryIdentity,
           artifactPath: context.artifactPath,
-          workerIdentity: 'publisher'
+          workerIdentity: 'publisher',
+          runner: context.runner
         }),
         /lease is no longer owned/
       )
@@ -357,18 +364,13 @@ test('publication rejects destination, branch-chain, and lease changes before mu
   await t.test('lease lost before push', async () => {
     const context = await fixture('lease-race-reject')
     try {
-      await admitCandidatePublication({
-        ledger: context.ledger,
-        runId: context.runId,
-        destination: context.destination,
-        observedAt: TIME
-      })
+      await admit(context)
       let leaseChecks = 0
       context.ledger.ownsLease = () => ++leaseChecks === 1
       let pushes = 0
       const runner: CommandRunner = async (executable, args, options) => {
         if (args[0] === 'push') pushes += 1
-        return runCommand(executable, args, options)
+        return context.runner(executable, args, options)
       }
       await assert.rejects(publish(context, { runner }), /lease was lost before mutation/)
       assert.equal(pushes, 0)
@@ -381,12 +383,7 @@ test('publication rejects destination, branch-chain, and lease changes before mu
   await t.test('candidate chain', async () => {
     const context = await fixture('chain-reject')
     try {
-      await admitCandidatePublication({
-        ledger: context.ledger,
-        runId: context.runId,
-        destination: context.destination,
-        observedAt: TIME
-      })
+      await admit(context)
       context.ledger.recordCheckpoint({
         inputCommitOid: context.third,
         outputCommitOid: context.candidate,
@@ -411,12 +408,10 @@ test('admission rejects authentication failures and malformed remote output', as
       const context = await fixture(`read-${name}`)
       try {
         await assert.rejects(
-          admitCandidatePublication({
-            ledger: context.ledger,
-            runId: context.runId,
-            destination: context.destination,
-            runner: async () => result,
-            observedAt: TIME
+          admit(context, {
+            runner: async (_executable, args) => args[0] === 'config'
+              ? { code: 1, stdout: '', stderr: '' }
+              : result
           }),
           message
         )
@@ -434,14 +429,9 @@ test('uncertain push results succeed only when the post-read proves the candidat
     await t.test(mode, async () => {
       const context = await fixture(`uncertain-${mode}`)
       try {
-        await admitCandidatePublication({
-          ledger: context.ledger,
-          runId: context.runId,
-          destination: context.destination,
-          observedAt: TIME
-        })
+        await admit(context)
         const runner: CommandRunner = async (executable, args, options) => {
-          const result = await runCommand(executable, args, options)
+          const result = await context.runner(executable, args, options)
           if (args[0] !== 'push') return result
           if (mode === 'disconnect') throw new Error('connection dropped')
           return { ...result, code: 124, stderr: 'timed out' }
@@ -461,15 +451,10 @@ test('a successful-looking push is rejected when the post-read does not match', 
   const context = await fixture('post-mismatch')
   try {
     push(context, context.base)
-    await admitCandidatePublication({
-      ledger: context.ledger,
-      runId: context.runId,
-      destination: context.destination,
-      observedAt: TIME
-    })
+    await admit(context)
     const runner: CommandRunner = async (executable, args, options) => {
       if (args[0] === 'push') return { code: 0, stdout: 'ok', stderr: '' }
-      return runCommand(executable, args, options)
+      return context.runner(executable, args, options)
     }
     await assert.rejects(publish(context, { runner }), /post-read did not prove the exact candidate/)
     assert.equal(context.ledger.remoteReceipt(context.runId, 'candidate-publication'), undefined)
@@ -483,28 +468,18 @@ test('a successful-looking push is rejected when the post-read does not match', 
 test('explicit reconciliation adopts only an already-present exact candidate', async () => {
   const context = await fixture('reconcile')
   try {
-    await admitCandidatePublication({
-      ledger: context.ledger,
-      runId: context.runId,
-      destination: context.destination,
-      observedAt: TIME
-    })
+    await admit(context)
     push(context, context.candidate)
     await assert.rejects(publish(context), /changed after admission/)
 
     const second = await fixture('reconcile-explicit')
     try {
-      await admitCandidatePublication({
-        ledger: second.ledger,
-        runId: second.runId,
-        destination: second.destination,
-        observedAt: TIME
-      })
+      await admit(second)
       push(second, second.candidate)
       let pushes = 0
       const runner: CommandRunner = async (executable, args, options) => {
         if (args[0] === 'push') pushes += 1
-        return runCommand(executable, args, options)
+        return second.runner(executable, args, options)
       }
       const result = await publish(second, { reconcileExactCandidate: true, runner })
       assert.equal(result.outcome, 'unchanged')
@@ -522,12 +497,7 @@ test('explicit reconciliation adopts only an already-present exact candidate', a
 test('a recorded publication receipt survives a later failed attempt outcome', async () => {
   const context = await fixture('receipt-custody')
   try {
-    await admitCandidatePublication({
-      ledger: context.ledger,
-      runId: context.runId,
-      destination: context.destination,
-      observedAt: TIME
-    })
+    await admit(context)
     const result = await publish(context)
     context.ledger.recordAttemptOutcome({
       actorIdentity: 'operator',

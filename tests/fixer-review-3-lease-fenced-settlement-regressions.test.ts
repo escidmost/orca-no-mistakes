@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -8,6 +8,7 @@ import type { CommandRunner } from '../scripts/github.ts'
 import {
   DomainLedger,
   evidenceSha256,
+  sha256,
   type RepositoryPublicationRouteInput
 } from '../scripts/ledger.ts'
 import { admitCandidatePublication, publishCandidate } from '../scripts/publication.ts'
@@ -15,6 +16,7 @@ import { admitCandidatePublication, publishCandidate } from '../scripts/publicat
 const POLICY = 'f'.repeat(64)
 const TIME = '2026-09-01T12:00:00.000Z'
 const OID = '0123456789abcdef'.repeat(3)
+const resolveRepositoryIdentity = async () => ({ id: 'R_base', nodeId: 'RN_base' })
 
 type Setup = {
   artifactPath: string
@@ -78,8 +80,11 @@ async function setup(name: string): Promise<Setup> {
     runId,
     stageId: 'lint'
   })
+  const lintArtifactPath = path.join(temp, 'lint.json')
+  const lintArtifact = 'lint evidence\n'
+  await writeFile(lintArtifactPath, lintArtifact)
   const lintEntry = {
-    artifactSha256: 'e'.repeat(64),
+    artifactSha256: sha256(lintArtifact),
     baseCommitOid: base,
     candidateCommitOid: candidate,
     exitCode: 0,
@@ -91,7 +96,7 @@ async function setup(name: string): Promise<Setup> {
   }
   const lintDigest = evidenceSha256(lintEntry)
   ledger.recordEvidence({
-    artifactPath: path.join(temp, 'lint.json'),
+    artifactPath: lintArtifactPath,
     artifactSha256: lintEntry.artifactSha256,
     baseCommitOid: base,
     candidateCommitOid: candidate,
@@ -135,6 +140,7 @@ async function setup(name: string): Promise<Setup> {
 function fakeTransport(onPush?: () => void): CommandRunner {
   let head: string | null = null
   const runner: CommandRunner = async (_executable, args) => {
+    if (args[0] === 'config') return { code: 1, stdout: '', stderr: '' }
     if (args[0] === 'ls-remote') {
       return head === null
         ? { code: 2, stdout: '', stderr: '' }
@@ -175,6 +181,7 @@ test('force-reclaiming the branch lease during the push prevents settlement', as
       ledger: ctx.ledger,
       runId: ctx.runId,
       destination: ctx.destination,
+      resolveRepositoryIdentity,
       runner,
       observedAt: TIME
     })
@@ -185,6 +192,7 @@ test('force-reclaiming the branch lease during the push prevents settlement', as
         attemptId: ctx.attemptId,
         generationToken: ctx.generationToken,
         destination: ctx.destination,
+        resolveRepositoryIdentity,
         artifactPath: ctx.artifactPath,
         workerIdentity: 'publisher',
         runner,
@@ -215,6 +223,7 @@ test('the same fixture settles when the lease is not reclaimed', async () => {
       ledger: ctx.ledger,
       runId: ctx.runId,
       destination: ctx.destination,
+      resolveRepositoryIdentity,
       runner,
       observedAt: TIME
     })
@@ -224,6 +233,7 @@ test('the same fixture settles when the lease is not reclaimed', async () => {
       attemptId: ctx.attemptId,
       generationToken: ctx.generationToken,
       destination: ctx.destination,
+      resolveRepositoryIdentity,
       artifactPath: ctx.artifactPath,
       workerIdentity: 'publisher',
       runner,

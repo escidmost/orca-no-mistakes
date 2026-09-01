@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 
 import type { CommandRunner } from '../scripts/github.ts'
-import { DomainLedger, evidenceSha256 } from '../scripts/ledger.ts'
+import { DomainLedger, evidenceSha256, sha256 } from '../scripts/ledger.ts'
 import {
   admitCandidatePublication,
   publishCandidate
@@ -14,6 +14,7 @@ import {
 const POLICY = 'f'.repeat(64)
 const TIME = '2026-09-01T12:00:00.000Z'
 const OID = '0123456789abcdef'.repeat(3)
+const resolveRepositoryIdentity = async () => ({ id: 'R_base', nodeId: 'RN_base' })
 
 type Context = {
   artifactPath: string
@@ -24,6 +25,7 @@ type Context = {
   forgedDigest: string
   generationToken: number
   ledger: DomainLedger
+  lintArtifactPath: string
   runId: string
   temp: string
 }
@@ -77,8 +79,11 @@ async function setup(name: string, forgeDigest: boolean): Promise<Context> {
     runId,
     stageId: 'lint'
   })
+  const lintArtifactPath = path.join(temp, 'lint.json')
+  const lintArtifact = 'lint evidence\n'
+  await writeFile(lintArtifactPath, lintArtifact)
   const lintEntry = {
-    artifactSha256: 'e'.repeat(64),
+    artifactSha256: sha256(lintArtifact),
     baseCommitOid: base,
     candidateCommitOid: candidate,
     exitCode: 0,
@@ -92,7 +97,7 @@ async function setup(name: string, forgeDigest: boolean): Promise<Context> {
     forgeDigest ? { ...lintEntry, summary: 'a different summary' } : lintEntry
   )
   ledger.recordEvidence({
-    artifactPath: path.join(temp, 'lint.json'),
+    artifactPath: lintArtifactPath,
     artifactSha256: lintEntry.artifactSha256,
     baseCommitOid: base,
     candidateCommitOid: candidate,
@@ -128,6 +133,7 @@ async function setup(name: string, forgeDigest: boolean): Promise<Context> {
     forgedDigest: digest,
     generationToken,
     ledger,
+    lintArtifactPath,
     runId,
     temp
   }
@@ -136,6 +142,7 @@ async function setup(name: string, forgeDigest: boolean): Promise<Context> {
 function fakeTransport(): CommandRunner {
   let head: string | null = null
   return async (_executable, args) => {
+    if (args[0] === 'config') return { code: 1, stdout: '', stderr: '' }
     if (args[0] === 'ls-remote') {
       if (head === null) return { code: 2, stdout: '', stderr: '' }
       return { code: 0, stdout: `${head}\t${args[4]}\n`, stderr: '' }
@@ -156,6 +163,7 @@ test('publication rejects retained evidence whose digest does not match its reco
       ledger: context.ledger,
       runId: context.runId,
       destination: context.destination,
+      resolveRepositoryIdentity,
       runner,
       observedAt: TIME
     })
@@ -166,12 +174,13 @@ test('publication rejects retained evidence whose digest does not match its reco
         attemptId: context.attemptId,
         generationToken: context.generationToken,
         destination: context.destination,
+        resolveRepositoryIdentity,
         artifactPath: context.artifactPath,
         workerIdentity: 'publisher',
         runner,
         now: () => TIME
       }),
-      /retained evidence digest does not match its recorded fields/
+      /retained evidence is invalid/
     )
     assert.ok(!context.ledger.remoteReceipt(context.runId, 'candidate-publication'))
   } finally {
@@ -188,6 +197,7 @@ test('publication settles when retained evidence matches its recorded digest', a
       ledger: context.ledger,
       runId: context.runId,
       destination: context.destination,
+      resolveRepositoryIdentity,
       runner,
       observedAt: TIME
     })
@@ -197,6 +207,7 @@ test('publication settles when retained evidence matches its recorded digest', a
       attemptId: context.attemptId,
       generationToken: context.generationToken,
       destination: context.destination,
+      resolveRepositoryIdentity,
       artifactPath: context.artifactPath,
       workerIdentity: 'publisher',
       runner,
@@ -207,5 +218,45 @@ test('publication settles when retained evidence matches its recorded digest', a
   } finally {
     context.ledger.close()
     await rm(context.temp, { recursive: true, force: true })
+  }
+})
+
+test('publication rejects missing or modified retained evidence artifacts', async (t) => {
+  for (const mode of ['missing', 'modified'] as const) {
+    await t.test(mode, async () => {
+      const context = await setup(`artifact-${mode}`, false)
+      try {
+        if (mode === 'missing') await rm(context.lintArtifactPath)
+        else await writeFile(context.lintArtifactPath, 'modified evidence\n')
+        const runner = fakeTransport()
+        await admitCandidatePublication({
+          ledger: context.ledger,
+          runId: context.runId,
+          destination: context.destination,
+          resolveRepositoryIdentity,
+          runner,
+          observedAt: TIME
+        })
+        await assert.rejects(
+          publishCandidate({
+            ledger: context.ledger,
+            runId: context.runId,
+            attemptId: context.attemptId,
+            generationToken: context.generationToken,
+            destination: context.destination,
+            resolveRepositoryIdentity,
+            artifactPath: context.artifactPath,
+            workerIdentity: 'publisher',
+            runner,
+            now: () => TIME
+          }),
+          /retained evidence is invalid/
+        )
+        assert.ok(!context.ledger.remoteReceipt(context.runId, 'candidate-publication'))
+      } finally {
+        context.ledger.close()
+        await rm(context.temp, { recursive: true, force: true })
+      }
+    })
   }
 })

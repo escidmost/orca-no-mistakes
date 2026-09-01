@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -8,6 +8,7 @@ import type { CommandRunner } from '../scripts/github.ts'
 import {
   DomainLedger,
   evidenceSha256,
+  sha256,
   type RepositoryPublicationRouteInput
 } from '../scripts/ledger.ts'
 import {
@@ -83,8 +84,11 @@ async function setup(name: string): Promise<Setup> {
     runId,
     stageId: 'lint'
   })
+  const lintArtifactPath = path.join(temp, 'lint.json')
+  const lintArtifact = 'lint evidence\n'
+  await writeFile(lintArtifactPath, lintArtifact)
   const lintEntry = {
-    artifactSha256: 'e'.repeat(64),
+    artifactSha256: sha256(lintArtifact),
     baseCommitOid: base,
     candidateCommitOid: candidate,
     exitCode: 0,
@@ -96,7 +100,7 @@ async function setup(name: string): Promise<Setup> {
   }
   const lintDigest = evidenceSha256(lintEntry)
   ledger.recordEvidence({
-    artifactPath: path.join(temp, 'lint.json'),
+    artifactPath: lintArtifactPath,
     artifactSha256: lintEntry.artifactSha256,
     baseCommitOid: base,
     candidateCommitOid: candidate,
@@ -140,6 +144,7 @@ async function setup(name: string): Promise<Setup> {
 function fakeTransport(): { runner: CommandRunner } {
   let head: string | null = null
   const runner: CommandRunner = async (_executable, args) => {
+    if (args[0] === 'config') return { code: 1, stdout: '', stderr: '' }
     if (args[0] === 'ls-remote') {
       return head === null
         ? { code: 2, stdout: '', stderr: '' }
@@ -185,6 +190,7 @@ test('publication refuses to settle when the destination identity changes after 
   try {
     const { runner } = fakeTransport()
     const identities: RepositoryIdentity[] = [
+      { id: 'R_base', nodeId: 'RN_base' },
       { id: 'R_base', nodeId: 'RN_base' },
       { id: 'R_base', nodeId: 'RN_base' },
       { id: 'R_other', nodeId: 'RN_other' }
@@ -256,8 +262,62 @@ test('publication settles with authoritative destination identity verification',
       now: () => TIME
     })
     assert.equal(result.outcome, 'created')
-    assert.deepEqual(calls, ['owner/repo', 'owner/repo', 'owner/repo'])
+    assert.deepEqual(calls, ['owner/repo', 'owner/repo', 'owner/repo', 'owner/repo'])
     assert.ok(ctx.ledger.remoteReceipt(ctx.runId, 'candidate-publication'))
+  } finally {
+    ctx.ledger.close()
+    await rm(ctx.temp, { force: true, recursive: true })
+  }
+})
+
+test('admission requires the stored repository node identity', async () => {
+  const ctx = await setup('missing-node-id')
+  try {
+    const { runner } = fakeTransport()
+    await assert.rejects(
+      admitCandidatePublication({
+        ledger: ctx.ledger,
+        runId: ctx.runId,
+        destination: ctx.destination,
+        resolveRepositoryIdentity: async () => ({ id: 'R_base' }),
+        runner,
+        observedAt: TIME
+      }),
+      /node undefined, not the stored route repository node RN_base/
+    )
+  } finally {
+    ctx.ledger.close()
+    await rm(ctx.temp, { force: true, recursive: true })
+  }
+})
+
+test('admission rejects repository-local Git URL rewrites', async () => {
+  const ctx = await setup('url-rewrite')
+  try {
+    let remoteReads = 0
+    const runner: CommandRunner = async (_executable, args) => {
+      if (args[0] === 'config') {
+        return {
+          code: 0,
+          stdout: `url.file:///tmp/other.git.insteadof ${ctx.destination}\n`,
+          stderr: ''
+        }
+      }
+      remoteReads += 1
+      return { code: 127, stdout: '', stderr: 'unexpected remote access' }
+    }
+    await assert.rejects(
+      admitCandidatePublication({
+        ledger: ctx.ledger,
+        runId: ctx.runId,
+        destination: ctx.destination,
+        resolveRepositoryIdentity: async () => ({ id: 'R_base', nodeId: 'RN_base' }),
+        runner,
+        observedAt: TIME
+      }),
+      /redirected by Git url\.\* rewrite configuration/
+    )
+    assert.equal(remoteReads, 0)
   } finally {
     ctx.ledger.close()
     await rm(ctx.temp, { force: true, recursive: true })
