@@ -60,6 +60,7 @@ test('init fails closed and rolls back when the origin default branch is ambiguo
     git(repo, 'checkout', '-b', 'feature')
     await commitAll(repo, 'file.txt', 'second\n', 'second')
     git(repo, 'push', 'origin', 'feature')
+    git(origin, 'symbolic-ref', 'HEAD', 'refs/heads/missing')
     const paths = repositoryGatePaths(repo)
     await assert.rejects(initializeLocalGate(repo, process.argv[1]!), /could not determine the default branch/)
     assert.equal(git(repo, 'remote', 'get-url', 'origin'), origin)
