@@ -2649,27 +2649,19 @@ export class DomainLedger {
       if (existing) {
         if (
           existing.gate_identity !== input.gateIdentity ||
-          existing.repo_root !== input.repoRoot ||
           existing.ref_name !== input.refName ||
           existing.new_oid !== input.newOid ||
           existing.intent_hash !== hash
         ) {
           throw new Error(`submission admission ${input.admissionId} does not match its identity`)
         }
-        if (existing.source !== input.source && existing.status !== 'accepted') {
-          throw new Error(`submission admission ${input.admissionId} was admitted through another ingress`)
-        }
-        if (
-          existing.status === 'failed' &&
-          existing.source === input.source &&
-          existing.run_id === null
-        ) {
+        if (existing.status === 'failed' && existing.run_id === null) {
           const lease = this.#db
             .prepare(
               `SELECT admission_id FROM pending_admission_leases
                WHERE repo_root = ? AND ref_name = ?`
             )
-            .get(input.repoRoot, input.refName) as { admission_id: string } | undefined
+            .get(existing.repo_root, input.refName) as { admission_id: string } | undefined
           if (lease && lease.admission_id !== input.admissionId) {
             throw new Error(`pending admission lease already exists for ${input.refName}`)
           }
@@ -2678,17 +2670,17 @@ export class DomainLedger {
             .prepare(
               `UPDATE submission_admissions
                SET status = 'pending', lease_token = ?, launched_at = NULL,
-                   accepted_oid = NULL, accepted_at = NULL
+                   accepted_oid = NULL, accepted_at = NULL, source = ?
                WHERE admission_id = ?`
             )
-            .run(randomUUID(), input.admissionId)
+            .run(randomUUID(), input.source, input.admissionId)
           if (lease) {
             this.#db
               .prepare(
                 `UPDATE pending_admission_leases
                  SET acquired_at = ? WHERE repo_root = ? AND ref_name = ?`
               )
-              .run(now, input.repoRoot, input.refName)
+              .run(now, existing.repo_root, input.refName)
           } else {
             this.#db
               .prepare(
@@ -2696,7 +2688,7 @@ export class DomainLedger {
                    (repo_root, ref_name, admission_id, acquired_at)
                  VALUES (?, ?, ?, ?)`
               )
-              .run(input.repoRoot, input.refName, input.admissionId, now)
+              .run(existing.repo_root, input.refName, input.admissionId, now)
           }
           this.#db.exec('COMMIT')
           return this.submissionAdmission(input.admissionId)!

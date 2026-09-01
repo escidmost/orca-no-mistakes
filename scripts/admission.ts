@@ -304,6 +304,7 @@ export async function initializeLocalGate(
   } catch (error) {
     if (previousRemote) {
       tryGitSync(['-C', paths.repoRoot, 'remote', 'set-url', GATE_REMOTE_NAME, previousRemote])
+      tryGitSync(['-C', paths.repoRoot, 'config', '--unset-all', `remote.${GATE_REMOTE_NAME}.pushurl`])
       for (const pushUrl of previousPushUrls?.split('\n').filter(Boolean) ?? []) {
         tryGitSync(['-C', paths.repoRoot, 'config', '--add', `remote.${GATE_REMOTE_NAME}.pushurl`, pushUrl])
       }
