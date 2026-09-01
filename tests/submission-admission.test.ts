@@ -118,6 +118,7 @@ test('a competing submission on the same ref cannot acquire the pending lease', 
         }),
       /pending admission lease already exists/
     )
+
   } finally {
     ledger.close()
     await rm(temp, { force: true, recursive: true })
@@ -154,6 +155,16 @@ test('an unbound failed direct admission can be retried', async () => {
         }),
       /pending admission lease already exists/
     )
+
+    const gateInput = {
+      ...input,
+      admissionId: `admission-${'e'.repeat(64)}`,
+      refName: 'refs/heads/gate-feature',
+      source: 'gate' as const
+    }
+    ledger.beginSubmissionAdmission(gateInput)
+    ledger.failSubmissionAdmission(gateInput.admissionId)
+    assert.equal(ledger.beginSubmissionAdmission(gateInput).status, 'pending')
   } finally {
     ledger.close()
     await rm(temp, { force: true, recursive: true })
