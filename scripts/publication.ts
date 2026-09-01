@@ -327,6 +327,9 @@ export async function publishCandidate(input: PublicationInput): Promise<{
   const runner = input.runner ?? runCommand
   const env = input.env ?? process.env
   const now = input.now ?? (() => new Date().toISOString())
+  if (!isAuthoritativeStageEvidence(input.workerIdentity)) {
+    throw new CandidatePublicationError('publication worker identity is not authoritative')
+  }
   const route = input.ledger.publicationRoute(input.runId)
   const baseline = input.ledger.publicationBaseline(input.runId)
   const run = input.ledger.run(input.runId)
