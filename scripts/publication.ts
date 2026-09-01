@@ -517,6 +517,11 @@ export async function publishCandidate(input: PublicationInput): Promise<{
   const settlement = input.ledger.settleRemoteStage({
     runId: input.runId,
     stageId: 'push',
+    ownership: {
+      repoRoot: run.repo_root,
+      branch: run.branch,
+      generationToken: input.generationToken
+    },
     checkpoint: {
       inputCommitOid: candidate,
       outputCommitOid: candidate,

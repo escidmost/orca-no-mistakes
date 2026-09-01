@@ -3167,6 +3167,7 @@ export class DomainLedger {
     }
     runId: string
     stageId: 'pr' | 'push'
+    ownership?: { branch: string; generationToken?: number; repoRoot: string }
   }): { evidenceId: string; receiptSha256: string } {
     const expectedKind: RemoteReceiptKind =
       input.stageId === 'push' ? 'candidate-publication' : 'pull-request-binding'
@@ -3209,6 +3210,9 @@ export class DomainLedger {
     const receiptJson = canonicalJson(input.receipt.payload)
     this.#db.exec('BEGIN IMMEDIATE')
     try {
+      if (input.ownership !== undefined && !this.ownsLease(input.runId, input.ownership)) {
+        throw new Error(`run ${input.runId} no longer owns its branch lease`)
+      }
       const existingEvidence = this.#db.prepare(
         `SELECT evidence_id
          FROM stage_evidence
