@@ -12791,10 +12791,10 @@ Run options:
       }
       if (
         gateMetadata &&
-        path.resolve(gateMetadata.repoRoot) !== path.resolve(launchRepoState.root)
+        path.resolve(gateMetadata.commonDir) !== path.resolve(gatePaths.commonDir)
       ) {
         throw new Error(
-          `the local gate is routed to ${gateMetadata.repoRoot}; run direct submissions from that worktree`,
+          `the local gate is routed to ${gateMetadata.repoRoot}; run direct submissions from that repository`,
         );
       }
       if (gateMetadata) gateIdentity = gateMetadata.gateIdentity;
