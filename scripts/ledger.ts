@@ -1890,6 +1890,21 @@ WHEN NOT EXISTS (
 BEGIN SELECT RAISE(ABORT, 'receipt observation does not belong to run'); END;
 `
 
+export type AttemptOutcomeInput = {
+  actorIdentity: string
+  attemptId: string
+  candidateCommitOid: string
+  completedAt: string
+  coordinatorIdentity: string
+  custody: Record<string, unknown>
+  reason: string
+  receiptDigests: string[]
+  resumeEligible: boolean
+  runId: string
+  stoppingFact: string
+  verdict: Exclude<RunStatus, 'in-progress'>
+}
+
 export class DomainLedger {
   readonly #db: DatabaseSync
   readonly #path: string
@@ -2795,20 +2810,7 @@ export class DomainLedger {
     )
   }
 
-  recordAttemptOutcome(input: {
-    actorIdentity: string
-    attemptId: string
-    candidateCommitOid: string
-    completedAt: string
-    coordinatorIdentity: string
-    custody: Record<string, unknown>
-    reason: string
-    receiptDigests: string[]
-    resumeEligible: boolean
-    runId: string
-    stoppingFact: string
-    verdict: Exclude<RunStatus, 'in-progress'>
-  }): string {
+  recordAttemptOutcome(input: AttemptOutcomeInput): string {
     const attempt = this.#db.prepare(
       `SELECT run_id, actor_identity, coordinator_identity
        FROM run_attempts WHERE attempt_id = ?`
@@ -3697,44 +3699,86 @@ export class DomainLedger {
   ): boolean {
     this.#db.exec('BEGIN IMMEDIATE')
     try {
-      const run = this.runIdentity(runId)
-      const lease =
-        ownership === undefined ? undefined : this.leaseFor(ownership.repoRoot, ownership.branch)
-      if (
-        ownership !== undefined &&
-        (!run ||
-          run.repo_root !== ownership.repoRoot ||
-          run.branch !== ownership.branch ||
-          (run.status === 'in-progress'
-            ? lease?.run_id !== runId ||
-              (ownership.generationToken !== undefined &&
-                lease.generation_token !== ownership.generationToken)
-            : run.status !== status))
-      ) {
-        this.#db.exec('COMMIT')
-        return false
-      }
-      const settled = this.finishRun(runId, status)
-      const alreadySettled = run?.status === status
-      if (settled || alreadySettled) this.releaseLease(runId)
-      let presentationRecorded: boolean | undefined
-      if (presentation && (settled || alreadySettled)) {
-        presentationRecorded = this.recordPresentationSnapshot(
-          runId,
-          presentation.eventKey,
-          presentation.snapshot
-        )
-        if (settled && !presentationRecorded) {
-          throw new Error(`presentation event ${presentation.eventKey} is already recorded`)
-        }
-      }
+      const settled = this.#settleRunLocked(runId, status, ownership, presentation)
       this.#db.exec('COMMIT')
-      if (presentation) return presentationRecorded ?? false
-      return ownership === undefined ? settled : settled || alreadySettled
+      return settled
     } catch (error) {
       this.#db.exec('ROLLBACK')
       throw error
     }
+  }
+
+  settleRunWithAttemptOutcome(
+    input: AttemptOutcomeInput,
+    runId: string,
+    status: 'cancelled' | 'failed',
+    ownership?: { branch: string; generationToken?: number; repoRoot: string },
+    presentation?: { eventKey: string; snapshot: PresentationSnapshot }
+  ): boolean {
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      if (this.#settlementBlocked(runId, status, ownership)) {
+        this.#db.exec('COMMIT')
+        return false
+      }
+      this.recordAttemptOutcome(input)
+      const settled = this.#settleRunLocked(runId, status, ownership, presentation)
+      if (!settled) {
+        this.#db.exec('ROLLBACK')
+        return settled
+      }
+      this.#db.exec('COMMIT')
+      return settled
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  #settlementBlocked(
+    runId: string,
+    status: 'cancelled' | 'failed',
+    ownership?: { branch: string; generationToken?: number; repoRoot: string }
+  ): boolean {
+    if (ownership === undefined) return false
+    const run = this.runIdentity(runId)
+    const lease = this.leaseFor(ownership.repoRoot, ownership.branch)
+    return (
+      !run ||
+      run.repo_root !== ownership.repoRoot ||
+      run.branch !== ownership.branch ||
+      (run.status === 'in-progress'
+        ? lease?.run_id !== runId ||
+          (ownership.generationToken !== undefined &&
+            lease.generation_token !== ownership.generationToken)
+        : run.status !== status)
+    )
+  }
+
+  #settleRunLocked(
+    runId: string,
+    status: 'cancelled' | 'failed',
+    ownership?: { branch: string; generationToken?: number; repoRoot: string },
+    presentation?: { eventKey: string; snapshot: PresentationSnapshot }
+  ): boolean {
+    if (this.#settlementBlocked(runId, status, ownership)) return false
+    const run = this.runIdentity(runId)
+    const settled = this.finishRun(runId, status)
+    const alreadySettled = run?.status === status
+    if (settled || alreadySettled) this.releaseLease(runId)
+    let presentationRecorded: boolean | undefined
+    if (presentation && (settled || alreadySettled)) {
+      presentationRecorded = this.recordPresentationSnapshot(
+        runId,
+        presentation.eventKey,
+        presentation.snapshot
+      )
+      if (settled && !presentationRecorded) {
+        throw new Error(`presentation event ${presentation.eventKey} is already recorded`)
+      }
+    }
+    if (presentation) return presentationRecorded ?? false
+    return ownership === undefined ? settled : settled || alreadySettled
   }
 
   #requirePassedRunLease(

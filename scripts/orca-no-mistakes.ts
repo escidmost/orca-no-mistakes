@@ -105,6 +105,7 @@ import {
   verifyCompletionAttestation,
   verifyManifest,
   type CompletionAttestationManifest,
+  type AttemptOutcomeInput,
   type FindingDecisionRow,
   type PassedAttestationManifest,
   type PrunableRun,
@@ -1662,9 +1663,19 @@ function settleRunOrThrow(
   originalError: unknown,
   ownership?: Parameters<DomainLedger["settleRun"]>[2],
   presentation?: Parameters<DomainLedger["settleRun"]>[3],
+  attemptOutcome?: AttemptOutcomeInput,
 ): boolean {
   try {
-    const settled = ledger.settleRun(runId, outcome, ownership, presentation);
+    const settled =
+      attemptOutcome === undefined
+        ? ledger.settleRun(runId, outcome, ownership, presentation)
+        : ledger.settleRunWithAttemptOutcome(
+            attemptOutcome,
+            runId,
+            outcome,
+            ownership,
+            presentation,
+          );
     if (!settled && ledger.runStatus(runId) !== outcome) {
       throw new Error(`run ${runId} no longer owns its branch lease`);
     }
@@ -1908,6 +1919,7 @@ export async function runPipeline(
           console.error(`warning: presentation renderer failed: ${String(error)}`),
         statusRenderer
           ? () => {
+              resumeControlAvailable = false;
               try {
                 (statusRenderer as { close?: () => void }).close?.();
               } catch {}
@@ -1996,32 +2008,32 @@ export async function runPipeline(
               kind: "error-recorded",
               resumable: false,
             },
-            (snapshot) => {
-              if (attemptId) {
-                ledger.recordAttemptOutcome({
-                  actorIdentity,
-                  attemptId,
-                  candidateCommitOid: repo.head,
-                  completedAt: new Date().toISOString(),
-                  coordinatorIdentity,
-                  custody: {},
-                  reason: error instanceof Error ? error.message : String(error),
-                  receiptDigests: [],
-                  resumeEligible: false,
-                  runId,
-                  stoppingFact: "attempt setup failed",
-                  verdict: "failed",
-                });
-              }
-              return settleRunOrThrow(
+            (snapshot) =>
+              settleRunOrThrow(
                 ledger,
                 runId,
                 "failed",
                 error,
                 ownership,
                 { eventKey, snapshot },
-              );
-            },
+                attemptId
+                  ? {
+                      actorIdentity,
+                      attemptId,
+                      candidateCommitOid: repo.head,
+                      completedAt: new Date().toISOString(),
+                      coordinatorIdentity,
+                      custody: {},
+                      reason:
+                        error instanceof Error ? error.message : String(error),
+                      receiptDigests: [],
+                      resumeEligible: false,
+                      runId,
+                      stoppingFact: "attempt setup failed",
+                      verdict: "failed",
+                    }
+                  : undefined,
+              ),
           );
           presentation.publish(
             `attempt:${presentation.current.attempt}:run:completed:failed`,
@@ -3018,23 +3030,6 @@ export async function runPipeline(
               if (!attemptId || anchoredOid === undefined) {
                 throw new Error("pipeline attempt outcome lacks durable identity");
               }
-              ledger.recordAttemptOutcome({
-                actorIdentity,
-                attemptId,
-                candidateCommitOid: anchoredOid,
-                completedAt: new Date().toISOString(),
-                coordinatorIdentity,
-                custody: {
-                  anchoredOid,
-                  recoverRef: (failure as CustodyTaggedError).recoverRef,
-                },
-                reason,
-                receiptDigests: [],
-                resumeEligible: resumable,
-                runId,
-                stoppingFact: `${outcome} during pipeline execution`,
-                verdict: outcome,
-              });
               return settleRunOrThrow(
                 ledger,
                 runId,
@@ -3042,6 +3037,23 @@ export async function runPipeline(
                 failure,
                 ownership,
                 { eventKey, snapshot },
+                {
+                  actorIdentity,
+                  attemptId,
+                  candidateCommitOid: anchoredOid,
+                  completedAt: new Date().toISOString(),
+                  coordinatorIdentity,
+                  custody: {
+                    anchoredOid,
+                    recoverRef: (failure as CustodyTaggedError).recoverRef,
+                  },
+                  reason,
+                  receiptDigests: [],
+                  resumeEligible: resumable,
+                  runId,
+                  stoppingFact: `${outcome} during pipeline execution`,
+                  verdict: outcome,
+                },
               );
             };
           if (outcome === "cancelled") {
@@ -3079,6 +3091,17 @@ export async function runPipeline(
         return resumable && resumeControlAvailable;
       });
       if (!retry) throw failure;
+
+      for (const worker of [...abortReap.workers]) {
+        try {
+          await releaseWorker(worker, orca);
+        } catch (cleanupError) {
+          throw new WorkerCleanupError(
+            `failed-attempt worker cleanup failed: ${String(cleanupError)}`,
+            { cause: failure },
+          );
+        }
+      }
 
       await waitForResume();
       const resumeHead = await git.head();
