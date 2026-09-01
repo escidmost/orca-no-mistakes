@@ -195,6 +195,7 @@ export function sanitizeCoordinatorEnvironment(
     'TMPDIR',
     'USER',
     'XDG_CONFIG_HOME',
+    'ORCA_NO_MISTAKES_CONFIG_DIR',
     'ORCA_CLI_COMMAND',
     'ORCA_NO_MISTAKES_HOME',
     'ORCA_NO_MISTAKES_USER_CONFIG'

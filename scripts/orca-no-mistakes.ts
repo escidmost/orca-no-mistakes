@@ -227,6 +227,7 @@ type WorkerRegistration = (() => void | Promise<void>) & {
   ready?: Promise<void>;
 };
 type WorkerAllocated = (worker: WorkerResult) => WorkerRegistration;
+type WorkerReportFailure = (worker: WorkerResult, error: Error) => Promise<void>;
 
 export interface OrcaOperations {
   createRun(objective: string): Promise<string>;
@@ -241,6 +242,7 @@ export interface OrcaOperations {
     launch: WorkerLaunch,
     fence?: TimeoutFence,
     onAllocated?: WorkerAllocated,
+    onReportFailure?: WorkerReportFailure,
   ): Promise<WorkerResult>;
   finishWorker(
     worker: WorkerResult,
@@ -1660,6 +1662,16 @@ export class PostMutationCustodyError extends Error {}
 class WorkerCleanupError extends Error {}
 
 class ResumableStageError extends Error {}
+
+class WorkerReportError extends Error {
+  readonly worker: WorkerResult;
+
+  constructor(message: string, worker: WorkerResult) {
+    super(message);
+    this.worker = worker;
+    this.name = "WorkerReportError";
+  }
+}
 
 export class RecoveryAnchorError extends Error {
   readonly outcome: "cancelled" | "failed";
@@ -3473,6 +3485,7 @@ export type FallbackAttempt = {
 
 export type WorkerLaunchOutcome = {
   attempts: FallbackAttempt[];
+  launch: WorkerLaunch;
   reportRetries: number;
   resolvedAgent: string;
   worker: WorkerResult;
@@ -3491,11 +3504,13 @@ function isRepairableWorkerReportError(error: unknown): boolean {
 }
 
 function repairWorkerReportLaunch(launch: WorkerLaunch): WorkerLaunch {
+  const shape = `{"findings":[...],"summary":"...","tested":[...],"artifacts":[...]}`;
   return {
     ...launch,
     prompt: `${launch.prompt}
 
-REPORT REPAIR: the previous response did not produce a readable report. Retry the task, create the report parent directory, and write a complete JSON object to the requested report path with a nonempty string summary, a findings array, and any tested/artifacts arrays required by the task before reporting completion. Do not report completion until the file exists and is readable; do not omit the summary.`,
+REPORT REPAIR: the previous response did not produce a valid report. Retry the task and follow the delivery contract exactly.
+${deliveryInstruction(deliveryChannel(launch.agent), launch.reportPath ?? "", shape)}`,
     ...(launch.retainedWorktreeId || launch.terminal
       ? {
           retainedWorktreeId: undefined,
@@ -3522,6 +3537,7 @@ export async function startWorkerWithFallback(
   fence?: TimeoutFence,
   onReportRetry?: (launch: WorkerLaunch) => Promise<void>,
   reportRetry = 0,
+  onReportFailure?: WorkerReportFailure,
 ): Promise<WorkerLaunchOutcome> {
   if (launches.length === 0)
     throw new Error("no agent configured for this role");
@@ -3575,12 +3591,20 @@ export async function startWorkerWithFallback(
             }
           },
         },
-        () => orca.startWorker(taskId, launch, fence, onAllocated),
+        () =>
+          orca.startWorker(
+            taskId,
+            launch,
+            fence,
+            onAllocated,
+            onReportFailure,
+          ),
       );
       if (!allocated) onAllocated(worker);
       await allocationRegistration?.ready;
       return {
         attempts,
+        launch,
         reportRetries: reportRetry,
         resolvedAgent: launch.agent?.harness ?? DEFAULT_WORKER_AGENT,
         worker,
@@ -3592,7 +3616,7 @@ export async function startWorkerWithFallback(
         reportRetry < WORKER_REPORT_RETRY_LIMIT
       ) {
         await onReportRetry?.(launch);
-        return startWorkerWithFallback(
+        const retryOutcome = await startWorkerWithFallback(
           orca,
           createTask,
           [repairWorkerReportLaunch(launch)],
@@ -3600,7 +3624,12 @@ export async function startWorkerWithFallback(
           fence,
           onReportRetry,
           reportRetry + 1,
+          onReportFailure,
         );
+        return {
+          ...retryOutcome,
+          attempts: [...attempts, ...retryOutcome.attempts],
+        };
       }
       if (
         !allocated &&
@@ -3820,10 +3849,7 @@ async function runReviewer(
       } catch (error) {
         if (reportRetry >= WORKER_REPORT_RETRY_LIMIT) throw error;
         reportRetry += 1;
-        const launch =
-          retryLaunches[outcome.attempts.length] ?? retryLaunches[0];
-        if (!launch) throw error;
-        retryLaunches = [repairWorkerReportLaunch(launch)];
+        retryLaunches = [repairWorkerReportLaunch(outcome.launch)];
         continue;
       }
       if (worker.failedOutcome === true) {
@@ -4084,6 +4110,26 @@ async function runFixer(
         await releaseFixerSession(staleSession, orca);
       },
       reportRetry,
+      async (worker, error) => {
+        if (
+          sessionToReuse &&
+          worker.worktreeId === sessionToReuse.worker.worktreeId
+        ) {
+          sessionToReuse = undefined;
+          retainedSession = undefined;
+        }
+        if (worker.worktreePath) {
+          try {
+            await git.anchorRecoveryRef(
+              `${runId}-fixer-${stage}-${round}`,
+              await git.headOf(worker.worktreePath),
+            );
+          } catch {
+            // Keep the original report failure; normal release still runs.
+          }
+        }
+        await releaseFixerWorker(worker, orca, stage, error);
+      },
     );
     const worker = outcome.worker;
     reportRetry = outcome.reportRetries;
@@ -4107,10 +4153,7 @@ async function runFixer(
         reportRetry += 1;
         sessionToReuse = undefined;
         retainedSession = undefined;
-        const launch =
-          retryLaunches[outcome.attempts.length] ?? retryLaunches[0];
-        if (!launch) throw error;
-        retryLaunches = [repairWorkerReportLaunch(launch)];
+        retryLaunches = [repairWorkerReportLaunch(outcome.launch)];
         continue;
       }
       if (!worktreePath) {
@@ -4177,7 +4220,7 @@ async function runFixer(
         ...(retainWorker
           ? {
               session: {
-                agent: retryLaunches[outcome.attempts.length]?.agent,
+                agent: outcome.launch.agent,
                 roleKey: fixerRoleKey(role),
                 worker,
               },
@@ -5419,9 +5462,16 @@ export class CliOrca implements OrcaOperations {
     launch: WorkerLaunch,
     fence?: TimeoutFence,
     onAllocated?: WorkerAllocated,
+    onReportFailure?: WorkerReportFailure,
   ): Promise<WorkerResult> {
     if (launch.agent && classifyHarness(launch.agent.harness) === "acp") {
-      return await this.#startAcpWorker(taskId, launch, fence, onAllocated);
+      return await this.#startAcpWorker(
+        taskId,
+        launch,
+        fence,
+        onAllocated,
+        onReportFailure,
+      );
     }
     if (launch.reportPath) await rm(launch.reportPath, { force: true });
     if (launch.terminal)
@@ -5430,6 +5480,7 @@ export class CliOrca implements OrcaOperations {
         launch,
         fence,
         onAllocated,
+        onReportFailure,
       );
     const harness = (
       launch.agent?.harness ?? DEFAULT_WORKER_AGENT
@@ -5594,7 +5645,13 @@ export class CliOrca implements OrcaOperations {
         fence,
       );
       deliveryId = result.deliveryId;
-      if (result.error) throw new Error(result.error);
+      if (result.error) {
+        worker.deliveryId = deliveryId;
+        const error = new Error(result.error);
+        throw isRepairableWorkerReportError(error)
+          ? new WorkerReportError(error.message, worker)
+          : error;
+      }
       Object.assign(worker, {
         deliveryId,
         failedOutcome: result.failedOutcome,
@@ -5602,16 +5659,20 @@ export class CliOrca implements OrcaOperations {
       });
       return worker;
     } catch (error) {
-      await withGateMutation(async () => {
-        if (abortOwnsWorkerCleanup(registration)) return;
-        await this.#cleanupFailedWorker(
-          dispatchId,
-          terminalHandle,
-          worktreeId,
-          deliveryId,
-        );
-        await registration?.();
-      }, true);
+      if (error instanceof WorkerReportError && onReportFailure) {
+        await onReportFailure(error.worker, error);
+      } else {
+        await withGateMutation(async () => {
+          if (abortOwnsWorkerCleanup(registration)) return;
+          await this.#cleanupFailedWorker(
+            dispatchId,
+            terminalHandle,
+            worktreeId,
+            deliveryId,
+          );
+          await registration?.();
+        }, true);
+      }
       throw error;
     } finally {
       if (promptPath) await rm(promptPath, { force: true });
@@ -5623,6 +5684,7 @@ export class CliOrca implements OrcaOperations {
     launch: WorkerLaunch,
     fence?: TimeoutFence,
     onAllocated?: WorkerAllocated,
+    onReportFailure?: WorkerReportFailure,
   ): Promise<WorkerResult> {
     const terminalHandle = launch.terminal!;
     // Bound before worker-start so a retained preflight failure still records
@@ -5722,7 +5784,13 @@ export class CliOrca implements OrcaOperations {
         fence,
       );
       deliveryId = result.deliveryId;
-      if (result.error) throw new Error(result.error);
+      if (result.error) {
+        worker.deliveryId = deliveryId;
+        const error = new Error(result.error);
+        throw isRepairableWorkerReportError(error)
+          ? new WorkerReportError(error.message, worker)
+          : error;
+      }
       Object.assign(worker, {
         deliveryId,
         failedOutcome: result.failedOutcome,
@@ -5730,16 +5798,20 @@ export class CliOrca implements OrcaOperations {
       });
       return worker;
     } catch (error) {
-      await withGateMutation(async () => {
-        if (abortOwnsWorkerCleanup(registration)) return;
-        await this.#cleanupFailedWorker(
-          dispatchId,
-          terminalHandle,
-          undefined,
-          deliveryId,
-        );
-        await registration?.();
-      }, true);
+      if (error instanceof WorkerReportError && onReportFailure) {
+        await onReportFailure(error.worker, error);
+      } else {
+        await withGateMutation(async () => {
+          if (abortOwnsWorkerCleanup(registration)) return;
+          await this.#cleanupFailedWorker(
+            dispatchId,
+            terminalHandle,
+            undefined,
+            deliveryId,
+          );
+          await registration?.();
+        }, true);
+      }
       throw error;
     }
   }
@@ -6563,6 +6635,7 @@ export class CliOrca implements OrcaOperations {
     launch: WorkerLaunch,
     fence?: TimeoutFence,
     onAllocated?: WorkerAllocated,
+    onReportFailure?: WorkerReportFailure,
   ): Promise<WorkerResult> {
     const agent = launch.agent!;
     const target = parseAcpTarget(agent.harness);
@@ -6741,21 +6814,28 @@ export class CliOrca implements OrcaOperations {
         report = extracted === undefined ? undefined : acpReportFrom(extracted);
       }
       if (!report)
-        throw new Error(`acp target ${target} returned an invalid report`);
+        throw new WorkerReportError(
+          `acp target ${target} returned an invalid report`,
+          worker,
+        );
       worker.report = report;
       return worker;
     } catch (error) {
-      await withGateMutation(async () => {
-        if (
-          processAbort.signal.aborted ||
-          abortOwnsWorkerCleanup(registration)
-        ) {
-          return;
-        }
-        if (worktreeId)
-          await this.#cleanupPreparedWorker({ terminalHandle: "", worktreeId });
-        await registration?.();
-      }, true);
+      if (error instanceof WorkerReportError && onReportFailure) {
+        await onReportFailure(error.worker, error);
+      } else {
+        await withGateMutation(async () => {
+          if (
+            processAbort.signal.aborted ||
+            abortOwnsWorkerCleanup(registration)
+          ) {
+            return;
+          }
+          if (worktreeId)
+            await this.#cleanupPreparedWorker({ terminalHandle: "", worktreeId });
+          await registration?.();
+        }, true);
+      }
       throw error;
     }
   }
@@ -10376,7 +10456,11 @@ async function launchDetachedRun(
       `ORCA_CLI_COMMAND=${shellQuote(process.env.ORCA_CLI_COMMAND)}`,
     );
   }
-  for (const name of ["ORCA_NO_MISTAKES_USER_CONFIG", "XDG_CONFIG_HOME"]) {
+  for (const name of [
+    "ORCA_NO_MISTAKES_USER_CONFIG",
+    "ORCA_NO_MISTAKES_CONFIG_DIR",
+    "XDG_CONFIG_HOME",
+  ]) {
     const value = process.env[name];
     if (value) environment.push(`${name}=${shellQuote(value)}`);
   }
@@ -13237,22 +13321,27 @@ Run options:
     let gateIdentity = sha256(
       canonicalJson({ gatePath: gatePaths.gatePath, repoRoot: gatePaths.repoRoot }),
     );
-    if (existsSync(path.join(gatePaths.stateDir, "gate.json"))) {
-      let gateMetadata: GateMetadata | undefined;
+    if (
+      existsSync(gatePaths.gatePath) ||
+      existsSync(path.join(gatePaths.stateDir, "gate.json"))
+    ) {
+      let gateMetadata: GateMetadata;
       try {
         gateMetadata = await readGateMetadata(gatePaths.gatePath);
-      } catch {
-        // A malformed gate is not needed for direct admission; init will repair it.
+      } catch (error) {
+        throw new Error(
+          `local gate metadata is invalid: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+          { cause: error },
+        );
       }
-      if (
-        gateMetadata &&
-        path.resolve(gateMetadata.commonDir) !== path.resolve(gatePaths.commonDir)
-      ) {
+      if (path.resolve(gateMetadata.commonDir) !== path.resolve(gatePaths.commonDir)) {
         throw new Error(
           `the local gate is routed to ${gateMetadata.repoRoot}; run direct submissions from that repository`,
         );
       }
-      if (gateMetadata) gateIdentity = gateMetadata.gateIdentity;
+      gateIdentity = gateMetadata.gateIdentity;
     }
     admissionLedger = openRepositoryLedger(launchRepoState.root, false);
     admissionRow = admissionLedger.beginSubmissionAdmission({

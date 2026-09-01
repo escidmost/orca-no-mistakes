@@ -2857,6 +2857,7 @@ test("detached run selects the Run TUI by default and preserves explicit opt-out
   const callsPath = path.join(temp, "calls.jsonl");
   const previousCommand = process.env.ORCA_CLI_COMMAND;
   const previousHandle = process.env.ORCA_TERMINAL_HANDLE;
+  const previousConfigDir = process.env.ORCA_NO_MISTAKES_CONFIG_DIR;
   const previousConfig = process.env.ORCA_NO_MISTAKES_USER_CONFIG;
   try {
     git(temp, "init", "--bare", origin);
@@ -2906,6 +2907,7 @@ console.log(JSON.stringify({ result }))
       temp,
       "missing-user-config.yaml",
     );
+    process.env.ORCA_NO_MISTAKES_CONFIG_DIR = path.join(temp, "config-dir");
 
     await main([
       "run",
@@ -2979,6 +2981,11 @@ console.log(JSON.stringify({ result }))
         `ORCA_NO_MISTAKES_USER_CONFIG='${path.join(temp, "missing-user-config.yaml")}'`,
       ),
     );
+    assert.ok(
+      commandText.includes(
+        `ORCA_NO_MISTAKES_CONFIG_DIR='${path.join(temp, "config-dir")}'`,
+      ),
+    );
     assert.ok(commandText.includes("NO_MISTAKES_DELIVERY_BRANCH='feature'"));
     assert.ok(commandText.includes("NO_MISTAKES_STARTUP_RECEIPT="));
     assert.ok(commandText.includes("'--notify' 'originating-opencode'"));
@@ -2996,6 +3003,9 @@ console.log(JSON.stringify({ result }))
     else process.env.ORCA_CLI_COMMAND = previousCommand;
     if (previousHandle === undefined) delete process.env.ORCA_TERMINAL_HANDLE;
     else process.env.ORCA_TERMINAL_HANDLE = previousHandle;
+    if (previousConfigDir === undefined)
+      delete process.env.ORCA_NO_MISTAKES_CONFIG_DIR;
+    else process.env.ORCA_NO_MISTAKES_CONFIG_DIR = previousConfigDir;
     if (previousConfig === undefined)
       delete process.env.ORCA_NO_MISTAKES_USER_CONFIG;
     else process.env.ORCA_NO_MISTAKES_USER_CONFIG = previousConfig;
@@ -8916,7 +8926,70 @@ test("an unreadable worker report gets one contract-repair retry", async () => {
 
   assert.equal(outcome.worker.report.summary, "review");
   assert.equal(orca.tasks.length, 2);
-  assert.match(orca.launches[1].prompt, /create the report parent directory/);
+  assert.match(orca.launches[1].prompt, /parent directory/i);
+});
+
+test("report repair preserves the selected fallback launch", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  orca.launchFailures.push(
+    new PreflightError("auth", "candidate A is unavailable"),
+    new Error("worker candidate B report could not be read: missing report"),
+  );
+
+  const outcome = await startWorkerWithFallback(
+    orca,
+    (launch) => orca.createTask(launch.prompt),
+    [
+      {
+        agent: { harness: "candidate-a" },
+        name: "candidate-a",
+        prompt: "Try candidate A.",
+        role: "reviewer",
+        stage: "review",
+        worktree: "current",
+      },
+      {
+        agent: { harness: "candidate-b" },
+        name: "candidate-b",
+        prompt: "Try candidate B.",
+        role: "reviewer",
+        stage: "review",
+        worktree: "current",
+      },
+    ],
+  );
+
+  assert.equal(outcome.attempts.length, 1);
+  assert.equal(outcome.launch.agent?.harness, "candidate-b");
+  assert.match(orca.launches.at(-1)?.prompt ?? "", /Try candidate B/);
+});
+
+test("ACP report repair keeps the final-message delivery contract", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  orca.launchFailures.push(
+    new Error("worker acp-1 returned an invalid report"),
+  );
+
+  await startWorkerWithFallback(
+    orca,
+    (launch) => orca.createTask(launch.prompt),
+    [
+      {
+        agent: { harness: "acp:test" },
+        name: "acp-report-repair",
+        prompt: "Return the review.",
+        role: "reviewer",
+        stage: "review",
+        worktree: "current",
+      },
+    ],
+  );
+
+  const repairPrompt = orca.launches.at(-1)?.prompt ?? "";
+  assert.match(repairPrompt, /Do not write a report file/);
+  assert.doesNotMatch(repairPrompt, /create the report parent directory/);
 });
 
 test("CliOrca retries twice when repaired report files are also missing", async () => {
