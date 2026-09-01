@@ -2642,10 +2642,8 @@ export class DomainLedger {
         }
         if (
           existing.status === 'failed' &&
-          existing.source === 'direct' &&
-          input.source === 'direct' &&
-          existing.run_id === null &&
-          existing.launcher_pid === null
+          existing.source === input.source &&
+          existing.run_id === null
         ) {
           const lease = this.#db
             .prepare(
@@ -2885,7 +2883,12 @@ export class DomainLedger {
         return
       }
       this.#db
-        .prepare('UPDATE submission_admissions SET status = ? WHERE admission_id = ?')
+        .prepare(
+          `UPDATE submission_admissions
+           SET status = ?, launched_at = CASE WHEN run_id IS NULL THEN NULL ELSE launched_at END,
+               launcher_pid = CASE WHEN run_id IS NULL THEN NULL ELSE launcher_pid END
+           WHERE admission_id = ?`
+        )
         .run(status, admissionId)
       this.#db
         .prepare('DELETE FROM pending_admission_leases WHERE admission_id = ?')
