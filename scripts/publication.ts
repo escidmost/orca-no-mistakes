@@ -385,6 +385,12 @@ export async function publishCandidate(input: PublicationInput): Promise<{
         !isAuthoritativeStageEvidence(settled.worker_identity)) {
       throw new CandidatePublicationError('push round 0 is already settled with different facts')
     }
+    const settledProblems = inputEvidenceProblems(input.ledger, input.runId, settled)
+    if (settledProblems.length > 0) {
+      throw new CandidatePublicationError(
+        `settled push round 0 retained evidence is invalid: ${settledProblems.join('; ')}`
+      )
+    }
     return { candidateCommitOid: candidate, outcome, receiptSha256: receipt.receipt_sha256 }
   }
   terminalCandidate(input.ledger, input.runId)
