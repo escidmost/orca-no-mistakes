@@ -216,15 +216,23 @@ export async function initializeLocalGate(
     if (!tryGitSync(['-C', paths.repoRoot, 'remote', 'get-url', 'origin'])) {
       throw new Error('the repository must have an origin remote before gate initialization')
     }
+    const objectFormat = gitSync(['-C', paths.repoRoot, 'rev-parse', '--show-object-format'])
     if (!gateExisted) {
       await mkdir(paths.stateDir, { recursive: true })
       gitSync([
         'init',
         '--bare',
         '--quiet',
-        `--object-format=${gitSync(['-C', paths.repoRoot, 'rev-parse', '--show-object-format'])}`,
+        `--object-format=${objectFormat}`,
         paths.gatePath
       ])
+    } else {
+      const gateFormat = tryGitSync(['--git-dir', paths.gatePath, 'rev-parse', '--show-object-format'])
+      if (gateFormat !== objectFormat) {
+        throw new Error(
+          `the existing gate object format ${gateFormat ?? 'unknown'} does not match the repository object format ${objectFormat}`
+        )
+      }
     }
     await mkdir(path.join(paths.gatePath, 'hooks'), { recursive: true })
     gitSync(['--git-dir', paths.gatePath, 'config', 'core.hooksPath', path.join(paths.gatePath, 'hooks')])
@@ -379,8 +387,10 @@ export function validateQuarantinedCommit(
 export async function waitForPermanentRef(
   metadata: GateMetadata,
   update: ReceiveUpdate,
-  pollMs = 100
+  pollMs = 100,
+  timeoutMs = 10_000
 ): Promise<void> {
+  const deadline = Date.now() + timeoutMs
   for (;;) {
     const current = tryGitSync([
       '--git-dir',
@@ -395,6 +405,9 @@ export async function waitForPermanentRef(
     }
     if (!current && !ZERO_OBJECT_ID.test(update.oldOid)) {
       throw new Error('the admitted feature ref was superseded before acceptance')
+    }
+    if (Date.now() >= deadline) {
+      throw new Error('the admitted feature ref did not materialize in the gate')
     }
     await delay(pollMs)
   }
@@ -487,6 +500,10 @@ function detectDefaultBranch(repoRoot: string): string {
     .map((ref) => ref.slice('origin/'.length))
   if (remoteBranches.length === 1) return remoteBranches[0]
   if (!remoteBranches.length) {
+    const advertisement =
+      tryGitSync(['-C', repoRoot, 'ls-remote', '--symref', 'origin', 'HEAD']) ?? ''
+    const advertised = /^ref: refs\/heads\/(\S+)\tHEAD$/m.exec(advertisement)
+    if (advertised) return advertised[1]
     const localHead = tryGitSync(['-C', repoRoot, 'symbolic-ref', '--short', 'HEAD'])
     if (localHead) return localHead
   }
