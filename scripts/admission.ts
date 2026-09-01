@@ -383,19 +383,23 @@ export async function waitForLaunchReadiness(
 ): Promise<LaunchReadiness> {
   const deadline = Date.now() + startupTimeoutMs
   for (;;) {
+    let readiness: LaunchReadiness | undefined
     try {
-      const readiness = JSON.parse(await readFile(readinessPath, 'utf8')) as LaunchReadiness
-      if (expectedNonce !== undefined && readiness.nonce !== expectedNonce) {
-        throw new Error('ENOENT')
-      }
-      if (readiness.state === 'ready' && typeof readiness.runId === 'string') return readiness
-      if (readiness.state === 'failed') {
-        throw new Error(readiness.error ?? 'coordinator launch failed')
-      }
-      throw new Error('coordinator readiness is invalid')
+      readiness = JSON.parse(await readFile(readinessPath, 'utf8')) as LaunchReadiness
     } catch (error) {
-      if (error instanceof Error && error.message !== 'ENOENT' && !error.message.includes('no such file')) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
         throw error
+      }
+    }
+    if (readiness !== undefined) {
+      if (expectedNonce !== undefined && readiness.nonce !== expectedNonce) {
+        // A different generation owns this readiness record; keep waiting for ours.
+      } else if (readiness.state === 'ready' && typeof readiness.runId === 'string') {
+        return readiness
+      } else if (readiness.state === 'failed') {
+        throw new Error(readiness.error ?? 'coordinator launch failed')
+      } else {
+        throw new Error('coordinator readiness is invalid')
       }
     }
     if (Date.now() >= deadline) throw new Error('coordinator did not become ready')
