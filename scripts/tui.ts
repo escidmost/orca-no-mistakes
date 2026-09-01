@@ -194,6 +194,7 @@ export class RailTuiRenderer implements PresentationRenderer {
   readonly #output: Output;
   readonly #requestCancel: () => void;
   readonly #resolveGate?: GateResolver;
+  readonly #setAutoFix?: (enabled: boolean) => Promise<void> | void;
   readonly #stageLogs: ReadonlyMap<string, StageLog>;
   #activityIndex = 0;
   #cancelVisible = false;
@@ -209,6 +210,7 @@ export class RailTuiRenderer implements PresentationRenderer {
   #inputBuffer = "";
   #lastFrame?: string;
   #logOffset = 0;
+  #modeSubmitting = false;
   #pinnedStage?: StageName;
   #refreshTimer?: ReturnType<typeof setInterval>;
   #selectedStage = 0;
@@ -238,6 +240,7 @@ export class RailTuiRenderer implements PresentationRenderer {
     stageLogs: ReadonlyMap<string, StageLog> = new Map(),
     resolveGate?: GateResolver,
     requestCancel: () => void = () => process.kill(process.pid, "SIGINT"),
+    setAutoFix?: (enabled: boolean) => Promise<void> | void,
   ) {
     this.#input = input;
     this.#output = output;
@@ -245,6 +248,7 @@ export class RailTuiRenderer implements PresentationRenderer {
     this.#stageLogs = stageLogs;
     this.#resolveGate = resolveGate;
     this.#requestCancel = requestCancel;
+    this.#setAutoFix = setAutoFix;
     this.#inputWasPaused = input.isPaused();
     this.#inputWasRaw = input.isRaw === true;
     try {
@@ -408,13 +412,13 @@ export class RailTuiRenderer implements PresentationRenderer {
     const snapshot = this.#snapshot!;
     const pin = this.#pinnedStage ? ` | pinned ${title(this.#pinnedStage)}` : "";
     return fit(
-      `ORCA NO-MISTAKES | ${snapshot.runId} | attempt ${snapshot.attempt} | ${snapshot.status}${pin}`,
+      `ORCA NO-MISTAKES | ${snapshot.runId} | attempt ${snapshot.attempt} | ${snapshot.status} | auto-fix ${snapshot.mode.autoFix ? "on" : "off"}${pin}`,
       width,
     );
   }
 
   #full(columns: number, rows: number): string[] {
-    const railWidth = 25;
+    const railWidth = 34;
     const bodyRows = rows - 3;
     const rail = this.#rail(bodyRows, railWidth);
     if (this.#cancelVisible || this.#gateVisible) {
@@ -447,7 +451,7 @@ export class RailTuiRenderer implements PresentationRenderer {
   }
 
   #compact(columns: number, rows: number): string[] {
-    const railWidth = 24;
+    const railWidth = 34;
     const detailWidth = columns - railWidth - 3;
     const bodyRows = rows - 3;
     const rail = this.#rail(bodyRows, railWidth);
@@ -473,8 +477,8 @@ export class RailTuiRenderer implements PresentationRenderer {
     const snapshot = this.#snapshot!;
     const lines = [this.#regionTitle("RAIL", "rail", width), ""];
     for (const [index, stage] of PIPELINE_STEPS.entries()) {
-      const status =
-        snapshot.stages.find((item) => item.id === stage)?.status ?? "pending";
+      const state = snapshot.stages.find((item) => item.id === stage);
+      const status = state?.status ?? "pending";
       const active = snapshot.currentStage === stage && status === "active";
       const marker = active
         ? ">"
@@ -486,7 +490,12 @@ export class RailTuiRenderer implements PresentationRenderer {
               ? "-"
               : " ";
       const selected = index === this.#selectedStage ? ">" : " ";
-      lines.push(`${selected} [${marker}] ${index + 1}. ${title(stage)}`);
+      lines.push(
+        `${selected} [${marker}] ${index + 1}. ${title(stage)}${state?.retainedFixer ? " retained" : ""}`,
+      );
+      lines.push(
+        `    ${state?.fixedFindings ?? 0}/${state?.totalFindings ?? 0} fixed ${state?.approvedFindings ?? 0} approved ${state?.openFindings ?? state?.actionableFindings ?? 0} open`,
+      );
     }
     return Array.from({ length: rows }, (_, index) => fit(lines[index] ?? "", width));
   }
@@ -573,12 +582,20 @@ export class RailTuiRenderer implements PresentationRenderer {
   #logs(rows: number, width: number): string[] {
     const snapshot = this.#snapshot!;
     const stage = this.#pinnedStage ?? PIPELINE_STEPS[this.#selectedStage];
-    const round = snapshot.stages.find((item) => item.id === stage)?.round ?? 0;
-    const all = logTail(
-      this.#artifactsDir,
-      `${stage}_r${round}.log`,
-      this.#stageLogs,
-    );
+    const state = snapshot.stages.find((item) => item.id === stage);
+    const round = state?.round ?? 0;
+    const all = [
+      `Findings: ${state?.fixedFindings ?? 0}/${state?.totalFindings ?? 0} fixed | ${state?.approvedFindings ?? 0} approved | ${state?.openFindings ?? state?.actionableFindings ?? 0} open${state?.retainedFixer ? " | fixer retained" : ""}`,
+      ...(state?.findings ?? []).map(
+        (finding) =>
+          `[${finding.disposition}] ${finding.id}: ${finding.description}${finding.file ? ` (${finding.file}${finding.line ? `:${finding.line}` : ""})` : ""}`,
+      ),
+      ...logTail(
+        this.#artifactsDir,
+        `${stage}_r${round}.log`,
+        this.#stageLogs,
+      ),
+    ];
     const room = Math.max(0, rows - 1);
     this.#logOffset = Math.min(
       this.#logOffset,
@@ -608,8 +625,8 @@ export class RailTuiRenderer implements PresentationRenderer {
     if (this.#gateVisible) {
       return fit(
         this.#gateSubmitting
-          ? "Waiting for canonical gate settlement | C Cancel"
-          : "Up/Down choice | Enter select/confirm | Esc return unanswered | C Cancel",
+          ? `Waiting for canonical gate settlement${this.#setAutoFix ? " | A Auto-fix" : ""} | C Cancel`
+          : `Up/Down choice | Enter select/confirm | Esc return unanswered${this.#setAutoFix ? " | A Auto-fix" : ""} | C Cancel`,
         width,
       );
     }
@@ -618,6 +635,7 @@ export class RailTuiRenderer implements PresentationRenderer {
     else keys.push("Up/Down move", "Enter open");
     if (this.#pinnedStage || this.#focus === "logs") keys.push("Esc return");
     if (this.#snapshot?.gate?.state === "open") keys.push("G open gate");
+    if (this.#setAutoFix) keys.push("A Auto-fix");
     keys.push("C Cancel");
     return fit(keys.join(" | "), width);
   }
@@ -640,7 +658,7 @@ export class RailTuiRenderer implements PresentationRenderer {
     const keys =
       complete.match(
         new RegExp(
-          "\\x03|\\x1b\\[Z|\\x1b\\[[ABCD]|\\r|\\n|\\t|\\x1b|[cCgG]",
+          "\\x03|\\x1b\\[Z|\\x1b\\[[ABCD]|\\r|\\n|\\t|\\x1b|[aAcCgG]",
           "g",
         ),
       ) ?? [];
@@ -656,6 +674,8 @@ export class RailTuiRenderer implements PresentationRenderer {
         }
       } else if (key === "c" || key === "C") {
         this.#cancelVisible = true;
+      } else if (key === "a" || key === "A") {
+        this.#toggleAutoFix();
       } else if (this.#gateVisible) {
         if (key === "\u001b" && !this.#gateSubmitting) {
           this.#leaveGate();
@@ -721,6 +741,23 @@ export class RailTuiRenderer implements PresentationRenderer {
     this.#requestCancel();
   }
 
+  #toggleAutoFix(): void {
+    if (!this.#setAutoFix || !this.#snapshot || this.#modeSubmitting) return;
+    this.#modeSubmitting = true;
+    const enabled = !this.#snapshot.mode.autoFix;
+    void Promise.resolve(this.#setAutoFix(enabled)).then(
+      () => {
+        this.#modeSubmitting = false;
+        this.#draw();
+      },
+      (error) => {
+        this.#modeSubmitting = false;
+        this.#activities.push({ label: `Auto-fix unchanged: ${String(error)}` });
+        this.#draw();
+      },
+    );
+  }
+
   #returnToRail(): void {
     this.#pinnedStage = undefined;
     this.#focus = "rail";
@@ -763,6 +800,7 @@ export function createRailTuiRenderer(
   stageLogs?: ReadonlyMap<string, StageLog>,
   resolveGate?: GateResolver,
   requestCancel?: () => void,
+  setAutoFix?: (enabled: boolean) => Promise<void> | void,
 ): RailTuiRenderer | undefined {
   if (!supportsRailTui(input, output)) return undefined;
   try {
@@ -773,6 +811,7 @@ export function createRailTuiRenderer(
       stageLogs,
       resolveGate,
       requestCancel,
+      setAutoFix,
     );
   } catch {
     return undefined;
@@ -786,6 +825,7 @@ export function createRunRenderer(
   stageLogs?: ReadonlyMap<string, StageLog>,
   resolveGate?: GateResolver,
   requestCancel?: () => void,
+  setAutoFix?: (enabled: boolean) => Promise<void> | void,
 ): PresentationRenderer & { close?: () => void } {
   return (
     createRailTuiRenderer(
@@ -795,6 +835,7 @@ export function createRunRenderer(
       stageLogs,
       resolveGate,
       requestCancel,
+      setAutoFix,
     ) ?? new PlainStatusRenderer(output)
   );
 }

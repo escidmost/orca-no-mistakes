@@ -2013,6 +2013,181 @@ test("inline resolver settles the canonical gate audit and resumes once", async 
   }
 });
 
+test("ONM-88 Auto-fix changes apply only to findings arriving after the toggle", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  const orca = new FakeOrca(git, "onm-88-future-only");
+  const ledger = new DomainLedger(":memory:");
+  const finding = (id: string): Finding => ({
+    action: "auto-fix",
+    description: `${id} needs repair.`,
+    id,
+    severity: "error",
+  });
+  orca.reports.set("review", [
+    { findings: [finding("first")], summary: "first finding" },
+    pass("first fix committed"),
+    { findings: [finding("second")], summary: "second finding" },
+    pass("second fix committed"),
+    pass("review clean"),
+  ]);
+  let disabledBeforeFinding = false;
+  let enabledAfterFinding = false;
+
+  const result = await runPipeline(
+    {
+      intent: "Apply Auto-fix changes only to future findings.",
+      maxFixRounds: 2,
+      rendererFactory: (_artifactsDir, _stageLogs, resolveGate, setAutoFix) => ({
+        render(snapshot) {
+          if (
+            snapshot.transition.kind === "round-started" &&
+            snapshot.transition.stage === "review" &&
+            !disabledBeforeFinding
+          ) {
+            disabledBeforeFinding = true;
+            void setAutoFix!(false);
+          }
+          if (
+            snapshot.transition.kind === "findings-recorded" &&
+            snapshot.transition.stage === "review" &&
+            snapshot.transition.actionable > 0 &&
+            !enabledAfterFinding
+          ) {
+            enabledAfterFinding = true;
+            void setAutoFix!(true);
+          }
+          if (snapshot.transition.kind === "gate-opened") {
+            void resolveGate!(snapshot.transition.gateId, "fix");
+          }
+        },
+      }),
+    },
+    orca,
+    git,
+    ledger,
+  );
+
+  assert.equal(result.runId, "onm-88-future-only");
+  assert.equal(
+    orca.gates.length,
+    1,
+    `the already-arrived finding still gates: ${JSON.stringify(orca.gates)}`,
+  );
+  assert.equal(
+    orca.fixerDispatches.length,
+    2,
+    "the later finding starts automatically",
+  );
+  assert.deepEqual(
+    ledger.listAutoFixModeEvents(result.runId).map(({ enabled, source }) => ({
+      enabled,
+      source,
+    })),
+    [
+      { enabled: true, source: "initial" },
+      { enabled: false, source: "operator" },
+      { enabled: true, source: "operator" },
+    ],
+  );
+  assert.deepEqual(
+    ledger
+      .listPresentationSnapshots(result.runId)
+      .filter(
+        (snapshot) =>
+          snapshot.transition.kind === "findings-recorded" &&
+          snapshot.transition.stage === "review" &&
+          snapshot.transition.actionable > 0,
+      )
+      .map((snapshot) => snapshot.mode.autoFix),
+    [false, true],
+  );
+  assert.equal(ledger.listGateAudit(result.runId)[0]?.decision, "fix");
+});
+
+test("ONM-88 Resume inherits the latest audited Auto-fix mode", async () => {
+  class InterruptedAtTest extends FakeOrca {
+    override async startWorker(
+      taskId: string,
+      launch: WorkerLaunch,
+    ): Promise<WorkerResult> {
+      if (launch.stage === "test") throw new Error("test worker interrupted");
+      return super.startWorker(taskId, launch);
+    }
+  }
+
+  const git = new FakeGit();
+  git.policyDigest = "f".repeat(64);
+  const runId = "onm-88-resume-mode";
+  const ledger = new DomainLedger(":memory:");
+  let disabled = false;
+  await assert.rejects(
+    runPipeline(
+      {
+        intent: "Persist the operator's Auto-fix setting.",
+        rendererFactory: (_artifactsDir, _stageLogs, _resolveGate, setAutoFix) => ({
+          render(snapshot) {
+            if (
+              snapshot.transition.kind === "stage-started" &&
+              snapshot.transition.stage === "review" &&
+              !disabled
+            ) {
+              disabled = true;
+              void setAutoFix!(false);
+            }
+          },
+        }),
+      },
+      new InterruptedAtTest(git, runId),
+      git,
+      ledger,
+    ),
+    /test worker interrupted/,
+  );
+
+  const resumed = new FakeOrca(git);
+  resumed.reports.set("test", [
+    {
+      findings: [
+        {
+          action: "auto-fix",
+          description: "A test repair is available.",
+          id: "test-repair",
+          severity: "error",
+        },
+      ],
+      summary: "test finding",
+    },
+  ]);
+  await runPipeline(
+    {
+      intent: "Persist the operator's Auto-fix setting.",
+      resumeRunId: runId,
+    },
+    resumed,
+    git,
+    ledger,
+  );
+
+  assert.deepEqual(
+    ledger.listAutoFixModeEvents(runId).map(({ enabled, source }) => ({
+      enabled,
+      source,
+    })),
+    [
+      { enabled: true, source: "initial" },
+      { enabled: false, source: "operator" },
+    ],
+  );
+  assert.equal(resumed.gates.length, 1);
+  assert.equal(
+    resumed.launches.some(
+      (launch) => launch.stage === "test" && launch.role === "fixer",
+    ),
+    false,
+  );
+});
+
 test("assertion updates documented in intent stay informational and never open gates", async () => {
   const git = new FakeGit();
   const orca = new FakeOrca(git);

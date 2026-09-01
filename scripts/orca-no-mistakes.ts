@@ -299,6 +299,7 @@ export type PipelineOptions = {
     artifactsDir: string,
     stageLogs: ReadonlyMap<string, StageLog>,
     resolveGate?: GateResolver,
+    setAutoFix?: (enabled: boolean) => Promise<void> | void,
   ) => PresentationRenderer;
   resumeRunId?: string;
   userGlobalConfig?: OrcaNoMistakesConfig;
@@ -1756,6 +1757,7 @@ export async function runPipeline(
   let domainRunStarted = false;
   let generationToken: number | undefined;
   let presentation!: PresentationPublisher;
+  let autoFixMode = pipelineConfig.auto_fix.enabled;
   let presentationReady = false;
   let resumeClaimId: string | undefined;
   let resumeCheckpoint: StageCheckpointRow | undefined;
@@ -1834,6 +1836,15 @@ export async function runPipeline(
         artifactsDir,
         stageLogs!,
         orca.resolveGate?.bind(orca),
+        (enabled) => {
+          if (enabled === autoFixMode) return;
+          ledger.recordAutoFixMode(runId, enabled, "operator");
+          autoFixMode = enabled;
+          presentation.publish(
+            `mode:${ledger.listAutoFixModeEvents(runId).length}:${enabled ? "on" : "off"}`,
+            { enabled, kind: "mode-changed" },
+          );
+        },
       ) ??
         (options.plainStatus
           ? new PlainStatusRenderer(process.stderr)
@@ -1855,6 +1866,15 @@ export async function runPipeline(
           : undefined,
       );
       presentationReady = true;
+      const recordedAutoFixMode = ledger.latestAutoFixMode(runId);
+      autoFixMode =
+        recordedAutoFixMode ??
+        (options.resumeRunId
+          ? presentation.current.mode.autoFix
+          : pipelineConfig.auto_fix.enabled);
+      if (recordedAutoFixMode === undefined) {
+        ledger.recordAutoFixMode(runId, autoFixMode, "initial");
+      }
       if (!options.resumeRunId) {
         presentation.publish("run:started", { kind: "run-started" });
       }
@@ -1865,12 +1885,12 @@ export async function runPipeline(
       });
       if (
         attempt === 1 ||
-        presentation.current.mode.autoFix !== pipelineConfig.auto_fix.enabled
+        presentation.current.mode.autoFix !== autoFixMode
       ) {
         presentation.publish(
-          `attempt:${attempt}:mode:${pipelineConfig.auto_fix.enabled ? "on" : "off"}`,
+          `attempt:${attempt}:mode:${autoFixMode ? "on" : "off"}`,
           {
-            enabled: pipelineConfig.auto_fix.enabled,
+            enabled: autoFixMode,
             kind: "mode-changed",
           },
         );
@@ -2117,7 +2137,8 @@ export async function runPipeline(
       report: StageReport,
       fallback: { attempts: FallbackAttempt[]; resolvedAgent: string },
       evidenceCommitOid?: string,
-    ): Promise<void> => {
+    ): Promise<boolean> => {
+      const autoFixModeAtFindings = autoFixMode;
       const candidate = evidenceCommitOid ?? (await git.head());
       const evidenceBaseCommitOid =
         stage === "rebase" && report.rebaseUpstreamHead
@@ -2194,13 +2215,24 @@ export async function runPipeline(
       });
       presentation.publish(`findings:${entry.evidenceSha256}`, {
         actionable: actionableFindings(report).length,
+        findings: actionableFindings(report).map(
+          ({ description, file, id, line, severity }) => ({
+            description,
+            ...(file ? { file } : {}),
+            id,
+            ...(line ? { line } : {}),
+            severity,
+          }),
+        ),
         kind: "findings-recorded",
+        retainedFixer: fixerSession !== undefined,
         round,
         stage,
         total: report.findings.length,
       });
       stageEntries.push(entry);
       latestEntryByStage.set(stage, entry);
+      return autoFixModeAtFindings;
     };
 
     const stageTasks = new Map<StageName, string>();
@@ -2264,6 +2296,15 @@ export async function runPipeline(
       if (resumedFixDecision) round = resumedEvidence!.round_index;
       let inheritedFallback:
         { attempts: FallbackAttempt[]; resolvedAgent: string } | undefined;
+      let autoFixModeForReport =
+        (resumedEvidence
+          ? ledger.listPresentationSnapshots(runId).findLast(
+              (snapshot) =>
+                snapshot.transition.kind === "findings-recorded" &&
+                snapshot.transition.stage === stage &&
+                snapshot.transition.round === resumedEvidence.round_index,
+            )?.mode.autoFix
+          : undefined) ?? autoFixMode;
       const runStage = async () => {
         presentation.publish(
           `attempt:${presentation.current.attempt}:stage:${stage}:round:${round}:started`,
@@ -2300,7 +2341,7 @@ export async function runPipeline(
           }
           baseCommitOid = execution.report.rebaseUpstreamHead;
         }
-        await recordStageEvidence(
+        autoFixModeForReport = await recordStageEvidence(
           stage,
           round,
           execution.workerIdentity,
@@ -2364,7 +2405,8 @@ export async function runPipeline(
           !stageAutoFix.enabled || !reviewAutoFixAllowed;
         const exhausted = round >= stageAutoFix.max_rounds;
         let targetFindings: Finding[] = actionable;
-        let shouldFix = !asksUser && !exhausted && !automationBlocked;
+        let shouldFix =
+          autoFixModeForReport && !asksUser && !exhausted && !automationBlocked;
         let guidance = "";
         const manualRebaseIssue = stage === "rebase";
 
@@ -12383,13 +12425,15 @@ Prune options:
         plainStatus: parsed.flags["no-tui"] === true,
         rendererFactory:
           parsed.flags.tui === true
-            ? (artifactsDir, stageLogs, resolveGate) => {
+            ? (artifactsDir, stageLogs, resolveGate, setAutoFix) => {
                 renderer = createRunRenderer(
                   process.stdin,
                   process.stderr,
                   artifactsDir,
                   stageLogs,
                   resolveGate,
+                  undefined,
+                  setAutoFix,
                 );
                 setAbortPresentationCleanup(closeRenderer);
                 return renderer;
