@@ -2830,6 +2830,11 @@ console.log(JSON.stringify({ result }))
     assert.ok(
       commandText.includes(`NO_MISTAKES_ORIGIN_WORKTREE='${canonicalRepo}'`),
     );
+    assert.ok(
+      commandText.includes(
+        `ORCA_NO_MISTAKES_USER_CONFIG='${path.join(temp, "missing-user-config.yaml")}'`,
+      ),
+    );
     assert.ok(commandText.includes("NO_MISTAKES_DELIVERY_BRANCH='feature'"));
     assert.ok(commandText.includes("NO_MISTAKES_STARTUP_RECEIPT="));
     assert.ok(commandText.includes("'--notify' 'originating-opencode'"));

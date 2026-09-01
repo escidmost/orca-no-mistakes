@@ -10061,6 +10061,10 @@ async function launchDetachedRun(
       `ORCA_CLI_COMMAND=${shellQuote(process.env.ORCA_CLI_COMMAND)}`,
     );
   }
+  for (const name of ["ORCA_NO_MISTAKES_USER_CONFIG", "XDG_CONFIG_HOME"]) {
+    const value = process.env[name];
+    if (value) environment.push(`${name}=${shellQuote(value)}`);
+  }
   const receiptCommand = [
     process.execPath,
     "-e",
