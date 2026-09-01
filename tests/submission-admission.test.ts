@@ -145,10 +145,21 @@ test('an unbound failed direct admission can be retried', async () => {
     const retry = ledger.beginSubmissionAdmission(input)
     assert.equal(retry.status, 'pending')
     assert.equal(retry.run_id, null)
+    ledger.failSubmissionAdmission(input.admissionId)
+
+    const gateRetryInput = {
+      ...input,
+      oldOid: oid('c'),
+      repoRoot: '/gate-repo',
+      source: 'gate' as const
+    }
+    const gateRetry = ledger.beginSubmissionAdmission(gateRetryInput)
+    assert.equal(gateRetry.old_oid, gateRetryInput.oldOid)
+    assert.equal(gateRetry.repo_root, gateRetryInput.repoRoot)
     assert.throws(
       () =>
         ledger.beginSubmissionAdmission({
-          ...input,
+          ...gateRetryInput,
           admissionId: `admission-${'c'.repeat(64)}`,
           intent: 'Competing retry.',
           newOid: oid('d')

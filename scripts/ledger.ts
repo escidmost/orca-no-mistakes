@@ -2641,12 +2641,13 @@ export class DomainLedger {
           throw new Error(`submission admission ${input.admissionId} does not match its identity`)
         }
         if (existing.status === 'failed' && existing.run_id === null) {
+          const repoRoot = input.source === "gate" ? input.repoRoot : existing.repo_root
           const lease = this.#db
             .prepare(
               `SELECT admission_id FROM pending_admission_leases
                WHERE repo_root = ? AND ref_name = ?`
             )
-            .get(existing.repo_root, input.refName) as { admission_id: string } | undefined
+            .get(repoRoot, input.refName) as { admission_id: string } | undefined
           if (lease && lease.admission_id !== input.admissionId) {
             throw new Error(`pending admission lease already exists for ${input.refName}`)
           }
@@ -2654,26 +2655,33 @@ export class DomainLedger {
           this.#db
             .prepare(
               `UPDATE submission_admissions
-               SET status = 'pending', lease_token = ?, launched_at = NULL,
-                   accepted_oid = NULL, accepted_at = NULL, source = ?
+               SET status = 'pending', repo_root = ?, old_oid = ?, lease_token = ?,
+                   launched_at = NULL, launcher_pid = NULL, accepted_oid = NULL,
+                   accepted_at = NULL, source = ?
                WHERE admission_id = ?`
             )
-            .run(randomUUID(), input.source, input.admissionId)
+            .run(
+              repoRoot,
+              input.oldOid,
+              randomUUID(),
+              input.source,
+              input.admissionId
+            )
           if (lease) {
             this.#db
               .prepare(
-                `UPDATE pending_admission_leases
-                 SET acquired_at = ? WHERE repo_root = ? AND ref_name = ?`
+                 `UPDATE pending_admission_leases
+                  SET acquired_at = ? WHERE repo_root = ? AND ref_name = ?`
               )
-              .run(now, existing.repo_root, input.refName)
+              .run(now, repoRoot, input.refName)
           } else {
             this.#db
               .prepare(
                 `INSERT INTO pending_admission_leases
-                   (repo_root, ref_name, admission_id, acquired_at)
+                 (repo_root, ref_name, admission_id, acquired_at)
                  VALUES (?, ?, ?, ?)`
               )
-              .run(existing.repo_root, input.refName, input.admissionId, now)
+                .run(repoRoot, input.refName, input.admissionId, now)
           }
           this.#db.exec('COMMIT')
           return this.submissionAdmission(input.admissionId)!
