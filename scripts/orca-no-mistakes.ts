@@ -1835,6 +1835,16 @@ export async function runPipeline(
   ) {
     throw new Error("submission admission is not ready for pipeline execution");
   }
+  if (
+    options.admission &&
+    admission &&
+    !options.resumeRunId &&
+    repo.head !== admission.new_oid
+  ) {
+    throw new Error(
+      "the pipeline checkout does not match the admitted submission object",
+    );
+  }
   let domainRunStarted = false;
   let generationToken: number | undefined;
   let presentation!: PresentationPublisher;
@@ -9279,6 +9289,7 @@ export * from "./config.ts";
 type RawCliFlags = Record<string, string | boolean>;
 
 const BOOLEAN_FLAGS = new Set([
+  "admission-materialized",
   "allow-local-config",
   "attached",
   "force-lease",
@@ -9312,6 +9323,7 @@ const COMMAND_FLAGS: Record<string, Set<string>> = {
   prune: new Set(["before", "repo", "stranded"]),
   run: new Set([
     "admission-id",
+    "admission-materialized",
     "allow-local-config",
     "attached",
     "base",
@@ -12766,6 +12778,7 @@ async function launchAdmittedPipeline(
     admission.intent,
     "--admission-id",
     admission.admission_id,
+    "--admission-materialized",
     "--run-id",
     runId,
   ]);
@@ -12858,6 +12871,7 @@ async function runGateCoordinatorCommand(flags: RawCliFlags): Promise<void> {
   const ledger = openRepositoryLedger(metadata.repoRoot, false);
   let runId: string | undefined;
   let orca: CliOrca | undefined;
+  let materialized = false;
   try {
     const admission = ledger.submissionAdmission(admissionId);
     if (!admission) throw new Error(`unknown submission admission ${admissionId}`);
@@ -12880,29 +12894,45 @@ async function runGateCoordinatorCommand(flags: RawCliFlags): Promise<void> {
     orca = new CliOrca({ cwd: metadata.repoRoot, runId: admission.run_id ?? undefined });
     runId = admission.run_id ?? (await orca.createRun(`no-mistakes: ${admission.intent}`));
     await writeLaunchReadiness(readinessPath, { nonce: launchNonce, runId, state: "ready" });
+    materialized = true;
     const update: ReceiveUpdate = {
       newOid: admission.new_oid,
       oldOid: admission.old_oid,
       refName: admission.ref_name,
     };
-    await waitForPermanentRef(metadata, update, 100);
-    anchorPermanentRef(metadata, update, runId);
-    await launchAdmittedPipeline(metadata, admission, runId);
+    let settled = false;
+    let handoffError: unknown;
+    for (let attempt = 0; attempt < 3 && !settled; attempt += 1) {
+      if (attempt > 0) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+      try {
+        await waitForPermanentRef(metadata, update, 100);
+        anchorPermanentRef(metadata, update, runId);
+        await launchAdmittedPipeline(metadata, admission, runId);
+        settled = true;
+      } catch (error) {
+        handoffError = error;
+        if (error instanceof Error && error.message.includes("superseded")) break;
+      }
+    }
+    if (!settled) throw handoffError;
     await releaseAdmissionLaunch(launchLockPath(readinessPath)).catch(() => undefined);
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
     await writeLaunchReadiness(readinessPath, {
-      error: error instanceof Error ? error.message : String(error),
+      error: message,
       nonce: launchNonce,
       state: "failed",
     }).catch(() => undefined);
-    ledger.failSubmissionAdmission(
-      admissionId,
-      error instanceof Error && error.message.includes("superseded")
-        ? "superseded"
-        : "failed",
-    );
+    if (!materialized || message.includes("superseded")) {
+      ledger.failSubmissionAdmission(
+        admissionId,
+        message.includes("superseded") ? "superseded" : "failed",
+      );
+    }
     if (runId && orca) {
-      await orca.failRun(`Admission coordinator failed: ${error instanceof Error ? error.message : String(error)}`).catch(
+      await orca.failRun(`Admission coordinator failed: ${message}`).catch(
         () => undefined,
       );
     }
@@ -13116,7 +13146,11 @@ Run options:
       }
       console.log(JSON.stringify({ detached: true, terminalHandle }));
     } catch (error) {
-      if (admissionRow && admissionLedger) {
+      if (
+        admissionRow &&
+        admissionLedger &&
+        parsed.flags["admission-materialized"] !== true
+      ) {
         admissionLedger.failSubmissionAdmission(admissionRow.admission_id);
       }
       throw error;
@@ -13288,6 +13322,19 @@ Run options:
     console.log(JSON.stringify(result));
   } catch (error) {
     closeRenderer();
+    if (
+      admissionRow &&
+      ledger &&
+      parsed.flags["admission-materialized"] !== true
+    ) {
+      try {
+        ledger.failSubmissionAdmission(admissionRow.admission_id);
+      } catch (settlementError) {
+        console.error(
+          `warning: could not settle the submission admission: ${String(settlementError)}`,
+        );
+      }
+    }
     const retainedOutcome =
       error instanceof RecoveryAnchorError || error instanceof RunSettlementError
         ? error.outcome
