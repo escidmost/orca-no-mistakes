@@ -2186,7 +2186,6 @@ export async function runPipeline(
       fallback: { attempts: FallbackAttempt[]; resolvedAgent: string },
       evidenceCommitOid?: string,
     ): Promise<boolean> => {
-      const autoFixModeAtFindings = autoFixMode;
       const candidate = evidenceCommitOid ?? (await git.head());
       const evidenceBaseCommitOid =
         stage === "rebase" && report.rebaseUpstreamHead
@@ -2261,6 +2260,7 @@ export async function runPipeline(
         effectivePolicyHash: effectiveProvenance.effectivePolicyHash,
         baseRefSha: effectiveProvenance.baseRefSha,
       });
+      const autoFixModeAtFindings = autoFixMode;
       if (isAuthoritativeStageEvidence(workerIdentity)) {
         presentation.publish(`findings:${entry.evidenceSha256}`, {
           actionable: actionableFindings(report).length,
@@ -2320,6 +2320,9 @@ export async function runPipeline(
       );
       let attempt = 0;
       const resumedEvidence = latestEvidenceByStage.get(stage);
+      const resumedFindings = JSON.parse(
+        resumedEvidence?.findings_json ?? "[]",
+      ) as Finding[];
       let resumedFixDecision =
         resumedEvidence &&
         resumedEvidence.candidate_commit_oid === stageInputCommitOid
@@ -2344,7 +2347,7 @@ export async function runPipeline(
         resumedEvidence.round_index === round
           ? ledger
               .listPresentationSnapshots(runId)
-              .find(
+              .findLast(
                 (snapshot) =>
                   snapshot.transition.kind === "findings-recorded" &&
                   snapshot.transition.stage === stage &&
@@ -2404,13 +2407,21 @@ export async function runPipeline(
       };
       let report = resumedFixDecision
         ? {
-            findings: JSON.parse(
-              resumedEvidence!.findings_json ?? "[]",
-            ) as Finding[],
+            findings: resumedFindings,
             summary: resumedEvidence!.summary,
           }
         : await runStage();
-      if (resumedFindingMode !== undefined) {
+      if (
+        resumedFindingMode !== undefined &&
+        isDeepStrictEqual(
+          actionableFindings(report)
+            .map((finding) => finding.id)
+            .sort(),
+          actionableFindings({ findings: resumedFindings, summary: "" })
+            .map((finding) => finding.id)
+            .sort(),
+        )
+      ) {
         autoFixModeForReport = resumedFindingMode;
       }
 

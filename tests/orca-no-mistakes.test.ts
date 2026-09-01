@@ -2105,30 +2105,46 @@ test("ONM-88 Auto-fix changes apply only to findings arriving after the toggle",
   assert.equal(ledger.listGateAudit(result.runId)[0]?.decision, "fix");
 });
 
-test("ONM-88 Resume inherits the latest audited Auto-fix mode", async () => {
-  class InterruptedAtTest extends FakeOrca {
+test("ONM-88 Resume applies the current audited mode to newly reported findings", async () => {
+  class InterruptedFixer extends FakeOrca {
     override async startWorker(
       taskId: string,
       launch: WorkerLaunch,
     ): Promise<WorkerResult> {
-      if (launch.stage === "test") throw new Error("test worker interrupted");
+      if (launch.role === "fixer") throw new Error("fixer interrupted");
       return super.startWorker(taskId, launch);
     }
   }
 
   const git = new FakeGit();
   git.policyDigest = "f".repeat(64);
-  const runId = "onm-88-resume-mode";
+  allowReviewAutoFix(git);
+  const runId = "onm-88-resume-new-finding";
   const ledger = new DomainLedger(":memory:");
+  const interrupted = new InterruptedFixer(git, runId);
+  interrupted.reports.set("review", [
+    {
+      findings: [
+        {
+          action: "auto-fix",
+          description: "The original review repair.",
+          id: "original-repair",
+          severity: "error",
+        },
+      ],
+      summary: "original review finding",
+    },
+  ]);
   let disabled = false;
+
   await assert.rejects(
     runPipeline(
       {
-        intent: "Persist the operator's Auto-fix setting.",
+        intent: "Use the current mode for newly reported findings.",
         rendererFactory: (_artifactsDir, _stageLogs, _resolveGate, setAutoFix) => ({
           render(snapshot) {
             if (
-              snapshot.transition.kind === "stage-started" &&
+              snapshot.transition.kind === "findings-recorded" &&
               snapshot.transition.stage === "review" &&
               !disabled
             ) {
@@ -2138,30 +2154,30 @@ test("ONM-88 Resume inherits the latest audited Auto-fix mode", async () => {
           },
         }),
       },
-      new InterruptedAtTest(git, runId),
+      interrupted,
       git,
       ledger,
     ),
-    /test worker interrupted/,
+    /fixer interrupted/,
   );
 
   const resumed = new FakeOrca(git);
-  resumed.reports.set("test", [
+  resumed.reports.set("review", [
     {
       findings: [
         {
           action: "auto-fix",
-          description: "A test repair is available.",
-          id: "test-repair",
+          description: "A newly reported review repair.",
+          id: "new-repair",
           severity: "error",
         },
       ],
-      summary: "test finding",
+      summary: "new review finding",
     },
   ]);
   await runPipeline(
     {
-      intent: "Persist the operator's Auto-fix setting.",
+      intent: "Use the current mode for newly reported findings.",
       resumeRunId: runId,
     },
     resumed,
@@ -2169,20 +2185,11 @@ test("ONM-88 Resume inherits the latest audited Auto-fix mode", async () => {
     ledger,
   );
 
-  assert.deepEqual(
-    ledger.listAutoFixModeEvents(runId).map(({ enabled, source }) => ({
-      enabled,
-      source,
-    })),
-    [
-      { enabled: true, source: "initial" },
-      { enabled: false, source: "operator" },
-    ],
-  );
+  assert.equal(ledger.latestAutoFixMode(runId), false);
   assert.equal(resumed.gates.length, 1);
   assert.equal(
     resumed.launches.some(
-      (launch) => launch.stage === "test" && launch.role === "fixer",
+      (launch) => launch.stage === "review" && launch.role === "fixer",
     ),
     false,
   );
