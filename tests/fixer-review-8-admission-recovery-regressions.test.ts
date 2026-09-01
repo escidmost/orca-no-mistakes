@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { chmod, mkdtemp, readFile, rm, realpath, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, realpath, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -10,6 +10,7 @@ import {
   admissionReadinessPath,
   deriveAdmissionId,
   initializeLocalGate,
+  launchLockPath,
   readGateMetadata,
   repositoryGatePaths,
   type GateMetadata
@@ -200,6 +201,10 @@ test('a materialized gate admission stays recoverable when the pipeline handoff 
     const readinessPath = admissionReadinessPath(fixture.metadata, admissionId)
 
     for (let attempt = 0; attempt < 2; attempt += 1) {
+      const launchNonce = `recover-launch-${attempt}`
+      const lockPath = launchLockPath(readinessPath)
+      await mkdir(lockPath, { recursive: true })
+      await writeFile(path.join(lockPath, 'nonce'), launchNonce)
       await assert.rejects(
         main([
           'gate',
@@ -209,7 +214,9 @@ test('a materialized gate admission stays recoverable when the pipeline handoff 
           '--admission-id',
           admissionId,
           '--readiness',
-          readinessPath
+          readinessPath,
+          '--launch-nonce',
+          launchNonce
         ])
       )
       const settled = new DomainLedger({ repositoryPath: fixture.repo })

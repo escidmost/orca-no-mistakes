@@ -1,7 +1,7 @@
 import { strict as assert } from 'node:assert'
 import { execFileSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -10,6 +10,7 @@ import {
   admissionReadinessPath,
   deriveAdmissionId,
   initializeLocalGate,
+  launchLockPath,
   readGateMetadata,
   repositoryGatePaths
 } from '../scripts/admission.ts'
@@ -148,6 +149,10 @@ test('the coordinator settles before custody acceptance when the pipeline run ca
         source: 'gate'
       })
       const readinessPath = admissionReadinessPath(fixture.metadata, admissionId)
+      const launchNonce = 'settle-launch'
+      const lockPath = launchLockPath(readinessPath)
+      await mkdir(lockPath, { recursive: true })
+      await writeFile(path.join(lockPath, 'nonce'), launchNonce)
       await assert.rejects(
         main([
           'gate',
@@ -157,7 +162,9 @@ test('the coordinator settles before custody acceptance when the pipeline run ca
           '--admission-id',
           admissionId,
           '--readiness',
-          readinessPath
+          readinessPath,
+          '--launch-nonce',
+          launchNonce
         ])
       )
       const readiness = JSON.parse(await readFile(readinessPath, 'utf8')) as {

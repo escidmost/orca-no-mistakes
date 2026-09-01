@@ -219,6 +219,10 @@ test('a replayed accepted admission anchors gate custody through the coordinator
 
     const readinessPath = admissionReadinessPath(metadata, admissionId)
     assert.throws(() => git(gate, 'rev-parse', '--verify', `refs/orca-no-mistakes/heads/${runId}`))
+    const launchNonce = 'accepted-replay-launch'
+    const lockPath = `${readinessPath}.lock`
+    await mkdir(lockPath, { recursive: true })
+    await writeFile(path.join(lockPath, 'nonce'), launchNonce)
     await main([
       'gate',
       'coordinator',
@@ -227,7 +231,9 @@ test('a replayed accepted admission anchors gate custody through the coordinator
       '--admission-id',
       admissionId,
       '--readiness',
-      readinessPath
+      readinessPath,
+      '--launch-nonce',
+      launchNonce
     ])
     assert.equal(git(gate, 'rev-parse', `refs/orca-no-mistakes/heads/${runId}`), head)
     const readiness = JSON.parse(await readFile(readinessPath, 'utf8')) as {
@@ -268,6 +274,10 @@ test('the coordinator rejects a checkout on another branch before acceptance', a
     ledger.close()
 
     const readinessPath = admissionReadinessPath(metadata, admissionId)
+    const launchNonce = 'wrong-checkout-launch'
+    const lockPath = `${readinessPath}.lock`
+    await mkdir(lockPath, { recursive: true })
+    await writeFile(path.join(lockPath, 'nonce'), launchNonce)
     await assert.rejects(
       main([
         'gate',
@@ -277,7 +287,9 @@ test('the coordinator rejects a checkout on another branch before acceptance', a
         '--admission-id',
         admissionId,
         '--readiness',
-        readinessPath
+        readinessPath,
+        '--launch-nonce',
+        launchNonce
       ]),
       /the repository checkout is on other but the admission is for refs\/heads\/feature/
     )
