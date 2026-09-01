@@ -92,6 +92,7 @@ import {
   deriveAdmissionId,
   ensureCustodyLaunch,
   initializeLocalGate,
+  isProcessAlive,
   launchDetachedCoordinator,
   launchLockPath,
   parseReceiveUpdates,
@@ -1018,7 +1019,7 @@ function startupReceiptPid(
 async function waitForStartupReceipt(
   markerFile: string,
   token: string,
-): Promise<void> {
+): Promise<number | undefined> {
   const deadline = Date.now() + 60_000;
   for (;;) {
     let text: string | undefined;
@@ -1040,9 +1041,9 @@ async function waitForStartupReceipt(
     if (pid !== undefined) {
       try {
         process.kill(pid, 0);
-        return;
+        return pid;
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ESRCH") return;
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") return pid;
         throw new Error("detached coordinator exited during startup");
       }
     }
@@ -1953,11 +1954,6 @@ export async function runPipeline(
         domainRunStarted = true;
         if (options.admission) {
           ledger.bindSubmissionAdmission(options.admission.admissionId, runId);
-          ledger.markSubmissionAccepted({
-            acceptedOid: options.admission.newOid,
-            admissionId: options.admission.admissionId,
-            runId,
-          });
         }
       }
       const statusRenderer = options.rendererFactory?.(
@@ -2068,6 +2064,13 @@ export async function runPipeline(
         resumeClaimId,
         runId,
       });
+      if (!options.resumeRunId && options.admission) {
+        ledger.markSubmissionAccepted({
+          acceptedOid: options.admission.newOid,
+          admissionId: options.admission.admissionId,
+          runId,
+        });
+      }
     } catch (error) {
       if (domainRunStarted) {
         const ownership = generationToken === undefined
@@ -9306,6 +9309,7 @@ const VALUE_FLAGS = new Set([
   "fixer-model",
   "head",
   "intent",
+  "launch-nonce",
   "max-fix-rounds",
   "notify",
   "out",
@@ -9856,7 +9860,7 @@ async function launchDetachedRun(
   userGlobalConfig: OrcaNoMistakesConfig,
   resumeStartOid?: string,
   admissionId?: string,
-): Promise<string> {
+): Promise<{ coordinatorPid: number | undefined; terminalHandle: string }> {
   const orcaCommand = resolveOrcaCommand();
   const root = await configuredWorktreeRoot(
     repo.root,
@@ -10283,6 +10287,7 @@ async function launchDetachedRun(
     .join(" ");
   const coordinatorCommand = `${receiptCommand} && exec env ${environment.join(" ")} ${quotedCommand}`;
 
+  let coordinatorPid: number | undefined;
   try {
     await writeLauncherGateMarker(
       repo.root,
@@ -10327,7 +10332,7 @@ async function launchDetachedRun(
       ],
       repo.root,
     );
-    await waitForStartupReceipt(
+    coordinatorPid = await waitForStartupReceipt(
       gateMarkerPath(repo.root, gateMarkerId(gate)),
       startupReceipt,
     );
@@ -10335,7 +10340,7 @@ async function launchDetachedRun(
     await cleanupFailedLaunch(error);
     throw error;
   }
-  return terminalHandle;
+  return { coordinatorPid, terminalHandle };
 }
 
 /**
@@ -13118,6 +13123,17 @@ Run options:
         `submission admission ${admissionRow.admission_id} is ${admissionRow.status}`,
       );
     }
+    if (
+      admissionRow.status === "launched" &&
+      admissionRow.run_id === null &&
+      admissionRow.launcher_pid !== null &&
+      !isProcessAlive(admissionRow.launcher_pid)
+    ) {
+      const reclaimed = admissionLedger.reclaimSubmissionAdmission(
+        admissionRow.admission_id,
+      );
+      if (reclaimed) admissionRow = reclaimed;
+    }
     if (admissionRow.status !== "pending") {
       console.log(
         JSON.stringify({
@@ -13134,7 +13150,7 @@ Run options:
     const repoState = launchRepoState ?? (await git.assertReady());
     const userGlobalConfig = loadUserConfig();
     try {
-      const terminalHandle = await launchDetachedRun(
+      const launch = await launchDetachedRun(
         repoState,
         parsed.flags,
         userGlobalConfig,
@@ -13142,9 +13158,14 @@ Run options:
         admissionRow?.admission_id,
       );
       if (admissionRow && admissionLedger) {
-        admissionLedger.markSubmissionLaunched(admissionRow.admission_id);
+        admissionLedger.markSubmissionLaunched(
+          admissionRow.admission_id,
+          launch.coordinatorPid,
+        );
       }
-      console.log(JSON.stringify({ detached: true, terminalHandle }));
+      console.log(
+        JSON.stringify({ detached: true, terminalHandle: launch.terminalHandle }),
+      );
     } catch (error) {
       if (
         admissionRow &&
@@ -13228,8 +13249,9 @@ Run options:
     }
   };
   let retainGate = false;
-  let gateCleanupOid = await git.head();
+  let gateCleanupOid: string | undefined;
   try {
+    gateCleanupOid = await git.head();
     const userGlobalConfig = loadUserConfig();
     ledger ??= openRepositoryLedger(originWorktree ?? gatePath);
     await installAbortReaping({
@@ -13328,7 +13350,12 @@ Run options:
       parsed.flags["admission-materialized"] !== true
     ) {
       try {
-        ledger.failSubmissionAdmission(admissionRow.admission_id);
+        const settled = ledger.submissionAdmission(admissionRow.admission_id);
+        if (settled && settled.run_id !== null && settled.status !== "accepted") {
+          ledger.reclaimSubmissionAdmission(admissionRow.admission_id);
+        } else {
+          ledger.failSubmissionAdmission(admissionRow.admission_id);
+        }
       } catch (settlementError) {
         console.error(
           `warning: could not settle the submission admission: ${String(settlementError)}`,
@@ -13400,7 +13427,7 @@ Run options:
               gate,
               originWorktree!,
               resolveOrcaCommand(),
-              gateCleanupOid,
+              gateCleanupOid ?? "",
             );
           } catch (cleanupError) {
             console.error(
