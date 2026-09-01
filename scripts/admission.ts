@@ -214,6 +214,27 @@ export async function initializeLocalGate(
   const metadataPath = path.join(paths.stateDir, 'gate.json')
   const metadataExisted = existsSync(metadataPath)
   const previousRemote = tryGitSync(['-C', paths.repoRoot, 'remote', 'get-url', GATE_REMOTE_NAME])
+  const previousPushUrls = tryGitSync([
+    '-C',
+    paths.repoRoot,
+    'config',
+    '--get-all',
+    `remote.${GATE_REMOTE_NAME}.pushurl`
+  ])
+  if (metadataExisted) {
+    let recordedRoot: string | undefined
+    try {
+      const parsed = JSON.parse(await readFile(metadataPath, 'utf8')) as Partial<GateMetadata>
+      if (typeof parsed.repoRoot === 'string') recordedRoot = parsed.repoRoot
+    } catch {
+      // Malformed metadata is repaired by re-initialization.
+    }
+    if (recordedRoot && path.resolve(recordedRoot) !== path.resolve(paths.repoRoot)) {
+      throw new Error(
+        `the local gate is routed to ${recordedRoot}; initialize it from that worktree to keep one repository-wide route`
+      )
+    }
+  }
   try {
     if (!tryGitSync(['-C', paths.repoRoot, 'remote', 'get-url', 'origin'])) {
       throw new Error('the repository must have an origin remote before gate initialization')
@@ -253,6 +274,18 @@ export async function initializeLocalGate(
     } else {
       gitSync(['-C', paths.repoRoot, 'remote', 'add', GATE_REMOTE_NAME, paths.gatePath])
     }
+    tryGitSync(['-C', paths.repoRoot, 'config', '--unset-all', `remote.${GATE_REMOTE_NAME}.pushurl`])
+    if (
+      tryGitSync([
+        '-C',
+        paths.repoRoot,
+        'config',
+        '--get-all',
+        `remote.${GATE_REMOTE_NAME}.pushurl`
+      ]) !== undefined
+    ) {
+      throw new Error(`could not reset the ${GATE_REMOTE_NAME} remote push URL`)
+    }
     const metadata: GateMetadata = {
       ...paths,
       defaultBranch: detectDefaultBranch(paths.repoRoot),
@@ -271,6 +304,9 @@ export async function initializeLocalGate(
   } catch (error) {
     if (previousRemote) {
       tryGitSync(['-C', paths.repoRoot, 'remote', 'set-url', GATE_REMOTE_NAME, previousRemote])
+      for (const pushUrl of previousPushUrls?.split('\n').filter(Boolean) ?? []) {
+        tryGitSync(['-C', paths.repoRoot, 'config', '--add', `remote.${GATE_REMOTE_NAME}.pushurl`, pushUrl])
+      }
     } else {
       tryGitSync(['-C', paths.repoRoot, 'remote', 'remove', GATE_REMOTE_NAME])
     }
@@ -301,6 +337,13 @@ export async function readGateMetadata(gatePath: string): Promise<GateMetadata> 
     canonicalJson({ gatePath: paths.gatePath, repoRoot: paths.repoRoot })
   )
   const configuredRemote = tryGitSync(['-C', paths.repoRoot, 'remote', 'get-url', GATE_REMOTE_NAME])
+  const configuredPushUrls = tryGitSync([
+    '-C',
+    paths.repoRoot,
+    'config',
+    '--get-all',
+    `remote.${GATE_REMOTE_NAME}.pushurl`
+  ])
   if (
     path.resolve(parsed.commonDir) !== paths.commonDir ||
     path.resolve(parsed.stateDir) !== paths.stateDir ||
@@ -309,6 +352,7 @@ export async function readGateMetadata(gatePath: string): Promise<GateMetadata> 
     parsed.gateIdentity !== expectedIdentity ||
     !validBranchName(parsed.defaultBranch) ||
     configuredRemote !== paths.gatePath ||
+    configuredPushUrls !== undefined ||
     detectDefaultBranch(paths.repoRoot) !== parsed.defaultBranch
   ) {
     throw new Error('local gate metadata does not match its repository')
@@ -393,10 +437,21 @@ export async function claimAdmissionLaunch(
   return { nonce, owned: true }
 }
 
-export async function recordCoordinatorLaunch(lockPath: string): Promise<void> {
-  try {
-    await writeFile(path.join(lockPath, 'coordinator'), `${process.pid}`, 'utf8')
-  } catch {}
+export async function recordCoordinatorLaunch(
+  lockPath: string,
+  expectedNonce?: string
+): Promise<void> {
+  if (expectedNonce === undefined) {
+    try {
+      await writeFile(path.join(lockPath, 'coordinator'), `${process.pid}`, 'utf8')
+    } catch {}
+    return
+  }
+  await writeFile(path.join(lockPath, 'coordinator'), `${process.pid}`, 'utf8')
+  const claim = await readAdmissionLaunchClaim(lockPath)
+  if (claim.nonce !== expectedNonce || claim.coordinatorPid !== process.pid) {
+    throw new Error('the admission launch generation changed before the coordinator started')
+  }
 }
 
 export async function readAdmissionLaunchClaim(

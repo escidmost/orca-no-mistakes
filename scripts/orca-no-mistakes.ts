@@ -98,6 +98,7 @@ import {
   readGateMetadata,
   readGateRef,
   recordCoordinatorLaunch,
+  releaseAdmissionLaunch,
   repositoryGatePaths,
   validateQuarantinedCommit,
   validateReceiveUpdate,
@@ -12821,28 +12822,20 @@ async function runGateAdmitCommand(flags: RawCliFlags): Promise<void> {
     }
     const readinessPath = admissionReadinessPath(metadata, admission.admission_id);
     await mkdir(path.dirname(readinessPath), { recursive: true });
-    const launch = await awaitAdmissionLaunch(readinessPath, (nonce) =>
+    const { readiness } = await awaitAdmissionLaunch(readinessPath, (nonce) =>
       spawnAdmissionCoordinator(metadata, admission.admission_id, readinessPath, nonce),
     );
-    try {
-      const readiness = launch.readiness;
-      const current = ledger.submissionAdmission(admission.admission_id);
-      if (current?.run_id && readiness.runId !== current.run_id) {
-        throw new Error("coordinator readiness did not bind the admitted run");
-      }
-      console.log(
-        JSON.stringify({
-          admissionId: admission.admission_id,
-          followUp: `orca-no-mistakes run --resume ${readiness.runId}`,
-          runId: readiness.runId,
-        }),
-      );
-    } finally {
-      const settled = ledger.submissionAdmission(admission.admission_id);
-      if (settled?.run_id) {
-        await launch.releaseLaunch?.();
-      }
+    const current = ledger.submissionAdmission(admission.admission_id);
+    if (current?.run_id && readiness.runId !== current.run_id) {
+      throw new Error("coordinator readiness did not bind the admitted run");
     }
+    console.log(
+      JSON.stringify({
+        admissionId: admission.admission_id,
+        followUp: `orca-no-mistakes run --resume ${readiness.runId}`,
+        runId: readiness.runId,
+      }),
+    );
   } finally {
     ledger.close();
   }
@@ -12861,7 +12854,7 @@ async function runGateCoordinatorCommand(flags: RawCliFlags): Promise<void> {
     throw new Error("coordinator readiness path does not match the admission");
   }
   const launchNonce = stringFlag(flags, "launch-nonce");
-  await recordCoordinatorLaunch(launchLockPath(readinessPath));
+  await recordCoordinatorLaunch(launchLockPath(readinessPath), launchNonce);
   const ledger = openRepositoryLedger(metadata.repoRoot, false);
   let runId: string | undefined;
   let orca: CliOrca | undefined;
@@ -12886,7 +12879,6 @@ async function runGateCoordinatorCommand(flags: RawCliFlags): Promise<void> {
     await assertAdmittedCheckout(metadata, admission);
     orca = new CliOrca({ cwd: metadata.repoRoot, runId: admission.run_id ?? undefined });
     runId = admission.run_id ?? (await orca.createRun(`no-mistakes: ${admission.intent}`));
-    ledger.bindSubmissionAdmission(admissionId, runId);
     await writeLaunchReadiness(readinessPath, { nonce: launchNonce, runId, state: "ready" });
     const update: ReceiveUpdate = {
       newOid: admission.new_oid,
@@ -12896,6 +12888,7 @@ async function runGateCoordinatorCommand(flags: RawCliFlags): Promise<void> {
     await waitForPermanentRef(metadata, update, 100);
     anchorPermanentRef(metadata, update, runId);
     await launchAdmittedPipeline(metadata, admission, runId);
+    await releaseAdmissionLaunch(launchLockPath(readinessPath)).catch(() => undefined);
   } catch (error) {
     await writeLaunchReadiness(readinessPath, {
       error: error instanceof Error ? error.message : String(error),
@@ -12930,7 +12923,7 @@ export async function main(argv: string[]): Promise<void> {
   orca-no-mistakes run (--intent <text> | --resume <run-id>) [--repo <path>] [--base <branch>] [--head <sha>] [--force-lease]
   orca-no-mistakes init [--repo <path>]
   orca-no-mistakes gate admit --gate <path>
-  orca-no-mistakes gate coordinator --gate <path> --admission-id <id> --readiness <path>
+  orca-no-mistakes gate coordinator --gate <path> --admission-id <id> --readiness <path> --launch-nonce <nonce>
   orca-no-mistakes attestation export <run-id|commit-sha> [--out <path>] [--repo <path>]
   orca-no-mistakes attestation verify <manifest-file|run-id|commit-sha> [--repo <path>]
   orca-no-mistakes prune [--before <date>] [--repo <path>]
@@ -13053,11 +13046,21 @@ Run options:
       canonicalJson({ gatePath: gatePaths.gatePath, repoRoot: gatePaths.repoRoot }),
     );
     if (existsSync(path.join(gatePaths.stateDir, "gate.json"))) {
+      let gateMetadata: GateMetadata | undefined;
       try {
-        gateIdentity = (await readGateMetadata(gatePaths.gatePath)).gateIdentity;
+        gateMetadata = await readGateMetadata(gatePaths.gatePath);
       } catch {
         // A malformed gate is not needed for direct admission; init will repair it.
       }
+      if (
+        gateMetadata &&
+        path.resolve(gateMetadata.repoRoot) !== path.resolve(launchRepoState.root)
+      ) {
+        throw new Error(
+          `the local gate is routed to ${gateMetadata.repoRoot}; run direct submissions from that worktree`,
+        );
+      }
+      if (gateMetadata) gateIdentity = gateMetadata.gateIdentity;
     }
     admissionLedger = openRepositoryLedger(launchRepoState.root, false);
     admissionRow = admissionLedger.beginSubmissionAdmission({
@@ -13224,7 +13227,9 @@ Run options:
               newOid: admissionRow.new_oid,
               runId:
                 admissionRow.run_id ??
-                (gate?.kind === "configured" ? gate.runId : undefined),
+                (gate?.kind === "configured"
+                  ? gate.runId
+                  : stringFlag(parsed.flags, "run-id")),
               source: admissionRow.source,
             }
           : undefined,
