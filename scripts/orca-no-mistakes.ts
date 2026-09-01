@@ -95,6 +95,7 @@ import {
   launchLockPath,
   parseReceiveUpdates,
   readGateMetadata,
+  readGateRef,
   recordCoordinatorLaunch,
   repositoryGatePaths,
   validateQuarantinedCommit,
@@ -12522,7 +12523,10 @@ async function runGateAdmitCommand(flags: RawCliFlags): Promise<void> {
         }),
       );
     } finally {
-      await launch.releaseLaunch?.();
+      const settled = ledger.submissionAdmission(admission.admission_id);
+      if (settled?.run_id) {
+        await launch.releaseLaunch?.();
+      }
     }
   } finally {
     ledger.close();
@@ -12552,7 +12556,7 @@ async function runGateCoordinatorCommand(flags: RawCliFlags): Promise<void> {
     if (admission.status === "accepted" && admission.run_id) {
       const custodyUpdate: ReceiveUpdate = {
         newOid: admission.new_oid,
-        oldOid: admission.old_oid,
+        oldOid: readGateRef(metadata, admission.ref_name) ?? "0".repeat(40),
         refName: admission.ref_name,
       };
       await writeLaunchReadiness(readinessPath, {
@@ -12567,6 +12571,7 @@ async function runGateCoordinatorCommand(flags: RawCliFlags): Promise<void> {
     await assertAdmittedCheckout(metadata, admission);
     orca = new CliOrca({ cwd: metadata.repoRoot, runId: admission.run_id ?? undefined });
     runId = admission.run_id ?? (await orca.createRun(`no-mistakes: ${admission.intent}`));
+    ledger.bindSubmissionAdmission(admissionId, runId);
     await writeLaunchReadiness(readinessPath, { nonce: launchNonce, runId, state: "ready" });
     const update: ReceiveUpdate = {
       newOid: admission.new_oid,
@@ -12788,6 +12793,9 @@ Run options:
         resumeStartOid,
         admissionRow?.admission_id,
       );
+      if (admissionRow && admissionLedger) {
+        admissionLedger.markSubmissionLaunched(admissionRow.admission_id);
+      }
       console.log(JSON.stringify({ detached: true, terminalHandle }));
     } catch (error) {
       if (admissionRow && admissionLedger) {

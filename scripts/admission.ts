@@ -375,21 +375,20 @@ export function isProcessAlive(pid: number): boolean {
 export async function claimAdmissionLaunch(
   lockPath: string
 ): Promise<{ nonce?: string; owned: boolean }> {
-  try {
-    await mkdir(lockPath)
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return { owned: false }
-    throw error
-  }
+  if (existsSync(lockPath)) return { owned: false }
   const nonce = randomUUID()
-  await writeFile(path.join(lockPath, 'nonce'), nonce, 'utf8')
-  await writeFile(path.join(lockPath, 'owner'), `${process.pid}`, 'utf8')
+  const staging = `${lockPath}.claim-${nonce}`
   try {
-    if ((await readFile(path.join(lockPath, 'nonce'), 'utf8')) !== nonce) {
-      return { owned: false }
-    }
-  } catch {
-    return { owned: false }
+    await mkdir(staging)
+    await writeFile(path.join(staging, 'nonce'), nonce, 'utf8')
+    await writeFile(path.join(staging, 'owner'), `${process.pid}`, 'utf8')
+    await rename(staging, lockPath)
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'EEXIST' || code === 'ENOTEMPTY') return { owned: false }
+    throw error
+  } finally {
+    await rm(staging, { force: true, recursive: true }).catch(() => undefined)
   }
   return { nonce, owned: true }
 }
@@ -545,6 +544,16 @@ export function validateQuarantinedCommit(
   } catch {
     throw new Error('the proposed commit is not available as a commit object')
   }
+}
+
+export function readGateRef(metadata: GateMetadata, refName: string): string | undefined {
+  return tryGitSync([
+    '--git-dir',
+    metadata.gatePath,
+    'rev-parse',
+    '--verify',
+    `${refName}^{commit}`
+  ])
 }
 
 export async function waitForPermanentRef(
