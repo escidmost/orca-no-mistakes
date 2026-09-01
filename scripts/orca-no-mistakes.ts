@@ -12484,14 +12484,29 @@ async function runGateAdmitCommand(flags: RawCliFlags): Promise<void> {
   const updates = parseReceiveUpdates(await readStandardInput());
   const intent = decodeIntentPushOption(process.env);
   const validated = validateReceiveUpdate(updates, metadata.defaultBranch, intent);
-  if (validated.noEvent) {
-    console.log(JSON.stringify({ accepted: true, noEvent: true }));
-    return;
-  }
   validateQuarantinedCommit(metadata.gatePath, validated.newOid);
 
   const ledger = openRepositoryLedger(metadata.repoRoot, false);
   try {
+    if (validated.noEvent) {
+      const existing = ledger.submissionAdmission(
+        deriveAdmissionId({
+          gateIdentity: metadata.gateIdentity,
+          intent: validated.intent,
+          newOid: validated.newOid,
+          oldOid: validated.oldOid,
+          refName: validated.refName,
+        }),
+      );
+      if (
+        !existing ||
+        existing.status === "accepted" ||
+        existing.status === "superseded"
+      ) {
+        console.log(JSON.stringify({ accepted: true, noEvent: true }));
+        return;
+      }
+    }
     const admission = beginGateAdmission(ledger, metadata, validated);
     if (admission.status === "failed" || admission.status === "superseded") {
       throw new Error(`submission admission ${admission.admission_id} is ${admission.status}`);
@@ -12548,15 +12563,17 @@ async function runGateCoordinatorCommand(flags: RawCliFlags): Promise<void> {
   const gatePath = stringFlag(flags, "gate");
   const admissionId = stringFlag(flags, "admission-id");
   const requestedReadiness = stringFlag(flags, "readiness");
-  if (!gatePath || !admissionId || !requestedReadiness) {
-    throw new Error("gate coordinator requires --gate, --admission-id, and --readiness");
+  const launchNonce = stringFlag(flags, "launch-nonce");
+  if (!gatePath || !admissionId || !requestedReadiness || !launchNonce) {
+    throw new Error(
+      "gate coordinator requires --gate, --admission-id, --readiness, and --launch-nonce",
+    );
   }
   const metadata = await readGateMetadata(gatePath);
   const readinessPath = admissionReadinessPath(metadata, admissionId);
   if (path.resolve(requestedReadiness) !== path.resolve(readinessPath)) {
     throw new Error("coordinator readiness path does not match the admission");
   }
-  const launchNonce = stringFlag(flags, "launch-nonce");
   await recordCoordinatorLaunch(launchLockPath(readinessPath), launchNonce);
   const ledger = openRepositoryLedger(metadata.repoRoot, false);
   let runId: string | undefined;
@@ -13020,16 +13037,12 @@ Run options:
     console.log(JSON.stringify(result));
   } catch (error) {
     closeRenderer();
-    if (
-      admissionRow &&
-      ledger &&
-      parsed.flags["admission-materialized"] !== true
-    ) {
+    if (admissionRow && ledger) {
       try {
         const settled = ledger.submissionAdmission(admissionRow.admission_id);
         if (settled && settled.run_id !== null && settled.status !== "accepted") {
           ledger.reclaimSubmissionAdmission(admissionRow.admission_id);
-        } else {
+        } else if (parsed.flags["admission-materialized"] !== true) {
           ledger.failSubmissionAdmission(admissionRow.admission_id);
         }
       } catch (settlementError) {

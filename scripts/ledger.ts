@@ -2239,12 +2239,16 @@ export class DomainLedger {
         source.exec('PRAGMA foreign_keys = ON')
         source.exec('BEGIN IMMEDIATE')
         cleanupTransaction = true
-        const deleteAdmissions = source.prepare(
-          'DELETE FROM submission_admissions WHERE run_id = ?'
-        )
+        const hasSubmissionAdmissions =
+          source.prepare(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'submission_admissions'"
+          ).get() !== undefined
+        const deleteAdmissions = hasSubmissionAdmissions
+          ? source.prepare('DELETE FROM submission_admissions WHERE run_id = ?')
+          : undefined
         const deleteRun = source.prepare('DELETE FROM runs WHERE repo_root = ? AND run_id = ?')
         for (const runId of runIds) {
-          deleteAdmissions.run(runId)
+          deleteAdmissions?.run(runId)
           deleteRun.run(repoRoot, runId)
         }
         source.exec('COMMIT')
