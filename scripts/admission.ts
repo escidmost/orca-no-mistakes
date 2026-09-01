@@ -1,4 +1,5 @@
 import { execFileSync, spawn } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { chmod, mkdir, open, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
@@ -49,6 +50,7 @@ export type GateMetadata = GatePaths & {
 
 export type LaunchReadiness = {
   error?: string
+  nonce?: string
   runId?: string
   state: 'failed' | 'ready'
 }
@@ -331,12 +333,16 @@ export async function writeLaunchReadiness(
 
 export async function waitForLaunchReadiness(
   readinessPath: string,
-  startupTimeoutMs = 30_000
+  startupTimeoutMs = 30_000,
+  expectedNonce?: string
 ): Promise<LaunchReadiness> {
   const deadline = Date.now() + startupTimeoutMs
   for (;;) {
     try {
       const readiness = JSON.parse(await readFile(readinessPath, 'utf8')) as LaunchReadiness
+      if (expectedNonce !== undefined && readiness.nonce !== expectedNonce) {
+        throw new Error('ENOENT')
+      }
       if (readiness.state === 'ready' && typeof readiness.runId === 'string') return readiness
       if (readiness.state === 'failed') {
         throw new Error(readiness.error ?? 'coordinator launch failed')
@@ -350,6 +356,154 @@ export async function waitForLaunchReadiness(
     if (Date.now() >= deadline) throw new Error('coordinator did not become ready')
     await delay(50)
   }
+}
+
+export function launchLockPath(readinessPath: string): string {
+  return `${readinessPath}.lock`
+}
+
+export function isProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+export async function claimAdmissionLaunch(
+  lockPath: string
+): Promise<{ nonce?: string; owned: boolean }> {
+  try {
+    await mkdir(lockPath)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return { owned: false }
+    throw error
+  }
+  const nonce = randomUUID()
+  await writeFile(path.join(lockPath, 'nonce'), nonce, 'utf8')
+  await writeFile(path.join(lockPath, 'owner'), `${process.pid}`, 'utf8')
+  try {
+    if ((await readFile(path.join(lockPath, 'nonce'), 'utf8')) !== nonce) {
+      return { owned: false }
+    }
+  } catch {
+    return { owned: false }
+  }
+  return { nonce, owned: true }
+}
+
+export async function recordCoordinatorLaunch(lockPath: string): Promise<void> {
+  try {
+    await writeFile(path.join(lockPath, 'coordinator'), `${process.pid}`, 'utf8')
+  } catch {}
+}
+
+export async function readAdmissionLaunchClaim(
+  lockPath: string
+): Promise<{ coordinatorPid?: number; nonce?: string; ownerPid?: number }> {
+  const readValue = async (name: string): Promise<string | undefined> => {
+    try {
+      return (await readFile(path.join(lockPath, name), 'utf8')).trim()
+    } catch {
+      return undefined
+    }
+  }
+  const nonce = await readValue('nonce')
+  const ownerPid = await readValue('owner')
+  const coordinatorPid = await readValue('coordinator')
+  return {
+    coordinatorPid: coordinatorPid === undefined ? undefined : Number(coordinatorPid),
+    nonce,
+    ownerPid: ownerPid === undefined ? undefined : Number(ownerPid)
+  }
+}
+
+export async function releaseAdmissionLaunch(lockPath: string): Promise<void> {
+  await rm(lockPath, { force: true, recursive: true })
+}
+
+export type AdmissionLaunchSpawn = (nonce: string) => Promise<void>
+
+async function reclaimIfAbandoned(
+  lockPath: string
+): Promise<boolean> {
+  const claim = await readAdmissionLaunchClaim(lockPath)
+  if (claim.nonce === undefined) return false
+  const ownerAlive = claim.ownerPid !== undefined && isProcessAlive(claim.ownerPid)
+  const coordinatorAlive =
+    claim.coordinatorPid !== undefined && isProcessAlive(claim.coordinatorPid)
+  if (!ownerAlive && !coordinatorAlive) {
+    await releaseAdmissionLaunch(lockPath)
+    return true
+  }
+  return false
+}
+
+export async function awaitAdmissionLaunch(
+  readinessPath: string,
+  spawnCoordinator: AdmissionLaunchSpawn,
+  startupTimeoutMs = 30_000
+): Promise<{ readiness: LaunchReadiness; releaseLaunch?: () => Promise<void> }> {
+  const lockPath = launchLockPath(readinessPath)
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const claim = await claimAdmissionLaunch(lockPath)
+    if (claim.owned && claim.nonce !== undefined) {
+      await rm(readinessPath, { force: true })
+      await spawnCoordinator(claim.nonce)
+      const readiness = await waitForLaunchReadiness(
+        readinessPath,
+        startupTimeoutMs,
+        claim.nonce
+      )
+      return {
+        readiness,
+        releaseLaunch: () => releaseAdmissionLaunch(lockPath)
+      }
+    }
+    const existing = await readAdmissionLaunchClaim(lockPath)
+    if (existing.nonce === undefined) {
+      return { readiness: await waitForLaunchReadiness(readinessPath, startupTimeoutMs) }
+    }
+    if (await reclaimIfAbandoned(lockPath)) continue
+    try {
+      return {
+        readiness: await waitForLaunchReadiness(readinessPath, startupTimeoutMs, existing.nonce)
+      }
+    } catch (error) {
+      if (await reclaimIfAbandoned(lockPath)) continue
+      throw error
+    }
+  }
+  throw new Error('could not claim the admission launch')
+}
+
+export async function ensureCustodyLaunch(
+  readinessPath: string,
+  spawnCoordinator: AdmissionLaunchSpawn,
+  startupTimeoutMs = 30_000
+): Promise<{ readiness: LaunchReadiness; releaseLaunch: () => Promise<void> } | undefined> {
+  const lockPath = launchLockPath(readinessPath)
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const claim = await claimAdmissionLaunch(lockPath)
+    if (claim.owned && claim.nonce !== undefined) {
+      await rm(readinessPath, { force: true })
+      await spawnCoordinator(claim.nonce)
+      const readiness = await waitForLaunchReadiness(
+        readinessPath,
+        startupTimeoutMs,
+        claim.nonce
+      )
+      return {
+        readiness,
+        releaseLaunch: () => releaseAdmissionLaunch(lockPath)
+      }
+    }
+    if (await reclaimIfAbandoned(lockPath)) continue
+    return undefined
+  }
+  throw new Error('could not claim the admission launch')
 }
 
 export function launchDetachedCoordinator(input: {
@@ -433,8 +587,9 @@ export function anchorPermanentRef(
   const transaction = [
     'start',
     `verify ${update.refName} ${update.newOid}`,
-    existing ? `verify ${anchor} ${existing}` : `create ${anchor} ${update.newOid}`,
-    ...(existing ? [`update ${anchor} ${update.newOid} ${existing}`] : []),
+    existing
+      ? `update ${anchor} ${update.newOid} ${existing}`
+      : `create ${anchor} ${update.newOid}`,
     'prepare',
     'commit',
     ''
