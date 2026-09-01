@@ -1,0 +1,351 @@
+import { dirname } from 'node:path'
+import { mkdir, writeFile } from 'node:fs/promises'
+
+import type { CommandResult, CommandRunner } from './github.ts'
+import { runCommand } from './github.ts'
+import {
+  canonicalJson,
+  evidenceSha256,
+  sha256,
+  type DomainLedger,
+  type StageCheckpointRow
+} from './ledger.ts'
+
+const OID_PATTERN = /^[0-9a-f]{40,64}$/
+
+export class CandidatePublicationError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'CandidatePublicationError'
+  }
+}
+
+type AdmissionInput = {
+  ledger: DomainLedger
+  runId: string
+  destination: string
+  runner?: CommandRunner
+  env?: NodeJS.ProcessEnv
+  observedAt?: string
+}
+
+type PublicationInput = {
+  ledger: DomainLedger
+  runId: string
+  attemptId: string
+  generationToken: number
+  destination: string
+  artifactPath: string
+  workerIdentity: string
+  reconcileExactCandidate?: boolean
+  runner?: CommandRunner
+  env?: NodeJS.ProcessEnv
+  now?: () => string
+}
+
+type HeadState = { oid: string | null }
+
+function after(previous: string, current: string): string {
+  const previousTime = Date.parse(previous)
+  const currentTime = Date.parse(current)
+  return Number.isFinite(previousTime) && Number.isFinite(currentTime) && currentTime <= previousTime
+    ? new Date(previousTime + 1).toISOString()
+    : current
+}
+
+function headRef(branch: string): string {
+  if (!branch || branch.startsWith('-')) {
+    throw new CandidatePublicationError(`invalid publication branch: ${branch}`)
+  }
+  return `refs/heads/${branch}`
+}
+
+async function readHead(
+  runner: CommandRunner,
+  destination: string,
+  ref: string,
+  cwd: string,
+  env: NodeJS.ProcessEnv
+): Promise<HeadState> {
+  if (!destination || destination.startsWith('-')) {
+    throw new CandidatePublicationError('publication destination is invalid')
+  }
+  const result = await runner(
+    'git',
+    ['ls-remote', '--exit-code', '--refs', destination, ref],
+    { cwd, env }
+  )
+  const output = result.stdout.trim()
+  if (result.code === 2 && output === '') return { oid: null }
+  if (result.code !== 0) {
+    throw new CandidatePublicationError(
+      `cannot read publication head ${ref}: ${result.stderr.trim() || `git exited ${result.code}`}`
+    )
+  }
+  const lines = output.split('\n')
+  const match = lines.length === 1 ? /^([0-9a-f]{40,64})\t(.+)$/.exec(lines[0]!) : null
+  if (!match || match[2] !== ref) {
+    throw new CandidatePublicationError(`malformed publication head response for ${ref}`)
+  }
+  return { oid: match[1]! }
+}
+
+function terminalCandidate(ledger: DomainLedger, runId: string): string {
+  const run = ledger.run(runId)
+  if (!run) throw new CandidatePublicationError(`run ${runId} does not exist`)
+  const plan = ledger.stagePlan(runId)
+  const pushIndex = plan.findIndex((stage) => stage.stage_id === 'push')
+  if (pushIndex < 1 || pushIndex !== plan.length - 1) {
+    throw new CandidatePublicationError('publication requires push as the final focused stage')
+  }
+
+  const dispositions = new Map(ledger.stageDispositions(runId).map((row) => [row.stage_id, row]))
+  const finalCheckpoint = new Map<string, { checkpoint: StageCheckpointRow; index: number }>()
+  ledger.listCheckpoints(runId).forEach((checkpoint, index) => {
+    finalCheckpoint.set(checkpoint.stage_id, { checkpoint, index })
+  })
+
+  let candidate = run.submission_commit_oid
+  let checkpointIndex = -1
+  for (const stage of plan.slice(0, pushIndex)) {
+    const disposition = dispositions.get(stage.stage_id)
+    if (!disposition) throw new CandidatePublicationError(`stage ${stage.stage_id} has no terminal disposition`)
+    const accepted = stage.requirement === 'disabled'
+      ? disposition.disposition === 'disabled'
+      : disposition.disposition === 'satisfied' ||
+        (stage.requirement === 'optional' &&
+          (disposition.disposition === 'skipped' || disposition.disposition === 'waived'))
+    if (!accepted) throw new CandidatePublicationError(`stage ${stage.stage_id} is not publication-ready`)
+
+    const final = finalCheckpoint.get(stage.stage_id)
+    if (disposition.disposition !== 'satisfied') {
+      if (final) throw new CandidatePublicationError(`non-executed stage ${stage.stage_id} has a checkpoint`)
+      continue
+    }
+    if (!final || final.index <= checkpointIndex || final.checkpoint.input_commit_oid !== candidate) {
+      throw new CandidatePublicationError(
+        `stage ${stage.stage_id} does not extend the contiguous candidate chain`
+      )
+    }
+    candidate = final.checkpoint.output_commit_oid
+    checkpointIndex = final.index
+  }
+
+  if (!OID_PATTERN.test(candidate)) {
+    throw new CandidatePublicationError(`invalid terminal candidate OID: ${candidate}`)
+  }
+  return candidate
+}
+
+function observationPayload(
+  route: NonNullable<ReturnType<DomainLedger['publicationRoute']>>,
+  oid: string | null
+): Record<string, unknown> {
+  const routeFacts = {
+    forgeHost: route.forge_host,
+    headBranch: route.head_branch,
+    headOwner: route.head_owner,
+    repositoryId: route.head_repository_id
+  }
+  return oid === null ? { ...routeFacts, state: 'absent' } : { ...routeFacts, oid }
+}
+
+export async function admitCandidatePublication(input: AdmissionInput): Promise<{
+  headCommitOid: string | null
+  routeFingerprint: string
+}> {
+  const run = input.ledger.run(input.runId)
+  const route = input.ledger.publicationRoute(input.runId)
+  if (!run || !route) throw new CandidatePublicationError(`run ${input.runId} has no publication route`)
+  const ref = headRef(route.head_branch)
+  const head = await readHead(
+    input.runner ?? runCommand,
+    input.destination,
+    ref,
+    run.repo_root,
+    input.env ?? process.env
+  )
+  input.ledger.recordPublicationBaseline({
+    runId: input.runId,
+    routeFingerprint: route.route_fingerprint,
+    transportUrl: input.destination,
+    headCommitOid: head.oid,
+    observedAt: input.observedAt ?? new Date().toISOString()
+  })
+  return { headCommitOid: head.oid, routeFingerprint: route.route_fingerprint }
+}
+
+export async function publishCandidate(input: PublicationInput): Promise<{
+  candidateCommitOid: string
+  outcome: 'created' | 'updated' | 'unchanged'
+  receiptSha256: string
+}> {
+  const runner = input.runner ?? runCommand
+  const env = input.env ?? process.env
+  const now = input.now ?? (() => new Date().toISOString())
+  const route = input.ledger.publicationRoute(input.runId)
+  const baseline = input.ledger.publicationBaseline(input.runId)
+  const run = input.ledger.run(input.runId)
+  if (!route || !baseline || !run) {
+    throw new CandidatePublicationError(`run ${input.runId} has no admitted publication`)
+  }
+  if (baseline.route_fingerprint !== route.route_fingerprint || baseline.transport_url !== input.destination) {
+    throw new CandidatePublicationError('publication destination differs from the immutable admission route')
+  }
+  if (!input.ledger.ownsLease(input.runId, {
+    repoRoot: run.repo_root,
+    branch: run.branch,
+    generationToken: input.generationToken
+  })) {
+    throw new CandidatePublicationError('publication lease is no longer owned by this run generation')
+  }
+
+  const candidate = terminalCandidate(input.ledger, input.runId)
+  const ref = headRef(route.head_branch)
+  const subject = `${route.forge_host}/${route.head_repository_id}:${ref}`
+  const pre = await readHead(runner, input.destination, ref, run.repo_root, env)
+  const preObservedAt = now()
+  const preRead = input.ledger.recordRemoteObservation({
+    runId: input.runId,
+    attemptId: input.attemptId,
+    kind: 'publication-head',
+    subject,
+    payload: observationPayload(route, pre.oid),
+    observedAt: preObservedAt
+  })
+
+  const baselineExpected = baseline.authoritative_absence === 1 ? null : baseline.head_commit_oid
+  const reconciled = pre.oid === candidate && pre.oid !== baselineExpected && input.reconcileExactCandidate === true
+  if (pre.oid !== baselineExpected && !reconciled) {
+    throw new CandidatePublicationError('publication head changed after admission; no mutation attempted')
+  }
+
+  const outcome = reconciled || baselineExpected === candidate
+    ? 'unchanged'
+    : baselineExpected === null
+      ? 'created'
+      : 'updated'
+  const mutationCreatedAt = after(preObservedAt, now())
+  const mutation = input.ledger.recordMutationIntent({
+    runId: input.runId,
+    attemptId: input.attemptId,
+    kind: 'candidate-publication',
+    targetFingerprint: route.route_fingerprint,
+    payload: {
+      expected: baselineExpected ?? 'absent',
+      update: candidate,
+      ...(reconciled ? { reconciled: true } : {})
+    },
+    createdAt: mutationCreatedAt
+  })
+
+  let pushResult: CommandResult | null = null
+  let pushError: unknown
+  if (pre.oid !== candidate) {
+    if (!input.ledger.ownsLease(input.runId, {
+      repoRoot: run.repo_root,
+      branch: run.branch,
+      generationToken: input.generationToken
+    })) {
+      throw new CandidatePublicationError('publication lease was lost before mutation')
+    }
+    try {
+      pushResult = await runner('git', [
+        'push',
+        '--porcelain',
+        `--force-with-lease=${ref}:${baselineExpected ?? ''}`,
+        input.destination,
+        `${candidate}:${ref}`
+      ], { cwd: run.repo_root, env })
+    } catch (error) {
+      pushError = error
+    }
+  }
+
+  let post: HeadState
+  try {
+    post = await readHead(runner, input.destination, ref, run.repo_root, env)
+  } catch (error) {
+    throw new CandidatePublicationError(
+      `publication result is uncertain because the authoritative post-read failed: ${String(error)}`
+    )
+  }
+  const postObservedAt = after(mutationCreatedAt, now())
+  const postRead = input.ledger.recordRemoteObservation({
+    runId: input.runId,
+    attemptId: input.attemptId,
+    kind: 'publication-head',
+    subject,
+    payload: observationPayload(route, post.oid),
+    observedAt: postObservedAt
+  })
+  if (post.oid !== candidate) {
+    const transportFailure = pushError
+      ? `; push threw ${String(pushError)}`
+      : pushResult && pushResult.code !== 0
+        ? `; push exited ${pushResult.code}: ${pushResult.stderr.trim()}`
+        : ''
+    throw new CandidatePublicationError(
+      `publication post-read did not prove the exact candidate${transportFailure}`
+    )
+  }
+
+  const artifactBytes = `${canonicalJson({
+    candidateCommitOid: candidate,
+    mutationIntent: mutation,
+    outcome,
+    postRead,
+    preRead,
+    pushExitCode: pushResult?.code ?? null
+  })}\n`
+  await mkdir(dirname(input.artifactPath), { recursive: true })
+  await writeFile(input.artifactPath, artifactBytes)
+  const artifactSha256 = sha256(artifactBytes)
+  const summary = `Published exact candidate ${candidate} to ${ref} (${outcome})`
+  const evidenceDigest = evidenceSha256({
+    artifactSha256,
+    baseCommitOid: run.submission_commit_oid,
+    candidateCommitOid: candidate,
+    exitCode: 0,
+    round: 0,
+    runId: input.runId,
+    stage: 'push',
+    summary,
+    workerIdentity: input.workerIdentity
+  })
+  const settlement = input.ledger.settleRemoteStage({
+    runId: input.runId,
+    stageId: 'push',
+    checkpoint: {
+      inputCommitOid: candidate,
+      outputCommitOid: candidate,
+      roundIndex: 0
+    },
+    evidence: {
+      runId: input.runId,
+      stageId: 'push',
+      roundIndex: 0,
+      candidateCommitOid: candidate,
+      baseCommitOid: run.submission_commit_oid,
+      workerIdentity: input.workerIdentity,
+      exitCode: 0,
+      evidenceSha256: evidenceDigest,
+      artifactPath: input.artifactPath,
+      artifactSha256,
+      summary
+    },
+    receipt: {
+      authoritativePostObservationSha256: postRead,
+      candidateCommitOid: candidate,
+      kind: 'candidate-publication',
+      payload: {
+        mutationIntent: mutation,
+        outcome,
+        postRead,
+        preRead,
+        routeFingerprint: route.route_fingerprint
+      }
+    }
+  })
+  return { candidateCommitOid: candidate, outcome, receiptSha256: settlement.receiptSha256 }
+}
