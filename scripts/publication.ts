@@ -376,7 +376,7 @@ export async function publishCandidate(input: PublicationInput): Promise<{
   const summary = `Published exact candidate ${candidate} to ${ref} (${outcome})`
   const evidenceDigest = evidenceSha256({
     artifactSha256,
-    baseCommitOid: run.submission_commit_oid,
+    baseCommitOid: candidate,
     candidateCommitOid: candidate,
     exitCode: 0,
     round: 0,
@@ -398,7 +398,7 @@ export async function publishCandidate(input: PublicationInput): Promise<{
       stageId: 'push',
       roundIndex: 0,
       candidateCommitOid: candidate,
-      baseCommitOid: run.submission_commit_oid,
+      baseCommitOid: candidate,
       workerIdentity: input.workerIdentity,
       exitCode: 0,
       evidenceSha256: evidenceDigest,
