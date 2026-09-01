@@ -92,6 +92,12 @@ async function readHead(
 }
 
 function transportIdentity(destination: string, forgeHost: string): string {
+  const explicit = destination.trim()
+  if (!/^[^/@\s]+@github\.com:/i.test(explicit) && !/^[a-z][a-z\d+.-]*:/i.test(explicit)) {
+    throw new CandidatePublicationError(
+      'publication destination must identify a credential-free github.com repository'
+    )
+  }
   let reference: { name: string; owner: string }
   try {
     reference = parseGithubRepositoryReference(destination)
@@ -148,6 +154,9 @@ function terminalCandidate(ledger: DomainLedger, runId: string): string {
       : undefined
     if (
       evidence?.stage_id !== stage.stage_id ||
+      evidence.base_commit_oid !== final.checkpoint.input_commit_oid ||
+      evidence.candidate_commit_oid !== final.checkpoint.output_commit_oid ||
+      evidence.round_index !== final.checkpoint.round_index ||
       evidence.exit_code !== 0 ||
       !isAuthoritativeStageEvidence(evidence.worker_identity)
     ) {
@@ -191,14 +200,7 @@ export async function admitCandidatePublication(input: AdmissionInput): Promise<
       `run ${input.runId} has no stored repository publication route to bind the transport`
     )
   }
-  if (route.route_fingerprint !== sha256(canonicalJson({
-    baseBranch: storedRoute.base_branch,
-    baseRepositoryId: storedRoute.base_repository_id,
-    forgeHost: storedRoute.forge_host,
-    headBranch: storedRoute.head_branch,
-    headOwner: storedRoute.head_owner,
-    headRepositoryId: storedRoute.head_repository_id
-  }))) {
+  if (route.route_fingerprint !== storedRoute.route_fingerprint) {
     throw new CandidatePublicationError('publication route does not match the stored repository route')
   }
   const transportUrl = transportIdentity(input.destination, storedRoute.forge_host)

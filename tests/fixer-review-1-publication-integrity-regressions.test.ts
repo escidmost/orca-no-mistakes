@@ -21,7 +21,7 @@ const POLICY = 'f'.repeat(64)
 const TIME = '2026-09-01T12:00:00.000Z'
 
 type FixtureOptions = {
-  evidence?: 'ok' | 'none' | 'failed' | 'advisory'
+  evidence?: 'ok' | 'none' | 'failed' | 'advisory' | 'mismatched'
   repositoryRoute?: 'stored' | 'missing' | 'divergent'
   fork?: boolean
 }
@@ -131,7 +131,7 @@ async function fixture(name: string, options: FixtureOptions = {}): Promise<Cont
     const entry = {
       artifactSha256: 'e'.repeat(64),
       baseCommitOid: base,
-      candidateCommitOid: candidate,
+      candidateCommitOid: evidenceMode === 'mismatched' ? third : candidate,
       exitCode: evidenceMode === 'failed' ? 1 : 0,
       round: 0,
       runId,
@@ -256,7 +256,8 @@ test('admission rejects destinations that are not the stored head repository', a
   for (const [name, destinationOf, message] of [
     ['other-repository', (context: Context) => 'https://github.com/owner/other.git', /does not name the stored head repository/],
     ['credential-bearing', (context: Context) => 'https://user:token@github.com/owner/repo.git', /credential-free github\.com repository/],
-    ['local-transport', localDestination, /credential-free github\.com repository/]
+    ['local-transport', localDestination, /credential-free github\.com repository/],
+    ['repository-shorthand', () => 'owner/repo', /credential-free github\.com repository/]
   ] as const) {
     await t.test(name, async () => {
       const context = await fixture(`admit-reject-${name}`)
@@ -317,7 +318,7 @@ test('admission persists the canonical credential-free transport identity', asyn
 })
 
 test('a satisfied pre-push stage must bind successful authoritative evidence', async (t) => {
-  for (const mode of ['none', 'failed', 'advisory'] as const) {
+  for (const mode of ['none', 'failed', 'advisory', 'mismatched'] as const) {
     await t.test(mode, async () => {
       const context = await fixture(`evidence-${mode}`, { evidence: mode })
       try {

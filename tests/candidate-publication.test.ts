@@ -6,7 +6,7 @@ import path from 'node:path'
 import test from 'node:test'
 
 import { runCommand, type CommandRunner } from '../scripts/github.ts'
-import { DomainLedger } from '../scripts/ledger.ts'
+import { DomainLedger, evidenceSha256 } from '../scripts/ledger.ts'
 import {
   admitCandidatePublication,
   publishCandidate
@@ -34,7 +34,10 @@ async function fixture(name: string): Promise<{
 }> {
   const temp = await mkdtemp(path.join(tmpdir(), `onm-publication-${name}-`))
   const repo = path.join(temp, 'source')
-  const destination = path.join(temp, 'remote.git')
+  const remote = path.join(temp, 'remote.git')
+  const fork = name.includes('fork')
+  const headOwner = fork ? 'fork-owner' : 'owner'
+  const destination = `https://github.com/${headOwner}/repo.git`
   execFileSync('git', ['-c', 'init.templateDir=', 'init', '-b', 'main', repo])
   git(repo, 'config', 'user.email', 'test@example.com')
   git(repo, 'config', 'user.name', 'Test')
@@ -44,11 +47,33 @@ async function fixture(name: string): Promise<{
   const candidate = git(repo, 'rev-parse', 'HEAD')
   git(repo, 'commit', '--allow-empty', '-m', 'third')
   const third = git(repo, 'rev-parse', 'HEAD')
-  execFileSync('git', ['-c', 'init.templateDir=', 'init', '--bare', destination])
+  execFileSync('git', ['-c', 'init.templateDir=', 'init', '--bare', remote])
+  git(repo, 'config', `url.${remote}.insteadOf`, destination)
 
   const ledger = new DomainLedger(path.join(temp, 'ledger.sqlite'))
   const runId = `run-${name}`
   const attemptId = `attempt-${name}`
+  ledger.setRepositoryPublicationRoute({
+    actorId: 'A_actor',
+    actorLogin: 'owner',
+    actorNodeId: 'AN_actor',
+    backend: 'gh',
+    backendVersion: 'test',
+    baseBranch: 'main',
+    baseRepositoryId: 'R_base',
+    baseRepositoryName: 'owner/repo',
+    baseRepositoryNodeId: 'RN_base',
+    credentialSource: 'GH_TOKEN',
+    forgeHost: 'github.com',
+    headBranch: 'feature',
+    headOwner,
+    headRepositoryId: fork ? 'R_fork' : 'R_base',
+    headRepositoryName: `${headOwner}/repo`,
+    headRepositoryNodeId: fork ? 'RN_fork' : 'RN_base',
+    networkRootRepositoryId: 'R_base',
+    observedAt: TIME,
+    repoRoot: repo
+  })
   ledger.startRun({
     baseBranch: 'main',
     branch: 'feature',
@@ -62,15 +87,6 @@ async function fixture(name: string): Promise<{
     ],
     submissionCommitOid: base
   })
-  ledger.recordPublicationRoute({
-    baseBranch: 'main',
-    baseRepositoryId: 'R_base',
-    forgeHost: 'github.com',
-    headBranch: 'feature',
-    headOwner: name.includes('fork') ? 'fork-owner' : 'owner',
-    headRepositoryId: name.includes('fork') ? 'R_fork' : 'R_base',
-    runId
-  })
   ledger.recordCheckpoint({
     inputCommitOid: base,
     outputCommitOid: candidate,
@@ -78,7 +94,37 @@ async function fixture(name: string): Promise<{
     runId,
     stageId: 'lint'
   })
-  ledger.recordStageDisposition({ disposition: 'satisfied', runId, stageId: 'lint' })
+  const lintEvidence = {
+    artifactSha256: 'e'.repeat(64),
+    baseCommitOid: base,
+    candidateCommitOid: candidate,
+    exitCode: 0,
+    round: 0,
+    runId,
+    stage: 'lint',
+    summary: 'lint passed',
+    workerIdentity: 'lint-worker'
+  }
+  const lintEvidenceSha256 = evidenceSha256(lintEvidence)
+  ledger.recordEvidence({
+    artifactPath: path.join(temp, 'lint.json'),
+    artifactSha256: lintEvidence.artifactSha256,
+    baseCommitOid: base,
+    candidateCommitOid: candidate,
+    evidenceSha256: lintEvidenceSha256,
+    exitCode: 0,
+    roundIndex: 0,
+    runId,
+    stageId: 'lint',
+    summary: lintEvidence.summary,
+    workerIdentity: lintEvidence.workerIdentity
+  })
+  ledger.recordStageDisposition({
+    disposition: 'satisfied',
+    evidenceSha256: lintEvidenceSha256,
+    runId,
+    stageId: 'lint'
+  })
   const generationToken = ledger.acquireLease({ branch: 'feature', repoRoot: repo, runId })
   ledger.startAttempt({
     actorIdentity: 'operator',
