@@ -21,10 +21,14 @@ export class CandidatePublicationError extends Error {
   }
 }
 
+export type RepositoryIdentity = { id: string; nodeId?: string | null }
+export type RepositoryIdentityResolver = (reference: string) => Promise<RepositoryIdentity>
+
 type AdmissionInput = {
   ledger: DomainLedger
   runId: string
   destination: string
+  resolveRepositoryIdentity?: RepositoryIdentityResolver
   runner?: CommandRunner
   env?: NodeJS.ProcessEnv
   observedAt?: string
@@ -36,6 +40,7 @@ type PublicationInput = {
   attemptId: string
   generationToken: number
   destination: string
+  resolveRepositoryIdentity?: RepositoryIdentityResolver
   artifactPath: string
   workerIdentity: string
   reconcileExactCandidate?: boolean
@@ -107,6 +112,28 @@ function transportIdentity(destination: string, forgeHost: string): string {
     )
   }
   return `${forgeHost}/${reference.owner}/${reference.name}`
+}
+
+async function requireStoredRepositoryIdentity(
+  resolveRepositoryIdentity: RepositoryIdentityResolver,
+  reference: string,
+  storedRoute: { head_repository_id: string; head_repository_node_id: string | null }
+): Promise<void> {
+  const identity = await resolveRepositoryIdentity(reference)
+  if (identity.id !== storedRoute.head_repository_id) {
+    throw new CandidatePublicationError(
+      `publication destination ${reference} resolves to repository ${identity.id}, not the stored route repository ${storedRoute.head_repository_id}`
+    )
+  }
+  if (
+    storedRoute.head_repository_node_id !== null &&
+    identity.nodeId != null &&
+    identity.nodeId !== storedRoute.head_repository_node_id
+  ) {
+    throw new CandidatePublicationError(
+      `publication destination ${reference} resolves to repository node ${identity.nodeId}, not the stored route repository node ${storedRoute.head_repository_node_id}`
+    )
+  }
 }
 
 function terminalCandidate(ledger: DomainLedger, runId: string): string {
@@ -207,6 +234,13 @@ export async function admitCandidatePublication(input: AdmissionInput): Promise<
   if (transportUrl !== `${storedRoute.forge_host}/${storedRoute.head_repository_name}`) {
     throw new CandidatePublicationError('publication destination does not name the stored head repository')
   }
+  if (input.resolveRepositoryIdentity) {
+    await requireStoredRepositoryIdentity(
+      input.resolveRepositoryIdentity,
+      transportUrl.split('/').slice(1).join('/'),
+      storedRoute
+    )
+  }
   const ref = headRef(route.head_branch)
   const head = await readHead(
     input.runner ?? runCommand,
@@ -242,6 +276,20 @@ export async function publishCandidate(input: PublicationInput): Promise<{
   const transportUrl = transportIdentity(input.destination, route.forge_host)
   if (baseline.route_fingerprint !== route.route_fingerprint || baseline.transport_url !== transportUrl) {
     throw new CandidatePublicationError('publication destination differs from the immutable admission route')
+  }
+  const storedRoute = input.ledger.repositoryPublicationRoute(run.repo_root)
+  if (!storedRoute) {
+    throw new CandidatePublicationError(
+      `run ${input.runId} has no stored repository publication route to bind the transport`
+    )
+  }
+  const repositoryReference = transportUrl.split('/').slice(1).join('/')
+  if (input.resolveRepositoryIdentity) {
+    await requireStoredRepositoryIdentity(
+      input.resolveRepositoryIdentity,
+      repositoryReference,
+      storedRoute
+    )
   }
   if (!input.ledger.ownsLease(input.runId, {
     repoRoot: run.repo_root,
@@ -360,6 +408,19 @@ export async function publishCandidate(input: PublicationInput): Promise<{
     throw new CandidatePublicationError(
       `publication post-read did not prove the exact candidate${transportFailure}`
     )
+  }
+  if (input.resolveRepositoryIdentity) {
+    try {
+      await requireStoredRepositoryIdentity(
+        input.resolveRepositoryIdentity,
+        repositoryReference,
+        storedRoute
+      )
+    } catch (error) {
+      throw new CandidatePublicationError(
+        `publication result is uncertain because the destination repository identity could not be re-verified: ${String(error)}`
+      )
+    }
   }
 
   const artifactBytes = `${canonicalJson({
