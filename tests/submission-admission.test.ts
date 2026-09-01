@@ -123,3 +123,39 @@ test('a competing submission on the same ref cannot acquire the pending lease', 
     await rm(temp, { force: true, recursive: true })
   }
 })
+
+test('an unbound failed direct admission can be retried', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'onm-admission-retry-'))
+  const ledger = new DomainLedger(path.join(temp, 'ledger.sqlite'))
+  const input = {
+    admissionId: `admission-${'a'.repeat(64)}`,
+    gateIdentity: 'gate-identity',
+    intent: 'Retry an unbound direct admission.',
+    newOid: oid('b'),
+    oldOid: oid('b'),
+    refName: 'refs/heads/feature',
+    repoRoot: '/repo',
+    source: 'direct' as const
+  }
+  try {
+    ledger.beginSubmissionAdmission(input)
+    ledger.failSubmissionAdmission(input.admissionId)
+
+    const retry = ledger.beginSubmissionAdmission(input)
+    assert.equal(retry.status, 'pending')
+    assert.equal(retry.run_id, null)
+    assert.throws(
+      () =>
+        ledger.beginSubmissionAdmission({
+          ...input,
+          admissionId: `admission-${'c'.repeat(64)}`,
+          intent: 'Competing retry.',
+          newOid: oid('d')
+        }),
+      /pending admission lease already exists/
+    )
+  } finally {
+    ledger.close()
+    await rm(temp, { force: true, recursive: true })
+  }
+})

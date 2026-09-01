@@ -2655,6 +2655,50 @@ export class DomainLedger {
         if (existing.source !== input.source && existing.status !== 'accepted') {
           throw new Error(`submission admission ${input.admissionId} was admitted through another ingress`)
         }
+        if (
+          existing.status === 'failed' &&
+          existing.source === 'direct' &&
+          input.source === 'direct' &&
+          existing.run_id === null &&
+          existing.launcher_pid === null
+        ) {
+          const lease = this.#db
+            .prepare(
+              `SELECT admission_id FROM pending_admission_leases
+               WHERE repo_root = ? AND ref_name = ?`
+            )
+            .get(input.repoRoot, input.refName) as { admission_id: string } | undefined
+          if (lease && lease.admission_id !== input.admissionId) {
+            throw new Error(`pending admission lease already exists for ${input.refName}`)
+          }
+          const now = new Date().toISOString()
+          this.#db
+            .prepare(
+              `UPDATE submission_admissions
+               SET status = 'pending', lease_token = ?, launched_at = NULL,
+                   accepted_oid = NULL, accepted_at = NULL
+               WHERE admission_id = ?`
+            )
+            .run(randomUUID(), input.admissionId)
+          if (lease) {
+            this.#db
+              .prepare(
+                `UPDATE pending_admission_leases
+                 SET acquired_at = ? WHERE repo_root = ? AND ref_name = ?`
+              )
+              .run(now, input.repoRoot, input.refName)
+          } else {
+            this.#db
+              .prepare(
+                `INSERT INTO pending_admission_leases
+                   (repo_root, ref_name, admission_id, acquired_at)
+                 VALUES (?, ?, ?, ?)`
+              )
+              .run(input.repoRoot, input.refName, input.admissionId, now)
+          }
+          this.#db.exec('COMMIT')
+          return this.submissionAdmission(input.admissionId)!
+        }
         this.#db.exec('COMMIT')
         return existing
       }
