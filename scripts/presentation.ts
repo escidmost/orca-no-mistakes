@@ -9,6 +9,15 @@ export type PresentationStatus =
 export type GateResolver = (gateId: string, resolution: string) => Promise<void>;
 export type CancellationAction = "cancel" | "force-stop" | "gate-stop";
 
+export type PresentationFinding = {
+  description: string;
+  disposition: "approved" | "fixed" | "open";
+  file?: string;
+  id: string;
+  line?: number;
+  severity: "error" | "info" | "warning";
+};
+
 export type PresentationTransition =
   | { kind: "run-started" }
   | { attempt: number; kind: "attempt-started" }
@@ -17,7 +26,9 @@ export type PresentationTransition =
   | { kind: "round-started"; round: number; stage: StageName }
   | {
       actionable: number;
+      findings?: readonly Omit<PresentationFinding, "disposition">[];
       kind: "findings-recorded";
+      retainedFixer?: boolean;
       round: number;
       stage: StageName;
       total: number;
@@ -67,7 +78,12 @@ export type PresentationSnapshot = {
   sequence: number;
   stages: readonly {
     actionableFindings: number;
+    approvedFindings?: number;
+    findings?: readonly PresentationFinding[];
+    fixedFindings?: number;
     id: StageName;
+    openFindings?: number;
+    retainedFixer?: boolean;
     round: number;
     status: "pending" | "active" | "blocked" | "passed" | "failed" | "cancelled";
     totalFindings: number;
@@ -99,7 +115,11 @@ function initialSnapshot(runId: string): PresentationSnapshot {
     sequence: 0,
     stages: PIPELINE_STEPS.map((id) => ({
       actionableFindings: 0,
+      approvedFindings: 0,
+      findings: [],
+      fixedFindings: 0,
       id,
+      openFindings: 0,
       round: 0,
       status: "pending" as const,
       totalFindings: 0,
@@ -119,6 +139,35 @@ function updateStage(
   return snapshot.stages.map((item) =>
     item.id === stage ? { ...item, ...update } : item,
   );
+}
+
+function updateFindings(
+  previous: readonly PresentationFinding[],
+  current: readonly Omit<PresentationFinding, "disposition">[],
+): PresentationFinding[] {
+  const pending = new Map<string, Omit<PresentationFinding, "disposition">[]>();
+  for (const finding of current) {
+    const queue = pending.get(finding.id);
+    if (queue) queue.push(finding);
+    else pending.set(finding.id, [finding]);
+  }
+  const next = previous.map((finding) => {
+    const reported = pending.get(finding.id)?.shift();
+    if (reported) {
+      if (pending.get(finding.id)?.length === 0) pending.delete(finding.id);
+      return { ...reported, disposition: "open" as const };
+    }
+    return finding.disposition === "open"
+      ? { ...finding, disposition: "fixed" as const }
+      : finding;
+  });
+  return [
+    ...next,
+    ...[...pending.values()].flat().map((finding) => ({
+      ...finding,
+      disposition: "open" as const,
+    })),
+  ];
 }
 
 function nextSnapshot(
@@ -146,10 +195,8 @@ function nextSnapshot(
         gate: undefined,
         stages: next.stages.map((stage) => ({
           ...stage,
-          actionableFindings: stage.status === "passed" ? stage.actionableFindings : 0,
           round: stage.status === "passed" ? stage.round : 0,
           status: stage.status === "passed" ? "passed" : "pending",
-          totalFindings: stage.status === "passed" ? stage.totalFindings : 0,
         })),
         status: "in-progress",
       };
@@ -177,16 +224,37 @@ function nextSnapshot(
       };
       break;
     case "findings-recorded":
+      {
+        const stage = next.stages.find((item) => item.id === transition.stage);
+        const findings = transition.findings
+          ? updateFindings(stage?.findings ?? [], transition.findings)
+          : undefined;
+        const fixed = findings?.filter((finding) => finding.disposition === "fixed").length;
+        const approved = findings?.filter(
+          (finding) => finding.disposition === "approved",
+        ).length;
+        const open = findings?.filter((finding) => finding.disposition === "open").length;
       next = {
         ...next,
         currentStage: transition.stage,
-        stages: updateStage(next, transition.stage, {
-          actionableFindings: transition.actionable,
-          round: transition.round,
-          status: transition.actionable > 0 ? "blocked" : "active",
-          totalFindings: transition.total,
-        }),
+        stages: next.stages.map((item) =>
+          item.id === transition.stage
+            ? {
+                ...item,
+                actionableFindings: open ?? transition.actionable,
+                approvedFindings: approved,
+                findings,
+                fixedFindings: fixed,
+                openFindings: open,
+                retainedFixer: transition.retainedFixer,
+                round: transition.round,
+                status: (open ?? transition.actionable) > 0 ? "blocked" : "active",
+                totalFindings: findings?.length ?? transition.total,
+              }
+            : { ...item, retainedFixer: false },
+        ),
       };
+      }
       break;
     case "gate-opened":
       next = {
@@ -199,10 +267,23 @@ function nextSnapshot(
           stage: transition.stage,
           state: "open",
         },
-        stages: updateStage(next, transition.stage, { status: "blocked" }),
+        stages: next.stages.map((item) =>
+          item.id === transition.stage
+            ? { ...item, retainedFixer: false, status: "blocked" as const }
+            : { ...item, retainedFixer: false },
+        ),
       };
       break;
     case "gate-resolved":
+      {
+        const stage = next.stages.find((item) => item.id === transition.stage);
+        const approved = ["approve", "skip"].includes(transition.decision)
+          ? stage?.findings?.map((finding) =>
+              finding.disposition === "open"
+                ? { ...finding, disposition: "approved" as const }
+                : finding,
+            )
+          : stage?.findings;
       next = {
         ...next,
         gate: {
@@ -211,7 +292,20 @@ function nextSnapshot(
           id: transition.gateId,
           state: "resolved",
         },
+        stages: updateStage(next, transition.stage, {
+          actionableFindings:
+            approved?.filter((finding) => finding.disposition === "open").length ??
+            stage?.actionableFindings,
+          approvedFindings: approved?.filter(
+            (finding) => finding.disposition === "approved",
+          ).length,
+          findings: approved,
+          openFindings: approved?.filter(
+            (finding) => finding.disposition === "open",
+          ).length,
+        }),
       };
+      }
       break;
     case "stage-completed":
       next = {
@@ -228,9 +322,14 @@ function nextSnapshot(
       next = {
         ...next,
         error: { resumable: transition.resumable },
-        stages: next.currentStage
-          ? updateStage(next, next.currentStage, { status: "failed" })
-          : next.stages,
+        stages: next.stages.map((stage) => ({
+          ...stage,
+          retainedFixer: false,
+          status:
+            stage.id === next.currentStage
+              ? ("failed" as const)
+              : stage.status,
+        })),
         status: "failed",
       };
       break;
@@ -245,7 +344,14 @@ function nextSnapshot(
       };
       break;
     case "run-completed":
-      next = { ...next, status: transition.status };
+      next = {
+        ...next,
+        stages: next.stages.map((stage) => ({
+          ...stage,
+          retainedFixer: false,
+        })),
+        status: transition.status,
+      };
       break;
   }
   Object.freeze(next.mode);
@@ -394,7 +500,10 @@ export class PlainStatusRenderer implements PresentationRenderer {
         line = `${prefix} ${event.stage} round ${event.round} started`;
         break;
       case "findings-recorded":
-        line = `${prefix} ${event.stage} round ${event.round} findings total=${event.total} actionable=${event.actionable}`;
+        {
+          const stage = snapshot.stages.find((item) => item.id === event.stage);
+          line = `${prefix} ${event.stage} round ${event.round} findings fixed=${stage?.fixedFindings ?? 0}/${stage?.totalFindings ?? event.total} approved=${stage?.approvedFindings ?? 0} open=${stage?.openFindings ?? event.actionable}`;
+        }
         break;
       case "gate-opened":
         line = `${prefix} ${event.stage} round ${event.round} gate opened`;

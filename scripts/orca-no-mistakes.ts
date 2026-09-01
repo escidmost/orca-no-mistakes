@@ -299,6 +299,7 @@ export type PipelineOptions = {
     artifactsDir: string,
     stageLogs: ReadonlyMap<string, StageLog>,
     resolveGate?: GateResolver,
+    setAutoFix?: (enabled: boolean) => Promise<void> | void,
   ) => PresentationRenderer;
   resumeRunId?: string;
   userGlobalConfig?: OrcaNoMistakesConfig;
@@ -1756,6 +1757,7 @@ export async function runPipeline(
   let domainRunStarted = false;
   let generationToken: number | undefined;
   let presentation!: PresentationPublisher;
+  let autoFixMode = pipelineConfig.auto_fix.enabled;
   let presentationReady = false;
   let resumeClaimId: string | undefined;
   let resumeCheckpoint: StageCheckpointRow | undefined;
@@ -1834,6 +1836,19 @@ export async function runPipeline(
         artifactsDir,
         stageLogs!,
         orca.resolveGate?.bind(orca),
+        (enabled) => {
+          if (enabled === autoFixMode) return;
+          const eventKey = `mode:${ledger.listAutoFixModeEvents(runId).length + 1}:${enabled ? "on" : "off"}`;
+          let committed = false;
+          presentation.publish(eventKey, { enabled, kind: "mode-changed" }, (snapshot) => {
+            committed = ledger.recordAutoFixMode(runId, enabled, "operator", {
+              eventKey,
+              snapshot,
+            });
+            return committed;
+          });
+          if (committed) autoFixMode = enabled;
+        },
       ) ??
         (options.plainStatus
           ? new PlainStatusRenderer(process.stderr)
@@ -1855,6 +1870,15 @@ export async function runPipeline(
           : undefined,
       );
       presentationReady = true;
+      const recordedAutoFixMode = ledger.latestAutoFixMode(runId);
+      autoFixMode =
+        recordedAutoFixMode ??
+        (options.resumeRunId
+          ? presentation.current.mode.autoFix
+          : pipelineConfig.auto_fix.enabled);
+      if (recordedAutoFixMode === undefined) {
+        ledger.recordAutoFixMode(runId, autoFixMode, "initial");
+      }
       if (!options.resumeRunId) {
         presentation.publish("run:started", { kind: "run-started" });
       }
@@ -1865,12 +1889,12 @@ export async function runPipeline(
       });
       if (
         attempt === 1 ||
-        presentation.current.mode.autoFix !== pipelineConfig.auto_fix.enabled
+        presentation.current.mode.autoFix !== autoFixMode
       ) {
         presentation.publish(
-          `attempt:${attempt}:mode:${pipelineConfig.auto_fix.enabled ? "on" : "off"}`,
+          `attempt:${attempt}:mode:${autoFixMode ? "on" : "off"}`,
           {
-            enabled: pipelineConfig.auto_fix.enabled,
+            enabled: autoFixMode,
             kind: "mode-changed",
           },
         );
@@ -2024,23 +2048,28 @@ export async function runPipeline(
     const priorRebase = latestEvidenceByStage.get("rebase");
     if (priorRebase) baseCommitOid = priorRebase.base_commit_oid;
 
+    const resolvedApprovalAudit = (
+      stage: StageName,
+      evidence: StageEvidenceRow,
+    ) =>
+      priorGateAudit.findLast(
+        (audit) =>
+          gateAuditMatchesEvidence(
+            audit,
+            stage,
+            evidence.round_index,
+            evidence.evidence_sha256,
+          ) &&
+          audit.resolved_at !== null &&
+          (audit.decision === "approve" || audit.decision === "skip"),
+      );
     let resumeStageIndex = 0;
     if (resumeCheckpoint) {
       for (const stage of PIPELINE_STEPS) {
         const evidence = latestEvidenceByStage.get(stage);
         if (!evidence) break;
         const findings = JSON.parse(evidence.findings_json ?? "[]") as Finding[];
-        const approved = priorGateAudit.findLast(
-          (audit) =>
-            gateAuditMatchesEvidence(
-              audit,
-              stage,
-              evidence.round_index,
-              evidence.evidence_sha256,
-            ) &&
-            audit.resolved_at !== null &&
-            (audit.decision === "approve" || audit.decision === "skip"),
-        );
+        const approved = resolvedApprovalAudit(stage, evidence);
         const complete =
           findings.every((finding) => finding.action === "no-op") ||
           approved !== undefined;
@@ -2057,6 +2086,45 @@ export async function runPipeline(
               resumeCheckpoint.output_commit_oid);
         if (!complete || !commitStillValid) break;
         resumeStageIndex += 1;
+      }
+      for (const stage of PIPELINE_STEPS.slice(0, resumeStageIndex)) {
+        const evidence = latestEvidenceByStage.get(stage)!;
+        const approval = resolvedApprovalAudit(stage, evidence);
+        if (!approval) continue;
+        const restored = presentation.current.stages.find(
+          (item) => item.id === stage,
+        );
+        const openCount =
+          restored?.openFindings ?? restored?.actionableFindings ?? 0;
+        if (restored?.status === "passed" && openCount === 0) continue;
+        if (restored?.findings === undefined && openCount > 0) {
+          const findings = JSON.parse(
+            evidence.findings_json ?? "[]",
+          ) as Finding[];
+          const actionable = actionableFindings({ findings, summary: "" });
+          presentation.publish(
+            `findings:${evidence.evidence_sha256}:reconciled`,
+            {
+              actionable: actionable.length,
+              findings: presentationFindingDetails(actionable),
+              kind: "findings-recorded",
+              round: evidence.round_index,
+              stage,
+              total: findings.length,
+            },
+          );
+        }
+        presentation.publish(`gate:${approval.gate_id}:resolved:reconciled`, {
+          decision: approval.decision,
+          gateId: approval.gate_id,
+          kind: "gate-resolved",
+          round: evidence.round_index,
+          stage,
+        });
+        presentation.publish(
+          `stage:${stage}:round:${evidence.round_index}:completed:${evidence.candidate_commit_oid}:reconciled`,
+          { kind: "stage-completed", round: evidence.round_index, stage },
+        );
       }
     }
     const stagesToRun = PIPELINE_STEPS.slice(resumeStageIndex);
@@ -2117,7 +2185,7 @@ export async function runPipeline(
       report: StageReport,
       fallback: { attempts: FallbackAttempt[]; resolvedAgent: string },
       evidenceCommitOid?: string,
-    ): Promise<void> => {
+    ): Promise<boolean> => {
       const candidate = evidenceCommitOid ?? (await git.head());
       const evidenceBaseCommitOid =
         stage === "rebase" && report.rebaseUpstreamHead
@@ -2192,15 +2260,21 @@ export async function runPipeline(
         effectivePolicyHash: effectiveProvenance.effectivePolicyHash,
         baseRefSha: effectiveProvenance.baseRefSha,
       });
-      presentation.publish(`findings:${entry.evidenceSha256}`, {
-        actionable: actionableFindings(report).length,
-        kind: "findings-recorded",
-        round,
-        stage,
-        total: report.findings.length,
-      });
+      const autoFixModeAtFindings = autoFixMode;
+      if (isAuthoritativeStageEvidence(workerIdentity)) {
+        presentation.publish(`findings:${entry.evidenceSha256}`, {
+          actionable: actionableFindings(report).length,
+          findings: presentationFindingDetails(actionableFindings(report)),
+          kind: "findings-recorded",
+          retainedFixer: fixerSession !== undefined,
+          round,
+          stage,
+          total: report.findings.length,
+        });
+      }
       stageEntries.push(entry);
       latestEntryByStage.set(stage, entry);
+      return autoFixModeAtFindings;
     };
 
     const stageTasks = new Map<StageName, string>();
@@ -2246,6 +2320,9 @@ export async function runPipeline(
       );
       let attempt = 0;
       const resumedEvidence = latestEvidenceByStage.get(stage);
+      const resumedFindings = JSON.parse(
+        resumedEvidence?.findings_json ?? "[]",
+      ) as Finding[];
       let resumedFixDecision =
         resumedEvidence &&
         resumedEvidence.candidate_commit_oid === stageInputCommitOid
@@ -2264,6 +2341,20 @@ export async function runPipeline(
       if (resumedFixDecision) round = resumedEvidence!.round_index;
       let inheritedFallback:
         { attempts: FallbackAttempt[]; resolvedAgent: string } | undefined;
+      const resumedFindingMode =
+        resumedEvidence &&
+        resumedEvidence.candidate_commit_oid === stageInputCommitOid &&
+        resumedEvidence.round_index === round
+          ? ledger
+              .listPresentationSnapshots(runId)
+              .findLast(
+                (snapshot) =>
+                  snapshot.transition.kind === "findings-recorded" &&
+                  snapshot.transition.stage === stage &&
+                  snapshot.transition.round === resumedEvidence.round_index,
+              )?.mode.autoFix
+          : undefined;
+      let autoFixModeForReport = resumedFindingMode ?? autoFixMode;
       const runStage = async () => {
         presentation.publish(
           `attempt:${presentation.current.attempt}:stage:${stage}:round:${round}:started`,
@@ -2300,7 +2391,7 @@ export async function runPipeline(
           }
           baseCommitOid = execution.report.rebaseUpstreamHead;
         }
-        await recordStageEvidence(
+        autoFixModeForReport = await recordStageEvidence(
           stage,
           round,
           execution.workerIdentity,
@@ -2316,12 +2407,23 @@ export async function runPipeline(
       };
       let report = resumedFixDecision
         ? {
-            findings: JSON.parse(
-              resumedEvidence!.findings_json ?? "[]",
-            ) as Finding[],
+            findings: resumedFindings,
             summary: resumedEvidence!.summary,
           }
         : await runStage();
+      if (
+        resumedFindingMode !== undefined &&
+        isDeepStrictEqual(
+          actionableFindings(report)
+            .map((finding) => finding.id)
+            .sort(),
+          actionableFindings({ findings: resumedFindings, summary: "" })
+            .map((finding) => finding.id)
+            .sort(),
+        )
+      ) {
+        autoFixModeForReport = resumedFindingMode;
+      }
 
       while (actionableFindings(report).length > 0) {
         const actionable = actionableFindings(report);
@@ -2364,7 +2466,8 @@ export async function runPipeline(
           !stageAutoFix.enabled || !reviewAutoFixAllowed;
         const exhausted = round >= stageAutoFix.max_rounds;
         let targetFindings: Finding[] = actionable;
-        let shouldFix = !asksUser && !exhausted && !automationBlocked;
+        let shouldFix =
+          autoFixModeForReport && !asksUser && !exhausted && !automationBlocked;
         let guidance = "";
         const manualRebaseIssue = stage === "rebase";
 
@@ -3619,6 +3722,16 @@ async function runFixer(
 
 function actionableFindings(report: StageReport): Finding[] {
   return report.findings.filter((finding) => finding.action !== "no-op");
+}
+
+function presentationFindingDetails(findings: readonly Finding[]) {
+  return findings.map(({ description, file, id, line, severity }) => ({
+    description,
+    ...(file ? { file } : {}),
+    id,
+    ...(line ? { line } : {}),
+    severity,
+  }));
 }
 
 function isValidFinding(value: unknown): value is Finding {
@@ -12383,13 +12496,15 @@ Prune options:
         plainStatus: parsed.flags["no-tui"] === true,
         rendererFactory:
           parsed.flags.tui === true
-            ? (artifactsDir, stageLogs, resolveGate) => {
+            ? (artifactsDir, stageLogs, resolveGate, setAutoFix) => {
                 renderer = createRunRenderer(
                   process.stdin,
                   process.stderr,
                   artifactsDir,
                   stageLogs,
                   resolveGate,
+                  undefined,
+                  setAutoFix,
                 );
                 setAbortPresentationCleanup(closeRenderer);
                 return renderer;

@@ -249,7 +249,7 @@ test("a failed renderer is replaced by the fallback and later status keeps rende
   ]);
 });
 
-test("a new attempt clears unfinished stage progress", () => {
+test("a new attempt preserves durable finding progress", () => {
   const ledger = new DomainLedger(":memory:");
   try {
     const runId = "attempt-reset";
@@ -264,15 +264,75 @@ test("a new attempt clears unfinished stage progress", () => {
     });
     publisher.publish("attempt-2", { attempt: 2, kind: "attempt-started" });
 
+    const stage = publisher.current.stages.find((item) => item.id === "test")!;
+    assert.equal(stage.actionableFindings, 2);
+    assert.equal(stage.round, 0);
+    assert.equal(stage.status, "pending");
+    assert.equal(stage.totalFindings, 4);
+  } finally {
+    ledger.close();
+  }
+});
+
+test("ONM-88 tracks fixed, approved, open, and retained findings separately", () => {
+  const ledger = new DomainLedger(":memory:");
+  try {
+    const runId = "finding-dispositions";
+    startRun(ledger, runId);
+    const publisher = new PresentationPublisher(ledger, runId);
+    const first = {
+      description: "First defect",
+      id: "first",
+      severity: "error" as const,
+    };
+    const second = {
+      description: "Second defect",
+      id: "second",
+      severity: "warning" as const,
+    };
+    publisher.publish("findings:first", {
+      actionable: 2,
+      findings: [first, second],
+      kind: "findings-recorded",
+      round: 0,
+      stage: "review",
+      total: 2,
+    });
+    publisher.publish("findings:second", {
+      actionable: 1,
+      findings: [second],
+      kind: "findings-recorded",
+      retainedFixer: true,
+      round: 1,
+      stage: "review",
+      total: 2,
+    });
+
+    let stage = publisher.current.stages.find((item) => item.id === "review")!;
     assert.deepEqual(
-      publisher.current.stages.find((stage) => stage.id === "test"),
-      {
-        actionableFindings: 0,
-        id: "test",
-        round: 0,
-        status: "pending",
-        totalFindings: 0,
-      },
+      [stage.fixedFindings, stage.approvedFindings, stage.openFindings],
+      [1, 0, 1],
+    );
+    assert.equal(stage.retainedFixer, true);
+    assert.deepEqual(
+      stage.findings?.map((finding) => [finding.id, finding.disposition]),
+      [
+        ["first", "fixed"],
+        ["second", "open"],
+      ],
+    );
+
+    publisher.publish("gate:approved", {
+      decision: "approve",
+      gateId: "gate-review",
+      kind: "gate-resolved",
+      round: 1,
+      stage: "review",
+    });
+    stage = publisher.current.stages.find((item) => item.id === "review")!;
+    assert.deepEqual(
+      [stage.fixedFindings, stage.approvedFindings, stage.openFindings],
+      [1, 1, 0],
     );
   } finally {
     ledger.close();

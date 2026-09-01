@@ -134,6 +134,12 @@ export type GateAuditRow = {
   stage_id: string
 }
 
+export type AutoFixModeEvent = {
+  changedAt: string
+  enabled: boolean
+  source: 'initial' | 'operator'
+}
+
 export function gateAuditMatchesEvidence(
   audit: GateAuditRow,
   stage: string,
@@ -1488,7 +1494,8 @@ const RELEASE_2_FACT_TABLES = [
   'attempt_outcomes',
   'remote_observations',
   'mutation_intents',
-  'remote_receipts'
+  'remote_receipts',
+  'auto_fix_mode_events'
 ] as const
 
 const SCHEMA = `
@@ -1739,6 +1746,17 @@ CREATE TABLE IF NOT EXISTS presentation_snapshots (
 CREATE INDEX IF NOT EXISTS idx_presentation_snapshots_run
   ON presentation_snapshots(run_id, sequence);
 
+CREATE TABLE IF NOT EXISTS auto_fix_mode_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+  source TEXT NOT NULL CHECK (source IN ('initial', 'operator')),
+  changed_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_auto_fix_mode_events_run
+  ON auto_fix_mode_events(run_id, id);
+
 CREATE TABLE IF NOT EXISTS passed_attestations (
   run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE CASCADE,
   candidate_commit_oid TEXT NOT NULL,
@@ -1835,6 +1853,15 @@ CREATE TRIGGER IF NOT EXISTS immutable_remote_receipts_delete
 BEFORE DELETE ON remote_receipts
 WHEN EXISTS (SELECT 1 FROM runs WHERE run_id = OLD.run_id)
 BEGIN SELECT RAISE(ABORT, 'remote_receipts rows are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_auto_fix_mode_events
+BEFORE UPDATE ON auto_fix_mode_events
+BEGIN SELECT RAISE(ABORT, 'auto-fix mode events are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_auto_fix_mode_events_delete
+BEFORE DELETE ON auto_fix_mode_events
+WHEN EXISTS (SELECT 1 FROM runs WHERE run_id = OLD.run_id)
+BEGIN SELECT RAISE(ABORT, 'auto-fix mode events are immutable'); END;
 
 CREATE TRIGGER IF NOT EXISTS enforce_remote_observation_attempt
 BEFORE INSERT ON remote_observations
@@ -2263,6 +2290,24 @@ export class DomainLedger {
           ).run(repoRoot)
           return
         }
+        if (table === 'auto_fix_mode_events') {
+          this.#db.prepare(
+            `INSERT INTO main.auto_fix_mode_events (run_id, enabled, source, changed_at)
+             SELECT source.run_id, source.enabled, source.source, source.changed_at
+             FROM legacy.auto_fix_mode_events AS source
+             WHERE source.run_id IN (
+               SELECT run_id FROM legacy.runs WHERE repo_root = ?
+             ) AND NOT EXISTS (
+               SELECT 1 FROM main.auto_fix_mode_events AS destination
+               WHERE destination.run_id = source.run_id
+                 AND destination.enabled = source.enabled
+                 AND destination.source = source.source
+                 AND destination.changed_at = source.changed_at
+             )
+             ORDER BY source.id`
+          ).run(repoRoot)
+          return
+        }
         const destinationColumns = new Set(
           (this.#db.prepare(`PRAGMA main.table_info(${table})`).all() as { name: string }[])
             .map(({ name }) => name)
@@ -2325,6 +2370,7 @@ export class DomainLedger {
         'stage_checkpoints',
         'stage_evidence',
         'gate_audit',
+        'auto_fix_mode_events',
         'presentation_snapshots',
         'passed_attestations'
       ]) {
@@ -4477,6 +4523,70 @@ export class DomainLedger {
     if (!this.recordPresentationSnapshot(runId, presentation.eventKey, presentation.snapshot)) {
       throw new Error(`presentation event ${presentation.eventKey} is already recorded`)
     }
+  }
+
+  recordAutoFixMode(
+    runId: string,
+    enabled: boolean,
+    source: AutoFixModeEvent['source'],
+    presentation?: { eventKey: string; snapshot: PresentationSnapshot }
+  ): boolean {
+    const insert = this.#db.prepare(
+      `INSERT INTO auto_fix_mode_events (run_id, enabled, source, changed_at)
+       VALUES (?, ?, ?, ?)`
+    )
+    const values = [runId, enabled ? 1 : 0, source, new Date().toISOString()] as const
+    if (!presentation) {
+      insert.run(...values)
+      return true
+    }
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      insert.run(...values)
+      const recorded = this.recordPresentationSnapshot(
+        runId,
+        presentation.eventKey,
+        presentation.snapshot
+      )
+      if (!recorded) {
+        this.#db.exec('ROLLBACK')
+        return false
+      }
+      this.#db.exec('COMMIT')
+      return true
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  latestAutoFixMode(runId: string): boolean | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT enabled FROM auto_fix_mode_events
+         WHERE run_id = ? ORDER BY id DESC LIMIT 1`
+      )
+      .get(runId) as { enabled: number } | undefined
+    return row === undefined ? undefined : row.enabled === 1
+  }
+
+  listAutoFixModeEvents(runId: string): AutoFixModeEvent[] {
+    return (
+      this.#db
+        .prepare(
+          `SELECT changed_at, enabled, source FROM auto_fix_mode_events
+           WHERE run_id = ? ORDER BY id`
+        )
+        .all(runId) as {
+        changed_at: string
+        enabled: number
+        source: AutoFixModeEvent['source']
+      }[]
+    ).map((row) => ({
+      changedAt: row.changed_at,
+      enabled: row.enabled === 1,
+      source: row.source
+    }))
   }
 
   listPresentationSnapshots(runId: string): PresentationSnapshot[] {

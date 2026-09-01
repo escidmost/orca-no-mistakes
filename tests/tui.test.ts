@@ -222,6 +222,63 @@ if (process.env.TUI_FIXTURE === "1") {
     renderer.close();
   });
 
+  test("ONM-88 shows finding dispositions and toggles Auto-fix without settling a gate", async () => {
+    const input = new FakeInput();
+    const output = new FakeOutput();
+    output.rows = 20;
+    const toggles: boolean[] = [];
+    const resolutions: string[] = [];
+    const renderer = new RailTuiRenderer(
+      input,
+      output,
+      "/unused",
+      new Map(),
+      async (_gateId, resolution) => {
+        resolutions.push(resolution);
+      },
+      undefined,
+      (enabled) => {
+        toggles.push(enabled);
+      },
+    );
+    const base = gateSnapshot("open", 2);
+    renderer.render({
+      ...base,
+      stages: base.stages.map((stage) =>
+        stage.id === "review"
+          ? {
+              ...stage,
+              approvedFindings: 1,
+              findings: [
+                {
+                  description: "Still open",
+                  disposition: "open" as const,
+                  id: "open-finding",
+                  severity: "warning" as const,
+                },
+              ],
+              fixedFindings: 2,
+              openFindings: 1,
+              retainedFixer: true,
+              totalFindings: 4,
+            }
+          : stage,
+      ),
+    });
+
+    const screen = cleanScreen(output.writes.at(-1) ?? "");
+    assert.match(screen, /auto-fix on/iu);
+    assert.match(screen, /Review retained/iu);
+    assert.match(screen, /2\/4 fixed 1 approved 1 open/iu);
+    assert.match(screen, /6\. Lint/iu);
+    assert.match(screen, /A Auto-fix/iu);
+    input.emit("data", "A");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(toggles, [false]);
+    assert.deepEqual(resolutions, []);
+    renderer.close();
+  });
+
   test("C confirms Cancel without hiding the run and Ctrl-C cancels immediately", async () => {
     const input = new FakeInput();
     const output = new FakeOutput();
