@@ -145,6 +145,10 @@ test('the custody coordinator anchors idempotently on replayed pushes', async ()
     git(fixture.metadata.gatePath, 'update-ref', 'refs/heads/feature', fixture.head)
     const readinessPath = admissionReadinessPath(fixture.metadata, admissionId)
     for (let attempt = 0; attempt < 2; attempt += 1) {
+      const launchNonce = `replay-launch-${attempt}`
+      const lockPath = launchLockPath(readinessPath)
+      await mkdir(lockPath, { recursive: true })
+      await writeFile(path.join(lockPath, 'nonce'), launchNonce)
       await main([
         'gate',
         'coordinator',
@@ -153,7 +157,9 @@ test('the custody coordinator anchors idempotently on replayed pushes', async ()
         '--admission-id',
         admissionId,
         '--readiness',
-        readinessPath
+        readinessPath,
+        '--launch-nonce',
+        launchNonce
       ])
     }
     equal(
