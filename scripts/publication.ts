@@ -191,6 +191,24 @@ function terminalCandidate(ledger: DomainLedger, runId: string): string {
         `satisfied stage ${stage.stage_id} does not bind successful authoritative evidence`
       )
     }
+    if (
+      evidence.artifact_sha256 === null ||
+      evidenceSha256({
+        artifactSha256: evidence.artifact_sha256,
+        baseCommitOid: evidence.base_commit_oid,
+        candidateCommitOid: evidence.candidate_commit_oid,
+        exitCode: Number(evidence.exit_code),
+        round: Number(evidence.round_index),
+        runId,
+        stage: evidence.stage_id,
+        summary: evidence.summary,
+        workerIdentity: evidence.worker_identity
+      }) !== evidence.evidence_sha256
+    ) {
+      throw new CandidatePublicationError(
+        `satisfied stage ${stage.stage_id} retained evidence digest does not match its recorded fields`
+      )
+    }
     candidate = final.checkpoint.output_commit_oid
     checkpointIndex = final.index
   }
