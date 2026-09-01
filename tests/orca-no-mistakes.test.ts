@@ -8754,6 +8754,32 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
   }
 });
 
+test("an invalid worker report gets one contract-repair retry", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  orca.launchFailures.push(
+    new Error("worker dispatch-invalid returned an invalid report"),
+  );
+
+  const outcome = await startWorkerWithFallback(
+    orca,
+    (launch) => orca.createTask(launch.prompt),
+    [
+      {
+        name: "report-retry",
+        prompt: "Review the change.",
+        role: "reviewer",
+        stage: "review",
+        worktree: "current",
+      },
+    ],
+  );
+
+  assert.equal(outcome.worker.report.summary, "review");
+  assert.equal(orca.tasks.length, 2);
+  assert.match(orca.launches[1].prompt, /REPORT REPAIR/);
+});
+
 test("CliOrca extracts acp reports wrapped in closed JSON fences", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-acp-fence-"));
   const fakeAcpx = path.join(temp, "acpx");

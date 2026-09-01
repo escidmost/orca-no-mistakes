@@ -3477,17 +3477,44 @@ export type WorkerLaunchOutcome = {
   worker: WorkerResult;
 };
 
+// ponytail: one repair retry; repeated malformed output remains a hard failure.
+const WORKER_REPORT_RETRY_LIMIT = 1;
+
+function isInvalidWorkerReportError(error: unknown): boolean {
+  return error instanceof Error && /returned an invalid report(?:$|:)/u.test(error.message);
+}
+
+function repairWorkerReportLaunch(launch: WorkerLaunch): WorkerLaunch {
+  return {
+    ...launch,
+    prompt: `${launch.prompt}
+
+REPORT REPAIR: the previous response did not satisfy the report contract. Retry the task and write a complete JSON object with a nonempty string summary, a findings array, and any tested/artifacts arrays required by the task before reporting completion. Do not omit the summary.`,
+    ...(launch.retainedWorktreeId || launch.terminal
+      ? {
+          retainedWorktreeId: undefined,
+          retainedWorktreePath: undefined,
+          terminal: undefined,
+          worktree: "new-child" as const,
+        }
+      : {}),
+  };
+}
+
 // Iterates an ordered fallback chain. Only PreflightError (launch/readiness/
 // dispatch failures before a candidate accepts the task) advances to the next
-// candidate; execution-phase errors propagate immediately. Each candidate gets
-// its own child task so the injected spec always carries that candidate's
-// delivery instructions.
+// candidate; execution-phase errors propagate immediately. A malformed report
+// gets one fresh task with an explicit contract reminder before it propagates.
+// Each candidate gets its own child task so the injected spec always carries
+// that candidate's delivery instructions.
 export async function startWorkerWithFallback(
   orca: OrcaOperations,
   createTask: (launch: WorkerLaunch) => Promise<string>,
   launches: WorkerLaunch[],
   onPreflightFailure?: (index: number) => Promise<void>,
   fence?: TimeoutFence,
+  onReportRetry?: (launch: WorkerLaunch) => Promise<void>,
+  reportRetry = 0,
 ): Promise<WorkerLaunchOutcome> {
   if (launches.length === 0)
     throw new Error("no agent configured for this role");
@@ -3552,6 +3579,21 @@ export async function startWorkerWithFallback(
       };
     } catch (error) {
       finishAllocation();
+      if (
+        isInvalidWorkerReportError(error) &&
+        reportRetry < WORKER_REPORT_RETRY_LIMIT
+      ) {
+        await onReportRetry?.(launch);
+        return startWorkerWithFallback(
+          orca,
+          createTask,
+          [repairWorkerReportLaunch(launch)],
+          undefined,
+          fence,
+          onReportRetry,
+          reportRetry + 1,
+        );
+      }
       if (
         !allocated &&
         error instanceof PreflightError &&
@@ -4001,6 +4043,17 @@ async function runFixer(
       await releaseFixerSession(sessionToReuse, orca);
     },
     fence,
+    async (launch) => {
+      if (
+        !sessionToReuse ||
+        launch.retainedWorktreeId !== sessionToReuse.worker.worktreeId
+      )
+        return;
+      const staleSession = sessionToReuse;
+      sessionToReuse = undefined;
+      retainedSession = undefined;
+      await releaseFixerSession(staleSession, orca);
+    },
   );
   const worker = outcome.worker;
   const worktreePath =
