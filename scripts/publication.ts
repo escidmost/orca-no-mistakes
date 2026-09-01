@@ -123,7 +123,11 @@ async function rejectUrlRewrite(
 
 function transportIdentity(destination: string, forgeHost: string): string {
   const explicit = destination.trim()
-  if (!/^[^/@\s]+@github\.com:/i.test(explicit) && !/^[a-z][a-z\d+.-]*:/i.test(explicit)) {
+  if (
+    !/^git@github\.com:/i.test(explicit) &&
+    !/^https:\/\/github\.com\//i.test(explicit) &&
+    !/^ssh:\/\/git@github\.com\//i.test(explicit)
+  ) {
     throw new CandidatePublicationError(
       'publication destination must identify a credential-free github.com repository'
     )
@@ -365,6 +369,7 @@ export async function publishCandidate(input: PublicationInput): Promise<{
     (row) => row.stage_id === 'push' && row.round_index === 0
   )
   if (settled) {
+    terminalCandidate(input.ledger, input.runId)
     const receipt = input.ledger.remoteReceipt(input.runId, 'candidate-publication')
     let outcome: 'created' | 'updated' | 'unchanged' | undefined
     try {
