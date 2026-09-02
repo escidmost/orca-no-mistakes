@@ -373,6 +373,11 @@ test('Release 2 ledger facts are immutable, append-only, and atomically checkpoi
         disposition: 'satisfied',
         evidence_sha256: sha256('intent-evidence'),
         stage_id: 'intent'
+      },
+      {
+        disposition: 'satisfied',
+        evidence_sha256: evidence.evidenceSha256,
+        stage_id: 'push'
       }
     ])
     assert.equal(ledger.listAttemptOutcomes(runId)[0].outcome_sha256, failedOutcome)

@@ -173,8 +173,10 @@ function terminalCandidate(
   if (!run) throw new CandidatePublicationError(`run ${runId} does not exist`)
   const plan = ledger.stagePlan(runId)
   const pushIndex = plan.findIndex((stage) => stage.stage_id === 'push')
-  if (pushIndex < 1 || pushIndex !== plan.length - 1) {
-    throw new CandidatePublicationError('publication requires push as the final focused stage')
+  const validTail = pushIndex === plan.length - 1 ||
+    (pushIndex === plan.length - 2 && plan.at(-1)?.stage_id === 'pr')
+  if (pushIndex < 1 || !validTail) {
+    throw new CandidatePublicationError('publication requires push immediately before optional PR binding')
   }
 
   const dispositions = new Map(ledger.stageDispositions(runId).map((row) => [row.stage_id, row]))
@@ -213,7 +215,6 @@ function terminalCandidate(
       : undefined
     if (
       evidence?.stage_id !== stage.stage_id ||
-      evidence.base_commit_oid !== final.checkpoint.input_commit_oid ||
       evidence.candidate_commit_oid !== final.checkpoint.output_commit_oid ||
       evidence.round_index !== final.checkpoint.round_index ||
       evidence.exit_code !== 0 ||

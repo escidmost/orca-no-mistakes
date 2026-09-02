@@ -245,7 +245,7 @@ test("a failed renderer is replaced by the fallback and later status keeps rende
   assert.equal(fallbackBuilds, 1);
   assert.deepEqual(lines, [
     "no-mistakes renderer-fallback attempt 1 started\n",
-    "no-mistakes renderer-fallback stage 3/6 review started\n",
+    "no-mistakes renderer-fallback stage 3/8 review started\n",
   ]);
 });
 

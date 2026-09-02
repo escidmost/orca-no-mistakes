@@ -96,10 +96,12 @@ function pullRequest(input: {
     headRefName: input.headBranch ?? 'feature',
     headRefOid: input.headOid ?? 'b'.repeat(40),
     headRepository: { databaseId: 20, id: 'R_20', nameWithOwner: 'fork/project' },
+    body: 'body',
     id: input.id,
     isDraft: false,
     number: input.number,
     state: 'OPEN',
+    title: 'title',
     url: `https://github.com/upstream/project/pull/${input.number}`
   }
 }

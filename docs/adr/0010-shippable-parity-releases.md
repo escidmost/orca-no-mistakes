@@ -33,6 +33,10 @@ A focused, non-default publication API (`scripts/publication.ts`) pulled forward
 
 The repository-local admission gate is also pulled forward from item 2 into Release 1. This moves only admission; Release 2 still owns automatic candidate publication orchestration and pull-request creation.
 
+## Amendment 2026-09-02
+
+Release 2 now runs `push` and `pr` after the six local validation stages for both direct and gate ingress. Candidate publication and pull-request/comment mutations settle only with authoritative post-reads and atomic receipts, evidence, dispositions, and checkpoints; successful runs store a v2 completion attestation and expose lowercase `passed`. Resume remains limited to durably failed runs: adopting a stranded `in-progress` remote run remains a Release 4 limitation.
+
 ## Consequences
 
 Before a release is marked complete, an automated end-to-end scenario must exercise its claimed Git, Orca, gate, failure, and recovery behavior. For what is implemented today, see [`docs/current-architecture.md`](../current-architecture.md).

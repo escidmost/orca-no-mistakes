@@ -205,7 +205,7 @@ if (process.env.TUI_FIXTURE === "1") {
     const renderer = createRunRenderer(input, output, "/unused");
     renderer.render(snapshot("review", 1));
     assert.deepEqual(output.writes, [
-      "no-mistakes run-tui-test stage 3/6 review started\n",
+      "no-mistakes run-tui-test stage 3/8 review started\n",
     ]);
   });
 
@@ -363,7 +363,7 @@ if (process.env.TUI_FIXTURE === "1") {
     renderer.render(snapshot("review", 1));
     assert.equal(
       output.writes.at(-1),
-      "no-mistakes run-tui-test stage 3/6 review started\n",
+      "no-mistakes run-tui-test stage 3/8 review started\n",
     );
   });
 
@@ -851,7 +851,7 @@ if (process.env.TUI_FIXTURE === "1") {
             TUI_FIXTURE: "1",
           },
           name: "xterm-256color",
-          rows: 24,
+          rows: 30,
         },
       );
       let output = "";

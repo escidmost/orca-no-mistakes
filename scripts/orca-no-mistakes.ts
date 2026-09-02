@@ -118,8 +118,12 @@ import {
   allowsLegacyLedgerFallback,
   isWithin,
   StageLog,
+  LEGACY_STAGE_PLAN,
+  RELEASE_2_STAGE_PLAN,
   artifactsRoot,
   buildAttestation,
+  buildPipelineCompletionAttestation,
+  buildPipelineEvidenceRoot,
   canonicalJson,
   capLog,
   evidenceSha256,
@@ -136,14 +140,24 @@ import {
   type AttemptOutcomeInput,
   type FindingDecisionRow,
   type PassedAttestationManifest,
+  type PipelineCompletionAttestationManifest,
   type PrunableRun,
   type StageCheckpointRow,
   type StageEvidenceRow,
   type StageEvidenceManifestEntry,
   type SubmissionAdmissionRow,
 } from "./ledger.ts";
+import {
+  GithubAuthority,
+  GithubAuthorityError,
+  parseGithubRepositoryReference,
+  resolveGithubPublicationRoute,
+} from "./github.ts";
+import { admitCandidatePublication, publishCandidate } from "./publication.ts";
+import { bindPullRequest } from "./pull-request.ts";
 export {
   DomainLedger,
+  LEGACY_STAGE_PLAN,
   buildAttestation,
   canonicalEntry,
   capLog,
@@ -333,10 +347,12 @@ export type PipelineOptions = {
   deliveryBranch?: string;
   deliveryGit?: GitOperations;
   forceLease?: boolean;
+  githubAuthority?: GithubAuthority;
   intentTaskId?: string;
   intent: string;
   maxFixRounds?: number;
   plainStatus?: boolean;
+  publicationDestination?: string;
   rendererFactory?: (
     artifactsDir: string,
     stageLogs: ReadonlyMap<string, StageLog>,
@@ -353,9 +369,11 @@ export type PipelineOptions = {
 export type PipelineResult = {
   policy: PolicyProvenance;
   attestation?: PassedAttestationManifest;
+  completionAttestation?: PipelineCompletionAttestationManifest;
   custodyNote?: string;
   runId: string;
   steps: readonly StageName[];
+  verdict?: "passed";
 };
 
 type RepoState = Awaited<ReturnType<GitOperations["assertReady"]>>;
@@ -1944,6 +1962,21 @@ export async function runPipeline(
     repoGlobalConfig: repoPolicyConfig,
     userGlobalConfig: options.userGlobalConfig,
   });
+  const remotePublication = options.githubAuthority !== undefined;
+  if (remotePublication !== (options.publicationDestination !== undefined)) {
+    throw new Error("GitHub authority and publication destination must be configured together");
+  }
+  const resumedPlan = options.resumeRunId
+    ? ledger.stagePlan(options.resumeRunId).map((entry) => entry.stage_id as StageName)
+    : [];
+  const pipelineSteps: readonly StageName[] = resumedPlan.length > 0
+    ? resumedPlan
+    : remotePublication
+      ? PIPELINE_STEPS
+      : LEGACY_STAGE_PLAN;
+  if (pipelineSteps.includes("push") && !remotePublication) {
+    throw new Error("Release 2 resume requires initialized GitHub publication");
+  }
   const effectiveConfig = JSON.parse(
     JSON.stringify(pipelineConfig),
   ) as typeof pipelineConfig;
@@ -2128,6 +2161,12 @@ export async function runPipeline(
           repoRoot: deliveryRepo.root,
           runId,
           submissionCommitOid: options.admission?.newOid ?? deliveryRepo.head,
+          stagePlan: remotePublication
+            ? RELEASE_2_STAGE_PLAN.map((stageId) => ({
+                requirement: "required" as const,
+                stageId,
+              }))
+            : undefined,
         });
         domainRunStarted = true;
         if (options.admission) {
@@ -2385,7 +2424,7 @@ export async function runPipeline(
     const priorRoundByStage = new Map<StageName, number>();
     for (const entry of priorEvidence) {
       if (
-        PIPELINE_STEPS.includes(entry.stage_id as StageName) &&
+        pipelineSteps.includes(entry.stage_id as StageName) &&
         isAuthoritativeStageEvidence(entry.worker_identity)
       ) {
         const stage = entry.stage_id as StageName;
@@ -2397,7 +2436,7 @@ export async function runPipeline(
       }
     }
     for (const checkpoint of priorCheckpoints) {
-      if (!PIPELINE_STEPS.includes(checkpoint.stage_id as StageName)) continue;
+      if (!pipelineSteps.includes(checkpoint.stage_id as StageName)) continue;
       const stage = checkpoint.stage_id as StageName;
       priorRoundByStage.set(
         stage,
@@ -2424,7 +2463,16 @@ export async function runPipeline(
       );
     let resumeStageIndex = 0;
     if (resumeCheckpoint) {
-      for (const stage of PIPELINE_STEPS) {
+      const contiguousCheckpoints = new Set<string>();
+      let checkpointCandidate = submissionCommitOid;
+      for (const checkpoint of priorCheckpoints) {
+        if (checkpoint.input_commit_oid !== checkpointCandidate) break;
+        contiguousCheckpoints.add(
+          `${checkpoint.stage_id}:${checkpoint.round_index}:${checkpoint.output_commit_oid}`,
+        );
+        checkpointCandidate = checkpoint.output_commit_oid;
+      }
+      for (const stage of pipelineSteps) {
         const evidence = latestEvidenceByStage.get(stage);
         if (!evidence) break;
         const findings = JSON.parse(evidence.findings_json ?? "[]") as Finding[];
@@ -2432,21 +2480,23 @@ export async function runPipeline(
         const complete =
           findings.every((finding) => finding.action === "no-op") ||
           approved !== undefined;
-        const checkpointMatchesEvidence = priorCheckpoints.some(
-          (checkpoint) =>
-            checkpoint.stage_id === stage &&
-            checkpoint.round_index === evidence.round_index &&
-            checkpoint.output_commit_oid === evidence.candidate_commit_oid,
+        const checkpointMatchesEvidence = contiguousCheckpoints.has(
+          `${stage}:${evidence.round_index}:${evidence.candidate_commit_oid}`,
         );
-        const commitStillValid =
-          stage === "intent" ||
+        const commitStillValid = pipelineSteps.includes("push")
+          ? checkpointMatchesEvidence
+          : stage === "intent" ||
           ((checkpointMatchesEvidence || approved !== undefined) &&
             evidence.candidate_commit_oid ===
               resumeCheckpoint.output_commit_oid);
         if (!complete || !commitStillValid) break;
         resumeStageIndex += 1;
       }
-      for (const stage of PIPELINE_STEPS.slice(0, resumeStageIndex)) {
+      const prIndex = pipelineSteps.indexOf("pr");
+      if (prIndex >= 0 && ledger.remoteReceipt(runId, "pull-request-binding")) {
+        resumeStageIndex = Math.min(resumeStageIndex, prIndex);
+      }
+      for (const stage of pipelineSteps.slice(0, resumeStageIndex)) {
         const evidence = latestEvidenceByStage.get(stage)!;
         const approval = resolvedApprovalAudit(stage, evidence);
         if (!approval) continue;
@@ -2486,7 +2536,7 @@ export async function runPipeline(
         );
       }
     }
-    const stagesToRun = PIPELINE_STEPS.slice(resumeStageIndex);
+    const stagesToRun = pipelineSteps.slice(resumeStageIndex);
     let attemptCounter = priorEvidence.length;
     for (const audit of priorGateAudit) {
       if (
@@ -2513,7 +2563,7 @@ export async function runPipeline(
     }
     const latestEntryByStage = new Map<StageName, StageEvidenceManifestEntry>();
     for (const entry of stageEntries) {
-      if (PIPELINE_STEPS.includes(entry.stage as StageName)) {
+      if (pipelineSteps.includes(entry.stage as StageName)) {
         latestEntryByStage.set(entry.stage as StageName, entry);
       }
     }
@@ -2638,6 +2688,25 @@ export async function runPipeline(
 
     const stageTasks = new Map<StageName, string>();
     let previousTask: string | undefined;
+    const appendSettledRemoteEvidence = (stage: "push" | "pr") => {
+      const row = ledger.listEvidence(runId).findLast((entry) => entry.stage_id === stage);
+      if (!row) throw new Error(`${stage} settled without durable evidence`);
+      if (!row.artifact_sha256) throw new Error(`${stage} evidence is missing its artifact digest`);
+      const entry: StageEvidenceManifestEntry = {
+        artifactSha256: row.artifact_sha256,
+        baseCommitOid: row.base_commit_oid,
+        candidateCommitOid: row.candidate_commit_oid,
+        evidenceSha256: row.evidence_sha256,
+        exitCode: row.exit_code,
+        round: row.round_index,
+        stage,
+        summary: row.summary,
+        workerIdentity: row.worker_identity,
+      };
+      stageEntries.push(entry);
+      latestEntryByStage.set(stage, entry);
+      return entry;
+    };
 
     if (options.intentTaskId && resumeStageIndex > 0) {
       const intentEvidence = latestEvidenceByStage.get("intent")!;
@@ -2652,9 +2721,12 @@ export async function runPipeline(
       const task =
         stage === "intent" && options.intentTaskId
           ? options.intentTaskId
-          : await orca.createTask(stageTaskSpec(stage, intent), {
+          : await orca.createTask(
+              `[${stage}] no-mistakes stage ${pipelineSteps.indexOf(stage) + 1}/${pipelineSteps.length}. Intent: ${intent}`,
+              {
               deps: previousTask ? [previousTask] : [],
-            });
+              },
+            );
       stageTasks.set(stage, task);
       previousTask = task;
     }
@@ -2669,7 +2741,7 @@ export async function runPipeline(
       const stageInputCommitOid = await git.head();
       ledger.heartbeatLease(deliveryRepo.root, deliveryRepo.branch, runId);
       await orca.setWorktreeStatus(
-        `${statusPrefix}no-mistakes ${stage} (${stageIndex(stage)}/${PIPELINE_STEPS.length})`,
+        `${statusPrefix}no-mistakes ${stage} (${pipelineSteps.indexOf(stage) + 1}/${pipelineSteps.length})`,
         "in-progress",
       );
       let round = priorRoundByStage.get(stage) ?? 0;
@@ -2677,6 +2749,101 @@ export async function runPipeline(
         `attempt:${presentation.current.attempt}:stage:${stage}:started`,
         { kind: "stage-started", stage },
       );
+      if (stage === "push" || stage === "pr") {
+        if (!options.githubAuthority || !options.publicationDestination || !attemptId) {
+          throw new Error(`${stage} requires initialized GitHub publication`);
+        }
+        const resolveRepositoryIdentity = async (reference: string) => {
+          const observed = await options.githubAuthority!.observeRepository(reference);
+          return { id: observed.id, nodeId: observed.nodeId };
+        };
+        try {
+        if (stage === "push") {
+          if (!ledger.publicationBaseline(runId)) {
+            await admitCandidatePublication({
+              destination: options.publicationDestination,
+              ledger,
+              resolveRepositoryIdentity,
+              runId,
+            });
+          }
+          await publishCandidate({
+            artifactPath: path.join(artifactsDir, "push-r0.json"),
+            attemptId,
+            destination: options.publicationDestination,
+            generationToken: generationToken!,
+            ledger,
+            reconcileExactCandidate: true,
+            resolveRepositoryIdentity,
+            runId,
+            workerIdentity: coordinatorIdentity,
+          });
+        } else {
+          const route = ledger.publicationRoute(runId);
+          const publicationReceipt = ledger.remoteReceipt(runId, "candidate-publication");
+          if (!route || !publicationReceipt) {
+            throw new Error("PR binding requires a settled candidate publication");
+          }
+          const pipelineEvidenceRoot = buildPipelineEvidenceRoot(stageEntries, {
+            attemptOutcomeDigests: ledger
+              .listAttemptOutcomes(runId)
+              .map((entry) => entry.outcome_sha256),
+            baseCommitOid,
+            candidateCommitOid: stageInputCommitOid,
+            candidatePublicationReceiptSha256: publicationReceipt.receipt_sha256,
+            intent,
+            policySha256: policySha256Value,
+            publicationRoute: {
+              baseBranch: route.base_branch,
+              baseRepositoryId: route.base_repository_id,
+              forgeHost: route.forge_host,
+              headBranch: route.head_branch,
+              headOwner: route.head_owner,
+              headRepositoryId: route.head_repository_id,
+              routeFingerprint: route.route_fingerprint,
+            },
+            runId,
+            stageDispositions: ledger.stageDispositions(runId).map((entry) => ({
+              disposition: entry.disposition,
+              ...(entry.evidence_sha256 ? { evidenceSha256: entry.evidence_sha256 } : {}),
+              stage: entry.stage_id,
+            })),
+            stagePlan: ledger.stagePlan(runId).map((entry) => ({
+              requirement: entry.requirement,
+              stage: entry.stage_id,
+            })),
+          });
+          const remoteRound = latestEvidenceByStage.has("pr") ? round + 1 : round;
+          await bindPullRequest({
+            artifactPath: path.join(artifactsDir, `pr-r${remoteRound}.json`),
+            attemptId,
+            authority: options.githubAuthority,
+            candidateCommitOid: stageInputCommitOid,
+            generationToken: generationToken!,
+            intent,
+            ledger,
+            pipelineEvidenceRoot,
+            roundIndex: remoteRound,
+            runId,
+            stageSummaries: pipelineSteps
+              .slice(0, pipelineSteps.indexOf("pr"))
+              .map((completedStage) => `${completedStage}: passed`),
+            workerIdentity: coordinatorIdentity,
+          });
+        }
+        } catch (stageError) {
+          throw new ResumableStageError(
+            stageError instanceof Error ? stageError.message : String(stageError),
+            { cause: stageError },
+          );
+        }
+        const entry = appendSettledRemoteEvidence(stage);
+        const report = { findings: [], summary: entry.summary };
+        const eventKey = `stage:${stage}:round:0:completed:${stageInputCommitOid}`;
+        presentation.publish(eventKey, { kind: "stage-completed", round: 0, stage });
+        await orca.completeTask(taskId, report);
+        continue;
+      }
       let attempt = 0;
       const resumedEvidence = latestEvidenceByStage.get(stage);
       const resumedFindings = JSON.parse(
@@ -3142,11 +3309,14 @@ export async function runPipeline(
         eventKey,
         { kind: "stage-completed", round, stage },
         (snapshot) =>
-          ledger.recordCheckpoint(
+          ledger.settleLocalStage(
             {
-              inputCommitOid: stageInputCommitOid,
-              outputCommitOid: stageOutputCommitOid,
-              roundIndex: round,
+              checkpoint: {
+                inputCommitOid: stageInputCommitOid,
+                outputCommitOid: stageOutputCommitOid,
+                roundIndex: round,
+              },
+              evidenceSha256: latestEntryByStage.get(stage)!.evidenceSha256,
               runId,
               stageId: stage,
             },
@@ -3186,6 +3356,110 @@ export async function runPipeline(
         generationToken,
       );
       const operatorHead = await deliveryGit.head();
+      const transferCustody = async () => {
+        if (deliveryGit === git && operatorHead === terminalCommitOid) {
+          return operatorHead === submissionCommitOid
+            ? `branch ${deliveryRepo.branch} already at submission commit ${submissionCommitOid}`
+            : `branch ${deliveryRepo.branch} carries the terminal commit ${terminalCommitOid}`;
+        }
+        const recoverRef = recoveryRefFor(runId);
+        let advanced = false;
+        let transferFailure: string | undefined;
+        if (deliveryGit !== git && operatorHead === submissionCommitOid) {
+          try {
+            advanced = await deliveryGit.applyWorktreeCommits(
+              repo.root,
+              submissionCommitOid,
+              terminalCommitOid,
+              leaseFence,
+            );
+          } catch (error) {
+            if (error instanceof PostMutationCustodyError) throw error;
+            transferFailure = error instanceof Error ? error.message : String(error);
+          }
+        }
+        return advanced
+          ? `advanced branch ${deliveryRepo.branch} from submission to terminal commit ${terminalCommitOid}`
+          : transferFailure
+            ? `custody transfer failed on the pipeline side (${transferFailure}); ` +
+              recoveryInstructions(recoverRef)
+            : "operator checkout diverged or carries uncommitted changes; " +
+              recoveryInstructions(recoverRef);
+      };
+      const eventKey = "run:completed:passed";
+      if (remotePublication) {
+        if (!attemptId) throw new Error("pipeline attempt was not started");
+        const terminalAttemptId = attemptId;
+        const route = ledger.publicationRoute(runId);
+        const pushReceipt = ledger.remoteReceipt(runId, "candidate-publication");
+        const prReceipt = ledger.remoteReceipt(runId, "pull-request-binding");
+        if (!route || !pushReceipt || !prReceipt) {
+          throw new Error("completion requires both durable remote receipts");
+        }
+        const priorOutcomeDigests = ledger
+          .listAttemptOutcomes(runId)
+          .map((entry) => entry.outcome_sha256);
+        const settled = await presentation.publishAsync(
+          { kind: "run-completed", status: "passed" },
+          (snapshot) =>
+            ledger.finalizePassedRunWithAttemptOutcomeAndLeaseMutation(
+              runId,
+              terminalCommitOid,
+              {
+                branch: deliveryRepo.branch,
+                generationToken: generationToken!,
+                repoRoot: deliveryRepo.root,
+              },
+              transferCustody,
+              (custodyNote) => ({
+                actorIdentity,
+                attemptId: terminalAttemptId,
+                candidateCommitOid: terminalCommitOid,
+                completedAt: new Date().toISOString(),
+                coordinatorIdentity,
+                custody: { custodyNote, terminalCommitOid },
+                reason: "pipeline completed",
+                receiptDigests: [pushReceipt.receipt_sha256, prReceipt.receipt_sha256],
+                resumeEligible: false,
+                runId,
+                stoppingFact: "all local and remote pipeline stages passed",
+                verdict: "passed",
+              }),
+              (outcome, outcomeDigest) =>
+                buildPipelineCompletionAttestation(stageEntries, {
+                  attemptOutcomeDigests: [...priorOutcomeDigests, outcomeDigest],
+                  baseCommitOid,
+                  candidateCommitOid: terminalCommitOid,
+                  candidatePublicationReceiptSha256: pushReceipt.receipt_sha256,
+                  custody: outcome.custody,
+                  intent,
+                  policySha256: policySha256Value,
+                  publicationRoute: {
+                    baseBranch: route.base_branch,
+                    baseRepositoryId: route.base_repository_id,
+                    forgeHost: route.forge_host,
+                    headBranch: route.head_branch,
+                    headOwner: route.head_owner,
+                    headRepositoryId: route.head_repository_id,
+                    routeFingerprint: route.route_fingerprint,
+                  },
+                  pullRequestBindingReceiptSha256: prReceipt.receipt_sha256,
+                  runId,
+                  stageDispositions: ledger.stageDispositions(runId).map((entry) => ({
+                    disposition: entry.disposition,
+                    ...(entry.evidence_sha256 ? { evidenceSha256: entry.evidence_sha256 } : {}),
+                    stage: entry.stage_id,
+                  })),
+                  stagePlan: ledger.stagePlan(runId).map((entry) => ({
+                    requirement: entry.requirement,
+                    stage: entry.stage_id,
+                  })),
+                }),
+              { eventKey, snapshot },
+            ),
+        );
+        return { attestation: settled.manifest, custodyNote: settled.custodyNote };
+      }
       const attestation = buildAttestation(stageEntries, {
         baseCommitOid,
         candidateCommitOid: terminalCommitOid,
@@ -3194,9 +3468,9 @@ export async function runPipeline(
         policySha256: policySha256Value,
         runId,
       });
-      verifyManifest(attestation, PIPELINE_STEPS);
+      verifyManifest(attestation, pipelineSteps);
       const passedSummary = [
-        `Run ${runId} passed all ${PIPELINE_STEPS.length} stages.`,
+        `Run ${runId} passed all ${pipelineSteps.length} stages.`,
         `Candidate commit: ${terminalCommitOid}.`,
       ].join("\n");
       await markOutcomeDeliveryPending("passed", passedSummary);
@@ -3213,6 +3487,7 @@ export async function runPipeline(
               repoRoot: deliveryRepo.root,
             },
             async () => {
+              const note = await transferCustody();
               if (!attemptId) throw new Error("pipeline attempt was not started");
               ledger.recordAttemptOutcome({
                 actorIdentity,
@@ -3220,49 +3495,14 @@ export async function runPipeline(
                 candidateCommitOid: terminalCommitOid,
                 completedAt: new Date().toISOString(),
                 coordinatorIdentity,
-                custody: { terminalCommitOid },
+                custody: { custodyNote: note, terminalCommitOid },
                 reason: "pipeline completed",
-                receiptDigests: stageEntries.map((entry) => entry.evidenceSha256),
+                receiptDigests: [],
                 resumeEligible: false,
                 runId,
-                stoppingFact: "all pipeline stages passed",
+                stoppingFact: "all local pipeline stages passed",
                 verdict: "passed",
               });
-              if (deliveryGit === git && operatorHead === terminalCommitOid) {
-                const note =
-                  operatorHead === submissionCommitOid
-                    ? `branch ${deliveryRepo.branch} already at submission commit ${submissionCommitOid}`
-                    : `branch ${deliveryRepo.branch} carries the terminal commit ${terminalCommitOid}`;
-                await markOutcomeDeliveryPending(
-                  "passed",
-                  `${passedSummary}\n${note}`,
-                );
-                return note;
-              }
-              const recoverRef = recoveryRefFor(runId);
-              let advanced = false;
-              let transferFailure: string | undefined;
-              if (deliveryGit !== git && operatorHead === submissionCommitOid) {
-                try {
-                  advanced = await deliveryGit.applyWorktreeCommits(
-                    repo.root,
-                    submissionCommitOid,
-                    terminalCommitOid,
-                    leaseFence,
-                  );
-                } catch (error) {
-                  if (error instanceof PostMutationCustodyError) throw error;
-                  transferFailure =
-                    error instanceof Error ? error.message : String(error);
-                }
-              }
-              const note = advanced
-                ? `advanced branch ${deliveryRepo.branch} from submission to terminal commit ${terminalCommitOid}`
-                : transferFailure
-                  ? `custody transfer failed on the pipeline side (${transferFailure}); ` +
-                    recoveryInstructions(recoverRef)
-                  : "operator checkout diverged or carries uncommitted changes; " +
-                    recoveryInstructions(recoverRef);
               await markOutcomeDeliveryPending(
                 "passed",
                 `${passedSummary}\n${note}`,
@@ -3276,16 +3516,19 @@ export async function runPipeline(
     });
     await orca
       .setWorktreeStatus(
-        `${statusPrefix}no-mistakes passed all ${PIPELINE_STEPS.length} stages`,
+        `${statusPrefix}no-mistakes passed all ${pipelineSteps.length} stages`,
         "completed",
       )
       .catch(() => {});
     return {
-      attestation,
+      ...(attestation.version === "2.0.0"
+        ? { completionAttestation: attestation }
+        : { attestation }),
       custodyNote,
       policy: effectiveProvenance,
       runId,
-      steps: PIPELINE_STEPS,
+      steps: pipelineSteps,
+      verdict: "passed",
     };
     } catch (error) {
       resumeRequestAllowed = false;
@@ -3370,7 +3613,10 @@ export async function runPipeline(
                     recoverRef: (failure as CustodyTaggedError).recoverRef,
                   },
                   reason,
-                  receiptDigests: [],
+                  receiptDigests: [
+                    ledger.remoteReceipt(runId, "candidate-publication")?.receipt_sha256,
+                    ledger.remoteReceipt(runId, "pull-request-binding")?.receipt_sha256,
+                  ].filter((digest): digest is string => digest !== undefined),
                   resumeEligible: resumable,
                   runId,
                   stoppingFact: `${outcome} during pipeline execution`,
@@ -4633,12 +4879,15 @@ function stageTaskSpec(stage: StageName, intent: string): string {
 }
 
 function checkerBrief(stage: StageName): string {
-  const briefs: Record<Exclude<StageName, "intent" | "rebase">, string> = {
+  const briefs: Record<Exclude<StageName, "intent" | "rebase" | "push" | "pr">, string> = {
     review: "Adversarially review the committed change.",
     test: "Run the smallest relevant behavioral checks and gather evidence for user intent.",
     document: "Check whether the change made owned documentation stale.",
     lint: "Run repository linting, formatting, and static-analysis checks.",
   };
+  if (stage === "push" || stage === "pr") {
+    throw new Error(`${stage} is a coordinator-owned remote stage`);
+  }
   return briefs[stage as keyof typeof briefs];
 }
 
@@ -9739,12 +9988,15 @@ const BOOLEAN_FLAGS = new Set([
 ]);
 const VALUE_FLAGS = new Set([
   "base",
+  "base-branch",
   "before",
   "config",
   "admission-id",
   "fixer-effort",
   "fixer-model",
   "head",
+  "head-branch",
+  "fork",
   "intent",
   "launch-nonce",
   "max-fix-rounds",
@@ -9756,11 +10008,12 @@ const VALUE_FLAGS = new Set([
   "readiness",
   "run-id",
   "gate",
+  "upstream",
 ]);
 const COMMAND_FLAGS: Record<string, Set<string>> = {
   attestation: new Set(["out", "repo"]),
   gate: new Set(["admission-id", "gate", "launch-nonce", "readiness", "run-id"]),
-  init: new Set(["repo"]),
+  init: new Set(["base-branch", "fork", "head-branch", "repo", "upstream"]),
   prune: new Set(["before", "repo", "stranded"]),
   run: new Set([
     "admission-id",
@@ -13594,11 +13847,23 @@ async function runInitCommand(flags: RawCliFlags): Promise<void> {
     repo,
     path.resolve(process.argv[1] ?? fileURLToPath(import.meta.url)),
   );
+  const ledger = openRepositoryLedger(metadata.repoRoot);
+  const authority = await GithubAuthority.connect();
+  const route = await resolveGithubPublicationRoute({
+    baseBranch: stringFlag(flags, "base-branch"),
+    fork: stringFlag(flags, "fork"),
+    headBranch: stringFlag(flags, "head-branch"),
+    ledger,
+    provider: authority,
+    repoPath: metadata.repoRoot,
+    upstream: stringFlag(flags, "upstream"),
+  });
   console.log(
     JSON.stringify({
       gate: metadata.gatePath,
       remote: metadata.remoteName,
       repo: metadata.repoRoot,
+      route: route.routeFingerprint,
     }),
   );
 }
@@ -14198,6 +14463,47 @@ Run options:
     gateCleanupOid = await git.head();
     const userGlobalConfig = loadUserConfig();
     ledger ??= openRepositoryLedger(originWorktree ?? gatePath);
+    const routeRoot = originWorktree ?? gatePath;
+    const storedRoute = ledger.repositoryPublicationRoute(
+      await canonicalPath(routeRoot),
+    );
+    let githubAuthority: GithubAuthority | undefined;
+    let publicationDestination: string | undefined;
+    const resumePlan = resumeRunId ? ledger.stagePlan(resumeRunId) : [];
+    const legacyResume = resumePlan.length > 0 &&
+      !resumePlan.some((entry) => entry.stage_id === "push");
+    if (!storedRoute && !legacyResume) {
+      const origin = await command("git", ["remote", "get-url", "origin"], routeRoot);
+      let githubOrigin = false;
+      try {
+        parseGithubRepositoryReference(origin.stdout.trim());
+        githubOrigin = true;
+      } catch {}
+      if (githubOrigin) {
+        throw new Error("new GitHub runs require successful orca-no-mistakes init");
+      }
+    }
+    try {
+      githubAuthority = await GithubAuthority.connect();
+      const publicationRoute = await resolveGithubPublicationRoute({
+        baseBranch: storedRoute?.base_branch,
+        fork:
+          storedRoute &&
+          storedRoute.head_repository_id !== storedRoute.base_repository_id
+            ? storedRoute.head_repository_name
+            : undefined,
+        headBranch: storedRoute?.head_branch,
+        ledger,
+        provider: githubAuthority,
+        repoPath: routeRoot,
+        upstream: storedRoute?.base_repository_name,
+      });
+      publicationDestination = `https://${publicationRoute.forgeHost}/${publicationRoute.headRepositoryName}.git`;
+    } catch (error) {
+      if (!(error instanceof GithubAuthorityError) ||
+          error.operation !== "parse-repository-reference") throw error;
+      githubAuthority = undefined;
+    }
     await installAbortReaping({
       ...(gate ? { gate } : {}),
       ...(deliveryGit ? { deliveryGit } : {}),
@@ -14238,11 +14544,13 @@ Run options:
         deliveryBranch: process.env.NO_MISTAKES_DELIVERY_BRANCH,
         deliveryGit,
         forceLease: parsed.flags["force-lease"] === true,
+        githubAuthority,
         intentTaskId:
           gate?.kind === "configured" ? gate.intentTaskId : undefined,
         intent,
         maxFixRounds,
         plainStatus: parsed.flags["no-tui"] === true,
+        publicationDestination,
         rendererFactory:
           parsed.flags.tui === true
             ? (
@@ -14278,11 +14586,15 @@ Run options:
       ledger,
     );
     closeRenderer();
-    gateCleanupOid = result.attestation?.candidateCommitOid ?? gateCleanupOid;
+    gateCleanupOid =
+      result.completionAttestation?.candidateCommitOid ??
+      result.attestation?.candidateCommitOid ??
+      gateCleanupOid;
+    const completedAttestation = result.completionAttestation ?? result.attestation;
     const passedSummary = [
       `Run ${result.runId} passed all ${result.steps.length} stages.`,
-      ...(result.attestation
-        ? [`Candidate commit: ${result.attestation.candidateCommitOid}.`]
+      ...(completedAttestation
+        ? [`Candidate commit: ${completedAttestation.candidateCommitOid}.`]
         : []),
       ...(result.custodyNote ? [result.custodyNote] : []),
     ].join("\n");
@@ -14453,7 +14765,7 @@ async function runAttestationCommand(
   try {
     if (action === "export") {
       const manifest = ledger.getCompletionAttestation(ref);
-      if (manifest.version === "1.3.0") verifyManifest(manifest, PIPELINE_STEPS);
+      if (manifest.version === "1.3.0") verifyManifest(manifest, LEGACY_STAGE_PLAN);
       else {
         verifyCompletionAttestation(manifest);
         ledger.verifyRetainedCompletionAttestation(manifest);
@@ -14484,7 +14796,7 @@ async function runAttestationCommand(
       raw === undefined
         ? ledger.getCompletionAttestation(ref)
         : (JSON.parse(raw) as CompletionAttestationManifest);
-    if (manifest.version === "1.3.0") verifyManifest(manifest, PIPELINE_STEPS);
+    if (manifest.version === "1.3.0") verifyManifest(manifest, LEGACY_STAGE_PLAN);
     else verifyCompletionAttestation(manifest);
     // The manifest is self-verifying: the Merkle root covers its header and
     // every stage digest, so a manifest carried to a machine that never ran the

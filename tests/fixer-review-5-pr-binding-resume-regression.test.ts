@@ -298,18 +298,12 @@ test('resumed attempt refreshes pull request binding after receipt schema upgrad
       stageId: 'pr',
       ownership: { branch: 'feature', generationToken: passedGeneration, repoRoot: '/repo' }
     }).receiptSha256
-    const dispositionEntries = [
-      entries.find((candidateEntry) => candidateEntry.stage === 'push')!,
-      refreshedPrEntry
-    ]
-    for (const entry of dispositionEntries) {
-      ledger.recordStageDisposition({
-        disposition: 'satisfied',
-        evidenceSha256: entry.evidenceSha256,
-        runId,
-        stageId: entry.stage
-      })
-    }
+    ledger.recordStageDisposition({
+      disposition: 'satisfied',
+      evidenceSha256: refreshedPrEntry.evidenceSha256,
+      runId,
+      stageId: 'pr'
+    })
     assert.notEqual(refreshedPrReceipt, firstPrReceipt)
     assert.equal(
       ledger.remoteReceipt(runId, 'pull-request-binding', firstPrReceipt)?.receipt_sha256,

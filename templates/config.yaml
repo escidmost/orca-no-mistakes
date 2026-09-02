@@ -103,7 +103,8 @@ defaults:
 # ------------------------------------------------------------------------------
 # Stage-Specific Overrides
 # ------------------------------------------------------------------------------
-# Supported stages: intent, rebase, review, test, document, lint
+# Supported stages: intent, rebase, review, test, document, lint, push, pr.
+# push and pr are coordinator-owned remote stages; agent settings do not apply.
 # stages:
 #   intent:
 #     agent: "claude"
@@ -131,3 +132,7 @@ defaults:
 #
 #   lint:
 #     timeout_ms: 60000
+#
+#   push: {}
+#
+#   pr: {}

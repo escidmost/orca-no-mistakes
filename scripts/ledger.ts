@@ -118,6 +118,12 @@ export const LEGACY_STAGE_PLAN = [
   'lint'
 ] as const
 
+export const RELEASE_2_STAGE_PLAN = [
+  ...LEGACY_STAGE_PLAN,
+  'push',
+  'pr'
+] as const
+
 export type GateKind = 'exhaustion' | 'finding' | 'guardrail'
 
 export type GateAuditRow = {
@@ -591,6 +597,40 @@ function pipelineEvidencePayload(manifest: PipelineCompletionAttestationManifest
   }
 }
 
+export function buildPipelineEvidenceRoot(
+  entries: StageEvidenceManifestEntry[],
+  meta: Pick<
+    PipelineCompletionAttestationManifest,
+    | 'attemptOutcomeDigests'
+    | 'baseCommitOid'
+    | 'candidateCommitOid'
+    | 'candidatePublicationReceiptSha256'
+    | 'intent'
+    | 'policySha256'
+    | 'publicationRoute'
+    | 'runId'
+    | 'stageDispositions'
+    | 'stagePlan'
+  >
+): string {
+  const pushIndex = meta.stagePlan.findIndex((entry) => entry.stage === 'push')
+  if (pushIndex < 0) throw new Error('pipeline evidence requires a push stage')
+  const prePrStages = new Set(meta.stagePlan.slice(0, pushIndex + 1).map((entry) => entry.stage))
+  return merkleRoot([sha256(canonicalJson({
+    attemptOutcomeDigests: meta.attemptOutcomeDigests,
+    baseCommitOid: meta.baseCommitOid,
+    candidateCommitOid: meta.candidateCommitOid,
+    candidatePublicationReceiptSha256: meta.candidatePublicationReceiptSha256,
+    intentHash: intentHash(meta.intent),
+    policySha256: meta.policySha256,
+    publicationRoute: meta.publicationRoute,
+    runId: meta.runId,
+    stageDispositions: meta.stageDispositions.filter((entry) => prePrStages.has(entry.stage)),
+    stageEvidence: entries.filter((entry) => prePrStages.has(entry.stage)),
+    stagePlan: meta.stagePlan.slice(0, pushIndex + 1)
+  }))])
+}
+
 function v2MerkleRoot(manifest: PipelineCompletionAttestationManifest): string {
   const { merkleRoot: _merkleRoot, ...payload } = manifest
   return merkleRoot([sha256(canonicalJson(payload))])
@@ -621,9 +661,10 @@ export function buildPipelineCompletionAttestation(
     coordinatorVersion: COORDINATOR_VERSION,
     createdAt: new Date().toISOString()
   }
-  manifest.pipelineEvidenceRoot = merkleRoot([
-    sha256(canonicalJson(pipelineEvidencePayload(manifest)))
-  ])
+  manifest.pipelineEvidenceRoot = buildPipelineEvidenceRoot(entries, {
+    ...manifest,
+    attemptOutcomeDigests: manifest.attemptOutcomeDigests.slice(0, -1)
+  })
   manifest.merkleRoot = v2MerkleRoot(manifest)
   verifyCompletionAttestation(manifest)
   return manifest
@@ -1997,6 +2038,23 @@ export type AttemptOutcomeInput = {
   verdict: Exclude<RunStatus, 'in-progress'>
 }
 
+export function attemptOutcomeSha256(input: AttemptOutcomeInput): string {
+  return sha256(canonicalJson({
+    actorIdentity: input.actorIdentity,
+    attemptId: input.attemptId,
+    candidateCommitOid: input.candidateCommitOid,
+    completedAt: input.completedAt,
+    coordinatorIdentity: input.coordinatorIdentity,
+    custody: input.custody,
+    reason: input.reason,
+    receiptDigests: input.receiptDigests,
+    resumeEligible: input.resumeEligible,
+    runId: input.runId,
+    stoppingFact: input.stoppingFact,
+    verdict: input.verdict
+  }))
+}
+
 export class DomainLedger {
   readonly #db: DatabaseSync
   readonly #path: string
@@ -3223,21 +3281,7 @@ export class DomainLedger {
         attempt.coordinator_identity !== input.coordinatorIdentity) {
       throw new Error(`attempt ${input.attemptId} identity does not match its outcome`)
     }
-    const outcome = {
-      actorIdentity: input.actorIdentity,
-      attemptId: input.attemptId,
-      candidateCommitOid: input.candidateCommitOid,
-      completedAt: input.completedAt,
-      coordinatorIdentity: input.coordinatorIdentity,
-      custody: input.custody,
-      reason: input.reason,
-      receiptDigests: input.receiptDigests,
-      resumeEligible: input.resumeEligible,
-      runId: input.runId,
-      stoppingFact: input.stoppingFact,
-      verdict: input.verdict
-    }
-    const outcomeSha256 = sha256(canonicalJson(outcome))
+    const outcomeSha256 = attemptOutcomeSha256(input)
     this.#db.prepare(
       `INSERT INTO attempt_outcomes (
          outcome_id, attempt_id, run_id, verdict, stopping_fact, reason, candidate_commit_oid,
@@ -3309,6 +3353,24 @@ export class DomainLedger {
       `SELECT observation_sha256 FROM remote_observations
        WHERE run_id = ? ORDER BY observed_at, rowid`
     ).all(runId) as { observation_sha256: string }[]
+  }
+
+  remoteObservation(
+    runId: string,
+    observationSha256: string
+  ): { kind: string; payload: Record<string, unknown>; subject: string } | undefined {
+    const row = this.#db.prepare(
+      `SELECT kind, payload_json, subject FROM remote_observations
+       WHERE run_id = ? AND observation_sha256 = ?`
+    ).get(runId, observationSha256) as
+      | { kind: string; payload_json: string; subject: string }
+      | undefined
+    if (!row) return undefined
+    return {
+      kind: row.kind,
+      payload: JSON.parse(row.payload_json) as Record<string, unknown>,
+      subject: row.subject
+    }
   }
 
   recordMutationIntent(input: {
@@ -3495,12 +3557,20 @@ export class DomainLedger {
         mutationPayload.update === input.candidateCommitOid
     }
     const receipt = input.receiptPayload
+    const hasManagedComment = Object.hasOwn(receipt, 'managedCommentIntent')
+    const hasPipelineEvidenceRoot = Object.hasOwn(receipt, 'pipelineEvidenceRoot')
     if (!hasOnlyOwnProperties(receipt, new Set([
+      ...(hasManagedComment ? ['managedCommentIntent'] : []),
+      ...(hasPipelineEvidenceRoot ? ['pipelineEvidenceRoot'] : []),
       'mutationIntent', 'number', 'outcome', 'postRead', 'routeFingerprint'
     ])) || !Number.isInteger(receipt.number) || Number(receipt.number) <= 0 ||
-        !['created', 'updated', 'unchanged'].includes(String(receipt.outcome)) ||
-        typeof receipt.mutationIntent !== 'string' ||
-        receipt.postRead !== input.observationSha256) return false
+      !['created', 'updated', 'unchanged'].includes(String(receipt.outcome)) ||
+      (hasManagedComment && typeof receipt.managedCommentIntent !== 'string') ||
+      (hasPipelineEvidenceRoot &&
+        (typeof receipt.pipelineEvidenceRoot !== 'string' ||
+          !/^[0-9a-f]{64}$/.test(receipt.pipelineEvidenceRoot))) ||
+      typeof receipt.mutationIntent !== 'string' ||
+      receipt.postRead !== input.observationSha256) return false
     const mutation = this.#db.prepare(
       `SELECT attempt_id, kind, target_fingerprint, payload_json, created_at
        FROM mutation_intents WHERE run_id = ? AND intent_sha256 = ?`
@@ -3513,14 +3583,35 @@ export class DomainLedger {
           target_fingerprint: string
         }
       | undefined
+    const managedCommentMutation = hasManagedComment ? this.#db.prepare(
+      `SELECT attempt_id, kind, target_fingerprint, payload_json, created_at
+       FROM mutation_intents WHERE run_id = ? AND intent_sha256 = ?`
+    ).get(input.runId, String(receipt.managedCommentIntent)) as
+      | {
+          attempt_id: string
+          created_at: string
+          kind: string
+          payload_json: string
+          target_fingerprint: string
+        }
+      | undefined : undefined
     const publication = this.remoteReceipt(input.runId, 'candidate-publication')
-    if (!mutation || !publication || publication.candidate_commit_oid !== input.candidateCommitOid ||
+    if (!mutation || !publication ||
+        publication.candidate_commit_oid !== input.candidateCommitOid ||
         mutation.attempt_id !== observation.attempt_id || mutation.kind !== 'pull-request' ||
         mutation.target_fingerprint !== route.route_fingerprint ||
+        (hasManagedComment && (!managedCommentMutation ||
+          managedCommentMutation.attempt_id !== observation.attempt_id ||
+          managedCommentMutation.kind !== 'managed-comment' ||
+          managedCommentMutation.target_fingerprint !== route.route_fingerprint)) ||
         mutation.created_at > observation.observed_at) return false
     let mutationPayload: Record<string, unknown>
+    let managedCommentPayload: Record<string, unknown>
     try {
       mutationPayload = JSON.parse(mutation.payload_json) as Record<string, unknown>
+      managedCommentPayload = managedCommentMutation
+        ? JSON.parse(managedCommentMutation.payload_json) as Record<string, unknown>
+        : {}
     } catch {
       return false
     }
@@ -3531,7 +3622,14 @@ export class DomainLedger {
       payload: mutationPayload,
       runId: input.runId,
       targetFingerprint: mutation.target_fingerprint
-    })) !== receipt.mutationIntent) return false
+    })) !== receipt.mutationIntent || (managedCommentMutation && sha256(canonicalJson({
+      attemptId: managedCommentMutation.attempt_id,
+      createdAt: managedCommentMutation.created_at,
+      kind: managedCommentMutation.kind,
+      payload: managedCommentPayload,
+      runId: input.runId,
+      targetFingerprint: managedCommentMutation.target_fingerprint
+    })) !== receipt.managedCommentIntent)) return false
     const routeFacts = {
       baseBranch: route.base_branch,
       baseRepositoryId: route.base_repository_id,
@@ -3541,19 +3639,38 @@ export class DomainLedger {
       headOwner: route.head_owner,
       headRepositoryId: route.head_repository_id
     }
-    return observation.kind === 'pull-request' &&
+    const commonMatch = observation.kind === 'pull-request' &&
       observation.subject === `${route.forge_host}/${route.base_repository_id}#${String(receipt.number)}` &&
-      hasOnlyOwnProperties(payload, new Set([
-        ...Object.keys(routeFacts), 'number', 'state'
-      ])) &&
-      hasOnlyOwnProperties(mutationPayload, new Set([
-        ...Object.keys(routeFacts), 'action'
-      ])) &&
       Object.entries(routeFacts).every(([key, value]) =>
         payload[key] === value && mutationPayload[key] === value
       ) &&
       payload.number === receipt.number && payload.state === 'open' &&
       mutationPayload.action === 'ensure-open'
+    if (!commonMatch) return false
+    if (!hasManagedComment) {
+      return hasOnlyOwnProperties(payload, new Set([
+        ...Object.keys(routeFacts), 'number', 'state'
+      ])) && hasOnlyOwnProperties(mutationPayload, new Set([
+        ...Object.keys(routeFacts), 'action'
+      ]))
+    }
+    return hasOnlyOwnProperties(payload, new Set([
+      ...Object.keys(routeFacts), 'managedCommentBodySha256', 'managedCommentNodeId',
+      'number', 'pullRequestNodeId', 'state'
+    ])) && hasOnlyOwnProperties(mutationPayload, new Set([
+      ...Object.keys(routeFacts), 'action', 'body', 'title'
+    ])) &&
+      hasOnlyOwnProperties(managedCommentPayload, new Set([
+        'action', 'bodySha256', 'managedCommentNodeId', 'number'
+      ])) &&
+      typeof payload.pullRequestNodeId === 'string' && payload.pullRequestNodeId !== '' &&
+      typeof payload.managedCommentNodeId === 'string' && payload.managedCommentNodeId !== '' &&
+      typeof payload.managedCommentBodySha256 === 'string' &&
+      managedCommentPayload.action === 'ensure-managed-summary' &&
+      managedCommentPayload.bodySha256 === payload.managedCommentBodySha256 &&
+      (managedCommentPayload.managedCommentNodeId === null ||
+        managedCommentPayload.managedCommentNodeId === payload.managedCommentNodeId) &&
+      managedCommentPayload.number === receipt.number
   }
 
   settleRemoteStage(input: {
@@ -3669,6 +3786,17 @@ export class DomainLedger {
         input.receipt.authoritativePostObservationSha256,
         receiptJson
       ) as { receipt_sha256: string } | undefined
+      const settlesDisposition = input.stageId !== 'pr' ||
+        (input.evidence.roundIndex === 0 &&
+          Object.hasOwn(input.receipt.payload, 'managedCommentIntent'))
+      const existingDisposition = this.#db.prepare(
+        `SELECT 1 FROM stage_dispositions
+         WHERE run_id = ? AND stage_id = ? AND disposition = 'satisfied'
+           AND evidence_sha256 = ?`
+      ).get(input.runId, input.stageId, input.evidence.evidenceSha256)
+      const priorDisposition = this.#db.prepare(
+        'SELECT 1 FROM stage_dispositions WHERE run_id = ? AND stage_id = ? LIMIT 1'
+      ).get(input.runId, input.stageId)
       const priorEvidence = this.#db.prepare(
         'SELECT 1 FROM stage_evidence WHERE run_id = ? AND stage_id = ? AND round_index = ? LIMIT 1'
       ).get(input.runId, input.stageId, input.evidence.roundIndex)
@@ -3676,7 +3804,8 @@ export class DomainLedger {
         'SELECT 1 FROM stage_checkpoints WHERE run_id = ? AND stage_id = ? AND round_index = ? LIMIT 1'
       ).get(input.runId, input.stageId, input.checkpoint.roundIndex)
       if (priorEvidence !== undefined || priorCheckpoint !== undefined) {
-        if (existingEvidence && existingCheckpoint && existingReceipt) {
+        if (existingEvidence && existingCheckpoint && existingReceipt &&
+            (!settlesDisposition || existingDisposition)) {
           this.#db.exec('COMMIT')
           return {
             evidenceId: existingEvidence.evidence_id,
@@ -3684,6 +3813,9 @@ export class DomainLedger {
           }
         }
         throw new Error(`${input.stageId} round ${input.checkpoint.roundIndex} is already settled with different facts`)
+      }
+      if (settlesDisposition && priorDisposition !== undefined && existingDisposition === undefined) {
+        throw new Error(`${input.stageId} is already settled with a different disposition`)
       }
 
       const createdAt = new Date().toISOString()
@@ -3716,6 +3848,14 @@ export class DomainLedger {
         runId: input.runId,
         stageId: input.stageId
       })
+      if (settlesDisposition && existingDisposition === undefined) {
+        this.recordStageDisposition({
+          disposition: 'satisfied',
+          evidenceSha256: input.evidence.evidenceSha256,
+          runId: input.runId,
+          stageId: input.stageId
+        })
+      }
       this.#db.exec('COMMIT')
       return { evidenceId, receiptSha256 }
     } catch (error) {
@@ -3861,6 +4001,11 @@ export class DomainLedger {
   }): StageCheckpointRow {
     const run = this.run(input.runId)
     if (!run) throw new Error(`run ${input.runId} does not exist`)
+    if (run.status === 'in-progress') {
+      throw new Error(
+        `run ${input.runId} is still in-progress; adopting stranded remote-stage runs is a Release 4 limitation`
+      )
+    }
     if (run.status !== 'failed') {
       throw new Error(`run ${input.runId} cannot resume from status ${run.status}`)
     }
@@ -3895,7 +4040,11 @@ export class DomainLedger {
              WHERE run_id = ? AND (base_ref_sha IS NULL OR base_ref_sha <> ?)`
           ).get(input.runId, input.baseRefSha)
     ) as { count: number | bigint }
-    if (Number(incompatibleBaseEvidence.count) > 0) {
+    const lintValidated = this.#db.prepare(
+      `SELECT 1 FROM stage_dispositions
+       WHERE run_id = ? AND stage_id = 'lint' AND disposition = 'satisfied'`
+    ).get(input.runId) !== undefined
+    if (Number(incompatibleBaseEvidence.count) > 0 && !lintValidated) {
       throw new Error(`run ${input.runId} base ref changed since it failed`)
     }
     const checkpoint = this.#db
@@ -4234,6 +4383,69 @@ export class DomainLedger {
     }
   }
 
+  finalizePassedRunWithAttemptOutcome(
+    manifest: PipelineCompletionAttestationManifest,
+    terminalCommitOid: string,
+    ownership: { branch: string; generationToken: number; repoRoot: string },
+    outcome: AttemptOutcomeInput,
+    presentation?: { eventKey: string; snapshot: PresentationSnapshot }
+  ): void {
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      this.#requirePassedRunLease(manifest.runId, ownership)
+      if (this.recordAttemptOutcome(outcome) !== manifest.attemptOutcomeDigests.at(-1)) {
+        throw new Error('terminal attempt outcome does not match the completion attestation')
+      }
+      this.#completePassedRun(manifest, terminalCommitOid)
+      if (presentation) this.#recordPresentationMilestone(manifest.runId, presentation)
+      this.#db.exec('COMMIT')
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  async finalizePassedRunWithAttemptOutcomeAndLeaseMutation(
+    runId: string,
+    terminalCommitOid: string,
+    ownership: { branch: string; generationToken: number; repoRoot: string },
+    mutate: () => Promise<string>,
+    outcomeFor: (custodyNote: string) => AttemptOutcomeInput,
+    manifestFor: (
+      outcome: AttemptOutcomeInput,
+      outcomeSha256: string
+    ) => PipelineCompletionAttestationManifest,
+    presentation?: { eventKey: string; snapshot: PresentationSnapshot }
+  ): Promise<{ custodyNote: string; manifest: PipelineCompletionAttestationManifest }> {
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      this.#requirePassedRunLease(runId, ownership)
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
+    try {
+      const custodyNote = await mutate()
+      const outcome = outcomeFor(custodyNote)
+      const outcomeDigest = attemptOutcomeSha256(outcome)
+      const manifest = manifestFor(outcome, outcomeDigest)
+      if (manifest.runId !== runId || outcome.runId !== runId) {
+        throw new Error('terminal settlement run identity changed')
+      }
+      this.#requirePassedRunLease(manifest.runId, ownership)
+      if (this.recordAttemptOutcome(outcome) !== outcomeDigest) {
+        throw new Error('terminal attempt outcome changed during settlement')
+      }
+      this.#completePassedRun(manifest, terminalCommitOid)
+      if (presentation) this.#recordPresentationMilestone(manifest.runId, presentation)
+      this.#db.exec('COMMIT')
+      return { custodyNote, manifest }
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
   recordCheckpoint(
     input: {
       inputCommitOid: string
@@ -4253,6 +4465,51 @@ export class DomainLedger {
       }
     } catch (error) {
       if (presentation) this.#db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  settleLocalStage(
+    input: {
+      checkpoint: {
+        inputCommitOid: string
+        outputCommitOid: string
+        roundIndex: number
+      }
+      evidenceSha256: string
+      runId: string
+      stageId: string
+    },
+    presentation?: { eventKey: string; snapshot: PresentationSnapshot }
+  ): void {
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      const settlesDisposition = this.stagePlan(input.runId).some(
+        (entry) => entry.stage_id === 'push'
+      )
+      const disposition = this.#db.prepare(
+        'SELECT disposition, evidence_sha256 FROM stage_dispositions WHERE run_id = ? AND stage_id = ?'
+      ).get(input.runId, input.stageId) as
+        | { disposition: string; evidence_sha256: string | null }
+        | undefined
+      if (settlesDisposition && disposition &&
+          (disposition.disposition !== 'satisfied' ||
+            disposition.evidence_sha256 !== input.evidenceSha256)) {
+        throw new Error(`${input.stageId} is already settled with a different disposition`)
+      }
+      this.recordCheckpoint({ ...input.checkpoint, runId: input.runId, stageId: input.stageId })
+      if (settlesDisposition && !disposition) {
+        this.recordStageDisposition({
+          disposition: 'satisfied',
+          evidenceSha256: input.evidenceSha256,
+          runId: input.runId,
+          stageId: input.stageId
+        })
+      }
+      if (presentation) this.#recordPresentationMilestone(input.runId, presentation)
+      this.#db.exec('COMMIT')
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
       throw error
     }
   }
@@ -4683,16 +4940,16 @@ export class DomainLedger {
     ) {
       problems.push('stage dispositions')
     }
-    const finalDisposition = manifest.stageDispositions.findLast(
+    const baseDisposition = manifest.stageDispositions.find(
       (disposition) => disposition.evidenceSha256 !== undefined
     )
-    const finalEvidence = manifest.stageEvidence.find(
-      (evidence) => evidence.evidenceSha256 === finalDisposition?.evidenceSha256
+    const baseEvidence = manifest.stageEvidence.find(
+      (evidence) => evidence.evidenceSha256 === baseDisposition?.evidenceSha256
     )
-    const retainedFinalEvidence = retainedEvidence.rows.find(
-      (row) => row.evidence_sha256 === finalEvidence?.evidenceSha256
+    const retainedBaseEvidence = retainedEvidence.rows.find(
+      (row) => row.evidence_sha256 === baseEvidence?.evidenceSha256
     )
-    if (!retainedFinalEvidence || retainedFinalEvidence.base_commit_oid !== manifest.baseCommitOid) {
+    if (!retainedBaseEvidence || retainedBaseEvidence.base_commit_oid !== manifest.baseCommitOid) {
       problems.push('base commit evidence')
     }
 

@@ -1,12 +1,12 @@
 # orca-no-mistakes
 
-An Orca-native, six-stage local adversarial validation pipeline:
+An Orca-native eight-stage adversarial validation and publication pipeline:
 
-`intent -> rebase -> review -> test -> document -> lint`
+`intent -> rebase -> review -> test -> document -> lint -> push -> pr`
 
-The current runner creates an Orca Run, acquires an exclusive semantic lease on the branch in a repository-local SQLite domain ledger (`<git-common-dir>/orca-no-mistakes/ledger.sqlite`), compiles its validation policy from the trusted base commit, and drives fresh reviewers plus retained fixers across disposable child worktrees while the coordinator runs in an isolated gate worktree and applies fixer commits. The first repository command transactionally imports that repository's history from the legacy `~/.orca-no-mistakes/ledger.db` archive when present, then removes that repository's migrated runs from the legacy archive. The worker agent for each stage and role comes from the resolved validation policy configuration. Human decisions use Orca gates; every approval or skip is recorded as an audit row and bound into the final local evidence manifest. Stage evidence (reports, logs, exit codes, content hashes) lands under `~/.orca-no-mistakes/artifacts/<run-id>/`, outside the branch. Release 1 is deliberately local-only: direct `run` and the repository-local admission gate feed the same six-stage pipeline, while remote `push`, `pr`, and `ci` stages remain excluded; completion terminates with a tamper-evident local v1.3 evidence manifest instead of publishing a candidate or creating a pull request. A focused candidate-publication route exists outside the default pipeline (see [Current Architecture](docs/current-architecture.md)).
+The runner creates an Orca Run, acquires an exclusive semantic lease on the branch in a repository-local SQLite domain ledger (`<git-common-dir>/orca-no-mistakes/ledger.sqlite`), validates through disposable child worktrees, publishes the exact candidate, and creates or adopts its exact ready-for-review pull request. Stage and remote evidence lands under `~/.orca-no-mistakes/artifacts/<run-id>/`, outside the branch. Migrated Release 1 failures retain their frozen six-stage local plan and v1.3 manifest; new initialized runs use the eight-stage Release 2 plan and v2 completion attestation.
 
-Successful completion means all six stages completed with a tamper-evident Merkle evidence manifest binding the recorded stage history and terminal candidate commit, plus the base commit, policy hash, and declared intent. It does not prove that every stage ran against one unchanged candidate. Automatic push/PR/CI orchestration and forge adapters remain future releases. See [Current Architecture](docs/current-architecture.md) for implemented behavior and [the ADRs](docs/adr/) for accepted target decisions.
+Successful completion means all eight required stages and both remote receipts settled durably in a v2 completion attestation. CI and delivery-proof orchestration remain future work. See [Current Architecture](docs/current-architecture.md) for implemented behavior and [the ADRs](docs/adr/) for accepted target decisions.
 
 ## Install
 
@@ -28,7 +28,7 @@ orca-no-mistakes run --repo /path/to/repo --intent "Add X without changing Y"
 orca-no-mistakes run --repo /path/to/repo --resume <failed-run-id>
 ```
 
-New runs require an explicit single-line `--intent`; failed runs can instead use `--resume` without repeating the intent. The runner requires a clean committed named feature branch, refuses the default base branch, and requires a configured `origin`. It rebases onto the detected default branch unless `--base` is supplied. Detached resume reuses the failed run's ledger and evidence, reconstructs the isolated gate worktree at its last durable checkpoint, and skips completed stages whose commit-bound evidence is still valid. Leave the clean initiating checkout at the failed run's original submission commit so successful custody transfer can advance it automatically.
+New runs require an explicit single-line `--intent`; failed runs can instead use `--resume` without repeating the intent. The runner requires a clean committed named feature branch, refuses the default base branch, and requires a configured `origin`. It rebases onto the detected default branch unless `--base` is supplied, publishes the validated candidate with an exact force-with-lease, and creates or adopts the exact ready-for-review pull request. Detached resume reuses the failed run's ledger and evidence, reconstructs the isolated gate worktree at its last durable checkpoint, and skips completed stages whose commit-bound evidence is still valid. Leave the clean initiating checkout at the failed run's original submission commit so successful custody transfer can advance it automatically.
 
 ## Local gate
 
@@ -36,6 +36,8 @@ Install or repair the repository-local bare gate and its managed remote:
 
 ```bash
 orca-no-mistakes init --repo /path/to/repo
+# Fork publication:
+orca-no-mistakes init --repo /path/to/repo --fork owner/repo --head-branch feature
 ```
 
 Submit one feature-branch update with one encoded intent option. The gate admits the update before Git mutates its permanent ref, then launches the same detached pipeline used by direct `run`:
@@ -45,7 +47,7 @@ intent=$(node -e 'process.stdout.write(Buffer.from(process.argv[1]).toString("ba
 git -C /path/to/repo push --push-option="no-mistakes.intent=$intent" orca-no-mistakes HEAD:refs/heads/feature
 ```
 
-Tags, deletes, the default branch, multi-ref pushes, malformed intent, and unsafe transport state are rejected before admission. Gate and direct submissions with the same repository, ref, candidate, and intent converge on one durable submission identity; remote delivery stages are not activated.
+`init` also authenticates GitHub and persists the stable base/head repository route. Use `--upstream`, `--fork`, `--base-branch`, and `--head-branch` to override the detected route. Tags, deletes, the default branch, multi-ref pushes, malformed intent, and unsafe transport state are rejected before admission. Gate and direct submissions with the same repository, ref, candidate, and intent converge on one durable submission identity and run the same remote delivery stages.
 
 Useful direct-run options:
 

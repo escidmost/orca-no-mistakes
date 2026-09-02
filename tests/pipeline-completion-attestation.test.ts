@@ -253,6 +253,20 @@ test('v2 completion attestations bind Release 2 facts without overstating assura
       runId,
       targetFingerprint: routeFingerprint
     })
+    const managedCommentBodySha256 = sha256('managed summary')
+    const managedCommentIntent = ledger.recordMutationIntent({
+      attemptId: 'passed-attempt',
+      createdAt: '2026-08-30T12:00:06.500Z',
+      kind: 'managed-comment',
+      payload: {
+        action: 'ensure-managed-summary',
+        bodySha256: managedCommentBodySha256,
+        managedCommentNodeId: 'IC_comment',
+        number: 77
+      },
+      runId,
+      targetFingerprint: routeFingerprint
+    })
     const prObservation = ledger.recordRemoteObservation({
       attemptId: 'passed-attempt',
       kind: 'pull-request',
@@ -265,7 +279,10 @@ test('v2 completion attestations bind Release 2 facts without overstating assura
         headBranch: 'feature',
         headOwner: 'owner',
         headRepositoryId: 'R_head',
+        managedCommentBodySha256,
+        managedCommentNodeId: 'IC_comment',
         number: 77,
+        pullRequestNodeId: 'PR_77',
         state: 'open'
       },
       runId,
@@ -291,6 +308,7 @@ test('v2 completion attestations bind Release 2 facts without overstating assura
         candidateCommitOid: commit,
         kind: 'pull-request-binding',
         payload: {
+          managedCommentIntent,
           mutationIntent: pullRequestIntent,
           number: 77,
           outcome: 'created',
