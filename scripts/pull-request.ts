@@ -114,15 +114,19 @@ async function observeExact(
 
 function ownedComment(
   comments: GithubIssueCommentObservation[],
-  actorId: string,
+  actor: { id: string; login?: string; nodeId?: string | null },
   receiptNodeId?: string
 ): GithubIssueCommentObservation | undefined {
   const exactReceipt = receiptNodeId
     ? comments.find((comment) => comment.id === receiptNodeId)
     : undefined
   if (exactReceipt) return exactReceipt
+  const owned = (comment: GithubIssueCommentObservation): boolean =>
+    (actor.nodeId != null && comment.author?.id === actor.nodeId) ||
+    (actor.login != null && comment.author?.login === actor.login) ||
+    (actor.nodeId == null && comment.author?.id === actor.id)
   const marked = comments.filter((comment) =>
-    comment.author?.id === actorId && comment.body.startsWith(MANAGED_SUMMARY_MARKER)
+    owned(comment) && comment.body.startsWith(MANAGED_SUMMARY_MARKER)
   )
   if (marked.length > 1) {
     throw new PullRequestBindingError('multiple managed summary markers are ambiguous')
@@ -236,7 +240,11 @@ export async function bindPullRequest(input: {
     ? previousObservation.payload.managedCommentNodeId
     : undefined
   let comments = await input.authority.observeIssueComments(pullRequest.id)
-  let comment = ownedComment(comments, repositoryRoute.actor_id, receiptNodeId)
+  let comment = ownedComment(comments, {
+    id: repositoryRoute.actor_id,
+    login: repositoryRoute.actor_login,
+    nodeId: repositoryRoute.actor_node_id
+  }, receiptNodeId)
   let commentMutated = false
   const managedCommentIntent = input.ledger.recordMutationIntent({
     attemptId: input.attemptId,
@@ -264,7 +272,11 @@ export async function bindPullRequest(input: {
       if (!(error instanceof GithubAuthorityError) || error.kind !== 'mutation-indeterminate') throw error
     }
     comments = await input.authority.observeIssueComments(pullRequest.id)
-    comment = ownedComment(comments, repositoryRoute.actor_id, comment?.id)
+    comment = ownedComment(comments, {
+      id: repositoryRoute.actor_id,
+      login: repositoryRoute.actor_login,
+      nodeId: repositoryRoute.actor_node_id
+    }, comment?.id)
   }
   if (!comment || comment.body !== summary) {
     throw new PullRequestBindingError('managed summary mutation was not proven by the authoritative post-read')
