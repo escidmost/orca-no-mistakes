@@ -1217,6 +1217,12 @@ async function markOutcomeDeliveryPending(
   await refreshGateMarker();
 }
 
+async function clearOutcomeDeliveryPending(): Promise<void> {
+  delete abortReap.pendingOutcome;
+  delete abortReap.pendingSummary;
+  await refreshGateMarker();
+}
+
 // Called by the launcher as soon as the gate workspace exists, before the
 // coordinator ever starts: even a coordinator that dies in its first second
 // leaves an identifiable workspace.
@@ -1515,16 +1521,21 @@ export async function reapAbortedRun(reason: string): Promise<void> {
     const summary = recoverRef
       ? `No-mistakes cancelled: ${reason}\n${recoveryInstructions(recoverRef)}`
       : `No-mistakes cancelled: ${reason}`;
+    await markOutcomeDeliveryPending("cancelled", summary).catch(
+      (markerError) =>
+        abortLog(
+          `warning: could not record the write-ahead cancelled outcome: ${String(markerError)}`,
+        ),
+    );
     try {
       await abortReap.notify(summary);
+      await clearOutcomeDeliveryPending().catch((markerError) =>
+        abortLog(
+          `warning: could not clear the delivered cancelled outcome: ${String(markerError)}`,
+        ),
+      );
     } catch (error) {
       outcomeDelivered = false;
-      await markOutcomeDeliveryPending("cancelled", summary).catch(
-        (markerError) =>
-          abortLog(
-            `warning: could not record the undelivered cancelled outcome: ${String(markerError)}`,
-          ),
-      );
       abortLog(
         `warning: abort could not deliver the cancelled outcome, retaining the gate for recovery: ${String(error)}`,
       );
@@ -11066,15 +11077,32 @@ async function deliverPendingOutcome(
     return false;
   }
   try {
-    await new CliOrca({
-      command: orcaCommand,
-      cwd: repoRoot,
-      runId,
-      notifyHandle: marker.notifyHandle,
-    }).notifyRunResult(outcome, marker.pendingSummary);
+    if (
+      process.env.ORCA_TERMINAL_HANDLE &&
+      marker.notifyHandle === process.env.ORCA_TERMINAL_HANDLE
+    ) {
+      console.error(marker.pendingSummary);
+    } else {
+      await new CliOrca({
+        command: orcaCommand,
+        cwd: repoRoot,
+        runId,
+        notifyHandle: marker.notifyHandle,
+      }).notifyRunResult(outcome, marker.pendingSummary);
+    }
   } catch (error) {
     console.error(
       `no-mistakes: retained gate marker ${markerFile}; its pending ${outcome} outcome could not be delivered: ${String(error)}`,
+    );
+    return false;
+  }
+  delete marker.pendingOutcome;
+  delete marker.pendingSummary;
+  try {
+    await writeMarker(markerFile, marker);
+  } catch (error) {
+    console.error(
+      `no-mistakes: retained gate marker ${markerFile}; could not clear delivered pending outcome: ${String(error)}`,
     );
     return false;
   }
@@ -12168,7 +12196,59 @@ function settleStrandedCancellation(
 }
 
 function isConsumerFenced(error: unknown): boolean {
-  return String(error).includes("consumer_fenced");
+  if (!error) return false;
+  if (typeof error === "object") {
+    const candidate = error as {
+      code?: unknown;
+      error?: { code?: unknown };
+    };
+    if (
+      candidate.error?.code === "consumer_fenced" ||
+      candidate.code === "consumer_fenced"
+    ) {
+      return true;
+    }
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  const failedIndex = message.lastIndexOf(" failed (");
+  const colonIndex = failedIndex >= 0 ? message.indexOf("): ", failedIndex) : -1;
+  const outputText =
+    colonIndex >= 0 ? message.slice(colonIndex + 3).trim() : message.trim();
+
+  const candidates: unknown[] = [];
+  for (const line of outputText.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+      try {
+        candidates.push(JSON.parse(trimmed));
+      } catch {}
+    }
+  }
+  if (candidates.length === 0) {
+    const start = outputText.indexOf("{");
+    const end = outputText.lastIndexOf("}");
+    if (start >= 0 && end > start) {
+      try {
+        candidates.push(JSON.parse(outputText.slice(start, end + 1)));
+      } catch {}
+    }
+  }
+
+  for (const candidate of candidates) {
+    if (candidate && typeof candidate === "object") {
+      const payload = candidate as {
+        code?: unknown;
+        error?: { code?: unknown };
+      };
+      if (
+        payload.error?.code === "consumer_fenced" ||
+        payload.code === "consumer_fenced"
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 async function reapDirectRun(
@@ -13841,20 +13921,25 @@ Run options:
         : []),
       ...(result.custodyNote ? [result.custodyNote] : []),
     ].join("\n");
-    await orca.notifyRunResult("passed", passedSummary).catch(
-      async (notificationError) => {
-        retainGate = true;
-        await markOutcomeDeliveryPending("passed", passedSummary).catch(
-          (markerError) =>
-            console.error(
-              `warning: could not record the undelivered passed outcome: ${String(markerError)}`,
-            ),
-        );
+    await markOutcomeDeliveryPending("passed", passedSummary).catch(
+      (markerError) =>
         console.error(
-          `warning: could not deliver the passed outcome, retaining the gate for recovery: ${String(notificationError)}`,
-        );
-      },
+          `warning: could not record the write-ahead passed outcome: ${String(markerError)}`,
+        ),
     );
+    try {
+      await orca.notifyRunResult("passed", passedSummary);
+      await clearOutcomeDeliveryPending().catch((markerError) =>
+        console.error(
+          `warning: could not clear the delivered passed outcome: ${String(markerError)}`,
+        ),
+      );
+    } catch (notificationError) {
+      retainGate = true;
+      console.error(
+        `warning: could not deliver the passed outcome, retaining the gate for recovery: ${String(notificationError)}`,
+      );
+    }
     console.log(JSON.stringify(result));
   } catch (error) {
     closeRenderer();
@@ -13907,16 +13992,21 @@ Run options:
     const failedSummary = recoverRef
       ? `No-mistakes ${outcome}: ${message}\n${recoveryInstructions(recoverRef)}`
       : `No-mistakes ${outcome}: ${message}`;
+    await markOutcomeDeliveryPending(outcome, failedSummary).catch(
+      (markerError) =>
+        console.error(
+          `warning: could not record the write-ahead ${outcome} outcome: ${String(markerError)}`,
+        ),
+    );
     try {
       await orca.notifyRunResult(outcome, failedSummary);
+      await clearOutcomeDeliveryPending().catch((markerError) =>
+        console.error(
+          `warning: could not clear the delivered ${outcome} outcome: ${String(markerError)}`,
+        ),
+      );
     } catch (notificationError) {
       retainGate = true;
-      await markOutcomeDeliveryPending(outcome, failedSummary).catch(
-        (markerError) =>
-          console.error(
-            `warning: could not record the undelivered ${outcome} outcome: ${String(markerError)}`,
-          ),
-      );
       console.error(
         `warning: could not notify Orca about the failed run, retaining the gate for recovery: ${String(notificationError)}`,
       );
