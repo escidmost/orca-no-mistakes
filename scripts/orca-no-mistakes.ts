@@ -1214,44 +1214,7 @@ async function markOutcomeDeliveryPending(
 ): Promise<void> {
   abortReap.pendingOutcome = outcome;
   abortReap.pendingSummary = summary;
-  const { gate, originWorktree } = abortReap;
-  if (!gate || !originWorktree) return;
-  const markerPath = gateMarkerPath(originWorktree, gateMarkerId(gate));
-  try {
-    await refreshGateMarker();
-  } catch (error) {
-    try {
-      let createdAt = new Date().toISOString();
-      let terminalHandle = abortReap.terminalHandle;
-      try {
-        const existing = JSON.parse(
-          await readFile(markerPath, "utf8"),
-        ) as Partial<GateRunMarker>;
-        if (typeof existing.createdAt === "string") createdAt = existing.createdAt;
-        if (terminalHandle === undefined && typeof existing.terminalHandle === "string") {
-          terminalHandle = existing.terminalHandle;
-        }
-      } catch {}
-      const fallbackMarker: GateRunMarker = {
-        createdAt,
-        gate,
-        originWorktree,
-        notifyHandle: abortReap.notifyHandle,
-        pendingOutcome: outcome,
-        pendingSummary: summary,
-        ...(terminalHandle !== undefined ? { terminalHandle } : {}),
-      };
-      await writeFile(
-        markerPath,
-        `${JSON.stringify(fallbackMarker, null, 2)}\n`,
-      );
-    } catch {
-      try {
-        appendFileSync(markerPath, "\n--incomplete-outcome-journal--\n");
-      } catch {}
-    }
-    throw error;
-  }
+  await refreshGateMarker();
 }
 
 async function clearOutcomeDeliveryPending(): Promise<void> {
@@ -14030,10 +13993,16 @@ Run options:
     const failedSummary = recoverRef
       ? `No-mistakes ${outcome}: ${message}\n${recoveryInstructions(recoverRef)}`
       : `No-mistakes ${outcome}: ${message}`;
-    retainGate = true;
-    await markOutcomeDeliveryPending(outcome, failedSummary);
+    const shouldRetainGate = retainGate;
+    try {
+      await markOutcomeDeliveryPending(outcome, failedSummary);
+    } catch (markerError) {
+      retainGate = true;
+      throw markerError;
+    }
     try {
       await orca.notifyRunResult(outcome, failedSummary);
+      retainGate = shouldRetainGate;
       await clearOutcomeDeliveryPending().catch((markerError) =>
         console.error(
           `warning: could not clear the delivered ${outcome} outcome: ${String(markerError)}`,
