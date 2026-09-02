@@ -193,6 +193,7 @@ export class RailTuiRenderer implements PresentationRenderer {
   readonly #inputWasRaw: boolean;
   readonly #output: Output;
   readonly #requestCancel: () => void;
+  readonly #requestResume?: () => void;
   readonly #resolveGate?: GateResolver;
   readonly #setAutoFix?: (enabled: boolean) => Promise<void> | void;
   readonly #stageLogs: ReadonlyMap<string, StageLog>;
@@ -213,6 +214,7 @@ export class RailTuiRenderer implements PresentationRenderer {
   #modeSubmitting = false;
   #pinnedStage?: StageName;
   #refreshTimer?: ReturnType<typeof setInterval>;
+  #resumeVisible = false;
   #selectedStage = 0;
   #snapshot?: PresentationSnapshot;
 
@@ -241,6 +243,7 @@ export class RailTuiRenderer implements PresentationRenderer {
     resolveGate?: GateResolver,
     requestCancel: () => void = () => process.kill(process.pid, "SIGINT"),
     setAutoFix?: (enabled: boolean) => Promise<void> | void,
+    requestResume?: () => void,
   ) {
     this.#input = input;
     this.#output = output;
@@ -248,6 +251,7 @@ export class RailTuiRenderer implements PresentationRenderer {
     this.#stageLogs = stageLogs;
     this.#resolveGate = resolveGate;
     this.#requestCancel = requestCancel;
+    this.#requestResume = requestResume;
     this.#setAutoFix = setAutoFix;
     this.#inputWasPaused = input.isPaused();
     this.#inputWasRaw = input.isRaw === true;
@@ -299,6 +303,13 @@ export class RailTuiRenderer implements PresentationRenderer {
         (snapshot.gate?.state !== "open" ||
           snapshot.gate.id !== this.#snapshot?.gate?.id);
       this.#snapshot = snapshot;
+      if (snapshot.error) this.#cancelVisible = false;
+      if (snapshot.transition.kind === "attempt-started") {
+        this.#resumeVisible = false;
+        this.#returnToRail();
+      } else if (snapshot.transition.kind === "error-recorded") {
+        this.#resumeVisible = Boolean(snapshot.error?.resumable);
+      }
       if (opensGate) this.#showGate();
       this.#activities.push({
         label: activity(snapshot.transition),
@@ -435,6 +446,18 @@ export class RailTuiRenderer implements PresentationRenderer {
         this.#footer(columns),
       ];
     }
+    if (this.#snapshot?.error) {
+      const detail = this.#errorPanel(bodyRows, columns - railWidth - 3);
+      return [
+        this.#header(columns),
+        fit("=".repeat(columns), columns),
+        ...Array.from(
+          { length: bodyRows },
+          (_, index) => `${rail[index]} | ${detail[index]}`,
+        ),
+        this.#footer(columns),
+      ];
+    }
     const activityWidth = 31;
     const logWidth = columns - railWidth - activityWidth - 6;
     const recent = this.#recent(bodyRows, activityWidth);
@@ -459,6 +482,8 @@ export class RailTuiRenderer implements PresentationRenderer {
       ? this.#cancelPanel(bodyRows, detailWidth)
       : this.#gateVisible
         ? this.#gatePanel(bodyRows, detailWidth)
+        : this.#snapshot?.error
+          ? this.#errorPanel(bodyRows, detailWidth)
         : this.#focus === "activity"
           ? this.#recent(bodyRows, detailWidth)
           : this.#logs(bodyRows, detailWidth);
@@ -561,6 +586,35 @@ export class RailTuiRenderer implements PresentationRenderer {
     return Array.from({ length: rows }, (_, index) => fit(lines[index] ?? "", width));
   }
 
+  #errorPanel(rows: number, width: number): string[] {
+    const resumable = this.#snapshot?.error?.resumable === true;
+    const stage = this.#snapshot?.currentStage;
+    const lines = [
+      fit(`> RUN ERROR${resumable ? " (RESUMABLE)" : ""}`, width),
+      fit(
+        `${stage ? `${title(stage)} | ` : ""}attempt ${this.#snapshot?.attempt ?? 0} settled`,
+        width,
+      ),
+      "",
+      ...wrap(
+        resumable
+          ? "The failed attempt is settled and cleaned. Resume reconstructs the next attempt from its durable checkpoint."
+          : "This error is not safe to resume in the current process.",
+        width,
+      ),
+      "",
+      fit(
+        resumable && this.#requestResume
+          ? this.#resumeVisible
+            ? "Press R to resume, or C to leave the run stopped."
+            : "Resume requested. Waiting for the next attempt."
+          : "Press C to leave the run stopped.",
+        width,
+      ),
+    ];
+    return Array.from({ length: rows }, (_, index) => fit(lines[index] ?? "", width));
+  }
+
   #recent(rows: number, width: number): string[] {
     const lines = [this.#regionTitle("RECENT ACTIVITY", "activity", width)];
     const room = Math.max(0, rows - 1);
@@ -630,6 +684,17 @@ export class RailTuiRenderer implements PresentationRenderer {
         width,
       );
     }
+    if (this.#snapshot?.error) {
+      const keys = [
+        this.#snapshot.error.resumable &&
+        this.#requestResume &&
+        this.#resumeVisible
+          ? "R Resume"
+          : "",
+        "C Leave stopped",
+      ].filter(Boolean);
+      return fit(keys.join(" | "), width);
+    }
     const keys = ["Tab/Shift-Tab region"];
     if (this.#focus === "logs") keys.push("Up/Down scroll");
     else keys.push("Up/Down move", "Enter open");
@@ -658,7 +723,7 @@ export class RailTuiRenderer implements PresentationRenderer {
     const keys =
       complete.match(
         new RegExp(
-          "\\x03|\\x1b\\[Z|\\x1b\\[[ABCD]|\\r|\\n|\\t|\\x1b|[aAcCgG]",
+          "\\x03|\\x1b\\[Z|\\x1b\\[[ABCD]|\\r|\\n|\\t|\\x1b|[aAcCgGrR]",
           "g",
         ),
       ) ?? [];
@@ -672,10 +737,21 @@ export class RailTuiRenderer implements PresentationRenderer {
           this.#cancelRun();
           return;
         }
+      } else if ((key === "c" || key === "C") && this.#snapshot?.error) {
+        this.#cancelRun();
+        return;
       } else if (key === "c" || key === "C") {
         this.#cancelVisible = true;
       } else if (key === "a" || key === "A") {
         this.#toggleAutoFix();
+      } else if (
+        (key === "r" || key === "R") &&
+        this.#resumeVisible &&
+        this.#requestResume
+      ) {
+        this.#resumeVisible = false;
+        this.#activities.push({ label: "Resume requested" });
+        this.#requestResume();
       } else if (this.#gateVisible) {
         if (key === "\u001b" && !this.#gateSubmitting) {
           this.#leaveGate();
@@ -803,10 +879,13 @@ export function createRailTuiRenderer(
   resolveGate?: GateResolver,
   requestCancel?: () => void,
   setAutoFix?: (enabled: boolean) => Promise<void> | void,
+  requestResume?: () => void,
+  onResumeAvailable?: () => void,
 ): RailTuiRenderer | undefined {
   if (!supportsRailTui(input, output)) return undefined;
+  let renderer: RailTuiRenderer | undefined;
   try {
-    return new RailTuiRenderer(
+    renderer = new RailTuiRenderer(
       input,
       output,
       artifactsDir,
@@ -814,8 +893,12 @@ export function createRailTuiRenderer(
       resolveGate,
       requestCancel,
       setAutoFix,
+      requestResume,
     );
+    onResumeAvailable?.();
+    return renderer;
   } catch {
+    renderer?.close();
     return undefined;
   }
 }
@@ -828,6 +911,8 @@ export function createRunRenderer(
   resolveGate?: GateResolver,
   requestCancel?: () => void,
   setAutoFix?: (enabled: boolean) => Promise<void> | void,
+  requestResume?: () => void,
+  onResumeAvailable?: () => void,
 ): PresentationRenderer & { close?: () => void } {
   return (
     createRailTuiRenderer(
@@ -838,6 +923,8 @@ export function createRunRenderer(
       resolveGate,
       requestCancel,
       setAutoFix,
+      requestResume,
+      onResumeAvailable,
     ) ?? new PlainStatusRenderer(output)
   );
 }

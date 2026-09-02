@@ -88,6 +88,12 @@ class RejectingSettlementLedger extends DomainLedger {
   ): boolean {
     return false;
   }
+
+  override settleRunWithAttemptOutcome(
+    ..._args: Parameters<DomainLedger["settleRunWithAttemptOutcome"]>
+  ): boolean {
+    return false;
+  }
 }
 
 test("rejected settlements retain startup and pipeline recovery custody", async () => {

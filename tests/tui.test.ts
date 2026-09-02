@@ -211,6 +211,38 @@ if (process.env.TUI_FIXTURE === "1") {
     assert.equal(output.writes.at(-1), "\u001b[?25h\u001b[?1049l");
   });
 
+  test("Resume availability errors close the Rail renderer before fallback", () => {
+    const input = new FakeInput();
+    const output = new FakeOutput();
+    const exitListeners = process.listenerCount("exit");
+    const renderer = createRunRenderer(
+      input,
+      output,
+      "/unused",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      () => {},
+      () => {
+        throw new Error("availability failed");
+      },
+    );
+
+    assert.equal(input.isRaw, false);
+    assert.equal(input.isPaused(), true);
+    assert.equal(input.listenerCount("data"), 0);
+    assert.equal(output.listenerCount("error"), 1);
+    assert.equal(output.listenerCount("resize"), 0);
+    assert.equal(process.listenerCount("exit"), exitListeners);
+    assert.ok(output.writes.includes("\u001b[?25h\u001b[?1049l"));
+    renderer.render(snapshot("review", 1));
+    assert.equal(
+      output.writes.at(-1),
+      "no-mistakes run-tui-test stage 3/6 review started\n",
+    );
+  });
+
   test("unchanged refreshes do not repaint the terminal", () => {
     const input = new FakeInput();
     const output = new FakeOutput();
@@ -276,6 +308,97 @@ if (process.env.TUI_FIXTURE === "1") {
     await new Promise((resolve) => setImmediate(resolve));
     assert.deepEqual(toggles, [false]);
     assert.deepEqual(resolutions, []);
+    renderer.close();
+  });
+
+  test("Resume is shown only for resumable errors and returns to the pipeline", () => {
+    const input = new FakeInput();
+    const output = new FakeOutput();
+    let requested = 0;
+    let available = 0;
+    let cancellations = 0;
+    const renderer = createRailTuiRenderer(
+      input,
+      output,
+      "/unused",
+      new Map(),
+      undefined,
+      () => {
+        cancellations += 1;
+      },
+      undefined,
+      () => {
+        requested += 1;
+      },
+      () => {
+        available += 1;
+      },
+    );
+    assert.ok(renderer);
+    renderer.render(snapshot("review", 1));
+    input.emit("data", "\r");
+    assert.match(cleanScreen(output.writes.at(-1) ?? ""), /pinned Review/u);
+    input.emit("data", "C");
+    assert.match(cleanScreen(output.writes.at(-1) ?? ""), /CANCEL RUN\?/u);
+    const resumable = snapshot("test", 2);
+    renderer.render({
+      ...resumable,
+      currentStage: "test",
+      error: { resumable: true },
+      status: "failed",
+      transition: { kind: "error-recorded", resumable: true },
+    });
+    const screen = (): string => cleanScreen(output.writes.at(-1) ?? "");
+    assert.equal(available, 1);
+    assert.match(screen(), /RUN ERROR \(RESUMABLE\)/u);
+    assert.doesNotMatch(screen(), /CANCEL RUN\?/u);
+    assert.match(screen(), /R Resume/u);
+    input.emit("data", "R");
+    assert.equal(requested, 1);
+    assert.match(screen(), /Resume requested\. Waiting for the next attempt\./u);
+    assert.doesNotMatch(screen(), /R Resume/u);
+
+    renderer.render({
+      ...resumable,
+      currentStage: "test",
+      error: { resumable: true },
+      status: "failed",
+      transition: { kind: "run-completed", status: "failed" },
+    });
+    assert.match(screen(), /Resume requested\. Waiting for the next attempt\./u);
+    assert.doesNotMatch(screen(), /R Resume/u);
+    input.emit("data", "R");
+    assert.equal(requested, 1);
+
+    renderer.render({
+      ...resumable,
+      attempt: 3,
+      currentStage: "test",
+      error: undefined,
+      status: "in-progress",
+      transition: { attempt: 3, kind: "attempt-started" },
+    });
+    assert.match(screen(), /RECENT ACTIVITY/u);
+    assert.match(screen(), /Test LOG/u);
+    assert.doesNotMatch(screen(), /pinned Review/u);
+    assert.match(screen(), /> RAIL/u);
+    assert.match(screen(), /> \[>\] 4\. Test/u);
+    input.emit("data", "R");
+    assert.equal(requested, 1);
+
+    renderer.render({
+      ...resumable,
+      currentStage: "test",
+      error: { resumable: false },
+      status: "failed",
+      transition: { kind: "error-recorded", resumable: false },
+    });
+    assert.doesNotMatch(screen(), /R Resume/u);
+    input.emit("data", "R");
+    assert.equal(requested, 1);
+    input.emit("data", "C");
+    assert.equal(cancellations, 1);
+    assert.doesNotMatch(screen(), /CANCEL RUN\?/u);
     renderer.close();
   });
 
