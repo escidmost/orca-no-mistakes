@@ -295,6 +295,7 @@ export interface GitOperations {
   diffBase(base: string, headOid: string): Promise<string>;
   rebase(base: string, onOutput?: CommandOutput): Promise<StageReport>;
   resolveRefSha(ref: string): Promise<string | undefined>;
+  isAncestor?(ancestor: string, descendant: string): Promise<boolean>;
   showFile(ref: string, filePath: string): Promise<string | undefined>;
   pathExists(ref: string, filePath: string): Promise<boolean>;
   policySha256(base: string): Promise<string>;
@@ -5524,8 +5525,8 @@ export class CliOrca implements OrcaOperations {
 
   #workerName(name: string): string {
     const runSuffix = this.#runId
-      ?.replace(/[^A-Za-z0-9]+/g, "-")
-      .slice(-12);
+      ? createHash("sha256").update(this.#runId).digest("hex").slice(0, 12)
+      : undefined;
     return runSuffix ? `${name}-${runSuffix}` : name;
   }
 
@@ -9579,6 +9580,14 @@ export class GitShell implements GitOperations {
     return result.failed ? undefined : result.stdout.trim() || undefined;
   }
 
+  async isAncestor(ancestor: string, descendant: string): Promise<boolean> {
+    const result = await this.#git(
+      ["merge-base", "--is-ancestor", ancestor, descendant],
+      true,
+    );
+    return !result.failed;
+  }
+
   async showFile(ref: string, filePath: string): Promise<string | undefined> {
     const result = await this.#git(["show", `${ref}:${filePath}`], true);
     return result.failed ? undefined : result.stdout;
@@ -11106,10 +11115,10 @@ async function deliverPendingOutcome(
   gateExists = true,
 ): Promise<boolean> {
   const outcome = marker.pendingOutcome;
+  const domainRunId = marker.domainRunId ?? runId;
+  const run =
+    domainRunId && ledger ? ledger.runIdentity(domainRunId) : undefined;
   if (outcome === undefined) {
-    const domainRunId = marker.domainRunId ?? runId;
-    const run =
-      domainRunId && ledger ? ledger.runIdentity(domainRunId) : undefined;
     if (
       gateExists &&
       run &&
@@ -11133,6 +11142,19 @@ async function deliverPendingOutcome(
     );
     return false;
   }
+  if (run !== undefined && run.status !== outcome) {
+    delete marker.pendingOutcome;
+    delete marker.pendingSummary;
+    try {
+      await writeMarker(markerFile, marker);
+    } catch (error) {
+      console.error(
+        `no-mistakes: retained gate marker ${markerFile}; could not clear uncommitted pending outcome: ${String(error)}`,
+      );
+      return false;
+    }
+    return true;
+  }
   let summary = marker.pendingSummary;
   if (outcome === "passed") {
     const hasCustodyStatus =
@@ -11142,14 +11164,11 @@ async function deliverPendingOutcome(
       summary.includes("custody transfer failed") ||
       summary.includes("operator checkout diverged");
     if (!hasCustodyStatus) {
-      const domainRunId = marker.domainRunId ?? runId;
-      const run =
-        domainRunId && ledger ? ledger.runIdentity(domainRunId) : undefined;
-      if (run && run.status === "passed") {
+      if (run && domainRunId && run.status === "passed") {
         const fullRun =
-          domainRunId && ledger ? ledger.run(domainRunId) : undefined;
+          ledger ? ledger.run(domainRunId) : undefined;
         const attestation =
-          domainRunId && ledger ? ledger.findAttestation(domainRunId) : undefined;
+          ledger ? ledger.findAttestation(domainRunId) : undefined;
         const terminalCommitOid =
           attestation?.candidateCommitOid ??
           summary.match(/Candidate commit: ([0-9a-f]{40,64})/)?.[1];
@@ -11166,6 +11185,12 @@ async function deliverPendingOutcome(
               branchSha === fullRun.submission_commit_oid
                 ? `branch ${branch} already at submission commit ${fullRun.submission_commit_oid}`
                 : `advanced branch ${branch} from submission to terminal commit ${terminalCommitOid}`;
+          } else if (
+            terminalCommitOid &&
+            branchSha &&
+            (await gitShell.isAncestor(terminalCommitOid, branchSha))
+          ) {
+            custodyNote = `branch ${branch} carries the terminal commit ${terminalCommitOid}`;
           } else {
             custodyNote =
               "operator checkout diverged or carries uncommitted changes; " +
