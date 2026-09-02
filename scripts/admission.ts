@@ -237,7 +237,11 @@ export async function initializeLocalGate(
     } catch {
       // Malformed metadata is repaired by re-initialization.
     }
-    if (recordedRoot && path.resolve(recordedRoot) !== path.resolve(paths.repoRoot)) {
+    if (
+      recordedRoot &&
+      path.resolve(recordedRoot) !== path.resolve(paths.repoRoot) &&
+      existsSync(recordedRoot)
+    ) {
       throw new Error(
         `the local gate is routed to ${recordedRoot}; initialize it from that worktree to keep one repository-wide route`
       )
@@ -297,7 +301,7 @@ export async function initializeLocalGate(
     const metadata: GateMetadata = {
       ...paths,
       defaultBranch: detectDefaultBranch(paths.repoRoot),
-      gateIdentity: sha256(canonicalJson({ gatePath: paths.gatePath, repoRoot: paths.repoRoot })),
+      gateIdentity: deriveFallbackGateIdentity(paths),
       hookVersion: 1,
       remoteName: GATE_REMOTE_NAME,
       version: 1
@@ -342,9 +346,7 @@ export async function readGateMetadata(gatePath: string): Promise<GateMetadata> 
     throw new Error('local gate metadata is invalid')
   }
   const paths = repositoryGatePaths(parsed.repoRoot)
-  const expectedIdentity = sha256(
-    canonicalJson({ gatePath: paths.gatePath, repoRoot: paths.repoRoot })
-  )
+  const expectedIdentity = deriveFallbackGateIdentity(paths)
   const configuredRemote = tryGitSync(['-C', paths.repoRoot, 'remote', 'get-url', GATE_REMOTE_NAME])
   const configuredPushUrls = tryGitSync([
     '-C',
@@ -521,14 +523,17 @@ export async function releaseAdmissionLaunch(lockPath: string): Promise<void> {
 export type AdmissionLaunchSpawn = (nonce: string) => Promise<void>
 
 async function reclaimIfAbandoned(
-  lockPath: string
+  lockPath: string,
+  getLauncherPid?: () => number | null | undefined
 ): Promise<boolean> {
   const claim = await readAdmissionLaunchClaim(lockPath)
   if (claim.nonce === undefined) return false
   const ownerAlive = claim.ownerPid !== undefined && isProcessAlive(claim.ownerPid)
   const coordinatorAlive =
     claim.coordinatorPid !== undefined && isProcessAlive(claim.coordinatorPid)
-  if (!ownerAlive && !coordinatorAlive) {
+  const launcherPid = getLauncherPid?.()
+  const launcherAlive = launcherPid != null && isProcessAlive(launcherPid)
+  if (!ownerAlive && !coordinatorAlive && !launcherAlive) {
     await releaseAdmissionLaunch(lockPath)
     return true
   }
@@ -538,7 +543,8 @@ async function reclaimIfAbandoned(
 export async function awaitAdmissionLaunch(
   readinessPath: string,
   spawnCoordinator: AdmissionLaunchSpawn,
-  startupTimeoutMs = 30_000
+  startupTimeoutMs = 30_000,
+  getLauncherPid?: () => number | null | undefined
 ): Promise<{ readiness: LaunchReadiness; releaseLaunch?: () => Promise<void> }> {
   const lockPath = launchLockPath(readinessPath)
   for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -561,13 +567,13 @@ export async function awaitAdmissionLaunch(
       await waitForLaunchReadiness(readinessPath, startupTimeoutMs)
       throw new Error('legacy coordinator readiness is not authenticated')
     }
-    if (await reclaimIfAbandoned(lockPath)) continue
+    if (await reclaimIfAbandoned(lockPath, getLauncherPid)) continue
     try {
       return {
         readiness: await waitForLaunchReadiness(readinessPath, startupTimeoutMs, existing.nonce)
       }
     } catch (error) {
-      if (await reclaimIfAbandoned(lockPath)) continue
+      if (await reclaimIfAbandoned(lockPath, getLauncherPid)) continue
       throw error
     }
   }
