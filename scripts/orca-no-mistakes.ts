@@ -616,6 +616,7 @@ type GateRunMarker = {
   launcherPid?: number;
   notifyHandle?: string;
   originWorktree: string;
+  outcomeDelivered?: boolean;
   pendingOutcome?: "passed" | "failed" | "cancelled";
   pendingSummary?: string;
   pid?: number;
@@ -724,6 +725,7 @@ type AbortReapState = {
   orcaCommand?: string;
   orchestrationRunId?: string;
   originWorktree?: string;
+  outcomeDelivered?: boolean;
   pendingOutcome?: "passed" | "failed" | "cancelled";
   pendingSummary?: string;
   pid?: number;
@@ -1169,6 +1171,8 @@ async function refreshGateMarker(): Promise<void> {
     marker.pendingOutcome = abortReap.pendingOutcome;
   if (abortReap.pendingSummary !== undefined)
     marker.pendingSummary = abortReap.pendingSummary;
+  if (abortReap.outcomeDelivered === true)
+    marker.outcomeDelivered = true;
   Object.assign(marker, abortWorkerMarkerState());
   await writeMarker(markerPath, marker);
 }
@@ -1220,6 +1224,7 @@ async function markOutcomeDeliveryPending(
 async function clearOutcomeDeliveryPending(): Promise<void> {
   delete abortReap.pendingOutcome;
   delete abortReap.pendingSummary;
+  abortReap.outcomeDelivered = true;
   await refreshGateMarker();
 }
 
@@ -3119,6 +3124,11 @@ export async function runPipeline(
         runId,
       });
       verifyManifest(attestation, PIPELINE_STEPS);
+      const passedSummary = [
+        `Run ${runId} passed all ${PIPELINE_STEPS.length} stages.`,
+        `Candidate commit: ${terminalCommitOid}.`,
+      ].join("\n");
+      await markOutcomeDeliveryPending("passed", passedSummary);
       const eventKey = "run:completed:passed";
       const custodyNote = await presentation.publishAsync(
         { kind: "run-completed", status: "passed" },
@@ -3286,6 +3296,11 @@ export async function runPipeline(
                 },
               );
             };
+          const recoverRef = (failure as CustodyTaggedError).recoverRef;
+          const failureSummary = recoverRef
+            ? `No-mistakes ${outcome}: ${reason}\n${recoveryInstructions(recoverRef)}`
+            : `No-mistakes ${outcome}: ${reason}`;
+          await markOutcomeDeliveryPending(outcome, failureSummary);
           if (outcome === "cancelled") {
             const eventKey =
               `attempt:${presentation.current.attempt}:cancellation:gate-stop`;
@@ -6814,7 +6829,7 @@ export class CliOrca implements OrcaOperations {
             "--repo",
             `path:${repoRoot}`,
             "--name",
-            launch.name,
+            this.#workerName(launch.name),
             "--base-branch",
             branch,
             "--parent-worktree",
@@ -11066,9 +11081,27 @@ async function deliverPendingOutcome(
   runId: string | undefined,
   orcaCommand: string,
   repoRoot: string,
+  ledger?: DomainLedger,
+  gateExists = true,
 ): Promise<boolean> {
   const outcome = marker.pendingOutcome;
-  if (outcome === undefined) return true;
+  if (outcome === undefined) {
+    const domainRunId = marker.domainRunId ?? runId;
+    const run =
+      domainRunId && ledger ? ledger.runIdentity(domainRunId) : undefined;
+    if (
+      gateExists &&
+      run &&
+      run.status === "passed" &&
+      marker.outcomeDelivered !== true
+    ) {
+      console.error(
+        `no-mistakes: retained gate marker ${markerFile}; its delivery state is unknown for settled run ${domainRunId}`,
+      );
+      return false;
+    }
+    return true;
+  }
   if (
     (outcome !== "passed" && outcome !== "failed" && outcome !== "cancelled") ||
     typeof marker.pendingSummary !== "string" ||
@@ -11101,6 +11134,7 @@ async function deliverPendingOutcome(
   }
   delete marker.pendingOutcome;
   delete marker.pendingSummary;
+  marker.outcomeDelivered = true;
   try {
     await writeMarker(markerFile, marker);
   } catch (error) {
@@ -11196,6 +11230,7 @@ async function reapConfiguredGate(
       gate.runId,
       orcaCommand,
       repoRoot,
+      ledger,
     ))
   ) {
     return false;
@@ -12686,6 +12721,8 @@ async function reapStrandedGates(
               orchestrationRunId,
               orcaCommand,
               repoRoot,
+              ledger,
+              false,
             ))
           ) {
             retained += 1;
@@ -12874,6 +12911,7 @@ async function reapStrandedGates(
             orchestrationRunId,
             orcaCommand,
             repoRoot,
+            ledger,
           ))
         ) {
           retained += 1;
