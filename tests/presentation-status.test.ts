@@ -250,32 +250,41 @@ test("a failed renderer is replaced by the fallback and later status keeps rende
 });
 
 test("plain status degrades hostile identifiers to one bounded ASCII line", () => {
+  const previousSecret = process.env.ONM_TEST_SECRET;
+  process.env.ONM_TEST_SECRET = "secret-value";
   const lines: string[] = [];
   const renderer = new PlainStatusRenderer({ write: (line) => lines.push(line) });
-  renderer.render({
-    attempt: 1,
-    currentStage: "review",
-    mode: { autoFix: false },
-    runId: `run\n\u001b[31mwide-\u4e2d-combining-e\u0301-${"x".repeat(500)}`,
-    sequence: 1,
-    stages: [],
-    status: "in-progress",
-    transition: {
-      decision: `approve\r\n\u001b[2J\u4e2d${"y".repeat(500)}`,
-      gateId: "gate-review",
-      kind: "gate-resolved",
-      round: 1,
-      stage: "review",
-    },
-    updatedAt: new Date(0).toISOString(),
-    version: 1,
-  });
+  try {
+    renderer.render({
+      attempt: 1,
+      currentStage: "review",
+      mode: { autoFix: false },
+      runId: `run\nsec\u001b[31mret-value\u001b[0mwide-\u4e2d-combining-e\u0301-${"x".repeat(500)}`,
+      sequence: 1,
+      stages: [],
+      status: "in-progress",
+      transition: {
+        decision: `approve\r\n\u001b[2J\u4e2d${"y".repeat(500)}`,
+        gateId: "gate-review",
+        kind: "gate-resolved",
+        round: 1,
+        stage: "review",
+      },
+      updatedAt: new Date(0).toISOString(),
+      version: 1,
+    });
+  } finally {
+    if (previousSecret === undefined) delete process.env.ONM_TEST_SECRET;
+    else process.env.ONM_TEST_SECRET = previousSecret;
+  }
 
   assert.equal(lines.length, 1);
   assert.equal(lines[0].split("\n").length, 2);
   assert.equal(lines[0].includes("\u001b"), false);
   assert.equal(lines[0].includes("\u4e2d"), false);
   assert.equal(lines[0].includes("\u0301"), false);
+  assert.equal(lines[0].includes("secret-value"), false);
+  assert.match(lines[0], /\[REDACTED\]/u);
   assert.match(lines[0], /^[\x20-\x7e]+\n$/u);
   assert.ok(lines[0].length < 300);
   assert.doesNotMatch(lines[0], new RegExp("x{120}|y{120}", "u"));

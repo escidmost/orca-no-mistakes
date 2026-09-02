@@ -362,7 +362,7 @@ if (process.env.TUI_FIXTURE === "1") {
     const output = new FakeOutput();
     const renderer = new RailTuiRenderer(input, output, "/unused");
     const base = snapshot("review", 1);
-    const hostile = "\u001b[31msecret-value\u001b[0m\nwide-\u4e2d-combining-e\u0301-";
+    const hostile = "sec\u001b[31mret-value\u001b[0m\nwide-\u4e2d-combining-e\u0301-";
     try {
       renderer.render({
         ...base,

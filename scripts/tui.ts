@@ -57,7 +57,9 @@ function title(stage: StageName): string {
 }
 
 function safeText(text: string, maxLength = Number.POSITIVE_INFINITY): string {
-  const stripped = stripVTControlCharacters(redactKnownSecrets(text));
+  const stripped = redactKnownSecrets(
+    stripVTControlCharacters(redactKnownSecrets(text)),
+  );
   let result = "";
   for (const character of stripped) {
     if (result.length >= maxLength) break;

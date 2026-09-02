@@ -1,6 +1,7 @@
 import { stripVTControlCharacters } from "node:util";
 
 import { PIPELINE_STEPS, type StageName } from "./config.ts";
+import { redactKnownSecrets } from "./ledger.ts";
 
 export type PresentationStatus =
   | "in-progress"
@@ -457,7 +458,9 @@ export class PresentationPublisher {
 }
 
 function safeToken(value: string): string {
-  return stripVTControlCharacters(value)
+  return redactKnownSecrets(
+    stripVTControlCharacters(redactKnownSecrets(value)),
+  )
     .replaceAll(/[^\x20-\x7e]/gu, " ")
     .replaceAll(/\s+/gu, " ")
     .trim()
