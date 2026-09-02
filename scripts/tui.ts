@@ -514,7 +514,7 @@ export class RailTuiRenderer implements PresentationRenderer {
   }
 
   #full(columns: number, rows: number): string[] {
-    const railWidth = 34;
+    const railWidth = 36;
     const bodyRows = rows - 3;
     const rail = this.#rail(bodyRows, railWidth);
     if (this.#cancelVisible || this.#gateVisible) {
@@ -559,7 +559,7 @@ export class RailTuiRenderer implements PresentationRenderer {
   }
 
   #compact(columns: number, rows: number): string[] {
-    const railWidth = 34;
+    const railWidth = 36;
     const detailWidth = columns - railWidth - 3;
     const bodyRows = rows - 3;
     const rail = this.#rail(bodyRows, railWidth);
