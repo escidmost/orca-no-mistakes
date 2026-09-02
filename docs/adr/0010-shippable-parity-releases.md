@@ -31,6 +31,8 @@ The local v1.3 evidence manifest emitted at the end of Release 1, historically c
 
 A focused, non-default publication API (`scripts/publication.ts`) pulled forward item 2's exact-head `--force-with-lease` publication primitive: it admits a custom plan whose final stage is `push` and enforces mandatory stable repository identity, transport-rewrite fencing, retained-evidence verification, authoritative post-read reconciliation, and durable receipts. It runs outside the default coordinator DAG, so the default six-stage plan remains local-only. Release 2 still owns automatic publication orchestration and pull-request creation.
 
+The repository-local admission gate is also pulled forward from item 2 into Release 1. This moves only admission; Release 2 still owns automatic candidate publication orchestration and pull-request creation.
+
 ## Consequences
 
 Before a release is marked complete, an automated end-to-end scenario must exercise its claimed Git, Orca, gate, failure, and recovery behavior. For what is implemented today, see [`docs/current-architecture.md`](../current-architecture.md).
