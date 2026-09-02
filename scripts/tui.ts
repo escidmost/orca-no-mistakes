@@ -795,19 +795,18 @@ export class RailTuiRenderer implements PresentationRenderer {
       this.#escapeTimer = undefined;
     }
     this.#inputBuffer += input;
-    const incomplete = this.#inputBuffer.endsWith("\u001b[")
-      ? 2
-      : this.#inputBuffer.endsWith("\u001b")
-        ? 1
-        : 0;
+    const incomplete =
+      this.#inputBuffer.match(
+        new RegExp("\\x1b(?:\\[[0-?]*[ -/]*)?$", "u"),
+      )?.[0] ?? "";
     const complete = incomplete
-      ? this.#inputBuffer.slice(0, -incomplete)
+      ? this.#inputBuffer.slice(0, -incomplete.length)
       : this.#inputBuffer;
-    this.#inputBuffer = incomplete ? this.#inputBuffer.slice(-incomplete) : "";
+    this.#inputBuffer = incomplete;
     const keys =
       complete.match(
         new RegExp(
-          "\\x03|\\x1a|\\x1b\\[Z|\\x1b\\[[ABCD]|\\r|\\n|\\t|\\x1b|[aAcCgGrR]",
+          "\\x1b\\[[0-?]*[ -/]*[@-~]|\\x03|\\x1a|\\r|\\n|\\t|\\x1b|[aAcCgGrR]",
           "g",
         ),
       ) ?? [];

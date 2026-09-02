@@ -530,6 +530,21 @@ if (process.env.TUI_FIXTURE === "1") {
     renderer.close();
   });
 
+  test("terminal control replies do not trigger keyboard actions", async () => {
+    const input = new FakeInput();
+    const output = new FakeOutput();
+    const renderer = new RailTuiRenderer(input, output, "/unused");
+
+    renderer.render(snapshot("review", 1));
+    input.emit("data", "\u001b[?1;2c");
+    input.emit("data", "\u001b[?1;");
+    input.emit("data", "2c");
+    await nextDraw();
+
+    assert.doesNotMatch(cleanScreen(output.writes.at(-1) ?? ""), /CANCEL RUN\?/u);
+    renderer.close();
+  });
+
   test("C confirms Cancel without hiding the run and Ctrl-C cancels immediately", async () => {
     const input = new FakeInput();
     const output = new FakeOutput();
