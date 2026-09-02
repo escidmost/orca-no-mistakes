@@ -3243,7 +3243,7 @@ ${deliveryInstruction(deliveryChannel(launch.agent), launch.reportPath ?? "", sh
 // Iterates an ordered fallback chain. Only PreflightError (launch/readiness/
 // dispatch failures before a candidate accepts the task) advances to the next
 // candidate; execution-phase errors propagate immediately. An invalid or
-// unreadable report gets one fresh task with an explicit contract reminder
+// unreadable report gets up to two fresh tasks with an explicit contract reminder
 // before it propagates.
 // Each candidate gets its own child task so the injected spec always carries
 // that candidate's delivery instructions.
