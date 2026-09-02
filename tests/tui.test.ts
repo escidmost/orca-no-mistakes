@@ -300,6 +300,9 @@ if (process.env.TUI_FIXTURE === "1") {
       },
     );
     assert.ok(renderer);
+    renderer.render(snapshot("review", 1));
+    input.emit("data", "\r");
+    assert.match(cleanScreen(output.writes.at(-1) ?? ""), /pinned Review/u);
     const resumable = snapshot("test", 2);
     renderer.render({
       ...resumable,
@@ -325,6 +328,7 @@ if (process.env.TUI_FIXTURE === "1") {
     });
     assert.match(screen(), /RECENT ACTIVITY/u);
     assert.match(screen(), /Test LOG/u);
+    assert.doesNotMatch(screen(), /pinned Review/u);
     input.emit("data", "R");
     assert.equal(requested, 1);
 

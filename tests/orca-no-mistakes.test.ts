@@ -915,7 +915,7 @@ test("a failed run resumes from its last checkpoint without repeating completed 
   });
 });
 
-test("same-process Resume retries repeated failures with one run and one attempt per failure", async () => {
+test("same-process Resume retries repeated failures with one run and one attempt per failure", { timeout: 30_000 }, async () => {
   const git = new FakeGit();
   git.policyDigest = "f".repeat(64);
   const deliveryGit = new FakeGit("/origin", "feature");
@@ -937,6 +937,9 @@ test("same-process Resume retries repeated failures with one run and one attempt
   }
   const orca = new RepeatedFailureOrca(git, runId);
   const ledger = new DomainLedger(":memory:");
+  let explicitSecondResume = false;
+  let resumedBeforeSecondRequest = false;
+  let resumableErrors = 0;
   const rendererFactory = (
     _artifactsDir: string,
     _stageLogs: ReadonlyMap<string, StageLog>,
@@ -947,9 +950,27 @@ test("same-process Resume retries repeated failures with one run and one attempt
   ) => {
     onResumeAvailable?.();
     return {
-      render(snapshot: { error?: { resumable: boolean }; transition: { kind: string } }) {
-        if (snapshot.transition.kind === "error-recorded" && snapshot.error?.resumable) {
+      render(snapshot: {
+        attempt?: number;
+        error?: { resumable: boolean };
+        transition: { kind: string };
+      }) {
+        if (snapshot.transition.kind === "attempt-started" && snapshot.attempt === 2) {
           requestResume?.();
+        }
+        if (snapshot.transition.kind === "attempt-started" && snapshot.attempt === 3) {
+          resumedBeforeSecondRequest = !explicitSecondResume;
+        }
+        if (snapshot.transition.kind === "error-recorded" && snapshot.error?.resumable) {
+          resumableErrors += 1;
+          if (resumableErrors === 1) {
+            requestResume?.();
+          } else {
+            setTimeout(() => {
+              explicitSecondResume = true;
+              requestResume?.();
+            }, 10);
+          }
         }
       },
     };
@@ -968,6 +989,7 @@ test("same-process Resume retries repeated failures with one run and one attempt
     ["review", "test", "test", "test", "document", "lint"],
   );
   assert.equal(ledger.runStatus(runId), "passed");
+  assert.equal(resumedBeforeSecondRequest, false);
   assert.equal(ledger.listAttemptOutcomes(runId).length, 3);
   assert.deepEqual(
     ledger

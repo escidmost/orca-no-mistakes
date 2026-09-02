@@ -412,14 +412,8 @@ test("resumed attempt setup failure after startAttempt records its outcome", asy
   const deliveryGit = new FakeGit("/origin", "feature");
   const runId = `resume-setup-outcome-${randomUUID()}`;
   class ClearResumeClaimFailsLedger extends DomainLedger {
-    #clearResumeClaimCalls = 0;
-
-    override clearResumeClaim(runId: string, claimId: string): void {
-      this.#clearResumeClaimCalls += 1;
-      if (this.#clearResumeClaimCalls > 0) {
-        throw new Error("clearResumeClaim sabotaged");
-      }
-      super.clearResumeClaim(runId, claimId);
+    override clearResumeClaim(): void {
+      throw new Error("clearResumeClaim sabotaged");
     }
   }
   class InterruptedOrca extends FakeOrca {

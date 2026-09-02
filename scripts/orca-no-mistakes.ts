@@ -1792,6 +1792,7 @@ export async function runPipeline(
   let resumeClaimId: string | undefined;
   let resumeCheckpoint: StageCheckpointRow | undefined;
   let resumeControlAvailable = false;
+  let resumeRequestAllowed = false;
   let resumeRequested = false;
   let resumingAttempt = options.resumeRunId !== undefined;
   let attemptId: string | undefined;
@@ -1799,16 +1800,19 @@ export async function runPipeline(
   const actorIdentity = coordinatorIdentity;
   let resumeResolver: (() => void) | undefined;
   const requestResume = (): void => {
+    if (!resumeRequestAllowed) return;
     resumeRequested = true;
     resumeResolver?.();
   };
   const waitForResume = async (): Promise<void> => {
     if (resumeRequested) {
+      resumeRequestAllowed = false;
       resumeRequested = false;
       return;
     }
     await new Promise<void>((resolve) => {
       resumeResolver = () => {
+        resumeRequestAllowed = false;
         resumeRequested = false;
         resumeResolver = undefined;
         resolve();
@@ -1941,6 +1945,8 @@ export async function runPipeline(
       if (!resumingAttempt) {
         presentation.publish("run:started", { kind: "run-started" });
       }
+      resumeRequestAllowed = false;
+      resumeRequested = false;
       const attempt = presentation.nextAttempt();
       presentation.publish(`attempt:${attempt}:started`, {
         attempt,
@@ -2468,6 +2474,7 @@ export async function runPipeline(
           if (
             stage === "intent" ||
             stage === "rebase" ||
+            stageError instanceof GateStopError ||
             stageError instanceof WorkerCleanupError ||
             stageError instanceof PostMutationCustodyError
           ) {
@@ -3000,6 +3007,8 @@ export async function runPipeline(
       steps: PIPELINE_STEPS,
     };
     } catch (error) {
+      resumeRequestAllowed = false;
+      resumeRequested = false;
       let failure: unknown = error;
       if (fixerSession) {
         const failedSession = fixerSession;
@@ -3049,6 +3058,7 @@ export async function runPipeline(
           outcome,
           ledger.listCheckpoints(runId).length,
         );
+        resumeRequestAllowed = resumable && resumeControlAvailable && !anchorError;
         if (!anchorError) {
           const ownership = {
             branch: deliveryRepo.branch,
@@ -3119,7 +3129,7 @@ export async function runPipeline(
         if (anchorError) {
           throw new RecoveryAnchorError(runId, outcome, failure, anchorError);
         }
-        return resumable && resumeControlAvailable;
+        return resumeRequestAllowed;
       });
       if (!retry) throw failure;
 
@@ -3190,6 +3200,8 @@ export async function runPipeline(
             startedAt: new Date().toISOString(),
           });
           resumedAttemptStarted = true;
+          resumeRequestAllowed = false;
+          resumeRequested = false;
           const attempt = presentation.nextAttempt();
           presentation.publish(`attempt:${attempt}:started`, {
             attempt,
