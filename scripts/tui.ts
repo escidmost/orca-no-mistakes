@@ -56,17 +56,20 @@ function title(stage: StageName): string {
   return `${stage[0].toUpperCase()}${stage.slice(1)}`;
 }
 
-function safeText(text: string, maxLength = Number.POSITIVE_INFINITY): string {
-  const stripped = redactKnownSecrets(
-    stripVTControlCharacters(redactKnownSecrets(text)),
-  );
+function printableText(text: string): string {
   let result = "";
-  for (const character of stripped) {
+  for (const character of text) {
     if (character === "\t") result += "  ";
     else if (character === "\r" || character === "\n") result += " ";
     else result += character >= " " && character <= "~" ? character : "?";
   }
-  return redactKnownSecrets(result).slice(0, maxLength);
+  return result;
+}
+
+function safeText(text: string, maxLength = Number.POSITIVE_INFINITY): string {
+  return redactKnownSecrets(
+    printableText(stripVTControlCharacters(redactKnownSecrets(text))),
+  ).slice(0, maxLength);
 }
 
 function fit(text: string, width: number): string {
@@ -93,12 +96,12 @@ function logTail(
     const log = stageLogs.get(filePath);
     if (!log) throw new Error("log is not coordinator-owned");
     const buffer = log.tail(STAGE_LOG_TAIL_BYTES + knownSecretPrefixBytes());
-    const sanitized = stripVTControlCharacters(
-      redactKnownSecrets(buffer.toString("utf8")),
-    )
-      .split("\n")
-      .map((line) => safeText(line))
-      .join("\n");
+    const sanitized = redactKnownSecrets(
+      stripVTControlCharacters(redactKnownSecrets(buffer.toString("utf8")))
+        .split("\n")
+        .map(printableText)
+        .join("\n"),
+    );
     const content = Buffer.from(sanitized)
       .subarray(-STAGE_LOG_TAIL_BYTES)
       .toString("utf8");
