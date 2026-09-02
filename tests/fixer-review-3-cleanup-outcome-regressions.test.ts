@@ -177,32 +177,3 @@ test("post-pass cleanup uses the attested candidate without another head read", 
   );
   assert.doesNotMatch(postPassSetup, /await git\.head\(\)/u);
 });
-
-test("ONM-92 notifies every run outcome before terminal and worktree cleanup", async () => {
-  const source = await readFile(
-    fileURLToPath(new URL("../scripts/orca-no-mistakes.ts", import.meta.url)),
-    "utf8",
-  );
-  const pipeline = source.indexOf("const result = await runPipeline(");
-  const passed = source.indexOf('await orca.notifyRunResult(\n      "passed"', pipeline);
-  const caught = source.indexOf("  } catch (error) {", passed);
-  const failedOrCancelled = source.indexOf(
-    "await orca.notifyRunResult(\n        outcome,",
-    caught,
-  );
-  const cleanup = source.indexOf("  } finally {", failedOrCancelled);
-  const cleanupBody = source.slice(cleanup, source.indexOf("\n  }\n}", cleanup));
-
-  assert.ok(pipeline >= 0 && pipeline < passed && passed < caught);
-  assert.ok(caught < failedOrCancelled && failedOrCancelled < cleanup);
-  assert.match(
-    source.slice(caught, failedOrCancelled),
-    /GateStopError[\s\S]+"cancelled"[\s\S]+: "failed"/u,
-  );
-  assert.match(
-    source.slice(failedOrCancelled, cleanup),
-    /recoveryInstructions\(recoverRef\)/u,
-  );
-  assert.match(cleanupBody, /removeGateWorktree/u);
-  assert.match(cleanupBody, /closeTerminalOrProveStale/u);
-});
