@@ -2795,11 +2795,6 @@ export class DomainLedger {
              WHERE admission_id = ?`
           )
           .run(new Date().toISOString(), launcherPid ?? null, admissionId)
-        if (row.source === 'direct') {
-          this.#db
-            .prepare('DELETE FROM pending_admission_leases WHERE admission_id = ?')
-            .run(admissionId)
-        }
       }
       this.#db.exec('COMMIT')
       return this.submissionAdmission(admissionId)!
