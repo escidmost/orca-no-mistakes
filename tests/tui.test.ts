@@ -317,6 +317,7 @@ if (process.env.TUI_FIXTURE === "1") {
     assert.match(screen(), /R Resume/u);
     input.emit("data", "R");
     assert.equal(requested, 1);
+    assert.match(screen(), /Resume requested\. Waiting for the next attempt\./u);
 
     renderer.render({
       ...resumable,
@@ -329,6 +330,8 @@ if (process.env.TUI_FIXTURE === "1") {
     assert.match(screen(), /RECENT ACTIVITY/u);
     assert.match(screen(), /Test LOG/u);
     assert.doesNotMatch(screen(), /pinned Review/u);
+    assert.match(screen(), /> RAIL/u);
+    assert.match(screen(), /> \[>\] 4\. Test/u);
     input.emit("data", "R");
     assert.equal(requested, 1);
 

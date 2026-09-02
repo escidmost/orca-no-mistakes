@@ -604,7 +604,9 @@ export class RailTuiRenderer implements PresentationRenderer {
       "",
       fit(
         resumable && this.#requestResume
-          ? "Press R to resume, or C to leave the run stopped."
+          ? this.#resumeVisible
+            ? "Press R to resume, or C to leave the run stopped."
+            : "Resume requested. Waiting for the next attempt."
           : "Press C to leave the run stopped.",
         width,
       ),
