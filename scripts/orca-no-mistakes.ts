@@ -1478,6 +1478,10 @@ export async function reapAbortedRun(reason: string): Promise<void> {
       );
       cancelled = run !== undefined;
       if (run) {
+        const summary = recoverRef
+          ? `No-mistakes cancelled: ${reason}\n${recoveryInstructions(recoverRef)}`
+          : `No-mistakes cancelled: ${reason}`;
+        await markOutcomeDeliveryPending("cancelled", summary);
         const eventKey = `attempt:${presentation.current.attempt}:cancellation:cancel`;
         presentation.publish(
           eventKey,
@@ -1526,14 +1530,16 @@ export async function reapAbortedRun(reason: string): Promise<void> {
     const summary = recoverRef
       ? `No-mistakes cancelled: ${reason}\n${recoveryInstructions(recoverRef)}`
       : `No-mistakes cancelled: ${reason}`;
-    try {
-      await markOutcomeDeliveryPending("cancelled", summary);
-    } catch (markerError) {
-      outcomeDelivered = false;
-      abortLog(
-        `warning: could not record the write-ahead cancelled outcome: ${String(markerError)}`,
-      );
-      throw markerError;
+    if (abortReap.pendingOutcome !== "cancelled") {
+      try {
+        await markOutcomeDeliveryPending("cancelled", summary);
+      } catch (markerError) {
+        outcomeDelivered = false;
+        abortLog(
+          `warning: could not record the write-ahead cancelled outcome: ${String(markerError)}`,
+        );
+        throw markerError;
+      }
     }
     try {
       await abortReap.notify(summary);
@@ -3158,9 +3164,15 @@ export async function runPipeline(
                 verdict: "passed",
               });
               if (deliveryGit === git && operatorHead === terminalCommitOid) {
-                return operatorHead === submissionCommitOid
-                  ? `branch ${deliveryRepo.branch} already at submission commit ${submissionCommitOid}`
-                  : `branch ${deliveryRepo.branch} carries the terminal commit ${terminalCommitOid}`;
+                const note =
+                  operatorHead === submissionCommitOid
+                    ? `branch ${deliveryRepo.branch} already at submission commit ${submissionCommitOid}`
+                    : `branch ${deliveryRepo.branch} carries the terminal commit ${terminalCommitOid}`;
+                await markOutcomeDeliveryPending(
+                  "passed",
+                  `${passedSummary}\n${note}`,
+                );
+                return note;
               }
               const recoverRef = recoveryRefFor(runId);
               let advanced = false;
@@ -3179,16 +3191,25 @@ export async function runPipeline(
                     error instanceof Error ? error.message : String(error);
                 }
               }
-              return advanced
+              const note = advanced
                 ? `advanced branch ${deliveryRepo.branch} from submission to terminal commit ${terminalCommitOid}`
                 : transferFailure
                   ? `custody transfer failed on the pipeline side (${transferFailure}); ` +
                     recoveryInstructions(recoverRef)
                   : "operator checkout diverged or carries uncommitted changes; " +
                     recoveryInstructions(recoverRef);
+              await markOutcomeDeliveryPending(
+                "passed",
+                `${passedSummary}\n${note}`,
+              );
+              return note;
             },
             { eventKey, snapshot },
           ),
+      );
+      await markOutcomeDeliveryPending(
+        "passed",
+        `${passedSummary}\n${custodyNote}`,
       );
       return { attestation, custodyNote };
     });
@@ -11112,19 +11133,72 @@ async function deliverPendingOutcome(
     );
     return false;
   }
+  let summary = marker.pendingSummary;
+  if (outcome === "passed") {
+    const hasCustodyStatus =
+      summary.includes("advanced branch") ||
+      summary.includes("carries the terminal commit") ||
+      summary.includes("already at submission commit") ||
+      summary.includes("custody transfer failed") ||
+      summary.includes("operator checkout diverged");
+    if (!hasCustodyStatus) {
+      const domainRunId = marker.domainRunId ?? runId;
+      const run =
+        domainRunId && ledger ? ledger.runIdentity(domainRunId) : undefined;
+      if (run && run.status === "passed") {
+        const fullRun =
+          domainRunId && ledger ? ledger.run(domainRunId) : undefined;
+        const attestation =
+          domainRunId && ledger ? ledger.findAttestation(domainRunId) : undefined;
+        const terminalCommitOid =
+          attestation?.candidateCommitOid ??
+          summary.match(/Candidate commit: ([0-9a-f]{40,64})/)?.[1];
+        const targetRepo = run.repo_root ?? repoRoot;
+        const branch = run.branch;
+        const recoverRef = recoveryRefFor(domainRunId);
+        let custodyNote: string | undefined;
+        try {
+          const gitShell = new GitShell({ repo: targetRepo });
+          const branchSha = await gitShell.resolveRefSha(`refs/heads/${branch}`);
+          if (terminalCommitOid && branchSha === terminalCommitOid) {
+            custodyNote =
+              fullRun?.submission_commit_oid &&
+              branchSha === fullRun.submission_commit_oid
+                ? `branch ${branch} already at submission commit ${fullRun.submission_commit_oid}`
+                : `advanced branch ${branch} from submission to terminal commit ${terminalCommitOid}`;
+          } else {
+            custodyNote =
+              "operator checkout diverged or carries uncommitted changes; " +
+              recoveryInstructions(recoverRef);
+          }
+        } catch {
+          custodyNote =
+            "operator checkout diverged or carries uncommitted changes; " +
+            recoveryInstructions(recoverRef);
+        }
+        summary = `${summary}\n${custodyNote}`;
+        marker.pendingSummary = summary;
+        try {
+          await writeMarker(markerFile, marker);
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }
   try {
     if (
       process.env.ORCA_TERMINAL_HANDLE &&
       marker.notifyHandle === process.env.ORCA_TERMINAL_HANDLE
     ) {
-      console.error(marker.pendingSummary);
+      console.error(summary);
     } else {
       await new CliOrca({
         command: orcaCommand,
         cwd: repoRoot,
         runId,
         notifyHandle: marker.notifyHandle,
-      }).notifyRunResult(outcome, marker.pendingSummary);
+      }).notifyRunResult(outcome, summary);
     }
   } catch (error) {
     console.error(
