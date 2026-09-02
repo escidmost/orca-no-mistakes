@@ -367,6 +367,7 @@ export class RailTuiRenderer implements PresentationRenderer {
       this.#input.setRawMode!(true);
       this.#input.resume();
       this.#output.write("\u001b[?1049h\u001b[?25l");
+      if (this.#closed) throw new Error("terminal output failed");
     } catch (error) {
       this.#leaveTerminal();
       throw error;
@@ -1019,6 +1020,7 @@ export function createRunRenderer(
 ): PresentationRenderer & { close?: () => void } {
   let fallback: PlainStatusRenderer | undefined;
   let failed = false;
+  let rail: RailTuiRenderer | undefined;
   const plain = (): PlainStatusRenderer =>
     (fallback ??= new PlainStatusRenderer(output));
   const switchToPlain = (
@@ -1043,7 +1045,7 @@ export function createRunRenderer(
       } catch {}
     }
   };
-  const rail = createRailTuiRenderer(
+  rail = createRailTuiRenderer(
     input,
     output,
     artifactsDir,
@@ -1052,10 +1054,16 @@ export function createRunRenderer(
     requestCancel,
     setAutoFix,
     requestResume,
-    onResumeAvailable,
+    undefined,
     switchToPlain,
   );
-  if (!rail) return plain();
+  if (!rail || failed) return plain();
+  try {
+    onResumeAvailable?.();
+  } catch {
+    rail.close();
+    return plain();
+  }
   return {
     close: () => rail.close(),
     render: (snapshot) => {

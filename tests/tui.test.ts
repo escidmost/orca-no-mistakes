@@ -146,12 +146,18 @@ class FakeInput extends EventEmitter {
 
 class FakeOutput extends EventEmitter {
   columns = 100;
+  emitErrorOnNextWrite = false;
   failNextWrite = false;
   isTTY = true;
   rows = 24;
   readonly writes: string[] = [];
 
   write(chunk: string): boolean {
+    if (this.emitErrorOnNextWrite) {
+      this.emitErrorOnNextWrite = false;
+      this.emit("error", new Error("emitted write failure"));
+      return false;
+    }
     if (this.failNextWrite) {
       this.failNextWrite = false;
       throw new Error("write failed");
@@ -242,6 +248,44 @@ if (process.env.TUI_FIXTURE === "1") {
     assert.equal(
       output.writes.at(-1),
       "no-mistakes run-tui-test stage 6/6 lint started\n",
+    );
+    renderer.close?.();
+  });
+
+  test("constructor output errors fall back before advertising Resume controls", () => {
+    const input = new FakeInput();
+    const output = new FakeOutput();
+    const failures: string[] = [];
+    let resumeAvailable = 0;
+    output.emitErrorOnNextWrite = true;
+
+    const renderer = createRunRenderer(
+      input,
+      output,
+      "/unused",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      () => {
+        resumeAvailable += 1;
+      },
+      (error) => failures.push(String(error)),
+    );
+    renderer.render(snapshot("review", 1));
+
+    assert.equal(input.isRaw, false);
+    assert.equal(input.isPaused(), true);
+    assert.equal(resumeAvailable, 0);
+    assert.deepEqual(failures, ["Error: terminal output failed"]);
+    assert.equal(
+      output.writes.filter((write) => write === "\u001b[?25h\u001b[?1049l").length,
+      1,
+    );
+    assert.equal(
+      output.writes.at(-1),
+      "no-mistakes run-tui-test stage 3/6 review started\n",
     );
     renderer.close?.();
   });
