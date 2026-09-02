@@ -800,18 +800,18 @@ export class RailTuiRenderer implements PresentationRenderer {
     const incomplete =
       this.#inputBuffer.match(
         new RegExp(
-          "\\x1b(?:\\[[0-?]*[ -/]*|O|\\][^\\x07\\x1b]*\\x1b?|[P_^][^\\x1b]*\\x1b?)?$",
+          "\\x1b(?:\\[[0-?]*[ -/]*|O|\\][^\\x00-\\x1f]*\\x1b?|[P_^][^\\x00-\\x1f]*\\x1b?)?$",
           "u",
         ),
       )?.[0] ?? "";
     const complete = incomplete
       ? this.#inputBuffer.slice(0, -incomplete.length)
       : this.#inputBuffer;
-    this.#inputBuffer = incomplete;
+    this.#inputBuffer = incomplete.length > 4096 ? "" : incomplete;
     const keys =
       complete.match(
         new RegExp(
-          "\\x1b\\[[0-?]*[ -/]*[@-~]|\\x1bO[@-~]|\\x1b\\][^\\x07\\x1b]*(?:\\x07|\\x1b\\\\)|\\x1b[P_^][^\\x1b]*\\x1b\\\\|\\x03|\\x1a|\\r|\\n|\\t|\\x1b|[aAcCgGrR]",
+          "\\x1b\\[[0-?]*[ -/]*[@-~]|\\x1bO[@-~]|\\x1b\\][^\\x00-\\x1f]*(?:\\x07|\\x1b\\\\)|\\x1b\\][^\\x00-\\x1f]*|\\x1b[P_^][^\\x00-\\x1f]*\\x1b\\\\|\\x1b[P_^][^\\x00-\\x1f]*|\\x03|\\x1a|\\r|\\n|\\t|\\x1b|[aAcCgGrR]",
           "g",
         ),
       ) ?? [];
@@ -890,8 +890,9 @@ export class RailTuiRenderer implements PresentationRenderer {
     if (this.#inputBuffer) {
       this.#escapeTimer = setTimeout(() => {
         this.#escapeTimer = undefined;
+        const held = this.#inputBuffer;
         this.#inputBuffer = "";
-        if (this.#closed) return;
+        if (this.#closed || held !== "\x1b") return;
         try {
           if (this.#cancelVisible) this.#cancelVisible = false;
           else if (this.#gateVisible) {
