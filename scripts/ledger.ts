@@ -2176,6 +2176,31 @@ export class DomainLedger {
         throw error
       }
     }
+    const singleUsePublicationRoute = this.#db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'publication_routes'")
+      .get() as { sql: string } | undefined
+    if (singleUsePublicationRoute && /route_fingerprint\s+TEXT\s+NOT\s+NULL\s+UNIQUE/i.test(singleUsePublicationRoute.sql)) {
+      this.#db.exec('BEGIN IMMEDIATE')
+      try {
+        this.#db.exec(`DROP TRIGGER IF EXISTS immutable_publication_routes;
+          DROP TRIGGER IF EXISTS immutable_publication_routes_delete;
+          DROP TRIGGER IF EXISTS fence_terminal_publication_routes;
+          ALTER TABLE publication_routes RENAME TO publication_routes_legacy`)
+        this.#db.exec(SCHEMA)
+        this.#db.exec(`INSERT INTO publication_routes (
+            run_id, route_fingerprint, forge_host, base_repository_id,
+            head_repository_id, head_owner, head_branch, base_branch, created_at
+          )
+          SELECT run_id, route_fingerprint, forge_host, base_repository_id,
+                 head_repository_id, head_owner, head_branch, base_branch, created_at
+          FROM publication_routes_legacy`)
+        this.#db.exec('DROP TABLE publication_routes_legacy')
+        this.#db.exec('COMMIT')
+      } catch (error) {
+        this.#db.exec('ROLLBACK')
+        throw error
+      }
+    }
     this.#db.exec(SCHEMA)
     this.#db.exec('DROP TRIGGER IF EXISTS fence_run_attempt_generation')
     this.#db.exec(`CREATE TRIGGER IF NOT EXISTS fence_run_attempt_generation
