@@ -290,6 +290,44 @@ if (process.env.TUI_FIXTURE === "1") {
     renderer.close?.();
   });
 
+  test("constructor write failures warn once before plain fallback", () => {
+    const input = new FakeInput();
+    const output = new FakeOutput();
+    let resumeAvailable = 0;
+    output.failNextWrite = true;
+
+    const renderer = createRunRenderer(
+      input,
+      output,
+      "/unused",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      () => {
+        resumeAvailable += 1;
+      },
+    );
+    renderer.render(snapshot("review", 1));
+
+    assert.equal(input.isRaw, false);
+    assert.equal(input.isPaused(), true);
+    assert.equal(resumeAvailable, 0);
+    assert.equal(
+      output.writes.filter(
+        (write) =>
+          write === "warning: interactive presentation failed; using plain status\n",
+      ).length,
+      1,
+    );
+    assert.equal(
+      output.writes.at(-1),
+      "no-mistakes run-tui-test stage 3/6 review started\n",
+    );
+    renderer.close?.();
+  });
+
   test("Resume availability errors close the Rail renderer before fallback", () => {
     const input = new FakeInput();
     const output = new FakeOutput();
@@ -315,6 +353,13 @@ if (process.env.TUI_FIXTURE === "1") {
     assert.equal(output.listenerCount("resize"), 0);
     assert.equal(process.listenerCount("exit"), exitListeners);
     assert.ok(output.writes.includes("\u001b[?25h\u001b[?1049l"));
+    assert.equal(
+      output.writes.filter(
+        (write) =>
+          write === "warning: interactive presentation failed; using plain status\n",
+      ).length,
+      1,
+    );
     renderer.render(snapshot("review", 1));
     assert.equal(
       output.writes.at(-1),

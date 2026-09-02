@@ -1000,8 +1000,9 @@ export function createRailTuiRenderer(
     );
     onResumeAvailable?.();
     return renderer;
-  } catch {
+  } catch (error) {
     renderer?.close();
+    onFailure?.(error);
     return undefined;
   }
 }
@@ -1060,8 +1061,8 @@ export function createRunRenderer(
   if (!rail || failed) return plain();
   try {
     onResumeAvailable?.();
-  } catch {
-    rail.close();
+  } catch (error) {
+    switchToPlain(error);
     return plain();
   }
   return {
