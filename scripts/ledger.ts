@@ -261,8 +261,14 @@ export type StageEvidenceManifestEntry = {
   waiverOrApproval?: GateDecisionRecord
 }
 
+const NON_AUTHORITATIVE_STAGE_EVIDENCE_IDENTITIES = new Set([
+  'coordinator:fixer-guardrail-advisory',
+  'coordinator:fixer-no-change',
+  'coordinator:fixer-policy'
+])
+
 export function isAuthoritativeStageEvidence(workerIdentity: string): boolean {
-  return workerIdentity !== 'coordinator:fixer-guardrail-advisory'
+  return !NON_AUTHORITATIVE_STAGE_EVIDENCE_IDENTITIES.has(workerIdentity)
 }
 
 export type PassedAttestationManifest = {

@@ -2467,11 +2467,21 @@ export async function runPipeline(
     let resumeStageIndex = 0;
     if (resumeCheckpoint) {
       const contiguousCheckpoints = new Set<string>();
-      let checkpointCandidate = submissionCommitOid;
+      const finalCheckpointByStage = new Map<string, StageCheckpointRow>();
       for (const checkpoint of priorCheckpoints) {
-        if (checkpoint.input_commit_oid !== checkpointCandidate) break;
+        finalCheckpointByStage.set(checkpoint.stage_id, checkpoint);
+      }
+      let checkpointCandidate = submissionCommitOid;
+      for (const stage of pipelineSteps) {
+        const checkpoint = finalCheckpointByStage.get(stage);
+        if (
+          !checkpoint ||
+          checkpoint.input_commit_oid !== checkpointCandidate
+        ) {
+          break;
+        }
         contiguousCheckpoints.add(
-          `${checkpoint.stage_id}:${checkpoint.round_index}:${checkpoint.output_commit_oid}`,
+          `${stage}:${checkpoint.round_index}:${checkpoint.output_commit_oid}`,
         );
         checkpointCandidate = checkpoint.output_commit_oid;
       }
@@ -2487,11 +2497,14 @@ export async function runPipeline(
           `${stage}:${evidence.round_index}:${evidence.candidate_commit_oid}`,
         );
         const commitStillValid = pipelineSteps.includes("push")
-          ? checkpointMatchesEvidence
+          ? checkpointMatchesEvidence ||
+            (approved !== undefined &&
+              evidence.candidate_commit_oid ===
+                resumeCheckpoint.output_commit_oid)
           : stage === "intent" ||
-          ((checkpointMatchesEvidence || approved !== undefined) &&
-            evidence.candidate_commit_oid ===
-              resumeCheckpoint.output_commit_oid);
+            ((checkpointMatchesEvidence || approved !== undefined) &&
+              evidence.candidate_commit_oid ===
+                resumeCheckpoint.output_commit_oid);
         if (!complete || !commitStillValid) break;
         resumeStageIndex += 1;
       }
@@ -2685,7 +2698,9 @@ export async function runPipeline(
         });
       }
       stageEntries.push(entry);
-      latestEntryByStage.set(stage, entry);
+      if (isAuthoritativeStageEvidence(workerIdentity)) {
+        latestEntryByStage.set(stage, entry);
+      }
       return autoFixModeAtFindings;
     };
 
@@ -3055,8 +3070,9 @@ export async function runPipeline(
             guardrailMode,
             exhausted ? stageAutoFix.max_rounds : undefined,
           );
-          const gateEvidenceSha256 =
-            latestEntryByStage.get(stage)!.evidenceSha256;
+          const gateEvidence = latestEntryByStage.get(stage)!;
+          const gateEvidenceSha256 = gateEvidence.evidenceSha256;
+          const gateEvidenceRound = gateEvidence.round;
           // Durable before the block: an interrupted run still shows why the
           // gate opened and that nobody has resolved it yet.
           let gateAudited = false;
@@ -3067,7 +3083,7 @@ export async function runPipeline(
               gateKind: exhausted ? "exhaustion" : "finding",
               optionsJson: JSON.stringify(gateOptions),
               question,
-              roundIndex: round,
+              roundIndex: gateEvidenceRound,
               runId,
               stageId: stage,
             });
@@ -3098,7 +3114,7 @@ export async function runPipeline(
             optionsJson: JSON.stringify(gateOptions),
             question,
             resolution,
-            roundIndex: round,
+            roundIndex: gateEvidenceRound,
             runId,
             selectedFindingIds: selectedFindingIdsForGate(
               decision,
