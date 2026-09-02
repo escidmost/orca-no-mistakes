@@ -210,7 +210,7 @@ test('bindPullRequest settles through a real DomainLedger with full route facts'
     const authority = {
       createIssueComment: async ({ body }: { body: string }) => {
         comments = [{
-          author: { id: 'actor', login: 'bot' },
+          author: { id: 'A_node', login: 'bot' },
           body,
           createdAt: '2026-09-01T00:00:20.000Z',
           id: 'IC_comment',

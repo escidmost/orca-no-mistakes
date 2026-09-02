@@ -1625,7 +1625,7 @@ test("protected fixer commits are rejected at a resumable human gate", async () 
   );
 });
 
-test("a policy-violation approval waives the evidence shown at its gate", async () => {
+test("a policy-violation approval waives the authoritative worker evidence", async () => {
   const git = new FakeGit();
   allowReviewAutoFix(git);
   git.protectedTestMutation = "tests/existing.test.ts";
@@ -1658,10 +1658,14 @@ test("a policy-violation approval waives the evidence shown at its gate", async 
   const policyEvidence = result.attestation?.stageEvidence.find(
     (entry) => entry.summary === "review fixer commit rejected by protected-path policy",
   );
+  const approvedEvidence = result.attestation?.stageEvidence.find(
+    (entry) => entry.stage === "review" && entry.workerIdentity.startsWith("reviewer:"),
+  );
   assert.equal(result.attestation?.guardrailMode, "strict");
   assert.equal(policyEvidence?.workerIdentity, "coordinator:fixer-policy");
   assert.equal(policyEvidence?.exitCode, 1);
-  assert.equal(policyEvidence?.waiverOrApproval?.decision, "approve");
+  assert.equal(policyEvidence?.waiverOrApproval, undefined);
+  assert.equal(approvedEvidence?.waiverOrApproval?.decision, "approve");
   const logsDir = path.join(artifactsRoot(), runId, "logs");
   const policyLog = (
     await Promise.all(

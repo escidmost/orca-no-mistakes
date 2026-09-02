@@ -164,6 +164,30 @@ test('does not adopt a marker comment authored by another actor', async () => {
   assert.equal(foreign.body, `${MANAGED_MARKER}\nfake`)
 })
 
+test('does not use a matching login when the stored actor node id differs', async () => {
+  const { ledger } = harness(NODE_ROUTE)
+  const foreign = comment(
+    { id: 'different-node', login: 'bot' },
+    'foreign-comment',
+    `${MANAGED_MARKER}\nfake`
+  )
+  let comments: GithubIssueCommentObservation[] = [foreign]
+  let created = 0
+  const authority = {
+    createIssueComment: async ({ body }: { body: string }) => {
+      created += 1
+      comments = [foreign, comment({ id: NODE_ROUTE.actor_node_id, login: 'bot' }, 'comment-node', body)]
+    },
+    createPullRequest: async () => assert.fail('unexpected pull request creation'),
+    observeIssueComments: async () => comments,
+    observePullRequests: async () => ({ exact: pullRequest(), nearMatches: [] }),
+    updateIssueComment: async () => assert.fail('unexpected comment update')
+  }
+  const result = await bind(ledger, authority)
+  assert.equal(created, 1)
+  assert.equal(result.commentNodeId, 'comment-node')
+})
+
 test('does not adopt a marker comment without an author', async () => {
   const { ledger } = harness({ actor_id: '12345', actor_login: 'bot', actor_node_id: null })
   const ghost = comment(null, 'ghost-comment', `${MANAGED_MARKER}\nghost`)

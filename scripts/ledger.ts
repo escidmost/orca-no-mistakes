@@ -797,7 +797,7 @@ export function verifyCompletionAttestation(manifest: CompletionAttestationManif
     if (
       disposition.disposition === 'satisfied' &&
       (evidence?.stage !== plan.stage ||
-        evidence.exitCode !== 0 ||
+        (evidence.exitCode !== 0 && evidence.waiverOrApproval === undefined) ||
         !isAuthoritativeStageEvidence(evidence.workerIdentity))
     ) {
       throw new Error(
@@ -4933,6 +4933,19 @@ export class DomainLedger {
     const problems: string[] = []
     const retainedEvidence = this.#verifyEvidence(manifest.runId, manifest.stageEvidence)
     problems.push(...retainedEvidence.problems.map((problem) => `stage evidence: ${problem}`))
+    const gateAudits = new Map(this.listGateAudit(manifest.runId).map((audit) => [audit.gate_id, audit]))
+    for (const disposition of manifest.stageDispositions) {
+      const evidence = manifest.stageEvidence.find(
+        (entry) => entry.evidenceSha256 === disposition.evidenceSha256
+      )
+      if (disposition.disposition !== 'satisfied' || !evidence || evidence.exitCode === 0) continue
+      const waiver = evidence.waiverOrApproval
+      const audit = waiver ? gateAudits.get(waiver.gateId) : undefined
+      if (!audit || audit.resolved_at === null || audit.decision !== waiver?.decision ||
+          !gateAuditMatchesEvidence(audit, evidence.stage, evidence.round, evidence.evidenceSha256)) {
+        problems.push(`stage evidence: ${evidence.stage} nonzero evidence lacks an exact approval`)
+      }
+    }
     const retainedRun = this.#db.prepare(
       `SELECT status, terminal_commit_oid, intent, intent_hash, policy_sha256
        FROM runs WHERE run_id = ?`

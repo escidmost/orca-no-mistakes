@@ -12,7 +12,7 @@ Scope: New direct and gate runs execute and recover the complete Release 2 publi
 - [x] G1: Release 2 pull-request publication and settlement behavior passes focused tests
   CHECK: node --test tests/github-authority.test.ts tests/candidate-publication.test.ts tests/pull-request-binding.test.ts tests/pull-request-route-facts.test.ts tests/pipeline-release-2-integration.test.ts tests/pipeline-completion-attestation.test.ts tests/presentation-plan-stages.test.ts tests/release-2-ledger-model.test.ts && node -e "console.log('release 2 focused verification passed')"
   EXPECT: release 2 focused verification passed
-  EVIDENCE: exit=0; shell=/bin/sh; cwd=/Users/host/repo/orca-no-mistakes/.orca/workspaces/onm-80-bind-pull-requests-and-settle-remote-runs; path=891ea4e2ea56/12 entries; EXPECT=matched; output-sha256=011aa17167d359d7a694d608e936a307d0c9662e50dc0887158356a540afa9e3; output-bytes=8415
+  EVIDENCE: exit=0; shell=/bin/sh; cwd=/Users/host/repo/orca-no-mistakes/.orca/workspaces/onm-80-bind-pull-requests-and-settle-remote-runs; path=891ea4e2ea56/12 entries; EXPECT=matched; output-sha256=f219071945c46762abe6133ef3f74d6417ae1cb11338f0369c26409dbc855d09; output-bytes=8414
 
 - [x] G2: the complete TypeScript project typechecks
   CHECK: npm run typecheck && node -e "console.log('typecheck verification passed')"
@@ -22,7 +22,7 @@ Scope: New direct and gate runs execute and recover the complete Release 2 publi
 - [x] G3: the complete regression suite passes
   CHECK: npm test && node -e "console.log('full regression verification passed')"
   EXPECT: full regression verification passed
-  EVIDENCE: exit=0; shell=/bin/sh; cwd=/Users/host/repo/orca-no-mistakes/.orca/workspaces/onm-80-bind-pull-requests-and-settle-remote-runs; path=891ea4e2ea56/12 entries; EXPECT=matched; output-sha256=12401cad9ad83f498072d9c58612ca39bd6222f38f101d95a8438e7035e36312; output-bytes=101992
+  EVIDENCE: exit=0; shell=/bin/sh; cwd=/Users/host/repo/orca-no-mistakes/.orca/workspaces/onm-80-bind-pull-requests-and-settle-remote-runs; path=891ea4e2ea56/12 entries; EXPECT=matched; output-sha256=66c7a8b129096d00c05de963f86e98baec22b60b9b18c7a057a665c006eb583d; output-bytes=102577
 
 - [ ] G4: the pull request has the ONM-80 prefix and CodeRabbit reports no issues
   EVIDENCE: pending

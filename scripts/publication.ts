@@ -6,6 +6,7 @@ import { parseGithubRepositoryReference, runCommand } from './github.ts'
 import {
   canonicalJson,
   evidenceSha256,
+  gateAuditMatchesEvidence,
   isAuthoritativeStageEvidence,
   sha256,
   type DomainLedger,
@@ -187,6 +188,7 @@ function terminalCandidate(
   const evidenceByDigest = new Map(
     ledger.listEvidence(runId).map((row) => [row.evidence_sha256, row])
   )
+  const gateAudits = ledger.listGateAudit(runId)
 
   let candidate = run.submission_commit_oid
   let checkpointIndex = -1
@@ -213,11 +215,22 @@ function terminalCandidate(
     const evidence = disposition.evidence_sha256
       ? evidenceByDigest.get(disposition.evidence_sha256)
       : undefined
+    const approved = evidence !== undefined && gateAudits.some(
+      (audit) =>
+        audit.resolved_at !== null &&
+        (audit.decision === 'approve' || audit.decision === 'skip') &&
+        gateAuditMatchesEvidence(
+          audit,
+          evidence.stage_id,
+          evidence.round_index,
+          evidence.evidence_sha256
+        )
+    )
     if (
       evidence?.stage_id !== stage.stage_id ||
       evidence.candidate_commit_oid !== final.checkpoint.output_commit_oid ||
       evidence.round_index !== final.checkpoint.round_index ||
-      evidence.exit_code !== 0 ||
+      (evidence.exit_code !== 0 && !approved) ||
       !isAuthoritativeStageEvidence(evidence.worker_identity)
     ) {
       throw new CandidatePublicationError(

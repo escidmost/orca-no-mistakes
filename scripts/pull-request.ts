@@ -114,7 +114,7 @@ async function observeExact(
 
 function ownedComment(
   comments: GithubIssueCommentObservation[],
-  actor: { id: string; login?: string; nodeId?: string | null },
+  actor: { login?: string; nodeId?: string | null },
   receiptNodeId?: string
 ): GithubIssueCommentObservation | undefined {
   const exactReceipt = receiptNodeId
@@ -122,9 +122,9 @@ function ownedComment(
     : undefined
   if (exactReceipt) return exactReceipt
   const owned = (comment: GithubIssueCommentObservation): boolean =>
-    (actor.nodeId != null && comment.author?.id === actor.nodeId) ||
-    (actor.login != null && comment.author?.login === actor.login) ||
-    (actor.nodeId == null && comment.author?.id === actor.id)
+    actor.nodeId != null
+      ? comment.author?.id === actor.nodeId
+      : actor.login != null && comment.author?.login === actor.login
   const marked = comments.filter((comment) =>
     owned(comment) && comment.body.startsWith(MANAGED_SUMMARY_MARKER)
   )
@@ -241,7 +241,6 @@ export async function bindPullRequest(input: {
     : undefined
   let comments = await input.authority.observeIssueComments(pullRequest.id)
   let comment = ownedComment(comments, {
-    id: repositoryRoute.actor_id,
     login: repositoryRoute.actor_login,
     nodeId: repositoryRoute.actor_node_id
   }, receiptNodeId)
@@ -273,7 +272,6 @@ export async function bindPullRequest(input: {
     }
     comments = await input.authority.observeIssueComments(pullRequest.id)
     comment = ownedComment(comments, {
-      id: repositoryRoute.actor_id,
       login: repositoryRoute.actor_login,
       nodeId: repositoryRoute.actor_node_id
     }, comment?.id)

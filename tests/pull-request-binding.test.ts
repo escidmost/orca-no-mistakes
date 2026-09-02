@@ -49,6 +49,7 @@ function harness() {
       : undefined,
     repositoryPublicationRoute: () => ({
       actor_id: 'actor',
+      actor_login: 'bot', actor_node_id: 'actor-node',
       base_repository_name: 'acme/repo', base_repository_node_id: 'R_base',
       head_repository_name: 'forker/repo', head_repository_node_id: 'R_head',
       route_fingerprint: 'route'
@@ -71,7 +72,7 @@ test('creates a ready pull request and one managed summary, then settles exact f
   const authority = {
     createIssueComment: async ({ body }: { body: string }) => {
       comments = [{
-        author: { id: 'actor', login: 'bot' }, body, createdAt: '2026-01-01T00:00:00.000Z', id: 'comment-node',
+        author: { id: 'actor-node', login: 'bot' }, body, createdAt: '2026-01-01T00:00:00.000Z', id: 'comment-node',
         updatedAt: '2026-01-01T00:00:00.000Z', url: 'https://example.test/comment'
       }]
     },
@@ -117,7 +118,7 @@ test('adopts an open pull request without mutating human content', async () => {
   let createCalls = 0
   let update: Record<string, unknown> | undefined
   let comments = [{
-    author: { id: 'actor', login: 'bot' }, body: '<!-- orca-no-mistakes:managed-summary:v1 -->\nold',
+    author: { id: 'actor-node', login: 'bot' }, body: '<!-- orca-no-mistakes:managed-summary:v1 -->\nold',
     createdAt: '2026-01-01T00:00:00.000Z', id: 'comment-node',
     updatedAt: '2026-01-01T00:00:00.000Z', url: 'https://example.test/comment'
   }]
@@ -211,7 +212,7 @@ test('reconciles indeterminate creation and rejects closed or moved pull request
   const authority = {
     createIssueComment: async ({ body }: { body: string }) => {
       comments = [{
-        author: { id: 'actor', login: 'bot' }, body,
+        author: { id: 'actor-node', login: 'bot' }, body,
         createdAt: '2026-01-01T00:00:00.000Z', id: 'comment-node',
         updatedAt: '2026-01-01T00:00:00.000Z', url: 'https://example.test/comment'
       }]
@@ -257,7 +258,7 @@ test('does not adopt human-quoted markers and rejects multiple owned markers', a
   const authority = {
     createIssueComment: async ({ body }: { body: string }) => {
       created += 1
-      comments.push({ ...human, author: { id: 'actor', login: 'bot' }, body, id: 'owned-comment' })
+      comments.push({ ...human, author: { id: 'actor-node', login: 'bot' }, body, id: 'owned-comment' })
     },
     createPullRequest: async () => assert.fail('unexpected PR creation'),
     observeIssueComments: async () => comments,

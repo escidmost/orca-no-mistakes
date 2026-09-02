@@ -367,6 +367,30 @@ test('v2 completion attestations bind Release 2 facts without overstating assura
     assert.notEqual(alternateTerminalOutcome.merkleRoot, manifest.merkleRoot)
 
     verifyCompletionAttestation(manifest)
+    const approvedStageEvidence = structuredClone(stageEvidence)
+    const approvedReview = approvedStageEvidence.find((entry) => entry.stage === 'review')!
+    approvedReview.exitCode = 1
+    approvedReview.waiverOrApproval = {
+      decision: 'approve',
+      gateId: 'gate-review',
+      resolvedAt: '2026-01-01T00:00:00.000Z'
+    }
+    approvedReview.evidenceSha256 = evidenceSha256({ ...approvedReview, runId })
+    const approvedManifest = buildPipelineCompletionAttestation(approvedStageEvidence, {
+      ...completionMetadata,
+      stageDispositions: approvedStageEvidence.map((entry) => ({
+        disposition: 'satisfied' as const,
+        evidenceSha256: entry.evidenceSha256,
+        stage: entry.stage
+      }))
+    })
+    verifyCompletionAttestation(approvedManifest)
+    const unapprovedManifest = structuredClone(approvedManifest)
+    delete unapprovedManifest.stageEvidence.find((entry) => entry.stage === 'review')!.waiverOrApproval
+    assert.throws(
+      () => verifyCompletionAttestation(unapprovedManifest),
+      /does not bind successful authoritative evidence/
+    )
     assert.equal(manifest.version, '2.0.0')
     assert.deepEqual(manifest.assuranceClaims, [
       'configured-pipeline-completed',

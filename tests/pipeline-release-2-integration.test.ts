@@ -90,7 +90,7 @@ test('runPipeline settles all eight stages before exposing Release 2 completion'
     observeIssueComments: async () => comments,
     createIssueComment: async ({ body }: { body: string }) => {
       comments = [{
-        author: { id: 'A_actor', login: 'owner' }, body,
+        author: { id: 'AN_actor', login: 'owner' }, body,
         createdAt: '2026-09-02T00:00:00.000Z', id: 'IC_node',
         updatedAt: '2026-09-02T00:00:00.000Z', url: 'https://github.com/owner/repo/pull/80#issuecomment-1',
       }]
