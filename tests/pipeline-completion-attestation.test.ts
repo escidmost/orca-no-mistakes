@@ -11,6 +11,7 @@ import {
   assuranceClaimsFor,
   buildAttestation,
   buildPipelineCompletionAttestation,
+  buildPipelineEvidenceRoot,
   canonicalJson,
   evidenceSha256,
   sha256,
@@ -234,6 +235,22 @@ test('v2 completion attestations bind Release 2 facts without overstating assura
       stageId: 'push',
       ownership: { branch: 'feature', generationToken: passedGeneration, repoRoot: '/repo' }
     }).receiptSha256
+    const pipelineEvidenceRoot = buildPipelineEvidenceRoot(stageEvidence, {
+      attemptOutcomeDigests: [failedOutcome],
+      baseCommitOid: commit,
+      candidateCommitOid: commit,
+      candidatePublicationReceiptSha256: publicationReceipt,
+      intent: completionIntent,
+      policySha256: policy,
+      publicationRoute: { ...publicationRoute, routeFingerprint },
+      runId,
+      stageDispositions: stageEvidence.map((entry) => ({
+        disposition: 'satisfied' as const,
+        evidenceSha256: entry.evidenceSha256,
+        stage: entry.stage
+      })),
+      stagePlan: stages.map((stage) => ({ requirement: 'required' as const, stage }))
+    })
 
     const prEvidence = stageEvidence.find((entry) => entry.stage === 'pr')!
     const pullRequestIntent = ledger.recordMutationIntent({
@@ -312,6 +329,7 @@ test('v2 completion attestations bind Release 2 facts without overstating assura
           mutationIntent: pullRequestIntent,
           number: 77,
           outcome: 'created',
+          pipelineEvidenceRoot,
           postRead: prObservation,
           routeFingerprint
         }

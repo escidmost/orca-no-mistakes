@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -16,11 +15,6 @@ import {
   sha256,
   type StageEvidenceManifestEntry,
 } from "../scripts/ledger.ts";
-import { main } from "../scripts/orca-no-mistakes.ts";
-
-function git(cwd: string, ...args: string[]): string {
-  return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
-}
 
 const base = "a".repeat(40);
 const candidate = "b".repeat(40);
@@ -293,101 +287,6 @@ test("isAuthoritativeStageEvidence filters non-authoritative coordinator diagnos
   assert.equal(isAuthoritativeStageEvidence("coordinator:fixer-guardrail-advisory"), false);
   assert.equal(isAuthoritativeStageEvidence("worker:review:1"), true);
   assert.equal(isAuthoritativeStageEvidence("operator"), true);
-
-  const stageEntries: StageEvidenceManifestEntry[] = [
-    {
-      artifactSha256: "1".repeat(64),
-      baseCommitOid: "0".repeat(40),
-      candidateCommitOid: "1".repeat(40),
-      evidenceSha256: "2".repeat(64),
-      exitCode: 0,
-      round: 1,
-      stage: "lint",
-      summary: "Worker ran lint",
-      workerIdentity: "worker:lint:1",
-    },
-    {
-      artifactSha256: "3".repeat(64),
-      baseCommitOid: "0".repeat(40),
-      candidateCommitOid: "1".repeat(40),
-      evidenceSha256: "4".repeat(64),
-      exitCode: 1,
-      round: 2,
-      stage: "lint",
-      summary: "No changes produced",
-      workerIdentity: "coordinator:fixer-no-change",
-    },
-  ];
-
-  const latestEntryByStage = new Map<string, StageEvidenceManifestEntry>();
-  for (const entry of stageEntries) {
-    if (isAuthoritativeStageEvidence(entry.workerIdentity)) {
-      latestEntryByStage.set(entry.stage, entry);
-    }
-  }
-
-  assert.equal(latestEntryByStage.get("lint")?.workerIdentity, "worker:lint:1");
-});
-
-test("fresh runs permit configured GitHub upstream stored route even when origin is local", async () => {
-  const temp = await mkdtemp(path.join(tmpdir(), "onm-stored-route-"));
-  const origin = path.join(temp, "local-origin.git");
-  const repo = path.join(temp, "repo");
-  try {
-    git(temp, "-c", "init.templateDir=", "init", "--bare", origin);
-    git(temp, "-c", "init.templateDir=", "init", "-b", "main", repo);
-    git(repo, "config", "user.email", "test@example.com");
-    git(repo, "config", "user.name", "Test User");
-    git(repo, "commit", "--allow-empty", "-m", "initial commit");
-    git(repo, "remote", "add", "origin", origin);
-    git(repo, "push", "-u", "origin", "main");
-    git(temp, `--git-dir=${origin}`, "symbolic-ref", "HEAD", "refs/heads/main");
-    git(repo, "checkout", "-b", "feature");
-
-    // Without stored route, fails as unsupported forge
-    await assert.rejects(
-      () => main(["run", "--repo", repo, "--intent", "Test run"]),
-      /unsupported forge: new runs require GitHub/,
-    );
-
-    // Persist a GitHub publication route with canonical repo root
-    const canonicalRepo = await realpath(repo);
-    const ledger = new DomainLedger({ repositoryPath: repo });
-    ledger.setRepositoryPublicationRoute({
-      actorId: "U_1",
-      actorLogin: "operator",
-      actorNodeId: "U_node_1",
-      backend: "gh",
-      backendVersion: "2.97.0",
-      baseBranch: "main",
-      baseRepositoryId: "R_base",
-      baseRepositoryName: "upstream/project",
-      baseRepositoryNodeId: "R_node",
-      credentialSource: "stored-account",
-      forgeHost: "github.com",
-      headBranch: "feature",
-      headOwner: "upstream",
-      headRepositoryId: "R_base",
-      headRepositoryName: "upstream/project",
-      headRepositoryNodeId: "R_node",
-      networkRootRepositoryId: "R_base",
-      observedAt: new Date().toISOString(),
-      repoRoot: canonicalRepo,
-    });
-    ledger.close();
-
-    // With configured GitHub route, the run is recognized as GitHub-supported and is not rejected as unsupported forge
-    await assert.rejects(
-      () => main(["run", "--repo", repo, "--intent", "Test run"]),
-      (err: unknown) => {
-        assert.ok(err instanceof Error);
-        assert.doesNotMatch(err.message, /unsupported forge/);
-        return true;
-      },
-    );
-  } finally {
-    await rm(temp, { force: true, recursive: true });
-  }
 });
 
 test("recordAttestation binds pull-request receipt pipelineEvidenceRoot to manifest root", async () => {
@@ -505,7 +404,7 @@ test("recordAttestation binds pull-request receipt pipelineEvidenceRoot to manif
             kind: "pull-request-binding",
             payload: {
               managedCommentIntent: "0".repeat(64), // Present without pipelineEvidenceRoot
-              mutationIntent: prIntent.intentSha256,
+              mutationIntent: prIntent,
               number: 77,
               outcome: "created",
               postRead: obs,

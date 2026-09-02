@@ -235,10 +235,6 @@ test("pull-request settlement rejects when managed-comment mutation postdates ob
     assert.ok(storedRoute);
 
     ledger.recordPublicationBaseline({
-      authoritativeAbsence: false,
-      baseBranch: "main",
-      baseCommitOid: "0".repeat(40),
-      headBranch: "feature",
       headCommitOid: "1".repeat(40),
       observedAt: "2026-09-02T10:00:00.000Z",
       routeFingerprint: storedRoute.route_fingerprint,
@@ -376,8 +372,8 @@ test("pull-request settlement rejects when managed-comment mutation postdates ob
             candidateCommitOid: candidateOid,
             kind: "pull-request-binding",
             payload: {
-              managedCommentIntent: commentMutation.intentSha256,
-              mutationIntent: prMutation.intentSha256,
+              managedCommentIntent: commentMutation,
+              mutationIntent: prMutation,
               number: 123,
               outcome: "created",
               postRead: prPostRead,

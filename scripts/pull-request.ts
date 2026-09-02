@@ -245,9 +245,10 @@ export async function bindPullRequest(input: {
     nodeId: repositoryRoute.actor_node_id
   }, receiptNodeId)
   let commentMutated = false
+  const managedCommentCreatedAt = after(mutationCreatedAt, now())
   const managedCommentIntent = input.ledger.recordMutationIntent({
     attemptId: input.attemptId,
-    createdAt: after(mutationCreatedAt, now()),
+    createdAt: managedCommentCreatedAt,
     kind: 'managed-comment',
     payload: {
       action: 'ensure-managed-summary',
@@ -289,7 +290,7 @@ export async function bindPullRequest(input: {
   if (!pullRequest || pullRequest.state !== 'OPEN' || pullRequest.draft || pullRequest.headOid !== input.candidateCommitOid) {
     throw new PullRequestBindingError('pull-request facts changed before settlement')
   }
-  const observedAt = after(managedCommentIntent.createdAt, now())
+  const observedAt = after(managedCommentCreatedAt, now())
   const postRead = input.ledger.recordRemoteObservation({
     attemptId: input.attemptId,
     kind: 'pull-request',

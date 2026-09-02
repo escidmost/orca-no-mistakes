@@ -7,6 +7,7 @@ import test from 'node:test'
 
 import {
   buildPipelineCompletionAttestation,
+  buildPipelineEvidenceRoot,
   DomainLedger,
   evidenceSha256,
   sha256,
@@ -271,11 +272,52 @@ test('resumed attempt refreshes pull request binding after receipt schema upgrad
       runId,
       targetFingerprint: routeFingerprint
     })
+    const managedCommentBodySha256 = sha256('managed summary')
+    const managedCommentIntent = ledger.recordMutationIntent({
+      attemptId: 'passed-attempt',
+      createdAt: '2026-08-30T12:00:08.500Z',
+      kind: 'managed-comment',
+      payload: {
+        action: 'ensure-managed-summary',
+        bodySha256: managedCommentBodySha256,
+        managedCommentNodeId: 'IC_comment',
+        number: 77
+      },
+      runId,
+      targetFingerprint: routeFingerprint
+    })
+    const pipelineEvidenceRoot = buildPipelineEvidenceRoot(
+      entries.map(({ artifactPath: _artifactPath, ...entry }) => entry), {
+      attemptOutcomeDigests: [failedOutcome],
+      baseCommitOid: base,
+      candidateCommitOid: candidate,
+      candidatePublicationReceiptSha256: publicationReceipt,
+      intent,
+      policySha256: policy,
+      publicationRoute: { ...route, routeFingerprint },
+      runId,
+      stageDispositions: [{
+        disposition: 'satisfied',
+        evidenceSha256: entries.find((entry) => entry.stage === 'push')!.evidenceSha256,
+        stage: 'push'
+      }],
+      stagePlan: [
+        { requirement: 'required', stage: 'push' },
+        { requirement: 'required', stage: 'pr' }
+      ]
+    })
     const refreshedPrObservation = ledger.recordRemoteObservation({
       attemptId: 'passed-attempt',
       kind: 'pull-request',
       observedAt: '2026-08-30T12:00:09.000Z',
-      payload: { ...prFacts, number: 77, state: 'open' },
+      payload: {
+        ...prFacts,
+        managedCommentBodySha256,
+        managedCommentNodeId: 'IC_comment',
+        number: 77,
+        pullRequestNodeId: 'PR_77',
+        state: 'open'
+      },
       runId,
       subject: 'github.com/R_base#77'
     })
@@ -287,9 +329,11 @@ test('resumed attempt refreshes pull request binding after receipt schema upgrad
         candidateCommitOid: candidate,
         kind: 'pull-request-binding',
         payload: {
+          managedCommentIntent,
           mutationIntent: refreshedPrIntent,
           number: 77,
           outcome: 'unchanged',
+          pipelineEvidenceRoot,
           postRead: refreshedPrObservation,
           routeFingerprint
         }
@@ -298,12 +342,6 @@ test('resumed attempt refreshes pull request binding after receipt schema upgrad
       stageId: 'pr',
       ownership: { branch: 'feature', generationToken: passedGeneration, repoRoot: '/repo' }
     }).receiptSha256
-    ledger.recordStageDisposition({
-      disposition: 'satisfied',
-      evidenceSha256: refreshedPrEntry.evidenceSha256,
-      runId,
-      stageId: 'pr'
-    })
     assert.notEqual(refreshedPrReceipt, firstPrReceipt)
     assert.equal(
       ledger.remoteReceipt(runId, 'pull-request-binding', firstPrReceipt)?.receipt_sha256,

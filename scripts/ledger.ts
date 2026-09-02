@@ -3076,14 +3076,23 @@ export class DomainLedger {
     const existing = this.repositoryPublicationRoute(input.repoRoot)
     if (existing && existing.route_fingerprint !== fingerprint) {
       const active = this.#db.prepare(
-        `SELECT COUNT(*) AS count
+        `SELECT COUNT(DISTINCT r.run_id) AS count
          FROM runs r
          JOIN publication_routes p ON p.run_id = r.run_id
-         WHERE r.repo_root = ? AND r.status = 'in-progress' AND p.route_fingerprint = ?`
+         WHERE r.repo_root = ? AND p.route_fingerprint = ?
+           AND (r.status = 'in-progress' OR (r.status = 'failed' AND EXISTS (
+             SELECT 1
+             FROM attempt_outcomes o
+             JOIN run_attempts a ON a.run_id = o.run_id AND a.attempt_id = o.attempt_id
+             WHERE o.run_id = r.run_id AND o.resume_eligible = 1
+               AND a.generation_token = (
+                 SELECT MAX(a2.generation_token) FROM run_attempts a2 WHERE a2.run_id = r.run_id
+               )
+           )))`
       ).get(input.repoRoot, existing.route_fingerprint) as { count: number }
       if (active.count > 0) {
         throw new Error(
-          `cannot change publication route while ${active.count} active run(s) depend on it`
+          `cannot change publication route while ${active.count} active or resumable run(s) depend on it`
         )
       }
     }
@@ -3833,9 +3842,6 @@ export class DomainLedger {
         input.receipt.authoritativePostObservationSha256,
         receiptJson
       ) as { receipt_sha256: string } | undefined
-      const settlesDisposition = input.stageId !== 'pr' ||
-        (input.evidence.roundIndex === 0 &&
-          Object.hasOwn(input.receipt.payload, 'managedCommentIntent'))
       const existingDisposition = this.#db.prepare(
         `SELECT 1 FROM stage_dispositions
          WHERE run_id = ? AND stage_id = ? AND disposition = 'satisfied'
@@ -3844,6 +3850,9 @@ export class DomainLedger {
       const priorDisposition = this.#db.prepare(
         'SELECT 1 FROM stage_dispositions WHERE run_id = ? AND stage_id = ? LIMIT 1'
       ).get(input.runId, input.stageId)
+      const settlesDisposition = input.stageId !== 'pr' ||
+        (Object.hasOwn(input.receipt.payload, 'managedCommentIntent') &&
+          (input.evidence.roundIndex === 0 || priorDisposition === undefined))
       const priorEvidence = this.#db.prepare(
         'SELECT 1 FROM stage_evidence WHERE run_id = ? AND stage_id = ? AND round_index = ? LIMIT 1'
       ).get(input.runId, input.stageId, input.evidence.roundIndex)

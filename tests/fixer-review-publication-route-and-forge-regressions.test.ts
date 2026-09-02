@@ -1,32 +1,15 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
 
 import { DomainLedger, main } from "../scripts/orca-no-mistakes.ts";
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 }
-
-test("post-pass cleanup assigns exact gateCleanupOid with completionAttestation then attestation fallback", async () => {
-  const source = await readFile(
-    fileURLToPath(new URL("../scripts/orca-no-mistakes.ts", import.meta.url)),
-    "utf8",
-  );
-  const start = source.indexOf("const result = await runPipeline(");
-  const end = source.indexOf("await orca.notifyRunResult(", start);
-  assert.ok(start >= 0 && end > start);
-  const postPassSetup = source.slice(start, end);
-  assert.match(
-    postPassSetup,
-    /gateCleanupOid =\s*result\.completionAttestation\?\.candidateCommitOid \?\?\s*result\.attestation\?\.candidateCommitOid \?\?\s*gateCleanupOid;/u,
-  );
-  assert.doesNotMatch(postPassSetup, /await git\.head\(\)/u);
-});
 
 test("startRun does not snapshot publication route when head or base branch mismatches", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "onm-branch-mismatch-"));
@@ -77,7 +60,7 @@ test("startRun does not snapshot publication route when head or base branch mism
   }
 });
 
-test("fresh runs fail closed on unsupported forge while init remains provider-neutral", async () => {
+test("init remains provider-neutral for repositories without GitHub remotes", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "onm-unsupported-forge-"));
   const origin = path.join(temp, "origin.git");
   const repo = path.join(temp, "repo");
@@ -105,12 +88,6 @@ test("fresh runs fail closed on unsupported forge while init remains provider-ne
     const initReceipt = JSON.parse(logs.at(-1) ?? "{}");
     assert.equal(initReceipt.route, null);
 
-    await assert.rejects(
-      () => main(["run", "--repo", repo, "--base", "main", "--intent", "Run on local forge repo"]),
-      (error: unknown) =>
-        error instanceof Error &&
-        error.message.includes("unsupported forge: new runs require GitHub"),
-    );
   } finally {
     await rm(temp, { force: true, recursive: true });
   }

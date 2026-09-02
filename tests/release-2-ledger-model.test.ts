@@ -93,7 +93,7 @@ test('repository publication routes update safely and snapshot into runs', async
         ...renamed,
         headBranch: 'different-feature'
       }),
-      /cannot change publication route while 1 active run\(s\) depend on it/
+      /cannot change publication route while 1 active or resumable run\(s\) depend on it/
     )
     ledger.finishRun('route-run', 'cancelled')
     const changed = ledger.setRepositoryPublicationRoute({
@@ -105,6 +105,57 @@ test('repository publication routes update safely and snapshot into runs', async
     assert.throws(
       () => ledger.recordStoredPublicationRoute('route-run', '/another-repo'),
       /does not belong to repository/
+    )
+  } finally {
+    ledger.close()
+    await rm(temp, { force: true, recursive: true })
+  }
+})
+
+test('repository publication routes cannot strand resumable failed runs', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'onm-resumable-repository-route-'))
+  const ledger = new DomainLedger(path.join(temp, 'ledger.sqlite'))
+  try {
+    ledger.setRepositoryPublicationRoute(publicationRoute)
+    ledger.startRun({
+      baseBranch: 'main',
+      branch: 'feature',
+      intent: 'Keep the frozen publication route resumable.',
+      policySha256: policy,
+      repoRoot: '/repo',
+      runId: 'resumable-route-run',
+      submissionCommitOid: commit
+    })
+    const generationToken = ledger.acquireLease({
+      branch: 'feature', repoRoot: '/repo', runId: 'resumable-route-run'
+    })
+    ledger.startAttempt({
+      actorIdentity: 'operator',
+      attemptId: 'failed-attempt',
+      coordinatorIdentity: 'coordinator',
+      generationToken,
+      runId: 'resumable-route-run',
+      startedAt: timestamp
+    })
+    ledger.recordAttemptOutcome({
+      actorIdentity: 'operator',
+      attemptId: 'failed-attempt',
+      candidateCommitOid: commit,
+      completedAt: timestamp,
+      coordinatorIdentity: 'coordinator',
+      custody: {},
+      reason: 'remote stage interrupted',
+      receiptDigests: [],
+      resumeEligible: true,
+      runId: 'resumable-route-run',
+      stoppingFact: 'pull-request-binding',
+      verdict: 'failed'
+    })
+    ledger.finishRun('resumable-route-run', 'failed')
+
+    assert.throws(
+      () => ledger.setRepositoryPublicationRoute({ ...publicationRoute, headBranch: 'other-feature' }),
+      /cannot change publication route while 1 active or resumable run\(s\) depend on it/
     )
   } finally {
     ledger.close()

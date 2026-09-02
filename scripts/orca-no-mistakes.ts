@@ -354,6 +354,7 @@ export type PipelineOptions = {
   maxFixRounds?: number;
   plainStatus?: boolean;
   publicationDestination?: string;
+  release2PublicationRequired?: boolean;
   publicationRunner?: CommandRunner;
   rendererFactory?: (
     artifactsDir: string,
@@ -1973,10 +1974,10 @@ export async function runPipeline(
     : [];
   const pipelineSteps: readonly StageName[] = resumedPlan.length > 0
     ? resumedPlan
-    : remotePublication
+    : remotePublication || options.release2PublicationRequired
       ? PIPELINE_STEPS
       : LEGACY_STAGE_PLAN;
-  if (pipelineSteps.includes("push") && !remotePublication) {
+  if (resumedPlan.length > 0 && pipelineSteps.includes("push") && !remotePublication) {
     throw new Error("Release 2 resume requires initialized GitHub publication");
   }
   const effectiveConfig = JSON.parse(
@@ -2163,7 +2164,7 @@ export async function runPipeline(
           repoRoot: deliveryRepo.root,
           runId,
           submissionCommitOid: options.admission?.newOid ?? deliveryRepo.head,
-          stagePlan: remotePublication
+          stagePlan: pipelineSteps.includes("push")
             ? RELEASE_2_STAGE_PLAN.map((stageId) => ({
                 requirement: "required" as const,
                 stageId,
@@ -2171,7 +2172,8 @@ export async function runPipeline(
             : undefined,
         });
         domainRunStarted = true;
-        if (remotePublication && !ledger.publicationRoute(runId)) {
+        if (remotePublication && ledger.repositoryPublicationRoute(deliveryRepo.root) &&
+            !ledger.publicationRoute(runId)) {
           throw new Error("stored publication route does not match the admitted run branches");
         }
         if (options.admission) {
@@ -10588,36 +10590,12 @@ async function launchDetachedRun(
   const resumeRunId = stringFlag(flags, "resume");
   let resumePlan: { stage_id: string }[] = [];
   const ledger = openRepositoryLedger(repo.root, false);
-  let storedRoute: ReturnType<DomainLedger["repositoryPublicationRoute"]> | undefined;
   try {
     if (resumeRunId) {
       resumePlan = ledger.stagePlan(resumeRunId);
     }
-    storedRoute = ledger.repositoryPublicationRoute(await canonicalPath(repo.root));
   } finally {
     ledger.close();
-  }
-  const legacyResume =
-    resumePlan.length > 0 &&
-    !resumePlan.some((entry) => entry.stage_id === "push");
-  if (!legacyResume) {
-    let hasGithubSupport = false;
-    if (storedRoute) {
-      hasGithubSupport = storedRoute.forge_host === "github.com";
-    } else {
-      try {
-        parseGithubRepositoryReference(
-          (await command("git", ["remote", "get-url", "origin"], repo.root)).stdout.trim(),
-        );
-        hasGithubSupport = true;
-      } catch {}
-    }
-    if (!hasGithubSupport) {
-      throw new Error("unsupported forge: new runs require GitHub");
-    }
-    if (!storedRoute) {
-      throw new Error("new GitHub runs require successful orca-no-mistakes init");
-    }
   }
   const gateStagePlan =
     resumePlan.length > 0
@@ -14570,15 +14548,7 @@ Run options:
     const hasGithubSupport = storedRoute
       ? storedRoute.forge_host === "github.com"
       : githubOrigin;
-    if (!legacyResume) {
-      if (!hasGithubSupport) {
-        throw new Error("unsupported forge: new runs require GitHub");
-      }
-      if (!storedRoute) {
-        throw new Error("new GitHub runs require successful orca-no-mistakes init");
-      }
-    }
-    if (!legacyResume) {
+    if (!legacyResume && hasGithubSupport && storedRoute) {
       try {
         githubAuthority = await GithubAuthority.connect();
         const publicationRoute = await resolveGithubPublicationRoute({
@@ -14648,6 +14618,7 @@ Run options:
         maxFixRounds,
         plainStatus: parsed.flags["no-tui"] === true,
         publicationDestination,
+        release2PublicationRequired: !legacyResume,
         rendererFactory:
           parsed.flags.tui === true
             ? (

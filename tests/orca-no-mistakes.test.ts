@@ -28,6 +28,7 @@ import {
   FixerPolicyViolationError,
   GitShell,
   LEGACY_STAGE_PLAN,
+  PIPELINE_STEPS,
   PostMutationCustodyError,
   RecoveryAnchorError,
   launchAgent,
@@ -837,6 +838,34 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
     kind: "run-completed",
     status: "passed",
   });
+});
+
+test("new CLI runs cannot pass without Release 2 publication support", async () => {
+  const git = new FakeGit();
+  const runId = `release-2-required-${randomUUID()}`;
+  const orca = new FakeOrca(git, runId);
+  const ledger = new DomainLedger(":memory:");
+  try {
+    await assert.rejects(
+      runPipeline(
+        {
+          intent: "Require remote publication for a new CLI run.",
+          release2PublicationRequired: true,
+        },
+        orca,
+        git,
+        ledger,
+      ),
+      /push requires initialized GitHub publication/,
+    );
+    assert.deepEqual(
+      ledger.stagePlan(runId).map((entry) => entry.stage_id),
+      PIPELINE_STEPS,
+    );
+    assert.equal(ledger.run(runId)?.status, "failed");
+  } finally {
+    ledger.close();
+  }
 });
 
 test("a failed run resumes from its last checkpoint without repeating completed stages or gates", async () => {
