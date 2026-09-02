@@ -33,6 +33,8 @@ orca-no-mistakes run --repo /path/to/repo --intent "<user objective and constrai
 orca-no-mistakes run --repo /path/to/repo --resume <failed-run-id>
 ```
 
+For repository-local admission, run `orca-no-mistakes init --repo /path/to/repo`, then follow the [Local gate](../../README.md#local-gate) workflow.
+
 The coordinator launches detached in a dedicated Orca terminal and returns immediately with `{"detached":true,"terminalHandle":"..."}`. This avoids blocking the caller and allows the originating session to receive and resolve decision gates via `orca orchestration gate-resolve`.
 
 Use `--resume` only for a failed run whose clean initiating checkout is still at its original submission commit. Detached resume reconstructs the isolated gate worktree at the last durable checkpoint, retains the original evidence and resolved gate decisions, and runs only the stages that still need validation. Keeping the initiating checkout at the submission commit lets successful custody transfer advance it automatically.
