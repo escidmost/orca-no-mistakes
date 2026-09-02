@@ -882,8 +882,9 @@ export function createRailTuiRenderer(
   onResumeAvailable?: () => void,
 ): RailTuiRenderer | undefined {
   if (!supportsRailTui(input, output)) return undefined;
+  let renderer: RailTuiRenderer | undefined;
   try {
-    const renderer = new RailTuiRenderer(
+    renderer = new RailTuiRenderer(
       input,
       output,
       artifactsDir,
@@ -896,6 +897,7 @@ export function createRailTuiRenderer(
     onResumeAvailable?.();
     return renderer;
   } catch {
+    renderer?.close();
     return undefined;
   }
 }
