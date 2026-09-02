@@ -3604,6 +3604,7 @@ export class DomainLedger {
     const receipt = input.receiptPayload
     const hasManagedComment = Object.hasOwn(receipt, 'managedCommentIntent')
     const hasPipelineEvidenceRoot = Object.hasOwn(receipt, 'pipelineEvidenceRoot')
+    if (hasManagedComment !== hasPipelineEvidenceRoot) return false
     if (!hasOnlyOwnProperties(receipt, new Set([
       ...(hasManagedComment ? ['managedCommentIntent'] : []),
       ...(hasPipelineEvidenceRoot ? ['pipelineEvidenceRoot'] : []),
@@ -5153,6 +5154,16 @@ export class DomainLedger {
         runId: manifest.runId
       })) {
         problems.push(`${receipt.kind} observation`)
+      }
+      if (receipt.kind === 'pull-request-binding') {
+        const hasManagedComment = Object.hasOwn(payload, 'managedCommentIntent')
+        const hasPipelineEvidenceRoot = Object.hasOwn(payload, 'pipelineEvidenceRoot')
+        if (hasManagedComment !== hasPipelineEvidenceRoot) {
+          problems.push('pull-request-binding receipt')
+        }
+        if (hasPipelineEvidenceRoot && payload.pipelineEvidenceRoot !== manifest.pipelineEvidenceRoot) {
+          problems.push('pipeline evidence root')
+        }
       }
     }
 

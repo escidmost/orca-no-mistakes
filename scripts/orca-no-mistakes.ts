@@ -2582,7 +2582,10 @@ export async function runPipeline(
     }
     const latestEntryByStage = new Map<StageName, StageEvidenceManifestEntry>();
     for (const entry of stageEntries) {
-      if (pipelineSteps.includes(entry.stage as StageName)) {
+      if (
+        pipelineSteps.includes(entry.stage as StageName) &&
+        isAuthoritativeStageEvidence(entry.workerIdentity)
+      ) {
         latestEntryByStage.set(entry.stage as StageName, entry);
       }
     }
@@ -10584,24 +10587,36 @@ async function launchDetachedRun(
 ): Promise<{ coordinatorPid: number | undefined; terminalHandle: string }> {
   const resumeRunId = stringFlag(flags, "resume");
   let resumePlan: { stage_id: string }[] = [];
-  if (resumeRunId) {
-    const ledger = openRepositoryLedger(repo.root, false);
-    try {
+  const ledger = openRepositoryLedger(repo.root, false);
+  let storedRoute: ReturnType<DomainLedger["repositoryPublicationRoute"]> | undefined;
+  try {
+    if (resumeRunId) {
       resumePlan = ledger.stagePlan(resumeRunId);
-    } finally {
-      ledger.close();
     }
+    storedRoute = ledger.repositoryPublicationRoute(await canonicalPath(repo.root));
+  } finally {
+    ledger.close();
   }
   const legacyResume =
     resumePlan.length > 0 &&
     !resumePlan.some((entry) => entry.stage_id === "push");
   if (!legacyResume) {
-    try {
-      parseGithubRepositoryReference(
-        (await command("git", ["remote", "get-url", "origin"], repo.root)).stdout.trim(),
-      );
-    } catch {
+    let hasGithubSupport = false;
+    if (storedRoute) {
+      hasGithubSupport = storedRoute.forge_host === "github.com";
+    } else {
+      try {
+        parseGithubRepositoryReference(
+          (await command("git", ["remote", "get-url", "origin"], repo.root)).stdout.trim(),
+        );
+        hasGithubSupport = true;
+      } catch {}
+    }
+    if (!hasGithubSupport) {
       throw new Error("unsupported forge: new runs require GitHub");
+    }
+    if (!storedRoute) {
+      throw new Error("new GitHub runs require successful orca-no-mistakes init");
     }
   }
   const gateStagePlan =
@@ -14552,8 +14567,11 @@ Run options:
       );
       githubOrigin = true;
     } catch {}
+    const hasGithubSupport = storedRoute
+      ? storedRoute.forge_host === "github.com"
+      : githubOrigin;
     if (!legacyResume) {
-      if (!githubOrigin) {
+      if (!hasGithubSupport) {
         throw new Error("unsupported forge: new runs require GitHub");
       }
       if (!storedRoute) {
