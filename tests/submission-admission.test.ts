@@ -10,7 +10,7 @@ import {
   type GateMetadata,
   type ValidatedReceive
 } from '../scripts/admission.ts'
-import { DomainLedger } from '../scripts/ledger.ts'
+import { cleanGitEnvironment, DomainLedger } from '../scripts/ledger.ts'
 
 const oid = (character: string) => character.repeat(40)
 
@@ -59,7 +59,7 @@ test('admission replay is idempotent and the pending ref lease is released on ac
       baseBranch: 'main',
       branch: 'feature',
       intent: update.intent,
-      policySha256: oid('c').slice(0, 64),
+      policySha256: 'c'.repeat(64),
       repoRoot: '/repo',
       runId: 'admission-run',
       submissionCommitOid: update.newOid
@@ -150,12 +150,10 @@ test('an unbound failed direct admission can be retried', async () => {
     const gateRetryInput = {
       ...input,
       oldOid: oid('c'),
-      repoRoot: '/gate-repo',
       source: 'gate' as const
     }
     const gateRetry = ledger.beginSubmissionAdmission(gateRetryInput)
     assert.equal(gateRetry.old_oid, gateRetryInput.oldOid)
-    assert.equal(gateRetry.repo_root, gateRetryInput.repoRoot)
     assert.throws(
       () =>
         ledger.beginSubmissionAdmission({
@@ -179,5 +177,22 @@ test('an unbound failed direct admission can be retried', async () => {
   } finally {
     ledger.close()
     await rm(temp, { force: true, recursive: true })
+  }
+})
+
+test('Git repository discovery ignores inherited repository overrides', () => {
+  const previousCommonDir = process.env.GIT_COMMON_DIR
+  const previousConfig = process.env.GIT_CONFIG
+  try {
+    process.env.GIT_COMMON_DIR = '/untrusted/common-dir'
+    process.env.GIT_CONFIG = '/untrusted/config'
+    const environment = cleanGitEnvironment()
+    assert.equal(environment.GIT_COMMON_DIR, undefined)
+    assert.equal(environment.GIT_CONFIG, undefined)
+  } finally {
+    if (previousCommonDir === undefined) delete process.env.GIT_COMMON_DIR
+    else process.env.GIT_COMMON_DIR = previousCommonDir
+    if (previousConfig === undefined) delete process.env.GIT_CONFIG
+    else process.env.GIT_CONFIG = previousConfig
   }
 })

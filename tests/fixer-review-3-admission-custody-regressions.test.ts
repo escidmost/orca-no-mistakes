@@ -299,7 +299,10 @@ test('the coordinator rejects a checkout on another branch before acceptance', a
     settled.close()
     const readiness = JSON.parse(await readFile(readinessPath, 'utf8')) as { state?: string }
     assert.equal(readiness.state, 'failed')
-    assert.throws(() => git(gate, 'rev-parse', '--verify', 'refs/orca-no-mistakes/heads/*'))
+    assert.equal(
+      git(gate, 'for-each-ref', '--format=%(refname)', 'refs/orca-no-mistakes/heads/'),
+      ''
+    )
   } finally {
     await rm(temp, { force: true, recursive: true })
   }

@@ -6,6 +6,7 @@ import path from 'node:path'
 
 import {
   canonicalJson,
+  cleanGitEnvironment,
   DomainLedger,
   normalizeIntent,
   RUN_ID_PATTERN,
@@ -880,30 +881,6 @@ function gitSync(args: readonly string[]): string {
   } catch {
     throw new Error(`git command failed: ${args[0] ?? 'git'}`)
   }
-}
-
-function cleanGitEnvironment(): NodeJS.ProcessEnv {
-  const environment = { ...process.env }
-  for (const key of [
-    'GIT_ALTERNATE_OBJECT_DIRECTORIES',
-    'GIT_CONFIG_COUNT',
-    'GIT_CONFIG_PARAMETERS',
-    'GIT_DIR',
-    'GIT_INDEX_FILE',
-    'GIT_OBJECT_DIRECTORY',
-    'GIT_PREFIX',
-    'GIT_PUSH_OPTION_COUNT',
-    'GIT_PUSH_OPTION_0',
-    'GIT_PUSH_OPTION_1',
-    'GIT_QUARANTINE_PATH',
-    'GIT_WORK_TREE'
-  ]) {
-    delete environment[key]
-  }
-  for (const key of Object.keys(environment)) {
-    if (/^GIT_(?:CONFIG_KEY|CONFIG_VALUE|PUSH_OPTION)_\d+$/u.test(key)) delete environment[key]
-  }
-  return environment
 }
 
 function tryGitSync(args: readonly string[]): string | undefined {

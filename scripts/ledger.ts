@@ -1468,12 +1468,12 @@ function repositoryLocation(repositoryPath: string): { ledgerPath: string; repoR
   const repoRoot = execFileSync(
     'git',
     ['-C', repositoryPath, 'rev-parse', '--path-format=absolute', '--show-toplevel'],
-    { encoding: 'utf8', env: repositoryGitEnvironment(), stdio: ['ignore', 'pipe', 'pipe'] }
+    { encoding: 'utf8', env: cleanGitEnvironment(), stdio: ['ignore', 'pipe', 'pipe'] }
   ).trim()
   const commonDir = execFileSync(
     'git',
     ['-C', repositoryPath, 'rev-parse', '--path-format=absolute', '--git-common-dir'],
-    { encoding: 'utf8', env: repositoryGitEnvironment(), stdio: ['ignore', 'pipe', 'pipe'] }
+    { encoding: 'utf8', env: cleanGitEnvironment(), stdio: ['ignore', 'pipe', 'pipe'] }
   ).trim()
   return {
     ledgerPath: path.join(commonDir, 'orca-no-mistakes', 'ledger.sqlite'),
@@ -1481,14 +1481,21 @@ function repositoryLocation(repositoryPath: string): { ledgerPath: string; repoR
   }
 }
 
-function repositoryGitEnvironment(): NodeJS.ProcessEnv {
+export function cleanGitEnvironment(): NodeJS.ProcessEnv {
   const environment = { ...process.env }
+  const exactKeys = new Set([
+    'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+    'GIT_COMMON_DIR',
+    'GIT_CONFIG',
+    'GIT_DIR',
+    'GIT_INDEX_FILE',
+    'GIT_OBJECT_DIRECTORY',
+    'GIT_PREFIX',
+    'GIT_QUARANTINE_PATH',
+    'GIT_WORK_TREE'
+  ])
   for (const key of Object.keys(environment)) {
-    if (
-      /^GIT_(?:ALTERNATE_OBJECT_DIRECTORIES|CONFIG(?:_|$)|DIR$|INDEX_FILE$|OBJECT_DIRECTORY|PREFIX$|PUSH_OPTION|QUARANTINE_PATH|WORK_TREE$)/u.test(
-        key
-      )
-    ) {
+    if (exactKeys.has(key) || key.startsWith('GIT_CONFIG_') || key.startsWith('GIT_PUSH_OPTION_')) {
       delete environment[key]
     }
   }

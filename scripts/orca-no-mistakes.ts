@@ -3538,12 +3538,16 @@ function isRepairableWorkerReportError(error: unknown): boolean {
 
 function repairWorkerReportLaunch(launch: WorkerLaunch): WorkerLaunch {
   const shape = `{"findings":[...],"summary":"...","tested":[...],"artifacts":[...]}`;
+  const delivery = deliveryChannel(launch.agent);
+  if (delivery === "orca" && !launch.reportPath?.trim()) {
+    throw new Error(`${launch.stage} worker report repair requires a report path`);
+  }
   return {
     ...launch,
     prompt: `${launch.prompt}
 
 REPORT REPAIR: the previous response did not produce a valid report. Retry the task and follow the delivery contract exactly.
-${deliveryInstruction(deliveryChannel(launch.agent), launch.reportPath ?? "", shape)}`,
+${deliveryInstruction(delivery, launch.reportPath ?? "", shape)}`,
     ...(launch.retainedWorktreeId || launch.terminal
       ? {
           retainedWorktreeId: undefined,
@@ -3880,7 +3884,12 @@ async function runReviewer(
           evidenceDir,
         );
       } catch (error) {
-        if (reportRetry >= WORKER_REPORT_RETRY_LIMIT) throw error;
+        if (
+          !isRepairableWorkerReportError(error) ||
+          reportRetry >= WORKER_REPORT_RETRY_LIMIT
+        ) {
+          throw error;
+        }
         reportRetry += 1;
         retryLaunches = [repairWorkerReportLaunch(outcome.launch)];
         continue;
@@ -4182,7 +4191,12 @@ async function runFixer(
         );
       } catch (error) {
         failure = error;
-        if (reportRetry >= WORKER_REPORT_RETRY_LIMIT) throw error;
+        if (
+          !isRepairableWorkerReportError(error) ||
+          reportRetry >= WORKER_REPORT_RETRY_LIMIT
+        ) {
+          throw error;
+        }
         reportRetry += 1;
         sessionToReuse = undefined;
         retainedSession = undefined;

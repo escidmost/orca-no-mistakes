@@ -174,8 +174,14 @@ test('the coordinator settles before custody acceptance when the pipeline run ca
       const row = ledger.submissionAdmission(admissionId)
       assert.equal(row?.status, 'failed')
       assert.equal(row?.run_id, null)
-      assert.throws(() =>
-        git(fixture.metadata.gatePath, 'rev-parse', '--verify', 'refs/orca-no-mistakes/heads/no-run')
+      assert.equal(
+        git(
+          fixture.metadata.gatePath,
+          'for-each-ref',
+          '--format=%(refname)',
+          'refs/orca-no-mistakes/heads/'
+        ),
+        ''
       )
     } finally {
       ledger.close()

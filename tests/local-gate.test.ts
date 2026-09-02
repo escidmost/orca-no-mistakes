@@ -149,7 +149,13 @@ test('the installed pre-receive hook rejects a tag before coordinator launch', a
           ],
           { stdio: 'pipe' }
         ),
-      /tag refs are not accepted|Command failed/
+      (error: unknown) => {
+        const stderr = (error as { stderr?: Buffer }).stderr
+        return (
+          Buffer.isBuffer(stderr) &&
+          /the local gate accepts only valid refs\/heads feature refs/u.test(stderr.toString())
+        )
+      }
     )
   } finally {
     await rm(temp, { force: true, recursive: true })

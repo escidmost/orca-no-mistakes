@@ -114,7 +114,7 @@ test('gate admit replays only accepted admissions, not launched ones', async () 
       baseBranch: 'main',
       branch: 'feature',
       intent,
-      policySha256: oid('c').slice(0, 64),
+      policySha256: 'c'.repeat(64),
       repoRoot: metadata.repoRoot,
       runId: 'gate-replay-run',
       submissionCommitOid: head
@@ -248,7 +248,7 @@ test('a repeated direct submission replays instead of relaunching a coordinator'
       baseBranch: 'main',
       branch: 'feature',
       intent: secondIntent,
-      policySha256: oid('c').slice(0, 64),
+      policySha256: 'c'.repeat(64),
       repoRoot: paths.repoRoot,
       runId: 'direct-replay-run',
       submissionCommitOid: head

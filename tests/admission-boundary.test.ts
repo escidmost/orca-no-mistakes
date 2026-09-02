@@ -121,7 +121,7 @@ writeFileSync(path.join(process.env.ORCA_NO_MISTAKES_HOME, 'env.json'), JSON.str
       }
     })
     let probe: { quarantine?: string; option?: string; secret?: string } | undefined
-    for (let attempt = 0; attempt < 40; attempt += 1) {
+    for (let attempt = 0; attempt < 120; attempt += 1) {
       try {
         probe = JSON.parse(await readFile(path.join(temp, 'env.json'), 'utf8'))
         break
@@ -129,6 +129,7 @@ writeFileSync(path.join(process.env.ORCA_NO_MISTAKES_HOME, 'env.json'), JSON.str
         await new Promise((resolve) => setTimeout(resolve, 25))
       }
     }
+    assert.notEqual(probe, undefined, 'detached coordinator did not write its environment probe')
     assert.deepEqual(probe, {})
   } finally {
     await rm(temp, { force: true, recursive: true })

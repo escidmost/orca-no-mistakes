@@ -15,6 +15,7 @@ import {
   launchLockPath,
   readGateMetadata,
   recordCoordinatorLaunch,
+  repositoryGatePaths,
   type GateMetadata
 } from '../scripts/admission.ts'
 import { DomainLedger } from '../scripts/ledger.ts'
@@ -41,32 +42,37 @@ const gateFixture = async (
   intent: string
 ): Promise<{ head: string; intent: string; metadata: GateMetadata; repo: string; temp: string }> => {
   const temp = await mkdtemp(path.join(tmpdir(), prefix))
-  execFileSync('git', ['init', '-b', 'main', path.join(temp, 'origin.git'), '--bare'], {
-    stdio: 'ignore'
-  })
-  execFileSync('git', ['init', '-b', 'main', path.join(temp, 'repo')], { stdio: 'ignore' })
-  const repo = await realpath(path.join(temp, 'repo'))
-  git(repo, 'config', 'user.email', 'test@example.com')
-  git(repo, 'config', 'user.name', 'Test User')
-  await commitAll(repo, 'base.txt', 'base\n', 'base')
-  git(repo, 'remote', 'add', 'origin', path.join(temp, 'origin.git'))
-  git(repo, 'push', '-q', 'origin', 'main')
-  git(repo, 'fetch', '-q', 'origin')
-  git(repo, 'checkout', '-b', 'feature')
-  await commitAll(repo, 'feature.txt', 'feature\n', 'feature')
-  git(repo, 'push', '-q', 'origin', 'feature')
-  const metadata = await initializeLocalGate(repo, process.argv[1]!)
-  execFileSync(
-    'git',
-    ['--git-dir', metadata.gatePath, 'fetch', '-q', repo, 'refs/heads/feature:refs/heads/feature'],
-    { stdio: 'ignore' }
-  )
-  return {
-    head: git(repo, 'rev-parse', 'HEAD'),
-    intent,
-    metadata: await readGateMetadata(metadata.gatePath),
-    repo,
-    temp
+  try {
+    execFileSync('git', ['init', '-b', 'main', path.join(temp, 'origin.git'), '--bare'], {
+      stdio: 'ignore'
+    })
+    execFileSync('git', ['init', '-b', 'main', path.join(temp, 'repo')], { stdio: 'ignore' })
+    const repo = await realpath(path.join(temp, 'repo'))
+    git(repo, 'config', 'user.email', 'test@example.com')
+    git(repo, 'config', 'user.name', 'Test User')
+    await commitAll(repo, 'base.txt', 'base\n', 'base')
+    git(repo, 'remote', 'add', 'origin', path.join(temp, 'origin.git'))
+    git(repo, 'push', '-q', 'origin', 'main')
+    git(repo, 'fetch', '-q', 'origin')
+    git(repo, 'checkout', '-b', 'feature')
+    await commitAll(repo, 'feature.txt', 'feature\n', 'feature')
+    git(repo, 'push', '-q', 'origin', 'feature')
+    const metadata = await initializeLocalGate(repo, process.argv[1]!)
+    execFileSync(
+      'git',
+      ['--git-dir', metadata.gatePath, 'fetch', '-q', repo, 'refs/heads/feature:refs/heads/feature'],
+      { stdio: 'ignore' }
+    )
+    return {
+      head: git(repo, 'rev-parse', 'HEAD'),
+      intent,
+      metadata: await readGateMetadata(metadata.gatePath),
+      repo,
+      temp
+    }
+  } catch (error) {
+    await rm(temp, { force: true, recursive: true })
+    throw error
   }
 }
 
@@ -140,8 +146,19 @@ test('direct submissions from a linked worktree follow the routed gate', async (
     git(fixture.repo, 'worktree', 'add', '-b', 'feature-b', worktree, 'main')
     await rejects(
       main(['run', '--attached', '--repo', worktree, '--intent', fixture.intent]),
-      (error: unknown) => error instanceof Error && !/the local gate is routed to/u.test(error.message)
+      /missing-orca-cli/
     )
+    const paths = repositoryGatePaths(worktree)
+    const admissionId = deriveAdmissionId({
+      gateIdentity: fixture.metadata.gateIdentity,
+      intent: fixture.intent,
+      newOid: git(worktree, 'rev-parse', 'HEAD'),
+      oldOid: git(worktree, 'rev-parse', 'HEAD'),
+      refName: 'refs/heads/feature-b'
+    })
+    const ledger = new DomainLedger({ repositoryPath: worktree })
+    strictEqual(ledger.submissionAdmission(admissionId)?.repo_root, paths.commonDir)
+    ledger.close()
   } finally {
     await rm(fixture.temp, { force: true, recursive: true })
     if (previousOrcaCommand === undefined) delete process.env.ORCA_CLI_COMMAND

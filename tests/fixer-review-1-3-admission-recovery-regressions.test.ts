@@ -10,12 +10,13 @@ import test from 'node:test'
 import {
   admissionReadinessPath,
   deriveAdmissionId,
+  deriveFallbackGateIdentity,
   initializeLocalGate,
   launchLockPath,
   recordCoordinatorLaunch,
   repositoryGatePaths
 } from '../scripts/admission.ts'
-import { canonicalJson, DomainLedger, sha256 } from '../scripts/ledger.ts'
+import { DomainLedger, sha256 } from '../scripts/ledger.ts'
 import { main } from '../scripts/orca-no-mistakes.ts'
 
 const oid = (character: string): string => character.repeat(40)
@@ -83,6 +84,8 @@ const fakeOrcaCli = async (temp: string, runId: string): Promise<string> => {
       '#!/bin/sh',
       'case "$*" in',
       `  *run-create*) echo '{"run":{"id":"${runId}"}}' ;;`,
+      '  *task-create*) echo \'{"task":{"id":"task-1"}}\' ;;',
+      '  *task-update*) echo \'{}\' ;;',
       '  *) exit 1 ;;',
       'esac',
       'exit 0'
@@ -98,29 +101,24 @@ const directAdmission = (
   head: string
 ): { admissionId: string; input: Parameters<DomainLedger['beginSubmissionAdmission']>[0] } => {
   const paths = repositoryGatePaths(repo)
-  const gateIdentity = sha256(canonicalJson({ gatePath: paths.gatePath, repoRoot: paths.repoRoot }))
+  const gateIdentity = deriveFallbackGateIdentity(paths)
+  const admissionId = deriveAdmissionId({
+    gateIdentity,
+    intent,
+    newOid: head,
+    oldOid: head,
+    refName: 'refs/heads/feature'
+  })
   return {
-    admissionId: deriveAdmissionId({
-      gateIdentity,
-      intent,
-      newOid: head,
-      oldOid: head,
-      refName: 'refs/heads/feature'
-    }),
+    admissionId,
     input: {
-      admissionId: deriveAdmissionId({
-        gateIdentity,
-        intent,
-        newOid: head,
-        oldOid: head,
-        refName: 'refs/heads/feature'
-      }),
+      admissionId,
       gateIdentity,
       intent,
       newOid: head,
       oldOid: head,
       refName: 'refs/heads/feature',
-      repoRoot: paths.repoRoot,
+      repoRoot: paths.commonDir,
       source: 'direct' as const
     }
   }
@@ -233,12 +231,12 @@ test('a materialized pipeline failure before acceptance reclaims the admission',
       branch: 'feature',
       intent: 'Hold the branch lease.',
       policySha256: sha256('policy'),
-      repoRoot: input.repoRoot,
+      repoRoot: fixture.repo,
       runId: 'lease-holder-run',
       submissionCommitOid: fixture.head
     })
     ledger.settleRun('lease-holder-run', 'failed')
-    ledger.acquireLease({ branch: 'feature', repoRoot: input.repoRoot, runId: 'lease-holder-run' })
+    ledger.acquireLease({ branch: 'feature', repoRoot: fixture.repo, runId: 'lease-holder-run' })
     ledger.close()
 
     await assert.rejects(
@@ -269,11 +267,10 @@ test('a materialized pipeline failure before acceptance reclaims the admission',
 })
 
 test('a same-head gate push consults the unfinished admission', async () => {
-  const temp = await mkdtemp(path.join(tmpdir(), 'onm-same-head-'))
   const freshIntent = 'Nothing unfinished for this head.'
   const intent = 'Re-engage an unfinished same-head admission.'
+  const fixture = await gateFixture('onm-same-head-', intent)
   try {
-    const fixture = await gateFixture('onm-same-head-', intent)
     const metadata = fixture.metadata
     const update = `${fixture.head} ${fixture.head} refs/heads/feature\n`
 
@@ -332,7 +329,7 @@ test('a same-head gate push consults the unfinished admission', async () => {
       true
     )
   } finally {
-    await rm(temp, { force: true, recursive: true })
+    await rm(fixture.temp, { force: true, recursive: true })
   }
 })
 

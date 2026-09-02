@@ -7,6 +7,7 @@ import test from 'node:test'
 
 import {
   deriveAdmissionId,
+  deriveFallbackGateIdentity,
   initializeLocalGate,
   repositoryGatePaths
 } from '../scripts/admission.ts'
@@ -36,10 +37,11 @@ test('admission rows are reused across ingress and retried under the retrying so
     await commitAll(repo, 'file.txt', 'first\n', 'first')
     const head = git(repo, 'rev-parse', 'HEAD')
     const paths = repositoryGatePaths(repo)
-    const gateIdentity = sha256(
-      canonicalJson({ gatePath: paths.gatePath, repoRoot: paths.repoRoot })
-    )
-    const linkedRoot = `${repo}-linked`
+    const gateIdentity = deriveFallbackGateIdentity(paths)
+    const linkedPath = path.join(temp, 'linked')
+    git(repo, 'worktree', 'add', '-b', 'linked', linkedPath, 'HEAD')
+    const linkedRoot = await realpath(linkedPath)
+    assert.equal(repositoryGatePaths(linkedRoot).commonDir, paths.commonDir)
     const admissionId = deriveAdmissionId({
       gateIdentity,
       intent,
@@ -58,23 +60,27 @@ test('admission rows are reused across ingress and retried under the retrying so
       source
     })
     const ledger = new DomainLedger({ repositoryPath: repo })
-    const gateRow = ledger.beginSubmissionAdmission(admissionInput(paths.repoRoot, 'gate'))
+    const gateRow = ledger.beginSubmissionAdmission(admissionInput(paths.commonDir, 'gate'))
     assert.equal(gateRow.status, 'pending')
-    const directRow = ledger.beginSubmissionAdmission(admissionInput(linkedRoot, 'direct'))
+    const directRow = ledger.beginSubmissionAdmission(
+      admissionInput(repositoryGatePaths(linkedRoot).commonDir, 'direct')
+    )
     assert.equal(directRow.admission_id, admissionId)
     assert.equal(directRow.status, 'pending')
     assert.equal(directRow.source, 'gate')
 
     ledger.failSubmissionAdmission(admissionId)
     assert.equal(ledger.submissionAdmission(admissionId)?.status, 'failed')
-    const retried = ledger.beginSubmissionAdmission(admissionInput(linkedRoot, 'direct'))
+    const retried = ledger.beginSubmissionAdmission(
+      admissionInput(repositoryGatePaths(linkedRoot).commonDir, 'direct')
+    )
     assert.equal(retried.status, 'pending')
     assert.equal(retried.source, 'direct')
 
     assert.throws(
       () =>
         ledger.beginSubmissionAdmission({
-          ...admissionInput(linkedRoot, 'direct'),
+          ...admissionInput(repositoryGatePaths(linkedRoot).commonDir, 'direct'),
           gateIdentity: sha256(
             canonicalJson({ gatePath: paths.gatePath, repoRoot: linkedRoot })
           )
@@ -98,14 +104,14 @@ test('admission rows are reused across ingress and retried under the retrying so
           newOid: oid('1'),
           oldOid: oid('1'),
           refName: 'refs/heads/feature',
-          repoRoot: paths.repoRoot,
+          repoRoot: paths.commonDir,
           source: 'gate'
         }),
       /pending admission lease already exists/
     )
 
     ledger.markSubmissionLaunched(admissionId)
-    const relaunched = ledger.beginSubmissionAdmission(admissionInput(paths.repoRoot, 'gate'))
+    const relaunched = ledger.beginSubmissionAdmission(admissionInput(paths.commonDir, 'gate'))
     assert.equal(relaunched.status, 'launched')
     ledger.close()
   } finally {
@@ -156,7 +162,7 @@ test('direct runs launch from linked worktrees sharing the repository gate', asy
       baseBranch: 'main',
       branch: 'feature2',
       intent,
-      policySha256: oid('c').slice(0, 64),
+      policySha256: 'c'.repeat(64),
       repoRoot: linkedRoot,
       runId: 'linked-worktree-run',
       submissionCommitOid: head

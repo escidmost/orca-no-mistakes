@@ -2569,28 +2569,6 @@ test("malformed reviewer findings fail closed and still clean up the worker", as
       ],
       summary: "malformed",
     },
-    {
-      findings: [
-        {
-          id: "bad-severity",
-          severity: "critical",
-          action: "auto-fix",
-          description: "This report is outside the schema.",
-        } as unknown as Finding,
-      ],
-      summary: "malformed",
-    },
-    {
-      findings: [
-        {
-          id: "bad-severity",
-          severity: "critical",
-          action: "auto-fix",
-          description: "This report is outside the schema.",
-        } as unknown as Finding,
-      ],
-      summary: "malformed",
-    },
   ]);
 
   await assert.rejects(
@@ -2599,7 +2577,7 @@ test("malformed reviewer findings fail closed and still clean up the worker", as
   );
 
   assert.ok(orca.calls.some((call) => call.startsWith("release:")));
-  assert.equal(orca.removedWorktrees.length, 3);
+  assert.equal(orca.removedWorktrees.length, 1);
 });
 
 test("a schema-invalid reviewer report gets one contract-repair retry", async () => {
@@ -2607,15 +2585,8 @@ test("a schema-invalid reviewer report gets one contract-repair retry", async ()
   const orca = new FakeOrca(git);
   orca.reports.set("review", [
     {
-      findings: [
-        {
-          id: "bad-severity",
-          severity: "critical",
-          action: "auto-fix",
-          description: "This report is outside the schema.",
-        } as unknown as Finding,
-      ],
-      summary: "malformed",
+      findings: [],
+      summary: "",
     },
     pass("review repaired"),
   ]);
@@ -2752,16 +2723,6 @@ test("reviewer artifacts must exist under the run evidence directory", async () 
       summary: "unsafe evidence",
       artifacts: ["/tmp/outside-evidence.log"],
     },
-    {
-      findings: [],
-      summary: "unsafe evidence",
-      artifacts: ["/tmp/outside-evidence.log"],
-    },
-    {
-      findings: [],
-      summary: "unsafe evidence",
-      artifacts: ["/tmp/outside-evidence.log"],
-    },
   ]);
 
   await assert.rejects(
@@ -2769,12 +2730,10 @@ test("reviewer artifacts must exist under the run evidence directory", async () 
     /review worker returned an unsafe artifact path/,
   );
   assert.ok(orca.calls.some((call) => call.startsWith("release:")));
-  assert.equal(orca.removedWorktrees.length, 3);
+  assert.equal(orca.removedWorktrees.length, 1);
 
   const missingOrca = new FakeOrca(git);
   missingOrca.reports.set("review", [
-    { findings: [], summary: "missing evidence", artifacts: ["missing.log"] },
-    { findings: [], summary: "missing evidence", artifacts: ["missing.log"] },
     { findings: [], summary: "missing evidence", artifacts: ["missing.log"] },
   ]);
   await assert.rejects(
@@ -2782,7 +2741,7 @@ test("reviewer artifacts must exist under the run evidence directory", async () 
     /review worker returned a missing artifact/,
   );
   assert.ok(missingOrca.calls.some((call) => call.startsWith("release:")));
-  assert.equal(missingOrca.removedWorktrees.length, 3);
+  assert.equal(missingOrca.removedWorktrees.length, 1);
 });
 
 test("reviewer URL references are not treated as local artifacts", async () => {
@@ -8915,6 +8874,7 @@ test("an invalid worker report gets one contract-repair retry", async () => {
       {
         name: "report-retry",
         prompt: "Review the change.",
+        reportPath: "/tmp/report-retry.json",
         role: "reviewer",
         stage: "review",
         worktree: "current",
@@ -8943,6 +8903,7 @@ test("an unreadable worker report gets one contract-repair retry", async () => {
       {
         name: "missing-report-retry",
         prompt: "Review the change.",
+        reportPath: "/tmp/missing-report-retry.json",
         role: "reviewer",
         stage: "review",
         worktree: "current",
@@ -8952,7 +8913,7 @@ test("an unreadable worker report gets one contract-repair retry", async () => {
 
   assert.equal(outcome.worker.report.summary, "review");
   assert.equal(orca.tasks.length, 2);
-  assert.match(orca.launches[1].prompt, /parent directory/i);
+  assert.match(orca.launches[1].prompt, /Create the parent directory if needed\./);
 });
 
 test("report repair preserves the selected fallback launch", async () => {
@@ -8979,6 +8940,7 @@ test("report repair preserves the selected fallback launch", async () => {
         agent: { harness: "candidate-b" },
         name: "candidate-b",
         prompt: "Try candidate B.",
+        reportPath: "/tmp/candidate-b-report.json",
         role: "reviewer",
         stage: "review",
         worktree: "current",
@@ -9015,7 +8977,33 @@ test("ACP report repair keeps the final-message delivery contract", async () => 
 
   const repairPrompt = orca.launches.at(-1)?.prompt ?? "";
   assert.match(repairPrompt, /Do not write a report file/);
-  assert.doesNotMatch(repairPrompt, /create the report parent directory/);
+  assert.doesNotMatch(repairPrompt, /Create the parent directory if needed\./);
+  assert.doesNotMatch(repairPrompt, /--report-path/);
+});
+
+test("Orca report repair requires a report path", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  orca.launchFailures.push(
+    new Error("worker dispatch-invalid returned an invalid report"),
+  );
+
+  await assert.rejects(
+    startWorkerWithFallback(
+      orca,
+      (launch) => orca.createTask(launch.prompt),
+      [
+        {
+          name: "missing-report-path",
+          prompt: "Review the change.",
+          role: "reviewer",
+          stage: "review",
+          worktree: "current",
+        },
+      ],
+    ),
+    /review worker report repair requires a report path/,
+  );
 });
 
 test("CliOrca retries twice when repaired report files are also missing", async () => {

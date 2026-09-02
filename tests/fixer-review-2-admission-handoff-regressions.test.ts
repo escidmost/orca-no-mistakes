@@ -181,7 +181,8 @@ test('accepted gate handoff releases nonce-bound launch custody', async () => {
         '--run-id',
         'gate-handoff-run',
         '--no-tui'
-      ])
+      ]),
+      /fake-orca/
     )
 
     assert.equal(existsSync(lockPath), false)
