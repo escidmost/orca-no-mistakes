@@ -67,10 +67,31 @@ import {
 } from "../scripts/ledger.ts";
 import { loadUserConfig } from "../scripts/config.ts";
 import { effectivePolicyHash } from "../scripts/policy.ts";
+import {
+  deriveAdmissionId,
+  deriveFallbackGateIdentity,
+  repositoryGatePaths,
+} from "../scripts/admission.ts";
 
 process.env.WORKER_SHELL_STARTUP_DELAY_MS ??= "0";
 
 const pass = (summary = "passed"): StageReport => ({ findings: [], summary });
+
+const failSyntheticDetachedAdmission = (repo: string, intent: string): void => {
+  const paths = repositoryGatePaths(repo);
+  const head = git(repo, "rev-parse", "HEAD");
+  const branch = git(repo, "branch", "--show-current");
+  const admissionId = deriveAdmissionId({
+    gateIdentity: deriveFallbackGateIdentity(paths),
+    intent,
+    newOid: head,
+    oldOid: head,
+    refName: `refs/heads/${branch}`,
+  });
+  const ledger = new DomainLedger({ repositoryPath: repo });
+  ledger.failSubmissionAdmission(admissionId);
+  ledger.close();
+};
 
 class FakeGit implements GitOperations {
   readonly calls: string[] = [];
@@ -1778,6 +1799,7 @@ test("an invalid fixer report preserves its error when cleanup also fails", asyn
       summary: "one defect",
     },
     { findings: [], summary: "" },
+    { findings: [], summary: "" },
   ]);
 
   await assert.rejects(
@@ -1865,7 +1887,11 @@ test("a failed run surfaces retained fixer cleanup failure with the stage error 
     pass("fix committed"),
     pass("clean rereview"),
   ]);
-  orca.reports.set("test", [{ findings: [], summary: "" }]);
+  orca.reports.set("test", [
+    { findings: [], summary: "" },
+    { findings: [], summary: "" },
+    { findings: [], summary: "" },
+  ]);
 
   await assert.rejects(
     runPipeline({ intent: "Preserve stage and cleanup failures." }, orca, git),
@@ -2554,6 +2580,26 @@ test("malformed reviewer findings fail closed and still clean up the worker", as
   assert.equal(orca.removedWorktrees.length, 1);
 });
 
+test("a schema-invalid reviewer report gets one contract-repair retry", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  orca.reports.set("review", [
+    {
+      findings: [],
+      summary: "",
+    },
+    pass("review repaired"),
+  ]);
+
+  await runPipeline({ intent: "Repair schema-invalid reviewer reports." }, orca, git);
+
+  const reviewLaunches = orca.launches.filter(
+    (launch) => launch.role === "reviewer" && launch.stage === "review",
+  );
+  assert.equal(reviewLaunches.length, 2);
+  assert.match(reviewLaunches[1].prompt, /REPORT REPAIR/);
+});
+
 test("reviewer findings without an action are conservatively escalated", async () => {
   const git = new FakeGit();
   const orca = new FakeOrca(git);
@@ -2791,6 +2837,8 @@ test("detached run selects the Run TUI by default and preserves explicit opt-out
   const callsPath = path.join(temp, "calls.jsonl");
   const previousCommand = process.env.ORCA_CLI_COMMAND;
   const previousHandle = process.env.ORCA_TERMINAL_HANDLE;
+  const previousConfigDir = process.env.ORCA_NO_MISTAKES_CONFIG_DIR;
+  const previousConfig = process.env.ORCA_NO_MISTAKES_USER_CONFIG;
   try {
     git(temp, "init", "--bare", origin);
     git(temp, "clone", origin, repo);
@@ -2835,6 +2883,11 @@ console.log(JSON.stringify({ result }))
     await chmod(fakeOrca, 0o755);
     process.env.ORCA_CLI_COMMAND = fakeOrca;
     process.env.ORCA_TERMINAL_HANDLE = "originating-opencode";
+    process.env.ORCA_NO_MISTAKES_USER_CONFIG = path.join(
+      temp,
+      "missing-user-config.yaml",
+    );
+    process.env.ORCA_NO_MISTAKES_CONFIG_DIR = path.join(temp, "config-dir");
 
     await main([
       "run",
@@ -2842,6 +2895,7 @@ console.log(JSON.stringify({ result }))
       "--intent=Validate detached coordination.",
       "--allow-local-config",
     ]);
+    failSyntheticDetachedAdmission(repo, "Validate detached coordination.");
     await rm(path.join(repo, ".orca"), { recursive: true, force: true });
     await main([
       "run",
@@ -2903,6 +2957,16 @@ console.log(JSON.stringify({ result }))
     assert.ok(
       commandText.includes(`NO_MISTAKES_ORIGIN_WORKTREE='${canonicalRepo}'`),
     );
+    assert.ok(
+      commandText.includes(
+        `ORCA_NO_MISTAKES_USER_CONFIG='${path.join(temp, "missing-user-config.yaml")}'`,
+      ),
+    );
+    assert.ok(
+      commandText.includes(
+        `ORCA_NO_MISTAKES_CONFIG_DIR='${path.join(temp, "config-dir")}'`,
+      ),
+    );
     assert.ok(commandText.includes("NO_MISTAKES_DELIVERY_BRANCH='feature'"));
     assert.ok(commandText.includes("NO_MISTAKES_STARTUP_RECEIPT="));
     assert.ok(commandText.includes("'--notify' 'originating-opencode'"));
@@ -2920,6 +2984,12 @@ console.log(JSON.stringify({ result }))
     else process.env.ORCA_CLI_COMMAND = previousCommand;
     if (previousHandle === undefined) delete process.env.ORCA_TERMINAL_HANDLE;
     else process.env.ORCA_TERMINAL_HANDLE = previousHandle;
+    if (previousConfigDir === undefined)
+      delete process.env.ORCA_NO_MISTAKES_CONFIG_DIR;
+    else process.env.ORCA_NO_MISTAKES_CONFIG_DIR = previousConfigDir;
+    if (previousConfig === undefined)
+      delete process.env.ORCA_NO_MISTAKES_USER_CONFIG;
+    else process.env.ORCA_NO_MISTAKES_USER_CONFIG = previousConfig;
     await rm(temp, { recursive: true, force: true });
   }
 });
@@ -3004,6 +3074,10 @@ console.log(JSON.stringify({ result }))
       `--repo=${repo}`,
       "--intent=Validate configured detached coordination.",
     ]);
+    failSyntheticDetachedAdmission(
+      repo,
+      "Validate configured detached coordination.",
+    );
     assert.ok(Date.now() - launchStartedAt >= 75);
 
     const [runId] = await readdir(root);
@@ -6158,9 +6232,13 @@ test("GitShell rejects protected fixer changes but permits new test files", asyn
     await assertWorkerChangesAllowed();
 
     git(worker, "reset", "--hard", featureHead);
+    const preflight = coordinatorSource.match(
+      /^(\s*)const (repo|repoState) = await git\.assertReady\(\);$/mu,
+    );
+    assert.ok(preflight, "mutation setup failed: runtime preflight was not found");
     const relocatedPreflight = coordinatorSource.replace(
-      "    const repoState = await git.assertReady();",
-      "      const repoState = await git.assertReady();",
+      preflight[0],
+      `${preflight[1]}  const ${preflight[2]} = await git.assertReady();`,
     );
     assert.notEqual(
       relocatedPreflight,
@@ -6358,6 +6436,8 @@ test("a failed fixer leaves its worktree commits anchored for recovery", async (
       summary: "one defect",
     },
     { findings: "bogus", summary: "x" } as unknown as StageReport,
+    { findings: "bogus", summary: "x" } as unknown as StageReport,
+    { findings: "bogus", summary: "x" } as unknown as StageReport,
     pass("never reached"),
   ]);
   await assert.rejects(
@@ -6373,6 +6453,36 @@ test("a failed fixer leaves its worktree commits anchored for recovery", async (
     "the failed fixer's commits are anchored under a recovery ref",
   );
   assert.ok(orca.removedWorktrees.length > 0);
+});
+
+test("a schema-invalid fixer report gets one contract-repair retry", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFix(git);
+  const orca = new FakeOrca(git);
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "review-1",
+          severity: "error",
+          action: "auto-fix",
+          description: "Repair the implementation.",
+        },
+      ],
+      summary: "one defect",
+    },
+    { findings: "bogus", summary: "x" } as unknown as StageReport,
+    pass("fix repaired"),
+    pass("clean rereview"),
+  ]);
+
+  await runPipeline({ intent: "Repair schema-invalid fixer reports." }, orca, git);
+
+  const fixerLaunches = orca.launches.filter(
+    (launch) => launch.role === "fixer" && launch.stage === "review",
+  );
+  assert.equal(fixerLaunches.length, 2);
+  assert.match(fixerLaunches[1].prompt, /REPORT REPAIR/);
 });
 
 test("stage evidence binds to the reviewer's pinned commit even if the branch advances", async () => {
@@ -8746,6 +8856,234 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     );
   } finally {
     restoreHomes();
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("an invalid worker report gets one contract-repair retry", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  orca.launchFailures.push(
+    new Error("worker dispatch-invalid returned an invalid report"),
+  );
+
+  const outcome = await startWorkerWithFallback(
+    orca,
+    (launch) => orca.createTask(launch.prompt),
+    [
+      {
+        name: "report-retry",
+        prompt: "Review the change.",
+        reportPath: "/tmp/report-retry.json",
+        role: "reviewer",
+        stage: "review",
+        worktree: "current",
+      },
+    ],
+  );
+
+  assert.equal(outcome.worker.report.summary, "review");
+  assert.equal(orca.tasks.length, 2);
+  assert.match(orca.launches[1].prompt, /REPORT REPAIR/);
+});
+
+test("an unreadable worker report gets one contract-repair retry", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  orca.launchFailures.push(
+    new Error(
+      "worker dispatch-missing report could not be read: Error: ENOENT: no such file or directory",
+    ),
+  );
+
+  const outcome = await startWorkerWithFallback(
+    orca,
+    (launch) => orca.createTask(launch.prompt),
+    [
+      {
+        name: "missing-report-retry",
+        prompt: "Review the change.",
+        reportPath: "/tmp/missing-report-retry.json",
+        role: "reviewer",
+        stage: "review",
+        worktree: "current",
+      },
+    ],
+  );
+
+  assert.equal(outcome.worker.report.summary, "review");
+  assert.equal(orca.tasks.length, 2);
+  assert.match(orca.launches[1].prompt, /Create the parent directory if needed\./);
+});
+
+test("report repair preserves the selected fallback launch", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  orca.launchFailures.push(
+    new PreflightError("auth", "candidate A is unavailable"),
+    new Error("worker candidate B report could not be read: missing report"),
+  );
+
+  const outcome = await startWorkerWithFallback(
+    orca,
+    (launch) => orca.createTask(launch.prompt),
+    [
+      {
+        agent: { harness: "candidate-a" },
+        name: "candidate-a",
+        prompt: "Try candidate A.",
+        role: "reviewer",
+        stage: "review",
+        worktree: "current",
+      },
+      {
+        agent: { harness: "candidate-b" },
+        name: "candidate-b",
+        prompt: "Try candidate B.",
+        reportPath: "/tmp/candidate-b-report.json",
+        role: "reviewer",
+        stage: "review",
+        worktree: "current",
+      },
+    ],
+  );
+
+  assert.equal(outcome.attempts.length, 1);
+  assert.equal(outcome.launch.agent?.harness, "candidate-b");
+  assert.match(orca.launches.at(-1)?.prompt ?? "", /Try candidate B/);
+});
+
+test("ACP report repair keeps the final-message delivery contract", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  orca.launchFailures.push(
+    new Error("worker acp-1 returned an invalid report"),
+  );
+
+  await startWorkerWithFallback(
+    orca,
+    (launch) => orca.createTask(launch.prompt),
+    [
+      {
+        agent: { harness: "acp:test" },
+        name: "acp-report-repair",
+        prompt: "Return the review.",
+        role: "reviewer",
+        stage: "review",
+        worktree: "current",
+      },
+    ],
+  );
+
+  const repairPrompt = orca.launches.at(-1)?.prompt ?? "";
+  assert.match(repairPrompt, /Do not write a report file/);
+  assert.doesNotMatch(repairPrompt, /Create the parent directory if needed\./);
+  assert.doesNotMatch(repairPrompt, /--report-path/);
+});
+
+test("Orca report repair requires a report path", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  orca.launchFailures.push(
+    new Error("worker dispatch-invalid returned an invalid report"),
+  );
+
+  await assert.rejects(
+    startWorkerWithFallback(
+      orca,
+      (launch) => orca.createTask(launch.prompt),
+      [
+        {
+          name: "missing-report-path",
+          prompt: "Review the change.",
+          role: "reviewer",
+          stage: "review",
+          worktree: "current",
+        },
+      ],
+    ),
+    /review worker report repair requires a report path/,
+  );
+});
+
+test("CliOrca retries twice when repaired report files are also missing", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-real-report-retry-"));
+  const fakeOrca = path.join(temp, "orca");
+  const statePath = path.join(temp, "state");
+  const runId = `real-report-retry-${randomUUID()}`;
+  const reportPath = path.join(
+    artifactsRoot(),
+    runId,
+    "review.json",
+  );
+  try {
+    await writeFile(
+      fakeOrca,
+      `#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+const statePath = ${JSON.stringify(statePath)}
+const reportPath = ${JSON.stringify(reportPath)}
+const increment = (key) => {
+  const state = fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, 'utf8')) : {}
+  state[key] = (state[key] ?? 0) + 1
+  fs.writeFileSync(statePath, JSON.stringify(state))
+  return state[key]
+}
+const out = (result) => console.log(JSON.stringify({ result }))
+if (args[0] === 'orchestration' && args[1] === 'run-create') {
+  out({ run: { id: ${JSON.stringify(runId)} } })
+} else if (args[0] === 'orchestration' && args[1] === 'task-create') {
+  out({ task: { id: 'task-' + increment('tasks') } })
+} else if (args[0] === 'terminal' && args[1] === 'create') {
+  out({ terminal: { handle: 'real-report-terminal' } })
+} else if (args[0] === 'terminal' && args[1] === 'show') {
+  out({ terminal: { connected: true, title: 'OpenCode', preview: 'ready' } })
+} else if (args[0] === 'terminal' && args[1] === 'send') {
+  out({ accepted: true })
+} else if (args[0] === 'orchestration' && args[1] === 'dispatch') {
+  const dispatch = increment('dispatches')
+  out({ dispatch: { id: 'dispatch-' + dispatch, status: 'dispatched' }, injected: true, preamble: 'authenticated' })
+} else if (args[0] === 'orchestration' && args[1] === 'check' && args.includes('--wait')) {
+  const check = increment('checks')
+  const attempt = Math.min(check, 3)
+  if (check === 3) {
+    fs.mkdirSync(${JSON.stringify(path.dirname(reportPath))}, { recursive: true })
+    fs.writeFileSync(reportPath, JSON.stringify({ findings: [], summary: 'repaired' }))
+  }
+  out({ deliveryId: 'delivery-' + attempt, messages: [{ type: 'worker_done', body: 'done', payload: JSON.stringify({ taskId: 'task-' + attempt, dispatchId: 'dispatch-' + attempt, outcome: 'succeeded', reportPath }) }] })
+} else {
+  out({ ok: true })
+}
+`,
+    );
+    await chmod(fakeOrca, 0o755);
+    const orca = new CliOrca({ command: fakeOrca, cwd: temp });
+    await orca.createRun("real report retry");
+    const outcome = await startWorkerWithFallback(
+      orca,
+      (launch) => orca.createTask(launch.prompt),
+      [
+        {
+          name: "real-report-retry",
+          prompt: "Review the change.",
+          role: "reviewer",
+          stage: "review",
+          worktree: "current",
+          reportPath,
+        },
+      ],
+    );
+    assert.equal(outcome.worker.report.summary, "repaired");
+    assert.equal(outcome.reportRetries, 2);
+    const state = JSON.parse(await readFile(statePath, "utf8")) as {
+      tasks: number;
+      dispatches: number;
+    };
+    assert.equal(state.tasks, 3);
+    assert.equal(state.dispatches, 3);
+  } finally {
+    await rm(path.join(artifactsRoot(), runId), { recursive: true, force: true });
     await rm(temp, { recursive: true, force: true });
   }
 });

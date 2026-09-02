@@ -84,6 +84,33 @@ import {
 } from "./presentation.ts";
 import { createRunRenderer } from "./tui.ts";
 import {
+  admissionReadinessPath,
+  anchorPermanentRef,
+  awaitAdmissionLaunch,
+  beginGateAdmission,
+  decodeIntentPushOption,
+  deriveAdmissionId,
+  deriveFallbackGateIdentity,
+  ensureCustodyLaunch,
+  initializeLocalGate,
+  isProcessAlive,
+  launchDetachedCoordinator,
+  launchLockPath,
+  parseReceiveUpdates,
+  readGateMetadata,
+  readGateRef,
+  recordCoordinatorLaunch,
+  releaseAdmissionLaunch,
+  repositoryGatePaths,
+  validateQuarantinedCommit,
+  validateReceiveUpdate,
+  waitForPermanentRef,
+  writeLaunchReadiness,
+  type GateMetadata,
+  type LaunchReadiness,
+  type ReceiveUpdate,
+} from "./admission.ts";
+import {
   DestinationActiveMigrationError,
   DomainLedger,
   LegacyActiveMigrationError,
@@ -93,6 +120,7 @@ import {
   StageLog,
   artifactsRoot,
   buildAttestation,
+  canonicalJson,
   capLog,
   evidenceSha256,
   gateAuditMatchesEvidence,
@@ -112,6 +140,7 @@ import {
   type StageCheckpointRow,
   type StageEvidenceRow,
   type StageEvidenceManifestEntry,
+  type SubmissionAdmissionRow,
 } from "./ledger.ts";
 export {
   DomainLedger,
@@ -126,6 +155,7 @@ export {
   type PassedAttestationManifest,
   type StageEvidenceManifestEntry,
 } from "./ledger.ts";
+export * from "./admission.ts";
 export * from "./presentation.ts";
 export type FindingAction = "ask-user" | "auto-fix" | "no-op";
 
@@ -198,6 +228,7 @@ type WorkerRegistration = (() => void | Promise<void>) & {
   ready?: Promise<void>;
 };
 type WorkerAllocated = (worker: WorkerResult) => WorkerRegistration;
+type WorkerReportFailure = (worker: WorkerResult, error: Error) => Promise<void>;
 
 export interface OrcaOperations {
   createRun(objective: string): Promise<string>;
@@ -212,6 +243,7 @@ export interface OrcaOperations {
     launch: WorkerLaunch,
     fence?: TimeoutFence,
     onAllocated?: WorkerAllocated,
+    onReportFailure?: WorkerReportFailure,
   ): Promise<WorkerResult>;
   finishWorker(
     worker: WorkerResult,
@@ -287,6 +319,12 @@ export interface GitOperations {
 }
 
 export type PipelineOptions = {
+  admission?: {
+    admissionId: string;
+    newOid: string;
+    runId?: string;
+    source: "direct" | "gate";
+  };
   allowLocalConfig?: boolean;
   cliFlags?: CliFlags;
   configPath?: string;
@@ -985,7 +1023,7 @@ function startupReceiptPid(
 async function waitForStartupReceipt(
   markerFile: string,
   token: string,
-): Promise<void> {
+): Promise<number | undefined> {
   const deadline = Date.now() + 60_000;
   for (;;) {
     let text: string | undefined;
@@ -1007,9 +1045,9 @@ async function waitForStartupReceipt(
     if (pid !== undefined) {
       try {
         process.kill(pid, 0);
-        return;
+        return pid;
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ESRCH") return;
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") return pid;
         throw new Error("detached coordinator exited during startup");
       }
     }
@@ -1626,6 +1664,16 @@ class WorkerCleanupError extends Error {}
 
 class ResumableStageError extends Error {}
 
+class WorkerReportError extends Error {
+  readonly worker: WorkerResult;
+
+  constructor(message: string, worker: WorkerResult) {
+    super(message);
+    this.worker = worker;
+    this.name = "WorkerReportError";
+  }
+}
+
 export class RecoveryAnchorError extends Error {
   readonly outcome: "cancelled" | "failed";
 
@@ -1784,6 +1832,56 @@ export async function runPipeline(
     ? "[uncertified: local config bypass] "
     : "";
   const policySha256Value = await git.policySha256(repo.base);
+  const admission = options.admission
+    ? ledger.submissionAdmission(options.admission.admissionId)
+    : undefined;
+  if (options.admission && !admission) {
+    throw new Error(`unknown submission admission ${options.admission.admissionId}`);
+  }
+  if (
+    options.admission &&
+    admission &&
+    (admission.new_oid !== options.admission.newOid ||
+      (options.admission.runId !== undefined &&
+        admission.run_id !== null &&
+        admission.run_id !== options.admission.runId) ||
+      admission.status === "failed" ||
+      admission.status === "superseded")
+  ) {
+    throw new Error("submission admission is not ready for pipeline execution");
+  }
+  if (
+    options.admission &&
+    admission &&
+    !options.resumeRunId
+  ) {
+    if (`refs/heads/${deliveryRepo.branch}` !== admission.ref_name) {
+      throw new Error(
+        `the pipeline checkout is on ${deliveryRepo.branch} but the admission is for ${admission.ref_name}`,
+      );
+    }
+    const checkoutRepository = path.resolve(
+      repositoryGatePaths(deliveryRepo.root).commonDir,
+    );
+    let admittedRepository = path.resolve(admission.repo_root);
+    if (admittedRepository !== checkoutRepository) {
+      try {
+        admittedRepository = path.resolve(
+          repositoryGatePaths(admission.repo_root).commonDir,
+        );
+      } catch {}
+    }
+    if (admittedRepository !== checkoutRepository) {
+      throw new Error(
+        "the pipeline checkout does not belong to the admitted repository",
+      );
+    }
+    if (repo.head !== admission.new_oid) {
+      throw new Error(
+        "the pipeline checkout does not match the admitted submission object",
+      );
+    }
+  }
   let domainRunStarted = false;
   let generationToken: number | undefined;
   let presentation!: PresentationPublisher;
@@ -1820,7 +1918,8 @@ export async function runPipeline(
     });
   };
   const { artifactsDir, runId } = await withGateMutation(async () => {
-    const orchestrationRunId = await orca.createRun(`no-mistakes: ${intent}`);
+    const orchestrationRunId =
+      options.admission?.runId ?? (await orca.createRun(`no-mistakes: ${intent}`));
     const runId = options.resumeRunId ?? orchestrationRunId;
     const artifactsBase = artifactsRoot();
     const artifactsDir = path.resolve(artifactsBase, runId);
@@ -1886,9 +1985,12 @@ export async function runPipeline(
           policySha256: policySha256Value,
           repoRoot: deliveryRepo.root,
           runId,
-          submissionCommitOid: deliveryRepo.head,
+          submissionCommitOid: options.admission?.newOid ?? deliveryRepo.head,
         });
         domainRunStarted = true;
+        if (options.admission) {
+          ledger.bindSubmissionAdmission(options.admission.admissionId, runId);
+        }
       }
       const statusRenderer = options.rendererFactory?.(
         artifactsDir,
@@ -1998,6 +2100,23 @@ export async function runPipeline(
         resumeClaimId,
         runId,
       });
+      if (!options.resumeRunId && options.admission) {
+        const acceptedAdmission = ledger.markSubmissionAccepted({
+          acceptedOid: options.admission.newOid,
+          admissionId: options.admission.admissionId,
+          runId,
+        });
+        if (acceptedAdmission.source === "gate") {
+          await releaseAdmissionLaunch(
+            launchLockPath(
+              admissionReadinessPath(
+                repositoryGatePaths(deliveryRepo.root),
+                acceptedAdmission.admission_id,
+              ),
+            ),
+          ).catch(() => undefined);
+        }
+      }
     } catch (error) {
       if (domainRunStarted) {
         const ownership = generationToken === undefined
@@ -3399,21 +3518,63 @@ export type FallbackAttempt = {
 
 export type WorkerLaunchOutcome = {
   attempts: FallbackAttempt[];
+  launch: WorkerLaunch;
+  reportRetries: number;
   resolvedAgent: string;
   worker: WorkerResult;
 };
 
+// ponytail: two repair retries; repeated invalid or unreadable output remains a hard failure.
+const WORKER_REPORT_RETRY_LIMIT = 2;
+
+function isRepairableWorkerReportError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    /(?:returned an invalid report|report could not be read)(?:$|:)/u.test(
+      error.message,
+    )
+  );
+}
+
+function repairWorkerReportLaunch(launch: WorkerLaunch): WorkerLaunch {
+  const shape = `{"findings":[...],"summary":"...","tested":[...],"artifacts":[...]}`;
+  const delivery = deliveryChannel(launch.agent);
+  if (delivery === "orca" && !launch.reportPath?.trim()) {
+    throw new Error(`${launch.stage} worker report repair requires a report path`);
+  }
+  return {
+    ...launch,
+    prompt: `${launch.prompt}
+
+REPORT REPAIR: the previous response did not produce a valid report. Retry the task and follow the delivery contract exactly.
+${deliveryInstruction(delivery, launch.reportPath ?? "", shape)}`,
+    ...(launch.retainedWorktreeId || launch.terminal
+      ? {
+          retainedWorktreeId: undefined,
+          retainedWorktreePath: undefined,
+          terminal: undefined,
+          worktree: "new-child" as const,
+        }
+      : {}),
+  };
+}
+
 // Iterates an ordered fallback chain. Only PreflightError (launch/readiness/
 // dispatch failures before a candidate accepts the task) advances to the next
-// candidate; execution-phase errors propagate immediately. Each candidate gets
-// its own child task so the injected spec always carries that candidate's
-// delivery instructions.
+// candidate; execution-phase errors propagate immediately. An invalid or
+// unreadable report gets up to two fresh tasks with an explicit contract reminder
+// before it propagates.
+// Each candidate gets its own child task so the injected spec always carries
+// that candidate's delivery instructions.
 export async function startWorkerWithFallback(
   orca: OrcaOperations,
   createTask: (launch: WorkerLaunch) => Promise<string>,
   launches: WorkerLaunch[],
   onPreflightFailure?: (index: number) => Promise<void>,
   fence?: TimeoutFence,
+  onReportRetry?: (launch: WorkerLaunch) => Promise<void>,
+  reportRetry = 0,
+  onReportFailure?: WorkerReportFailure,
 ): Promise<WorkerLaunchOutcome> {
   if (launches.length === 0)
     throw new Error("no agent configured for this role");
@@ -3467,17 +3628,46 @@ export async function startWorkerWithFallback(
             }
           },
         },
-        () => orca.startWorker(taskId, launch, fence, onAllocated),
+        () =>
+          orca.startWorker(
+            taskId,
+            launch,
+            fence,
+            onAllocated,
+            onReportFailure,
+          ),
       );
       if (!allocated) onAllocated(worker);
       await allocationRegistration?.ready;
       return {
         attempts,
+        launch,
+        reportRetries: reportRetry,
         resolvedAgent: launch.agent?.harness ?? DEFAULT_WORKER_AGENT,
         worker,
       };
     } catch (error) {
       finishAllocation();
+      if (
+        isRepairableWorkerReportError(error) &&
+        reportRetry < WORKER_REPORT_RETRY_LIMIT
+      ) {
+        await onReportRetry?.(launch);
+        const retryOutcome = await startWorkerWithFallback(
+          orca,
+          createTask,
+          [repairWorkerReportLaunch(launch)],
+          undefined,
+          fence,
+          onReportRetry,
+          reportRetry + 1,
+          onReportFailure,
+        );
+        return {
+          ...retryOutcome,
+          attempts: [...attempts, ...retryOutcome.attempts],
+        };
+      }
       if (
         !allocated &&
         error instanceof PreflightError &&
@@ -3668,40 +3858,60 @@ async function runReviewer(
       worktree: "new-child",
     };
   });
-  const outcome = await startWorkerWithFallback(
-    orca,
-    (launch) =>
-      orca.createTask(`[${stage} check ${attempt + 1}]\n${launch.prompt}`, {
-        parent: parentTask,
-      }),
-    launches,
-    undefined,
-    fence,
-  );
-  const worker = outcome.worker;
-  try {
-    const validatedReport = await validateReport(
-      worker.report,
-      stage,
-      evidenceDir,
+  let retryLaunches = launches;
+  let reportRetry = 0;
+  for (;;) {
+    const outcome = await startWorkerWithFallback(
+      orca,
+      (launch) =>
+        orca.createTask(`[${stage} check ${attempt + 1}]\n${launch.prompt}`, {
+          parent: parentTask,
+        }),
+      retryLaunches,
+      undefined,
+      fence,
+      undefined,
+      reportRetry,
     );
-    if (worker.failedOutcome === true) {
-      throw new Error(
-        `${stage} worker failed after writing report: ${validatedReport.summary}`,
-      );
+    const worker = outcome.worker;
+    reportRetry = outcome.reportRetries;
+    try {
+      let validatedReport: StageReport;
+      try {
+        validatedReport = await validateReport(
+          worker.report,
+          stage,
+          evidenceDir,
+        );
+      } catch (error) {
+        if (
+          !isRepairableWorkerReportError(error) ||
+          reportRetry >= WORKER_REPORT_RETRY_LIMIT
+        ) {
+          throw error;
+        }
+        reportRetry += 1;
+        retryLaunches = [repairWorkerReportLaunch(outcome.launch)];
+        continue;
+      }
+      if (worker.failedOutcome === true) {
+        throw new Error(
+          `${stage} worker failed after writing report: ${validatedReport.summary}`,
+        );
+      }
+      return {
+        exitCode: exitCodeFor(validatedReport),
+        report: validatedReport,
+        workerIdentity: `reviewer:${worker.dispatchId}`,
+        resolvedAgent: outcome.resolvedAgent,
+        ...(outcome.attempts.length > 0
+          ? { fallbackAttempts: outcome.attempts }
+          : {}),
+        evidenceCommitOid: untrusted.headOid,
+      };
+    } finally {
+      await releaseReviewerWorker(worker, orca, stage);
     }
-    return {
-      exitCode: exitCodeFor(validatedReport),
-      report: validatedReport,
-      workerIdentity: `reviewer:${worker.dispatchId}`,
-      resolvedAgent: outcome.resolvedAgent,
-      ...(outcome.attempts.length > 0
-        ? { fallbackAttempts: outcome.attempts }
-        : {}),
-      evidenceCommitOid: untrusted.headOid,
-    };
-  } finally {
-    await releaseReviewerWorker(worker, orca, stage);
   }
 }
 
@@ -3914,123 +4124,176 @@ async function runFixer(
       worktree: reuseSession ? "current" : "new-child",
     };
   });
-  const outcome = await startWorkerWithFallback(
-    orca,
-    (launch) =>
-      orca.createTask(`[${stage} fix ${round}]\n${launch.prompt}`, {
-        parent: parentTask,
-      }),
-    launches,
-    async (index) => {
-      if (!sessionToReuse || index !== 0) return;
-      retainedSession = undefined;
-      await releaseFixerSession(sessionToReuse, orca);
-    },
-    fence,
-  );
-  const worker = outcome.worker;
-  const worktreePath =
-    worker.worktreePath ?? retainedSession?.worker.worktreePath;
-  const worktreeId = worker.worktreeId ?? retainedSession?.worker.worktreeId;
-  let workerHead: string | undefined;
-  let retainWorker = false;
-  let failure: unknown;
-  try {
-    const validatedReport = await validateFixerReport(
-      worker.report,
-      stage,
-      path.dirname(reportPath),
-    );
-    if (!worktreePath) {
-      throw new Error(`${stage} fixer did not return a worktree path`);
-    }
-    workerHead = await git.headOf(worktreePath);
-    if (before === workerHead) {
-      throw new FixerNoChangeError(validatedReport, stage);
-    }
-    const verdict = await git.assertFixerChangesAllowed(
-      worktreePath,
-      before,
-      workerHead,
-      guardrails,
-    );
-    if (verdict !== undefined && !verdict.changed) {
-      throw new FixerNoChangeError(validatedReport, stage);
-    }
-    if (fence.aborted) {
-      // The execution timeout already failed this stage; refuse late mutations
-      // so a delayed worker cannot apply commits into a settled run.
-      throw new Error(`${stage} fixer timed out; commits were not applied`);
-    }
-    const expectedWorkerHead = workerHead;
-    const after = await withGateMutation(async () => {
-      if (
-        !(await git.applyWorktreeCommits(
-          worktreePath,
-          before,
-          expectedWorkerHead,
-          fence,
-        ))
-      ) {
-        throw new Error(`${stage} fixer could not apply its committed change`);
-      }
-      fence.deadlineSatisfied = true;
-      const after = await git.head();
-      if (after !== expectedWorkerHead) {
-        throw new PostMutationCustodyError(
-          `${stage} fixer custody ended at unexpected HEAD ${after}; expected ${expectedWorkerHead}`,
-        );
-      }
-      return after;
-    });
-    const terminalHandle =
-      worker.terminalHandle ?? retainedSession?.worker.terminalHandle;
-    if (terminalHandle && worktreeId) {
-      worker.terminalHandle = terminalHandle;
-      worker.worktreeId = worktreeId;
-      worker.worktreePath = worktreePath;
-      try {
-        await orca.finishWorker(worker, "retain");
-        worker.deliveryId = undefined;
-        retainWorker = true;
-      } catch {
-        // The round succeeded, but this worker cannot safely be reused.
-      }
-    }
-    return {
-      after,
-      before,
-      guardrailViolations: verdict?.guardrailViolations ?? [],
-      resolvedAgent: outcome.resolvedAgent,
-      ...(retainWorker
-        ? {
-            session: {
-              agent: launches[outcome.attempts.length]?.agent,
-              roleKey: fixerRoleKey(role),
-              worker,
-            },
+  let retryLaunches = launches;
+  let reportRetry = 0;
+  for (;;) {
+    const outcome = await startWorkerWithFallback(
+      orca,
+      (launch) =>
+        orca.createTask(`[${stage} fix ${round}]\n${launch.prompt}`, {
+          parent: parentTask,
+        }),
+      retryLaunches,
+      async (index) => {
+        if (!sessionToReuse || index !== 0) return;
+        retainedSession = undefined;
+        await releaseFixerSession(sessionToReuse, orca);
+      },
+      fence,
+      async (launch) => {
+        if (
+          !sessionToReuse ||
+          launch.retainedWorktreeId !== sessionToReuse.worker.worktreeId
+        )
+          return;
+        const staleSession = sessionToReuse;
+        sessionToReuse = undefined;
+        retainedSession = undefined;
+        await releaseFixerSession(staleSession, orca);
+      },
+      reportRetry,
+      async (worker, error) => {
+        if (
+          sessionToReuse &&
+          worker.worktreeId === sessionToReuse.worker.worktreeId
+        ) {
+          sessionToReuse = undefined;
+          retainedSession = undefined;
+        }
+        if (worker.worktreePath) {
+          try {
+            await git.anchorRecoveryRef(
+              `${runId}-fixer-${stage}-${round}`,
+              await git.headOf(worker.worktreePath),
+            );
+          } catch {
+            // Keep the original report failure; normal release still runs.
           }
-        : {}),
-      ...(outcome.attempts.length > 0
-        ? { fallbackAttempts: outcome.attempts }
-        : {}),
-    };
-  } catch (error) {
-    failure = error;
-    throw error;
-  } finally {
-    if (worktreePath) {
+        }
+        await releaseFixerWorker(worker, orca, stage, error);
+      },
+    );
+    const worker = outcome.worker;
+    reportRetry = outcome.reportRetries;
+    const worktreePath =
+      worker.worktreePath ?? retainedSession?.worker.worktreePath;
+    const worktreeId = worker.worktreeId ?? retainedSession?.worker.worktreeId;
+    let workerHead: string | undefined;
+    let retainWorker = false;
+    let failure: unknown;
+    try {
+      let validatedReport: StageReport;
       try {
-        await git.anchorRecoveryRef(
-          `${runId}-fixer-${stage}-${round}`,
-          workerHead ?? (await git.headOf(worktreePath)),
+        validatedReport = await validateFixerReport(
+          worker.report,
+          stage,
+          path.dirname(reportPath),
         );
-      } catch {
-        // Recovery anchoring must never mask the stage outcome.
+      } catch (error) {
+        failure = error;
+        if (
+          !isRepairableWorkerReportError(error) ||
+          reportRetry >= WORKER_REPORT_RETRY_LIMIT
+        ) {
+          throw error;
+        }
+        reportRetry += 1;
+        sessionToReuse = undefined;
+        retainedSession = undefined;
+        retryLaunches = [repairWorkerReportLaunch(outcome.launch)];
+        continue;
       }
-    }
-    if (!retainWorker) {
-      await releaseFixerWorker(worker, orca, stage, failure);
+      if (!worktreePath) {
+        throw new Error(`${stage} fixer did not return a worktree path`);
+      }
+      workerHead = await git.headOf(worktreePath);
+      if (before === workerHead) {
+        throw new FixerNoChangeError(validatedReport, stage);
+      }
+      const verdict = await git.assertFixerChangesAllowed(
+        worktreePath,
+        before,
+        workerHead,
+        guardrails,
+      );
+      if (verdict !== undefined && !verdict.changed) {
+        throw new FixerNoChangeError(validatedReport, stage);
+      }
+      if (fence.aborted) {
+        // The execution timeout already failed this stage; refuse late mutations
+        // so a delayed worker cannot apply commits into a settled run.
+        throw new Error(`${stage} fixer timed out; commits were not applied`);
+      }
+      const expectedWorkerHead = workerHead;
+      const after = await withGateMutation(async () => {
+        if (
+          !(await git.applyWorktreeCommits(
+            worktreePath,
+            before,
+            expectedWorkerHead,
+            fence,
+          ))
+        ) {
+          throw new Error(`${stage} fixer could not apply its committed change`);
+        }
+        fence.deadlineSatisfied = true;
+        const after = await git.head();
+        if (after !== expectedWorkerHead) {
+          throw new PostMutationCustodyError(
+            `${stage} fixer custody ended at unexpected HEAD ${after}; expected ${expectedWorkerHead}`,
+          );
+        }
+        return after;
+      });
+      const terminalHandle =
+        worker.terminalHandle ?? retainedSession?.worker.terminalHandle;
+      if (terminalHandle && worktreeId) {
+        worker.terminalHandle = terminalHandle;
+        worker.worktreeId = worktreeId;
+        worker.worktreePath = worktreePath;
+        try {
+          await orca.finishWorker(worker, "retain");
+          worker.deliveryId = undefined;
+          retainWorker = true;
+        } catch {
+          // The round succeeded, but this worker cannot safely be reused.
+        }
+      }
+      return {
+        after,
+        before,
+        guardrailViolations: verdict?.guardrailViolations ?? [],
+        resolvedAgent: outcome.resolvedAgent,
+        ...(retainWorker
+          ? {
+              session: {
+                agent: outcome.launch.agent,
+                roleKey: fixerRoleKey(role),
+                worker,
+              },
+            }
+          : {}),
+        ...(outcome.attempts.length > 0
+          ? { fallbackAttempts: outcome.attempts }
+          : {}),
+      };
+    } catch (error) {
+      failure = error;
+      throw error;
+    } finally {
+      if (worktreePath) {
+        try {
+          await git.anchorRecoveryRef(
+            `${runId}-fixer-${stage}-${round}`,
+            workerHead ?? (await git.headOf(worktreePath)),
+          );
+        } catch {
+          // Recovery anchoring must never mask the stage outcome.
+        }
+      }
+      if (!retainWorker) {
+        await releaseFixerWorker(worker, orca, stage, failure);
+      }
     }
   }
 }
@@ -5246,9 +5509,16 @@ export class CliOrca implements OrcaOperations {
     launch: WorkerLaunch,
     fence?: TimeoutFence,
     onAllocated?: WorkerAllocated,
+    onReportFailure?: WorkerReportFailure,
   ): Promise<WorkerResult> {
     if (launch.agent && classifyHarness(launch.agent.harness) === "acp") {
-      return await this.#startAcpWorker(taskId, launch, fence, onAllocated);
+      return await this.#startAcpWorker(
+        taskId,
+        launch,
+        fence,
+        onAllocated,
+        onReportFailure,
+      );
     }
     if (launch.reportPath) await rm(launch.reportPath, { force: true });
     if (launch.terminal)
@@ -5257,6 +5527,7 @@ export class CliOrca implements OrcaOperations {
         launch,
         fence,
         onAllocated,
+        onReportFailure,
       );
     const harness = (
       launch.agent?.harness ?? DEFAULT_WORKER_AGENT
@@ -5421,7 +5692,13 @@ export class CliOrca implements OrcaOperations {
         fence,
       );
       deliveryId = result.deliveryId;
-      if (result.error) throw new Error(result.error);
+      if (result.error) {
+        worker.deliveryId = deliveryId;
+        const error = new Error(result.error);
+        throw isRepairableWorkerReportError(error)
+          ? new WorkerReportError(error.message, worker)
+          : error;
+      }
       Object.assign(worker, {
         deliveryId,
         failedOutcome: result.failedOutcome,
@@ -5429,16 +5706,20 @@ export class CliOrca implements OrcaOperations {
       });
       return worker;
     } catch (error) {
-      await withGateMutation(async () => {
-        if (abortOwnsWorkerCleanup(registration)) return;
-        await this.#cleanupFailedWorker(
-          dispatchId,
-          terminalHandle,
-          worktreeId,
-          deliveryId,
-        );
-        await registration?.();
-      }, true);
+      if (error instanceof WorkerReportError && onReportFailure) {
+        await onReportFailure(error.worker, error);
+      } else {
+        await withGateMutation(async () => {
+          if (abortOwnsWorkerCleanup(registration)) return;
+          await this.#cleanupFailedWorker(
+            dispatchId,
+            terminalHandle,
+            worktreeId,
+            deliveryId,
+          );
+          await registration?.();
+        }, true);
+      }
       throw error;
     } finally {
       if (promptPath) await rm(promptPath, { force: true });
@@ -5450,6 +5731,7 @@ export class CliOrca implements OrcaOperations {
     launch: WorkerLaunch,
     fence?: TimeoutFence,
     onAllocated?: WorkerAllocated,
+    onReportFailure?: WorkerReportFailure,
   ): Promise<WorkerResult> {
     const terminalHandle = launch.terminal!;
     // Bound before worker-start so a retained preflight failure still records
@@ -5549,7 +5831,13 @@ export class CliOrca implements OrcaOperations {
         fence,
       );
       deliveryId = result.deliveryId;
-      if (result.error) throw new Error(result.error);
+      if (result.error) {
+        worker.deliveryId = deliveryId;
+        const error = new Error(result.error);
+        throw isRepairableWorkerReportError(error)
+          ? new WorkerReportError(error.message, worker)
+          : error;
+      }
       Object.assign(worker, {
         deliveryId,
         failedOutcome: result.failedOutcome,
@@ -5557,16 +5845,20 @@ export class CliOrca implements OrcaOperations {
       });
       return worker;
     } catch (error) {
-      await withGateMutation(async () => {
-        if (abortOwnsWorkerCleanup(registration)) return;
-        await this.#cleanupFailedWorker(
-          dispatchId,
-          terminalHandle,
-          undefined,
-          deliveryId,
-        );
-        await registration?.();
-      }, true);
+      if (error instanceof WorkerReportError && onReportFailure) {
+        await onReportFailure(error.worker, error);
+      } else {
+        await withGateMutation(async () => {
+          if (abortOwnsWorkerCleanup(registration)) return;
+          await this.#cleanupFailedWorker(
+            dispatchId,
+            terminalHandle,
+            undefined,
+            deliveryId,
+          );
+          await registration?.();
+        }, true);
+      }
       throw error;
     }
   }
@@ -6390,6 +6682,7 @@ export class CliOrca implements OrcaOperations {
     launch: WorkerLaunch,
     fence?: TimeoutFence,
     onAllocated?: WorkerAllocated,
+    onReportFailure?: WorkerReportFailure,
   ): Promise<WorkerResult> {
     const agent = launch.agent!;
     const target = parseAcpTarget(agent.harness);
@@ -6568,21 +6861,28 @@ export class CliOrca implements OrcaOperations {
         report = extracted === undefined ? undefined : acpReportFrom(extracted);
       }
       if (!report)
-        throw new Error(`acp target ${target} returned an invalid report`);
+        throw new WorkerReportError(
+          `acp target ${target} returned an invalid report`,
+          worker,
+        );
       worker.report = report;
       return worker;
     } catch (error) {
-      await withGateMutation(async () => {
-        if (
-          processAbort.signal.aborted ||
-          abortOwnsWorkerCleanup(registration)
-        ) {
-          return;
-        }
-        if (worktreeId)
-          await this.#cleanupPreparedWorker({ terminalHandle: "", worktreeId });
-        await registration?.();
-      }, true);
+      if (error instanceof WorkerReportError && onReportFailure) {
+        await onReportFailure(error.worker, error);
+      } else {
+        await withGateMutation(async () => {
+          if (
+            processAbort.signal.aborted ||
+            abortOwnsWorkerCleanup(registration)
+          ) {
+            return;
+          }
+          if (worktreeId)
+            await this.#cleanupPreparedWorker({ terminalHandle: "", worktreeId });
+          await registration?.();
+        }, true);
+      }
       throw error;
     }
   }
@@ -9219,6 +9519,7 @@ export * from "./config.ts";
 type RawCliFlags = Record<string, string | boolean>;
 
 const BOOLEAN_FLAGS = new Set([
+  "admission-materialized",
   "allow-local-config",
   "attached",
   "force-lease",
@@ -9230,21 +9531,30 @@ const VALUE_FLAGS = new Set([
   "base",
   "before",
   "config",
+  "admission-id",
   "fixer-effort",
   "fixer-model",
   "head",
   "intent",
+  "launch-nonce",
   "max-fix-rounds",
   "notify",
   "out",
   "repo",
   "resume",
   "reviewer-model",
+  "readiness",
+  "run-id",
+  "gate",
 ]);
 const COMMAND_FLAGS: Record<string, Set<string>> = {
   attestation: new Set(["out", "repo"]),
+  gate: new Set(["admission-id", "gate", "launch-nonce", "readiness", "run-id"]),
+  init: new Set(["repo"]),
   prune: new Set(["before", "repo", "stranded"]),
   run: new Set([
+    "admission-id",
+    "admission-materialized",
     "allow-local-config",
     "attached",
     "base",
@@ -9260,6 +9570,7 @@ const COMMAND_FLAGS: Record<string, Set<string>> = {
     "repo",
     "resume",
     "reviewer-model",
+    "run-id",
     "tui",
   ]),
 };
@@ -9298,8 +9609,11 @@ function parseCli(argv: string[]): {
     flags[name] = value;
     if (inlineValue === undefined) index += 1;
   }
-  if (subcommand !== "attestation" && positionals.length > 0) {
+  if (subcommand !== "attestation" && subcommand !== "gate" && positionals.length > 0) {
     throw new Error(`${subcommand} does not accept positional arguments`);
+  }
+  if (subcommand === "gate" && positionals.length !== 1) {
+    throw new Error("gate requires exactly one action: admit or coordinator");
   }
   return { command: subcommand, flags, positionals };
 }
@@ -9772,12 +10086,14 @@ async function launchDetachedRun(
   flags: RawCliFlags,
   userGlobalConfig: OrcaNoMistakesConfig,
   resumeStartOid?: string,
-): Promise<string> {
+  admissionId?: string,
+): Promise<{ coordinatorPid: number | undefined; terminalHandle: string }> {
   const orcaCommand = resolveOrcaCommand();
   const root = await configuredWorktreeRoot(
     repo.root,
     userGlobalConfig.worktree_roots,
   );
+  const existingRunId = stringFlag(flags, "run-id");
   let configuredOrca: CliOrca | undefined;
   let intentTaskId = "";
   let terminalHandle = "";
@@ -9967,26 +10283,29 @@ async function launchDetachedRun(
       }
       launcherMarker.terminalHandle = terminalHandle;
       await finishLauncherAllocation(launcherMarker);
-      const runReceipt = unwrapJson<{ run: { id: string } }>(
-        (
-          await withLauncherAllocation(launcherMarker, () =>
-            command(
-              orcaCommand,
-              [
-                "orchestration",
-                "run-create",
-                "--objective",
-                runObjective,
-                "--from",
-                terminalHandle,
-                "--json",
-              ],
-              repo.root,
-            ),
-          )
-        ).stdout,
-      );
-      const runId = runReceipt.run?.id ?? "";
+      const createdRun = existingRunId
+        ? undefined
+        : unwrapJson<{ run: { id: string } }>(
+            (
+              await withLauncherAllocation(launcherMarker, () =>
+                command(
+                  orcaCommand,
+                  [
+                    "orchestration",
+                    "run-create",
+                    "--objective",
+                    runObjective,
+                    "--from",
+                    terminalHandle,
+                    "--json",
+                  ],
+                  repo.root,
+                ),
+              )
+            ).stdout,
+          );
+      const runId = existingRunId ?? createdRun?.run?.id ?? "";
+      if (!runId) throw new Error("orchestration run-create returned no run ID");
       configuredRunPath(root, runId);
       configuredOrca = new CliOrca({
         command: orcaCommand,
@@ -10156,6 +10475,7 @@ async function launchDetachedRun(
     const value = stringFlag(flags, name);
     if (value !== undefined) attachedArgs.push(`--${name}`, value);
   }
+  if (admissionId) attachedArgs.push("--admission-id", admissionId);
   if (flags.tui !== true && flags["no-tui"] !== true) attachedArgs.push("--tui");
   const notifyHandle =
     stringFlag(flags, "notify") ?? process.env.ORCA_TERMINAL_HANDLE;
@@ -10183,6 +10503,14 @@ async function launchDetachedRun(
       `ORCA_CLI_COMMAND=${shellQuote(process.env.ORCA_CLI_COMMAND)}`,
     );
   }
+  for (const name of [
+    "ORCA_NO_MISTAKES_USER_CONFIG",
+    "ORCA_NO_MISTAKES_CONFIG_DIR",
+    "XDG_CONFIG_HOME",
+  ]) {
+    const value = process.env[name];
+    if (value) environment.push(`${name}=${shellQuote(value)}`);
+  }
   const receiptCommand = [
     process.execPath,
     "-e",
@@ -10194,6 +10522,7 @@ async function launchDetachedRun(
     .join(" ");
   const coordinatorCommand = `${receiptCommand} && exec env ${environment.join(" ")} ${quotedCommand}`;
 
+  let coordinatorPid: number | undefined;
   try {
     await writeLauncherGateMarker(
       repo.root,
@@ -10238,7 +10567,7 @@ async function launchDetachedRun(
       ],
       repo.root,
     );
-    await waitForStartupReceipt(
+    coordinatorPid = await waitForStartupReceipt(
       gateMarkerPath(repo.root, gateMarkerId(gate)),
       startupReceipt,
     );
@@ -10246,7 +10575,7 @@ async function launchDetachedRun(
     await cleanupFailedLaunch(error);
     throw error;
   }
-  return terminalHandle;
+  return { coordinatorPid, terminalHandle };
 }
 
 /**
@@ -12614,6 +12943,301 @@ async function runPruneCommand(flags: RawCliFlags): Promise<void> {
   );
 }
 
+async function runInitCommand(flags: RawCliFlags): Promise<void> {
+  const repo = stringFlag(flags, "repo") ?? process.cwd();
+  const metadata = await initializeLocalGate(
+    repo,
+    path.resolve(process.argv[1] ?? fileURLToPath(import.meta.url)),
+  );
+  console.log(
+    JSON.stringify({
+      gate: metadata.gatePath,
+      remote: metadata.remoteName,
+      repo: metadata.repoRoot,
+    }),
+  );
+}
+
+async function readStandardInput(): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function spawnAdmissionCoordinator(
+  metadata: GateMetadata,
+  admissionId: string,
+  readinessPath: string,
+  launchNonce: string,
+): Promise<void> {
+  await launchDetachedCoordinator({
+    args: [
+      "gate",
+      "coordinator",
+      "--gate",
+      metadata.gatePath,
+      "--admission-id",
+      admissionId,
+      "--readiness",
+      readinessPath,
+      "--launch-nonce",
+      launchNonce,
+    ],
+    cwd: metadata.repoRoot,
+    entrypoint: path.resolve(process.argv[1] ?? fileURLToPath(import.meta.url)),
+  });
+}
+
+async function assertAdmittedCheckout(
+  metadata: GateMetadata,
+  admission: SubmissionAdmissionRow,
+): Promise<string> {
+  const expectedBranch = admission.ref_name
+  const worktrees = await listGitWorktrees(metadata.repoRoot)
+  const matchingWorktree = worktrees?.find(
+    (worktree) =>
+      worktree.branch === expectedBranch && worktree.head === admission.new_oid,
+  )
+  if (matchingWorktree) {
+    const checkout = await new GitShell({
+      expectedHead: admission.new_oid,
+      repo: matchingWorktree.path,
+    }).assertReady()
+    if (`refs/heads/${checkout.branch}` !== expectedBranch) {
+      throw new Error(
+        `the repository checkout is on ${checkout.branch} but the admission is for ${expectedBranch}`,
+      )
+    }
+    return matchingWorktree.path
+  }
+
+  const checkout = await new GitShell({
+    repo: metadata.repoRoot,
+  }).assertReady();
+  if (`refs/heads/${checkout.branch}` !== expectedBranch) {
+    throw new Error(
+      `the repository checkout is on ${checkout.branch} but the admission is for ${expectedBranch}`,
+    );
+  }
+  if (checkout.head !== admission.new_oid) {
+    throw new Error(
+      `the repository checkout is at ${checkout.head} but the admission is for ${admission.new_oid}`,
+    );
+  }
+  return metadata.repoRoot;
+}
+
+async function launchAdmittedPipeline(
+  checkoutPath: string,
+  admission: SubmissionAdmissionRow,
+  runId: string,
+): Promise<void> {
+  await main([
+    "run",
+    "--repo",
+    checkoutPath,
+    "--head",
+    admission.new_oid,
+    "--intent",
+    admission.intent,
+    "--admission-id",
+    admission.admission_id,
+    "--admission-materialized",
+    "--run-id",
+    runId,
+  ]);
+}
+
+async function runGateAdmitCommand(flags: RawCliFlags): Promise<void> {
+  const gatePath = stringFlag(flags, "gate");
+  if (!gatePath) throw new Error("gate admit requires --gate");
+  const metadata = await readGateMetadata(gatePath);
+  if (path.resolve(metadata.gatePath) !== path.resolve(gatePath)) {
+    throw new Error("gate metadata does not match the requested gate");
+  }
+  const updates = parseReceiveUpdates(await readStandardInput());
+  const intent = decodeIntentPushOption(process.env);
+  const validated = validateReceiveUpdate(updates, metadata.defaultBranch, intent);
+  validateQuarantinedCommit(metadata.gatePath, validated.newOid);
+
+  const ledger = openRepositoryLedger(metadata.repoRoot, false);
+  try {
+    if (validated.noEvent) {
+      const existing = ledger.submissionAdmission(
+        deriveAdmissionId({
+          gateIdentity: metadata.gateIdentity,
+          intent: validated.intent,
+          newOid: validated.newOid,
+          oldOid: validated.oldOid,
+          refName: validated.refName,
+        }),
+      );
+      if (
+        !existing ||
+        existing.status === "accepted" ||
+        existing.status === "superseded"
+      ) {
+        console.log(JSON.stringify({ accepted: true, noEvent: true }));
+        return;
+      }
+    }
+    const admission = beginGateAdmission(ledger, metadata, validated);
+    if (admission.status === "failed" || admission.status === "superseded") {
+      throw new Error(`submission admission ${admission.admission_id} is ${admission.status}`);
+    }
+    if (admission.status === "accepted" && admission.run_id) {
+      const replayReadinessPath = admissionReadinessPath(metadata, admission.admission_id);
+      await mkdir(path.dirname(replayReadinessPath), { recursive: true });
+      const custodyLaunch = await ensureCustodyLaunch(replayReadinessPath, (nonce) =>
+        spawnAdmissionCoordinator(
+          metadata,
+          admission.admission_id,
+          replayReadinessPath,
+          nonce,
+        ),
+      );
+      try {
+        if (!custodyLaunch) {
+          const readiness = await readFile(replayReadinessPath, "utf8")
+            .then((contents) => JSON.parse(contents) as LaunchReadiness)
+            .catch(() => undefined);
+          if (readiness?.state !== "failed") {
+            throw new Error("accepted admission has no nonce-bound launch custody");
+          }
+        }
+        if (custodyLaunch && custodyLaunch.readiness.runId !== admission.run_id) {
+          throw new Error("coordinator readiness did not bind the admitted run");
+        }
+      } finally {
+        await custodyLaunch?.releaseLaunch();
+      }
+      console.log(
+        JSON.stringify({
+          admissionId: admission.admission_id,
+          replayed: true,
+          runId: admission.run_id,
+        }),
+      );
+      return;
+    }
+    const readinessPath = admissionReadinessPath(metadata, admission.admission_id);
+    await mkdir(path.dirname(readinessPath), { recursive: true });
+    const { readiness } = await awaitAdmissionLaunch(
+      readinessPath,
+      (nonce) =>
+        spawnAdmissionCoordinator(metadata, admission.admission_id, readinessPath, nonce),
+      30_000,
+      () => ledger.submissionAdmission(admission.admission_id)?.launcher_pid,
+    );
+    const current = ledger.submissionAdmission(admission.admission_id);
+    if (current?.run_id && readiness.runId !== current.run_id) {
+      throw new Error("coordinator readiness did not bind the admitted run");
+    }
+    console.log(
+      JSON.stringify({
+        admissionId: admission.admission_id,
+        followUp: `orca-no-mistakes run --resume ${readiness.runId}`,
+        runId: readiness.runId,
+      }),
+    );
+  } finally {
+    ledger.close();
+  }
+}
+
+async function runGateCoordinatorCommand(flags: RawCliFlags): Promise<void> {
+  const gatePath = stringFlag(flags, "gate");
+  const admissionId = stringFlag(flags, "admission-id");
+  const requestedReadiness = stringFlag(flags, "readiness");
+  const launchNonce = stringFlag(flags, "launch-nonce");
+  if (!gatePath || !admissionId || !requestedReadiness || !launchNonce) {
+    throw new Error(
+      "gate coordinator requires --gate, --admission-id, --readiness, and --launch-nonce",
+    );
+  }
+  const metadata = await readGateMetadata(gatePath);
+  const readinessPath = admissionReadinessPath(metadata, admissionId);
+  if (path.resolve(requestedReadiness) !== path.resolve(readinessPath)) {
+    throw new Error("coordinator readiness path does not match the admission");
+  }
+  await recordCoordinatorLaunch(launchLockPath(readinessPath), launchNonce);
+  const ledger = openRepositoryLedger(metadata.repoRoot, false);
+  let runId: string | undefined;
+  let orca: CliOrca | undefined;
+  let materialized = false;
+  try {
+    const admission = ledger.submissionAdmission(admissionId);
+    if (!admission) throw new Error(`unknown submission admission ${admissionId}`);
+    if (admission.status === "accepted" && admission.run_id) {
+      const custodyUpdate: ReceiveUpdate = {
+        newOid: admission.new_oid,
+        oldOid: readGateRef(metadata, admission.ref_name) ?? "0".repeat(40),
+        refName: admission.ref_name,
+      };
+      await writeLaunchReadiness(readinessPath, {
+        nonce: launchNonce,
+        runId: admission.run_id,
+        state: "ready",
+      });
+      await waitForPermanentRef(metadata, custodyUpdate, 100);
+      anchorPermanentRef(metadata, custodyUpdate, admission.run_id);
+      return;
+    }
+    const checkoutPath = await assertAdmittedCheckout(metadata, admission);
+    orca = new CliOrca({ cwd: checkoutPath, runId: admission.run_id ?? undefined });
+    runId = admission.run_id ?? (await orca.createRun(`no-mistakes: ${admission.intent}`));
+    await writeLaunchReadiness(readinessPath, { nonce: launchNonce, runId, state: "ready" });
+    materialized = true;
+    const update: ReceiveUpdate = {
+      newOid: admission.new_oid,
+      oldOid: admission.old_oid,
+      refName: admission.ref_name,
+    };
+    let settled = false;
+    let handoffError: unknown;
+    for (let attempt = 0; attempt < 3 && !settled; attempt += 1) {
+      if (attempt > 0) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+      try {
+        await waitForPermanentRef(metadata, update, 100);
+        anchorPermanentRef(metadata, update, runId);
+        await launchAdmittedPipeline(checkoutPath, admission, runId);
+        settled = true;
+      } catch (error) {
+        handoffError = error;
+        if (error instanceof Error && error.message.includes("superseded")) break;
+      }
+    }
+    if (!settled) throw handoffError;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await writeLaunchReadiness(readinessPath, {
+      error: message,
+      nonce: launchNonce,
+      state: "failed",
+    }).catch(() => undefined);
+    const admissionSettled = !materialized || message.includes("superseded");
+    if (admissionSettled) {
+      ledger.failSubmissionAdmission(
+        admissionId,
+        message.includes("superseded") ? "superseded" : "failed",
+      );
+      await releaseAdmissionLaunch(launchLockPath(readinessPath)).catch(
+        () => undefined,
+      );
+    }
+    if (runId && orca) {
+      await orca.failRun(`Admission coordinator failed: ${message}`).catch(
+        () => undefined,
+      );
+    }
+    throw error;
+  } finally {
+    ledger.close();
+  }
+}
+
 export async function main(argv: string[]): Promise<void> {
   if (
     argv.length === 0 ||
@@ -12623,6 +13247,9 @@ export async function main(argv: string[]): Promise<void> {
   ) {
     console.log(`Usage:
   orca-no-mistakes run (--intent <text> | --resume <run-id>) [--repo <path>] [--base <branch>] [--head <sha>] [--force-lease]
+  orca-no-mistakes init [--repo <path>]
+  orca-no-mistakes gate admit --gate <path>
+  orca-no-mistakes gate coordinator --gate <path> --admission-id <id> --readiness <path> --launch-nonce <nonce>
   orca-no-mistakes attestation export <run-id|commit-sha> [--out <path>] [--repo <path>]
   orca-no-mistakes attestation verify <manifest-file|run-id|commit-sha> [--repo <path>]
   orca-no-mistakes prune [--before <date>] [--repo <path>]
@@ -12639,11 +13266,30 @@ Run options:
   --config <path>
   --force-lease (reclaim a stranded branch lease)
 
-Prune options:
-  --stranded (reap stranded gate and direct-run resources whose coordinator died; cannot be combined with --before)`);
+ Prune options:
+  --stranded (reap stranded gate and direct-run resources whose coordinator died; cannot be combined with --before)
+
+ Gate options:
+  init installs or refreshes the repository-local bare gate and managed remote
+  admit accepts one feature ref update with one encoded intent push option`);
     return;
   }
   const parsed = parseCli(argv);
+  if (parsed.command === "init") {
+    await runInitCommand(parsed.flags);
+    return;
+  }
+  if (parsed.command === "gate") {
+    if (parsed.positionals[0] === "admit") {
+      await runGateAdmitCommand(parsed.flags);
+      return;
+    }
+    if (parsed.positionals[0] === "coordinator") {
+      await runGateCoordinatorCommand(parsed.flags);
+      return;
+    }
+    throw new Error(`unknown gate action: ${parsed.positionals[0]}`);
+  }
   if (parsed.command === "attestation") {
     await runAttestationCommand(parsed.positionals, parsed.flags);
     return;
@@ -12696,16 +13342,136 @@ Prune options:
     base: stringFlag(parsed.flags, "base"),
     expectedHead: stringFlag(parsed.flags, "head"),
   });
-  if (parsed.flags.attached !== true) {
-    const repoState = await git.assertReady();
-    const userGlobalConfig = loadUserConfig();
-    const terminalHandle = await launchDetachedRun(
-      repoState,
-      parsed.flags,
-      userGlobalConfig,
-      resumeStartOid,
+  const suppliedAdmissionId = stringFlag(parsed.flags, "admission-id");
+  const isGateChild = Boolean(
+    process.env.NO_MISTAKES_ORIGIN_WORKTREE &&
+      (process.env.NO_MISTAKES_GATE_WORKTREE_ID ||
+        process.env.NO_MISTAKES_GATE_WORKTREE_ROOT),
+  );
+  let admissionRow: SubmissionAdmissionRow | undefined;
+  let admissionLedger: DomainLedger | undefined;
+  let launchRepoState: RepoSnapshot | undefined;
+  if (suppliedAdmissionId) {
+    admissionLedger = openRepositoryLedger(
+      process.env.NO_MISTAKES_ORIGIN_WORKTREE ?? repo,
+      false,
     );
-    console.log(JSON.stringify({ detached: true, terminalHandle }));
+    admissionRow = admissionLedger.submissionAdmission(suppliedAdmissionId);
+    if (!admissionRow) {
+      admissionLedger.close();
+      throw new Error(`unknown submission admission ${suppliedAdmissionId}`);
+    }
+    if (admissionRow.intent !== intent) {
+      admissionLedger.close();
+      throw new Error("run intent does not match the submission admission");
+    }
+  } else if (!resumeRunId && !isGateChild) {
+    launchRepoState = await git.assertReady();
+    const gatePaths = repositoryGatePaths(launchRepoState.root);
+    let gateIdentity = deriveFallbackGateIdentity(gatePaths);
+    if (
+      existsSync(gatePaths.gatePath) ||
+      existsSync(path.join(gatePaths.stateDir, "gate.json"))
+    ) {
+      let gateMetadata: GateMetadata;
+      try {
+        gateMetadata = await readGateMetadata(gatePaths.gatePath);
+      } catch (error) {
+        throw new Error(
+          `local gate metadata is invalid: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+          { cause: error },
+        );
+      }
+      if (path.resolve(gateMetadata.commonDir) !== path.resolve(gatePaths.commonDir)) {
+        throw new Error(
+          `the local gate is routed to ${gateMetadata.repoRoot}; run direct submissions from that repository`,
+        );
+      }
+      gateIdentity = gateMetadata.gateIdentity;
+    }
+    admissionLedger = openRepositoryLedger(launchRepoState.root, false);
+    admissionRow = admissionLedger.beginSubmissionAdmission({
+      admissionId: deriveAdmissionId({
+        gateIdentity,
+        intent,
+        newOid: launchRepoState.head,
+        oldOid: launchRepoState.head,
+        refName: `refs/heads/${launchRepoState.branch}`,
+      }),
+      gateIdentity,
+      intent,
+      newOid: launchRepoState.head,
+      oldOid: launchRepoState.head,
+      refName: `refs/heads/${launchRepoState.branch}`,
+      repoRoot: gatePaths.commonDir,
+      source: "direct",
+    });
+    if (
+      admissionRow.status === "failed" ||
+      admissionRow.status === "superseded"
+    ) {
+      admissionLedger.close();
+      throw new Error(
+        `submission admission ${admissionRow.admission_id} is ${admissionRow.status}`,
+      );
+    }
+    if (
+      admissionRow.status === "launched" &&
+      admissionRow.run_id === null &&
+      admissionRow.launcher_pid !== null &&
+      !isProcessAlive(admissionRow.launcher_pid)
+    ) {
+      const reclaimed = admissionLedger.reclaimSubmissionAdmission(
+        admissionRow.admission_id,
+      );
+      if (reclaimed) admissionRow = reclaimed;
+    }
+    if (admissionRow.status !== "pending") {
+      console.log(
+        JSON.stringify({
+          admissionId: admissionRow.admission_id,
+          replayed: true,
+          runId: admissionRow.run_id,
+        }),
+      );
+      admissionLedger.close();
+      return;
+    }
+  }
+  if (parsed.flags.attached !== true) {
+    const repoState = launchRepoState ?? (await git.assertReady());
+    const userGlobalConfig = loadUserConfig();
+    try {
+      const launch = await launchDetachedRun(
+        repoState,
+        parsed.flags,
+        userGlobalConfig,
+        resumeStartOid,
+        admissionRow?.admission_id,
+      );
+      if (admissionRow && admissionLedger) {
+        admissionLedger.markSubmissionLaunched(
+          admissionRow.admission_id,
+          launch.coordinatorPid,
+        );
+      }
+      console.log(
+        JSON.stringify({ detached: true, terminalHandle: launch.terminalHandle }),
+      );
+    } catch (error) {
+      if (
+        admissionRow &&
+        admissionLedger &&
+        parsed.flags["admission-materialized"] !== true
+      ) {
+        admissionLedger.failSubmissionAdmission(admissionRow.admission_id);
+      }
+      throw error;
+    } finally {
+      admissionLedger?.close();
+    }
     return;
   }
   const reviewerModel = stringFlag(parsed.flags, "reviewer-model");
@@ -12748,7 +13514,10 @@ Prune options:
     cwd: gatePath,
     notifyHandle: stringFlag(parsed.flags, "notify"),
     parentWorktree: gate?.kind === "configured" ? originWorktree : undefined,
-    runId: gate?.kind === "configured" ? gate.runId : undefined,
+    runId:
+      gate?.kind === "configured"
+        ? gate.runId
+        : admissionRow?.run_id ?? stringFlag(parsed.flags, "run-id"),
   });
   const deliveryGit = gate
     ? new GitShell({
@@ -12757,7 +13526,7 @@ Prune options:
         repo: originWorktree!,
       })
     : undefined;
-  let ledger: DomainLedger | undefined;
+  let ledger: DomainLedger | undefined = admissionLedger;
   let renderer:
     | (PresentationRenderer & { close?: () => void })
     | undefined;
@@ -12774,10 +13543,11 @@ Prune options:
     }
   };
   let retainGate = false;
-  let gateCleanupOid = await git.head();
+  let gateCleanupOid: string | undefined;
   try {
+    gateCleanupOid = await git.head();
     const userGlobalConfig = loadUserConfig();
-    ledger = openRepositoryLedger(originWorktree ?? gatePath);
+    ledger ??= openRepositoryLedger(originWorktree ?? gatePath);
     await installAbortReaping({
       ...(gate ? { gate } : {}),
       ...(deliveryGit ? { deliveryGit } : {}),
@@ -12801,6 +13571,18 @@ Prune options:
         allowLocalConfig: parsed.flags["allow-local-config"] === true,
         cliFlags,
         configPath: stringFlag(parsed.flags, "config"),
+        admission: admissionRow
+          ? {
+              admissionId: admissionRow.admission_id,
+              newOid: admissionRow.new_oid,
+              runId:
+                admissionRow.run_id ??
+                (gate?.kind === "configured"
+                  ? gate.runId
+                  : stringFlag(parsed.flags, "run-id")),
+              source: admissionRow.source,
+            }
+          : undefined,
         deliveryBranch: process.env.NO_MISTAKES_DELIVERY_BRANCH,
         deliveryGit,
         forceLease: parsed.flags["force-lease"] === true,
@@ -12856,6 +13638,20 @@ Prune options:
     console.log(JSON.stringify(result));
   } catch (error) {
     closeRenderer();
+    if (admissionRow && ledger) {
+      try {
+        const settled = ledger.submissionAdmission(admissionRow.admission_id);
+        if (settled && settled.run_id !== null && settled.status !== "accepted") {
+          ledger.reclaimSubmissionAdmission(admissionRow.admission_id);
+        } else if (parsed.flags["admission-materialized"] !== true) {
+          ledger.failSubmissionAdmission(admissionRow.admission_id);
+        }
+      } catch (settlementError) {
+        console.error(
+          `warning: could not settle the submission admission: ${String(settlementError)}`,
+        );
+      }
+    }
     const retainedOutcome =
       error instanceof RecoveryAnchorError || error instanceof RunSettlementError
         ? error.outcome
@@ -12921,7 +13717,7 @@ Prune options:
               gate,
               originWorktree!,
               resolveOrcaCommand(),
-              gateCleanupOid,
+              gateCleanupOid ?? "",
             );
           } catch (cleanupError) {
             console.error(

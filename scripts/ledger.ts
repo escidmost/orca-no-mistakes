@@ -191,6 +191,44 @@ export type RunRecord = {
   submission_commit_oid: string
 }
 
+export type SubmissionAdmissionStatus =
+  | 'accepted'
+  | 'failed'
+  | 'launched'
+  | 'pending'
+  | 'superseded'
+
+export type SubmissionAdmissionInput = {
+  admissionId: string
+  gateIdentity: string
+  intent: string
+  newOid: string
+  oldOid: string
+  refName: string
+  repoRoot: string
+  source: 'direct' | 'gate'
+}
+
+export type SubmissionAdmissionRow = {
+  accepted_at: string | null
+  accepted_oid: string | null
+  admission_id: string
+  created_at: string
+  gate_identity: string
+  intent: string
+  intent_hash: string
+  launched_at: string | null
+  launcher_pid: number | null
+  lease_token: string
+  new_oid: string
+  old_oid: string
+  ref_name: string
+  repo_root: string
+  run_id: string | null
+  source: 'direct' | 'gate'
+  status: SubmissionAdmissionStatus
+}
+
 export type StageCheckpointRow = {
   input_commit_oid: string
   output_commit_oid: string
@@ -1430,17 +1468,38 @@ function repositoryLocation(repositoryPath: string): { ledgerPath: string; repoR
   const repoRoot = execFileSync(
     'git',
     ['-C', repositoryPath, 'rev-parse', '--path-format=absolute', '--show-toplevel'],
-    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }
+    { encoding: 'utf8', env: cleanGitEnvironment(), stdio: ['ignore', 'pipe', 'pipe'] }
   ).trim()
   const commonDir = execFileSync(
     'git',
     ['-C', repositoryPath, 'rev-parse', '--path-format=absolute', '--git-common-dir'],
-    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }
+    { encoding: 'utf8', env: cleanGitEnvironment(), stdio: ['ignore', 'pipe', 'pipe'] }
   ).trim()
   return {
     ledgerPath: path.join(commonDir, 'orca-no-mistakes', 'ledger.sqlite'),
     repoRoot
   }
+}
+
+export function cleanGitEnvironment(): NodeJS.ProcessEnv {
+  const environment = { ...process.env }
+  const exactKeys = new Set([
+    'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+    'GIT_COMMON_DIR',
+    'GIT_CONFIG',
+    'GIT_DIR',
+    'GIT_INDEX_FILE',
+    'GIT_OBJECT_DIRECTORY',
+    'GIT_PREFIX',
+    'GIT_QUARANTINE_PATH',
+    'GIT_WORK_TREE'
+  ])
+  for (const key of Object.keys(environment)) {
+    if (exactKeys.has(key) || key.startsWith('GIT_CONFIG_') || key.startsWith('GIT_PUSH_OPTION_')) {
+      delete environment[key]
+    }
+  }
+  return environment
 }
 
 export function allowsLegacyLedgerFallback(error: unknown): boolean {
@@ -1513,6 +1572,39 @@ CREATE TABLE IF NOT EXISTS runs (
   created_at TEXT NOT NULL,
   completed_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS submission_admissions (
+  admission_id TEXT PRIMARY KEY,
+  gate_identity TEXT NOT NULL,
+  repo_root TEXT NOT NULL,
+  ref_name TEXT NOT NULL,
+  old_oid TEXT NOT NULL,
+  new_oid TEXT NOT NULL,
+  intent TEXT NOT NULL,
+  intent_hash TEXT NOT NULL,
+  source TEXT NOT NULL CHECK(source IN ('direct', 'gate')),
+  status TEXT NOT NULL CHECK(status IN ('pending', 'launched', 'accepted', 'failed', 'superseded')),
+  lease_token TEXT NOT NULL,
+  run_id TEXT REFERENCES runs(run_id),
+  created_at TEXT NOT NULL,
+  launched_at TEXT,
+  accepted_oid TEXT,
+  accepted_at TEXT,
+  UNIQUE (gate_identity, repo_root, ref_name, new_oid, intent_hash)
+);
+
+CREATE TABLE IF NOT EXISTS pending_admission_leases (
+  repo_root TEXT NOT NULL,
+  ref_name TEXT NOT NULL,
+  admission_id TEXT NOT NULL UNIQUE REFERENCES submission_admissions(admission_id) ON DELETE CASCADE,
+  acquired_at TEXT NOT NULL,
+  PRIMARY KEY (repo_root, ref_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_submission_admissions_run
+  ON submission_admissions(run_id);
+CREATE INDEX IF NOT EXISTS idx_submission_admissions_ref
+  ON submission_admissions(repo_root, ref_name, created_at);
 
 CREATE TABLE IF NOT EXISTS repository_migrations (
   source_path TEXT NOT NULL,
@@ -2097,7 +2189,8 @@ export class DomainLedger {
       ['gate_audit', 'selected_finding_ids TEXT'],
       ['gate_audit', 'evidence_sha256 TEXT'],
       ['repository_publication_routes', 'actor_node_id TEXT'],
-      ['publication_baselines', 'transport_url TEXT']
+      ['publication_baselines', 'transport_url TEXT'],
+      ['submission_admissions', 'launcher_pid INTEGER']
     ]) {
       try {
         this.#db.exec(`ALTER TABLE ${table} ADD COLUMN ${column}`)
@@ -2168,8 +2261,18 @@ export class DomainLedger {
         source.exec('PRAGMA foreign_keys = ON')
         source.exec('BEGIN IMMEDIATE')
         cleanupTransaction = true
+        const hasSubmissionAdmissions =
+          source.prepare(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'submission_admissions'"
+          ).get() !== undefined
+        const deleteAdmissions = hasSubmissionAdmissions
+          ? source.prepare('DELETE FROM submission_admissions WHERE run_id = ?')
+          : undefined
         const deleteRun = source.prepare('DELETE FROM runs WHERE repo_root = ? AND run_id = ?')
-        for (const runId of runIds) deleteRun.run(repoRoot, runId)
+        for (const runId of runIds) {
+          deleteAdmissions?.run(runId)
+          deleteRun.run(repoRoot, runId)
+        }
         source.exec('COMMIT')
         cleanupTransaction = false
       } catch (error) {
@@ -2515,6 +2618,302 @@ export class DomainLedger {
       }
       const route = this.repositoryPublicationRoute(input.repoRoot)
       if (route) this.#recordStoredPublicationRoute(input.runId, route)
+      this.#db.exec('COMMIT')
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  submissionAdmission(admissionId: string): SubmissionAdmissionRow | undefined {
+    return this.#db
+      .prepare(
+        `SELECT admission_id, gate_identity, repo_root, ref_name, old_oid, new_oid,
+                intent, intent_hash, source, status, lease_token, run_id,
+                created_at, launched_at, launcher_pid, accepted_oid, accepted_at
+         FROM submission_admissions WHERE admission_id = ?`
+      )
+      .get(admissionId) as SubmissionAdmissionRow | undefined
+  }
+
+  beginSubmissionAdmission(input: SubmissionAdmissionInput): SubmissionAdmissionRow {
+    if (!/^admission-[0-9a-f]{64}$/.test(input.admissionId)) {
+      throw new Error('submission admission ID is invalid')
+    }
+    const intent = normalizeIntent(input.intent)
+    const hash = intentHash(intent)
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      const existing = this.#db
+        .prepare(
+          `SELECT admission_id, gate_identity, repo_root, ref_name, old_oid, new_oid,
+                  intent, intent_hash, source, status, lease_token, run_id,
+                  created_at, launched_at, launcher_pid, accepted_oid, accepted_at
+           FROM submission_admissions
+           WHERE admission_id = ?`
+        )
+        .get(input.admissionId) as SubmissionAdmissionRow | undefined
+      if (existing) {
+        if (
+          existing.gate_identity !== input.gateIdentity ||
+          existing.ref_name !== input.refName ||
+          existing.new_oid !== input.newOid ||
+          existing.intent_hash !== hash
+        ) {
+          throw new Error(`submission admission ${input.admissionId} does not match its identity`)
+        }
+        if (existing.status === 'failed' && existing.run_id === null) {
+          const repoRoot = input.source === "gate" ? input.repoRoot : existing.repo_root
+          const lease = this.#db
+            .prepare(
+              `SELECT admission_id FROM pending_admission_leases
+               WHERE repo_root = ? AND ref_name = ?`
+            )
+            .get(repoRoot, input.refName) as { admission_id: string } | undefined
+          if (lease && lease.admission_id !== input.admissionId) {
+            throw new Error(`pending admission lease already exists for ${input.refName}`)
+          }
+          const now = new Date().toISOString()
+          this.#db
+            .prepare(
+              `UPDATE submission_admissions
+               SET status = 'pending', repo_root = ?, old_oid = ?, lease_token = ?,
+                   launched_at = NULL, launcher_pid = NULL, accepted_oid = NULL,
+                   accepted_at = NULL, source = ?
+               WHERE admission_id = ?`
+            )
+            .run(
+              repoRoot,
+              input.oldOid,
+              randomUUID(),
+              input.source,
+              input.admissionId
+            )
+          if (lease) {
+            this.#db
+              .prepare(
+                 `UPDATE pending_admission_leases
+                  SET acquired_at = ? WHERE repo_root = ? AND ref_name = ?`
+              )
+              .run(now, repoRoot, input.refName)
+          } else {
+            this.#db
+              .prepare(
+                `INSERT INTO pending_admission_leases
+                 (repo_root, ref_name, admission_id, acquired_at)
+                 VALUES (?, ?, ?, ?)`
+              )
+                .run(repoRoot, input.refName, input.admissionId, now)
+          }
+          this.#db.exec('COMMIT')
+          return this.submissionAdmission(input.admissionId)!
+        }
+        this.#db.exec('COMMIT')
+        return existing
+      }
+
+      const lease = this.#db
+        .prepare(
+          `SELECT admission_id FROM pending_admission_leases
+           WHERE repo_root = ? AND ref_name = ?`
+        )
+        .get(input.repoRoot, input.refName) as { admission_id: string } | undefined
+      if (lease && lease.admission_id !== input.admissionId) {
+        throw new Error(`pending admission lease already exists for ${input.refName}`)
+      }
+
+      const now = new Date().toISOString()
+      const leaseToken = randomUUID()
+      this.#db
+        .prepare(
+          `INSERT INTO submission_admissions (
+             admission_id, gate_identity, repo_root, ref_name, old_oid, new_oid,
+             intent, intent_hash, source, status, lease_token, run_id,
+             created_at, launched_at, accepted_oid, accepted_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL, ?, NULL, NULL, NULL)`
+        )
+        .run(
+          input.admissionId,
+          input.gateIdentity,
+          input.repoRoot,
+          input.refName,
+          input.oldOid,
+          input.newOid,
+          intent,
+          hash,
+          input.source,
+          leaseToken,
+          now
+        )
+      this.#db
+        .prepare(
+          `INSERT INTO pending_admission_leases
+             (repo_root, ref_name, admission_id, acquired_at)
+           VALUES (?, ?, ?, ?)`
+        )
+        .run(input.repoRoot, input.refName, input.admissionId, now)
+      this.#db.exec('COMMIT')
+      return this.submissionAdmission(input.admissionId)!
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  bindSubmissionAdmission(admissionId: string, runId: string): SubmissionAdmissionRow {
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      const row = this.submissionAdmission(admissionId)
+      if (!row) throw new Error(`unknown submission admission ${admissionId}`)
+      if (row.run_id && row.run_id !== runId) {
+        throw new Error(`submission admission ${admissionId} is bound to another run`)
+      }
+      if (row.status === 'failed' || row.status === 'superseded') {
+        throw new Error(`submission admission ${admissionId} is ${row.status}`)
+      }
+      if (!row.run_id || row.status === 'pending') {
+        this.#db
+          .prepare(
+            `UPDATE submission_admissions
+             SET run_id = ?, status = 'launched', launched_at = COALESCE(launched_at, ?)
+             WHERE admission_id = ?`
+          )
+          .run(runId, new Date().toISOString(), admissionId)
+      }
+      this.#db.exec('COMMIT')
+      return this.submissionAdmission(admissionId)!
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  markSubmissionLaunched(admissionId: string, launcherPid?: number): SubmissionAdmissionRow {
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      const row = this.submissionAdmission(admissionId)
+      if (!row) throw new Error(`unknown submission admission ${admissionId}`)
+      if (row.status === 'pending') {
+        this.#db
+          .prepare(
+            `UPDATE submission_admissions
+             SET status = 'launched', launched_at = COALESCE(launched_at, ?),
+                 launcher_pid = COALESCE(?, launcher_pid)
+             WHERE admission_id = ?`
+          )
+          .run(new Date().toISOString(), launcherPid ?? null, admissionId)
+      }
+      this.#db.exec('COMMIT')
+      return this.submissionAdmission(admissionId)!
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  reclaimSubmissionAdmission(admissionId: string): SubmissionAdmissionRow | undefined {
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      const row = this.submissionAdmission(admissionId)
+      if (
+        !row ||
+        row.status === 'accepted' ||
+        row.status === 'failed' ||
+        row.status === 'superseded'
+      ) {
+        this.#db.exec('COMMIT')
+        return row
+      }
+      this.#db
+        .prepare(
+          `UPDATE submission_admissions
+           SET status = 'pending', run_id = NULL, launcher_pid = NULL, launched_at = NULL
+           WHERE admission_id = ?`
+        )
+        .run(admissionId)
+      const lease = this.#db
+        .prepare(
+          'SELECT admission_id FROM pending_admission_leases WHERE repo_root = ? AND ref_name = ?'
+        )
+        .get(row.repo_root, row.ref_name) as { admission_id: string } | undefined
+      if (!lease) {
+        this.#db
+          .prepare(
+            `INSERT INTO pending_admission_leases
+               (repo_root, ref_name, admission_id, acquired_at)
+             VALUES (?, ?, ?, ?)`
+          )
+          .run(row.repo_root, row.ref_name, admissionId, new Date().toISOString())
+      } else if (lease.admission_id !== admissionId) {
+        this.#db
+          .prepare(`UPDATE submission_admissions SET status = 'superseded' WHERE admission_id = ?`)
+          .run(admissionId)
+      }
+      this.#db.exec('COMMIT')
+      return this.submissionAdmission(admissionId)!
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  markSubmissionAccepted(input: {
+    acceptedOid: string
+    admissionId: string
+    runId: string
+  }): SubmissionAdmissionRow {
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      const row = this.submissionAdmission(input.admissionId)
+      if (!row) throw new Error(`unknown submission admission ${input.admissionId}`)
+      if (row.run_id && row.run_id !== input.runId) {
+        throw new Error(`submission admission ${input.admissionId} is bound to another run`)
+      }
+      if (row.new_oid !== input.acceptedOid) {
+        throw new Error(`submission admission ${input.admissionId} accepted the wrong object`)
+      }
+      if (row.status === 'failed' || row.status === 'superseded') {
+        throw new Error(`submission admission ${input.admissionId} is ${row.status}`)
+      }
+      if (row.status !== 'accepted') {
+        this.#db
+          .prepare(
+            `UPDATE submission_admissions
+             SET run_id = COALESCE(run_id, ?), status = 'accepted', accepted_oid = ?, accepted_at = ?
+             WHERE admission_id = ?`
+          )
+          .run(input.runId, input.acceptedOid, new Date().toISOString(), input.admissionId)
+        this.#db
+          .prepare('DELETE FROM pending_admission_leases WHERE admission_id = ?')
+          .run(input.admissionId)
+      }
+      this.#db.exec('COMMIT')
+      return this.submissionAdmission(input.admissionId)!
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  failSubmissionAdmission(admissionId: string, status: 'failed' | 'superseded' = 'failed'): void {
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      const row = this.submissionAdmission(admissionId)
+      if (!row || row.status === 'accepted') {
+        this.#db.exec('COMMIT')
+        return
+      }
+      this.#db
+        .prepare(
+          `UPDATE submission_admissions
+           SET status = ?, launched_at = CASE WHEN run_id IS NULL THEN NULL ELSE launched_at END,
+               launcher_pid = CASE WHEN run_id IS NULL THEN NULL ELSE launcher_pid END
+           WHERE admission_id = ?`
+        )
+        .run(status, admissionId)
+      this.#db
+        .prepare('DELETE FROM pending_admission_leases WHERE admission_id = ?')
+        .run(admissionId)
       this.#db.exec('COMMIT')
     } catch (error) {
       this.#db.exec('ROLLBACK')
@@ -4534,10 +4933,24 @@ export class DomainLedger {
     try {
       // One statement per id rather than an IN list: a long-lived ledger can
       // hold more completed runs than SQLite allows host parameters.
+      const removable = this.#db.prepare(
+        "SELECT 1 FROM runs WHERE run_id = ? AND status <> 'in-progress' AND run_id NOT IN (SELECT run_id FROM branch_leases)"
+      )
+      // Accepted admissions retain their run binding indefinitely, so the
+      // runs.delete would trip the run foreign key. The admission follows its
+      // run: without it the ledger would keep replay rows that can never
+      // resolve to the evidence an operator just asked to remove.
+      const removeAdmissions = this.#db.prepare(
+        'DELETE FROM submission_admissions WHERE run_id = ?'
+      )
       const remove = this.#db.prepare(
         "DELETE FROM runs WHERE run_id = ? AND status <> 'in-progress' AND run_id NOT IN (SELECT run_id FROM branch_leases)"
       )
-      for (const runId of runIds) pruned += Number(remove.run(runId).changes)
+      for (const runId of runIds) {
+        if (removable.get(runId) === undefined) continue
+        removeAdmissions.run(runId)
+        pruned += Number(remove.run(runId).changes)
+      }
       this.#db.exec('COMMIT')
       return pruned
     } catch (error) {
