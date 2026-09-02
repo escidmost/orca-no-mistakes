@@ -10582,13 +10582,32 @@ async function launchDetachedRun(
   resumeStartOid?: string,
   admissionId?: string,
 ): Promise<{ coordinatorPid: number | undefined; terminalHandle: string }> {
-  try {
-    parseGithubRepositoryReference(
-      (await command("git", ["remote", "get-url", "origin"], repo.root)).stdout.trim(),
-    );
-  } catch {
-    throw new Error("unsupported forge: new runs require GitHub");
+  const resumeRunId = stringFlag(flags, "resume");
+  let resumePlan: { stage_id: string }[] = [];
+  if (resumeRunId) {
+    const ledger = openRepositoryLedger(repo.root, false);
+    try {
+      resumePlan = ledger.stagePlan(resumeRunId);
+    } finally {
+      ledger.close();
+    }
   }
+  const legacyResume =
+    resumePlan.length > 0 &&
+    !resumePlan.some((entry) => entry.stage_id === "push");
+  if (!legacyResume) {
+    try {
+      parseGithubRepositoryReference(
+        (await command("git", ["remote", "get-url", "origin"], repo.root)).stdout.trim(),
+      );
+    } catch {
+      throw new Error("unsupported forge: new runs require GitHub");
+    }
+  }
+  const gateStagePlan =
+    resumePlan.length > 0
+      ? (resumePlan.map((entry) => entry.stage_id as StageName))
+      : PIPELINE_STEPS;
   const orcaCommand = resolveOrcaCommand();
   const root = await configuredWorktreeRoot(
     repo.root,
@@ -10743,7 +10762,6 @@ async function launchDetachedRun(
     if (launcherMarkerFile) await rm(launcherMarkerFile, { force: true });
   };
   if (root) {
-    const gateStagePlan = PIPELINE_STEPS;
     const launcherId = randomUUID();
     const gateBranch = `no-mistakes-gate-${randomUUID().slice(0, 8)}`;
     const intent = normalizeIntent(stringFlag(flags, "intent")!);

@@ -289,7 +289,7 @@ export async function bindPullRequest(input: {
   if (!pullRequest || pullRequest.state !== 'OPEN' || pullRequest.draft || pullRequest.headOid !== input.candidateCommitOid) {
     throw new PullRequestBindingError('pull-request facts changed before settlement')
   }
-  const observedAt = after(mutationCreatedAt, now())
+  const observedAt = after(managedCommentIntent.createdAt, now())
   const postRead = input.ledger.recordRemoteObservation({
     attemptId: input.attemptId,
     kind: 'pull-request',

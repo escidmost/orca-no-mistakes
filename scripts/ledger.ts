@@ -3351,7 +3351,10 @@ export class DomainLedger {
 
   listAttemptOutcomes(runId: string): { outcome_sha256: string }[] {
     return this.#db.prepare(
-      'SELECT outcome_sha256 FROM attempt_outcomes WHERE run_id = ? ORDER BY completed_at, rowid'
+      `SELECT o.outcome_sha256
+       FROM attempt_outcomes o
+       JOIN run_attempts a ON a.run_id = o.run_id AND a.attempt_id = o.attempt_id
+       WHERE o.run_id = ? ORDER BY a.generation_token, o.rowid`
     ).all(runId) as { outcome_sha256: string }[]
   }
 
@@ -3645,7 +3648,8 @@ export class DomainLedger {
         (hasManagedComment && (!managedCommentMutation ||
           managedCommentMutation.attempt_id !== observation.attempt_id ||
           managedCommentMutation.kind !== 'managed-comment' ||
-          managedCommentMutation.target_fingerprint !== route.route_fingerprint)) ||
+          managedCommentMutation.target_fingerprint !== route.route_fingerprint ||
+          managedCommentMutation.created_at > observation.observed_at)) ||
         mutation.created_at > observation.observed_at) return false
     let mutationPayload: Record<string, unknown>
     let managedCommentPayload: Record<string, unknown>
@@ -3819,7 +3823,7 @@ export class DomainLedger {
          FROM remote_receipts
          WHERE run_id = ? AND kind = ? AND candidate_commit_oid = ?
            AND authoritative_post_observation_sha256 = ? AND receipt_json = ?
-         ORDER BY created_at DESC, rowid DESC
+         ORDER BY rowid DESC
          LIMIT 1`
       ).get(
         input.runId,
@@ -3916,7 +3920,7 @@ export class DomainLedger {
               receipt_json, receipt_sha256, created_at
        FROM remote_receipts
        WHERE run_id = ? AND kind = ? AND (? IS NULL OR receipt_sha256 = ?)
-       ORDER BY created_at DESC, rowid DESC
+       ORDER BY rowid DESC
        LIMIT 1`
     ).get(runId, kind, receiptSha256 ?? null, receiptSha256 ?? null) as
       | RemoteReceiptRow
@@ -5029,7 +5033,7 @@ export class DomainLedger {
               o.completed_at, o.outcome_sha256, a.generation_token
        FROM attempt_outcomes o
        JOIN run_attempts a ON a.run_id = o.run_id AND a.attempt_id = o.attempt_id
-       WHERE o.run_id = ? ORDER BY o.completed_at, o.rowid`
+       WHERE o.run_id = ? ORDER BY a.generation_token, o.rowid`
     ).all(manifest.runId) as {
       actor_identity: string
       attempt_id: string
