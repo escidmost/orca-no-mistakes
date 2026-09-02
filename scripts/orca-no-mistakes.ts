@@ -2171,6 +2171,9 @@ export async function runPipeline(
             : undefined,
         });
         domainRunStarted = true;
+        if (remotePublication && !ledger.publicationRoute(runId)) {
+          throw new Error("stored publication route does not match the admitted run branches");
+        }
         if (options.admission) {
           ledger.bindSubmissionAdmission(options.admission.admissionId, runId);
         }
@@ -10579,6 +10582,13 @@ async function launchDetachedRun(
   resumeStartOid?: string,
   admissionId?: string,
 ): Promise<{ coordinatorPid: number | undefined; terminalHandle: string }> {
+  try {
+    parseGithubRepositoryReference(
+      (await command("git", ["remote", "get-url", "origin"], repo.root)).stdout.trim(),
+    );
+  } catch {
+    throw new Error("unsupported forge: new runs require GitHub");
+  }
   const orcaCommand = resolveOrcaCommand();
   const root = await configuredWorktreeRoot(
     repo.root,
@@ -10733,6 +10743,7 @@ async function launchDetachedRun(
     if (launcherMarkerFile) await rm(launcherMarkerFile, { force: true });
   };
   if (root) {
+    const gateStagePlan = PIPELINE_STEPS;
     const launcherId = randomUUID();
     const gateBranch = `no-mistakes-gate-${randomUUID().slice(0, 8)}`;
     const intent = normalizeIntent(stringFlag(flags, "intent")!);
@@ -10812,15 +10823,6 @@ async function launchDetachedRun(
       });
       launcherMarker.runId = runId;
       await finishLauncherAllocation(launcherMarker);
-      let gateStagePlan: readonly StageName[];
-      try {
-        parseGithubRepositoryReference(
-          (await command("git", ["remote", "get-url", "origin"], repo.root)).stdout.trim(),
-        );
-        gateStagePlan = PIPELINE_STEPS;
-      } catch {
-        gateStagePlan = LEGACY_STAGE_PLAN;
-      }
       intentTaskId = await withLauncherAllocation(launcherMarker, () =>
         configuredOrca!.createTask(stageTaskSpec("intent", intent, gateStagePlan)),
       );
@@ -14532,10 +14534,15 @@ Run options:
       );
       githubOrigin = true;
     } catch {}
-    if (!storedRoute && !legacyResume && githubOrigin) {
-      throw new Error("new GitHub runs require successful orca-no-mistakes init");
+    if (!legacyResume) {
+      if (!githubOrigin) {
+        throw new Error("unsupported forge: new runs require GitHub");
+      }
+      if (!storedRoute) {
+        throw new Error("new GitHub runs require successful orca-no-mistakes init");
+      }
     }
-    if (!legacyResume && (githubOrigin || storedRoute)) {
+    if (!legacyResume) {
       try {
         githubAuthority = await GithubAuthority.connect();
         const publicationRoute = await resolveGithubPublicationRoute({

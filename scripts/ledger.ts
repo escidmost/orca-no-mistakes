@@ -2706,7 +2706,13 @@ export class DomainLedger {
         insert.run(input.runId, position, entry.stageId, entry.requirement)
       }
       const route = this.repositoryPublicationRoute(input.repoRoot)
-      if (route) this.#recordStoredPublicationRoute(input.runId, route)
+      if (
+        route &&
+        route.head_branch === input.branch &&
+        route.base_branch === input.baseBranch
+      ) {
+        this.#recordStoredPublicationRoute(input.runId, route)
+      }
       this.#db.exec('COMMIT')
     } catch (error) {
       this.#db.exec('ROLLBACK')
@@ -3158,6 +3164,11 @@ export class DomainLedger {
       }
       const route = this.repositoryPublicationRoute(repoRoot)
       if (!route) throw new Error(`repository ${repoRoot} has no publication route`)
+      if (route.head_branch !== run.branch || route.base_branch !== run.base_branch) {
+        throw new Error(
+          `stored publication route (${route.head_branch} -> ${route.base_branch}) does not match run (${run.branch} -> ${run.base_branch})`
+        )
+      }
       const fingerprint = this.#recordStoredPublicationRoute(runId, route)
       this.#db.exec('COMMIT')
       return fingerprint
