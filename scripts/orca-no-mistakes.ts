@@ -587,7 +587,10 @@ export class GateStopError extends Error {}
 // branch lease. Closing or signalling its terminal kills only the coordinator
 // process, so those resources used to outlive the run. The registry below
 // tracks everything the run still holds; a signal handler reaps it all,
-// anchors the recovery ref, and only then exits. The marker file under
+// anchors the recovery ref, and only then exits — unless the cancelled
+// outcome cannot be delivered over any notification transport, in which
+// case the gate worktree/branch, terminal, and marker are retained for
+// recovery. The marker file under
 // .orca/no-mistakes/ lets a later `prune --stranded` tell a dead run's
 // leftover gate workspace from a live one's without guessing.
 
