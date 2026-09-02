@@ -1852,12 +1852,34 @@ export async function runPipeline(
   if (
     options.admission &&
     admission &&
-    !options.resumeRunId &&
-    repo.head !== admission.new_oid
+    !options.resumeRunId
   ) {
-    throw new Error(
-      "the pipeline checkout does not match the admitted submission object",
+    if (`refs/heads/${deliveryRepo.branch}` !== admission.ref_name) {
+      throw new Error(
+        `the pipeline checkout is on ${deliveryRepo.branch} but the admission is for ${admission.ref_name}`,
+      );
+    }
+    const checkoutRepository = path.resolve(
+      repositoryGatePaths(deliveryRepo.root).commonDir,
     );
+    let admittedRepository = path.resolve(admission.repo_root);
+    if (admittedRepository !== checkoutRepository) {
+      try {
+        admittedRepository = path.resolve(
+          repositoryGatePaths(admission.repo_root).commonDir,
+        );
+      } catch {}
+    }
+    if (admittedRepository !== checkoutRepository) {
+      throw new Error(
+        "the pipeline checkout does not belong to the admitted repository",
+      );
+    }
+    if (repo.head !== admission.new_oid) {
+      throw new Error(
+        "the pipeline checkout does not match the admitted submission object",
+      );
+    }
   }
   let domainRunStarted = false;
   let generationToken: number | undefined;
@@ -13357,7 +13379,7 @@ Run options:
       newOid: launchRepoState.head,
       oldOid: launchRepoState.head,
       refName: `refs/heads/${launchRepoState.branch}`,
-      repoRoot: launchRepoState.root,
+      repoRoot: gatePaths.commonDir,
       source: "direct",
     });
     if (

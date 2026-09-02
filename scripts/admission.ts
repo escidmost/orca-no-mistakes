@@ -718,7 +718,7 @@ export function beginGateAdmission(
     newOid: update.newOid,
     oldOid: update.oldOid,
     refName: update.refName,
-    repoRoot: metadata.repoRoot,
+    repoRoot: metadata.commonDir,
     source: 'gate'
   }
   return ledger.beginSubmissionAdmission(input)
