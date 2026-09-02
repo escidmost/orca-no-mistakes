@@ -1214,7 +1214,44 @@ async function markOutcomeDeliveryPending(
 ): Promise<void> {
   abortReap.pendingOutcome = outcome;
   abortReap.pendingSummary = summary;
-  await refreshGateMarker();
+  const { gate, originWorktree } = abortReap;
+  if (!gate || !originWorktree) return;
+  const markerPath = gateMarkerPath(originWorktree, gateMarkerId(gate));
+  try {
+    await refreshGateMarker();
+  } catch (error) {
+    try {
+      let createdAt = new Date().toISOString();
+      let terminalHandle = abortReap.terminalHandle;
+      try {
+        const existing = JSON.parse(
+          await readFile(markerPath, "utf8"),
+        ) as Partial<GateRunMarker>;
+        if (typeof existing.createdAt === "string") createdAt = existing.createdAt;
+        if (terminalHandle === undefined && typeof existing.terminalHandle === "string") {
+          terminalHandle = existing.terminalHandle;
+        }
+      } catch {}
+      const fallbackMarker: GateRunMarker = {
+        createdAt,
+        gate,
+        originWorktree,
+        notifyHandle: abortReap.notifyHandle,
+        pendingOutcome: outcome,
+        pendingSummary: summary,
+        ...(terminalHandle !== undefined ? { terminalHandle } : {}),
+      };
+      await writeFile(
+        markerPath,
+        `${JSON.stringify(fallbackMarker, null, 2)}\n`,
+      );
+    } catch {
+      try {
+        appendFileSync(markerPath, "\n--incomplete-outcome-journal--\n");
+      } catch {}
+    }
+    throw error;
+  }
 }
 
 async function clearOutcomeDeliveryPending(): Promise<void> {
@@ -1521,12 +1558,15 @@ export async function reapAbortedRun(reason: string): Promise<void> {
     const summary = recoverRef
       ? `No-mistakes cancelled: ${reason}\n${recoveryInstructions(recoverRef)}`
       : `No-mistakes cancelled: ${reason}`;
-    await markOutcomeDeliveryPending("cancelled", summary).catch(
-      (markerError) =>
-        abortLog(
-          `warning: could not record the write-ahead cancelled outcome: ${String(markerError)}`,
-        ),
-    );
+    try {
+      await markOutcomeDeliveryPending("cancelled", summary);
+    } catch (markerError) {
+      outcomeDelivered = false;
+      abortLog(
+        `warning: could not record the write-ahead cancelled outcome: ${String(markerError)}`,
+      );
+      throw markerError;
+    }
     try {
       await abortReap.notify(summary);
       await clearOutcomeDeliveryPending().catch((markerError) =>
@@ -11257,6 +11297,7 @@ async function reapConfiguredGate(
       }).failRun("Configured coordinator terminated before cleanup completed");
       return true;
     } catch (error) {
+      if (isConsumerFenced(error)) return true;
       console.error(
         `no-mistakes: retained gate workspace ${gate.path}; its configured run could not be settled: ${String(error)}`,
       );
@@ -11564,8 +11605,10 @@ async function reapConfiguredLauncher(
         cwd: repoRoot,
         runId: marker.runId,
       }).failRun("Configured launcher terminated before gate allocation");
-    } catch {
-      return false;
+    } catch (error) {
+      if (!isConsumerFenced(error)) {
+        return false;
+      }
     }
     if (
       run !== undefined &&
@@ -13921,12 +13964,7 @@ Run options:
         : []),
       ...(result.custodyNote ? [result.custodyNote] : []),
     ].join("\n");
-    await markOutcomeDeliveryPending("passed", passedSummary).catch(
-      (markerError) =>
-        console.error(
-          `warning: could not record the write-ahead passed outcome: ${String(markerError)}`,
-        ),
-    );
+    await markOutcomeDeliveryPending("passed", passedSummary);
     try {
       await orca.notifyRunResult("passed", passedSummary);
       await clearOutcomeDeliveryPending().catch((markerError) =>
@@ -13992,12 +14030,8 @@ Run options:
     const failedSummary = recoverRef
       ? `No-mistakes ${outcome}: ${message}\n${recoveryInstructions(recoverRef)}`
       : `No-mistakes ${outcome}: ${message}`;
-    await markOutcomeDeliveryPending(outcome, failedSummary).catch(
-      (markerError) =>
-        console.error(
-          `warning: could not record the write-ahead ${outcome} outcome: ${String(markerError)}`,
-        ),
-    );
+    retainGate = true;
+    await markOutcomeDeliveryPending(outcome, failedSummary);
     try {
       await orca.notifyRunResult(outcome, failedSummary);
       await clearOutcomeDeliveryPending().catch((markerError) =>
