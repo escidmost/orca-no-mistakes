@@ -342,6 +342,7 @@ export type PipelineOptions = {
     setAutoFix?: (enabled: boolean) => Promise<void> | void,
     requestResume?: () => void,
     onResumeAvailable?: () => void,
+    onRendererFailure?: (error: unknown) => void,
   ) => PresentationRenderer;
   resumeRunId?: string;
   userGlobalConfig?: OrcaNoMistakesConfig;
@@ -2012,6 +2013,10 @@ export async function runPipeline(
         requestResume,
         () => {
           resumeControlAvailable = true;
+        },
+        (error) => {
+          resumeControlAvailable = false;
+          console.error(`warning: presentation renderer failed: ${String(error)}`);
         },
       ) ??
         (options.plainStatus
@@ -13600,6 +13605,7 @@ Run options:
                 setAutoFix,
                 requestResume,
                 onResumeAvailable,
+                onRendererFailure,
               ) => {
                 renderer = createRunRenderer(
                   process.stdin,
@@ -13611,6 +13617,7 @@ Run options:
                   setAutoFix,
                   requestResume,
                   onResumeAvailable,
+                  onRendererFailure,
                 );
                 setAbortPresentationCleanup(closeRenderer);
                 return renderer;

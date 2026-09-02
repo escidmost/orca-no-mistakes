@@ -251,7 +251,9 @@ test("a failed renderer is replaced by the fallback and later status keeps rende
 
 test("plain status degrades hostile identifiers to one bounded ASCII line", () => {
   const previousSecret = process.env.ONM_TEST_SECRET;
+  const previousPassword = process.env.ONM_TEST_PASSWORD;
   process.env.ONM_TEST_SECRET = "secret-value";
+  process.env.ONM_TEST_PASSWORD = "open sesame";
   const lines: string[] = [];
   const renderer = new PlainStatusRenderer({ write: (line) => lines.push(line) });
   try {
@@ -259,7 +261,7 @@ test("plain status degrades hostile identifiers to one bounded ASCII line", () =
       attempt: 1,
       currentStage: "review",
       mode: { autoFix: false },
-      runId: `run\nsec\u001b[31mret-value\u001b[0mwide-\u4e2d-combining-e\u0301-${"x".repeat(500)}`,
+      runId: `run\nsec\u001b[31mret-value\u001b[0m-open\nsesame-wide-\u4e2d-combining-e\u0301-${"x".repeat(500)}`,
       sequence: 1,
       stages: [],
       status: "in-progress",
@@ -276,6 +278,8 @@ test("plain status degrades hostile identifiers to one bounded ASCII line", () =
   } finally {
     if (previousSecret === undefined) delete process.env.ONM_TEST_SECRET;
     else process.env.ONM_TEST_SECRET = previousSecret;
+    if (previousPassword === undefined) delete process.env.ONM_TEST_PASSWORD;
+    else process.env.ONM_TEST_PASSWORD = previousPassword;
   }
 
   assert.equal(lines.length, 1);
@@ -284,6 +288,7 @@ test("plain status degrades hostile identifiers to one bounded ASCII line", () =
   assert.equal(lines[0].includes("\u4e2d"), false);
   assert.equal(lines[0].includes("\u0301"), false);
   assert.equal(lines[0].includes("secret-value"), false);
+  assert.equal(lines[0].includes("open sesame"), false);
   assert.match(lines[0], /\[REDACTED\]/u);
   assert.match(lines[0], /^[\x20-\x7e]+\n$/u);
   assert.ok(lines[0].length < 300);

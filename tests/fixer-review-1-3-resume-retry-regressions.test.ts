@@ -368,11 +368,15 @@ test("renderer fallback revokes same-process resume availability", async () => {
     _setAutoFix: unknown,
     _requestResume?: () => void,
     onResumeAvailable?: () => void,
+    onRendererFailure?: (error: unknown) => void,
   ) => {
     onResumeAvailable?.();
+    let failed = false;
     return {
       render(): void {
-        throw new Error("renderer exploded");
+        if (failed) return;
+        failed = true;
+        onRendererFailure?.(new Error("renderer exploded"));
       },
     };
   };

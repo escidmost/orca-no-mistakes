@@ -458,13 +458,13 @@ export class PresentationPublisher {
 }
 
 function safeToken(value: string): string {
-  return redactKnownSecrets(
+  const normalized = redactKnownSecrets(
     stripVTControlCharacters(redactKnownSecrets(value)),
   )
     .replaceAll(/[^\x20-\x7e]/gu, " ")
     .replaceAll(/\s+/gu, " ")
-    .trim()
-    .slice(0, 120);
+    .trim();
+  return redactKnownSecrets(normalized).slice(0, 120);
 }
 
 export class PlainStatusRenderer implements PresentationRenderer {

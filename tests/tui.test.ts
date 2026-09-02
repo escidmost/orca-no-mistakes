@@ -206,7 +206,19 @@ if (process.env.TUI_FIXTURE === "1") {
   test("runtime renderer errors restore once and permanently fall back to plain status", async () => {
     const input = new FakeInput();
     const output = new FakeOutput();
-    const renderer = createRunRenderer(input, output, "/unused");
+    const failures: string[] = [];
+    const renderer = createRunRenderer(
+      input,
+      output,
+      "/unused",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      (error) => failures.push(String(error)),
+    );
     output.failNextWrite = true;
     renderer.render(snapshot("review", 1));
     await nextDraw();
@@ -217,12 +229,7 @@ if (process.env.TUI_FIXTURE === "1") {
       output.writes.filter((write) => write === "\u001b[?25h\u001b[?1049l").length,
       1,
     );
-    assert.equal(
-      output.writes.filter((write) =>
-        write.startsWith("warning: interactive presentation failed"),
-      ).length,
-      1,
-    );
+    assert.deepEqual(failures, ["Error: write failed"]);
     assert.equal(
       output.writes.at(-1),
       "no-mistakes run-tui-test stage 3/6 review started\n",
@@ -231,12 +238,7 @@ if (process.env.TUI_FIXTURE === "1") {
     output.emit("resize");
     renderer.render(snapshot("lint", 2));
     await nextDraw();
-    assert.equal(
-      output.writes.filter((write) =>
-        write.startsWith("warning: interactive presentation failed"),
-      ).length,
-      1,
-    );
+    assert.deepEqual(failures, ["Error: write failed"]);
     assert.equal(
       output.writes.at(-1),
       "no-mistakes run-tui-test stage 6/6 lint started\n",
@@ -355,14 +357,16 @@ if (process.env.TUI_FIXTURE === "1") {
 
   test("untrusted terminal text is redacted, ASCII-safe, bounded, and textually labeled", async () => {
     const previousSecret = process.env.ONM_TEST_SECRET;
+    const previousPassword = process.env.ONM_TEST_PASSWORD;
     const previousNoColor = process.env.NO_COLOR;
     process.env.ONM_TEST_SECRET = "secret-value";
+    process.env.ONM_TEST_PASSWORD = "open sesame";
     process.env.NO_COLOR = "1";
     const input = new FakeInput();
     const output = new FakeOutput();
     const renderer = new RailTuiRenderer(input, output, "/unused");
     const base = snapshot("review", 1);
-    const hostile = "sec\u001b[31mret-value\u001b[0m\nwide-\u4e2d-combining-e\u0301-";
+    const hostile = "sec\u001b[31mret-value\u001b[0m-open\nsesame\nwide-\u4e2d-combining-e\u0301-";
     try {
       renderer.render({
         ...base,
@@ -401,6 +405,7 @@ if (process.env.TUI_FIXTURE === "1") {
       );
       assert.equal(frame.includes("\u001b"), false);
       assert.equal(frame.includes("secret-value"), false);
+      assert.equal(frame.includes("open sesame"), false);
       assert.equal(frame.includes("\u4e2d"), false);
       assert.equal(frame.includes("\u0301"), false);
       assert.match(frame, /\[REDACTED\]/u);
@@ -418,6 +423,8 @@ if (process.env.TUI_FIXTURE === "1") {
       renderer.close();
       if (previousSecret === undefined) delete process.env.ONM_TEST_SECRET;
       else process.env.ONM_TEST_SECRET = previousSecret;
+      if (previousPassword === undefined) delete process.env.ONM_TEST_PASSWORD;
+      else process.env.ONM_TEST_PASSWORD = previousPassword;
       if (previousNoColor === undefined) delete process.env.NO_COLOR;
       else process.env.NO_COLOR = previousNoColor;
     }
@@ -728,7 +735,11 @@ if (process.env.TUI_FIXTURE === "1") {
       const screen = (): string => cleanScreen(output);
 
       try {
-        await waitFor(() => screen().includes("RECENT ACTIVITY"));
+        await waitFor(
+          () =>
+            screen().includes("RECENT ACTIVITY") &&
+            screen().includes("6. Lint"),
+        );
         const initial = screen();
         const labels = [
           "1. Intent",
@@ -779,10 +790,11 @@ if (process.env.TUI_FIXTURE === "1") {
         terminal.write("n");
         await waitFor(
           () =>
-            screen().includes("Lint started") &&
+            screen().includes("6. Lint active") &&
             screen().includes("pinned Review"),
         );
         assert.match(screen(), /6\. Lint active/u);
+        assert.equal(screen().match(/\[>\]/gu)?.length, 1);
 
         terminal.resize(60, 15);
         await waitFor(() => screen().includes("Terminal too small"));

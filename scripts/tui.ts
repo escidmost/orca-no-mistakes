@@ -67,7 +67,7 @@ function safeText(text: string, maxLength = Number.POSITIVE_INFINITY): string {
     else if (character === "\r" || character === "\n") result += " ";
     else result += character >= " " && character <= "~" ? character : "?";
   }
-  return result.slice(0, maxLength);
+  return redactKnownSecrets(result).slice(0, maxLength);
 }
 
 function fit(text: string, width: number): string {
@@ -808,12 +808,15 @@ export class RailTuiRenderer implements PresentationRenderer {
     const keys =
       complete.match(
         new RegExp(
-          "\\x03|\\x1b\\[Z|\\x1b\\[[ABCD]|\\r|\\n|\\t|\\x1b|[aAcCgGrR]",
+          "\\x03|\\x1a|\\x1b\\[Z|\\x1b\\[[ABCD]|\\r|\\n|\\t|\\x1b|[aAcCgGrR]",
           "g",
         ),
       ) ?? [];
     for (const key of keys) {
-      if (key === "\u0003") {
+      if (key === "\u001a") {
+        this.#onSuspend();
+        return;
+      } else if (key === "\u0003") {
         this.#cancelRun();
         return;
       } else if (this.#cancelVisible) {
@@ -1002,21 +1005,28 @@ export function createRunRenderer(
   setAutoFix?: (enabled: boolean) => Promise<void> | void,
   requestResume?: () => void,
   onResumeAvailable?: () => void,
+  onFailure?: (error: unknown) => void,
 ): PresentationRenderer & { close?: () => void } {
   let fallback: PlainStatusRenderer | undefined;
   let failed = false;
   const plain = (): PlainStatusRenderer =>
     (fallback ??= new PlainStatusRenderer(output));
   const switchToPlain = (
-    _error: unknown,
+    error: unknown,
     snapshot?: PresentationSnapshot,
   ): void => {
     if (failed) return;
     failed = true;
     rail?.close();
-    try {
-      output.write("warning: interactive presentation failed; using plain status\n");
-    } catch {}
+    if (onFailure) {
+      try {
+        onFailure(error);
+      } catch {}
+    } else {
+      try {
+        output.write("warning: interactive presentation failed; using plain status\n");
+      } catch {}
+    }
     if (snapshot) {
       try {
         plain().render(snapshot);

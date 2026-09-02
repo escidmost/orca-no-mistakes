@@ -160,7 +160,7 @@ if (process.env.TUI_CTRL_C_FIXTURE === "1") {
     }
   });
 
-  test("suspend, resume, and raw Ctrl-C restore each terminal boundary exactly once", { timeout: 10_000 }, async () => {
+  test("raw Ctrl-Z, resume, and raw Ctrl-C restore each terminal boundary exactly once", { timeout: 10_000 }, async () => {
     const artifactsDir = mkdtempSync(path.join(tmpdir(), "orca-tui-sigint-"));
     ensurePtyHelperExecutable();
     const env = Object.fromEntries(
@@ -202,7 +202,7 @@ if (process.env.TUI_CTRL_C_FIXTURE === "1") {
       const count = (sequence: string): number => output.split(sequence).length - 1;
       await waitFor(() => output.includes("RECENT ACTIVITY"));
 
-      terminal.kill("SIGTSTP");
+      terminal.write("\u001a");
       await waitFor(() => count("\u001b[?25h\u001b[?1049l") === 1);
       terminal.kill("SIGCONT");
       await waitFor(
