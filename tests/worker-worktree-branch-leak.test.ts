@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -20,13 +20,14 @@ function git(cwd: string, ...args: string[]): string {
 async function seedWorker(
   prefix: string,
   branch: string,
-  options: { adopts?: boolean } = {},
+  options: { adopts?: boolean; runId?: string } = {},
 ) {
   const adopts = options.adopts ?? false;
   const temp = await mkdtemp(path.join(tmpdir(), prefix));
   const repo = path.join(temp, "repo");
   const worker = path.join(temp, "worker");
   const fakeOrca = path.join(temp, "orca");
+  const callsPath = path.join(temp, "calls.jsonl");
   git(temp, "-c", "init.templateDir=", "init", "-b", "feature", "repo");
   git(repo, "config", "user.email", "test@example.com");
   git(repo, "config", "user.name", "Test User");
@@ -40,8 +41,9 @@ async function seedWorker(
     fakeOrca,
     `#!/usr/bin/env node
 import { execFileSync } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { appendFileSync, existsSync } from 'node:fs'
 const args = process.argv.slice(2)
+appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')
 const out = (result) => console.log(JSON.stringify({ result }))
 const repo = ${JSON.stringify(repo)}
 const worker = ${JSON.stringify(worker)}
@@ -77,7 +79,11 @@ if (args[0] === 'worktree' && args[1] === 'create') {
   );
   await chmod(fakeOrca, 0o755);
 
-  const orca = new CliOrca({ command: fakeOrca, cwd: repo });
+  const orca = new CliOrca({
+    command: fakeOrca,
+    cwd: repo,
+    runId: options.runId,
+  });
   const start = () =>
     orca.startWorker("task-review", {
       commitOid,
@@ -87,7 +93,7 @@ if (args[0] === 'worktree' && args[1] === 'create') {
       stage: "review",
       worktree: "new-child",
     });
-  return { orca, repo, start, temp };
+  return { callsPath, orca, repo, start, temp };
 }
 
 test("a detached worker worktree still releases the branch Orca minted", async () => {
@@ -99,6 +105,30 @@ test("a detached worker worktree still releases the branch Orca minted", async (
       git(repo, "branch", "--list", branch),
       "",
       "worker branch must not outlive its worktree",
+    );
+  } finally {
+    await rm(temp, { force: true, recursive: true });
+  }
+});
+
+test("worker worktree names are scoped to the orchestration run", async () => {
+  const { callsPath, start, temp } = await seedWorker(
+    "orca-worker-name-",
+    "evs/no-mistakes-review-1",
+    { runId: "run_collision_12345678" },
+  );
+  try {
+    await assert.rejects(start());
+    const calls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    const create = calls.find(
+      (args) => args[0] === "worktree" && args[1] === "create",
+    );
+    assert.equal(
+      create?.[create.indexOf("--name") + 1],
+      "no-mistakes-review-1-ion-12345678",
     );
   } finally {
     await rm(temp, { force: true, recursive: true });

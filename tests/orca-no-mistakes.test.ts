@@ -2892,7 +2892,9 @@ if (args[0] === 'terminal' && args[1] === 'send') {
   fs.writeFileSync(markerFile, JSON.stringify(marker))
 }
 const gateName = args[args.indexOf('--name') + 1]
-const result = args[0] === 'worktree' && args[1] === 'create'
+const result = args[0] === 'worktree' && args[1] === 'current'
+  ? { worktree: { displayName: 'ONM-92 Validate the completed Run TUI end to end', linkedLinearIssue: 'ONM-92' } }
+  : args[0] === 'worktree' && args[1] === 'create'
   ? { worktree: { id: 'gate-id', path: ${JSON.stringify(gate)}, branch: 'refs/heads/evs/' + gateName } }
   : args[0] === 'terminal' && args[1] === 'list'
     ? { terminals: [{ handle: 'gate-shell', connected: true, writable: true }] }
@@ -2967,6 +2969,21 @@ console.log(JSON.stringify({ result }))
     assert.equal(
       worktreeSet?.[worktreeSet.indexOf("--parent-worktree") + 1],
       `path:${canonicalRepo}`,
+    );
+    assert.equal(
+      worktreeSet?.[worktreeSet.indexOf("--linear-issue") + 1],
+      "ONM-92",
+    );
+    assert.equal(
+      worktreeSet?.[worktreeSet.indexOf("--display-name") + 1],
+      "ONM-92 Validate the completed Run TUI end to end - no-mistakes",
+    );
+    const terminalRename = calls.find(
+      (args) => args[0] === "terminal" && args[1] === "rename",
+    );
+    assert.equal(
+      terminalRename?.[terminalRename.indexOf("--title") + 1],
+      "ONM-92 no-mistakes",
     );
     assert.equal(
       worktreeCreate?.[worktreeCreate.indexOf("--base-branch") + 1],

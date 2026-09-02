@@ -5446,6 +5446,13 @@ export class CliOrca implements OrcaOperations {
     return result.run.id;
   }
 
+  #workerName(name: string): string {
+    const runSuffix = this.#runId
+      ?.replace(/[^A-Za-z0-9]+/g, "-")
+      .slice(-12);
+    return runSuffix ? `${name}-${runSuffix}` : name;
+  }
+
   async notifyRunResult(
     outcome: "passed" | "failed" | "cancelled",
     summary: string,
@@ -5971,7 +5978,7 @@ export class CliOrca implements OrcaOperations {
             baseBranch,
             effort: agent.effort,
             model: agent.model,
-            name: launch.name,
+            name: this.#workerName(launch.name),
             repoRoot,
             runId: this.#runId,
             taskId,
@@ -6160,7 +6167,7 @@ export class CliOrca implements OrcaOperations {
           "--repo",
           `path:${repoRoot}`,
           "--name",
-          launch.name,
+          this.#workerName(launch.name),
           "--base-branch",
           branch,
           "--parent-worktree",
@@ -10143,6 +10150,7 @@ async function launchDetachedRun(
   let configuredOrca: CliOrca | undefined;
   let intentTaskId = "";
   let terminalHandle = "";
+  let terminalTitle = "no-mistakes";
   let gate: GateWorktree | undefined;
   let launcherMarkerFile: string | undefined;
   let launcherMarker: ConfiguredLauncherMarker | undefined;
@@ -10448,17 +10456,49 @@ async function launchDetachedRun(
       orcaLauncherMarker = undefined;
     }
     if (gate.kind === "orca") {
+      let originDisplayName: string | undefined;
+      let originLinearIssue: string | undefined;
+      const current = await command(
+        orcaCommand,
+        ["worktree", "current", "--json"],
+        repo.root,
+        { allowFailure: true },
+      );
+      if (current.code === 0) {
+        try {
+          const worktree = unwrapJson<{
+            worktree?: {
+              displayName?: unknown;
+              linkedLinearIssue?: unknown;
+            };
+          }>(current.stdout).worktree;
+          if (typeof worktree?.displayName === "string")
+            originDisplayName = worktree.displayName;
+          if (typeof worktree?.linkedLinearIssue === "string")
+            originLinearIssue = worktree.linkedLinearIssue;
+        } catch {}
+      }
+      const setArgs = [
+        "worktree",
+        "set",
+        "--worktree",
+        `id:${gate.id}`,
+        "--parent-worktree",
+        `path:${repo.root}`,
+      ];
+      if (originDisplayName)
+        setArgs.push(
+          "--display-name",
+          `${originDisplayName} - no-mistakes`,
+        );
+      if (originLinearIssue) {
+        setArgs.push("--linear-issue", originLinearIssue);
+        terminalTitle = `${originLinearIssue} no-mistakes`;
+      }
+      setArgs.push("--json");
       await command(
         orcaCommand,
-        [
-          "worktree",
-          "set",
-          "--worktree",
-          `id:${gate.id}`,
-          "--parent-worktree",
-          `path:${repo.root}`,
-          "--json",
-        ],
+        setArgs,
         repo.root,
       );
       const listed = unwrapJson<{
@@ -10481,6 +10521,21 @@ async function launchDetachedRun(
           (terminal) =>
             terminal.connected !== false && terminal.writable !== false,
         )?.handle ?? "";
+      if (terminalHandle && terminalTitle !== "no-mistakes") {
+        await command(
+          orcaCommand,
+          [
+            "terminal",
+            "rename",
+            "--terminal",
+            terminalHandle,
+            "--title",
+            terminalTitle,
+            "--json",
+          ],
+          repo.root,
+        );
+      }
     }
     if (!terminalHandle) {
       const created = unwrapJson<{ terminal: { handle: string } }>(
@@ -10493,7 +10548,7 @@ async function launchDetachedRun(
               "--worktree",
               `path:${gate.kind === "orca" ? gate.path : repo.root}`,
               "--title",
-              "no-mistakes",
+              terminalTitle,
               "--json",
             ],
             repo.root,
