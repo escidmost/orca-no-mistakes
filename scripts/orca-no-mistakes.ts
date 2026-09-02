@@ -2218,6 +2218,7 @@ export async function runPipeline(
               return new PlainStatusRenderer(process.stderr);
             }
           : undefined,
+        pipelineSteps,
       );
       presentationReady = true;
       const recordedAutoFixMode = ledger.latestAutoFixMode(runId);
@@ -4870,12 +4871,19 @@ function optionalStringArray(value: string[] | undefined): boolean {
   );
 }
 
-function stageIndex(stage: StageName): number {
-  return PIPELINE_STEPS.indexOf(stage) + 1;
+function stageIndex(
+  stage: StageName,
+  stages: readonly StageName[] = PIPELINE_STEPS,
+): number {
+  return stages.indexOf(stage) + 1;
 }
 
-function stageTaskSpec(stage: StageName, intent: string): string {
-  return `[${stage}] no-mistakes stage ${stageIndex(stage)}/${PIPELINE_STEPS.length}. Intent: ${intent}`;
+function stageTaskSpec(
+  stage: StageName,
+  intent: string,
+  stages: readonly StageName[] = PIPELINE_STEPS,
+): string {
+  return `[${stage}] no-mistakes stage ${stageIndex(stage, stages)}/${stages.length}. Intent: ${intent}`;
 }
 
 function checkerBrief(stage: StageName): string {
@@ -10784,8 +10792,17 @@ async function launchDetachedRun(
       });
       launcherMarker.runId = runId;
       await finishLauncherAllocation(launcherMarker);
+      let gateStagePlan: readonly StageName[];
+      try {
+        parseGithubRepositoryReference(
+          (await command("git", ["remote", "get-url", "origin"], repo.root)).stdout.trim(),
+        );
+        gateStagePlan = PIPELINE_STEPS;
+      } catch {
+        gateStagePlan = LEGACY_STAGE_PLAN;
+      }
       intentTaskId = await withLauncherAllocation(launcherMarker, () =>
-        configuredOrca!.createTask(stageTaskSpec("intent", intent)),
+        configuredOrca!.createTask(stageTaskSpec("intent", intent, gateStagePlan)),
       );
       launcherMarker.intentTaskId = intentTaskId;
       launcherMarker.gate = {
@@ -14498,7 +14515,7 @@ Run options:
     if (!storedRoute && !legacyResume && githubOrigin) {
       throw new Error("new GitHub runs require successful orca-no-mistakes init");
     }
-    if (githubOrigin || storedRoute) {
+    if (!legacyResume && (githubOrigin || storedRoute)) {
       try {
         githubAuthority = await GithubAuthority.connect();
         const publicationRoute = await resolveGithubPublicationRoute({
