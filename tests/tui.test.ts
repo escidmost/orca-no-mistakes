@@ -238,7 +238,7 @@ if (process.env.TUI_FIXTURE === "1") {
     assert.deepEqual(failures, ["Error: write failed"]);
     assert.equal(
       output.writes.at(-1),
-      "no-mistakes run-tui-test stage 3/6 review started\n",
+      "no-mistakes run-tui-test stage 3/8 review started\n",
     );
 
     output.emit("resize");
@@ -247,7 +247,7 @@ if (process.env.TUI_FIXTURE === "1") {
     assert.deepEqual(failures, ["Error: write failed"]);
     assert.equal(
       output.writes.at(-1),
-      "no-mistakes run-tui-test stage 6/6 lint started\n",
+      "no-mistakes run-tui-test stage 6/8 lint started\n",
     );
     renderer.close?.();
   });
@@ -285,7 +285,7 @@ if (process.env.TUI_FIXTURE === "1") {
     );
     assert.equal(
       output.writes.at(-1),
-      "no-mistakes run-tui-test stage 3/6 review started\n",
+      "no-mistakes run-tui-test stage 3/8 review started\n",
     );
     renderer.close?.();
   });
@@ -323,7 +323,7 @@ if (process.env.TUI_FIXTURE === "1") {
     );
     assert.equal(
       output.writes.at(-1),
-      "no-mistakes run-tui-test stage 3/6 review started\n",
+      "no-mistakes run-tui-test stage 3/8 review started\n",
     );
     renderer.close?.();
   });
