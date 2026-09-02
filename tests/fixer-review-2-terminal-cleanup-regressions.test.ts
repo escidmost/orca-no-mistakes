@@ -205,6 +205,7 @@ for (const kind of ["configured", "orca"] as const) {
           createdAt: new Date().toISOString(),
           gate,
           originWorktree: seeded.repo,
+          outcomeDelivered: true,
           runId,
           terminalHandle: "term-dead",
         }),

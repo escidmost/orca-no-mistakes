@@ -158,6 +158,7 @@ test("allocation discovery refreshes snapshots after PID quiescence", async () =
       createdAt: new Date().toISOString(),
       gate,
       originWorktree: seeded.repo,
+      outcomeDelivered: true,
       pid: 2_147_483_647,
       runId: gate.runId,
       workerAllocationPids: { pending: [2_147_483_647] },

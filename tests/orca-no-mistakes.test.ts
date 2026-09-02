@@ -7835,7 +7835,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     assert.ok(workerStart?.includes("new-child"));
     assert.equal(
       workerStart?.[workerStart.indexOf("--name") + 1],
-      "nm-review-native-run",
+      "nm-review-78b61bd4cb4a",
     );
     assert.ok(workerStart?.includes("--base-branch"));
     assert.ok(workerStart?.includes("feature"));

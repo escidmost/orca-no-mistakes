@@ -128,7 +128,7 @@ test("worker worktree names are scoped to the orchestration run", async () => {
     );
     assert.equal(
       create?.[create.indexOf("--name") + 1],
-      "no-mistakes-review-1-ion-12345678",
+      "no-mistakes-review-1-d59321e51db5",
     );
   } finally {
     await rm(temp, { force: true, recursive: true });
