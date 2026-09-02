@@ -303,10 +303,11 @@ export class RailTuiRenderer implements PresentationRenderer {
         (snapshot.gate?.state !== "open" ||
           snapshot.gate.id !== this.#snapshot?.gate?.id);
       this.#snapshot = snapshot;
+      if (snapshot.error) this.#cancelVisible = false;
       if (snapshot.transition.kind === "attempt-started") {
         this.#resumeVisible = false;
         this.#returnToRail();
-      } else {
+      } else if (snapshot.transition.kind === "error-recorded") {
         this.#resumeVisible = Boolean(snapshot.error?.resumable);
       }
       if (opensGate) this.#showGate();
