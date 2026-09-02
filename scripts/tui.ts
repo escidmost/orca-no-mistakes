@@ -157,7 +157,9 @@ function gateConsequence(option: string, stage?: StageName): string {
 function wrap(text: string, width: number): string[] {
   if (width <= 0) return [];
   const lines: string[] = [];
-  let rest = safeText(text, 2_048).replace(/\s+/gu, " ").trim();
+  let rest = redactKnownSecrets(
+    safeText(text, 2_048).replace(/\s+/gu, " "),
+  ).trim();
   while (rest.length > width) {
     const space = rest.lastIndexOf(" ", width);
     const end = space > 0 ? space : width;
@@ -599,7 +601,7 @@ export class RailTuiRenderer implements PresentationRenderer {
               : " ";
       const selected = index === this.#selectedStage ? ">" : " ";
       lines.push(
-        `${selected} [${marker}] ${index + 1}. ${title(stage)} ${status}${index === this.#selectedStage ? " selected" : ""}${state?.retainedFixer ? " retained" : ""}`,
+        `${selected} [${marker}] ${index + 1}. ${title(stage)} ${status}${state?.retainedFixer ? " retained" : ""}`,
       );
       lines.push(
         `    ${state?.fixedFindings ?? 0}/${state?.totalFindings ?? 0} fixed ${state?.approvedFindings ?? 0} approved ${state?.openFindings ?? state?.actionableFindings ?? 0} open`,
@@ -797,7 +799,10 @@ export class RailTuiRenderer implements PresentationRenderer {
     this.#inputBuffer += input;
     const incomplete =
       this.#inputBuffer.match(
-        new RegExp("\\x1b(?:\\[[0-?]*[ -/]*)?$", "u"),
+        new RegExp(
+          "\\x1b(?:\\[[0-?]*[ -/]*|O|\\][^\\x07\\x1b]*\\x1b?|[P_^][^\\x1b]*\\x1b?)?$",
+          "u",
+        ),
       )?.[0] ?? "";
     const complete = incomplete
       ? this.#inputBuffer.slice(0, -incomplete.length)
@@ -806,11 +811,14 @@ export class RailTuiRenderer implements PresentationRenderer {
     const keys =
       complete.match(
         new RegExp(
-          "\\x1b\\[[0-?]*[ -/]*[@-~]|\\x03|\\x1a|\\r|\\n|\\t|\\x1b|[aAcCgGrR]",
+          "\\x1b\\[[0-?]*[ -/]*[@-~]|\\x1bO[@-~]|\\x1b\\][^\\x07\\x1b]*(?:\\x07|\\x1b\\\\)|\\x1b[P_^][^\\x1b]*\\x1b\\\\|\\x03|\\x1a|\\r|\\n|\\t|\\x1b|[aAcCgGrR]",
           "g",
         ),
       ) ?? [];
-    for (const key of keys) {
+    for (let key of keys) {
+      if (key.length === 3 && key.startsWith("\u001bO") && "ABCD".includes(key[2])) {
+        key = `\u001b[${key[2]}`;
+      }
       if (key === "\u001a") {
         this.#onSuspend();
         return;

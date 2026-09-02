@@ -377,7 +377,7 @@ if (process.env.TUI_FIXTURE === "1") {
                 ...stage,
                 findings: [
                   {
-                    description: `${hostile}${"y".repeat(500)}`,
+                    description: `${hostile}open  sesame-${"y".repeat(500)}`,
                     disposition: "open" as const,
                     file: `${hostile}.ts`,
                     id: "secret-value",
@@ -385,6 +385,7 @@ if (process.env.TUI_FIXTURE === "1") {
                   },
                 ],
                 openFindings: 1,
+                retainedFixer: true,
                 totalFindings: 1,
               }
             : stage,
@@ -392,6 +393,7 @@ if (process.env.TUI_FIXTURE === "1") {
         transition: {
           actionable: 1,
           kind: "findings-recorded",
+          retainedFixer: true,
           round: 1,
           stage: "review",
           total: 1,
@@ -410,7 +412,7 @@ if (process.env.TUI_FIXTURE === "1") {
       assert.equal(frame.includes("\u4e2d"), false);
       assert.equal(frame.includes("\u0301"), false);
       assert.match(frame, /\[REDACTED\]/u);
-      assert.match(frame, /Review active selected/u);
+      assert.match(frame, /> \[>\] 3\. Review active retained/u);
       assert.equal(frame.split("\n").length, output.rows);
       assert.ok(
         frame
@@ -509,7 +511,7 @@ if (process.env.TUI_FIXTURE === "1") {
     assert.match(screen(), /Test LOG/u);
     assert.doesNotMatch(screen(), /pinned Review/u);
     assert.match(screen(), /> RAIL \(focused\)/u);
-    assert.match(screen(), /> \[>\] 4\. Test active selected/u);
+    assert.match(screen(), /> \[>\] 4\. Test active/u);
     input.emit("data", "R");
     assert.equal(requested, 1);
 
@@ -533,15 +535,50 @@ if (process.env.TUI_FIXTURE === "1") {
   test("terminal control replies do not trigger keyboard actions", async () => {
     const input = new FakeInput();
     const output = new FakeOutput();
-    const renderer = new RailTuiRenderer(input, output, "/unused");
+    let cancellations = 0;
+    let resumes = 0;
+    const toggles: boolean[] = [];
+    const renderer = new RailTuiRenderer(
+      input,
+      output,
+      "/unused",
+      new Map(),
+      undefined,
+      () => {
+        cancellations += 1;
+      },
+      (enabled) => {
+        toggles.push(enabled);
+      },
+      () => {
+        resumes += 1;
+      },
+    );
+    const base = snapshot("review", 1);
 
-    renderer.render(snapshot("review", 1));
+    renderer.render({
+      ...base,
+      error: { resumable: true },
+      status: "failed",
+      transition: { kind: "error-recorded", resumable: true },
+    });
     input.emit("data", "\u001b[?1;2c");
     input.emit("data", "\u001b[?1;");
     input.emit("data", "2c");
+    input.emit("data", "\u001b]11;rgb:cafe/0000/0000\u0007");
+    input.emit("data", "\u001bP1+r636f=726762\u001b\\");
+    input.emit("data", "\u001b_cag\u001b");
+    input.emit("data", "\\");
+    input.emit("data", "\u001b^r\u001b\\");
+    input.emit("data", "\u001bO");
+    input.emit("data", "D");
     await nextDraw();
 
+    assert.equal(cancellations, 0);
+    assert.equal(resumes, 0);
+    assert.deepEqual(toggles, []);
     assert.doesNotMatch(cleanScreen(output.writes.at(-1) ?? ""), /CANCEL RUN\?/u);
+    assert.match(cleanScreen(output.writes.at(-1) ?? ""), /> \[ \] 2\. Rebase/u);
     renderer.close();
   });
 
