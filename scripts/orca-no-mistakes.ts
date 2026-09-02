@@ -12793,8 +12793,12 @@ async function runGateAdmitCommand(flags: RawCliFlags): Promise<void> {
     }
     const readinessPath = admissionReadinessPath(metadata, admission.admission_id);
     await mkdir(path.dirname(readinessPath), { recursive: true });
-    const { readiness } = await awaitAdmissionLaunch(readinessPath, (nonce) =>
-      spawnAdmissionCoordinator(metadata, admission.admission_id, readinessPath, nonce),
+    const { readiness } = await awaitAdmissionLaunch(
+      readinessPath,
+      (nonce) =>
+        spawnAdmissionCoordinator(metadata, admission.admission_id, readinessPath, nonce),
+      30_000,
+      () => ledger.submissionAdmission(admission.admission_id)?.launcher_pid,
     );
     const current = ledger.submissionAdmission(admission.admission_id);
     if (current?.run_id && readiness.runId !== current.run_id) {
