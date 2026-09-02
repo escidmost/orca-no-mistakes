@@ -152,6 +152,7 @@ import {
   GithubAuthorityError,
   parseGithubRepositoryReference,
   resolveGithubPublicationRoute,
+  type CommandRunner,
 } from "./github.ts";
 import { admitCandidatePublication, publishCandidate } from "./publication.ts";
 import { bindPullRequest } from "./pull-request.ts";
@@ -353,6 +354,7 @@ export type PipelineOptions = {
   maxFixRounds?: number;
   plainStatus?: boolean;
   publicationDestination?: string;
+  publicationRunner?: CommandRunner;
   rendererFactory?: (
     artifactsDir: string,
     stageLogs: ReadonlyMap<string, StageLog>,
@@ -2766,6 +2768,7 @@ export async function runPipeline(
               destination: options.publicationDestination,
               ledger,
               resolveRepositoryIdentity,
+              runner: options.publicationRunner,
               runId,
             });
           }
@@ -2777,6 +2780,7 @@ export async function runPipeline(
             ledger,
             reconcileExactCandidate: true,
             resolveRepositoryIdentity,
+            runner: options.publicationRunner,
             runId,
             workerIdentity: coordinatorIdentity,
           });

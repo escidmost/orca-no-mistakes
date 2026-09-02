@@ -505,6 +505,7 @@ export async function publishCandidate(input: PublicationInput): Promise<{
   }
   const artifactBytes = `${canonicalJson({
     candidateCommitOid: candidate,
+    findings: [],
     mutationIntent: mutation,
     outcome,
     postRead,
@@ -548,6 +549,7 @@ export async function publishCandidate(input: PublicationInput): Promise<{
       workerIdentity: input.workerIdentity,
       exitCode: 0,
       evidenceSha256: evidenceDigest,
+      findingsJson: '[]',
       artifactPath: input.artifactPath,
       artifactSha256,
       summary

@@ -298,6 +298,7 @@ export async function bindPullRequest(input: {
   const outcome = created ? 'created' : commentMutated ? 'updated' : 'unchanged'
   const roundIndex = input.roundIndex ?? 0
   const artifactBytes = `${canonicalJson({
+    findings: [],
     managedCommentIntent,
     mutationIntent: pullRequestIntent,
     number: pullRequest.number,
@@ -332,6 +333,7 @@ export async function bindPullRequest(input: {
       candidateCommitOid: input.candidateCommitOid,
       evidenceSha256: evidenceDigest,
       exitCode: 0,
+      findingsJson: '[]',
       roundIndex,
       runId: input.runId,
       stageId: 'pr',
