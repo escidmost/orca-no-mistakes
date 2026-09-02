@@ -1486,6 +1486,7 @@ export async function reapAbortedRun(reason: string): Promise<void> {
       preserved = false;
     }
   }
+  let outcomeDelivered = true;
   if (cancelled && abortReap.notify) {
     try {
       await abortReap.notify(
@@ -1493,7 +1494,12 @@ export async function reapAbortedRun(reason: string): Promise<void> {
           ? `No-mistakes cancelled: ${reason}\n${recoveryInstructions(recoverRef)}`
           : `No-mistakes cancelled: ${reason}`,
       );
-    } catch {}
+    } catch (error) {
+      outcomeDelivered = false;
+      abortLog(
+        `warning: abort could not deliver the cancelled outcome, retaining the gate for recovery: ${String(error)}`,
+      );
+    }
   }
   if (preserved && settled && abortReap.orca) {
     for (const worker of workers) {
@@ -1522,6 +1528,7 @@ export async function reapAbortedRun(reason: string): Promise<void> {
   if (
     preserved &&
     settled &&
+    outcomeDelivered &&
     abortReap.gate &&
     gateOid &&
     abortReap.originWorktree &&
@@ -5440,6 +5447,7 @@ export class CliOrca implements OrcaOperations {
       return;
     }
     const subject = `no-mistakes run ${outcome}`;
+    const failures: string[] = [];
     await this.#json([
       "orchestration",
       "send",
@@ -5456,8 +5464,8 @@ export class CliOrca implements OrcaOperations {
       outcome === "passed" ? "normal" : "high",
       "--json",
     ]).catch((error) => {
-      console.error(
-        `warning: could not notify terminal ${this.#notifyHandle}: ${String(error)}`,
+      failures.push(
+        `could not notify terminal ${this.#notifyHandle}: ${String(error)}`,
       );
     });
     await this.#json([
@@ -5474,10 +5482,18 @@ export class CliOrca implements OrcaOperations {
       "--enter",
       "--json",
     ]).catch((error) => {
-      console.error(
-        `warning: could not wake terminal ${this.#notifyHandle}: ${String(error)}`,
+      failures.push(
+        `could not wake terminal ${this.#notifyHandle}: ${String(error)}`,
       );
     });
+    if (failures.length > 0) {
+      console.error(`warning: ${failures.join("; ")}`);
+    }
+    if (failures.length === 2) {
+      throw new Error(
+        `no-mistakes run ${outcome} notification could not be delivered to ${this.#notifyHandle} over any transport`,
+      );
+    }
   }
 
   async createTask(
@@ -13656,7 +13672,12 @@ Run options:
           : []),
         ...(result.custodyNote ? [result.custodyNote] : []),
       ].join("\n"),
-    );
+    ).catch((notificationError) => {
+      retainGate = true;
+      console.error(
+        `warning: could not deliver the passed outcome, retaining the gate for recovery: ${String(notificationError)}`,
+      );
+    });
     console.log(JSON.stringify(result));
   } catch (error) {
     closeRenderer();
@@ -13714,8 +13735,9 @@ Run options:
           : `No-mistakes ${outcome}: ${message}`,
       );
     } catch (notificationError) {
+      retainGate = true;
       console.error(
-        `warning: could not notify Orca about the failed run: ${String(notificationError)}`,
+        `warning: could not notify Orca about the failed run, retaining the gate for recovery: ${String(notificationError)}`,
       );
     }
     throw error;
