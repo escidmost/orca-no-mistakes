@@ -146,12 +146,18 @@ class FakeInput extends EventEmitter {
 
 class FakeOutput extends EventEmitter {
   columns = 100;
+  emitErrorOnNextWrite = false;
   failNextWrite = false;
   isTTY = true;
   rows = 24;
   readonly writes: string[] = [];
 
   write(chunk: string): boolean {
+    if (this.emitErrorOnNextWrite) {
+      this.emitErrorOnNextWrite = false;
+      this.emit("error", new Error("emitted write failure"));
+      return false;
+    }
     if (this.failNextWrite) {
       this.failNextWrite = false;
       throw new Error("write failed");
@@ -166,6 +172,10 @@ function cleanScreen(output: string): string {
   return screen
     .replaceAll(new RegExp("\\x1b\\[[0-?]*[ -/]*[@-~]", "gu"), "")
     .replaceAll("\r", "");
+}
+
+async function nextDraw(): Promise<void> {
+  await new Promise((resolve) => setImmediate(resolve));
 }
 
 function ensurePtyHelperExecutable(): void {
@@ -199,16 +209,123 @@ if (process.env.TUI_FIXTURE === "1") {
     ]);
   });
 
-  test("renderer errors restore raw mode, cursor, and alternate screen", () => {
+  test("runtime renderer errors restore once and permanently fall back to plain status", async () => {
     const input = new FakeInput();
     const output = new FakeOutput();
-    const renderer = new RailTuiRenderer(input, output, "/unused");
+    const failures: string[] = [];
+    const renderer = createRunRenderer(
+      input,
+      output,
+      "/unused",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      (error) => failures.push(String(error)),
+    );
     output.failNextWrite = true;
-    assert.throws(() => renderer.render(snapshot("review", 1)));
+    renderer.render(snapshot("review", 1));
+    await nextDraw();
     assert.equal(input.isRaw, false);
     assert.equal(input.isPaused(), true);
     assert.equal(output.writes[0], "\u001b[?1049h\u001b[?25l");
-    assert.equal(output.writes.at(-1), "\u001b[?25h\u001b[?1049l");
+    assert.equal(
+      output.writes.filter((write) => write === "\u001b[?25h\u001b[?1049l").length,
+      1,
+    );
+    assert.deepEqual(failures, ["Error: write failed"]);
+    assert.equal(
+      output.writes.at(-1),
+      "no-mistakes run-tui-test stage 3/6 review started\n",
+    );
+
+    output.emit("resize");
+    renderer.render(snapshot("lint", 2));
+    await nextDraw();
+    assert.deepEqual(failures, ["Error: write failed"]);
+    assert.equal(
+      output.writes.at(-1),
+      "no-mistakes run-tui-test stage 6/6 lint started\n",
+    );
+    renderer.close?.();
+  });
+
+  test("constructor output errors fall back before advertising Resume controls", () => {
+    const input = new FakeInput();
+    const output = new FakeOutput();
+    const failures: string[] = [];
+    let resumeAvailable = 0;
+    output.emitErrorOnNextWrite = true;
+
+    const renderer = createRunRenderer(
+      input,
+      output,
+      "/unused",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      () => {
+        resumeAvailable += 1;
+      },
+      (error) => failures.push(String(error)),
+    );
+    renderer.render(snapshot("review", 1));
+
+    assert.equal(input.isRaw, false);
+    assert.equal(input.isPaused(), true);
+    assert.equal(resumeAvailable, 0);
+    assert.deepEqual(failures, ["Error: terminal output failed"]);
+    assert.equal(
+      output.writes.filter((write) => write === "\u001b[?25h\u001b[?1049l").length,
+      1,
+    );
+    assert.equal(
+      output.writes.at(-1),
+      "no-mistakes run-tui-test stage 3/6 review started\n",
+    );
+    renderer.close?.();
+  });
+
+  test("constructor write failures warn once before plain fallback", () => {
+    const input = new FakeInput();
+    const output = new FakeOutput();
+    let resumeAvailable = 0;
+    output.failNextWrite = true;
+
+    const renderer = createRunRenderer(
+      input,
+      output,
+      "/unused",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      () => {
+        resumeAvailable += 1;
+      },
+    );
+    renderer.render(snapshot("review", 1));
+
+    assert.equal(input.isRaw, false);
+    assert.equal(input.isPaused(), true);
+    assert.equal(resumeAvailable, 0);
+    assert.equal(
+      output.writes.filter(
+        (write) =>
+          write === "warning: interactive presentation failed; using plain status\n",
+      ).length,
+      1,
+    );
+    assert.equal(
+      output.writes.at(-1),
+      "no-mistakes run-tui-test stage 3/6 review started\n",
+    );
+    renderer.close?.();
   });
 
   test("Resume availability errors close the Rail renderer before fallback", () => {
@@ -236,6 +353,13 @@ if (process.env.TUI_FIXTURE === "1") {
     assert.equal(output.listenerCount("resize"), 0);
     assert.equal(process.listenerCount("exit"), exitListeners);
     assert.ok(output.writes.includes("\u001b[?25h\u001b[?1049l"));
+    assert.equal(
+      output.writes.filter(
+        (write) =>
+          write === "warning: interactive presentation failed; using plain status\n",
+      ).length,
+      1,
+    );
     renderer.render(snapshot("review", 1));
     assert.equal(
       output.writes.at(-1),
@@ -243,14 +367,22 @@ if (process.env.TUI_FIXTURE === "1") {
     );
   });
 
-  test("unchanged refreshes do not repaint the terminal", () => {
+  test("semantic redraws wait one event-loop turn and unchanged refreshes do not repaint", async () => {
     const input = new FakeInput();
     const output = new FakeOutput();
     const renderer = new RailTuiRenderer(input, output, "/unused");
     renderer.render(snapshot("review", 1));
+    assert.equal(output.writes.length, 1);
+    await nextDraw();
     const writes = output.writes.length;
-    output.emit("resize");
+    input.emit("data", "\t");
     assert.equal(output.writes.length, writes);
+    await nextDraw();
+    assert.equal(output.writes.length, writes + 1);
+    const navigatedWrites = output.writes.length;
+    output.emit("resize");
+    await nextDraw();
+    assert.equal(output.writes.length, navigatedWrites);
     renderer.close();
   });
 
@@ -297,10 +429,11 @@ if (process.env.TUI_FIXTURE === "1") {
           : stage,
       ),
     });
+    await nextDraw();
 
     const screen = cleanScreen(output.writes.at(-1) ?? "");
     assert.match(screen, /auto-fix on/iu);
-    assert.match(screen, /Review retained/iu);
+    assert.match(screen, /Review blocked retained/iu);
     assert.match(screen, /2\/4 fixed 1 approved 1 open/iu);
     assert.match(screen, /6\. Lint/iu);
     assert.match(screen, /A Auto-fix/iu);
@@ -311,7 +444,85 @@ if (process.env.TUI_FIXTURE === "1") {
     renderer.close();
   });
 
-  test("Resume is shown only for resumable errors and returns to the pipeline", () => {
+  test("untrusted terminal text is redacted, ASCII-safe, bounded, and textually labeled", async () => {
+    const previousSecret = process.env.ONM_TEST_SECRET;
+    const previousPassword = process.env.ONM_TEST_PASSWORD;
+    const previousNoColor = process.env.NO_COLOR;
+    process.env.ONM_TEST_SECRET = "secret-value";
+    process.env.ONM_TEST_PASSWORD = "open sesame";
+    process.env.NO_COLOR = "1";
+    const input = new FakeInput();
+    const output = new FakeOutput();
+    const renderer = new RailTuiRenderer(input, output, "/unused");
+    const base = snapshot("review", 1);
+    const hostile = "sec\u001b[31mret-value\u001b[0m-open\nsesame\nwide-\u4e2d-combining-e\u0301-";
+    try {
+      renderer.render({
+        ...base,
+        runId: `${"x".repeat(72)}open\nsesame-${hostile}`,
+        stages: base.stages.map((stage) =>
+          stage.id === "review"
+            ? {
+                ...stage,
+                findings: [
+                  {
+                    description: `${hostile}open  sesame-${"y".repeat(500)}`,
+                    disposition: "open" as const,
+                    file: `${hostile}.ts`,
+                    id: "secret-value",
+                    severity: "warning" as const,
+                  },
+                ],
+                openFindings: 1,
+                retainedFixer: true,
+                totalFindings: 1,
+              }
+            : stage,
+        ),
+        transition: {
+          actionable: 1,
+          kind: "findings-recorded",
+          retainedFixer: true,
+          round: 1,
+          stage: "review",
+          total: 1,
+        },
+      });
+      await nextDraw();
+
+      const frame = (output.writes.at(-1) ?? "").replace(
+        "\u001b[H\u001b[2J",
+        "",
+      );
+      assert.equal(frame.includes("\u001b"), false);
+      assert.equal(frame.includes("secret-value"), false);
+      assert.equal(frame.includes("open sesame"), false);
+      assert.equal(frame.includes("open s"), false);
+      assert.equal(frame.includes("\u4e2d"), false);
+      assert.equal(frame.includes("\u0301"), false);
+      assert.match(frame, /\[REDACTED\]/u);
+      assert.match(frame, /> \[>\] 3\. Review active retained/u);
+      assert.equal(frame.split("\n").length, output.rows);
+      assert.ok(
+        frame
+          .split("\n")
+          .every(
+            (line) => line.length <= output.columns && /^[\x20-\x7e]*$/u.test(line),
+          ),
+      );
+      assert.doesNotMatch(frame, new RegExp("x{100}|y{100}", "u"));
+    } finally {
+      renderer.close();
+      if (previousSecret === undefined) delete process.env.ONM_TEST_SECRET;
+      else process.env.ONM_TEST_SECRET = previousSecret;
+      if (previousPassword === undefined) delete process.env.ONM_TEST_PASSWORD;
+      else process.env.ONM_TEST_PASSWORD = previousPassword;
+      if (previousNoColor === undefined) delete process.env.NO_COLOR;
+      else process.env.NO_COLOR = previousNoColor;
+    }
+  });
+
+  test("Resume is shown only for resumable errors and returns to the pipeline", async () => {
     const input = new FakeInput();
     const output = new FakeOutput();
     let requested = 0;
@@ -336,9 +547,12 @@ if (process.env.TUI_FIXTURE === "1") {
     );
     assert.ok(renderer);
     renderer.render(snapshot("review", 1));
+    await nextDraw();
     input.emit("data", "\r");
+    await nextDraw();
     assert.match(cleanScreen(output.writes.at(-1) ?? ""), /pinned Review/u);
     input.emit("data", "C");
+    await nextDraw();
     assert.match(cleanScreen(output.writes.at(-1) ?? ""), /CANCEL RUN\?/u);
     const resumable = snapshot("test", 2);
     renderer.render({
@@ -348,12 +562,14 @@ if (process.env.TUI_FIXTURE === "1") {
       status: "failed",
       transition: { kind: "error-recorded", resumable: true },
     });
+    await nextDraw();
     const screen = (): string => cleanScreen(output.writes.at(-1) ?? "");
     assert.equal(available, 1);
     assert.match(screen(), /RUN ERROR \(RESUMABLE\)/u);
     assert.doesNotMatch(screen(), /CANCEL RUN\?/u);
     assert.match(screen(), /R Resume/u);
     input.emit("data", "R");
+    await nextDraw();
     assert.equal(requested, 1);
     assert.match(screen(), /Resume requested\. Waiting for the next attempt\./u);
     assert.doesNotMatch(screen(), /R Resume/u);
@@ -365,6 +581,7 @@ if (process.env.TUI_FIXTURE === "1") {
       status: "failed",
       transition: { kind: "run-completed", status: "failed" },
     });
+    await nextDraw();
     assert.match(screen(), /Resume requested\. Waiting for the next attempt\./u);
     assert.doesNotMatch(screen(), /R Resume/u);
     input.emit("data", "R");
@@ -378,11 +595,12 @@ if (process.env.TUI_FIXTURE === "1") {
       status: "in-progress",
       transition: { attempt: 3, kind: "attempt-started" },
     });
+    await nextDraw();
     assert.match(screen(), /RECENT ACTIVITY/u);
     assert.match(screen(), /Test LOG/u);
     assert.doesNotMatch(screen(), /pinned Review/u);
-    assert.match(screen(), /> RAIL/u);
-    assert.match(screen(), /> \[>\] 4\. Test/u);
+    assert.match(screen(), /> RAIL \(focused\)/u);
+    assert.match(screen(), /> \[>\] 4\. Test active/u);
     input.emit("data", "R");
     assert.equal(requested, 1);
 
@@ -393,12 +611,63 @@ if (process.env.TUI_FIXTURE === "1") {
       status: "failed",
       transition: { kind: "error-recorded", resumable: false },
     });
+    await nextDraw();
     assert.doesNotMatch(screen(), /R Resume/u);
     input.emit("data", "R");
     assert.equal(requested, 1);
     input.emit("data", "C");
     assert.equal(cancellations, 1);
     assert.doesNotMatch(screen(), /CANCEL RUN\?/u);
+    renderer.close();
+  });
+
+  test("terminal control replies do not trigger keyboard actions", async () => {
+    const input = new FakeInput();
+    const output = new FakeOutput();
+    let cancellations = 0;
+    let resumes = 0;
+    const toggles: boolean[] = [];
+    const renderer = new RailTuiRenderer(
+      input,
+      output,
+      "/unused",
+      new Map(),
+      undefined,
+      () => {
+        cancellations += 1;
+      },
+      (enabled) => {
+        toggles.push(enabled);
+      },
+      () => {
+        resumes += 1;
+      },
+    );
+    const base = snapshot("review", 1);
+
+    renderer.render({
+      ...base,
+      error: { resumable: true },
+      status: "failed",
+      transition: { kind: "error-recorded", resumable: true },
+    });
+    input.emit("data", "\u001b[?1;2c");
+    input.emit("data", "\u001b[?1;");
+    input.emit("data", "2c");
+    input.emit("data", "\u001b]11;rgb:cafe/0000/0000\u0007");
+    input.emit("data", "\u001bP1+r636f=726762\u001b\\");
+    input.emit("data", "\u001b_cag\u001b");
+    input.emit("data", "\\");
+    input.emit("data", "\u001b^r\u001b\\");
+    input.emit("data", "\u001bO");
+    input.emit("data", "D");
+    await nextDraw();
+
+    assert.equal(cancellations, 0);
+    assert.equal(resumes, 0);
+    assert.deepEqual(toggles, []);
+    assert.doesNotMatch(cleanScreen(output.writes.at(-1) ?? ""), /CANCEL RUN\?/u);
+    assert.match(cleanScreen(output.writes.at(-1) ?? ""), /> \[ \] 2\. Rebase/u);
     renderer.close();
   });
 
@@ -420,6 +689,7 @@ if (process.env.TUI_FIXTURE === "1") {
 
     renderer.render(gateSnapshot("open", 0));
     input.emit("data", "c");
+    await nextDraw();
     assert.equal(cancellations, 0);
     assert.match(screen(), /CANCEL RUN\?/u);
     assert.match(screen(), /run-tui-test.*in-progress/u);
@@ -478,8 +748,11 @@ if (process.env.TUI_FIXTURE === "1") {
     const screen = (): string => cleanScreen(output.writes.at(-1) ?? "");
 
     renderer.render(snapshot("review", 1));
+    await nextDraw();
     input.emit("data", "\r");
+    await nextDraw();
     renderer.render(gateSnapshot("open", 2));
+    await nextDraw();
     assert.match(screen(), /DECISION REQUIRED/u);
     assert.match(screen(), /pinned Review/u);
     assert.match(screen(), /approve.*audited approval/su);
@@ -487,6 +760,7 @@ if (process.env.TUI_FIXTURE === "1") {
     assert.match(screen(), /stop.*cancel this run/su);
 
     input.emit("data", "\r");
+    await nextDraw();
     assert.deepEqual(resolutions, []);
     assert.match(screen(), /Confirm approve\? Press Enter again/u);
     input.emit("data", "\u001b");
@@ -496,6 +770,7 @@ if (process.env.TUI_FIXTURE === "1") {
     assert.match(screen(), /pinned Review/u);
 
     input.emit("data", "g\u001b[B\r\r");
+    await nextDraw();
     assert.deepEqual(resolutions, []);
     assert.match(screen(), /Confirm fix\? Press Enter again/u);
     input.emit("data", "\r");
@@ -505,6 +780,7 @@ if (process.env.TUI_FIXTURE === "1") {
     assert.equal(resolutions.length, 1);
     assert.match(screen(), /Waiting for canonical gate settlement/u);
     renderer.render(gateSnapshot("resolved", 3, "fix"));
+    await nextDraw();
     assert.doesNotMatch(screen(), /DECISION REQUIRED/u);
     assert.match(screen(), /pinned Review/u);
     renderer.close();
@@ -531,13 +807,17 @@ if (process.env.TUI_FIXTURE === "1") {
     const screen = (): string => cleanScreen(output.writes.at(-1) ?? "");
 
     renderer.render(snapshot("review", 1));
+    await nextDraw();
     input.emit("data", "\r");
+    await nextDraw();
     renderer.render(gateSnapshot("open", 2));
+    await nextDraw();
     input.emit("data", "\r\r");
     assert.deepEqual(resolutions, []);
     input.emit("data", "\r");
     assert.deepEqual(resolutions, [["gate-review", "approve"]]);
     renderer.render(gateSnapshot("resolved", 3, "stop"));
+    await nextDraw();
     settle();
     await pending;
     await new Promise((resolve) => setImmediate(resolve));
@@ -597,7 +877,11 @@ if (process.env.TUI_FIXTURE === "1") {
       const screen = (): string => cleanScreen(output);
 
       try {
-        await waitFor(() => screen().includes("RECENT ACTIVITY"));
+        await waitFor(
+          () =>
+            screen().includes("RECENT ACTIVITY") &&
+            screen().includes("6. Lint"),
+        );
         const initial = screen();
         const labels = [
           "1. Intent",
@@ -648,9 +932,10 @@ if (process.env.TUI_FIXTURE === "1") {
         terminal.write("n");
         await waitFor(
           () =>
-            screen().includes("Lint started") &&
+            screen().includes("6. Lint active") &&
             screen().includes("pinned Review"),
         );
+        assert.match(screen(), /6\. Lint active/u);
         assert.equal(screen().match(/\[>\]/gu)?.length, 1);
 
         terminal.resize(60, 15);

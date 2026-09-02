@@ -1,4 +1,5 @@
 import path from "node:path";
+import { stripVTControlCharacters } from "node:util";
 
 import { PIPELINE_STEPS, type StageName } from "./config.ts";
 import {
@@ -55,11 +56,25 @@ function title(stage: StageName): string {
   return `${stage[0].toUpperCase()}${stage.slice(1)}`;
 }
 
+function printableText(text: string): string {
+  let result = "";
+  for (const character of text) {
+    if (character === "\t") result += "  ";
+    else if (character === "\r" || character === "\n") result += " ";
+    else result += character >= " " && character <= "~" ? character : "?";
+  }
+  return result;
+}
+
+function safeText(text: string, maxLength = Number.POSITIVE_INFINITY): string {
+  return redactKnownSecrets(
+    printableText(stripVTControlCharacters(redactKnownSecrets(text))),
+  ).slice(0, maxLength);
+}
+
 function fit(text: string, width: number): string {
   if (width <= 0) return "";
-  const value = text
-    .replaceAll("\t", "  ")
-    .replaceAll(new RegExp("[\\x00-\\x1f\\x7f-\\x9f]", "gu"), "?");
+  const value = safeText(text, width + 1);
   if (value.length > width) {
     return width === 1 ? value.slice(0, 1) : `${value.slice(0, width - 1)}~`;
   }
@@ -81,21 +96,12 @@ function logTail(
     const log = stageLogs.get(filePath);
     if (!log) throw new Error("log is not coordinator-owned");
     const buffer = log.tail(STAGE_LOG_TAIL_BYTES + knownSecretPrefixBytes());
-    const redacted = redactKnownSecrets(
-      buffer
-        .toString("utf8")
-        .replaceAll(new RegExp("\\x1b\\[[0-?]*[ -/]*[@-~]", "gu"), ""),
+    const sanitized = redactKnownSecrets(
+      stripVTControlCharacters(redactKnownSecrets(buffer.toString("utf8")))
+        .split("\n")
+        .map(printableText)
+        .join("\n"),
     );
-    const sanitized = Array.from(
-      redacted,
-      (character) => {
-        if (character === "\t") return "  ";
-        return character === "\n" ||
-            (character >= " " && character <= "~")
-          ? character
-          : "?";
-      },
-    ).join("");
     const content = Buffer.from(sanitized)
       .subarray(-STAGE_LOG_TAIL_BYTES)
       .toString("utf8");
@@ -152,8 +158,11 @@ function gateConsequence(option: string, stage?: StageName): string {
 }
 
 function wrap(text: string, width: number): string[] {
+  if (width <= 0) return [];
   const lines: string[] = [];
-  let rest = text.replace(/\s+/gu, " ").trim();
+  let rest = redactKnownSecrets(
+    safeText(text, 2_048).replace(/\s+/gu, " "),
+  ).trim();
   while (rest.length > width) {
     const space = rest.lastIndexOf(" ", width);
     const end = space > 0 ? space : width;
@@ -192,6 +201,10 @@ export class RailTuiRenderer implements PresentationRenderer {
   readonly #inputWasPaused: boolean;
   readonly #inputWasRaw: boolean;
   readonly #output: Output;
+  readonly #onFailure?: (
+    error: unknown,
+    snapshot?: PresentationSnapshot,
+  ) => void;
   readonly #requestCancel: () => void;
   readonly #requestResume?: () => void;
   readonly #resolveGate?: GateResolver;
@@ -201,6 +214,7 @@ export class RailTuiRenderer implements PresentationRenderer {
   #cancelVisible = false;
   #closed = false;
   #escapeTimer?: ReturnType<typeof setTimeout>;
+  #drawImmediate?: ReturnType<typeof setImmediate>;
   #focus: Region = "rail";
   #gateChoice = 0;
   #gateConfirm = false;
@@ -217,21 +231,42 @@ export class RailTuiRenderer implements PresentationRenderer {
   #resumeVisible = false;
   #selectedStage = 0;
   #snapshot?: PresentationSnapshot;
+  #suspended = false;
+  #terminalActive = false;
 
   readonly #onData = (chunk: Buffer | string): void => {
     try {
       this.#handleInput(chunk.toString());
-    } catch {
-      this.close();
+    } catch (error) {
+      this.#fail(error);
     }
   };
-  readonly #onError = (): void => this.close();
+  readonly #onError = (): void => this.#fail(new Error("terminal output failed"));
   readonly #onExit = (): void => this.close();
-  readonly #onResize = (): void => {
+  readonly #onResize = (): void => this.#scheduleDraw();
+  readonly #onSuspend = (): void => {
+    if (this.#closed || this.#suspended) return;
+    this.#suspended = true;
+    this.#leaveTerminal();
+    process.off("SIGTSTP", this.#onSuspend);
     try {
-      this.#draw();
-    } catch {
-      this.close();
+      process.kill(process.pid, "SIGTSTP");
+    } catch (error) {
+      this.#suspended = false;
+      process.on("SIGTSTP", this.#onSuspend);
+      this.#fail(error);
+    }
+  };
+  readonly #onContinue = (): void => {
+    if (this.#closed || !this.#suspended) return;
+    this.#suspended = false;
+    process.on("SIGTSTP", this.#onSuspend);
+    try {
+      this.#enterTerminal();
+      this.#lastFrame = undefined;
+      this.#scheduleDraw();
+    } catch (error) {
+      this.#fail(error);
     }
   };
 
@@ -244,6 +279,7 @@ export class RailTuiRenderer implements PresentationRenderer {
     requestCancel: () => void = () => process.kill(process.pid, "SIGINT"),
     setAutoFix?: (enabled: boolean) => Promise<void> | void,
     requestResume?: () => void,
+    onFailure?: (error: unknown, snapshot?: PresentationSnapshot) => void,
   ) {
     this.#input = input;
     this.#output = output;
@@ -253,17 +289,18 @@ export class RailTuiRenderer implements PresentationRenderer {
     this.#requestCancel = requestCancel;
     this.#requestResume = requestResume;
     this.#setAutoFix = setAutoFix;
+    this.#onFailure = onFailure;
     this.#inputWasPaused = input.isPaused();
     this.#inputWasRaw = input.isRaw === true;
     try {
-      input.setRawMode!(true);
-      input.resume();
       input.on("data", this.#onData);
       output.on("error", this.#onError);
       output.on("resize", this.#onResize);
       process.once("exit", this.#onExit);
-      output.write("\u001b[?1049h\u001b[?25l");
-      this.#refreshTimer = setInterval(this.#onResize, 250);
+      process.on("SIGCONT", this.#onContinue);
+      process.on("SIGTSTP", this.#onSuspend);
+      this.#enterTerminal();
+      this.#refreshTimer = setInterval(this.#onResize, 1_000);
       this.#refreshTimer.unref();
     } catch (error) {
       this.close();
@@ -275,21 +312,16 @@ export class RailTuiRenderer implements PresentationRenderer {
     if (this.#closed) return;
     this.#closed = true;
     if (this.#escapeTimer) clearTimeout(this.#escapeTimer);
+    if (this.#drawImmediate) clearImmediate(this.#drawImmediate);
     if (this.#refreshTimer) clearInterval(this.#refreshTimer);
     this.#inputBuffer = "";
     this.#input.off("data", this.#onData);
     this.#output.off("error", this.#onError);
     this.#output.off("resize", this.#onResize);
     process.off("exit", this.#onExit);
-    try {
-      this.#input.setRawMode?.(this.#inputWasRaw);
-    } catch {}
-    try {
-      if (this.#inputWasPaused) this.#input.pause();
-    } catch {}
-    try {
-      this.#output.write("\u001b[?25h\u001b[?1049l");
-    } catch {}
+    process.off("SIGCONT", this.#onContinue);
+    process.off("SIGTSTP", this.#onSuspend);
+    this.#leaveTerminal();
   }
 
   render(snapshot: PresentationSnapshot): void {
@@ -312,7 +344,7 @@ export class RailTuiRenderer implements PresentationRenderer {
       }
       if (opensGate) this.#showGate();
       this.#activities.push({
-        label: activity(snapshot.transition),
+        label: safeText(activity(snapshot.transition), 240),
         stage: transitionStage(snapshot.transition),
       });
       if (this.#activities.length > 50) this.#activities.shift();
@@ -321,11 +353,68 @@ export class RailTuiRenderer implements PresentationRenderer {
       if (!opensGate && !settlesGate && !this.#pinnedStage && snapshot.currentStage) {
         this.#selectedStage = PIPELINE_STEPS.indexOf(snapshot.currentStage);
       }
-      this.#draw();
+      this.#scheduleDraw();
     } catch (error) {
       this.close();
       throw error;
     }
+  }
+
+  #enterTerminal(): void {
+    if (this.#closed || this.#terminalActive) return;
+    this.#terminalActive = true;
+    try {
+      this.#input.setRawMode!(true);
+      this.#input.resume();
+      this.#output.write("\u001b[?1049h\u001b[?25l");
+      if (this.#closed) throw new Error("terminal output failed");
+    } catch (error) {
+      this.#leaveTerminal();
+      throw error;
+    }
+  }
+
+  #leaveTerminal(): void {
+    if (!this.#terminalActive) return;
+    this.#terminalActive = false;
+    try {
+      this.#input.setRawMode?.(this.#inputWasRaw);
+    } catch {}
+    try {
+      if (this.#inputWasPaused) this.#input.pause();
+    } catch {}
+    try {
+      this.#output.write("\u001b[?25h\u001b[?1049l");
+    } catch {}
+  }
+
+  #fail(error: unknown): void {
+    if (this.#closed) return;
+    const snapshot = this.#snapshot;
+    this.close();
+    try {
+      this.#onFailure?.(error, snapshot);
+    } catch {}
+  }
+
+  #scheduleDraw(): void {
+    if (
+      this.#closed ||
+      this.#suspended ||
+      this.#drawImmediate ||
+      !this.#snapshot
+    ) {
+      return;
+    }
+    this.#drawImmediate = setImmediate(() => {
+      this.#drawImmediate = undefined;
+      try {
+        this.#draw();
+      } catch (error) {
+        this.#fail(error);
+      }
+    });
+    this.#drawImmediate.unref();
   }
 
   #showGate(): void {
@@ -372,12 +461,12 @@ export class RailTuiRenderer implements PresentationRenderer {
     this.#gateConfirm = false;
     this.#gateSubmitting = true;
     this.#gateMessage = "Submitting canonical gate decision...";
-    this.#draw();
+    this.#scheduleDraw();
     void this.#resolveGate(gate.id, resolution).then(
       () => {
         if (this.#gateVisible && this.#snapshot?.gate?.id === gate.id) {
           this.#gateMessage = "Decision sent; waiting for settlement.";
-          this.#draw();
+          this.#scheduleDraw();
         }
       },
       (error) => {
@@ -385,14 +474,14 @@ export class RailTuiRenderer implements PresentationRenderer {
           this.#gateSubmitting = false;
           this.#gateConfirm = false;
           this.#gateMessage = `Could not resolve gate: ${String(error)}`;
-          this.#draw();
+          this.#scheduleDraw();
         }
       },
     );
   }
 
   #draw(): void {
-    if (this.#closed || !this.#snapshot) return;
+    if (this.#closed || !this.#terminalActive || !this.#snapshot) return;
     const columns = this.#output.columns ?? 0;
     const rows = this.#output.rows ?? 0;
     const screen =
@@ -429,7 +518,7 @@ export class RailTuiRenderer implements PresentationRenderer {
   }
 
   #full(columns: number, rows: number): string[] {
-    const railWidth = 34;
+    const railWidth = 36;
     const bodyRows = rows - 3;
     const rail = this.#rail(bodyRows, railWidth);
     if (this.#cancelVisible || this.#gateVisible) {
@@ -474,7 +563,7 @@ export class RailTuiRenderer implements PresentationRenderer {
   }
 
   #compact(columns: number, rows: number): string[] {
-    const railWidth = 34;
+    const railWidth = 36;
     const detailWidth = columns - railWidth - 3;
     const bodyRows = rows - 3;
     const rail = this.#rail(bodyRows, railWidth);
@@ -516,7 +605,7 @@ export class RailTuiRenderer implements PresentationRenderer {
               : " ";
       const selected = index === this.#selectedStage ? ">" : " ";
       lines.push(
-        `${selected} [${marker}] ${index + 1}. ${title(stage)}${state?.retainedFixer ? " retained" : ""}`,
+        `${selected} [${marker}] ${index + 1}. ${title(stage)} ${status}${state?.retainedFixer ? " retained" : ""}`,
       );
       lines.push(
         `    ${state?.fixedFindings ?? 0}/${state?.totalFindings ?? 0} fixed ${state?.approvedFindings ?? 0} approved ${state?.openFindings ?? state?.actionableFindings ?? 0} open`,
@@ -669,7 +758,8 @@ export class RailTuiRenderer implements PresentationRenderer {
   }
 
   #regionTitle(label: string, region: Region, width: number): string {
-    return fit(`${this.#focus === region ? ">" : " "} ${label}`, width);
+    const focused = this.#focus === region;
+    return fit(`${focused ? ">" : " "} ${label}${focused ? " (focused)" : ""}`, width);
   }
 
   #footer(width: number): string {
@@ -711,24 +801,32 @@ export class RailTuiRenderer implements PresentationRenderer {
       this.#escapeTimer = undefined;
     }
     this.#inputBuffer += input;
-    const incomplete = this.#inputBuffer.endsWith("\u001b[")
-      ? 2
-      : this.#inputBuffer.endsWith("\u001b")
-        ? 1
-        : 0;
+    const incomplete =
+      this.#inputBuffer.match(
+        new RegExp(
+          "\\x1b(?:\\[[0-?]*[ -/]*|O|\\][^\\x00-\\x1f]*\\x1b?|[P_^][^\\x00-\\x1f]*\\x1b?)?$",
+          "u",
+        ),
+      )?.[0] ?? "";
     const complete = incomplete
-      ? this.#inputBuffer.slice(0, -incomplete)
+      ? this.#inputBuffer.slice(0, -incomplete.length)
       : this.#inputBuffer;
-    this.#inputBuffer = incomplete ? this.#inputBuffer.slice(-incomplete) : "";
+    this.#inputBuffer = incomplete.length > 4096 ? "" : incomplete;
     const keys =
       complete.match(
         new RegExp(
-          "\\x03|\\x1b\\[Z|\\x1b\\[[ABCD]|\\r|\\n|\\t|\\x1b|[aAcCgGrR]",
+          "\\x1b\\[[0-?]*[ -/]*[@-~]|\\x1bO[@-~]|\\x1b\\][^\\x00-\\x1f]*(?:\\x07|\\x1b\\\\)|\\x1b\\][^\\x00-\\x1f]*|\\x1b[P_^][^\\x00-\\x1f]*\\x1b\\\\|\\x1b[P_^][^\\x00-\\x1f]*|\\x03|\\x1a|\\r|\\n|\\t|\\x1b|[aAcCgGrR]",
           "g",
         ),
       ) ?? [];
-    for (const key of keys) {
-      if (key === "\u0003") {
+    for (let key of keys) {
+      if (key.length === 3 && key.startsWith("\u001bO") && "ABCD".includes(key[2])) {
+        key = `\u001b[${key[2]}`;
+      }
+      if (key === "\u001a") {
+        this.#onSuspend();
+        return;
+      } else if (key === "\u0003") {
         this.#cancelRun();
         return;
       } else if (this.#cancelVisible) {
@@ -796,20 +894,21 @@ export class RailTuiRenderer implements PresentationRenderer {
     if (this.#inputBuffer) {
       this.#escapeTimer = setTimeout(() => {
         this.#escapeTimer = undefined;
+        const held = this.#inputBuffer;
         this.#inputBuffer = "";
-        if (this.#closed) return;
+        if (this.#closed || held !== "\x1b") return;
         try {
           if (this.#cancelVisible) this.#cancelVisible = false;
           else if (this.#gateVisible) {
             if (!this.#gateSubmitting) this.#leaveGate();
           } else this.#returnToRail();
-          this.#draw();
-        } catch {
-          this.close();
+          this.#scheduleDraw();
+        } catch (error) {
+          this.#fail(error);
         }
       }, 100);
     }
-    this.#draw();
+    this.#scheduleDraw();
   }
 
   #cancelRun(): void {
@@ -826,12 +925,14 @@ export class RailTuiRenderer implements PresentationRenderer {
       .then(
         () => {
           this.#modeSubmitting = false;
-          this.#draw();
+          this.#scheduleDraw();
         },
         (error) => {
           this.#modeSubmitting = false;
-          this.#activities.push({ label: `Auto-fix unchanged: ${String(error)}` });
-          this.#draw();
+          this.#activities.push({
+            label: safeText(`Auto-fix unchanged: ${String(error)}`, 240),
+          });
+          this.#scheduleDraw();
         },
       );
   }
@@ -881,6 +982,7 @@ export function createRailTuiRenderer(
   setAutoFix?: (enabled: boolean) => Promise<void> | void,
   requestResume?: () => void,
   onResumeAvailable?: () => void,
+  onFailure?: (error: unknown, snapshot?: PresentationSnapshot) => void,
 ): RailTuiRenderer | undefined {
   if (!supportsRailTui(input, output)) return undefined;
   let renderer: RailTuiRenderer | undefined;
@@ -894,11 +996,13 @@ export function createRailTuiRenderer(
       requestCancel,
       setAutoFix,
       requestResume,
+      onFailure,
     );
     onResumeAvailable?.();
     return renderer;
-  } catch {
+  } catch (error) {
     renderer?.close();
+    onFailure?.(error);
     return undefined;
   }
 }
@@ -913,18 +1017,66 @@ export function createRunRenderer(
   setAutoFix?: (enabled: boolean) => Promise<void> | void,
   requestResume?: () => void,
   onResumeAvailable?: () => void,
+  onFailure?: (error: unknown) => void,
 ): PresentationRenderer & { close?: () => void } {
-  return (
-    createRailTuiRenderer(
-      input,
-      output,
-      artifactsDir,
-      stageLogs,
-      resolveGate,
-      requestCancel,
-      setAutoFix,
-      requestResume,
-      onResumeAvailable,
-    ) ?? new PlainStatusRenderer(output)
+  let fallback: PlainStatusRenderer | undefined;
+  let failed = false;
+  let rail: RailTuiRenderer | undefined;
+  const plain = (): PlainStatusRenderer =>
+    (fallback ??= new PlainStatusRenderer(output));
+  const switchToPlain = (
+    error: unknown,
+    snapshot?: PresentationSnapshot,
+  ): void => {
+    if (failed) return;
+    failed = true;
+    rail?.close();
+    if (onFailure) {
+      try {
+        onFailure(error);
+      } catch {}
+    } else {
+      try {
+        output.write("warning: interactive presentation failed; using plain status\n");
+      } catch {}
+    }
+    if (snapshot) {
+      try {
+        plain().render(snapshot);
+      } catch {}
+    }
+  };
+  rail = createRailTuiRenderer(
+    input,
+    output,
+    artifactsDir,
+    stageLogs,
+    resolveGate,
+    requestCancel,
+    setAutoFix,
+    requestResume,
+    undefined,
+    switchToPlain,
   );
+  if (!rail || failed) return plain();
+  try {
+    onResumeAvailable?.();
+  } catch (error) {
+    switchToPlain(error);
+    return plain();
+  }
+  return {
+    close: () => rail.close(),
+    render: (snapshot) => {
+      if (failed) {
+        plain().render(snapshot);
+        return;
+      }
+      try {
+        rail.render(snapshot);
+      } catch (error) {
+        switchToPlain(error, snapshot);
+      }
+    },
+  };
 }

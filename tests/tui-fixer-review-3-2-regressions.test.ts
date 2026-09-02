@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
-import { setTimeout as delay } from "node:timers/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -53,34 +52,33 @@ function snapshot(): PresentationSnapshot {
     attempt: 1,
     currentStage: "review",
     mode: { autoFix: true },
-    runId: "run-tui-fixer-review-3",
+    runId: "run-tui-logtail-batched",
     sequence: 1,
     stages: PIPELINE_STEPS.map((id) => ({
       actionableFindings: 0,
       id,
-      round: 0,
+      round: 1,
       status: id === "review" ? "active" : "pending",
       totalFindings: 0,
     })),
     status: "in-progress",
-    transition: { kind: "round-started", round: 0, stage: "review" },
+    transition: { kind: "round-started", round: 1, stage: "review" },
     updatedAt: new Date(0).toISOString(),
     version: 1,
   };
 }
 
-test("live log redraws reuse StageLog redaction and stop on close", async () => {
-  const artifactsDir = mkdtempSync(path.join(tmpdir(), "orca-tui-refresh-"));
-  const logPath = path.join(artifactsDir, "review_r0.log");
+test("log tail keeps redaction and printable mapping in the batched path", async () => {
+  const artifactsDir = mkdtempSync(path.join(tmpdir(), "orca-tui-logtail-"));
+  const logPath = path.join(artifactsDir, "review_r1.log");
   const log = new StageLog(logPath);
   const input = new FakeInput();
   const output = new FakeOutput();
-  const secretName = "TUI_REDACTION_TEST_TOKEN";
-  const secret = "stage-log-boundary-secret-value";
+  const secretName = "TUI_LOGTAIL_BATCH_REDACTION_TEST_TOKEN";
   const previous = process.env[secretName];
-  process.env[secretName] = secret;
+  process.env[secretName] = "tuiLt0SecretZZ";
   await log.append(
-    `${"x".repeat(100)}${secret}${"y".repeat(64 * 1024 - 16)}`,
+    "split tuiLt0\u001b[31mSecretZZ end\nplain a\tb c\x01d end\n",
   );
   const renderer = new RailTuiRenderer(
     input,
@@ -91,22 +89,12 @@ test("live log redraws reuse StageLog redaction and stop on close", async () => 
   try {
     renderer.render(snapshot());
     await new Promise((resolve) => setImmediate(resolve));
-    const initial = output.writes.at(-1) ?? "";
-    assert.doesNotMatch(initial, new RegExp(secret, "u"));
-    assert.match(initial, /\[REDACTED\]/u);
-
-    await log.append("\nupdated while running\n");
-    const deadline = Date.now() + 2_000;
-    while (!(output.writes.at(-1) ?? "").includes("updated while running")) {
-      assert.ok(Date.now() < deadline, "live log did not refresh");
-      await delay(25);
-    }
-
-    renderer.close();
-    const writesAfterClose = output.writes.length;
-    await log.append("must not redraw\n");
-    await delay(1_100);
-    assert.equal(output.writes.length, writesAfterClose);
+    const screen = (output.writes.at(-1) ?? "")
+      .replace(new RegExp("^.*\\x1b\\[H\\x1b\\[2J", "u"), "")
+      .replaceAll(new RegExp("\\x1b\\[[0-?]*[ -/]*[@-~]", "gu"), "");
+    assert.doesNotMatch(screen, /tuiLt0|SecretZZ/u);
+    assert.match(screen, /\[REDACTED\]/u);
+    assert.match(screen, /a {2}b c\?d/u);
   } finally {
     renderer.close();
     await log.close();

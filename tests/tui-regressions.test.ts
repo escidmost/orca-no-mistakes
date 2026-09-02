@@ -73,8 +73,12 @@ class FakeOutput extends EventEmitter {
 
 function screen(output: FakeOutput): string {
   return (output.writes.at(-1) ?? "")
-    .replace(/^.*\u001b\[H\u001b\[2J/u, "")
+    .replace(new RegExp("^.*\\x1b\\[H\\x1b\\[2J", "u"), "")
     .replaceAll(new RegExp("\\x1b\\[[0-?]*[ -/]*[@-~]", "gu"), "");
+}
+
+async function nextDraw(): Promise<void> {
+  await new Promise((resolve) => setImmediate(resolve));
 }
 
 function ensurePtyHelperExecutable(): void {
@@ -130,9 +134,11 @@ if (process.env.TUI_CTRL_C_FIXTURE === "1") {
       for (let sequence = 1; sequence <= 30; sequence += 1) {
         renderer.render(snapshot(sequence));
       }
+      await nextDraw();
       for (const columns of [100, 137]) {
         output.columns = columns;
         output.emit("resize");
+        await nextDraw();
         assert.ok(
           screen(output)
             .split("\n")
@@ -141,9 +147,11 @@ if (process.env.TUI_CTRL_C_FIXTURE === "1") {
       }
 
       input.emit("data", `\t${"\u001b[A".repeat(21)}`);
+      await nextDraw();
       assert.match(screen(output), /> Review round 9/u);
 
       input.emit("data", `\t${"\u001b[A".repeat(100)}`);
+      await nextDraw();
       assert.match(screen(output), /third line/u);
     } finally {
       renderer.close();
@@ -152,7 +160,7 @@ if (process.env.TUI_CTRL_C_FIXTURE === "1") {
     }
   });
 
-  test("raw Ctrl-C restores the terminal before SIGINT", { timeout: 10_000 }, async () => {
+  test("raw Ctrl-Z, resume, and raw Ctrl-C restore each terminal boundary exactly once", { timeout: 10_000 }, async () => {
     const artifactsDir = mkdtempSync(path.join(tmpdir(), "orca-tui-sigint-"));
     ensurePtyHelperExecutable();
     const env = Object.fromEntries(
@@ -184,19 +192,30 @@ if (process.env.TUI_CTRL_C_FIXTURE === "1") {
       }),
     );
     try {
-      await new Promise<void>((resolve, reject) => {
-        const timeout = setTimeout(() => reject(new Error("TUI did not start")), 3_000);
-        const disposable = terminal.onData(() => {
-          if (!output.includes("RECENT ACTIVITY")) return;
-          clearTimeout(timeout);
-          disposable.dispose();
-          resolve();
-        });
-      });
+      const waitFor = async (predicate: () => boolean): Promise<void> => {
+        const deadline = Date.now() + 3_000;
+        while (!predicate()) {
+          if (Date.now() >= deadline) assert.fail("Timed out waiting for TUI signal state");
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      };
+      const count = (sequence: string): number => output.split(sequence).length - 1;
+      await waitFor(() => output.includes("RECENT ACTIVITY"));
+
+      terminal.write("\u001a");
+      await waitFor(() => count("\u001b[?25h\u001b[?1049l") === 1);
+      terminal.kill("SIGCONT");
+      await waitFor(
+        () =>
+          count("\u001b[?1049h\u001b[?25l") === 2 &&
+          output.includes("RECENT ACTIVITY"),
+      );
+
       terminal.write("\u0003");
       assert.equal(await exited, 0);
       assert.match(output, /SIGINT raw=false/u);
-      assert.ok(output.includes("\u001b[?25h\u001b[?1049l"));
+      assert.equal(count("\u001b[?1049h\u001b[?25l"), 2);
+      assert.equal(count("\u001b[?25h\u001b[?1049l"), 2);
     } finally {
       if (!hasExited) terminal.kill("SIGKILL");
       rmSync(artifactsDir, { force: true, recursive: true });
