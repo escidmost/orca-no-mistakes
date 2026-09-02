@@ -10,11 +10,12 @@ import test from 'node:test'
 import {
   admissionReadinessPath,
   deriveAdmissionId,
+  deriveFallbackGateIdentity,
   initializeLocalGate,
   repositoryGatePaths
 } from '../scripts/admission.ts'
 import { main } from '../scripts/orca-no-mistakes.ts'
-import { canonicalJson, DomainLedger, sha256 } from '../scripts/ledger.ts'
+import { DomainLedger } from '../scripts/ledger.ts'
 
 const oid = (character: string) => character.repeat(40)
 
@@ -191,9 +192,7 @@ test('a repeated direct submission replays instead of relaunching a coordinator'
     git(repo, 'push', 'origin', 'feature')
     const head = git(repo, 'rev-parse', 'HEAD')
     const paths = repositoryGatePaths(repo)
-    const gateIdentity = sha256(
-      canonicalJson({ gatePath: paths.gatePath, repoRoot: paths.repoRoot })
-    )
+    const gateIdentity = deriveFallbackGateIdentity(paths)
 
     const beginDirect = (intent: string): string =>
       deriveAdmissionId({
@@ -212,10 +211,24 @@ test('a repeated direct submission replays instead of relaunching a coordinator'
       newOid: head,
       oldOid: head,
       refName: 'refs/heads/feature',
-      repoRoot: paths.repoRoot,
+      repoRoot: paths.commonDir,
       source: 'direct'
     })
     ledger.markSubmissionLaunched(launchedId)
+    ledger.close()
+
+    const originalLog = console.log
+    const lines: string[] = []
+    try {
+      console.log = (line: unknown) => {
+        lines.push(String(line))
+      }
+      await main(['run', '--repo', repo, '--intent', firstIntent])
+    } finally {
+      console.log = originalLog
+    }
+    ledger = new DomainLedger({ repositoryPath: repo })
+    ledger.failSubmissionAdmission(launchedId)
     ledger.close()
 
     const acceptedId = beginDirect(secondIntent)
@@ -227,7 +240,7 @@ test('a repeated direct submission replays instead of relaunching a coordinator'
       newOid: head,
       oldOid: head,
       refName: 'refs/heads/feature',
-      repoRoot: paths.repoRoot,
+      repoRoot: paths.commonDir,
       source: 'direct'
     })
     ledger.markSubmissionLaunched(acceptedId)
@@ -248,13 +261,10 @@ test('a repeated direct submission replays instead of relaunching a coordinator'
     })
     ledger.close()
 
-    const originalLog = console.log
-    const lines: string[] = []
     try {
       console.log = (line: unknown) => {
         lines.push(String(line))
       }
-      await main(['run', '--repo', repo, '--intent', firstIntent])
       await main(['run', '--repo', repo, '--intent', secondIntent])
     } finally {
       console.log = originalLog
@@ -266,7 +276,7 @@ test('a repeated direct submission replays instead of relaunching a coordinator'
     assert.equal(accepted.replayed, true)
     assert.equal(accepted.runId, 'direct-replay-run')
     ledger = new DomainLedger({ repositoryPath: repo })
-    assert.equal(ledger.submissionAdmission(launchedId)?.status, 'launched')
+    assert.equal(ledger.submissionAdmission(launchedId)?.status, 'failed')
     assert.equal(ledger.submissionAdmission(acceptedId)?.status, 'accepted')
     ledger.close()
   } finally {

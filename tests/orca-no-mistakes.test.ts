@@ -67,10 +67,31 @@ import {
 } from "../scripts/ledger.ts";
 import { loadUserConfig } from "../scripts/config.ts";
 import { effectivePolicyHash } from "../scripts/policy.ts";
+import {
+  deriveAdmissionId,
+  deriveFallbackGateIdentity,
+  repositoryGatePaths,
+} from "../scripts/admission.ts";
 
 process.env.WORKER_SHELL_STARTUP_DELAY_MS ??= "0";
 
 const pass = (summary = "passed"): StageReport => ({ findings: [], summary });
+
+const failSyntheticDetachedAdmission = (repo: string, intent: string): void => {
+  const paths = repositoryGatePaths(repo);
+  const head = git(repo, "rev-parse", "HEAD");
+  const branch = git(repo, "branch", "--show-current");
+  const admissionId = deriveAdmissionId({
+    gateIdentity: deriveFallbackGateIdentity(paths),
+    intent,
+    newOid: head,
+    oldOid: head,
+    refName: `refs/heads/${branch}`,
+  });
+  const ledger = new DomainLedger({ repositoryPath: repo });
+  ledger.failSubmissionAdmission(admissionId);
+  ledger.close();
+};
 
 class FakeGit implements GitOperations {
   readonly calls: string[] = [];
@@ -2771,6 +2792,7 @@ console.log(JSON.stringify({ result }))
       "--intent=Validate detached coordination.",
       "--allow-local-config",
     ]);
+    failSyntheticDetachedAdmission(repo, "Validate detached coordination.");
     await rm(path.join(repo, ".orca"), { recursive: true, force: true });
     await main([
       "run",
@@ -2949,6 +2971,10 @@ console.log(JSON.stringify({ result }))
       `--repo=${repo}`,
       "--intent=Validate configured detached coordination.",
     ]);
+    failSyntheticDetachedAdmission(
+      repo,
+      "Validate configured detached coordination.",
+    );
     assert.ok(Date.now() - launchStartedAt >= 75);
 
     const [runId] = await readdir(root);
