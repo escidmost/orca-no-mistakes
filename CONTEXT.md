@@ -25,7 +25,7 @@ The repository-scoped Git endpoint that accepts one proposed feature-ref update 
 _Avoid_: Publication remote, delivery branch, scheduler
 
 **Submission admission**:
-The durable normalization of one direct invocation or local-gate update into one exact run identity before pipeline execution begins.
+The durable normalization of one direct invocation or local-gate update into one exact submission identity, which may remain pending or launched before later binding to a run.
 _Avoid_: Process launch, hook success, branch push
 
 **Accepted gate submission**:
