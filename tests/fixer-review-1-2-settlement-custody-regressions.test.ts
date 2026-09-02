@@ -109,6 +109,12 @@ class FailingSettlementLedger extends DomainLedger {
   ): boolean {
     throw new Error("injected settlement failure");
   }
+
+  override settleRunWithAttemptOutcome(
+    ..._args: Parameters<DomainLedger["settleRunWithAttemptOutcome"]>
+  ): boolean {
+    throw new Error("injected settlement failure");
+  }
 }
 
 test("local settlement failure retains recovery custody", async () => {

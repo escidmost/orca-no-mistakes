@@ -323,6 +323,25 @@ class FakeOrca implements OrcaOperations {
   async setWorktreeStatus(): Promise<void> {}
 }
 
+class OrphanAllocationOrca extends FakeOrca {
+  readonly orphanDispatchIds: string[] = [];
+
+  override async startWorker(
+    taskId: string,
+    launch: WorkerLaunch,
+    _fence?: unknown,
+    onAllocated?: (worker: WorkerResult) => unknown,
+  ): Promise<WorkerResult> {
+    const worker = await super.startWorker(taskId, launch);
+    if (launch.stage === "test" && this.orphanDispatchIds.length === 0) {
+      this.orphanDispatchIds.push(worker.dispatchId);
+      onAllocated?.(worker);
+      throw new Error("test worker interrupted");
+    }
+    return worker;
+  }
+}
+
 test("renderer fallback revokes same-process resume availability", async () => {
   const git = new FakeGit();
   git.policyDigest = "f".repeat(64);
@@ -380,24 +399,6 @@ test("same-process resume drains registered attempt workers before retrying", as
   git.policyDigest = "f".repeat(64);
   const deliveryGit = new FakeGit("/origin", "feature");
   const runId = `drain-resume-${randomUUID()}`;
-  class OrphanAllocationOrca extends FakeOrca {
-    readonly orphanDispatchIds: string[] = [];
-
-    override async startWorker(
-      taskId: string,
-      launch: WorkerLaunch,
-      _fence?: unknown,
-      onAllocated?: (worker: WorkerResult) => unknown,
-    ): Promise<WorkerResult> {
-      const worker = await super.startWorker(taskId, launch);
-      if (launch.stage === "test" && this.orphanDispatchIds.length === 0) {
-        this.orphanDispatchIds.push(worker.dispatchId);
-        onAllocated?.(worker);
-        throw new Error("test worker interrupted");
-      }
-      return worker;
-    }
-  }
   const orca = new OrphanAllocationOrca(runId);
   const ledger = new DomainLedger(":memory:");
   const rendererFactory = (
@@ -440,6 +441,34 @@ test("same-process resume drains registered attempt workers before retrying", as
       `expected the orphan worker to be released, saw: ${orca.calls.join(",")}`,
     );
     assert.equal(ledger.listAttemptOutcomes(runId).length, 2);
+  } finally {
+    ledger.close();
+  }
+});
+
+test("noninteractive failures also drain registered attempt workers", async () => {
+  const git = new FakeGit();
+  git.policyDigest = "f".repeat(64);
+  const deliveryGit = new FakeGit("/origin", "feature");
+  const runId = `drain-plain-${randomUUID()}`;
+  const orca = new OrphanAllocationOrca(runId);
+  const ledger = new DomainLedger(":memory:");
+
+  try {
+    await assert.rejects(
+      runPipeline(
+        { deliveryGit, intent: "Drain workers without a TUI." },
+        orca,
+        git,
+        ledger,
+      ),
+      /test worker interrupted/,
+    );
+    assert.equal(ledger.runStatus(runId), "failed");
+    assert.ok(
+      orca.calls.includes(`release:${orca.orphanDispatchIds[0]}`),
+      `expected the orphan worker to be released, saw: ${orca.calls.join(",")}`,
+    );
   } finally {
     ledger.close();
   }

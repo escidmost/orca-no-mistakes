@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
 
-import { DomainLedger } from "../scripts/ledger.ts";
+import {
+  DomainLedger,
+  type RecordEvidenceInput,
+} from "../scripts/ledger.ts";
 import {
   runPipeline,
   type FixerChangesVerdict,
@@ -12,6 +15,7 @@ import {
   type WorkerLaunch,
   type WorkerResult,
 } from "../scripts/orca-no-mistakes.ts";
+import type { PresentationSnapshot } from "../scripts/presentation.ts";
 
 class FakeGit implements GitOperations {
   readonly calls: string[] = [];
@@ -199,6 +203,13 @@ class FakeOrca implements OrcaOperations {
   async resolveGate(): Promise<void> {}
 
   async setWorktreeStatus(): Promise<void> {}
+}
+
+class EvidencePersistenceFailsLedger extends DomainLedger {
+  override recordEvidence(input: RecordEvidenceInput): string {
+    if (input.stageId === "test") throw new Error("evidence persistence failed");
+    return super.recordEvidence(input);
+  }
 }
 
 function resumeRendererFactory(
@@ -458,6 +469,45 @@ test("resumed attempt setup failure after startAttempt records its outcome", asy
       ),
     );
     assert.equal(snapshots.at(-1)?.transition.kind, "run-completed");
+  } finally {
+    ledger.close();
+  }
+});
+
+test("evidence persistence failures are never declared resumable", async () => {
+  const git = new FakeGit();
+  git.policyDigest = "f".repeat(64);
+  const deliveryGit = new FakeGit("/origin", "feature");
+  const runId = `evidence-nonresumable-${randomUUID()}`;
+  const orca = new FakeOrca(runId);
+  const ledger = new EvidencePersistenceFailsLedger(":memory:");
+  const snapshots: PresentationSnapshot[] = [];
+
+  try {
+    await assert.rejects(
+      runPipeline(
+        {
+          deliveryGit,
+          intent: "Reject unsafe evidence failures.",
+          rendererFactory: () => ({
+            render(snapshot): void {
+              snapshots.push(snapshot);
+            },
+          }),
+        },
+        orca,
+        git,
+        ledger,
+      ),
+      /evidence persistence failed/,
+    );
+    assert.equal(ledger.runStatus(runId), "failed");
+    assert.equal(
+      snapshots.findLast(
+        (snapshot) => snapshot.transition.kind === "error-recorded",
+      )?.error?.resumable,
+      false,
+    );
   } finally {
     ledger.close();
   }

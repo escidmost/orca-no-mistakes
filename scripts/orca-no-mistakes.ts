@@ -1191,10 +1191,12 @@ export async function registerAbortRunContext(state: {
   runId: string;
 }): Promise<void> {
   Object.assign(abortReap, state);
-  delete abortReap.resumeClaimId;
+  if (!state.resumeClaimId) delete abortReap.resumeClaimId;
   await refreshGateMarker();
   if (state.resumeClaimId) {
     state.ledger.clearResumeClaim(state.runId, state.resumeClaimId);
+    delete abortReap.resumeClaimId;
+    await refreshGateMarker();
   }
 }
 
@@ -1622,6 +1624,8 @@ export class PostMutationCustodyError extends Error {}
 
 class WorkerCleanupError extends Error {}
 
+class ResumableStageError extends Error {}
+
 export class RecoveryAnchorError extends Error {
   readonly outcome: "cancelled" | "failed";
 
@@ -1695,13 +1699,10 @@ function isResumablePipelineFailure(
   outcome: "cancelled" | "failed",
   checkpointCount: number,
 ): boolean {
-  if (outcome !== "failed" || checkpointCount === 0) return false;
-  return !(
-    failure instanceof GateStopError ||
-    failure instanceof PostMutationCustodyError ||
-    failure instanceof RecoveryAnchorError ||
-    failure instanceof RunSettlementError ||
-    failure instanceof WorkerCleanupError
+  return (
+    outcome === "failed" &&
+    checkpointCount > 0 &&
+    failure instanceof ResumableStageError
   );
 }
 
@@ -2447,20 +2448,36 @@ export async function runPipeline(
           `attempt:${presentation.current.attempt}:stage:${stage}:round:${round}:started`,
           { kind: "round-started", round, stage },
         );
-        const execution = await executeStage(
-          stage,
-          attempt++,
-          round,
-          taskId,
-          intent,
-          artifactsDir,
-          repo,
-          orca,
-          git,
-          pipelineConfig.stages[stage],
-          stageLogs,
-          decisionHistory(),
-        );
+        let execution: StageExecution;
+        try {
+          execution = await executeStage(
+            stage,
+            attempt++,
+            round,
+            taskId,
+            intent,
+            artifactsDir,
+            repo,
+            orca,
+            git,
+            pipelineConfig.stages[stage],
+            stageLogs,
+            decisionHistory(),
+          );
+        } catch (stageError) {
+          if (
+            stage === "intent" ||
+            stage === "rebase" ||
+            stageError instanceof WorkerCleanupError ||
+            stageError instanceof PostMutationCustodyError
+          ) {
+            throw stageError;
+          }
+          throw new ResumableStageError(
+            stageError instanceof Error ? stageError.message : String(stageError),
+            { cause: stageError },
+          );
+        }
         if (inheritedFallback) {
           // Merge so a fixer's fallback history is never dropped or silently
           // replaced by the next reviewer run; roles on each attempt keep the
@@ -2997,25 +3014,19 @@ export async function runPipeline(
         }
       }
       const outcome = error instanceof GateStopError ? "cancelled" : "failed";
-      if (
-        isResumablePipelineFailure(
-          failure,
-          outcome,
-          ledger.listCheckpoints(runId).length,
-        ) &&
-        resumeControlAvailable
-      ) {
-        for (const worker of [...abortReap.workers]) {
-          try {
-            await releaseWorker(worker, orca);
-          } catch (cleanupError) {
-            failure = new WorkerCleanupError(
-              `failed-attempt worker cleanup failed: ${String(cleanupError)}`,
-              { cause: failure },
-            );
-            break;
-          }
+      const cleanupErrors: unknown[] = [];
+      for (const worker of [...abortReap.workers]) {
+        try {
+          await releaseWorker(worker, orca);
+        } catch (cleanupError) {
+          cleanupErrors.push(cleanupError);
         }
+      }
+      if (cleanupErrors.length > 0) {
+        failure = new WorkerCleanupError(
+          `failed-attempt worker cleanup failed: ${cleanupErrors.map(String).join("; ")}`,
+          { cause: new AggregateError([failure, ...cleanupErrors]) },
+        );
       }
       const retry = await withGateMutation(async () => {
         let anchorError: unknown;
@@ -3116,83 +3127,89 @@ export async function runPipeline(
       let resumeHead: string | undefined;
       let resumedAttemptStarted = false;
       try {
-        resumeHead = await git.head();
-        let resumeClaim: ReturnType<DomainLedger["prepareResume"]>;
-        try {
-          resumeClaim = ledger.prepareResume({
+        await withGateMutation(async () => {
+          const currentHead = await git.head();
+          resumeHead = currentHead;
+          let resumeClaim: ReturnType<DomainLedger["prepareResume"]>;
+          try {
+            resumeClaim = ledger.prepareResume({
+              baseBranch: deliveryRepo.base,
+              baseRefSha: effectiveProvenance.baseRefSha,
+              branch: deliveryRepo.branch,
+              effectivePolicyHash: effectiveProvenance.effectivePolicyHash,
+              force: options.forceLease === true,
+              head: currentHead,
+              intent,
+              policySha256: policySha256Value,
+              repoRoot: deliveryRepo.root,
+              runId,
+            });
+          } catch (resumeError) {
+            const message =
+              resumeError instanceof Error
+                ? resumeError.message
+                : String(resumeError);
+            throw new Error(`resume rejected: ${message}`, { cause: failure });
+          }
+          resumeClaimId = resumeClaim.claimId;
+          generationToken = resumeClaim.generationToken;
+          const resumed = ledger.resumeRun({
             baseBranch: deliveryRepo.base,
             baseRefSha: effectiveProvenance.baseRefSha,
             branch: deliveryRepo.branch,
+            claimId: resumeClaimId,
             effectivePolicyHash: effectiveProvenance.effectivePolicyHash,
             force: options.forceLease === true,
-            head: resumeHead,
+            head: currentHead,
             intent,
             policySha256: policySha256Value,
             repoRoot: deliveryRepo.root,
             runId,
           });
-        } catch (resumeError) {
-          const message =
-            resumeError instanceof Error ? resumeError.message : String(resumeError);
-          throw new Error(`resume rejected: ${message}`, { cause: failure });
-        }
-        resumeClaimId = resumeClaim.claimId;
-        generationToken = resumeClaim.generationToken;
-        const resumed = ledger.resumeRun({
-          baseBranch: deliveryRepo.base,
-          baseRefSha: effectiveProvenance.baseRefSha,
-          branch: deliveryRepo.branch,
-          claimId: resumeClaimId,
-          effectivePolicyHash: effectiveProvenance.effectivePolicyHash,
-          force: options.forceLease === true,
-          head: resumeHead,
-          intent,
-          policySha256: policySha256Value,
-          repoRoot: deliveryRepo.root,
-          runId,
-        });
-        resumeCheckpoint = resumed.checkpoint;
-        generationToken = resumed.generationToken;
-        resumingAttempt = true;
-        Object.assign(abortReap, {
-          generationToken,
-          resumeClaimId,
-          runId,
-        });
-        await refreshGateMarker();
-        const attempt = presentation.nextAttempt();
-        presentation.publish(`attempt:${attempt}:started`, {
-          attempt,
-          kind: "attempt-started",
-        });
-        await deliveryGit.anchorRecoveryRef(
-          runId,
-          resumeCheckpoint.output_commit_oid,
-          generationToken,
-        );
-        attemptId = randomUUID();
-        ledger.startAttempt({
-          actorIdentity,
-          attemptId,
-          coordinatorIdentity,
-          generationToken,
-          runId,
-          startedAt: new Date().toISOString(),
-        });
-        resumedAttemptStarted = true;
-        await registerAbortRunContext({
-          artifactsDir,
-          deliveryGit,
-          generationToken,
-          git,
-          ledger,
-          orchestrationRunId: abortReap.orchestrationRunId,
-          plainStatus: options.plainStatus,
-          resumeClaimId,
-          runId,
+          resumeCheckpoint = resumed.checkpoint;
+          generationToken = resumed.generationToken;
+          resumingAttempt = true;
+          Object.assign(abortReap, {
+            generationToken,
+            resumeClaimId,
+            runId,
+          });
+          await refreshGateMarker();
+          await deliveryGit.anchorRecoveryRef(
+            runId,
+            resumeCheckpoint.output_commit_oid,
+            generationToken,
+          );
+          attemptId = randomUUID();
+          ledger.startAttempt({
+            actorIdentity,
+            attemptId,
+            coordinatorIdentity,
+            generationToken,
+            runId,
+            startedAt: new Date().toISOString(),
+          });
+          resumedAttemptStarted = true;
+          const attempt = presentation.nextAttempt();
+          presentation.publish(`attempt:${attempt}:started`, {
+            attempt,
+            kind: "attempt-started",
+          });
+          await registerAbortRunContext({
+            artifactsDir,
+            deliveryGit,
+            generationToken,
+            git,
+            ledger,
+            orchestrationRunId: abortReap.orchestrationRunId,
+            plainStatus: options.plainStatus,
+            resumeClaimId,
+            runId,
+          });
         });
         continue;
       } catch (setupError) {
+        let propagatedError = setupError;
         await withGateMutation(async () => {
           const ownership =
             generationToken === undefined
@@ -3202,7 +3219,10 @@ export async function runPipeline(
                   generationToken,
                   repoRoot: deliveryRepo.root,
                 };
-          const eventKey = `attempt:${presentation.current.attempt}:error:setup`;
+          const setupEventPrefix = resumedAttemptStarted
+            ? `attempt:${presentation.current.attempt}`
+            : `resume:${generationToken ?? "unknown"}`;
+          const eventKey = `${setupEventPrefix}:error:setup`;
           presentation.publish(
             eventKey,
             { kind: "error-recorded", resumable: false },
@@ -3236,11 +3256,25 @@ export async function runPipeline(
               ),
           );
           presentation.publish(
-            `attempt:${presentation.current.attempt}:run:completed:failed`,
+            `${setupEventPrefix}:run:completed:failed`,
             { kind: "run-completed", status: "failed" },
           );
+          if (resumeClaimId) {
+            try {
+              ledger.clearResumeClaim(runId, resumeClaimId);
+              if (abortReap.resumeClaimId === resumeClaimId) {
+                delete abortReap.resumeClaimId;
+              }
+              await refreshGateMarker();
+            } catch (claimCleanupError) {
+              propagatedError = new AggregateError(
+                [setupError, claimCleanupError],
+                `resumed attempt setup and claim cleanup failed: ${String(claimCleanupError)}`,
+              );
+            }
+          }
         }, true);
-        throw setupError;
+        throw propagatedError;
       }
     }
   }
