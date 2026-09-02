@@ -31,6 +31,7 @@ import {
   PostMutationCustodyError,
   RecoveryAnchorError,
   launchAgent,
+  installAbortReaping,
   startWorkerWithFallback,
   buildAttestation,
   capLog,
@@ -1242,7 +1243,9 @@ test("resume preserves a stage's consumed automatic-fix budget", async () => {
   assert.equal(resumed.gates.length, 1);
 });
 
-test("fix rounds reuse one durable fixer terminal and worktree", async () => {
+test("fix rounds reuse one durable fixer and clear its marker ownership", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-retained-fixer-marker-"));
+  const markerDir = path.join(temp, ".orca", "no-mistakes");
   const git = new FakeGit();
   allowReviewAutoFix(git);
   const orca = new FakeOrca(git);
@@ -1260,15 +1263,34 @@ test("fix rounds reuse one durable fixer terminal and worktree", async () => {
     pass("clean rereview"),
   ]);
 
-  await runPipeline({ intent: "Repair the persistent defect." }, orca, git);
+  await installAbortReaping({
+    gate: {
+      branch: "evs/no-mistakes-gate-test",
+      id: "gate-test",
+      kind: "orca",
+      path: path.join(temp, "gate"),
+    },
+    originWorktree: temp,
+    pid: process.pid,
+  });
+  try {
+    await runPipeline({ intent: "Repair the persistent defect." }, orca, git);
 
-  const fixers = orca.launches.filter((launch) => launch.role === "fixer");
-  assert.equal(fixers.length, 2);
-  assert.equal(fixers[0].terminal, undefined);
-  assert.equal(fixers[0].worktree, "new-child");
-  assert.equal(fixers[1].terminal, "term-fixer");
-  assert.equal(fixers[1].worktree, "current");
-  assert.ok(orca.calls.includes(`release:${orca.fixerDispatches.at(-1)}`));
+    const fixers = orca.launches.filter((launch) => launch.role === "fixer");
+    assert.equal(fixers.length, 2);
+    assert.equal(fixers[0].terminal, undefined);
+    assert.equal(fixers[0].worktree, "new-child");
+    assert.equal(fixers[1].terminal, "term-fixer");
+    assert.equal(fixers[1].worktree, "current");
+    assert.ok(orca.calls.includes(`release:${orca.fixerDispatches.at(-1)}`));
+    const marker = JSON.parse(
+      await readFile(path.join(markerDir, (await readdir(markerDir))[0]!), "utf8"),
+    ) as { workers?: unknown[] };
+    assert.equal(marker.workers, undefined);
+  } finally {
+    await installAbortReaping({ pid: process.pid });
+    await rm(temp, { force: true, recursive: true });
+  }
 });
 
 test("a failed retain acknowledgement discards the fixer session", async () => {

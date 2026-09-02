@@ -4283,6 +4283,13 @@ async function runFixer(
         worker.worktreePath = worktreePath;
         try {
           await orca.finishWorker(worker, "retain");
+          if (
+            sessionToReuse &&
+            worker !== sessionToReuse.worker &&
+            worktreeId === sessionToReuse.worker.worktreeId
+          ) {
+            await unregisterAbortWorker(sessionToReuse.worker);
+          }
           worker.deliveryId = undefined;
           retainWorker = true;
         } catch {
