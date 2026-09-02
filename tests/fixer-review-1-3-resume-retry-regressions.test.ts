@@ -342,7 +342,7 @@ class OrphanAllocationOrca extends FakeOrca {
   }
 }
 
-test("renderer fallback revokes same-process resume availability", async () => {
+test("deferred renderer fallback revokes a pending same-process resume wait", { timeout: 2_000 }, async () => {
   const git = new FakeGit();
   git.policyDigest = "f".repeat(64);
   const deliveryGit = new FakeGit("/origin", "feature");
@@ -373,10 +373,21 @@ test("renderer fallback revokes same-process resume availability", async () => {
     onResumeAvailable?.();
     let failed = false;
     return {
-      render(): void {
-        if (failed) return;
+      render(snapshot: {
+        error?: { resumable: boolean };
+        transition: { kind: string };
+      }): void {
+        if (
+          failed ||
+          snapshot.transition.kind !== "error-recorded" ||
+          !snapshot.error?.resumable
+        ) {
+          return;
+        }
         failed = true;
-        onRendererFailure?.(new Error("renderer exploded"));
+        setImmediate(() =>
+          onRendererFailure?.(new Error("renderer exploded")),
+        );
       },
     };
   };

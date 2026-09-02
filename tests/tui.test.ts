@@ -370,7 +370,7 @@ if (process.env.TUI_FIXTURE === "1") {
     try {
       renderer.render({
         ...base,
-        runId: `${hostile}${"x".repeat(500)}`,
+        runId: `${"x".repeat(72)}open\nsesame-${hostile}`,
         stages: base.stages.map((stage) =>
           stage.id === "review"
             ? {
@@ -406,6 +406,7 @@ if (process.env.TUI_FIXTURE === "1") {
       assert.equal(frame.includes("\u001b"), false);
       assert.equal(frame.includes("secret-value"), false);
       assert.equal(frame.includes("open sesame"), false);
+      assert.equal(frame.includes("open s"), false);
       assert.equal(frame.includes("\u4e2d"), false);
       assert.equal(frame.includes("\u0301"), false);
       assert.match(frame, /\[REDACTED\]/u);

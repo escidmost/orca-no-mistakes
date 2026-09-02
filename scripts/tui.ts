@@ -62,7 +62,6 @@ function safeText(text: string, maxLength = Number.POSITIVE_INFINITY): string {
   );
   let result = "";
   for (const character of stripped) {
-    if (result.length >= maxLength) break;
     if (character === "\t") result += "  ";
     else if (character === "\r" || character === "\n") result += " ";
     else result += character >= " " && character <= "~" ? character : "?";

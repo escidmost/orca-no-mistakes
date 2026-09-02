@@ -1893,6 +1893,7 @@ export async function runPipeline(
   let resumeControlAvailable = false;
   let resumeRequestAllowed = false;
   let resumeRequested = false;
+  let resumeRevoked = false;
   let resumingAttempt = options.resumeRunId !== undefined;
   let attemptId: string | undefined;
   const coordinatorIdentity = `no-mistakes:${process.pid}`;
@@ -1903,11 +1904,22 @@ export async function runPipeline(
     resumeRequested = true;
     resumeResolver?.();
   };
-  const waitForResume = async (): Promise<void> => {
+  const revokeResumeControl = (): void => {
+    resumeControlAvailable = false;
+    if (!resumeRequestAllowed || resumeRequested) return;
+    resumeRequestAllowed = false;
+    resumeRevoked = true;
+    resumeResolver?.();
+  };
+  const waitForResume = async (): Promise<boolean> => {
     if (resumeRequested) {
       resumeRequestAllowed = false;
       resumeRequested = false;
-      return;
+      return true;
+    }
+    if (resumeRevoked) {
+      resumeRevoked = false;
+      return false;
     }
     await new Promise<void>((resolve) => {
       resumeResolver = () => {
@@ -1917,6 +1929,9 @@ export async function runPipeline(
         resolve();
       };
     });
+    const shouldResume = !resumeRevoked;
+    resumeRevoked = false;
+    return shouldResume;
   };
   const { artifactsDir, runId } = await withGateMutation(async () => {
     const orchestrationRunId =
@@ -2015,7 +2030,7 @@ export async function runPipeline(
           resumeControlAvailable = true;
         },
         (error) => {
-          resumeControlAvailable = false;
+          revokeResumeControl();
           console.error(`warning: presentation renderer failed: ${String(error)}`);
         },
       ) ??
@@ -2031,7 +2046,7 @@ export async function runPipeline(
           console.error(`warning: presentation renderer failed: ${String(error)}`),
         statusRenderer
           ? () => {
-              resumeControlAvailable = false;
+              revokeResumeControl();
               try {
                 (statusRenderer as { close?: () => void }).close?.();
               } catch {}
@@ -3257,7 +3272,7 @@ export async function runPipeline(
       });
       if (!retry) throw failure;
 
-      await waitForResume();
+      if (!(await waitForResume())) throw failure;
       let resumeHead: string | undefined;
       let resumedAttemptStarted = false;
       try {
