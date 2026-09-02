@@ -89,6 +89,7 @@ import {
   beginGateAdmission,
   decodeIntentPushOption,
   deriveAdmissionId,
+  deriveFallbackGateIdentity,
   ensureCustodyLaunch,
   initializeLocalGate,
   isProcessAlive,
@@ -2026,11 +2027,21 @@ export async function runPipeline(
         runId,
       });
       if (!options.resumeRunId && options.admission) {
-        ledger.markSubmissionAccepted({
+        const acceptedAdmission = ledger.markSubmissionAccepted({
           acceptedOid: options.admission.newOid,
           admissionId: options.admission.admissionId,
           runId,
         });
+        if (acceptedAdmission.source === "gate") {
+          await releaseAdmissionLaunch(
+            launchLockPath(
+              admissionReadinessPath(
+                repositoryGatePaths(deliveryRepo.root),
+                acceptedAdmission.admission_id,
+              ),
+            ),
+          ).catch(() => undefined);
+        }
       }
     } catch (error) {
       if (domainRunStarted) {
@@ -12866,7 +12877,6 @@ async function runGateCoordinatorCommand(flags: RawCliFlags): Promise<void> {
       }
     }
     if (!settled) throw handoffError;
-    await releaseAdmissionLaunch(launchLockPath(readinessPath)).catch(() => undefined);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await writeLaunchReadiness(readinessPath, {
@@ -13025,9 +13035,7 @@ Run options:
   } else if (!resumeRunId && !isGateChild) {
     launchRepoState = await git.assertReady();
     const gatePaths = repositoryGatePaths(launchRepoState.root);
-    let gateIdentity = sha256(
-      canonicalJson({ gatePath: gatePaths.gatePath, repoRoot: gatePaths.repoRoot }),
-    );
+    let gateIdentity = deriveFallbackGateIdentity(gatePaths);
     if (
       existsSync(gatePaths.gatePath) ||
       existsSync(path.join(gatePaths.stateDir, "gate.json"))

@@ -76,6 +76,12 @@ export function deriveAdmissionId(input: AdmissionIdentityInput): string {
   return `admission-${deriveSubmissionIdentity(input)}`
 }
 
+export function deriveFallbackGateIdentity(
+  paths: Pick<GatePaths, 'commonDir' | 'gatePath'>
+): string {
+  return sha256(canonicalJson({ gatePath: paths.gatePath, repoRoot: paths.commonDir }))
+}
+
 export function repositoryGatePaths(repoPath: string): GatePaths {
   const requestedPath = path.resolve(repoPath)
   const repoRoot = path.resolve(gitSync(['-C', requestedPath, 'rev-parse', '--show-toplevel']))
@@ -363,7 +369,10 @@ export async function readGateMetadata(gatePath: string): Promise<GateMetadata> 
   return parsed as GateMetadata
 }
 
-export function admissionReadinessPath(metadata: GateMetadata, admissionId: string): string {
+export function admissionReadinessPath(
+  metadata: Pick<GatePaths, 'stateDir'>,
+  admissionId: string
+): string {
   if (!/^admission-[0-9a-f]{64}$/u.test(admissionId)) {
     throw new Error('invalid admission ID')
   }
