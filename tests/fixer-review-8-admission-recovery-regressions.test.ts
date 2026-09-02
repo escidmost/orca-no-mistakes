@@ -9,13 +9,14 @@ import test from 'node:test'
 import {
   admissionReadinessPath,
   deriveAdmissionId,
+  deriveFallbackGateIdentity,
   initializeLocalGate,
   launchLockPath,
   readGateMetadata,
   repositoryGatePaths,
   type GateMetadata
 } from '../scripts/admission.ts'
-import { canonicalJson, DomainLedger, sha256 } from '../scripts/ledger.ts'
+import { DomainLedger } from '../scripts/ledger.ts'
 import { main } from '../scripts/orca-no-mistakes.ts'
 
 const oid = (character: string): string => character.repeat(40)
@@ -73,9 +74,7 @@ test('a direct run whose checkout drifted from the admission is rejected and the
 
     const base = git(repo, 'rev-parse', 'origin/main')
     const paths = repositoryGatePaths(repo)
-    const gateIdentity = sha256(
-      canonicalJson({ gatePath: paths.gatePath, repoRoot: paths.repoRoot })
-    )
+    const gateIdentity = deriveFallbackGateIdentity(paths)
     const admissionId = deriveAdmissionId({
       gateIdentity,
       intent,
@@ -91,7 +90,7 @@ test('a direct run whose checkout drifted from the admission is rejected and the
       newOid: base,
       oldOid: base,
       refName: 'refs/heads/feature',
-      repoRoot: paths.repoRoot,
+      repoRoot: paths.commonDir,
       source: 'direct'
     })
     ledger.markSubmissionLaunched(admissionId)
