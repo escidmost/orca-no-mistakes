@@ -43,7 +43,10 @@ function setEnv(home: string, orcaCommand: string): () => void {
   };
 }
 
-async function seedTerminalRetry(status: "failed" | "passed") {
+async function seedTerminalRetry(
+  status: "failed" | "passed",
+  fenced = false,
+) {
   const temp = await mkdtemp(path.join(tmpdir(), `onm-${status}-branch-retry-`));
   const repo = path.join(temp, "repo");
   await mkdir(path.join(repo, ".orca", "no-mistakes"), { recursive: true });
@@ -83,6 +86,10 @@ if (args[0] === "worktree" && args[1] === "list") out({ worktrees: [{
   head: ${JSON.stringify(gateHead)}
 }] })
 else if (args[0] === "orchestration" && args[1] === "task-list") out({ tasks: [{ id: "task-failed", status: "ready" }] })
+else if (args[0] === "orchestration" && args[1] === "task-update" && ${JSON.stringify(fenced)}) {
+  console.error(JSON.stringify({ ok: false, error: { code: "consumer_fenced" } }))
+  process.exit(1)
+}
 else if (args[0] === "orchestration" && args[1] === "task-update") out({ task: { id: "task-failed", status: "failed" } })
 else out({ accepted: true })
 `,
@@ -161,6 +168,19 @@ for (const status of ["passed", "failed"] as const) {
     }
   });
 }
+
+test("stranded cleanup releases a dead coordinator after Orca fences settlement", async () => {
+  const seeded = await seedTerminalRetry("failed", true);
+  try {
+    await main(["prune", "--stranded", "--repo", seeded.repo]);
+
+    assert.equal(existsSync(seeded.marker), false);
+    assert.equal(git(seeded.repo, "branch", "--list", seeded.branch), "");
+  } finally {
+    seeded.restore();
+    await rm(seeded.temp, { force: true, recursive: true });
+  }
+});
 
 test("post-pass cleanup uses the attested candidate without another head read", async () => {
   const source = await readFile(

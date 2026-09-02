@@ -12167,6 +12167,10 @@ function settleStrandedCancellation(
   return settled;
 }
 
+function isConsumerFenced(error: unknown): boolean {
+  return String(error).includes("consumer_fenced");
+}
+
 async function reapDirectRun(
   markerFile: string,
   marker: DirectRunMarker,
@@ -12294,8 +12298,8 @@ async function reapDirectRun(
       cwd: repoRoot,
       runId: marker.runId,
     }).failRun("Coordinator terminated before cleanup completed");
-  } catch {
-    return false;
+  } catch (error) {
+    if (!isConsumerFenced(error)) return false;
   }
   await rm(markerFile);
   console.error(`no-mistakes: reaped stranded direct run ${domainRunId}`);
@@ -12679,11 +12683,13 @@ async function reapStrandedGates(
                 runId: orchestrationRunId,
               }).failRun("Coordinator terminated before cleanup completed");
             } catch (error) {
-              retained += 1;
-              console.error(
-                `no-mistakes: retained gate workspace ${gate.path}; its Orca run could not be settled: ${String(error)}`,
-              );
-              continue;
+              if (!isConsumerFenced(error)) {
+                retained += 1;
+                console.error(
+                  `no-mistakes: retained gate workspace ${gate.path}; its Orca run could not be settled: ${String(error)}`,
+                );
+                continue;
+              }
             }
           }
           const branch = await command(
@@ -12954,11 +12960,13 @@ async function reapStrandedGates(
               runId: orchestrationRunId,
             }).failRun("Coordinator terminated before cleanup completed");
           } catch (error) {
-            retained += 1;
-            console.error(
-              `no-mistakes: retained gate workspace ${gate.path}; its Orca run could not be settled: ${String(error)}`,
-            );
-            continue;
+            if (!isConsumerFenced(error)) {
+              retained += 1;
+              console.error(
+                `no-mistakes: retained gate workspace ${gate.path}; its Orca run could not be settled: ${String(error)}`,
+              );
+              continue;
+            }
           }
         }
         // Orca cannot conditionally remove atomically, so stranded cleanup
