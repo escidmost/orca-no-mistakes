@@ -90,12 +90,13 @@ test("live log redraws reuse StageLog redaction and stop on close", async () => 
   );
   try {
     renderer.render(snapshot());
+    await new Promise((resolve) => setImmediate(resolve));
     const initial = output.writes.at(-1) ?? "";
     assert.doesNotMatch(initial, new RegExp(secret, "u"));
     assert.match(initial, /\[REDACTED\]/u);
 
     await log.append("\nupdated while running\n");
-    const deadline = Date.now() + 1_000;
+    const deadline = Date.now() + 2_000;
     while (!(output.writes.at(-1) ?? "").includes("updated while running")) {
       assert.ok(Date.now() < deadline, "live log did not refresh");
       await delay(25);
@@ -104,7 +105,7 @@ test("live log redraws reuse StageLog redaction and stop on close", async () => 
     renderer.close();
     const writesAfterClose = output.writes.length;
     await log.append("must not redraw\n");
-    await delay(300);
+    await delay(1_100);
     assert.equal(output.writes.length, writesAfterClose);
   } finally {
     renderer.close();

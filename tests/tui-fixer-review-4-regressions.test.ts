@@ -99,11 +99,13 @@ test("log reads stay bound when artifact ancestors are replaced", async () => {
   );
   try {
     renderer.render(snapshot(1));
+    await new Promise((resolve) => setImmediate(resolve));
     assert.match(output.writes.at(-1) ?? "", /trusted log/u);
 
     renameSync(artifactRoot, movedRoot);
     symlinkSync(outsideRoot, artifactRoot);
     renderer.render(snapshot(2));
+    await new Promise((resolve) => setImmediate(resolve));
     assert.match(output.writes.at(-1) ?? "", /trusted log/u);
     assert.doesNotMatch(output.writes.at(-1) ?? "", /escaped log/u);
 
@@ -111,6 +113,7 @@ test("log reads stay bound when artifact ancestors are replaced", async () => {
     mkdirSync(artifactsDir, { recursive: true });
     writeFileSync(path.join(artifactsDir, "review_r0.log"), "replacement log\n");
     renderer.render(snapshot(3));
+    await new Promise((resolve) => setImmediate(resolve));
     assert.doesNotMatch(output.writes.at(-1) ?? "", /replacement log/u);
   } finally {
     renderer.close();

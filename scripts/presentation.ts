@@ -1,3 +1,5 @@
+import { stripVTControlCharacters } from "node:util";
+
 import { PIPELINE_STEPS, type StageName } from "./config.ts";
 
 export type PresentationStatus =
@@ -455,7 +457,11 @@ export class PresentationPublisher {
 }
 
 function safeToken(value: string): string {
-  return value.replaceAll(/[^\p{L}\p{N}._:\/-]+/gu, " ").trim().slice(0, 120);
+  return stripVTControlCharacters(value)
+    .replaceAll(/[^\x20-\x7e]/gu, " ")
+    .replaceAll(/\s+/gu, " ")
+    .trim()
+    .slice(0, 120);
 }
 
 export class PlainStatusRenderer implements PresentationRenderer {

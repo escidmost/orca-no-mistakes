@@ -72,15 +72,16 @@ function screen(output: FakeOutput): string {
   return output.writes.at(-1) ?? "";
 }
 
-function renderOnce(
+async function renderOnce(
   artifactsDir: string,
   stageLogs: ReadonlyMap<string, StageLog> = new Map(),
-): string {
+): Promise<string> {
   const input = new FakeInput();
   const output = new FakeOutput();
   const renderer = new RailTuiRenderer(input, output, artifactsDir, stageLogs);
   try {
     renderer.render(snapshot(0));
+    await new Promise((resolve) => setImmediate(resolve));
     return screen(output);
   } finally {
     renderer.close();
@@ -93,11 +94,11 @@ test("only coordinator-owned logs are displayed", async () => {
     const log = new StageLog(logPath);
     try {
       writeFileSync(logPath, "unregistered transcript\n");
-      assert.doesNotMatch(renderOnce(artifactsDir), /unregistered transcript/u);
+      assert.doesNotMatch(await renderOnce(artifactsDir), /unregistered transcript/u);
       rmSync(logPath);
       await log.append("coordinator transcript\n");
       assert.match(
-        renderOnce(artifactsDir, new Map([[path.resolve(logPath), log]])),
+        await renderOnce(artifactsDir, new Map([[path.resolve(logPath), log]])),
         /coordinator transcript/u,
       );
     } finally {
@@ -106,7 +107,7 @@ test("only coordinator-owned logs are displayed", async () => {
     }
 });
 
-test("split escape sequences remain single navigation keys", () => {
+test("split escape sequences remain single navigation keys", async () => {
     const artifactsDir = mkdtempSync(path.join(tmpdir(), "orca-tui-input-"));
     const input = new FakeInput();
     const output = new FakeOutput();
@@ -118,9 +119,11 @@ test("split escape sequences remain single navigation keys", () => {
       input.emit("data", "\t");
       input.emit("data", "\u001b");
       input.emit("data", "[A");
+      await new Promise((resolve) => setImmediate(resolve));
       assert.match(screen(output), /> Review round 2/u);
       input.emit("data", "\u001b");
       input.emit("data", "[Z");
+      await new Promise((resolve) => setImmediate(resolve));
       assert.match(screen(output), /> RAIL/u);
     } finally {
       renderer.close();
