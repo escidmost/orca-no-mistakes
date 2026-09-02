@@ -284,13 +284,16 @@ if (process.env.TUI_FIXTURE === "1") {
     const output = new FakeOutput();
     let requested = 0;
     let available = 0;
+    let cancellations = 0;
     const renderer = createRailTuiRenderer(
       input,
       output,
       "/unused",
       new Map(),
       undefined,
-      undefined,
+      () => {
+        cancellations += 1;
+      },
       undefined,
       () => {
         requested += 1;
@@ -346,6 +349,9 @@ if (process.env.TUI_FIXTURE === "1") {
     assert.doesNotMatch(screen(), /R Resume/u);
     input.emit("data", "R");
     assert.equal(requested, 1);
+    input.emit("data", "C");
+    assert.equal(cancellations, 1);
+    assert.doesNotMatch(screen(), /CANCEL RUN\?/u);
     renderer.close();
   });
 

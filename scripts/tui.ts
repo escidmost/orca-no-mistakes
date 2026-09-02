@@ -736,6 +736,9 @@ export class RailTuiRenderer implements PresentationRenderer {
           this.#cancelRun();
           return;
         }
+      } else if ((key === "c" || key === "C") && this.#snapshot?.error) {
+        this.#cancelRun();
+        return;
       } else if (key === "c" || key === "C") {
         this.#cancelVisible = true;
       } else if (key === "a" || key === "A") {
