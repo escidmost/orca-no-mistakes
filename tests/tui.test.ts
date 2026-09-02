@@ -318,6 +318,7 @@ if (process.env.TUI_FIXTURE === "1") {
     input.emit("data", "R");
     assert.equal(requested, 1);
     assert.match(screen(), /Resume requested\. Waiting for the next attempt\./u);
+    assert.doesNotMatch(screen(), /R Resume/u);
 
     renderer.render({
       ...resumable,

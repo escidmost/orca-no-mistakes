@@ -685,7 +685,9 @@ export class RailTuiRenderer implements PresentationRenderer {
     }
     if (this.#snapshot?.error) {
       const keys = [
-        this.#snapshot.error.resumable && this.#requestResume
+        this.#snapshot.error.resumable &&
+        this.#requestResume &&
+        this.#resumeVisible
           ? "R Resume"
           : "",
         "C Leave stopped",
