@@ -8,6 +8,7 @@ import test from 'node:test'
 
 import {
   deriveAdmissionId,
+  deriveFallbackGateIdentity,
   launchLockPath,
   readAdmissionLaunchClaim,
   recordCoordinatorLaunch,
@@ -81,6 +82,8 @@ const fakeOrcaCli = async (temp: string, runId: string): Promise<string> => {
       '#!/bin/sh',
       'case "$*" in',
       `  *run-create*) echo '{"run":{"id":"${runId}"}}' ;;`,
+      '  *task-create*) echo \'{"task":{"id":"task-intent"}}\' ;;',
+      '  *task-list*) echo \'{"tasks":[{"id":"task-intent","status":"failed"}]}\' ;;',
       '  *) exit 1 ;;',
       'esac',
       'exit 0'
@@ -102,7 +105,7 @@ const directAdmission = (
   head: string
 ): { admissionId: string; input: Parameters<DomainLedger['beginSubmissionAdmission']>[0] } => {
   const paths = repositoryGatePaths(repo)
-  const gateIdentity = sha256(canonicalJson({ gatePath: paths.gatePath, repoRoot: paths.repoRoot }))
+  const gateIdentity = deriveFallbackGateIdentity(paths)
   return {
     admissionId: deriveAdmissionId({
       gateIdentity,
@@ -124,7 +127,7 @@ const directAdmission = (
       newOid: head,
       oldOid: head,
       refName: 'refs/heads/feature',
-      repoRoot: paths.repoRoot,
+      repoRoot: paths.commonDir,
       source: 'direct' as const
     }
   }
@@ -170,12 +173,12 @@ test('branch lease contention after binding reclaims the admission to pending', 
       branch: 'feature',
       intent: 'Hold the branch lease.',
       policySha256: sha256('policy'),
-      repoRoot: input.repoRoot,
+      repoRoot: fixture.repo,
       runId: 'lease-holder-run',
       submissionCommitOid: fixture.head
     })
     ledger.settleRun('lease-holder-run', 'failed')
-    ledger.acquireLease({ branch: 'feature', repoRoot: input.repoRoot, runId: 'lease-holder-run' })
+    ledger.acquireLease({ branch: 'feature', repoRoot: fixture.repo, runId: 'lease-holder-run' })
     ledger.close()
 
     await assert.rejects(
