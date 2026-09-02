@@ -2757,6 +2757,7 @@ export async function runPipeline(
           const observed = await options.githubAuthority!.observeRepository(reference);
           return { id: observed.id, nodeId: observed.nodeId };
         };
+        const remoteRound = stage === "pr" && latestEvidenceByStage.has("pr") ? round + 1 : 0;
         try {
         if (stage === "push") {
           if (!ledger.publicationBaseline(runId)) {
@@ -2813,7 +2814,6 @@ export async function runPipeline(
               stage: entry.stage_id,
             })),
           });
-          const remoteRound = latestEvidenceByStage.has("pr") ? round + 1 : round;
           await bindPullRequest({
             artifactPath: path.join(artifactsDir, `pr-r${remoteRound}.json`),
             attemptId,
@@ -2839,8 +2839,8 @@ export async function runPipeline(
         }
         const entry = appendSettledRemoteEvidence(stage);
         const report = { findings: [], summary: entry.summary };
-        const eventKey = `stage:${stage}:round:0:completed:${stageInputCommitOid}`;
-        presentation.publish(eventKey, { kind: "stage-completed", round: 0, stage });
+        const eventKey = `stage:${stage}:round:${remoteRound}:completed:${stageInputCommitOid}`;
+        presentation.publish(eventKey, { kind: "stage-completed", round: remoteRound, stage });
         await orca.completeTask(taskId, report);
         continue;
       }
@@ -3387,7 +3387,7 @@ export async function runPipeline(
               recoveryInstructions(recoverRef);
       };
       const eventKey = "run:completed:passed";
-      if (remotePublication) {
+      if (pipelineSteps.includes("push")) {
         if (!attemptId) throw new Error("pipeline attempt was not started");
         const terminalAttemptId = attemptId;
         const route = ledger.publicationRoute(runId);
@@ -13848,22 +13848,38 @@ async function runInitCommand(flags: RawCliFlags): Promise<void> {
     path.resolve(process.argv[1] ?? fileURLToPath(import.meta.url)),
   );
   const ledger = openRepositoryLedger(metadata.repoRoot);
-  const authority = await GithubAuthority.connect();
-  const route = await resolveGithubPublicationRoute({
-    baseBranch: stringFlag(flags, "base-branch"),
-    fork: stringFlag(flags, "fork"),
-    headBranch: stringFlag(flags, "head-branch"),
-    ledger,
-    provider: authority,
-    repoPath: metadata.repoRoot,
-    upstream: stringFlag(flags, "upstream"),
-  });
+  let upstream = stringFlag(flags, "upstream");
+  if (upstream === undefined) {
+    try {
+      upstream = (await command("git", ["remote", "get-url", "origin"], metadata.repoRoot))
+        .stdout.trim();
+    } catch {}
+  }
+  let routeFingerprint: string | null = null;
+  if (upstream !== undefined) {
+    try {
+      parseGithubRepositoryReference(upstream);
+      const authority = await GithubAuthority.connect();
+      routeFingerprint = (await resolveGithubPublicationRoute({
+        baseBranch: stringFlag(flags, "base-branch"),
+        fork: stringFlag(flags, "fork"),
+        headBranch: stringFlag(flags, "head-branch"),
+        ledger,
+        provider: authority,
+        repoPath: metadata.repoRoot,
+        upstream,
+      })).routeFingerprint;
+    } catch (error) {
+      if (!(error instanceof GithubAuthorityError) ||
+          error.operation !== "parse-repository-reference") throw error;
+    }
+  }
   console.log(
     JSON.stringify({
       gate: metadata.gatePath,
       remote: metadata.remoteName,
       repo: metadata.repoRoot,
-      route: route.routeFingerprint,
+      route: routeFingerprint,
     }),
   );
 }
@@ -14472,37 +14488,38 @@ Run options:
     const resumePlan = resumeRunId ? ledger.stagePlan(resumeRunId) : [];
     const legacyResume = resumePlan.length > 0 &&
       !resumePlan.some((entry) => entry.stage_id === "push");
-    if (!storedRoute && !legacyResume) {
-      const origin = await command("git", ["remote", "get-url", "origin"], routeRoot);
-      let githubOrigin = false;
-      try {
-        parseGithubRepositoryReference(origin.stdout.trim());
-        githubOrigin = true;
-      } catch {}
-      if (githubOrigin) {
-        throw new Error("new GitHub runs require successful orca-no-mistakes init");
-      }
-    }
+    let githubOrigin = false;
     try {
-      githubAuthority = await GithubAuthority.connect();
-      const publicationRoute = await resolveGithubPublicationRoute({
-        baseBranch: storedRoute?.base_branch,
-        fork:
-          storedRoute &&
-          storedRoute.head_repository_id !== storedRoute.base_repository_id
-            ? storedRoute.head_repository_name
-            : undefined,
-        headBranch: storedRoute?.head_branch,
-        ledger,
-        provider: githubAuthority,
-        repoPath: routeRoot,
-        upstream: storedRoute?.base_repository_name,
-      });
-      publicationDestination = `https://${publicationRoute.forgeHost}/${publicationRoute.headRepositoryName}.git`;
-    } catch (error) {
-      if (!(error instanceof GithubAuthorityError) ||
-          error.operation !== "parse-repository-reference") throw error;
-      githubAuthority = undefined;
+      parseGithubRepositoryReference(
+        (await command("git", ["remote", "get-url", "origin"], routeRoot)).stdout.trim(),
+      );
+      githubOrigin = true;
+    } catch {}
+    if (!storedRoute && !legacyResume && githubOrigin) {
+      throw new Error("new GitHub runs require successful orca-no-mistakes init");
+    }
+    if (githubOrigin || storedRoute) {
+      try {
+        githubAuthority = await GithubAuthority.connect();
+        const publicationRoute = await resolveGithubPublicationRoute({
+          baseBranch: storedRoute?.base_branch,
+          fork:
+            storedRoute &&
+            storedRoute.head_repository_id !== storedRoute.base_repository_id
+              ? storedRoute.head_repository_name
+              : undefined,
+          headBranch: storedRoute?.head_branch,
+          ledger,
+          provider: githubAuthority,
+          repoPath: routeRoot,
+          upstream: storedRoute?.base_repository_name,
+        });
+        publicationDestination = `https://${publicationRoute.forgeHost}/${publicationRoute.headRepositoryName}.git`;
+      } catch (error) {
+        if (!(error instanceof GithubAuthorityError) ||
+            error.operation !== "parse-repository-reference") throw error;
+        githubAuthority = undefined;
+      }
     }
     await installAbortReaping({
       ...(gate ? { gate } : {}),

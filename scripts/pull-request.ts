@@ -64,7 +64,7 @@ function capSummary(content: string, budget: number): string {
 function pullRequestContent(intent: string): { body: string; title: string } {
   const redacted = redactKnownSecrets(intent).trim() || 'Complete the validated pipeline changes.'
   const firstLine = redacted.split('\n', 1)[0].trim()
-  const title = /^[a-z]+(?:\([^)]+\))?!?:\s/.test(firstLine)
+  const title = /^(?:[a-z]+(?:\([^)]+\))?!?:\s|[A-Z][A-Z0-9]+-\d+:\s)/.test(firstLine)
     ? firstLine
     : `chore: ${firstLine}`
   return {
@@ -174,7 +174,9 @@ export async function bindPullRequest(input: {
     baseBranch: route.base_branch,
     baseRepositoryId: route.base_repository_id,
     candidateCommitOid: input.candidateCommitOid,
+    forgeHost: route.forge_host,
     headBranch: route.head_branch,
+    headOwner: route.head_owner,
     headRepositoryId: route.head_repository_id
   }
   const mutationCreatedAt = now()
