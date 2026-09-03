@@ -126,6 +126,7 @@ const GraphqlRepositorySchema = z.object({
   nameWithOwner: NameWithOwnerSchema
 })
 const PullRequestNodeSchema = z.object({
+  body: z.string(),
   baseRefName: RefSchema,
   baseRefOid: OidSchema,
   baseRepository: GraphqlRepositorySchema,
@@ -136,6 +137,7 @@ const PullRequestNodeSchema = z.object({
   isDraft: z.boolean(),
   number: z.number().int().positive(),
   state: z.enum(['OPEN', 'CLOSED', 'MERGED']),
+  title: z.string().min(1),
   url: z.string().url()
 })
 const PullRequestPageSchema = z.object({
@@ -192,6 +194,7 @@ export type GithubPullRequestObservation = {
   baseOid: string
   baseRepositoryId: string
   baseRepositoryNodeId: string
+  body: string
   draft: boolean
   headBranch: string
   headOid: string | null
@@ -200,6 +203,7 @@ export type GithubPullRequestObservation = {
   id: string
   number: number
   state: 'OPEN' | 'CLOSED' | 'MERGED'
+  title: string
   url: string
 }
 
@@ -232,7 +236,7 @@ const PULL_REQUESTS_QUERY = `query PullRequests($owner: String!, $name: String!,
     id
     pullRequests(states: [OPEN, CLOSED, MERGED], baseRefName: $baseBranch, headRefName: $headBranch, first: 100, after: $cursor, orderBy: {field: CREATED_AT, direction: ASC}) {
       nodes {
-        id number url state isDraft baseRefName baseRefOid headRefName headRefOid
+        id number url state isDraft title body baseRefName baseRefOid headRefName headRefOid
         baseRepository { databaseId id nameWithOwner }
         headRepository { databaseId id nameWithOwner }
       }
@@ -245,7 +249,7 @@ const COMMENTS_QUERY = `query IssueComments($id: ID!, $cursor: String) {
   node(id: $id) {
     ... on PullRequest {
       comments(first: 100, after: $cursor) {
-        nodes { id body createdAt updatedAt url author { id login } }
+        nodes { id body createdAt updatedAt url author { login ... on Node { id } } }
         pageInfo { hasNextPage endCursor }
       }
     }
@@ -853,6 +857,7 @@ function normalizePullRequest(
     baseOid: pullRequest.baseRefOid,
     baseRepositoryId: pullRequest.baseRepository.databaseId,
     baseRepositoryNodeId: pullRequest.baseRepository.id,
+    body: pullRequest.body,
     draft: pullRequest.isDraft,
     headBranch: pullRequest.headRefName,
     headOid: pullRequest.headRefOid,
@@ -861,6 +866,7 @@ function normalizePullRequest(
     id: pullRequest.id,
     number: pullRequest.number,
     state: pullRequest.state,
+    title: pullRequest.title,
     url: pullRequest.url
   }
 }

@@ -27,6 +27,7 @@ import {
   DomainLedger,
   FixerPolicyViolationError,
   GitShell,
+  LEGACY_STAGE_PLAN,
   PIPELINE_STEPS,
   PostMutationCustodyError,
   RecoveryAnchorError,
@@ -398,7 +399,7 @@ class FakeOrca implements OrcaOperations {
   async completeTask(taskId: string, report: StageReport): Promise<void> {
     const task = this.tasks.find((candidate) => candidate.id === taskId);
     assert.ok(task);
-    const stage = PIPELINE_STEPS.find((candidate) =>
+    const stage = LEGACY_STAGE_PLAN.find((candidate) =>
       task.spec.startsWith(`[${candidate}]`),
     );
     if (stage) {
@@ -615,11 +616,11 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
   );
 
   assert.match(result.runId, /^test-run-/);
-  assert.deepEqual(result.steps, PIPELINE_STEPS);
-  assert.deepEqual(orca.completedStages, PIPELINE_STEPS);
+  assert.deepEqual(result.steps, LEGACY_STAGE_PLAN);
+  assert.deepEqual(orca.completedStages, LEGACY_STAGE_PLAN);
 
-  const stageTasks = orca.tasks.slice(0, PIPELINE_STEPS.length);
-  assert.equal(stageTasks.length, PIPELINE_STEPS.length);
+  const stageTasks = orca.tasks.slice(0, LEGACY_STAGE_PLAN.length);
+  assert.equal(stageTasks.length, LEGACY_STAGE_PLAN.length);
   assert.deepEqual(stageTasks[0].deps, []);
   for (let index = 1; index < stageTasks.length; index += 1) {
     assert.deepEqual(stageTasks[index].deps, [stageTasks[index - 1].id]);
@@ -812,7 +813,7 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
   assert.match(result.custodyNote ?? "", /carries the terminal commit/);
   assert.equal(
     orca.calls.at(-1),
-    `status:completed:no-mistakes passed all ${PIPELINE_STEPS.length} stages`,
+    `status:completed:no-mistakes passed all ${LEGACY_STAGE_PLAN.length} stages`,
   );
   const presentation = ledger.listPresentationSnapshots(result.runId);
   assert.deepEqual(
@@ -825,7 +826,7 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
         ? [snapshot.transition.stage]
         : [],
     ),
-    PIPELINE_STEPS,
+    LEGACY_STAGE_PLAN,
   );
   assert.equal(
     presentation.filter(
@@ -837,6 +838,34 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
     kind: "run-completed",
     status: "passed",
   });
+});
+
+test("new CLI runs cannot pass without Release 2 publication support", async () => {
+  const git = new FakeGit();
+  const runId = `release-2-required-${randomUUID()}`;
+  const orca = new FakeOrca(git, runId);
+  const ledger = new DomainLedger(":memory:");
+  try {
+    await assert.rejects(
+      runPipeline(
+        {
+          intent: "Require remote publication for a new CLI run.",
+          release2PublicationRequired: true,
+        },
+        orca,
+        git,
+        ledger,
+      ),
+      /push requires initialized GitHub publication/,
+    );
+    assert.deepEqual(
+      ledger.stagePlan(runId).map((entry) => entry.stage_id),
+      PIPELINE_STEPS,
+    );
+    assert.equal(ledger.run(runId)?.status, "failed");
+  } finally {
+    ledger.close();
+  }
 });
 
 test("a failed run resumes from its last checkpoint without repeating completed stages or gates", async () => {
@@ -908,7 +937,7 @@ test("a failed run resumes from its last checkpoint without repeating completed 
   assert.match(result.custodyNote ?? "", /advanced branch feature/);
   assert.equal(ledger.runStatus(runId), "passed");
   assert.ok(result.attestation);
-  verifyManifest(result.attestation, PIPELINE_STEPS);
+  verifyManifest(result.attestation, LEGACY_STAGE_PLAN);
   assert.deepEqual(ledger.verifyEvidence(result.attestation), []);
   const presentation = ledger.listPresentationSnapshots(runId);
   assert.deepEqual(
@@ -923,7 +952,7 @@ test("a failed run resumes from its last checkpoint without repeating completed 
         ? [snapshot.transition.stage]
         : [],
     ),
-    PIPELINE_STEPS,
+    LEGACY_STAGE_PLAN,
   );
   assert.equal(
     presentation.filter(
@@ -943,6 +972,37 @@ test("same-process Resume retries repeated failures with one run and one attempt
   const deliveryGit = new FakeGit("/origin", "feature");
   const runId = `same-process-resume-${randomUUID()}`;
   class RepeatedFailureOrca extends FakeOrca {
+    #resolveResumeGate: ((resolution: string) => void) | undefined;
+
+    override async createGate(
+      taskId: string,
+      question: string,
+      options: string[],
+    ): Promise<string> {
+      if (options?.includes("resume")) {
+        return "gate-resume";
+      }
+      return await super.createGate(taskId, question, options);
+    }
+
+    override async waitForGate(gateId: string): Promise<string> {
+      if (gateId !== "gate-resume") return await super.waitForGate(gateId);
+      return await new Promise((resolve) => {
+        this.#resolveResumeGate = resolve;
+      });
+    }
+
+    override async resolveGate(
+      gateId: string,
+      resolution: string,
+    ): Promise<void> {
+      if (gateId === "gate-resume") {
+        this.#resolveResumeGate?.(resolution);
+        return;
+      }
+      await super.resolveGate(gateId, resolution);
+    }
+
     override async startWorker(
       taskId: string,
       launch: WorkerLaunch,
@@ -1625,7 +1685,7 @@ test("protected fixer commits are rejected at a resumable human gate", async () 
   );
 });
 
-test("a policy-violation approval waives the evidence shown at its gate", async () => {
+test("a policy-violation approval waives the authoritative worker evidence", async () => {
   const git = new FakeGit();
   allowReviewAutoFix(git);
   git.protectedTestMutation = "tests/existing.test.ts";
@@ -1658,10 +1718,14 @@ test("a policy-violation approval waives the evidence shown at its gate", async 
   const policyEvidence = result.attestation?.stageEvidence.find(
     (entry) => entry.summary === "review fixer commit rejected by protected-path policy",
   );
+  const approvedEvidence = result.attestation?.stageEvidence.find(
+    (entry) => entry.stage === "review" && entry.workerIdentity.startsWith("reviewer:"),
+  );
   assert.equal(result.attestation?.guardrailMode, "strict");
   assert.equal(policyEvidence?.workerIdentity, "coordinator:fixer-policy");
   assert.equal(policyEvidence?.exitCode, 1);
-  assert.equal(policyEvidence?.waiverOrApproval?.decision, "approve");
+  assert.equal(policyEvidence?.waiverOrApproval, undefined);
+  assert.equal(approvedEvidence?.waiverOrApproval?.decision, "approve");
   const logsDir = path.join(artifactsRoot(), runId, "logs");
   const policyLog = (
     await Promise.all(
@@ -2144,7 +2208,7 @@ test("unexplained policy relaxations pause the pipeline at a decision gate", asy
     orca.gates[0].question.includes("unexplained-policy-relaxation"),
     "the gate question must surface the policy relaxation finding",
   );
-  assert.deepEqual(orca.completedStages, PIPELINE_STEPS);
+  assert.deepEqual(orca.completedStages, LEGACY_STAGE_PLAN);
   assert.ok(result.attestation);
 });
 
@@ -2415,7 +2479,7 @@ test("assertion updates documented in intent stay informational and never open g
   );
 
   assert.equal(orca.gates.length, 0);
-  assert.deepEqual(orca.completedStages, PIPELINE_STEPS);
+  assert.deepEqual(orca.completedStages, LEGACY_STAGE_PLAN);
   assert.ok(result.attestation);
 });
 
@@ -2441,7 +2505,7 @@ test("exhaustion gate allows user to authorize another fix round", async () => {
     orca,
     git,
   );
-  assert.equal(result.steps.length, PIPELINE_STEPS.length);
+  assert.equal(result.steps.length, LEGACY_STAGE_PLAN.length);
   assert.ok(
     orca.calls.some((call) =>
       call.includes("reached the limit of 1 fix rounds"),
@@ -3266,7 +3330,11 @@ console.log(JSON.stringify({ result }))
     assert.ok(sent?.includes("originating-opencode"));
     assert.ok(sent?.includes("gate-run"));
     assert.ok(sent?.includes("question"));
-    assert.ok(sent?.includes("Choose a review action.\nGate: gate-review"));
+    assert.ok(
+      sent?.some((value) =>
+        value.includes("Choose a review action.\n\nGate: gate-review"),
+      ),
+    );
     assert.ok(wake?.includes("originating-opencode"));
     assert.ok(wake?.includes("--enter"));
     assert.ok(
@@ -6869,7 +6937,7 @@ test("runs selective fix on human gate and sends only chosen findings to fixer",
   ]);
 
   const result = await runPipeline({ intent: "Selective fix test" }, orca, git);
-  assert.equal(result.steps.length, PIPELINE_STEPS.length);
+  assert.equal(result.steps.length, LEGACY_STAGE_PLAN.length);
 
   // Only review-2 is active fixer work; review-1 is preserved as a decline.
   const fixerTask = orca.tasks.find((task) =>

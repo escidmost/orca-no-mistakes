@@ -53,11 +53,11 @@ A guarded update that places the exact candidate commit on the remote pull-reque
 _Avoid_: Delivery, merge, ordinary force-push
 
 **Publication route**:
-The immutable per-run identity of the base repository, head repository, head owner, head branch, and base branch used for candidate publication and pull-request binding.
+The immutable per-run identity of the forge, stable base and head repositories, head owner, fully qualified publication ref, base branch, route fingerprint, and canonical credential-free transport used for candidate publication and pull-request binding.
 _Avoid_: Origin, current remotes, push URL
 
 **Repository publication route**:
-The durable, mutable publication route persisted once per repository and bound to the authenticated actor and backend. It is guarded against authenticated-actor drift and against change while active runs depend on it, and each run snapshots it as its immutable per-run Publication route.
+The durable, mutable publication route persisted once per repository and bound to the authenticated actor, backend, forge, stable repository identities, owner, branches, fingerprint, and canonical credential-free transport identity. It is guarded against authenticated-actor drift and against change while active runs or resumable failed runs depend on it. Release 2 runs whose head and base branches match the stored route snapshot it as their immutable per-run Publication route; legacy, provider-neutral, and unmatched runs do not.
 _Avoid_: Per-run route, origin, ambient remote
 
 **Publication head ref**:
@@ -189,7 +189,7 @@ A deterministic root binding the frozen stage plan and evidence through candidat
 _Avoid_: Completion-attestation root, remote trust anchor, raw evidence link
 
 **Pipeline completion attestation**:
-A portable, tamper-evident manifest using the version 2 completion schema for a run with a `passed` verdict. It binds the frozen stage plan, recorded stage dispositions and evidence, candidate-publication and pull-request-binding receipt digests, prior attempt-outcome digests, custody facts, and explicit assurance claims to the candidate commit. It proves historical observations, not current remote state or independent authenticity.
+A portable, tamper-evident manifest using the version 2 completion schema for a run with a `passed` verdict. It binds the frozen stage plan, recorded stage dispositions and evidence, candidate-publication and pull-request-binding receipt digests, all attempt-outcome digests (explicitly including the terminal passed attempt; only pipelineEvidenceRoot excludes that final digest), custody facts, and explicit assurance claims to the candidate commit. It proves historical observations, not current remote state or independent authenticity.
 _Avoid_: Passed, signature, live-status certificate
 
 **Passed attestation**:

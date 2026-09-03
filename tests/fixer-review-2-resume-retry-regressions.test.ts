@@ -205,6 +205,40 @@ class FakeOrca implements OrcaOperations {
   async setWorktreeStatus(): Promise<void> {}
 }
 
+class DurableResumeOrca extends FakeOrca {
+  #pendingResolution: string | undefined;
+  #resolveGate: ((resolution: string) => void) | undefined;
+
+  override async createGate(): Promise<string> {
+    return "gate-resume";
+  }
+
+  override async waitForGate(): Promise<string> {
+    if (this.#pendingResolution !== undefined) {
+      const resolution = this.#pendingResolution;
+      this.#pendingResolution = undefined;
+      return resolution;
+    }
+    return await new Promise((resolve) => {
+      this.#resolveGate = resolve;
+    });
+  }
+
+  override async resolveGate(
+    _gateId?: string,
+    resolution?: string,
+  ): Promise<void> {
+    if (resolution === undefined) return;
+    if (this.#resolveGate) {
+      const resolve = this.#resolveGate;
+      this.#resolveGate = undefined;
+      resolve(resolution);
+    } else {
+      this.#pendingResolution = resolution;
+    }
+  }
+}
+
 class EvidencePersistenceFailsLedger extends DomainLedger {
   override recordEvidence(input: RecordEvidenceInput): string {
     if (input.stageId === "test") throw new Error("evidence persistence failed");
@@ -354,7 +388,7 @@ test("resumed attempt setup failure settles the run before propagating", async (
       super.startAttempt(input);
     }
   }
-  class InterruptedOrca extends FakeOrca {
+  class InterruptedOrca extends DurableResumeOrca {
     #testFailures = 0;
 
     override async startWorker(
@@ -416,7 +450,7 @@ test("resumed attempt setup failure after startAttempt records its outcome", asy
       throw new Error("clearResumeClaim sabotaged");
     }
   }
-  class InterruptedOrca extends FakeOrca {
+  class InterruptedOrca extends DurableResumeOrca {
     #testFailures = 0;
 
     override async startWorker(

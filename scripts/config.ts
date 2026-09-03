@@ -4,7 +4,16 @@ import { homedir } from 'node:os'
 import { z } from 'zod'
 import YAML from 'yaml'
 
-export const PIPELINE_STEPS = ['intent', 'rebase', 'review', 'test', 'document', 'lint'] as const
+export const PIPELINE_STEPS = [
+  'intent',
+  'rebase',
+  'review',
+  'test',
+  'document',
+  'lint',
+  'push',
+  'pr'
+] as const
 export type StageName = (typeof PIPELINE_STEPS)[number]
 
 export const ROLES = ['reviewer', 'fixer'] as const
@@ -516,7 +525,8 @@ defaults:
 # ------------------------------------------------------------------------------
 # Stage-Specific Overrides
 # ------------------------------------------------------------------------------
-# Supported stages: intent, rebase, review, test, document, lint
+# Supported stages: intent, rebase, review, test, document, lint, push, pr.
+# push and pr are coordinator-owned remote stages; agent settings do not apply.
 # stages:
 #   intent:
 #     agent: "claude"
@@ -544,6 +554,10 @@ defaults:
 #
 #   lint:
 #     timeout_ms: 60000
+#
+#   push: {}
+#
+#   pr: {}
 `
 
 export function defaultUserConfigDir(): string {

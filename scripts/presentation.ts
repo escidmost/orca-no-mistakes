@@ -110,13 +110,16 @@ export interface PresentationRenderer {
   render(snapshot: PresentationSnapshot): void;
 }
 
-function initialSnapshot(runId: string): PresentationSnapshot {
+function initialSnapshot(
+  runId: string,
+  stages: readonly StageName[] = PIPELINE_STEPS,
+): PresentationSnapshot {
   return {
     attempt: 0,
     mode: { autoFix: true },
     runId,
     sequence: 0,
-    stages: PIPELINE_STEPS.map((id) => ({
+    stages: stages.map((id) => ({
       actionableFindings: 0,
       approvedFindings: 0,
       findings: [],
@@ -383,13 +386,14 @@ export class PresentationPublisher {
     clock: () => Date = () => new Date(),
     onRendererError: (error: unknown) => void = () => {},
     fallbackRenderer?: () => PresentationRenderer,
+    stages: readonly StageName[] = PIPELINE_STEPS,
   ) {
     this.clock = clock;
     this.onRendererError = onRendererError;
     this.runId = runId;
     this.store = store;
     const snapshots = store.listPresentationSnapshots(runId);
-    this.#current = snapshots.at(-1) ?? initialSnapshot(runId);
+    this.#current = snapshots.at(-1) ?? initialSnapshot(runId, stages);
     this.#fallbackRenderer = fallbackRenderer;
     this.#renderer = renderer;
   }
@@ -488,7 +492,7 @@ export class PlainStatusRenderer implements PresentationRenderer {
     if (this.#failed) return;
     const event = snapshot.transition;
     const stageNumber = "stage" in event
-      ? PIPELINE_STEPS.indexOf(event.stage) + 1
+      ? snapshot.stages.findIndex((item) => item.id === event.stage) + 1
       : 0;
     const prefix = `no-mistakes ${safeToken(snapshot.runId)}`;
     let line: string;
@@ -503,7 +507,7 @@ export class PlainStatusRenderer implements PresentationRenderer {
         line = `${prefix} auto-fix ${event.enabled ? "on" : "off"}`;
         break;
       case "stage-started":
-        line = `${prefix} stage ${stageNumber}/${PIPELINE_STEPS.length} ${event.stage} started`;
+        line = `${prefix} stage ${stageNumber}/${snapshot.stages.length} ${event.stage} started`;
         break;
       case "round-started":
         line = `${prefix} ${event.stage} round ${event.round} started`;
@@ -521,7 +525,7 @@ export class PlainStatusRenderer implements PresentationRenderer {
         line = `${prefix} ${event.stage} round ${event.round} gate resolved ${safeToken(event.decision)}`;
         break;
       case "stage-completed":
-        line = `${prefix} stage ${stageNumber}/${PIPELINE_STEPS.length} ${event.stage} completed`;
+        line = `${prefix} stage ${stageNumber}/${snapshot.stages.length} ${event.stage} completed`;
         break;
       case "error-recorded":
         line = `${prefix} error${event.resumable ? " resumable" : ""}`;

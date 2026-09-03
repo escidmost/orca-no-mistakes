@@ -193,7 +193,7 @@ test("post-pass cleanup uses the attested candidate without another head read", 
   const postPassSetup = source.slice(start, end);
   assert.match(
     postPassSetup,
-    /gateCleanupOid = result\.attestation\?\.candidateCommitOid \?\? gateCleanupOid;/u,
+    /gateCleanupOid =\s*result\.completionAttestation\?\.candidateCommitOid \?\?\s*result\.attestation\?\.candidateCommitOid \?\?\s*gateCleanupOid;/u,
   );
   assert.doesNotMatch(postPassSetup, /await git\.head\(\)/u);
 });

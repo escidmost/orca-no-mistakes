@@ -6,7 +6,7 @@ import { homedir } from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
-import type { GuardrailMode } from './config.ts'
+import { PIPELINE_STEPS, type GuardrailMode } from './config.ts'
 import type { PresentationSnapshot } from './presentation.ts'
 
 const { O_APPEND, O_CREAT, O_EXCL, O_NOFOLLOW, O_RDONLY, O_RDWR, O_WRONLY } = constants
@@ -117,6 +117,8 @@ export const LEGACY_STAGE_PLAN = [
   'document',
   'lint'
 ] as const
+
+export const RELEASE_2_STAGE_PLAN = PIPELINE_STEPS
 
 export type GateKind = 'exhaustion' | 'finding' | 'guardrail'
 
@@ -236,6 +238,47 @@ export type StageCheckpointRow = {
   stage_id: string
 }
 
+export function finalContiguousCheckpointByStage(
+  stageIds: readonly string[],
+  checkpoints: readonly StageCheckpointRow[],
+  initialCandidate: string
+): Map<string, StageCheckpointRow> {
+  const result = new Map<string, StageCheckpointRow>()
+  const stagePosition = new Map(stageIds.map((stageId, index) => [stageId, index]))
+  let candidate = initialCandidate
+  let previousIndex = -1
+  for (const [position, stageId] of stageIds.entries()) {
+    const seenCandidates = new Set([candidate])
+    let final: { checkpoint: StageCheckpointRow; index: number } | undefined
+    for (let index = previousIndex + 1; index < checkpoints.length; index += 1) {
+      const checkpoint = checkpoints[index]!
+      if (checkpoint.stage_id !== stageId) {
+        const checkpointPosition = stagePosition.get(checkpoint.stage_id)
+        if (checkpointPosition !== undefined && checkpointPosition > position) break
+        continue
+      }
+      if (checkpoint.input_commit_oid === candidate) {
+        candidate = checkpoint.output_commit_oid
+        seenCandidates.add(candidate)
+        final = { checkpoint, index }
+        continue
+      }
+      if (
+        checkpoint.output_commit_oid === candidate &&
+        seenCandidates.has(checkpoint.input_commit_oid)
+      ) {
+        final = { checkpoint, index }
+        continue
+      }
+      return result
+    }
+    if (!final) break
+    result.set(stageId, final.checkpoint)
+    previousIndex = final.index
+  }
+  return result
+}
+
 export type GateDecisionRecord = {
   decision: 'approve' | 'skip'
   gateId: string
@@ -255,8 +298,14 @@ export type StageEvidenceManifestEntry = {
   waiverOrApproval?: GateDecisionRecord
 }
 
+const NON_AUTHORITATIVE_STAGE_EVIDENCE_IDENTITIES = new Set([
+  'coordinator:fixer-guardrail-advisory',
+  'coordinator:fixer-no-change',
+  'coordinator:fixer-policy'
+])
+
 export function isAuthoritativeStageEvidence(workerIdentity: string): boolean {
-  return workerIdentity !== 'coordinator:fixer-guardrail-advisory'
+  return !NON_AUTHORITATIVE_STAGE_EVIDENCE_IDENTITIES.has(workerIdentity)
 }
 
 export type PassedAttestationManifest = {
@@ -573,22 +622,60 @@ const V2_ASSURANCE_CLAIMS: AssuranceClaim[] = [
   'pull-request-bound'
 ]
 
-function pipelineEvidencePayload(manifest: PipelineCompletionAttestationManifest): unknown {
-  const pushIndex = manifest.stagePlan.findIndex((entry) => entry.stage === 'push')
-  const prePrStages = new Set(manifest.stagePlan.slice(0, pushIndex + 1).map((entry) => entry.stage))
+function pipelineEvidencePayload(
+  entries: StageEvidenceManifestEntry[],
+  meta: Pick<
+    PipelineCompletionAttestationManifest,
+    | 'attemptOutcomeDigests'
+    | 'baseCommitOid'
+    | 'candidateCommitOid'
+    | 'candidatePublicationReceiptSha256'
+    | 'intentHash'
+    | 'policySha256'
+    | 'publicationRoute'
+    | 'runId'
+    | 'stageDispositions'
+    | 'stagePlan'
+  >
+): unknown {
+  const pushIndex = meta.stagePlan.findIndex((entry) => entry.stage === 'push')
+  if (pushIndex < 0) throw new Error('pipeline evidence requires a push stage')
+  const prePrStages = new Set(meta.stagePlan.slice(0, pushIndex + 1).map((entry) => entry.stage))
   return {
-    attemptOutcomeDigests: manifest.attemptOutcomeDigests.slice(0, -1),
-    baseCommitOid: manifest.baseCommitOid,
-    candidateCommitOid: manifest.candidateCommitOid,
-    candidatePublicationReceiptSha256: manifest.candidatePublicationReceiptSha256,
-    intentHash: manifest.intentHash,
-    policySha256: manifest.policySha256,
-    publicationRoute: manifest.publicationRoute,
-    runId: manifest.runId,
-    stageDispositions: manifest.stageDispositions.filter((entry) => prePrStages.has(entry.stage)),
-    stageEvidence: manifest.stageEvidence.filter((entry) => prePrStages.has(entry.stage)),
-    stagePlan: manifest.stagePlan.slice(0, pushIndex + 1)
+    attemptOutcomeDigests: meta.attemptOutcomeDigests,
+    baseCommitOid: meta.baseCommitOid,
+    candidateCommitOid: meta.candidateCommitOid,
+    candidatePublicationReceiptSha256: meta.candidatePublicationReceiptSha256,
+    intentHash: meta.intentHash,
+    policySha256: meta.policySha256,
+    publicationRoute: meta.publicationRoute,
+    runId: meta.runId,
+    stageDispositions: meta.stageDispositions.filter((entry) => prePrStages.has(entry.stage)),
+    stageEvidence: entries.filter((entry) => prePrStages.has(entry.stage)),
+    stagePlan: meta.stagePlan.slice(0, pushIndex + 1)
   }
+}
+
+export function buildPipelineEvidenceRoot(
+  entries: StageEvidenceManifestEntry[],
+  meta: Pick<
+    PipelineCompletionAttestationManifest,
+    | 'attemptOutcomeDigests'
+    | 'baseCommitOid'
+    | 'candidateCommitOid'
+    | 'candidatePublicationReceiptSha256'
+    | 'intent'
+    | 'policySha256'
+    | 'publicationRoute'
+    | 'runId'
+    | 'stageDispositions'
+    | 'stagePlan'
+  >
+): string {
+  return merkleRoot([sha256(canonicalJson(pipelineEvidencePayload(entries, {
+    ...meta,
+    intentHash: intentHash(meta.intent)
+  })))])
 }
 
 function v2MerkleRoot(manifest: PipelineCompletionAttestationManifest): string {
@@ -621,9 +708,10 @@ export function buildPipelineCompletionAttestation(
     coordinatorVersion: COORDINATOR_VERSION,
     createdAt: new Date().toISOString()
   }
-  manifest.pipelineEvidenceRoot = merkleRoot([
-    sha256(canonicalJson(pipelineEvidencePayload(manifest)))
-  ])
+  manifest.pipelineEvidenceRoot = buildPipelineEvidenceRoot(entries, {
+    ...manifest,
+    attemptOutcomeDigests: manifest.attemptOutcomeDigests.slice(0, -1)
+  })
   manifest.merkleRoot = v2MerkleRoot(manifest)
   verifyCompletionAttestation(manifest)
   return manifest
@@ -750,7 +838,7 @@ export function verifyCompletionAttestation(manifest: CompletionAttestationManif
     if (
       disposition.disposition === 'satisfied' &&
       (evidence?.stage !== plan.stage ||
-        evidence.exitCode !== 0 ||
+        (evidence.exitCode !== 0 && evidence.waiverOrApproval === undefined) ||
         !isAuthoritativeStageEvidence(evidence.workerIdentity))
     ) {
       throw new Error(
@@ -803,7 +891,10 @@ export function verifyCompletionAttestation(manifest: CompletionAttestationManif
     throw new Error('attestation assurance claims are invalid')
   }
   const expectedPipelineRoot = merkleRoot([
-    sha256(canonicalJson(pipelineEvidencePayload(manifest)))
+    sha256(canonicalJson(pipelineEvidencePayload(
+      manifest.stageEvidence,
+      { ...manifest, attemptOutcomeDigests: manifest.attemptOutcomeDigests.slice(0, -1) }
+    )))
   ])
   if (manifest.pipelineEvidenceRoot !== expectedPipelineRoot) {
     throw new Error('attestation pipeline evidence root is invalid')
@@ -1553,6 +1644,7 @@ const RELEASE_2_FACT_TABLES = [
   'attempt_outcomes',
   'remote_observations',
   'mutation_intents',
+  'resolved_mutation_intents',
   'remote_receipts',
   'auto_fix_mode_events'
 ] as const
@@ -1733,6 +1825,16 @@ CREATE TABLE IF NOT EXISTS mutation_intents (
   intent_sha256 TEXT NOT NULL UNIQUE
 );
 
+CREATE TABLE IF NOT EXISTS resolved_mutation_intents (
+  resolution_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  attempt_id TEXT NOT NULL REFERENCES run_attempts(attempt_id) ON DELETE CASCADE,
+  intent_sha256 TEXT NOT NULL REFERENCES mutation_intents(intent_sha256) ON DELETE CASCADE,
+  reason TEXT NOT NULL CHECK(reason IN ('definite-failure', 'lease-lost', 'reconciled')),
+  resolved_at TEXT NOT NULL,
+  UNIQUE (run_id, intent_sha256)
+);
+
 CREATE TABLE IF NOT EXISTS remote_receipts (
   receipt_id TEXT PRIMARY KEY,
   run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
@@ -1820,6 +1922,7 @@ CREATE INDEX IF NOT EXISTS idx_remote_observations_run ON remote_observations(ru
 CREATE UNIQUE INDEX IF NOT EXISTS idx_remote_observations_run_digest
   ON remote_observations(run_id, observation_sha256);
 CREATE INDEX IF NOT EXISTS idx_mutation_intents_run ON mutation_intents(run_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_resolved_mutation_intents_run ON resolved_mutation_intents(run_id);
 CREATE INDEX IF NOT EXISTS idx_stage_evidence_run ON stage_evidence(run_id);
 CREATE INDEX IF NOT EXISTS idx_stage_evidence_stage
   ON stage_evidence(run_id, stage_id, round_index);
@@ -1898,6 +2001,10 @@ CREATE TRIGGER IF NOT EXISTS immutable_mutation_intents
 BEFORE UPDATE ON mutation_intents
 BEGIN SELECT RAISE(ABORT, 'mutation_intents rows are immutable'); END;
 
+CREATE TRIGGER IF NOT EXISTS immutable_resolved_mutation_intents
+BEFORE UPDATE ON resolved_mutation_intents
+BEGIN SELECT RAISE(ABORT, 'resolved_mutation_intents rows are immutable'); END;
+
 CREATE TRIGGER IF NOT EXISTS immutable_remote_receipts
 BEFORE UPDATE ON remote_receipts
 BEGIN SELECT RAISE(ABORT, 'remote_receipts rows are immutable'); END;
@@ -1941,6 +2048,11 @@ CREATE TRIGGER IF NOT EXISTS immutable_mutation_intents_delete
 BEFORE DELETE ON mutation_intents
 WHEN EXISTS (SELECT 1 FROM runs WHERE run_id = OLD.run_id)
 BEGIN SELECT RAISE(ABORT, 'mutation_intents rows are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_resolved_mutation_intents_delete
+BEFORE DELETE ON resolved_mutation_intents
+WHEN EXISTS (SELECT 1 FROM runs WHERE run_id = OLD.run_id)
+BEGIN SELECT RAISE(ABORT, 'resolved_mutation_intents rows are immutable'); END;
 
 CREATE TRIGGER IF NOT EXISTS immutable_remote_receipts_delete
 BEFORE DELETE ON remote_receipts
@@ -1995,6 +2107,23 @@ export type AttemptOutcomeInput = {
   runId: string
   stoppingFact: string
   verdict: Exclude<RunStatus, 'in-progress'>
+}
+
+export function attemptOutcomeSha256(input: AttemptOutcomeInput): string {
+  return sha256(canonicalJson({
+    actorIdentity: input.actorIdentity,
+    attemptId: input.attemptId,
+    candidateCommitOid: input.candidateCommitOid,
+    completedAt: input.completedAt,
+    coordinatorIdentity: input.coordinatorIdentity,
+    custody: input.custody,
+    reason: input.reason,
+    receiptDigests: input.receiptDigests,
+    resumeEligible: input.resumeEligible,
+    runId: input.runId,
+    stoppingFact: input.stoppingFact,
+    verdict: input.verdict
+  }))
 }
 
 export class DomainLedger {
@@ -2112,6 +2241,57 @@ export class DomainLedger {
                  authoritative_post_observation_sha256, receipt_json, receipt_sha256, created_at
           FROM remote_receipts_legacy`)
         this.#db.exec('DROP TABLE remote_receipts_legacy')
+        this.#db.exec('COMMIT')
+      } catch (error) {
+        this.#db.exec('ROLLBACK')
+        throw error
+      }
+    }
+    const singleUsePublicationRoute = this.#db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'publication_routes'")
+      .get() as { sql: string } | undefined
+    if (singleUsePublicationRoute && /route_fingerprint\s+TEXT\s+NOT\s+NULL\s+UNIQUE/i.test(singleUsePublicationRoute.sql)) {
+      this.#db.exec('BEGIN IMMEDIATE')
+      try {
+        this.#db.exec(`DROP TRIGGER IF EXISTS immutable_publication_routes;
+          DROP TRIGGER IF EXISTS immutable_publication_routes_delete;
+          DROP TRIGGER IF EXISTS fence_terminal_publication_routes;
+          ALTER TABLE publication_routes RENAME TO publication_routes_legacy`)
+        this.#db.exec(SCHEMA)
+        this.#db.exec(`INSERT INTO publication_routes (
+            run_id, route_fingerprint, forge_host, base_repository_id,
+            head_repository_id, head_owner, head_branch, base_branch, created_at
+          )
+          SELECT run_id, route_fingerprint, forge_host, base_repository_id,
+                 head_repository_id, head_owner, head_branch, base_branch, created_at
+          FROM publication_routes_legacy`)
+        this.#db.exec('DROP TABLE publication_routes_legacy')
+        this.#db.exec('COMMIT')
+      } catch (error) {
+        this.#db.exec('ROLLBACK')
+        throw error
+      }
+    }
+    const resolvedIntentSchema = this.#db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'resolved_mutation_intents'")
+      .get() as { sql: string } | undefined
+    if (resolvedIntentSchema && !resolvedIntentSchema.sql.includes("'reconciled'")) {
+      this.#db.exec('BEGIN IMMEDIATE')
+      try {
+        this.#db.exec(`DROP INDEX IF EXISTS idx_resolved_mutation_intents_run;
+          DROP TRIGGER IF EXISTS immutable_resolved_mutation_intents;
+          DROP TRIGGER IF EXISTS immutable_resolved_mutation_intents_delete;
+          DROP TRIGGER IF EXISTS fence_terminal_resolved_mutation_intents;
+          ALTER TABLE resolved_mutation_intents RENAME TO resolved_mutation_intents_legacy`)
+        this.#db.exec(SCHEMA)
+        this.#db.exec(`INSERT INTO resolved_mutation_intents (
+            resolution_id, run_id, attempt_id, intent_sha256, reason, resolved_at
+          )
+          SELECT resolution_id, run_id, attempt_id, intent_sha256, reason, resolved_at
+          FROM resolved_mutation_intents_legacy`)
+        this.#db.exec('DROP TABLE resolved_mutation_intents_legacy')
+        this.#db.exec(`CREATE INDEX IF NOT EXISTS idx_resolved_mutation_intents_run
+          ON resolved_mutation_intents(run_id)`)
         this.#db.exec('COMMIT')
       } catch (error) {
         this.#db.exec('ROLLBACK')
@@ -2486,6 +2666,7 @@ export class DomainLedger {
         'attempt_outcomes',
         'remote_observations',
         'mutation_intents',
+        'resolved_mutation_intents',
         'remote_receipts',
         'stage_checkpoints',
         'stage_evidence',
@@ -2617,7 +2798,13 @@ export class DomainLedger {
         insert.run(input.runId, position, entry.stageId, entry.requirement)
       }
       const route = this.repositoryPublicationRoute(input.repoRoot)
-      if (route) this.#recordStoredPublicationRoute(input.runId, route)
+      if (
+        route &&
+        route.head_branch === input.branch &&
+        route.base_branch === input.baseBranch
+      ) {
+        this.#recordStoredPublicationRoute(input.runId, route)
+      }
       this.#db.exec('COMMIT')
     } catch (error) {
       this.#db.exec('ROLLBACK')
@@ -2981,14 +3168,23 @@ export class DomainLedger {
     const existing = this.repositoryPublicationRoute(input.repoRoot)
     if (existing && existing.route_fingerprint !== fingerprint) {
       const active = this.#db.prepare(
-        `SELECT COUNT(*) AS count
+        `SELECT COUNT(DISTINCT r.run_id) AS count
          FROM runs r
          JOIN publication_routes p ON p.run_id = r.run_id
-         WHERE r.repo_root = ? AND r.status = 'in-progress' AND p.route_fingerprint = ?`
+         WHERE r.repo_root = ? AND p.route_fingerprint = ?
+           AND (r.status = 'in-progress' OR (r.status = 'failed' AND EXISTS (
+             SELECT 1
+             FROM attempt_outcomes o
+             JOIN run_attempts a ON a.run_id = o.run_id AND a.attempt_id = o.attempt_id
+             WHERE o.run_id = r.run_id AND o.resume_eligible = 1
+               AND a.generation_token = (
+                 SELECT MAX(a2.generation_token) FROM run_attempts a2 WHERE a2.run_id = r.run_id
+               )
+           )))`
       ).get(input.repoRoot, existing.route_fingerprint) as { count: number }
       if (active.count > 0) {
         throw new Error(
-          `cannot change publication route while ${active.count} active run(s) depend on it`
+          `cannot change publication route while ${active.count} active or resumable run(s) depend on it`
         )
       }
     }
@@ -3069,6 +3265,11 @@ export class DomainLedger {
       }
       const route = this.repositoryPublicationRoute(repoRoot)
       if (!route) throw new Error(`repository ${repoRoot} has no publication route`)
+      if (route.head_branch !== run.branch || route.base_branch !== run.base_branch) {
+        throw new Error(
+          `stored publication route (${route.head_branch} -> ${route.base_branch}) does not match run (${run.branch} -> ${run.base_branch})`
+        )
+      }
       const fingerprint = this.#recordStoredPublicationRoute(runId, route)
       this.#db.exec('COMMIT')
       return fingerprint
@@ -3223,21 +3424,7 @@ export class DomainLedger {
         attempt.coordinator_identity !== input.coordinatorIdentity) {
       throw new Error(`attempt ${input.attemptId} identity does not match its outcome`)
     }
-    const outcome = {
-      actorIdentity: input.actorIdentity,
-      attemptId: input.attemptId,
-      candidateCommitOid: input.candidateCommitOid,
-      completedAt: input.completedAt,
-      coordinatorIdentity: input.coordinatorIdentity,
-      custody: input.custody,
-      reason: input.reason,
-      receiptDigests: input.receiptDigests,
-      resumeEligible: input.resumeEligible,
-      runId: input.runId,
-      stoppingFact: input.stoppingFact,
-      verdict: input.verdict
-    }
-    const outcomeSha256 = sha256(canonicalJson(outcome))
+    const outcomeSha256 = attemptOutcomeSha256(input)
     this.#db.prepare(
       `INSERT INTO attempt_outcomes (
          outcome_id, attempt_id, run_id, verdict, stopping_fact, reason, candidate_commit_oid,
@@ -3265,7 +3452,10 @@ export class DomainLedger {
 
   listAttemptOutcomes(runId: string): { outcome_sha256: string }[] {
     return this.#db.prepare(
-      'SELECT outcome_sha256 FROM attempt_outcomes WHERE run_id = ? ORDER BY completed_at, rowid'
+      `SELECT o.outcome_sha256
+       FROM attempt_outcomes o
+       JOIN run_attempts a ON a.run_id = o.run_id AND a.attempt_id = o.attempt_id
+       WHERE o.run_id = ? ORDER BY a.generation_token, o.rowid`
     ).all(runId) as { outcome_sha256: string }[]
   }
 
@@ -3311,6 +3501,24 @@ export class DomainLedger {
     ).all(runId) as { observation_sha256: string }[]
   }
 
+  remoteObservation(
+    runId: string,
+    observationSha256: string
+  ): { kind: string; payload: Record<string, unknown>; subject: string } | undefined {
+    const row = this.#db.prepare(
+      `SELECT kind, payload_json, subject FROM remote_observations
+       WHERE run_id = ? AND observation_sha256 = ?`
+    ).get(runId, observationSha256) as
+      | { kind: string; payload_json: string; subject: string }
+      | undefined
+    if (!row) return undefined
+    return {
+      kind: row.kind,
+      payload: JSON.parse(row.payload_json) as Record<string, unknown>,
+      subject: row.subject
+    }
+  }
+
   recordMutationIntent(input: {
     attemptId: string
     createdAt: string
@@ -3350,6 +3558,125 @@ export class DomainLedger {
     return this.#db.prepare(
       'SELECT intent_sha256 FROM mutation_intents WHERE run_id = ? ORDER BY created_at, rowid'
     ).all(runId) as { intent_sha256: string }[]
+  }
+
+  resolveMutationIntent(input: {
+    attemptId: string
+    intentSha256: string
+    reason: 'definite-failure' | 'lease-lost' | 'reconciled'
+    runId: string
+  }): void {
+    const belongsToRun = this.#db.prepare(
+      `SELECT 1
+       FROM mutation_intents m
+       JOIN run_attempts a ON a.run_id = m.run_id AND a.attempt_id = m.attempt_id
+       WHERE m.run_id = ? AND m.intent_sha256 = ? AND m.attempt_id = ?`
+    ).get(input.runId, input.intentSha256, input.attemptId)
+    if (!belongsToRun) {
+      throw new Error('mutation intent resolution does not belong to the run and attempt')
+    }
+    const existing = this.#db.prepare(
+      `SELECT reason
+       FROM resolved_mutation_intents
+       WHERE run_id = ? AND intent_sha256 = ?`
+    ).get(input.runId, input.intentSha256) as
+      | { reason: string }
+      | undefined
+    if (existing) {
+      if (existing.reason === input.reason) return
+      throw new Error('mutation intent already has a different resolution')
+    }
+    this.#db.prepare(
+      `INSERT INTO resolved_mutation_intents (
+         resolution_id, run_id, attempt_id, intent_sha256, reason, resolved_at
+       ) VALUES (?, ?, ?, ?, ?, ?)`
+    ).run(
+      randomUUID(),
+      input.runId,
+      input.attemptId,
+      input.intentSha256,
+      input.reason,
+      new Date().toISOString()
+    )
+  }
+
+  unresolvedManagedCommentCreateIntent(runId: string): {
+    attemptId: string
+    createdAt: string
+    intentSha256: string
+    payload: Record<string, unknown>
+    targetFingerprint: string
+  } | undefined {
+    const settledReceipts = this.#db.prepare(
+      `SELECT receipt_json
+       FROM remote_receipts
+       WHERE run_id = ? AND kind = 'pull-request-binding'`
+    ).all(runId) as Array<{
+      receipt_json: string
+    }>
+
+    const resolvedIntents = new Set<string>()
+    const resolvedRows = this.#db.prepare(
+      `SELECT intent_sha256 FROM resolved_mutation_intents WHERE run_id = ?`
+    ).all(runId) as Array<{ intent_sha256: string }>
+    for (const r of resolvedRows) {
+      resolvedIntents.add(r.intent_sha256)
+    }
+    for (const receipt of settledReceipts) {
+      try {
+        const parsed = JSON.parse(receipt.receipt_json) as {
+          managedCommentIntent?: unknown
+          payload?: { managedCommentIntent?: unknown }
+        }
+        const intent = typeof parsed?.managedCommentIntent === 'string'
+          ? parsed.managedCommentIntent
+          : typeof parsed?.payload?.managedCommentIntent === 'string'
+          ? parsed.payload.managedCommentIntent
+          : undefined
+        if (intent) {
+          resolvedIntents.add(intent)
+        }
+      } catch {
+        // ignore malformed
+      }
+    }
+
+    const rows = this.#db.prepare(
+      `SELECT m.attempt_id, m.created_at, m.intent_sha256, m.payload_json, m.target_fingerprint,
+              a.generation_token, m.rowid
+       FROM mutation_intents m
+       JOIN run_attempts a ON a.attempt_id = m.attempt_id AND a.run_id = m.run_id
+       WHERE m.run_id = ? AND m.kind = 'managed-comment'
+       ORDER BY a.generation_token ASC, m.rowid ASC`
+    ).all(runId) as Array<{
+      attempt_id: string
+      created_at: string
+      intent_sha256: string
+      payload_json: string
+      rowid: number | bigint
+      target_fingerprint: string
+    }>
+
+    for (const row of rows) {
+      if (resolvedIntents.has(row.intent_sha256)) {
+        continue
+      }
+      try {
+        const payload = JSON.parse(row.payload_json) as Record<string, unknown>
+        if (payload.action === 'ensure-managed-summary' && payload.managedCommentNodeId === null) {
+          return {
+            attemptId: row.attempt_id,
+            createdAt: row.created_at,
+            intentSha256: row.intent_sha256,
+            payload,
+            targetFingerprint: row.target_fingerprint
+          }
+        }
+      } catch {
+        // ignore malformed
+      }
+    }
+    return undefined
   }
 
   #remoteObservationMatches(input: {
@@ -3495,12 +3822,21 @@ export class DomainLedger {
         mutationPayload.update === input.candidateCommitOid
     }
     const receipt = input.receiptPayload
+    const hasManagedComment = Object.hasOwn(receipt, 'managedCommentIntent')
+    const hasPipelineEvidenceRoot = Object.hasOwn(receipt, 'pipelineEvidenceRoot')
+    if (hasManagedComment !== hasPipelineEvidenceRoot) return false
     if (!hasOnlyOwnProperties(receipt, new Set([
+      ...(hasManagedComment ? ['managedCommentIntent'] : []),
+      ...(hasPipelineEvidenceRoot ? ['pipelineEvidenceRoot'] : []),
       'mutationIntent', 'number', 'outcome', 'postRead', 'routeFingerprint'
     ])) || !Number.isInteger(receipt.number) || Number(receipt.number) <= 0 ||
-        !['created', 'updated', 'unchanged'].includes(String(receipt.outcome)) ||
-        typeof receipt.mutationIntent !== 'string' ||
-        receipt.postRead !== input.observationSha256) return false
+      !['created', 'updated', 'unchanged'].includes(String(receipt.outcome)) ||
+      (hasManagedComment && typeof receipt.managedCommentIntent !== 'string') ||
+      (hasPipelineEvidenceRoot &&
+        (typeof receipt.pipelineEvidenceRoot !== 'string' ||
+          !/^[0-9a-f]{64}$/.test(receipt.pipelineEvidenceRoot))) ||
+      typeof receipt.mutationIntent !== 'string' ||
+      receipt.postRead !== input.observationSha256) return false
     const mutation = this.#db.prepare(
       `SELECT attempt_id, kind, target_fingerprint, payload_json, created_at
        FROM mutation_intents WHERE run_id = ? AND intent_sha256 = ?`
@@ -3513,14 +3849,36 @@ export class DomainLedger {
           target_fingerprint: string
         }
       | undefined
+    const managedCommentMutation = hasManagedComment ? this.#db.prepare(
+      `SELECT attempt_id, kind, target_fingerprint, payload_json, created_at
+       FROM mutation_intents WHERE run_id = ? AND intent_sha256 = ?`
+    ).get(input.runId, String(receipt.managedCommentIntent)) as
+      | {
+          attempt_id: string
+          created_at: string
+          kind: string
+          payload_json: string
+          target_fingerprint: string
+        }
+      | undefined : undefined
     const publication = this.remoteReceipt(input.runId, 'candidate-publication')
-    if (!mutation || !publication || publication.candidate_commit_oid !== input.candidateCommitOid ||
+    if (!mutation || !publication ||
+        publication.candidate_commit_oid !== input.candidateCommitOid ||
         mutation.attempt_id !== observation.attempt_id || mutation.kind !== 'pull-request' ||
         mutation.target_fingerprint !== route.route_fingerprint ||
+        (hasManagedComment && (!managedCommentMutation ||
+          managedCommentMutation.attempt_id !== observation.attempt_id ||
+          managedCommentMutation.kind !== 'managed-comment' ||
+          managedCommentMutation.target_fingerprint !== route.route_fingerprint ||
+          managedCommentMutation.created_at > observation.observed_at)) ||
         mutation.created_at > observation.observed_at) return false
     let mutationPayload: Record<string, unknown>
+    let managedCommentPayload: Record<string, unknown>
     try {
       mutationPayload = JSON.parse(mutation.payload_json) as Record<string, unknown>
+      managedCommentPayload = managedCommentMutation
+        ? JSON.parse(managedCommentMutation.payload_json) as Record<string, unknown>
+        : {}
     } catch {
       return false
     }
@@ -3531,7 +3889,14 @@ export class DomainLedger {
       payload: mutationPayload,
       runId: input.runId,
       targetFingerprint: mutation.target_fingerprint
-    })) !== receipt.mutationIntent) return false
+    })) !== receipt.mutationIntent || (managedCommentMutation && sha256(canonicalJson({
+      attemptId: managedCommentMutation.attempt_id,
+      createdAt: managedCommentMutation.created_at,
+      kind: managedCommentMutation.kind,
+      payload: managedCommentPayload,
+      runId: input.runId,
+      targetFingerprint: managedCommentMutation.target_fingerprint
+    })) !== receipt.managedCommentIntent)) return false
     const routeFacts = {
       baseBranch: route.base_branch,
       baseRepositoryId: route.base_repository_id,
@@ -3541,19 +3906,39 @@ export class DomainLedger {
       headOwner: route.head_owner,
       headRepositoryId: route.head_repository_id
     }
-    return observation.kind === 'pull-request' &&
+    const commonMatch = observation.kind === 'pull-request' &&
       observation.subject === `${route.forge_host}/${route.base_repository_id}#${String(receipt.number)}` &&
-      hasOnlyOwnProperties(payload, new Set([
-        ...Object.keys(routeFacts), 'number', 'state'
-      ])) &&
-      hasOnlyOwnProperties(mutationPayload, new Set([
-        ...Object.keys(routeFacts), 'action'
-      ])) &&
       Object.entries(routeFacts).every(([key, value]) =>
         payload[key] === value && mutationPayload[key] === value
       ) &&
       payload.number === receipt.number && payload.state === 'open' &&
       mutationPayload.action === 'ensure-open'
+    if (!commonMatch) return false
+    if (!hasManagedComment) {
+      return hasOnlyOwnProperties(payload, new Set([
+        ...Object.keys(routeFacts), 'number', 'state'
+      ])) && hasOnlyOwnProperties(mutationPayload, new Set([
+        ...Object.keys(routeFacts), 'action'
+      ]))
+    }
+    return hasOnlyOwnProperties(payload, new Set([
+      ...Object.keys(routeFacts), 'managedCommentBodySha256', 'managedCommentNodeId',
+      'number', 'pullRequestNodeId', 'state'
+    ])) && hasOnlyOwnProperties(mutationPayload, new Set([
+      ...Object.keys(routeFacts), 'action', 'body', 'title'
+    ])) &&
+      hasOnlyOwnProperties(managedCommentPayload, new Set([
+        'action', 'bodySha256', 'managedCommentNodeId', 'number'
+      ])) &&
+      typeof payload.pullRequestNodeId === 'string' && payload.pullRequestNodeId !== '' &&
+      typeof payload.managedCommentNodeId === 'string' && payload.managedCommentNodeId !== '' &&
+      typeof payload.managedCommentBodySha256 === 'string' &&
+      HEX_64.test(payload.managedCommentBodySha256) &&
+      managedCommentPayload.action === 'ensure-managed-summary' &&
+      managedCommentPayload.bodySha256 === payload.managedCommentBodySha256 &&
+      (managedCommentPayload.managedCommentNodeId === null ||
+        managedCommentPayload.managedCommentNodeId === payload.managedCommentNodeId) &&
+      managedCommentPayload.number === receipt.number
   }
 
   settleRemoteStage(input: {
@@ -3660,7 +4045,7 @@ export class DomainLedger {
          FROM remote_receipts
          WHERE run_id = ? AND kind = ? AND candidate_commit_oid = ?
            AND authoritative_post_observation_sha256 = ? AND receipt_json = ?
-         ORDER BY created_at DESC, rowid DESC
+         ORDER BY rowid DESC
          LIMIT 1`
       ).get(
         input.runId,
@@ -3669,6 +4054,17 @@ export class DomainLedger {
         input.receipt.authoritativePostObservationSha256,
         receiptJson
       ) as { receipt_sha256: string } | undefined
+      const existingDisposition = this.#db.prepare(
+        `SELECT 1 FROM stage_dispositions
+         WHERE run_id = ? AND stage_id = ? AND disposition = 'satisfied'
+           AND evidence_sha256 = ?`
+      ).get(input.runId, input.stageId, input.evidence.evidenceSha256)
+      const priorDisposition = this.#db.prepare(
+        'SELECT 1 FROM stage_dispositions WHERE run_id = ? AND stage_id = ? LIMIT 1'
+      ).get(input.runId, input.stageId)
+      const settlesDisposition = input.stageId !== 'pr' ||
+        (Object.hasOwn(input.receipt.payload, 'managedCommentIntent') &&
+          (input.evidence.roundIndex === 0 || priorDisposition === undefined))
       const priorEvidence = this.#db.prepare(
         'SELECT 1 FROM stage_evidence WHERE run_id = ? AND stage_id = ? AND round_index = ? LIMIT 1'
       ).get(input.runId, input.stageId, input.evidence.roundIndex)
@@ -3676,7 +4072,8 @@ export class DomainLedger {
         'SELECT 1 FROM stage_checkpoints WHERE run_id = ? AND stage_id = ? AND round_index = ? LIMIT 1'
       ).get(input.runId, input.stageId, input.checkpoint.roundIndex)
       if (priorEvidence !== undefined || priorCheckpoint !== undefined) {
-        if (existingEvidence && existingCheckpoint && existingReceipt) {
+        if (existingEvidence && existingCheckpoint && existingReceipt &&
+            (!settlesDisposition || existingDisposition)) {
           this.#db.exec('COMMIT')
           return {
             evidenceId: existingEvidence.evidence_id,
@@ -3684,6 +4081,9 @@ export class DomainLedger {
           }
         }
         throw new Error(`${input.stageId} round ${input.checkpoint.roundIndex} is already settled with different facts`)
+      }
+      if (settlesDisposition && priorDisposition !== undefined && existingDisposition === undefined) {
+        throw new Error(`${input.stageId} is already settled with a different disposition`)
       }
 
       const createdAt = new Date().toISOString()
@@ -3716,6 +4116,14 @@ export class DomainLedger {
         runId: input.runId,
         stageId: input.stageId
       })
+      if (settlesDisposition && existingDisposition === undefined) {
+        this.recordStageDisposition({
+          disposition: 'satisfied',
+          evidenceSha256: input.evidence.evidenceSha256,
+          runId: input.runId,
+          stageId: input.stageId
+        })
+      }
       this.#db.exec('COMMIT')
       return { evidenceId, receiptSha256 }
     } catch (error) {
@@ -3734,7 +4142,7 @@ export class DomainLedger {
               receipt_json, receipt_sha256, created_at
        FROM remote_receipts
        WHERE run_id = ? AND kind = ? AND (? IS NULL OR receipt_sha256 = ?)
-       ORDER BY created_at DESC, rowid DESC
+       ORDER BY rowid DESC
        LIMIT 1`
     ).get(runId, kind, receiptSha256 ?? null, receiptSha256 ?? null) as
       | RemoteReceiptRow
@@ -3861,6 +4269,11 @@ export class DomainLedger {
   }): StageCheckpointRow {
     const run = this.run(input.runId)
     if (!run) throw new Error(`run ${input.runId} does not exist`)
+    if (run.status === 'in-progress') {
+      throw new Error(
+        `run ${input.runId} is still in-progress; adopting stranded remote-stage runs is a Release 4 limitation`
+      )
+    }
     if (run.status !== 'failed') {
       throw new Error(`run ${input.runId} cannot resume from status ${run.status}`)
     }
@@ -3878,7 +4291,8 @@ export class DomainLedger {
     const incompatibleEvidence = this.#db
       .prepare(
         `SELECT COUNT(*) AS count FROM stage_evidence
-         WHERE run_id = ? AND (effective_policy_hash IS NULL OR effective_policy_hash <> ?)`
+         WHERE run_id = ? AND stage_id NOT IN ('push', 'pr')
+           AND (effective_policy_hash IS NULL OR effective_policy_hash <> ?)`
       )
       .get(input.runId, input.effectivePolicyHash) as { count: number | bigint }
     if (Number(incompatibleEvidence.count) > 0) {
@@ -3888,14 +4302,20 @@ export class DomainLedger {
       input.baseRefSha === undefined
         ? this.#db.prepare(
             `SELECT COUNT(*) AS count FROM stage_evidence
-             WHERE run_id = ? AND base_ref_sha IS NOT NULL`
+             WHERE run_id = ? AND stage_id NOT IN ('push', 'pr')
+               AND base_ref_sha IS NOT NULL`
           ).get(input.runId)
         : this.#db.prepare(
             `SELECT COUNT(*) AS count FROM stage_evidence
-             WHERE run_id = ? AND (base_ref_sha IS NULL OR base_ref_sha <> ?)`
+             WHERE run_id = ? AND stage_id NOT IN ('push', 'pr')
+               AND (base_ref_sha IS NULL OR base_ref_sha <> ?)`
           ).get(input.runId, input.baseRefSha)
     ) as { count: number | bigint }
-    if (Number(incompatibleBaseEvidence.count) > 0) {
+    const lintValidated = this.#db.prepare(
+      `SELECT 1 FROM stage_dispositions
+       WHERE run_id = ? AND stage_id = 'lint' AND disposition = 'satisfied'`
+    ).get(input.runId) !== undefined
+    if (Number(incompatibleBaseEvidence.count) > 0 && !lintValidated) {
       throw new Error(`run ${input.runId} base ref changed since it failed`)
     }
     const checkpoint = this.#db
@@ -4234,6 +4654,69 @@ export class DomainLedger {
     }
   }
 
+  finalizePassedRunWithAttemptOutcome(
+    manifest: PipelineCompletionAttestationManifest,
+    terminalCommitOid: string,
+    ownership: { branch: string; generationToken: number; repoRoot: string },
+    outcome: AttemptOutcomeInput,
+    presentation?: { eventKey: string; snapshot: PresentationSnapshot }
+  ): void {
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      this.#requirePassedRunLease(manifest.runId, ownership)
+      if (this.recordAttemptOutcome(outcome) !== manifest.attemptOutcomeDigests.at(-1)) {
+        throw new Error('terminal attempt outcome does not match the completion attestation')
+      }
+      this.#completePassedRun(manifest, terminalCommitOid)
+      if (presentation) this.#recordPresentationMilestone(manifest.runId, presentation)
+      this.#db.exec('COMMIT')
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  async finalizePassedRunWithAttemptOutcomeAndLeaseMutation(
+    runId: string,
+    terminalCommitOid: string,
+    ownership: { branch: string; generationToken: number; repoRoot: string },
+    mutate: () => Promise<string>,
+    outcomeFor: (custodyNote: string) => AttemptOutcomeInput,
+    manifestFor: (
+      outcome: AttemptOutcomeInput,
+      outcomeSha256: string
+    ) => PipelineCompletionAttestationManifest,
+    presentation?: { eventKey: string; snapshot: PresentationSnapshot }
+  ): Promise<{ custodyNote: string; manifest: PipelineCompletionAttestationManifest }> {
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      this.#requirePassedRunLease(runId, ownership)
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
+    try {
+      const custodyNote = await mutate()
+      const outcome = outcomeFor(custodyNote)
+      const outcomeDigest = attemptOutcomeSha256(outcome)
+      const manifest = manifestFor(outcome, outcomeDigest)
+      if (manifest.runId !== runId || outcome.runId !== runId) {
+        throw new Error('terminal settlement run identity changed')
+      }
+      this.#requirePassedRunLease(manifest.runId, ownership)
+      if (this.recordAttemptOutcome(outcome) !== outcomeDigest) {
+        throw new Error('terminal attempt outcome changed during settlement')
+      }
+      this.#completePassedRun(manifest, terminalCommitOid)
+      if (presentation) this.#recordPresentationMilestone(manifest.runId, presentation)
+      this.#db.exec('COMMIT')
+      return { custodyNote, manifest }
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
   recordCheckpoint(
     input: {
       inputCommitOid: string
@@ -4253,6 +4736,51 @@ export class DomainLedger {
       }
     } catch (error) {
       if (presentation) this.#db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  settleLocalStage(
+    input: {
+      checkpoint: {
+        inputCommitOid: string
+        outputCommitOid: string
+        roundIndex: number
+      }
+      evidenceSha256: string
+      runId: string
+      stageId: string
+    },
+    presentation?: { eventKey: string; snapshot: PresentationSnapshot }
+  ): void {
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      const settlesDisposition = this.stagePlan(input.runId).some(
+        (entry) => entry.stage_id === 'push'
+      )
+      const disposition = this.#db.prepare(
+        'SELECT disposition, evidence_sha256 FROM stage_dispositions WHERE run_id = ? AND stage_id = ?'
+      ).get(input.runId, input.stageId) as
+        | { disposition: string; evidence_sha256: string | null }
+        | undefined
+      if (settlesDisposition && disposition &&
+          (disposition.disposition !== 'satisfied' ||
+            disposition.evidence_sha256 !== input.evidenceSha256)) {
+        throw new Error(`${input.stageId} is already settled with a different disposition`)
+      }
+      this.recordCheckpoint({ ...input.checkpoint, runId: input.runId, stageId: input.stageId })
+      if (settlesDisposition && !disposition) {
+        this.recordStageDisposition({
+          disposition: 'satisfied',
+          evidenceSha256: input.evidenceSha256,
+          runId: input.runId,
+          stageId: input.stageId
+        })
+      }
+      if (presentation) this.#recordPresentationMilestone(input.runId, presentation)
+      this.#db.exec('COMMIT')
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
       throw error
     }
   }
@@ -4645,6 +5173,19 @@ export class DomainLedger {
     const problems: string[] = []
     const retainedEvidence = this.#verifyEvidence(manifest.runId, manifest.stageEvidence)
     problems.push(...retainedEvidence.problems.map((problem) => `stage evidence: ${problem}`))
+    const gateAudits = new Map(this.listGateAudit(manifest.runId).map((audit) => [audit.gate_id, audit]))
+    for (const disposition of manifest.stageDispositions) {
+      const evidence = manifest.stageEvidence.find(
+        (entry) => entry.evidenceSha256 === disposition.evidenceSha256
+      )
+      if (disposition.disposition !== 'satisfied' || !evidence || evidence.exitCode === 0) continue
+      const waiver = evidence.waiverOrApproval
+      const audit = waiver ? gateAudits.get(waiver.gateId) : undefined
+      if (!audit || audit.resolved_at === null || audit.decision !== waiver?.decision ||
+          !gateAuditMatchesEvidence(audit, evidence.stage, evidence.round, evidence.evidenceSha256)) {
+        problems.push(`stage evidence: ${evidence.stage} nonzero evidence lacks an exact approval`)
+      }
+    }
     const retainedRun = this.#db.prepare(
       `SELECT status, terminal_commit_oid, intent, intent_hash, policy_sha256
        FROM runs WHERE run_id = ?`
@@ -4683,16 +5224,21 @@ export class DomainLedger {
     ) {
       problems.push('stage dispositions')
     }
-    const finalDisposition = manifest.stageDispositions.findLast(
-      (disposition) => disposition.evidenceSha256 !== undefined
+    const baseDisposition =
+      manifest.stageDispositions.find(
+        (disposition) =>
+          disposition.stage === 'rebase' && disposition.evidenceSha256 !== undefined
+      ) ??
+      manifest.stageDispositions.find(
+        (disposition) => disposition.evidenceSha256 !== undefined
+      )
+    const baseEvidence = manifest.stageEvidence.find(
+      (evidence) => evidence.evidenceSha256 === baseDisposition?.evidenceSha256
     )
-    const finalEvidence = manifest.stageEvidence.find(
-      (evidence) => evidence.evidenceSha256 === finalDisposition?.evidenceSha256
+    const retainedBaseEvidence = retainedEvidence.rows.find(
+      (row) => row.evidence_sha256 === baseEvidence?.evidenceSha256
     )
-    const retainedFinalEvidence = retainedEvidence.rows.find(
-      (row) => row.evidence_sha256 === finalEvidence?.evidenceSha256
-    )
-    if (!retainedFinalEvidence || retainedFinalEvidence.base_commit_oid !== manifest.baseCommitOid) {
+    if (!retainedBaseEvidence || retainedBaseEvidence.base_commit_oid !== manifest.baseCommitOid) {
       problems.push('base commit evidence')
     }
 
@@ -4717,7 +5263,7 @@ export class DomainLedger {
               o.completed_at, o.outcome_sha256, a.generation_token
        FROM attempt_outcomes o
        JOIN run_attempts a ON a.run_id = o.run_id AND a.attempt_id = o.attempt_id
-       WHERE o.run_id = ? ORDER BY o.completed_at, o.rowid`
+       WHERE o.run_id = ? ORDER BY a.generation_token, o.rowid`
     ).all(manifest.runId) as {
       actor_identity: string
       attempt_id: string
@@ -4736,20 +5282,20 @@ export class DomainLedger {
     }[]
     const outcomes = retainedOutcomes.map((row) => {
       try {
-        const digest = sha256(canonicalJson({
+        const digest = attemptOutcomeSha256({
           actorIdentity: row.actor_identity,
           attemptId: row.attempt_id,
           candidateCommitOid: row.candidate_commit_oid,
           completedAt: row.completed_at,
           coordinatorIdentity: row.coordinator_identity,
-          custody: JSON.parse(row.custody_json) as unknown,
+          custody: JSON.parse(row.custody_json) as AttemptOutcomeInput['custody'],
           reason: row.reason,
-          receiptDigests: JSON.parse(row.receipt_digests_json) as unknown,
+          receiptDigests: JSON.parse(row.receipt_digests_json) as string[],
           resumeEligible: Number(row.resume_eligible) === 1,
           runId: row.run_id,
           stoppingFact: row.stopping_fact,
           verdict: row.verdict
-        }))
+        })
         return digest === row.outcome_sha256 ? digest : ''
       } catch {
         return ''
@@ -4837,6 +5383,16 @@ export class DomainLedger {
         runId: manifest.runId
       })) {
         problems.push(`${receipt.kind} observation`)
+      }
+      if (receipt.kind === 'pull-request-binding') {
+        const hasManagedComment = Object.hasOwn(payload, 'managedCommentIntent')
+        const hasPipelineEvidenceRoot = Object.hasOwn(payload, 'pipelineEvidenceRoot')
+        if (hasManagedComment !== hasPipelineEvidenceRoot) {
+          problems.push('pull-request-binding receipt')
+        }
+        if (hasPipelineEvidenceRoot && payload.pipelineEvidenceRoot !== manifest.pipelineEvidenceRoot) {
+          problems.push('pipeline evidence root')
+        }
       }
     }
 

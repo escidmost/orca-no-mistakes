@@ -351,7 +351,7 @@ export class RailTuiRenderer implements PresentationRenderer {
       this.#activityIndex = this.#activities.length - 1;
       if (settlesGate) this.#leaveGate();
       if (!opensGate && !settlesGate && !this.#pinnedStage && snapshot.currentStage) {
-        this.#selectedStage = PIPELINE_STEPS.indexOf(snapshot.currentStage);
+        this.#selectedStage = this.#stageIds().indexOf(snapshot.currentStage);
       }
       this.#scheduleDraw();
     } catch (error) {
@@ -415,6 +415,10 @@ export class RailTuiRenderer implements PresentationRenderer {
       }
     });
     this.#drawImmediate.unref();
+  }
+
+  #stageIds(): readonly StageName[] {
+    return this.#snapshot?.stages.map((item) => item.id) ?? PIPELINE_STEPS;
   }
 
   #showGate(): void {
@@ -590,7 +594,7 @@ export class RailTuiRenderer implements PresentationRenderer {
   #rail(rows: number, width: number): string[] {
     const snapshot = this.#snapshot!;
     const lines = [this.#regionTitle("RAIL", "rail", width), ""];
-    for (const [index, stage] of PIPELINE_STEPS.entries()) {
+    for (const [index, stage] of this.#stageIds().entries()) {
       const state = snapshot.stages.find((item) => item.id === stage);
       const status = state?.status ?? "pending";
       const active = snapshot.currentStage === stage && status === "active";
@@ -724,7 +728,7 @@ export class RailTuiRenderer implements PresentationRenderer {
 
   #logs(rows: number, width: number): string[] {
     const snapshot = this.#snapshot!;
-    const stage = this.#pinnedStage ?? PIPELINE_STEPS[this.#selectedStage];
+    const stage = this.#pinnedStage ?? this.#stageIds()[this.#selectedStage];
     const state = snapshot.stages.find((item) => item.id === stage);
     const round = state?.round ?? 0;
     const all = [
@@ -941,14 +945,14 @@ export class RailTuiRenderer implements PresentationRenderer {
     this.#pinnedStage = undefined;
     this.#focus = "rail";
     const current = this.#snapshot?.currentStage;
-    if (current) this.#selectedStage = PIPELINE_STEPS.indexOf(current);
+    if (current) this.#selectedStage = this.#stageIds().indexOf(current);
   }
 
   #move(direction: -1 | 1): void {
     if (this.#focus === "rail") {
       this.#selectedStage = Math.max(
         0,
-        Math.min(PIPELINE_STEPS.length - 1, this.#selectedStage + direction),
+        Math.min(this.#stageIds().length - 1, this.#selectedStage + direction),
       );
     } else if (this.#focus === "activity") {
       this.#activityIndex = Math.max(
@@ -964,9 +968,9 @@ export class RailTuiRenderer implements PresentationRenderer {
     if (this.#focus === "logs") return;
     if (this.#focus === "activity") {
       const stage = this.#activities[this.#activityIndex]?.stage;
-      if (stage) this.#selectedStage = PIPELINE_STEPS.indexOf(stage);
+      if (stage) this.#selectedStage = this.#stageIds().indexOf(stage);
     }
-    this.#pinnedStage = PIPELINE_STEPS[this.#selectedStage];
+    this.#pinnedStage = this.#stageIds()[this.#selectedStage];
     this.#logOffset = 0;
     this.#focus = "logs";
   }

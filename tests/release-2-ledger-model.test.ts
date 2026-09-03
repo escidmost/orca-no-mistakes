@@ -10,6 +10,16 @@ import { DomainLedger, evidenceSha256, sha256 } from '../scripts/ledger.ts'
 const commit = 'a'.repeat(40)
 const policy = 'b'.repeat(64)
 const timestamp = '2026-08-30T12:00:00.000Z'
+const publicationRoute = {
+  actorId: 'U_1', actorLogin: 'operator', actorNodeId: 'U_node_1',
+  backend: 'gh' as const, backendVersion: '2.97.0', baseBranch: 'main',
+  baseRepositoryId: '1', baseRepositoryName: 'upstream/project',
+  baseRepositoryNodeId: 'R_base', credentialSource: 'stored-account' as const,
+  forgeHost: 'github.com' as const, headBranch: 'feature', headOwner: 'upstream',
+  headRepositoryId: '1', headRepositoryName: 'upstream/project',
+  headRepositoryNodeId: 'R_base', networkRootRepositoryId: '1',
+  observedAt: timestamp, repoRoot: '/repo'
+}
 
 test('reopening replaces stale terminal fact triggers', async () => {
   const temp = await mkdtemp(path.join(tmpdir(), 'onm-release-2-trigger-'))
@@ -54,29 +64,8 @@ test('repository publication routes update safely and snapshot into runs', async
   const temp = await mkdtemp(path.join(tmpdir(), 'onm-repository-route-'))
   const dbPath = path.join(temp, 'ledger.sqlite')
   const ledger = new DomainLedger(dbPath)
-  const route = {
-    actorId: 'U_1',
-    actorLogin: 'operator',
-    actorNodeId: 'U_node_1',
-    backend: 'gh' as const,
-    backendVersion: '2.97.0',
-    baseBranch: 'main',
-    baseRepositoryId: '1',
-    baseRepositoryName: 'upstream/project',
-    baseRepositoryNodeId: 'R_base',
-    credentialSource: 'stored-account' as const,
-    forgeHost: 'github.com' as const,
-    headBranch: 'feature',
-    headOwner: 'upstream',
-    headRepositoryId: '1',
-    headRepositoryName: 'upstream/project',
-    headRepositoryNodeId: 'R_base',
-    networkRootRepositoryId: '1',
-    observedAt: timestamp,
-    repoRoot: '/repo'
-  }
   try {
-    const fingerprint = ledger.setRepositoryPublicationRoute(route)
+    const fingerprint = ledger.setRepositoryPublicationRoute(publicationRoute)
     ledger.startRun({
       baseBranch: 'main',
       branch: 'feature',
@@ -89,7 +78,7 @@ test('repository publication routes update safely and snapshot into runs', async
     assert.equal(ledger.publicationRoute('route-run')?.route_fingerprint, fingerprint)
 
     const renamed = {
-      ...route,
+      ...publicationRoute,
       actorLogin: 'renamed-operator',
       baseRepositoryName: 'renamed/project',
       headRepositoryName: 'renamed/project',
@@ -104,7 +93,7 @@ test('repository publication routes update safely and snapshot into runs', async
         ...renamed,
         headBranch: 'different-feature'
       }),
-      /cannot change publication route while 1 active run\(s\) depend on it/
+      /cannot change publication route while 1 active or resumable run\(s\) depend on it/
     )
     ledger.finishRun('route-run', 'cancelled')
     const changed = ledger.setRepositoryPublicationRoute({
@@ -119,6 +108,95 @@ test('repository publication routes update safely and snapshot into runs', async
     )
   } finally {
     ledger.close()
+    await rm(temp, { force: true, recursive: true })
+  }
+})
+
+test('repository publication routes cannot strand resumable failed runs', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'onm-resumable-repository-route-'))
+  const ledger = new DomainLedger(path.join(temp, 'ledger.sqlite'))
+  try {
+    ledger.setRepositoryPublicationRoute(publicationRoute)
+    ledger.startRun({
+      baseBranch: 'main',
+      branch: 'feature',
+      intent: 'Keep the frozen publication route resumable.',
+      policySha256: policy,
+      repoRoot: '/repo',
+      runId: 'resumable-route-run',
+      submissionCommitOid: commit
+    })
+    const generationToken = ledger.acquireLease({
+      branch: 'feature', repoRoot: '/repo', runId: 'resumable-route-run'
+    })
+    ledger.startAttempt({
+      actorIdentity: 'operator',
+      attemptId: 'failed-attempt',
+      coordinatorIdentity: 'coordinator',
+      generationToken,
+      runId: 'resumable-route-run',
+      startedAt: timestamp
+    })
+    ledger.recordAttemptOutcome({
+      actorIdentity: 'operator',
+      attemptId: 'failed-attempt',
+      candidateCommitOid: commit,
+      completedAt: timestamp,
+      coordinatorIdentity: 'coordinator',
+      custody: {},
+      reason: 'remote stage interrupted',
+      receiptDigests: [],
+      resumeEligible: true,
+      runId: 'resumable-route-run',
+      stoppingFact: 'pull-request-binding',
+      verdict: 'failed'
+    })
+    ledger.finishRun('resumable-route-run', 'failed')
+
+    assert.throws(
+      () => ledger.setRepositoryPublicationRoute({ ...publicationRoute, headBranch: 'other-feature' }),
+      /cannot change publication route while 1 active or resumable run\(s\) depend on it/
+    )
+  } finally {
+    ledger.close()
+    await rm(temp, { force: true, recursive: true })
+  }
+})
+
+test('reopening removes the legacy unique route fingerprint constraint', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'onm-publication-route-upgrade-'))
+  const dbPath = path.join(temp, 'ledger.sqlite')
+  try {
+    const database = new DatabaseSync(dbPath)
+    database.exec(`CREATE TABLE publication_routes (
+      run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE CASCADE,
+      route_fingerprint TEXT NOT NULL UNIQUE,
+      forge_host TEXT NOT NULL,
+      base_repository_id TEXT NOT NULL,
+      head_repository_id TEXT NOT NULL,
+      head_owner TEXT NOT NULL,
+      head_branch TEXT NOT NULL,
+      base_branch TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )`)
+    database.close()
+
+    const ledger = new DomainLedger(dbPath)
+    ledger.setRepositoryPublicationRoute(publicationRoute)
+    for (const runId of ['route-reuse-1', 'route-reuse-2']) {
+      ledger.startRun({
+        baseBranch: 'main', branch: 'feature', intent: 'Reuse one route.',
+        policySha256: policy, repoRoot: '/repo', runId, submissionCommitOid: commit
+      })
+    }
+    assert.ok(ledger.publicationRoute('route-reuse-1')?.route_fingerprint)
+    assert.ok(ledger.publicationRoute('route-reuse-2')?.route_fingerprint)
+    assert.equal(
+      ledger.publicationRoute('route-reuse-1')?.route_fingerprint,
+      ledger.publicationRoute('route-reuse-2')?.route_fingerprint
+    )
+    ledger.close()
+  } finally {
     await rm(temp, { force: true, recursive: true })
   }
 })
@@ -373,6 +451,11 @@ test('Release 2 ledger facts are immutable, append-only, and atomically checkpoi
         disposition: 'satisfied',
         evidence_sha256: sha256('intent-evidence'),
         stage_id: 'intent'
+      },
+      {
+        disposition: 'satisfied',
+        evidence_sha256: evidence.evidenceSha256,
+        stage_id: 'push'
       }
     ])
     assert.equal(ledger.listAttemptOutcomes(runId)[0].outcome_sha256, failedOutcome)

@@ -96,10 +96,12 @@ function pullRequest(input: {
     headRefName: input.headBranch ?? 'feature',
     headRefOid: input.headOid ?? 'b'.repeat(40),
     headRepository: { databaseId: 20, id: 'R_20', nameWithOwner: 'fork/project' },
+    body: 'body',
     id: input.id,
     isDraft: false,
     number: input.number,
     state: 'OPEN',
+    title: 'title',
     url: `https://github.com/upstream/project/pull/${input.number}`
   }
 }
@@ -313,7 +315,10 @@ test('issue comment observation exhausts every page', async () => {
   ]
   let page = 0
   const provider = await GithubAuthority.connect({
-    runner: githubRunner(() => json({ data: { node: { comments: pages[page++] } } }))
+    runner: githubRunner((_executable, _args, options) => {
+      assert.match(options.input ?? '', /author \{ login \.\.\. on Node \{ id \} \}/)
+      return json({ data: { node: { comments: pages[page++] } } })
+    })
   })
   const comments = await provider.observeIssueComments('PR_1')
   assert.deepEqual(comments.map((comment) => comment.id), ['IC_1', 'IC_2'])
