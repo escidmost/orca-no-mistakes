@@ -3468,6 +3468,50 @@ export class DomainLedger {
     ).all(runId) as { intent_sha256: string }[]
   }
 
+  unresolvedManagedCommentCreateIntent(runId: string): {
+    attemptId: string
+    createdAt: string
+    intentSha256: string
+    payload: Record<string, unknown>
+    targetFingerprint: string
+  } | undefined {
+    const settledReceipt = this.remoteReceipt(runId, 'pull-request-binding')
+    if (settledReceipt) {
+      return undefined
+    }
+
+    const rows = this.#db.prepare(
+      `SELECT attempt_id, created_at, intent_sha256, payload_json, target_fingerprint
+       FROM mutation_intents
+       WHERE run_id = ? AND kind = 'managed-comment'
+       ORDER BY created_at ASC, rowid ASC`
+    ).all(runId) as Array<{
+      attempt_id: string
+      created_at: string
+      intent_sha256: string
+      payload_json: string
+      target_fingerprint: string
+    }>
+
+    for (const row of rows) {
+      try {
+        const payload = JSON.parse(row.payload_json) as Record<string, unknown>
+        if (payload.action === 'ensure-managed-summary' && payload.managedCommentNodeId === null) {
+          return {
+            attemptId: row.attempt_id,
+            createdAt: row.created_at,
+            intentSha256: row.intent_sha256,
+            payload,
+            targetFingerprint: row.target_fingerprint
+          }
+        }
+      } catch {
+        // ignore malformed
+      }
+    }
+    return undefined
+  }
+
   #remoteObservationMatches(input: {
     allowHistoricalAttempt?: boolean
     candidateCommitOid: string

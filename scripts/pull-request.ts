@@ -15,6 +15,7 @@ import {
 
 const MANAGED_SUMMARY_MARKER = '<!-- orca-no-mistakes:managed-summary:v1 -->'
 const SUMMARY_BUDGET = 32 * 1024
+const PULL_REQUEST_BODY_BUDGET = 65536
 
 type PullRequestAuthority = {
   createIssueComment(input: { body: string; subjectId: string }): Promise<unknown>
@@ -61,15 +62,21 @@ function capSummary(content: string, budget: number): string {
   return capped
 }
 
-function pullRequestContent(intent: string): { body: string; title: string } {
+export function pullRequestContent(intent: string): { body: string; title: string } {
   const redacted = redactKnownSecrets(intent).trim() || 'Complete the validated pipeline changes.'
   const firstLine = redacted.split('\n', 1)[0].trim()
   const title = /^(?:[a-z]+(?:\([^)]+\))?!?:\s|[A-Z][A-Z0-9]+-\d+:\s)/.test(firstLine)
     ? firstLine
     : `chore: ${firstLine}`
+  const prefix = '## Intent\n\n'
+  const suffix = '\n\n## What Changed\n\nCompleted the validated pipeline changes for this run.\n'
+  const cappedIntent = capSummary(
+    redacted,
+    PULL_REQUEST_BODY_BUDGET - Buffer.byteLength(prefix) - Buffer.byteLength(suffix)
+  )
   return {
     title: title.slice(0, 256),
-    body: `## Intent\n\n${redacted}\n\n## What Changed\n\nCompleted the validated pipeline changes for this run.\n`
+    body: `${prefix}${cappedIntent}${suffix}`
   }
 }
 
@@ -244,6 +251,14 @@ export async function bindPullRequest(input: {
     login: repositoryRoute.actor_login,
     nodeId: repositoryRoute.actor_node_id
   }, receiptNodeId)
+  const unresolvedCreate = typeof input.ledger.unresolvedManagedCommentCreateIntent === 'function'
+    ? input.ledger.unresolvedManagedCommentCreateIntent(input.runId)
+    : undefined
+  if (!comment && unresolvedCreate) {
+    throw new PullRequestBindingError(
+      `unresolved managed comment create intent (${unresolvedCreate.intentSha256}) requires manual resolution: managed comment is absent on pull request #${pullRequest.number}`
+    )
+  }
   let commentMutated = false
   const managedCommentCreatedAt = after(mutationCreatedAt, now())
   const managedCommentIntent = input.ledger.recordMutationIntent({
