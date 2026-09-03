@@ -3507,14 +3507,7 @@ export async function runPipeline(
                 generationToken: generationToken!,
                 repoRoot: deliveryRepo.root,
               },
-              async () => {
-                const note = await transferCustody();
-                await markOutcomeDeliveryPending(
-                  "passed",
-                  `${passedSummary}\n${note}`,
-                );
-                return note;
-              },
+              () => transferCustody(),
               (custodyNote) => ({
                 actorIdentity,
                 attemptId: terminalAttemptId,
@@ -3562,6 +3555,10 @@ export async function runPipeline(
               { eventKey, snapshot },
             ),
         );
+        await markOutcomeDeliveryPending(
+          "passed",
+          `${passedSummary}\n${settled.custodyNote}`,
+        ).catch(() => {});
         return { attestation: settled.manifest, custodyNote: settled.custodyNote };
       }
       const attestation = buildAttestation(stageEntries, {
@@ -3606,15 +3603,15 @@ export async function runPipeline(
                 stoppingFact: "all local pipeline stages passed",
                 verdict: "passed",
               });
-              await markOutcomeDeliveryPending(
-                "passed",
-                `${passedSummary}\n${note}`,
-              );
               return note;
             },
             { eventKey, snapshot },
           ),
       );
+      await markOutcomeDeliveryPending(
+        "passed",
+        `${passedSummary}\n${custodyNote}`,
+      ).catch(() => {});
       return { attestation, custodyNote };
     });
     await orca
