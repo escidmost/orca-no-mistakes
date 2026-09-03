@@ -1218,6 +1218,7 @@ async function markOutcomeDeliveryPending(
   outcome: "passed" | "failed" | "cancelled",
   summary: string,
 ): Promise<void> {
+  if (abortReap.notifyHandle === undefined) return;
   abortReap.pendingOutcome = outcome;
   abortReap.pendingSummary = summary;
   await refreshGateMarker();
@@ -3208,10 +3209,6 @@ export async function runPipeline(
             },
             { eventKey, snapshot },
           ),
-      );
-      await markOutcomeDeliveryPending(
-        "passed",
-        `${passedSummary}\n${custodyNote}`,
       );
       return { attestation, custodyNote };
     });
@@ -11122,6 +11119,21 @@ async function deliverPendingOutcome(
   const domainRunId = marker.domainRunId ?? runId;
   const run =
     domainRunId && ledger ? ledger.runIdentity(domainRunId) : undefined;
+  if (marker.notifyHandle === undefined) {
+    if (outcome === undefined) return true;
+    delete marker.pendingOutcome;
+    delete marker.pendingSummary;
+    marker.outcomeDelivered = true;
+    try {
+      await writeMarker(markerFile, marker);
+      return true;
+    } catch (error) {
+      console.error(
+        `no-mistakes: retained gate marker ${markerFile}; could not clear its no-target outcome state: ${String(error)}`,
+      );
+      return false;
+    }
+  }
   if (outcome === undefined) {
     if (
       gateExists &&
@@ -11749,6 +11761,12 @@ async function reapConfiguredLauncher(
       }).failRun("Configured launcher terminated before gate allocation");
     } catch (error) {
       if (!isConsumerFenced(error)) {
+        return false;
+      }
+      if (run?.status === "in-progress") {
+        console.error(
+          `no-mistakes: retained configured launcher marker ${markerFile}; its Orca run is owned by another consumer`,
+        );
         return false;
       }
     }
@@ -14129,7 +14147,6 @@ Run options:
         : []),
       ...(result.custodyNote ? [result.custodyNote] : []),
     ].join("\n");
-    await markOutcomeDeliveryPending("passed", passedSummary);
     try {
       await orca.notifyRunResult("passed", passedSummary);
       await clearOutcomeDeliveryPending().catch((markerError) =>

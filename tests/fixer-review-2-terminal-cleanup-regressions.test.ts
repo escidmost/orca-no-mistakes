@@ -158,8 +158,12 @@ test("late abort does not fail an already-passed Orca run", async () => {
   }
 });
 
-for (const kind of ["configured", "orca"] as const) {
-  test(`stranded cleanup reaps a ${kind} gate after the run passes`, async () => {
+for (const [kind, noTargetPending] of [
+  ["configured", false],
+  ["orca", false],
+  ["configured", true],
+] as const) {
+  test(`stranded cleanup reaps a ${kind} gate after the run passes${noTargetPending ? " without a notification target" : ""}`, async () => {
     const seeded = await seed(`onm-passed-${kind}-gate-`);
     const runId = `run-passed-${kind}`;
     const branch = `no-mistakes-gate-${runId}`;
@@ -205,7 +209,12 @@ for (const kind of ["configured", "orca"] as const) {
           createdAt: new Date().toISOString(),
           gate,
           originWorktree: seeded.repo,
-          outcomeDelivered: true,
+          ...(noTargetPending
+            ? {
+                pendingOutcome: "passed",
+                pendingSummary: `Run ${runId} passed all 6 stages.`,
+              }
+            : { outcomeDelivered: true }),
           runId,
           terminalHandle: "term-dead",
         }),

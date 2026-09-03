@@ -128,7 +128,7 @@ else out({ accepted: true })
   }
 });
 
-test("stranded cleanup reaps a configured launcher when Orca settlement is consumer-fenced", async () => {
+test("stranded cleanup retains a configured launcher when Orca settlement is consumer-fenced", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "onm-launcher-fence-"));
   const repo = path.join(temp, "repo");
   await mkdir(path.join(repo, ".orca", "no-mistakes"), { recursive: true });
@@ -185,7 +185,7 @@ console.log(JSON.stringify({ accepted: true }))
     runId,
     submissionCommitOid: git(canonicalRepo, "rev-parse", "HEAD"),
   });
-  ledger.acquireLease({
+  const generationToken = ledger.acquireLease({
     branch: "main",
     repoRoot: canonicalRepo,
     runId,
@@ -213,7 +213,17 @@ console.log(JSON.stringify({ accepted: true }))
 
   try {
     await main(["prune", "--stranded", "--repo", canonicalRepo]);
-    assert.equal(existsSync(marker), false);
+    assert.equal(existsSync(marker), true);
+    const reopened = new DomainLedger({ repositoryPath: canonicalRepo });
+    try {
+      assert.equal(reopened.runStatus(runId), "in-progress");
+      assert.equal(
+        reopened.leaseFor(canonicalRepo, "main")?.generation_token,
+        generationToken,
+      );
+    } finally {
+      reopened.close();
+    }
   } finally {
     restore();
     await rm(temp, { force: true, recursive: true });
@@ -239,4 +249,3 @@ test("unreadable marker is retained and not reaped by stranded prune", async () 
     await rm(temp, { force: true, recursive: true });
   }
 });
-

@@ -62,7 +62,7 @@ test("abort path journals cancelled pending outcome before settling domain run",
   );
 });
 
-test("runPipeline writes pending outcome with custody note during and after lease mutation", async () => {
+test("passed outcome journaling stays inside the lease mutation", async () => {
   const source = await readFile(
     new URL("../scripts/orca-no-mistakes.ts", import.meta.url),
     "utf8",
@@ -77,9 +77,19 @@ test("runPipeline writes pending outcome with custody note during and after leas
     finalizeBlock.includes('markOutcomeDeliveryPending(\n                "passed",'),
     "finalizePassedRunWithLeaseMutation callback must journal custody note before committing",
   );
-  assert.ok(
-    finalizeBlock.includes('await markOutcomeDeliveryPending(\n        "passed",\n        `${passedSummary}\\n${custodyNote}`,'),
-    "runPipeline must journal custody note upon return from finalizePassedRunWithLeaseMutation",
+  assert.doesNotMatch(
+    finalizeBlock,
+    /\}\);\s*await markOutcomeDeliveryPending\(\s*"passed"/u,
+    "runPipeline must not rewrite the passed journal after the ledger commits",
+  );
+  const mainPassed = source.slice(
+    source.lastIndexOf("const passedSummary = ["),
+    source.lastIndexOf('await orca.notifyRunResult("passed", passedSummary);'),
+  );
+  assert.doesNotMatch(
+    mainPassed,
+    /markOutcomeDeliveryPending\(\s*"passed"/u,
+    "main must deliver the journal committed by runPipeline without rewriting it",
   );
 });
 
