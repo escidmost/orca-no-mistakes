@@ -48,13 +48,12 @@ The detached run returns immediately. When an Orca gate is pending, the coordina
 
 Finding-gate choices are `approve`, `fix`, `skip`, and `stop`. Durable resume-gate choices (opened when an attempt stops after a resumable failure) are `resume` and `stop`. Anything else fails closed.
 
-A `fix` resolution supports targeted finding selection, per-finding instructions, and global guidance:
+A `fix` resolution supports targeted finding selection and global guidance:
 
-- Plain text syntax: `--resolution "fix: id1, id2: guidance"` or `--resolution "fix [id1, id2] - guidance"`.
-- JSON syntax: `--resolution '{"action":"fix","findingIds":["id1"],"instructions":{"id1":"instruction"},"guidance":"global guidance"}'`.
+- Plain text syntax: `fix: id1, id2: guidance` or `fix [id1,id2] - guidance`.
 - Resolving with `fix` without IDs targets all actionable findings. Unselected findings are evaluated in subsequent re-review passes.
 - Copy IDs exactly from the gate question. If none of the supplied IDs match a reported finding, the run stops with `<stage> fix gate resolved with no matching findings`.
-- Single-word guidance following `fix` without brackets (e.g. `--resolution "fix urgently"`) is parsed as a finding ID candidate and can fail closed if no such finding exists. For global guidance across all findings, use bracket syntax (e.g. `--resolution "fix [] - urgently"`), multi-word text (e.g. `--resolution "fix please handle urgently"`), or JSON.
+- Single-word guidance following `fix` without brackets (e.g. `fix urgently`) is parsed as a finding ID candidate and can fail closed if no such finding exists. For global guidance across all findings, use bracket syntax (e.g. `fix [] - urgently`) or multi-word text (e.g. `fix please handle urgently`).
 
 Escalate every `ask-user` finding to the user before resolving it. Relay its ID, file and line when present, and full description. Do not choose `approve` or `skip` on the user's behalf.
 
