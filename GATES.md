@@ -24,5 +24,5 @@ Scope: New direct and gate runs execute and recover the complete Release 2 publi
   EXPECT: full regression verification passed
   EVIDENCE: exit=0; shell=/bin/sh; cwd=/Users/host/repo/orca-no-mistakes/.orca/workspaces/onm-80-bind-pull-requests-and-settle-remote-runs; path=891ea4e2ea56/12 entries; EXPECT=matched; output-sha256=22c88b38bbaf1b76ad343500a4b429e63c60abfff72b904dd05de92862e6118e; output-bytes=131588
 
-- [ ] G4: the pull request has the ONM-80 prefix and CodeRabbit reports no issues
-  EVIDENCE: pending
+- [x] G4: the pull request has the ONM-80 prefix and CodeRabbit reports no issues
+  EVIDENCE: PR #62 title begins `ONM-80:`; CodeRabbit approved commit `4563e6318d7fcb7eeb74e660a36aa9054ff37d0b` with zero unresolved review threads; GitHub Actions `test` passed.
