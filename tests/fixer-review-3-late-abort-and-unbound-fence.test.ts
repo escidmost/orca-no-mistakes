@@ -219,7 +219,7 @@ if (args[0] === "orchestration" && args[1] === "task-list") {
   process.exit(0);
 }
 if (args[0] === "orchestration" && args[1] === "task-update") {
-  console.log(JSON.stringify({ error: { code: "consumer_fenced", message: "owned by another consumer" } }));
+  console.error(JSON.stringify({ error: { code: "consumer_fenced", message: "owned by another consumer" } }));
   process.exit(1);
 }
 process.exit(0);
