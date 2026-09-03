@@ -206,6 +206,7 @@ class FakeOrca implements OrcaOperations {
 }
 
 class DurableResumeOrca extends FakeOrca {
+  #pendingResolution: string | undefined;
   #resolveGate: ((resolution: string) => void) | undefined;
 
   override async createGate(): Promise<string> {
@@ -213,6 +214,11 @@ class DurableResumeOrca extends FakeOrca {
   }
 
   override async waitForGate(): Promise<string> {
+    if (this.#pendingResolution !== undefined) {
+      const resolution = this.#pendingResolution;
+      this.#pendingResolution = undefined;
+      return resolution;
+    }
     return await new Promise((resolve) => {
       this.#resolveGate = resolve;
     });
@@ -222,7 +228,14 @@ class DurableResumeOrca extends FakeOrca {
     _gateId?: string,
     resolution?: string,
   ): Promise<void> {
-    if (resolution) this.#resolveGate?.(resolution);
+    if (resolution === undefined) return;
+    if (this.#resolveGate) {
+      const resolve = this.#resolveGate;
+      this.#resolveGate = undefined;
+      resolve(resolution);
+    } else {
+      this.#pendingResolution = resolution;
+    }
   }
 }
 

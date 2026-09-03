@@ -55,11 +55,13 @@ function harness() {
       route_fingerprint: 'route'
     }),
     ownsLease: () => true,
+    resolveMutationIntent: () => {},
     run: () => ({ branch: 'feature', repo_root: '/repo' }),
     settleRemoteStage: (input: Record<string, unknown>) => {
       settlements.push(input)
       return { receiptSha256: 'pr-receipt' }
-    }
+    },
+    unresolvedManagedCommentCreateIntent: () => undefined
   }
   return { intents, ledger, settlements }
 }
@@ -85,31 +87,28 @@ test('creates a ready pull request and one managed summary, then settles exact f
     updateIssueComment: async () => assert.fail('unexpected comment update')
   }
   const directory = await mkdtemp(path.join(tmpdir(), 'onm-pr-'))
-  process.env.ONM_BINDING_TEST_SECRET = 'secret'
-  const result = await bindPullRequest({
-    artifactPath: path.join(directory, 'pr.json'),
-    attemptId: 'attempt',
-    authority,
-    candidateCommitOid: OID,
-    generationToken: 1,
-    intent: 'add remote settlement\nTOKEN=secret',
-    ledger: ledger as never,
-    now: (() => { let tick = 0; return () => `2026-01-01T00:00:0${tick++}.000Z` })(),
-    pipelineEvidenceRoot: 'root',
-    runId: 'run',
-    stageSummaries: ['lint passed TOKEN=secret'],
-    workerIdentity: 'coordinator'
-  })
-  delete process.env.ONM_BINDING_TEST_SECRET
-
-  assert.equal(createdPullRequest?.draft, false)
-  assert.equal(createdPullRequest?.title, 'chore: add remote settlement')
-  assert.match(String(createdPullRequest?.body), /## Intent[\s\S]*## What Changed/)
-  assert.doesNotMatch(String(comments[0]?.body), /secret/)
-  assert.equal(result.outcome, 'created')
-  assert.equal(result.commentNodeId, 'comment-node')
-  assert.equal(intents[1]?.kind, 'managed-comment')
-  assert.equal(settlements.length, 1)
+  try {
+    process.env.ONM_BINDING_TEST_SECRET = 'secret'
+    const result = await bindPullRequest({
+      artifactPath: path.join(directory, 'pr.json'),
+      attemptId: 'attempt', authority, candidateCommitOid: OID, generationToken: 1,
+      intent: 'add remote settlement\nTOKEN=secret', ledger: ledger as never,
+      now: (() => { let tick = 0; return () => `2026-01-01T00:00:0${tick++}.000Z` })(),
+      pipelineEvidenceRoot: 'root', runId: 'run', stageSummaries: ['lint passed TOKEN=secret'],
+      workerIdentity: 'coordinator'
+    })
+    assert.equal(createdPullRequest?.draft, false)
+    assert.equal(createdPullRequest?.title, 'chore: add remote settlement')
+    assert.match(String(createdPullRequest?.body), /## Intent[\s\S]*## What Changed/)
+    assert.doesNotMatch(String(comments[0]?.body), /secret/)
+    assert.equal(result.outcome, 'created')
+    assert.equal(result.commentNodeId, 'comment-node')
+    assert.equal(intents[1]?.kind, 'managed-comment')
+    assert.equal(settlements.length, 1)
+  } finally {
+    delete process.env.ONM_BINDING_TEST_SECRET
+    await rm(directory, { force: true, recursive: true })
+  }
 })
 
 test('adopts an open pull request without mutating human content', async () => {
@@ -133,16 +132,20 @@ test('adopts an open pull request without mutating human content', async () => {
     }
   }
   const directory = await mkdtemp(path.join(tmpdir(), 'onm-pr-'))
-  const result = await bindPullRequest({
-    artifactPath: path.join(directory, 'pr.json'), attemptId: 'attempt', authority,
-    candidateCommitOid: OID, generationToken: 1, intent: 'ignored', ledger: ledger as never,
-    pipelineEvidenceRoot: 'root', runId: 'run', stageSummaries: [], workerIdentity: 'coordinator'
-  })
-  assert.equal(createCalls, 0)
-  assert.equal(update?.commentId, 'comment-node')
-  assert.equal(existing.title, 'human title')
-  assert.equal(existing.body, 'human body')
-  assert.equal(result.outcome, 'updated')
+  try {
+    const result = await bindPullRequest({
+      artifactPath: path.join(directory, 'pr.json'), attemptId: 'attempt', authority,
+      candidateCommitOid: OID, generationToken: 1, intent: 'ignored', ledger: ledger as never,
+      pipelineEvidenceRoot: 'root', runId: 'run', stageSummaries: [], workerIdentity: 'coordinator'
+    })
+    assert.equal(createCalls, 0)
+    assert.equal(update?.commentId, 'comment-node')
+    assert.equal(existing.title, 'human title')
+    assert.equal(existing.body, 'human body')
+    assert.equal(result.outcome, 'updated')
+  } finally {
+    await rm(directory, { force: true, recursive: true })
+  }
 })
 
 test('rejects conflicting near matches and deterministically caps managed summaries', async () => {
@@ -228,21 +231,24 @@ test('reconciles indeterminate creation and rejects closed or moved pull request
     },
     updateIssueComment: async () => assert.fail('unexpected comment update')
   }
-  await assert.rejects(bindPullRequest({
-    artifactPath: path.join(directory, 'pr.json'), attemptId: 'attempt', authority,
-    candidateCommitOid: OID, generationToken: 1, intent: 'intent', ledger: ledger as never,
-    pipelineEvidenceRoot: 'root', runId: 'run', stageSummaries: [], workerIdentity: 'coordinator'
-  }), /facts changed/)
-
-  const closedAuthority = {
-    ...authority,
-    observePullRequests: async () => ({ exact: pullRequest({ state: 'CLOSED' }), nearMatches: [] })
+  try {
+    await assert.rejects(bindPullRequest({
+      artifactPath: path.join(directory, 'pr.json'), attemptId: 'attempt', authority,
+      candidateCommitOid: OID, generationToken: 1, intent: 'intent', ledger: ledger as never,
+      pipelineEvidenceRoot: 'root', runId: 'run', stageSummaries: [], workerIdentity: 'coordinator'
+    }), /facts changed/)
+    const closedAuthority = {
+      ...authority,
+      observePullRequests: async () => ({ exact: pullRequest({ state: 'CLOSED' }), nearMatches: [] })
+    }
+    await assert.rejects(bindPullRequest({
+      artifactPath: path.join(directory, 'closed.json'), attemptId: 'attempt', authority: closedAuthority,
+      candidateCommitOid: OID, generationToken: 1, intent: 'intent', ledger: ledger as never,
+      pipelineEvidenceRoot: 'root', runId: 'run', stageSummaries: [], workerIdentity: 'coordinator'
+    }), /not open/)
+  } finally {
+    await rm(directory, { force: true, recursive: true })
   }
-  await assert.rejects(bindPullRequest({
-    artifactPath: path.join(directory, 'closed.json'), attemptId: 'attempt', authority: closedAuthority,
-    candidateCommitOid: OID, generationToken: 1, intent: 'intent', ledger: ledger as never,
-    pipelineEvidenceRoot: 'root', runId: 'run', stageSummaries: [], workerIdentity: 'coordinator'
-  }), /not open/)
 })
 
 test('rejects a different pull request identity before settlement', async () => {
@@ -301,18 +307,22 @@ test('does not adopt human-quoted markers and rejects multiple owned markers', a
     updateIssueComment: async () => assert.fail('unexpected comment update')
   }
   const directory = await mkdtemp(path.join(tmpdir(), 'onm-pr-'))
-  await bindPullRequest({
-    artifactPath: path.join(directory, 'pr.json'), attemptId: 'attempt', authority,
-    candidateCommitOid: OID, generationToken: 1, intent: 'intent', ledger: ledger as never,
-    pipelineEvidenceRoot: 'root', runId: 'run', stageSummaries: [], workerIdentity: 'coordinator'
-  })
-  assert.equal(created, 1)
-  assert.equal(comments[0], human)
+  try {
+    await bindPullRequest({
+      artifactPath: path.join(directory, 'pr.json'), attemptId: 'attempt', authority,
+      candidateCommitOid: OID, generationToken: 1, intent: 'intent', ledger: ledger as never,
+      pipelineEvidenceRoot: 'root', runId: 'run', stageSummaries: [], workerIdentity: 'coordinator'
+    })
+    assert.equal(created, 1)
+    assert.equal(comments[0], human)
 
-  comments.push({ ...comments[1]!, id: 'second-owned-comment' })
-  await assert.rejects(bindPullRequest({
-    artifactPath: path.join(directory, 'ambiguous.json'), attemptId: 'attempt', authority,
-    candidateCommitOid: OID, generationToken: 1, intent: 'intent', ledger: ledger as never,
-    pipelineEvidenceRoot: 'root', runId: 'run', stageSummaries: [], workerIdentity: 'coordinator'
-  }), /multiple managed summary markers/)
+    comments.push({ ...comments[1]!, id: 'second-owned-comment' })
+    await assert.rejects(bindPullRequest({
+      artifactPath: path.join(directory, 'ambiguous.json'), attemptId: 'attempt', authority,
+      candidateCommitOid: OID, generationToken: 1, intent: 'intent', ledger: ledger as never,
+      pipelineEvidenceRoot: 'root', runId: 'run', stageSummaries: [], workerIdentity: 'coordinator'
+    }), /multiple managed summary markers/)
+  } finally {
+    await rm(directory, { force: true, recursive: true })
+  }
 })

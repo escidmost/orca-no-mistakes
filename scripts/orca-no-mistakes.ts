@@ -1416,13 +1416,20 @@ function markStageLogIncomplete(filePath: string): void {
   }
 }
 
+function persistedStageIds(ledger: DomainLedger, runId: string): StageName[] {
+  return ledger.stagePlan(runId).map(({ stage_id }) => stage_id as StageName);
+}
+
 function forceStopAbortedRun(signal: "SIGHUP" | "SIGINT" | "SIGTERM"): void {
   abortRequested = true;
   runAbortPresentationCleanup();
   const { artifactsDir, ledger, runId } = abortReap;
   try {
     if (ledger && runId) {
-      const presentation = new PresentationPublisher(ledger, runId);
+      const presentation = new PresentationPublisher(
+        ledger, runId, undefined, undefined, undefined, undefined,
+        persistedStageIds(ledger, runId),
+      );
       const stage = presentation.current.currentStage;
       if (artifactsDir && stage) {
         const round =
@@ -1528,6 +1535,8 @@ export async function reapAbortedRun(reason: string): Promise<void> {
           : undefined,
         () => new Date(),
         (error) => abortLog(String(error)),
+        undefined,
+        persistedStageIds(ledger, runId),
       );
       if (run?.status === "in-progress") {
         const summary = recoverRef
@@ -2547,7 +2556,10 @@ export async function runPipeline(
         const hasDisposition = dispositions.some(
           (d) => d.stage_id === stage && d.disposition === "satisfied",
         );
-        if (pipelineSteps.includes("push") && (!checkpointMatches || !hasDisposition)) {
+        if (
+          stage !== "push" && stage !== "pr" &&
+          pipelineSteps.includes("push") && (!checkpointMatches || !hasDisposition)
+        ) {
           const stageIndex = pipelineSteps.indexOf(stage);
           const prevStage = stageIndex > 0 ? pipelineSteps[stageIndex - 1] : undefined;
           const checkpointCandidate = prevStage
@@ -12960,7 +12972,10 @@ function settleStrandedCancellation(
   runId: string,
   ownership: { branch: string; generationToken: number; repoRoot: string },
 ): boolean {
-  const presentation = new PresentationPublisher(ledger, runId);
+  const presentation = new PresentationPublisher(
+    ledger, runId, undefined, undefined, undefined, undefined,
+    persistedStageIds(ledger, runId),
+  );
   const eventKey = `attempt:${presentation.current.attempt}:run:completed:cancelled`;
   let settled = false;
   presentation.publish(
@@ -14038,40 +14053,44 @@ async function runInitCommand(flags: RawCliFlags): Promise<void> {
     path.resolve(process.argv[1] ?? fileURLToPath(import.meta.url)),
   );
   const ledger = openRepositoryLedger(metadata.repoRoot);
-  let upstream = stringFlag(flags, "upstream");
-  if (upstream === undefined) {
-    try {
-      upstream = (await command("git", ["remote", "get-url", "origin"], metadata.repoRoot))
-        .stdout.trim();
-    } catch {}
-  }
-  let routeFingerprint: string | null = null;
-  if (upstream !== undefined) {
-    try {
-      parseGithubRepositoryReference(upstream);
-      const authority = await GithubAuthority.connect();
-      routeFingerprint = (await resolveGithubPublicationRoute({
-        baseBranch: stringFlag(flags, "base-branch"),
-        fork: stringFlag(flags, "fork"),
-        headBranch: stringFlag(flags, "head-branch"),
-        ledger,
-        provider: authority,
-        repoPath: metadata.repoRoot,
-        upstream,
-      })).routeFingerprint;
-    } catch (error) {
-      if (!(error instanceof GithubAuthorityError) ||
-          error.operation !== "parse-repository-reference") throw error;
+  try {
+    let upstream = stringFlag(flags, "upstream");
+    if (upstream === undefined) {
+      try {
+        upstream = (await command("git", ["remote", "get-url", "origin"], metadata.repoRoot))
+          .stdout.trim();
+      } catch {}
     }
+    let routeFingerprint: string | null = null;
+    if (upstream !== undefined) {
+      try {
+        parseGithubRepositoryReference(upstream);
+        const authority = await GithubAuthority.connect();
+        routeFingerprint = (await resolveGithubPublicationRoute({
+          baseBranch: stringFlag(flags, "base-branch"),
+          fork: stringFlag(flags, "fork"),
+          headBranch: stringFlag(flags, "head-branch"),
+          ledger,
+          provider: authority,
+          repoPath: metadata.repoRoot,
+          upstream,
+        })).routeFingerprint;
+      } catch (error) {
+        if (!(error instanceof GithubAuthorityError) ||
+            error.operation !== "parse-repository-reference") throw error;
+      }
+    }
+    console.log(
+      JSON.stringify({
+        gate: metadata.gatePath,
+        remote: metadata.remoteName,
+        repo: metadata.repoRoot,
+        route: routeFingerprint,
+      }),
+    );
+  } finally {
+    ledger.close();
   }
-  console.log(
-    JSON.stringify({
-      gate: metadata.gatePath,
-      remote: metadata.remoteName,
-      repo: metadata.repoRoot,
-      route: routeFingerprint,
-    }),
-  );
 }
 
 async function readStandardInput(): Promise<string> {

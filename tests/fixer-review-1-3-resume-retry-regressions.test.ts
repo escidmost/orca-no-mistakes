@@ -526,6 +526,7 @@ test("a local TUI resume resolves the durable resume gate", async () => {
   const deliveryGit = new FakeGit("/origin", "feature");
   const runId = `local-resume-${randomUUID()}`;
   let requestResume: (() => void) | undefined;
+  let pendingDurableResolution: string | undefined;
   let resolveDurableGate: ((resolution: string) => void) | undefined;
   class LocalResumeOrca extends OrphanAllocationOrca {
     readonly durableResolutions: string[] = [];
@@ -536,6 +537,11 @@ test("a local TUI resume resolves the durable resume gate", async () => {
     }
 
     override async waitForGate(): Promise<string> {
+      if (pendingDurableResolution !== undefined) {
+        const resolution = pendingDurableResolution;
+        pendingDurableResolution = undefined;
+        return resolution;
+      }
       return await new Promise((resolve) => {
         resolveDurableGate = resolve;
       });
@@ -546,7 +552,13 @@ test("a local TUI resume resolves the durable resume gate", async () => {
       resolution = "",
     ): Promise<void> {
       this.durableResolutions.push(resolution);
-      resolveDurableGate?.(resolution);
+      if (resolveDurableGate) {
+        const resolve = resolveDurableGate;
+        resolveDurableGate = undefined;
+        resolve(resolution);
+      } else {
+        pendingDurableResolution = resolution;
+      }
     }
   }
   const orca = new LocalResumeOrca(runId);

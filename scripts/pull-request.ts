@@ -252,9 +252,7 @@ export async function bindPullRequest(input: {
     login: repositoryRoute.actor_login,
     nodeId: repositoryRoute.actor_node_id
   }, receiptNodeId)
-  const unresolvedCreate = typeof input.ledger.unresolvedManagedCommentCreateIntent === 'function'
-    ? input.ledger.unresolvedManagedCommentCreateIntent(input.runId)
-    : undefined
+  const unresolvedCreate = input.ledger.unresolvedManagedCommentCreateIntent(input.runId)
   if (!comment && unresolvedCreate) {
     throw new PullRequestBindingError(
       `unresolved managed comment create intent (${unresolvedCreate.intentSha256}) requires manual resolution: managed comment is absent on pull request #${pullRequest.number}`
@@ -279,7 +277,7 @@ export async function bindPullRequest(input: {
     try {
       requireLease()
     } catch (error) {
-      input.ledger.resolveMutationIntent?.({
+      input.ledger.resolveMutationIntent({
         attemptId: input.attemptId,
         intentSha256: managedCommentIntent,
         reason: 'lease-lost',
@@ -296,7 +294,7 @@ export async function bindPullRequest(input: {
       }
     } catch (error) {
       if (!(error instanceof GithubAuthorityError) || error.kind !== 'mutation-indeterminate') {
-        input.ledger.resolveMutationIntent?.({
+        input.ledger.resolveMutationIntent({
           attemptId: input.attemptId,
           intentSha256: managedCommentIntent,
           reason: 'definite-failure',
@@ -412,7 +410,7 @@ export async function bindPullRequest(input: {
     stageId: 'pr'
   })
   if (comment && unresolvedCreate) {
-    input.ledger.resolveMutationIntent?.({
+    input.ledger.resolveMutationIntent({
       attemptId: input.attemptId,
       intentSha256: unresolvedCreate.intentSha256,
       reason: 'reconciled',

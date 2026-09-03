@@ -33,6 +33,8 @@ test('runPipeline in Release 2 journals passed outcome before settlement and upd
   const remote = path.join(temp, 'origin.git')
   const gatePath = path.join(temp, 'gate')
   const priorHome = process.env.ORCA_NO_MISTAKES_HOME
+  let ledger: DomainLedger | undefined
+  try {
   process.env.ORCA_NO_MISTAKES_HOME = path.join(temp, 'home')
 
   await mkdir(repo)
@@ -59,7 +61,7 @@ test('runPipeline in Release 2 journals passed outcome before settlement and upd
     }
     return runCommand(executable, args.map((arg) => arg === destination ? remote : arg), options)
   }
-  const ledger = new DomainLedger(':memory:')
+  ledger = new DomainLedger(':memory:')
   const runId = 'run-release-2-journal'
 
   let task = 0
@@ -116,7 +118,6 @@ test('runPipeline in Release 2 journals passed outcome before settlement and upd
   await mkdir(path.join(repoRoot, '.orca', 'no-mistakes'), { recursive: true })
   await mkdir(gatePath)
 
-  try {
     await installAbortReaping({
       gate: {
         branch: 'feature',
@@ -169,7 +170,7 @@ test('runPipeline in Release 2 journals passed outcome before settlement and upd
       `pending summary must include custody note: ${markerContent.pendingSummary}`
     )
   } finally {
-    ledger.close()
+    ledger?.close()
     await installAbortReaping({ pid: process.pid })
     if (priorHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME
     else process.env.ORCA_NO_MISTAKES_HOME = priorHome

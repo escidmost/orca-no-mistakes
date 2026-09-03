@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp } from 'node:fs/promises'
+import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -51,8 +51,10 @@ function harness(route: { actor_id: string; actor_login: string; actor_node_id: 
       route_fingerprint: 'route'
     }),
     ownsLease: () => true,
+    resolveMutationIntent: () => {},
     run: () => ({ branch: 'feature', repo_root: '/repo' }),
-    settleRemoteStage: () => ({ receiptSha256: 'pr-receipt' })
+    settleRemoteStage: () => ({ receiptSha256: 'pr-receipt' }),
+    unresolvedManagedCommentCreateIntent: () => undefined
   }
   return { ledger }
 }
@@ -72,12 +74,16 @@ async function bind(
   authority: Record<string, unknown>
 ) {
   const directory = await mkdtemp(path.join(tmpdir(), 'onm-ownership-'))
-  return bindPullRequest({
-    artifactPath: path.join(directory, 'pr.json'), attemptId: 'attempt',
-    authority: authority as never, candidateCommitOid: OID, generationToken: 1,
-    intent: 'intent', ledger: ledger as never, now: () => '2026-01-01T00:00:00.000Z',
-    pipelineEvidenceRoot: 'root', runId: 'run', stageSummaries: [], workerIdentity: 'coordinator'
-  })
+  try {
+    return await bindPullRequest({
+      artifactPath: path.join(directory, 'pr.json'), attemptId: 'attempt',
+      authority: authority as never, candidateCommitOid: OID, generationToken: 1,
+      intent: 'intent', ledger: ledger as never, now: () => '2026-01-01T00:00:00.000Z',
+      pipelineEvidenceRoot: 'root', runId: 'run', stageSummaries: [], workerIdentity: 'coordinator'
+    })
+  } finally {
+    await rm(directory, { force: true, recursive: true })
+  }
 }
 
 test('proves a newly created managed comment authored under the actor node id', async () => {

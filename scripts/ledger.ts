@@ -626,21 +626,37 @@ const V2_ASSURANCE_CLAIMS: AssuranceClaim[] = [
   'pull-request-bound'
 ]
 
-function pipelineEvidencePayload(manifest: PipelineCompletionAttestationManifest): unknown {
-  const pushIndex = manifest.stagePlan.findIndex((entry) => entry.stage === 'push')
-  const prePrStages = new Set(manifest.stagePlan.slice(0, pushIndex + 1).map((entry) => entry.stage))
+function pipelineEvidencePayload(
+  entries: StageEvidenceManifestEntry[],
+  meta: Pick<
+    PipelineCompletionAttestationManifest,
+    | 'attemptOutcomeDigests'
+    | 'baseCommitOid'
+    | 'candidateCommitOid'
+    | 'candidatePublicationReceiptSha256'
+    | 'intentHash'
+    | 'policySha256'
+    | 'publicationRoute'
+    | 'runId'
+    | 'stageDispositions'
+    | 'stagePlan'
+  >
+): unknown {
+  const pushIndex = meta.stagePlan.findIndex((entry) => entry.stage === 'push')
+  if (pushIndex < 0) throw new Error('pipeline evidence requires a push stage')
+  const prePrStages = new Set(meta.stagePlan.slice(0, pushIndex + 1).map((entry) => entry.stage))
   return {
-    attemptOutcomeDigests: manifest.attemptOutcomeDigests.slice(0, -1),
-    baseCommitOid: manifest.baseCommitOid,
-    candidateCommitOid: manifest.candidateCommitOid,
-    candidatePublicationReceiptSha256: manifest.candidatePublicationReceiptSha256,
-    intentHash: manifest.intentHash,
-    policySha256: manifest.policySha256,
-    publicationRoute: manifest.publicationRoute,
-    runId: manifest.runId,
-    stageDispositions: manifest.stageDispositions.filter((entry) => prePrStages.has(entry.stage)),
-    stageEvidence: manifest.stageEvidence.filter((entry) => prePrStages.has(entry.stage)),
-    stagePlan: manifest.stagePlan.slice(0, pushIndex + 1)
+    attemptOutcomeDigests: meta.attemptOutcomeDigests,
+    baseCommitOid: meta.baseCommitOid,
+    candidateCommitOid: meta.candidateCommitOid,
+    candidatePublicationReceiptSha256: meta.candidatePublicationReceiptSha256,
+    intentHash: meta.intentHash,
+    policySha256: meta.policySha256,
+    publicationRoute: meta.publicationRoute,
+    runId: meta.runId,
+    stageDispositions: meta.stageDispositions.filter((entry) => prePrStages.has(entry.stage)),
+    stageEvidence: entries.filter((entry) => prePrStages.has(entry.stage)),
+    stagePlan: meta.stagePlan.slice(0, pushIndex + 1)
   }
 }
 
@@ -660,22 +676,10 @@ export function buildPipelineEvidenceRoot(
     | 'stagePlan'
   >
 ): string {
-  const pushIndex = meta.stagePlan.findIndex((entry) => entry.stage === 'push')
-  if (pushIndex < 0) throw new Error('pipeline evidence requires a push stage')
-  const prePrStages = new Set(meta.stagePlan.slice(0, pushIndex + 1).map((entry) => entry.stage))
-  return merkleRoot([sha256(canonicalJson({
-    attemptOutcomeDigests: meta.attemptOutcomeDigests,
-    baseCommitOid: meta.baseCommitOid,
-    candidateCommitOid: meta.candidateCommitOid,
-    candidatePublicationReceiptSha256: meta.candidatePublicationReceiptSha256,
-    intentHash: intentHash(meta.intent),
-    policySha256: meta.policySha256,
-    publicationRoute: meta.publicationRoute,
-    runId: meta.runId,
-    stageDispositions: meta.stageDispositions.filter((entry) => prePrStages.has(entry.stage)),
-    stageEvidence: entries.filter((entry) => prePrStages.has(entry.stage)),
-    stagePlan: meta.stagePlan.slice(0, pushIndex + 1)
-  }))])
+  return merkleRoot([sha256(canonicalJson(pipelineEvidencePayload(entries, {
+    ...meta,
+    intentHash: intentHash(meta.intent)
+  })))])
 }
 
 function v2MerkleRoot(manifest: PipelineCompletionAttestationManifest): string {
@@ -891,7 +895,10 @@ export function verifyCompletionAttestation(manifest: CompletionAttestationManif
     throw new Error('attestation assurance claims are invalid')
   }
   const expectedPipelineRoot = merkleRoot([
-    sha256(canonicalJson(pipelineEvidencePayload(manifest)))
+    sha256(canonicalJson(pipelineEvidencePayload(
+      manifest.stageEvidence,
+      { ...manifest, attemptOutcomeDigests: manifest.attemptOutcomeDigests.slice(0, -1) }
+    )))
   ])
   if (manifest.pipelineEvidenceRoot !== expectedPipelineRoot) {
     throw new Error('attestation pipeline evidence root is invalid')
@@ -2288,7 +2295,7 @@ export class DomainLedger {
           FROM resolved_mutation_intents_legacy`)
         this.#db.exec('DROP TABLE resolved_mutation_intents_legacy')
         this.#db.exec(`CREATE INDEX IF NOT EXISTS idx_resolved_mutation_intents_run
-          ON resolved_mutation_intents(run_id, intent_sha256)`)
+          ON resolved_mutation_intents(run_id)`)
         this.#db.exec('COMMIT')
       } catch (error) {
         this.#db.exec('ROLLBACK')
@@ -3930,6 +3937,7 @@ export class DomainLedger {
       typeof payload.pullRequestNodeId === 'string' && payload.pullRequestNodeId !== '' &&
       typeof payload.managedCommentNodeId === 'string' && payload.managedCommentNodeId !== '' &&
       typeof payload.managedCommentBodySha256 === 'string' &&
+      HEX_64.test(payload.managedCommentBodySha256) &&
       managedCommentPayload.action === 'ensure-managed-summary' &&
       managedCommentPayload.bodySha256 === payload.managedCommentBodySha256 &&
       (managedCommentPayload.managedCommentNodeId === null ||
@@ -5278,20 +5286,20 @@ export class DomainLedger {
     }[]
     const outcomes = retainedOutcomes.map((row) => {
       try {
-        const digest = sha256(canonicalJson({
+        const digest = attemptOutcomeSha256({
           actorIdentity: row.actor_identity,
           attemptId: row.attempt_id,
           candidateCommitOid: row.candidate_commit_oid,
           completedAt: row.completed_at,
           coordinatorIdentity: row.coordinator_identity,
-          custody: JSON.parse(row.custody_json) as unknown,
+          custody: JSON.parse(row.custody_json) as AttemptOutcomeInput['custody'],
           reason: row.reason,
-          receiptDigests: JSON.parse(row.receipt_digests_json) as unknown,
+          receiptDigests: JSON.parse(row.receipt_digests_json) as string[],
           resumeEligible: Number(row.resume_eligible) === 1,
           runId: row.run_id,
           stoppingFact: row.stopping_fact,
           verdict: row.verdict
-        }))
+        })
         return digest === row.outcome_sha256 ? digest : ''
       } catch {
         return ''

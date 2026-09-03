@@ -23,6 +23,8 @@ async function runRelease2Pipeline(failAfter?: 'push' | 'pr'): Promise<void> {
   const repo = path.join(temp, 'repo')
   const remote = path.join(temp, 'origin.git')
   const priorHome = process.env.ORCA_NO_MISTAKES_HOME
+  let ledger: DomainLedger | undefined
+  try {
   process.env.ORCA_NO_MISTAKES_HOME = path.join(temp, 'home')
   await mkdir(repo)
   execFileSync('git', ['-c', 'init.templateDir=', 'init', '--bare', '-b', 'main', remote])
@@ -49,7 +51,7 @@ async function runRelease2Pipeline(failAfter?: 'push' | 'pr'): Promise<void> {
     if (args[0] === 'push') pushCount += 1
     return runCommand(executable, args.map((arg) => arg === destination ? remote : arg), options)
   }
-  const ledger = new DomainLedger(':memory:')
+  ledger = new DomainLedger(':memory:')
   const completedStages: string[] = []
   let task = 0
   let dispatch = 0
@@ -119,7 +121,6 @@ async function runRelease2Pipeline(failAfter?: 'push' | 'pr'): Promise<void> {
     },
   } as unknown as GithubAuthority
 
-  try {
     ledger.setRepositoryPublicationRoute({
       actorId: 'A_actor', actorLogin: 'owner', actorNodeId: 'AN_actor',
       backend: 'gh', backendVersion: 'test', baseBranch: 'main',
@@ -162,7 +163,7 @@ async function runRelease2Pipeline(failAfter?: 'push' | 'pr'): Promise<void> {
     assert.equal(commentCreateCount, 1)
     assert.equal(commentUpdateCount, failAfter === 'pr' ? 1 : 0)
   } finally {
-    ledger.close()
+    ledger?.close()
     if (priorHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME
     else process.env.ORCA_NO_MISTAKES_HOME = priorHome
     await rm(temp, { force: true, recursive: true })
