@@ -19,10 +19,13 @@ If your assigned task explicitly says you are already a no-mistakes stage worker
 - Work is committed on a clean, named feature branch.
 - The branch is not the detected default branch.
 - The repository has an `origin` remote.
+- The repository has a successful `orca-no-mistakes init` and a persisted GitHub publication route matching the run's base and head branches.
 - Orca is running and CLI tooling for the configured worker agents (`opencode` by default) is authenticated.
 - No other run holds the branch semantic lease. A conflicting run fails closed with `branch <name> is already leased by run <id>`; reclaim it with `--force-lease` only after confirming the other run is dead.
 
 ## Invocation
+
+New Release 2 direct runs are rejected unless this repository has a successful init and a persisted GitHub publication route matching the run's base/head branch. Run `orca-no-mistakes init --repo /path/to/repo` before invocation to install repository-local admission and persist the matching publication route; follow the [Local gate](../../README.md#local-gate) workflow.
 
 For a bare `/orca-no-mistakes`, validate the user's already-committed changes. For `/orca-no-mistakes <task>`, complete and commit only that task first, preserving unrelated work, then validate it.
 
@@ -33,8 +36,6 @@ orca-no-mistakes run --repo /path/to/repo --intent "<user objective and constrai
 orca-no-mistakes run --repo /path/to/repo --resume <failed-run-id>
 ```
 
-For repository-local admission, run `orca-no-mistakes init --repo /path/to/repo`, then follow the [Local gate](../../README.md#local-gate) workflow.
-
 A newly admitted direct run launches detached in a dedicated Orca terminal and returns `{"detached":true,"terminalHandle":"..."}`. If its admission is already being handled or accepted, the command returns `{"admissionId":"...","replayed":true,"runId":"..."}` immediately instead (`runId` can be `null` until binding); see [Gates and outcomes](../../README.md#gates-and-outcomes). A detached launch avoids blocking the caller and allows the originating session to receive decision notifications and resolve gates via `orca orchestration send`.
 
 Use `--resume` only for a failed run whose clean initiating checkout is still at its original submission commit. Detached resume reconstructs the isolated gate worktree at the last durable checkpoint, retains the original evidence and resolved gate decisions, and runs only the stages that still need validation. Keeping the initiating checkout at the submission commit lets successful custody transfer advance it automatically.
@@ -43,13 +44,9 @@ Available direct-run controls are `--base`, `--head`, `--force-lease`, `--notify
 
 ## Gates
 
-The detached run returns immediately. When an Orca gate is pending, the coordinator sends a gate notification to the originating terminal with the exact `orca orchestration send` command to resolve it. Agents must use that supplied command:
+The detached run returns immediately. When an Orca gate is pending, the coordinator sends a gate notification to the originating terminal with the exact `orca orchestration send` command to resolve it. The coordinator generates an authenticated `question` message addressed with `--to`/`--run`, the exact subject `no-mistakes gate response`, and a JSON body containing `gateId` and `resolution`. Agents must run that emitted command verbatim, substituting only the chosen `<resolution>`. Do not use static or handwritten command templates.
 
-```bash
-orca orchestration send --from <terminal> --type gate_resolved --gate-id <gate-id> --resolution <decision>
-```
-
-Decisions are `approve`, `fix`, `skip`, and `stop`; anything else fails closed.
+Finding-gate choices are `approve`, `fix`, `skip`, and `stop`. Durable resume-gate choices (opened when an attempt stops after a resumable failure) are `resume` and `stop`. Anything else fails closed.
 
 A `fix` resolution supports targeted finding selection, per-finding instructions, and global guidance:
 
