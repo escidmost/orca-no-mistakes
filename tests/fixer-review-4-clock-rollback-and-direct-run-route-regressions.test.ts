@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -425,6 +425,10 @@ test('new direct Release 2 run without init fails after admission before creatin
   const temp = await mkdtemp(path.join(tmpdir(), 'onm-direct-no-init-'))
   const intent = 'Reject direct Release 2 run without initialized route.'
   try {
+    const fakeOrca = path.join(temp, 'orca')
+    await writeFile(fakeOrca, '#!/bin/sh\nprintf \'{"ok":true,"result":{}}\\n\'\n')
+    await chmod(fakeOrca, 0o755)
+    process.env.ORCA_CLI_COMMAND = fakeOrca
     const origin = path.join(temp, 'origin.git')
     execFileSync('git', ['init', '-b', 'main', path.join(temp, 'repo')], { stdio: 'ignore' })
     const repo = await realpath(path.join(temp, 'repo'))
