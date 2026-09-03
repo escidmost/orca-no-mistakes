@@ -5079,9 +5079,9 @@ async function validateReport(
       const title =
         typeof aliases.title === "string" ? aliases.title.trim() : "";
       const message =
-        typeof aliases.message === "string"
+        typeof aliases.message === "string" && aliases.message.trim()
           ? aliases.message.trim()
-          : typeof aliases.body === "string"
+          : typeof aliases.body === "string" && aliases.body.trim()
             ? aliases.body.trim()
             : "";
       const description =
