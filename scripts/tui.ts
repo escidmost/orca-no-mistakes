@@ -1175,17 +1175,24 @@ export class RailTuiRenderer implements PresentationRenderer {
     const isFixing =
       (state?.status === "active" && (state?.round ?? 0) > 0) ||
       this.#autoFixedStages.has(stage);
+    const targetFindingIds = state?.targetFindingIds
+      ? new Set(state.targetFindingIds)
+      : undefined;
 
     for (const finding of findings) {
       let dispGlyph: string;
       let color: string;
+      const isTargetFixing =
+        targetFindingIds !== undefined
+          ? targetFindingIds.has(finding.id)
+          : false;
       if (finding.disposition === "fixed") {
         dispGlyph = glyph.fixed;
         color = SGR.green;
       } else if (finding.disposition === "approved") {
         dispGlyph = glyph.approved;
         color = SGR.dim;
-      } else if (isFixing) {
+      } else if (isFixing && isTargetFixing) {
         dispGlyph = glyph.fixing;
         color = SGR.amber;
       } else {

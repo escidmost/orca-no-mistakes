@@ -3187,6 +3187,10 @@ export async function runPipeline(
           if (!gateAudited) openGateAudit(gateId);
           const resolution = (await orca.waitForGate(gateId)).trim();
           const decision = parseGateResolution(resolution, actionable);
+          const selectedFindingIds = selectedFindingIdsForGate(
+            decision,
+            gateOptions,
+          );
           ledger.recordGateAudit({
             decision: decision.action,
             evidenceSha256: gateEvidenceSha256,
@@ -3197,10 +3201,7 @@ export async function runPipeline(
             resolution,
             roundIndex: gateEvidenceRound,
             runId,
-            selectedFindingIds: selectedFindingIdsForGate(
-              decision,
-              gateOptions,
-            ),
+            selectedFindingIds,
             stageId: stage,
           });
           presentation.publish(`gate:${gateId}:resolved`, {
@@ -3209,6 +3210,9 @@ export async function runPipeline(
             kind: "gate-resolved",
             round,
             stage,
+            ...(selectedFindingIds !== undefined
+              ? { targetFindingIds: selectedFindingIds }
+              : {}),
           });
           if (
             decision.action !== "unknown" &&
@@ -3262,7 +3266,12 @@ export async function runPipeline(
         round += 1;
         presentation.publish(
           `attempt:${presentation.current.attempt}:stage:${stage}:round:${round}:started`,
-          { kind: "round-started", round, stage },
+          {
+            kind: "round-started",
+            round,
+            stage,
+            targetFindingIds: targetFindings.map((finding) => finding.id),
+          },
         );
         ledger.heartbeatLease(deliveryRepo.root, deliveryRepo.branch, runId);
         const fixerRoles = pipelineConfig.stages[stage].fixer;
@@ -4469,7 +4478,7 @@ export function registeredStageLog(
 }
 
 function exitCodeFor(report: StageReport): number {
-  return report.findings.length > 0 ? 1 : 0;
+  return actionableFindings(report).length > 0 ? 1 : 0;
 }
 
 async function runReviewer(
@@ -4996,6 +5005,47 @@ function isValidFinding(value: unknown): value is Finding {
   );
 }
 
+function invalidFindingFields(value: unknown): string[] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return ["shape"];
+  }
+  const finding = value as Partial<Finding>;
+  const invalid: string[] = [];
+  if (typeof finding.id !== "string" || !FINDING_ID_PATTERN.test(finding.id)) {
+    invalid.push("id");
+  }
+  if (typeof finding.description !== "string" || !finding.description.trim()) {
+    invalid.push("description");
+  }
+  if (
+    finding.action !== "ask-user" &&
+    finding.action !== "auto-fix" &&
+    finding.action !== "no-op"
+  ) {
+    invalid.push("action");
+  }
+  if (
+    finding.severity !== "error" &&
+    finding.severity !== "info" &&
+    finding.severity !== "warning"
+  ) {
+    invalid.push("severity");
+  }
+  if (
+    finding.file !== undefined &&
+    (typeof finding.file !== "string" || !finding.file.trim())
+  ) {
+    invalid.push("file");
+  }
+  if (
+    finding.line !== undefined &&
+    (!Number.isInteger(finding.line) || finding.line < 1)
+  ) {
+    invalid.push("line");
+  }
+  return invalid;
+}
+
 async function validateReport(
   report: StageReport,
   stage: StageName,
@@ -5064,37 +5114,38 @@ async function validateReport(
               aliases.location.line >= 1
             ? aliases.location.line
             : undefined;
+      const id =
+        typeof finding.id === "string" &&
+        FINDING_ID_PATTERN.test(finding.id.trim())
+          ? finding.id.trim()
+          : `${stage}-${createHash("sha256")
+              .update(
+                JSON.stringify([
+                  index,
+                  file,
+                  line,
+                  description,
+                  action,
+                  severity,
+                ]),
+              )
+              .digest("hex")
+              .slice(0, 12)}`;
       return {
-        ...finding,
         action,
         description,
         ...(file !== undefined ? { file } : {}),
-        id:
-          typeof finding.id === "string" &&
-          FINDING_ID_PATTERN.test(finding.id.trim())
-            ? finding.id.trim()
-            : `${stage}-${createHash("sha256")
-                .update(
-                  JSON.stringify([
-                    index,
-                    file,
-                    line,
-                    description,
-                    action,
-                    severity,
-                  ]),
-                )
-                .digest("hex")
-                .slice(0, 12)}`,
+        id,
         ...(line !== undefined ? { line } : {}),
         severity,
       };
     }),
   };
-  for (const finding of normalizedReport.findings) {
+  for (const [index, finding] of normalizedReport.findings.entries()) {
     if (!isValidFinding(finding)) {
+      const invalidFields = invalidFindingFields(finding);
       throw new Error(
-        `${stage} worker returned an invalid finding: ${JSON.stringify(finding)}`,
+        `${stage} worker returned an invalid finding: index ${index} (invalid fields: ${invalidFields.join(", ")})`,
       );
     }
   }
