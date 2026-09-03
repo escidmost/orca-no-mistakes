@@ -649,7 +649,11 @@ type ConfiguredLauncherMarker = {
   intentTaskId?: string;
   kind: "configured-launcher";
   launcherId: string;
+  notifyHandle?: string;
   originWorktree: string;
+  outcomeDelivered?: boolean;
+  pendingOutcome?: "passed" | "failed" | "cancelled";
+  pendingSummary?: string;
   pid: number;
   root: string;
   runObjective: string;
@@ -667,7 +671,11 @@ type OrcaLauncherMarker = {
   gateBranch: string;
   kind: "orca-launcher";
   launcherId: string;
+  notifyHandle?: string;
   originWorktree: string;
+  outcomeDelivered?: boolean;
+  pendingOutcome?: "passed" | "failed" | "cancelled";
+  pendingSummary?: string;
   pid: number;
 };
 
@@ -10251,6 +10259,10 @@ async function launchDetachedRun(
     userGlobalConfig.worktree_roots,
   );
   const existingRunId = stringFlag(flags, "run-id");
+  const notifyHandle =
+    stringFlag(flags, "notify") ?? process.env.ORCA_TERMINAL_HANDLE;
+  if (notifyHandle !== undefined) abortReap.notifyHandle = notifyHandle;
+  else delete abortReap.notifyHandle;
   let configuredOrca: CliOrca | undefined;
   let intentTaskId = "";
   let terminalHandle = "";
@@ -10287,6 +10299,7 @@ async function launchDetachedRun(
     await writeMarker(launcherMarkerFile!, marker);
   };
   const cleanupFailedLaunch = async (error: unknown): Promise<void> => {
+    delete abortReap.notifyHandle;
     const cleanupGate = gate ?? launcherMarker?.gate ?? orcaLauncherMarker?.gate;
     if (launcherMarker && launcherMarkerFile) {
       launcherMarker.cleanupPending = true;
@@ -10408,6 +10421,7 @@ async function launchDetachedRun(
       createdAt: new Date().toISOString(),
       kind: "configured-launcher",
       launcherId,
+      ...(notifyHandle !== undefined ? { notifyHandle } : {}),
       originWorktree: repo.root,
       pid: process.pid,
       root,
@@ -10518,6 +10532,7 @@ async function launchDetachedRun(
       gateBranch,
       kind: "orca-launcher",
       launcherId,
+      ...(notifyHandle !== undefined ? { notifyHandle } : {}),
       originWorktree: repo.root,
       pid: process.pid,
     };
@@ -10682,8 +10697,6 @@ async function launchDetachedRun(
   }
   if (admissionId) attachedArgs.push("--admission-id", admissionId);
   if (flags.tui !== true && flags["no-tui"] !== true) attachedArgs.push("--tui");
-  const notifyHandle =
-    stringFlag(flags, "notify") ?? process.env.ORCA_TERMINAL_HANDLE;
   if (notifyHandle) attachedArgs.push("--notify", notifyHandle);
   const quotedCommand = [
     process.execPath,
@@ -11126,7 +11139,7 @@ async function discoverConfiguredLauncherAllocations(
 
 async function deliverPendingOutcome(
   markerFile: string,
-  marker: GateRunMarker,
+  marker: GateRunMarker | ConfiguredLauncherMarker,
   runId: string | undefined,
   orcaCommand: string,
   repoRoot: string,
@@ -11134,7 +11147,7 @@ async function deliverPendingOutcome(
   gateExists = true,
 ): Promise<boolean> {
   const outcome = marker.pendingOutcome;
-  const domainRunId = marker.domainRunId ?? runId;
+  const domainRunId = (marker as GateRunMarker).domainRunId ?? runId;
   const run =
     domainRunId && ledger ? ledger.runIdentity(domainRunId) : undefined;
   if (marker.notifyHandle === undefined) {
@@ -11282,7 +11295,7 @@ async function deliverPendingOutcome(
 
 async function journalStrandedCancellation(
   markerFile: string,
-  marker: GateRunMarker,
+  marker: GateRunMarker | ConfiguredLauncherMarker,
   runId: string,
   reason: string,
 ): Promise<boolean> {
@@ -11686,7 +11699,17 @@ async function reapConfiguredLauncher(
     (marker.runId !== undefined &&
       (!RUN_ID_PATTERN.test(marker.runId) ||
         configuredRunPath(root, marker.runId) !==
-          path.join(root, marker.runId)))
+          path.join(root, marker.runId))) ||
+    (marker.notifyHandle !== undefined &&
+      (typeof marker.notifyHandle !== "string" || marker.notifyHandle.length === 0)) ||
+    (marker.pendingOutcome !== undefined &&
+      marker.pendingOutcome !== "passed" &&
+      marker.pendingOutcome !== "failed" &&
+      marker.pendingOutcome !== "cancelled") ||
+    (marker.pendingSummary !== undefined &&
+      typeof marker.pendingSummary !== "string") ||
+    (marker.outcomeDelivered !== undefined &&
+      typeof marker.outcomeDelivered !== "boolean")
   ) {
     return false;
   }
@@ -11756,6 +11779,9 @@ async function reapConfiguredLauncher(
         cleanupPending: true,
         createdAt: marker.createdAt,
         gate: marker.gate,
+        ...(marker.notifyHandle !== undefined
+          ? { notifyHandle: marker.notifyHandle }
+          : {}),
         originWorktree: marker.originWorktree,
         pid: marker.pid,
         runId: marker.runId,
@@ -11791,10 +11817,45 @@ async function reapConfiguredLauncher(
     if (
       run !== undefined &&
       run.status === "in-progress" &&
-      !ledger.settleRun(marker.runId, "cancelled", {
-        branch: run.branch,
+      (!(await journalStrandedCancellation(
+        markerFile,
+        marker,
+        marker.runId,
+        "Configured launcher terminated before gate allocation",
+      )) ||
+        !ledger.settleRun(marker.runId, "cancelled", {
+          branch: run.branch,
+          repoRoot,
+        }))
+    ) {
+      return false;
+    }
+    if (
+      run !== undefined &&
+      run.status === "in-progress" &&
+      !(await deliverPendingOutcome(
+        markerFile,
+        marker,
+        marker.runId,
+        orcaCommand,
         repoRoot,
-      })
+        ledger,
+        false,
+      ))
+    ) {
+      return false;
+    }
+    if (
+      marker.pendingOutcome !== undefined &&
+      !(await deliverPendingOutcome(
+        markerFile,
+        marker,
+        marker.runId,
+        orcaCommand,
+        repoRoot,
+        ledger,
+        false,
+      ))
     ) {
       return false;
     }
@@ -11840,6 +11901,16 @@ async function reapOrcaLauncher(
       typeof marker.allocationPending !== "boolean") ||
     (marker.allocationPid !== undefined &&
       (!Number.isInteger(marker.allocationPid) || marker.allocationPid <= 0)) ||
+    (marker.notifyHandle !== undefined &&
+      (typeof marker.notifyHandle !== "string" || marker.notifyHandle.length === 0)) ||
+    (marker.pendingOutcome !== undefined &&
+      marker.pendingOutcome !== "passed" &&
+      marker.pendingOutcome !== "failed" &&
+      marker.pendingOutcome !== "cancelled") ||
+    (marker.pendingSummary !== undefined &&
+      typeof marker.pendingSummary !== "string") ||
+    (marker.outcomeDelivered !== undefined &&
+      typeof marker.outcomeDelivered !== "boolean") ||
     (await coordinatorIsLive({ pid: marker.pid }, orcaCommand, repoRoot))
   ) {
     return false;
