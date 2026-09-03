@@ -10,7 +10,7 @@ Successful completion means all eight required stages and both remote receipts s
 
 ## Install
 
-Requires Node.js 24+, Git, GitHub CLI (`gh`) with existing authentication (`GH_TOKEN`, `GITHUB_TOKEN`, or stored `gh` auth), a running Orca app, and authenticated CLI tooling for the configured worker agents (`opencode` by default).
+Requires Node.js 24+, Git, a running Orca app, and authenticated CLI tooling for the configured worker agents (`opencode` by default). New Release 2 runs additionally require the GitHub CLI (`gh`) with existing authentication (`GH_TOKEN`, `GITHUB_TOKEN`, or stored `gh` auth); migrated Release 1 resumes do not require GitHub publication initialization or credentials.
 
 ```bash
 npm install

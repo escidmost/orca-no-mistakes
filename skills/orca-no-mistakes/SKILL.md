@@ -19,8 +19,7 @@ If your assigned task explicitly says you are already a no-mistakes stage worker
 - Work is committed on a clean, named feature branch.
 - The branch is not the detected default branch.
 - The repository has an `origin` remote.
-- The repository has a successful `orca-no-mistakes init` and a persisted GitHub publication route matching the run's base and head branches.
-- The GitHub CLI (`gh`) is installed and GitHub authentication is configured (`GH_TOKEN`, `GITHUB_TOKEN`, or stored `gh` account).
+- For new Release 2 runs, the repository has a successful `orca-no-mistakes init` with a persisted GitHub publication route matching the run's base and head branches, and the GitHub CLI (`gh`) is installed with configured authentication (`GH_TOKEN`, `GITHUB_TOKEN`, or stored `gh` account). Migrated Release 1 resumes do not require GitHub publication initialization or credentials.
 - Orca is running and CLI tooling for the configured worker agents (`opencode` by default) is authenticated.
 - No other run holds the branch semantic lease. A conflicting run fails closed with `branch <name> is already leased by run <id>`; reclaim it with `--force-lease` only after confirming the other run is dead.
 
