@@ -247,6 +247,7 @@ type WorkerReportFailure = (worker: WorkerResult, error: Error) => Promise<void>
 
 export interface OrcaOperations {
   preflight?(): Promise<void>;
+  notifyResumeRequired?(message: string): Promise<void>;
   createRun(objective: string): Promise<string>;
   workerName?(name: string): string;
   createTask(
@@ -3750,14 +3751,35 @@ export async function runPipeline(
         }
         const message =
           failure instanceof Error ? failure.message : String(failure);
+        const waitingForResume = resumeRequestAllowed && !resumeRequested;
         await orca
           .setWorktreeStatus(
-            `${statusPrefix}no-mistakes stopped: ${message}`,
-            "in-review",
+            waitingForResume
+              ? `${statusPrefix}no-mistakes waiting for resume: ${message}`
+              : resumeRequestAllowed
+                ? `${statusPrefix}no-mistakes resuming: ${message}`
+                : `${statusPrefix}no-mistakes stopped: ${message}`,
+            resumeRequestAllowed ? "in-progress" : "in-review",
           )
           .catch(() => {});
         if (anchorError) {
           throw new RecoveryAnchorError(runId, outcome, failure, anchorError);
+        }
+        if (waitingForResume) {
+          try {
+            await orca.notifyResumeRequired?.(message);
+          } catch (notificationError) {
+            resumeRequestAllowed = false;
+            console.error(
+              `warning: could not deliver resumable-run decision: ${String(notificationError)}`,
+            );
+            await orca
+              .setWorktreeStatus(
+                `${statusPrefix}no-mistakes stopped: ${message} (resume notification unavailable)`,
+                "in-review",
+              )
+              .catch(() => {});
+          }
         }
         return resumeRequestAllowed;
       });
@@ -5955,13 +5977,52 @@ export class CliOrca implements OrcaOperations {
     outcome: "passed" | "failed" | "cancelled",
     summary: string,
   ): Promise<void> {
+    await this.#notifyOrigin(
+      `no-mistakes run ${outcome}`,
+      summary,
+      [
+        `A detached no-mistakes run ${outcome}.`,
+        summary,
+        "Report this result to the user and take any requested follow-up action.",
+      ].join("\n\n"),
+      outcome === "passed" ? "normal" : "high",
+      "status",
+    );
+  }
+
+  async notifyResumeRequired(message: string): Promise<void> {
+    const terminal = process.env.ORCA_TERMINAL_HANDLE;
+    const instructions = [
+      message,
+      ...(terminal ? [`Coordinator terminal: ${terminal}`] : []),
+      "Send R to resume, or send C to leave the run stopped.",
+    ].join("\n\n");
+    await this.#notifyOrigin(
+      "no-mistakes resume decision required",
+      instructions,
+      [
+        "A detached no-mistakes run is waiting after a resumable failure.",
+        instructions,
+        "Inspect the failure and ask the user whether to resume or leave the run stopped.",
+      ].join("\n\n"),
+      "high",
+      "question",
+    );
+  }
+
+  async #notifyOrigin(
+    subject: string,
+    body: string,
+    prompt: string,
+    priority: "high" | "normal",
+    type: "question" | "status",
+  ): Promise<void> {
     if (
       !this.#notifyHandle ||
       this.#notifyHandle === process.env.ORCA_TERMINAL_HANDLE
     ) {
       return;
     }
-    const subject = `no-mistakes run ${outcome}`;
     const failures: string[] = [];
     await this.#json([
       "orchestration",
@@ -5972,11 +6033,11 @@ export class CliOrca implements OrcaOperations {
       "--subject",
       subject,
       "--body",
-      summary,
+      body,
       "--type",
-      "status",
+      type,
       "--priority",
-      outcome === "passed" ? "normal" : "high",
+      priority,
       "--json",
     ]).catch((error) => {
       failures.push(
@@ -5989,11 +6050,7 @@ export class CliOrca implements OrcaOperations {
       "--terminal",
       this.#notifyHandle,
       "--text",
-      [
-        `A detached no-mistakes run ${outcome}.`,
-        summary,
-        "Report this result to the user and take any requested follow-up action.",
-      ].join("\n\n"),
+      prompt,
       "--enter",
       "--json",
     ]).catch((error) => {
@@ -6006,7 +6063,7 @@ export class CliOrca implements OrcaOperations {
     }
     if (failures.length === 2) {
       throw new Error(
-        `no-mistakes run ${outcome} notification could not be delivered to ${this.#notifyHandle} over any transport`,
+        `${subject} notification could not be delivered to ${this.#notifyHandle} over any transport`,
       );
     }
   }
@@ -7840,7 +7897,9 @@ export class CliOrca implements OrcaOperations {
       "--comment",
       comment,
     ];
-    if (status) args.push("--workspace-status", status);
+    if (status && !process.env.NO_MISTAKES_GATE_WORKTREE_ID) {
+      args.push("--workspace-status", status);
+    }
     args.push("--json");
     try {
       await this.#json(args);
