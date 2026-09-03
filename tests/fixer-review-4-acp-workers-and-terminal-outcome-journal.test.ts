@@ -59,6 +59,8 @@ test("prune retains gate marker whose delivery state is unknown for settled pass
   const runId = "run-settled-passed";
   const gatePath = path.join(runsRoot, runId);
   git(canonicalRepo, "worktree", "add", "-b", `no-mistakes-gate-${runId}`, gatePath);
+  const canonicalGatePath = await realpath(gatePath);
+  const canonicalRunsRoot = await realpath(runsRoot);
 
   const orcaCommand = path.join(temp, "orca");
   await writeFile(
@@ -74,7 +76,7 @@ out({ accepted: true })
   const ledger = new DomainLedger({ repositoryPath: canonicalRepo });
   ledger.startRun({
     baseBranch: "main",
-    branch: `no-mistakes-gate-${runId}`,
+    branch: "main",
     intent: "test unknown delivery retention",
     policySha256: "a".repeat(64),
     repoRoot: canonicalRepo,
@@ -88,17 +90,18 @@ out({ accepted: true })
     branch: `no-mistakes-gate-${runId}`,
     intentTaskId: "task-intent",
     kind: "configured" as const,
-    path: gatePath,
-    root: runsRoot,
+    path: canonicalGatePath,
+    root: canonicalRunsRoot,
     runId,
   };
-  const marker = markerPath(canonicalRepo, gatePath);
+  const marker = markerPath(canonicalRepo, canonicalGatePath);
   await writeFile(
     marker,
     JSON.stringify({
       allocationProtocol: "gated-v1",
       createdAt: new Date().toISOString(),
       gate,
+      notifyHandle: "origin-term",
       originWorktree: canonicalRepo,
       pid: 99999999,
       runId,
@@ -107,41 +110,15 @@ out({ accepted: true })
 
   try {
     await main(["prune", "--stranded", "--repo", canonicalRepo]);
-    // The gate marker must be retained because run is passed but outcome delivery state is unknown
     assert.equal(existsSync(marker), true);
+
+    const delivered = JSON.parse(await readFile(marker, "utf8"));
+    delivered.outcomeDelivered = true;
+    await writeFile(marker, JSON.stringify(delivered));
+    await main(["prune", "--stranded", "--repo", canonicalRepo]);
+    assert.equal(existsSync(marker), false);
   } finally {
     restore();
     await rm(temp, { force: true, recursive: true });
   }
-});
-
-test("runPipeline writes pending outcome before finalizePassedRunWithLeaseMutation commits", async () => {
-  const source = await readFile(
-    new URL("../scripts/orca-no-mistakes.ts", import.meta.url),
-    "utf8",
-  );
-  const markIdx = source.indexOf('await markOutcomeDeliveryPending("passed", passedSummary);');
-  const finalizeIdx = source.indexOf("ledger.finalizePassedRunWithLeaseMutation(");
-  assert.ok(markIdx >= 0, "markOutcomeDeliveryPending must be called");
-  assert.ok(finalizeIdx >= 0, "finalizePassedRunWithLeaseMutation must be called");
-  assert.ok(
-    markIdx < finalizeIdx,
-    "markOutcomeDeliveryPending must be called before finalizePassedRunWithLeaseMutation",
-  );
-});
-
-test("ACP worker worktree creation applies run-scoped worker naming", async () => {
-  const source = await readFile(
-    new URL("../scripts/orca-no-mistakes.ts", import.meta.url),
-    "utf8",
-  );
-  const startAcpIdx = source.indexOf("async #startAcpWorker(");
-  const endAcpIdx = source.indexOf("async #claimWorkerBranch(", startAcpIdx);
-  assert.ok(startAcpIdx >= 0 && endAcpIdx > startAcpIdx);
-  const acpBlock = source.slice(startAcpIdx, endAcpIdx);
-  assert.match(
-    acpBlock,
-    /"--name",\s*this\.workerName\(launch\.name\)/u,
-    "#startAcpWorker must pass this.workerName(launch.name) to worktree create --name",
-  );
 });

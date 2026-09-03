@@ -16,6 +16,7 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  CliOrca,
   DomainLedger,
   GitShell,
   main,
@@ -145,7 +146,7 @@ out({ accepted: true });
       (args) =>
         args.includes("orchestration") &&
         args.includes("send") &&
-        args.some((arg) => arg.includes("passed")),
+        args.includes("no-mistakes run passed"),
     );
     assert.equal(
       passedNotify,
@@ -186,29 +187,20 @@ out({ accepted: true });
   }
 });
 
-test("workerName avoids collisions for distinct run IDs via stable hash", async () => {
-  const source = await readFile(
-    new URL("../scripts/orca-no-mistakes.ts", import.meta.url),
-    "utf8",
-  );
-  assert.match(
-    source,
-    /workerName\(name:\s*string\):\s*string\s*\{[\s\S]*?createHash\("sha256"\)\.update\(this\.#runId\)\.digest\("hex"\)\.slice\(0,\s*12\)/u,
-    "workerName must scope worker names with sha256 hash of complete run ID",
-  );
-
-  const hashSuffix = (runId: string) =>
-    createHash("sha256").update(runId).digest("hex").slice(0, 12);
-
+test("workerName avoids collisions for distinct run IDs", () => {
+  const scopedName = (runId: string) =>
+    new CliOrca({ command: "orca", cwd: process.cwd(), runId }).workerName(
+      "worker",
+    );
   assert.notEqual(
-    hashSuffix("run.a"),
-    hashSuffix("run-a"),
+    scopedName("run.a"),
+    scopedName("run-a"),
     "run.a and run-a must not produce colliding suffixes",
   );
 
   assert.notEqual(
-    hashSuffix("prefix-alpha-123456789012"),
-    hashSuffix("prefix-bravo-123456789012"),
+    scopedName("prefix-alpha-123456789012"),
+    scopedName("prefix-bravo-123456789012"),
     "run IDs with identical trailing 12 characters must not collide",
   );
 });
@@ -336,7 +328,7 @@ out({ accepted: true });
       "must not report diverged checkout when terminal commit is ancestor",
     );
     assert.equal(
-      body.includes("recoveryInstructions"),
+      body.includes(`refs/no-mistakes/recover/${runId}`),
       false,
       "must not emit recovery instructions when terminal commit is ancestor",
     );

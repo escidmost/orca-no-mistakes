@@ -113,7 +113,7 @@ test("reapAbortedRun preserves and delivers pending passed outcome on already se
     canonicalRepo,
     ".orca",
     "no-mistakes",
-    `gate-${createHash("sha256").update(gate.id).digest("hex").slice(0, 32)}.json`,
+    `gate-${createHash("sha256").update(gate.path).digest("hex").slice(0, 32)}.json`,
   );
   await writeFile(
     markerFile,

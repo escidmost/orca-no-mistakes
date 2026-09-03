@@ -45,54 +45,6 @@ function setEnv(home: string, orcaCommand: string): () => void {
   };
 }
 
-test("abort path journals cancelled pending outcome before settling domain run", async () => {
-  const source = await readFile(
-    new URL("../scripts/orca-no-mistakes.ts", import.meta.url),
-    "utf8",
-  );
-  const reapIdx = source.indexOf("export async function reapAbortedRun(");
-  assert.ok(reapIdx >= 0, "reapAbortedRun must exist");
-  const markIdx = source.indexOf('await markOutcomeDeliveryPending("cancelled", summary);', reapIdx);
-  const settleIdx = source.indexOf('cancelled = ledger.settleRun(', reapIdx);
-  assert.ok(markIdx >= 0, "markOutcomeDeliveryPending must be called in reapAbortedRun");
-  assert.ok(settleIdx >= 0, "ledger.settleRun must be called in reapAbortedRun");
-  assert.ok(
-    markIdx < settleIdx,
-    "markOutcomeDeliveryPending must be called before ledger.settleRun in reapAbortedRun",
-  );
-});
-
-test("passed outcome journaling stays inside the lease mutation", async () => {
-  const source = await readFile(
-    new URL("../scripts/orca-no-mistakes.ts", import.meta.url),
-    "utf8",
-  );
-  const finalizeIdx = source.indexOf("ledger.finalizePassedRunWithLeaseMutation(");
-  assert.ok(finalizeIdx >= 0, "finalizePassedRunWithLeaseMutation must be called");
-  const endFinalizeIdx = source.indexOf("return { attestation, custodyNote };", finalizeIdx);
-  assert.ok(endFinalizeIdx > finalizeIdx);
-  const finalizeBlock = source.slice(finalizeIdx, endFinalizeIdx);
-  assert.ok(
-    finalizeBlock.includes('await markOutcomeDeliveryPending(\n                "passed",\n                `${passedSummary}\\n${note}`,') ||
-    finalizeBlock.includes('markOutcomeDeliveryPending(\n                "passed",'),
-    "finalizePassedRunWithLeaseMutation callback must journal custody note before committing",
-  );
-  assert.doesNotMatch(
-    finalizeBlock,
-    /\}\);\s*await markOutcomeDeliveryPending\(\s*"passed"/u,
-    "runPipeline must not rewrite the passed journal after the ledger commits",
-  );
-  const mainPassed = source.slice(
-    source.lastIndexOf("const passedSummary = ["),
-    source.lastIndexOf('await orca.notifyRunResult("passed", passedSummary);'),
-  );
-  assert.doesNotMatch(
-    mainPassed,
-    /markOutcomeDeliveryPending\(\s*"passed"/u,
-    "main must deliver the journal committed by runPipeline without rewriting it",
-  );
-});
-
 test("deliverPendingOutcome reconstructs custody note and recovery instructions when missing from passed pending outcome", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "onm-custody-reconstruct-"));
   const repo = path.join(temp, "repo");

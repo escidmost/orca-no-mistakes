@@ -3382,7 +3382,16 @@ export async function runPipeline(
           const failureSummary = recoverRef
             ? `No-mistakes ${outcome}: ${reason}\n${recoveryInstructions(recoverRef)}`
             : `No-mistakes ${outcome}: ${reason}`;
-          await markOutcomeDeliveryPending(outcome, failureSummary);
+          try {
+            await markOutcomeDeliveryPending(outcome, failureSummary);
+          } catch (journalError) {
+            throw new RunSettlementError(
+              runId,
+              outcome,
+              failure,
+              journalError,
+            );
+          }
           if (outcome === "cancelled") {
             const eventKey =
               `attempt:${presentation.current.attempt}:cancellation:gate-stop`;
@@ -14150,14 +14159,15 @@ Run options:
   if (!gate && notifyHandle) {
     throw new Error("--notify is not supported for direct attached runs");
   }
+  const attachedRunId =
+    gate?.kind === "configured"
+      ? gate.runId
+      : admissionRow?.run_id ?? stringFlag(parsed.flags, "run-id");
   const orca = new CliOrca({
     cwd: gatePath,
     notifyHandle,
     parentWorktree: gate?.kind === "configured" ? originWorktree : undefined,
-    runId:
-      gate?.kind === "configured"
-        ? gate.runId
-        : admissionRow?.run_id ?? stringFlag(parsed.flags, "run-id"),
+    runId: attachedRunId,
   });
   const deliveryGit = gate
     ? new GitShell({
@@ -14346,7 +14356,12 @@ Run options:
       await markOutcomeDeliveryPending(outcome, failedSummary);
     } catch (markerError) {
       retainGate = true;
-      throw markerError;
+      throw new RunSettlementError(
+        attachedRunId ?? "unknown",
+        outcome,
+        error,
+        markerError,
+      );
     }
     try {
       await orca.notifyRunResult(outcome, failedSummary);

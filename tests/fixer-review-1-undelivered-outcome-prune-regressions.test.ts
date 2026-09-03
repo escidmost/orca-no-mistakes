@@ -282,6 +282,7 @@ test("failed attached runs persist their undelivered outcome in the gate marker"
       /gate worktree is not based on the initiating checkout/,
     );
   } finally {
+    await installAbortReaping({ pid: process.pid });
     restoreSnapshot(snapshot);
     await rm(seeded.temp, { force: true, recursive: true });
   }
@@ -372,6 +373,7 @@ test("stranded prune delivers a pending configured-gate outcome before cleanup",
       calls.some((args) => args[0] === "terminal" && args[1] === "send"),
     );
   } finally {
+    await installAbortReaping({ pid: process.pid });
     restoreSnapshot(snapshot);
     await rm(seeded.temp, { force: true, recursive: true });
   }
