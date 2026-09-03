@@ -2540,7 +2540,6 @@ export async function runPipeline(
       for (const stage of pipelineSteps.slice(0, resumeStageIndex)) {
         const evidence = latestEvidenceByStage.get(stage)!;
         const approval = resolvedApprovalAudit(stage, evidence);
-        if (!approval) continue;
         const checkpointMatches = contiguousCheckpoints.has(
           `${stage}:${evidence.round_index}:${evidence.candidate_commit_oid}`,
         );
@@ -2599,13 +2598,15 @@ export async function runPipeline(
             },
           );
         }
-        presentation.publish(`gate:${approval.gate_id}:resolved:reconciled`, {
-          decision: approval.decision,
-          gateId: approval.gate_id,
-          kind: "gate-resolved",
-          round: evidence.round_index,
-          stage,
-        });
+        if (approval) {
+          presentation.publish(`gate:${approval.gate_id}:resolved:reconciled`, {
+            decision: approval.decision,
+            gateId: approval.gate_id,
+            kind: "gate-resolved",
+            round: evidence.round_index,
+            stage,
+          });
+        }
         presentation.publish(
           `stage:${stage}:round:${evidence.round_index}:completed:${evidence.candidate_commit_oid}:reconciled`,
           { kind: "stage-completed", round: evidence.round_index, stage },
