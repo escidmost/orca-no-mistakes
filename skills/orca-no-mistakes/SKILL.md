@@ -20,6 +20,7 @@ If your assigned task explicitly says you are already a no-mistakes stage worker
 - The branch is not the detected default branch.
 - The repository has an `origin` remote.
 - The repository has a successful `orca-no-mistakes init` and a persisted GitHub publication route matching the run's base and head branches.
+- The GitHub CLI (`gh`) is installed and GitHub authentication is configured (`GH_TOKEN`, `GITHUB_TOKEN`, or stored `gh` account).
 - Orca is running and CLI tooling for the configured worker agents (`opencode` by default) is authenticated.
 - No other run holds the branch semantic lease. A conflicting run fails closed with `branch <name> is already leased by run <id>`; reclaim it with `--force-lease` only after confirming the other run is dead.
 

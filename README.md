@@ -10,7 +10,7 @@ Successful completion means all eight required stages and both remote receipts s
 
 ## Install
 
-Requires Node.js 24+, Git, a running Orca app, and authenticated CLI tooling for the configured worker agents (`opencode` by default).
+Requires Node.js 24+, Git, GitHub CLI (`gh`) with existing authentication (`GH_TOKEN`, `GITHUB_TOKEN`, or stored `gh` auth), a running Orca app, and authenticated CLI tooling for the configured worker agents (`opencode` by default).
 
 ```bash
 npm install
@@ -47,7 +47,7 @@ intent=$(node -e 'process.stdout.write(Buffer.from(process.argv[1]).toString("ba
 git -C /path/to/repo push --push-option="no-mistakes.intent=$intent" orca-no-mistakes HEAD:refs/heads/feature
 ```
 
-When the upstream remote parses as GitHub, `init` also authenticates GitHub and persists the stable base/head repository route; provider-neutral init installs the local gate without a publication route. New Release 2 runs require the persisted GitHub publication route before they can complete the remote push and pr stages. Use `--upstream`, `--fork`, `--base-branch`, and `--head-branch` to override the detected route. Tags, deletes, the default branch, multi-ref pushes, malformed intent, and unsafe transport state are rejected before admission. Gate and direct submissions with the same repository, ref, candidate, and intent converge on one durable submission identity and run the same remote delivery stages.
+When the upstream remote parses as GitHub, `init` also verifies GitHub authentication and persists the stable base/head repository route; provider-neutral init installs the local gate without a publication route. New Release 2 runs require the persisted GitHub publication route before they can complete the remote push and pr stages. Use `--upstream`, `--fork`, `--base-branch`, and `--head-branch` to override the detected route. Tags, deletes, the default branch, multi-ref pushes, malformed intent, and unsafe transport state are rejected before admission. Gate and direct submissions with the same repository, ref, candidate, and intent converge on one durable submission identity and run the same remote delivery stages.
 
 Useful direct-run options:
 

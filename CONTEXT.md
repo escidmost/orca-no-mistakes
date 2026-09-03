@@ -57,7 +57,7 @@ The immutable per-run identity of the base repository, head repository, head own
 _Avoid_: Origin, current remotes, push URL
 
 **Repository publication route**:
-The durable, mutable publication route persisted once per repository and bound to the authenticated actor and backend. It is guarded against authenticated-actor drift and against change while active runs depend on it, and each run snapshots it as its immutable per-run Publication route.
+The durable, mutable publication route persisted once per repository and bound to the authenticated actor and backend. It is guarded against authenticated-actor drift and against change while active runs or resumable failed runs depend on it, and each run snapshots it as its immutable per-run Publication route.
 _Avoid_: Per-run route, origin, ambient remote
 
 **Publication head ref**:
