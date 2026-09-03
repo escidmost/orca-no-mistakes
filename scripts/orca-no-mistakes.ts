@@ -14369,7 +14369,7 @@ export async function main(argv: string[]): Promise<void> {
   ) {
     console.log(`Usage:
   orca-no-mistakes run (--intent <text> | --resume <run-id>) [--repo <path>] [--base <branch>] [--head <sha>] [--force-lease]
-  orca-no-mistakes init [--repo <path>]
+  orca-no-mistakes init [--repo <path>] [--upstream <url|nwo>] [--fork <url|nwo>] [--base-branch <branch>] [--head-branch <branch>]
   orca-no-mistakes gate admit --gate <path>
   orca-no-mistakes gate coordinator --gate <path> --admission-id <id> --readiness <path> --launch-nonce <nonce>
   orca-no-mistakes attestation export <run-id|commit-sha> [--out <path>] [--repo <path>]
@@ -14387,6 +14387,12 @@ Run options:
   --allow-local-config
   --config <path>
   --force-lease (reclaim a stranded branch lease)
+
+ Init options:
+  --upstream <url|nwo> (override upstream repository URL or owner/repo)
+  --fork <url|nwo> (override fork repository URL or owner/repo)
+  --base-branch <branch> (override target base branch)
+  --head-branch <branch> (override publication head branch)
 
  Prune options:
   --stranded (reap stranded gate and direct-run resources whose coordinator died; cannot be combined with --before)
