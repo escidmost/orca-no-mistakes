@@ -3475,9 +3475,27 @@ export class DomainLedger {
     payload: Record<string, unknown>
     targetFingerprint: string
   } | undefined {
-    const settledReceipt = this.remoteReceipt(runId, 'pull-request-binding')
-    if (settledReceipt) {
-      return undefined
+    const settledReceipts = this.#db.prepare(
+      `SELECT created_at, receipt_json FROM remote_receipts
+       WHERE run_id = ? AND kind = 'pull-request-binding'`
+    ).all(runId) as Array<{ created_at: string; receipt_json: string }>
+
+    const resolvedIntents = new Set<string>()
+    let latestReceiptCreatedAt: string | undefined
+    for (const receipt of settledReceipts) {
+      if (latestReceiptCreatedAt === undefined || receipt.created_at > latestReceiptCreatedAt) {
+        latestReceiptCreatedAt = receipt.created_at
+      }
+      try {
+        const parsed = JSON.parse(receipt.receipt_json) as {
+          payload?: { managedCommentIntent?: unknown }
+        }
+        if (typeof parsed?.payload?.managedCommentIntent === 'string') {
+          resolvedIntents.add(parsed.payload.managedCommentIntent)
+        }
+      } catch {
+        // ignore malformed
+      }
     }
 
     const rows = this.#db.prepare(
@@ -3494,6 +3512,12 @@ export class DomainLedger {
     }>
 
     for (const row of rows) {
+      if (resolvedIntents.has(row.intent_sha256)) {
+        continue
+      }
+      if (latestReceiptCreatedAt !== undefined && row.created_at <= latestReceiptCreatedAt) {
+        continue
+      }
       try {
         const payload = JSON.parse(row.payload_json) as Record<string, unknown>
         if (payload.action === 'ensure-managed-summary' && payload.managedCommentNodeId === null) {

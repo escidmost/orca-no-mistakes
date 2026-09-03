@@ -2521,6 +2521,43 @@ export async function runPipeline(
         const evidence = latestEvidenceByStage.get(stage)!;
         const approval = resolvedApprovalAudit(stage, evidence);
         if (!approval) continue;
+        const checkpointMatches = contiguousCheckpoints.has(
+          `${stage}:${evidence.round_index}:${evidence.candidate_commit_oid}`,
+        );
+        const dispositions = ledger.stageDispositions(runId);
+        const hasDisposition = dispositions.some(
+          (d) => d.stage_id === stage && d.disposition === "satisfied",
+        );
+        if (pipelineSteps.includes("push") && (!checkpointMatches || !hasDisposition)) {
+          const stageIndex = pipelineSteps.indexOf(stage);
+          const prevStage = stageIndex > 0 ? pipelineSteps[stageIndex - 1] : undefined;
+          const checkpointCandidate = prevStage
+            ? finalCheckpointByStage.get(prevStage)?.output_commit_oid ?? submissionCommitOid
+            : submissionCommitOid;
+          ledger.settleLocalStage(
+            {
+              checkpoint: {
+                inputCommitOid: checkpointCandidate,
+                outputCommitOid: evidence.candidate_commit_oid,
+                roundIndex: evidence.round_index,
+              },
+              evidenceSha256: evidence.evidence_sha256,
+              runId,
+              stageId: stage,
+            },
+          );
+          contiguousCheckpoints.add(
+            `${stage}:${evidence.round_index}:${evidence.candidate_commit_oid}`,
+          );
+          finalCheckpointByStage.set(stage, {
+            created_at: new Date().toISOString(),
+            input_commit_oid: checkpointCandidate,
+            output_commit_oid: evidence.candidate_commit_oid,
+            round_index: evidence.round_index,
+            run_id: runId,
+            stage_id: stage,
+          });
+        }
         const restored = presentation.current.stages.find(
           (item) => item.id === stage,
         );
