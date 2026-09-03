@@ -388,7 +388,9 @@ export class GithubAuthority {
       cursor = nextCursor(data.repository.pullRequests.pageInfo, seen, 'observe-pull-requests')
     } while (cursor)
 
-    const observations = nodes.map(normalizePullRequest)
+    const observations = nodes
+      .map(normalizePullRequest)
+      .filter((pullRequest) => pullRequest.state === 'OPEN')
     const exact = observations.filter((pullRequest) =>
       pullRequest.baseBranch === input.baseBranch &&
       pullRequest.baseRepositoryId === input.baseRepositoryId &&

@@ -3491,6 +3491,11 @@ export async function runPipeline(
         const priorOutcomeDigests = ledger
           .listAttemptOutcomes(runId)
           .map((entry) => entry.outcome_sha256);
+        const passedSummary = [
+          `Run ${runId} passed all ${pipelineSteps.length} stages.`,
+          `Candidate commit: ${terminalCommitOid}.`,
+        ].join("\n");
+        await markOutcomeDeliveryPending("passed", passedSummary);
         const settled = await presentation.publishAsync(
           { kind: "run-completed", status: "passed" },
           (snapshot) =>
@@ -3502,7 +3507,14 @@ export async function runPipeline(
                 generationToken: generationToken!,
                 repoRoot: deliveryRepo.root,
               },
-              transferCustody,
+              async () => {
+                const note = await transferCustody();
+                await markOutcomeDeliveryPending(
+                  "passed",
+                  `${passedSummary}\n${note}`,
+                );
+                return note;
+              },
               (custodyNote) => ({
                 actorIdentity,
                 attemptId: terminalAttemptId,
