@@ -3573,8 +3573,8 @@ export class DomainLedger {
     const belongsToRun = this.#db.prepare(
       `SELECT 1
        FROM mutation_intents m
-       JOIN run_attempts a ON a.run_id = m.run_id
-       WHERE m.run_id = ? AND m.intent_sha256 = ? AND a.attempt_id = ?`
+       JOIN run_attempts a ON a.run_id = m.run_id AND a.attempt_id = m.attempt_id
+       WHERE m.run_id = ? AND m.intent_sha256 = ? AND m.attempt_id = ?`
     ).get(input.runId, input.intentSha256, input.attemptId)
     if (!belongsToRun) {
       throw new Error('mutation intent resolution does not belong to the run and attempt')

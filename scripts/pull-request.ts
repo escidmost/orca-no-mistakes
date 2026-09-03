@@ -411,7 +411,7 @@ export async function bindPullRequest(input: {
   })
   if (comment && unresolvedCreate) {
     input.ledger.resolveMutationIntent({
-      attemptId: input.attemptId,
+      attemptId: unresolvedCreate.attemptId,
       intentSha256: unresolvedCreate.intentSha256,
       reason: 'reconciled',
       runId: input.runId

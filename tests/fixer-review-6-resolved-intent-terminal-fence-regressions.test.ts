@@ -45,6 +45,21 @@ test('reopening adds reconciled mutation intent resolutions', async () => {
       payload: { action: 'ensure-managed-summary', managedCommentNodeId: null },
       runId, targetFingerprint: 'target-1'
     })
+    const laterAttemptId = 'attempt-2'
+    ledger.releaseLease(runId)
+    const laterGenerationToken = ledger.acquireLease({
+      branch: 'feature', repoRoot: '/repo', runId
+    })
+    ledger.startAttempt({
+      actorIdentity: 'operator', attemptId: laterAttemptId, coordinatorIdentity: 'coordinator',
+      generationToken: laterGenerationToken, runId, startedAt: new Date().toISOString()
+    })
+    assert.throws(
+      () => ledger.resolveMutationIntent({
+        attemptId: laterAttemptId, intentSha256, reason: 'reconciled', runId
+      }),
+      /does not belong to the run and attempt/
+    )
     ledger.resolveMutationIntent({ attemptId, intentSha256, reason: 'reconciled', runId })
     ledger.resolveMutationIntent({ attemptId, intentSha256, reason: 'reconciled', runId })
     assert.equal(ledger.unresolvedManagedCommentCreateIntent(runId), undefined)
