@@ -2224,8 +2224,10 @@ export async function runPipeline(
         stageLogs!,
         orca.resolveGate?.bind(orca),
         (enabled) => {
-          if (enabled === autoFixMode) return;
-          const eventKey = `mode:${ledger.listAutoFixModeEvents(runId).length + 1}:${enabled ? "on" : "off"}`;
+          const events = ledger.listAutoFixModeEvents(runId);
+          const latestEvent = events.at(-1);
+          if (enabled === autoFixMode && latestEvent?.source === "operator") return;
+          const eventKey = `mode:${events.length + 1}:${enabled ? "on" : "off"}`;
           let committed = false;
           presentation.publish(eventKey, { enabled, kind: "mode-changed", source: "operator" }, (snapshot) => {
             committed = ledger.recordAutoFixMode(runId, enabled, "operator", {
@@ -5088,18 +5090,17 @@ async function validateReport(
           : [title, message].filter(Boolean).join(": ");
       const rawAction = finding.action as string | undefined;
       const rawSeverity = finding.severity as string | undefined;
+      const isNoOpSeverity = rawSeverity === "no-op";
+      const isAbsentOrNoOpAction =
+        rawAction === undefined || rawAction === "no-op";
       const action: FindingAction =
-        rawAction === "no-op" || rawSeverity === "no-op"
+        isNoOpSeverity && isAbsentOrNoOpAction
           ? "no-op"
-          : rawAction === "auto-fix" || rawAction === "ask-user"
-            ? rawAction
-            : "ask-user";
+          : ((rawAction === undefined ? "ask-user" : rawAction) as FindingAction);
       const severity: "error" | "info" | "warning" =
-        rawSeverity === "no-op"
+        isNoOpSeverity && isAbsentOrNoOpAction
           ? "info"
-          : rawSeverity === "error" || rawSeverity === "warning" || rawSeverity === "info"
-            ? rawSeverity
-            : "error";
+          : (rawSeverity as "error" | "info" | "warning");
       const file =
         typeof finding.file === "string" && finding.file.trim()
           ? finding.file.trim()
