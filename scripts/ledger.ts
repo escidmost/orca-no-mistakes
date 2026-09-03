@@ -1780,6 +1780,16 @@ CREATE TABLE IF NOT EXISTS mutation_intents (
   intent_sha256 TEXT NOT NULL UNIQUE
 );
 
+CREATE TABLE IF NOT EXISTS resolved_mutation_intents (
+  resolution_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  attempt_id TEXT NOT NULL REFERENCES run_attempts(attempt_id) ON DELETE CASCADE,
+  intent_sha256 TEXT NOT NULL REFERENCES mutation_intents(intent_sha256) ON DELETE CASCADE,
+  reason TEXT NOT NULL CHECK(reason IN ('definite-failure', 'lease-lost')),
+  resolved_at TEXT NOT NULL,
+  UNIQUE (run_id, intent_sha256)
+);
+
 CREATE TABLE IF NOT EXISTS remote_receipts (
   receipt_id TEXT PRIMARY KEY,
   run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
@@ -1867,6 +1877,7 @@ CREATE INDEX IF NOT EXISTS idx_remote_observations_run ON remote_observations(ru
 CREATE UNIQUE INDEX IF NOT EXISTS idx_remote_observations_run_digest
   ON remote_observations(run_id, observation_sha256);
 CREATE INDEX IF NOT EXISTS idx_mutation_intents_run ON mutation_intents(run_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_resolved_mutation_intents_run ON resolved_mutation_intents(run_id);
 CREATE INDEX IF NOT EXISTS idx_stage_evidence_run ON stage_evidence(run_id);
 CREATE INDEX IF NOT EXISTS idx_stage_evidence_stage
   ON stage_evidence(run_id, stage_id, round_index);
@@ -1945,6 +1956,10 @@ CREATE TRIGGER IF NOT EXISTS immutable_mutation_intents
 BEFORE UPDATE ON mutation_intents
 BEGIN SELECT RAISE(ABORT, 'mutation_intents rows are immutable'); END;
 
+CREATE TRIGGER IF NOT EXISTS immutable_resolved_mutation_intents
+BEFORE UPDATE ON resolved_mutation_intents
+BEGIN SELECT RAISE(ABORT, 'resolved_mutation_intents rows are immutable'); END;
+
 CREATE TRIGGER IF NOT EXISTS immutable_remote_receipts
 BEFORE UPDATE ON remote_receipts
 BEGIN SELECT RAISE(ABORT, 'remote_receipts rows are immutable'); END;
@@ -1988,6 +2003,11 @@ CREATE TRIGGER IF NOT EXISTS immutable_mutation_intents_delete
 BEFORE DELETE ON mutation_intents
 WHEN EXISTS (SELECT 1 FROM runs WHERE run_id = OLD.run_id)
 BEGIN SELECT RAISE(ABORT, 'mutation_intents rows are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_resolved_mutation_intents_delete
+BEFORE DELETE ON resolved_mutation_intents
+WHEN EXISTS (SELECT 1 FROM runs WHERE run_id = OLD.run_id)
+BEGIN SELECT RAISE(ABORT, 'resolved_mutation_intents rows are immutable'); END;
 
 CREATE TRIGGER IF NOT EXISTS immutable_remote_receipts_delete
 BEFORE DELETE ON remote_receipts
@@ -3468,6 +3488,26 @@ export class DomainLedger {
     ).all(runId) as { intent_sha256: string }[]
   }
 
+  resolveMutationIntent(input: {
+    attemptId: string
+    intentSha256: string
+    reason: 'definite-failure' | 'lease-lost'
+    runId: string
+  }): void {
+    this.#db.prepare(
+      `INSERT OR IGNORE INTO resolved_mutation_intents (
+         resolution_id, run_id, attempt_id, intent_sha256, reason, resolved_at
+       ) VALUES (?, ?, ?, ?, ?, ?)`
+    ).run(
+      randomUUID(),
+      input.runId,
+      input.attemptId,
+      input.intentSha256,
+      input.reason,
+      new Date().toISOString()
+    )
+  }
+
   unresolvedManagedCommentCreateIntent(runId: string): {
     attemptId: string
     createdAt: string
@@ -3489,6 +3529,12 @@ export class DomainLedger {
     }>
 
     const resolvedIntents = new Set<string>()
+    const resolvedRows = this.#db.prepare(
+      `SELECT intent_sha256 FROM resolved_mutation_intents WHERE run_id = ?`
+    ).all(runId) as Array<{ intent_sha256: string }>
+    for (const r of resolvedRows) {
+      resolvedIntents.add(r.intent_sha256)
+    }
     let maxReceiptGeneration: number | bigint | undefined
     let maxReceiptRowid: number | bigint | undefined
 
@@ -3502,10 +3548,16 @@ export class DomainLedger {
       }
       try {
         const parsed = JSON.parse(receipt.receipt_json) as {
+          managedCommentIntent?: unknown
           payload?: { managedCommentIntent?: unknown }
         }
-        if (typeof parsed?.payload?.managedCommentIntent === 'string') {
-          resolvedIntents.add(parsed.payload.managedCommentIntent)
+        const intent = typeof parsed?.managedCommentIntent === 'string'
+          ? parsed.managedCommentIntent
+          : typeof parsed?.payload?.managedCommentIntent === 'string'
+          ? parsed.payload.managedCommentIntent
+          : undefined
+        if (intent) {
+          resolvedIntents.add(intent)
         }
       } catch {
         // ignore malformed

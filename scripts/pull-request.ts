@@ -275,7 +275,17 @@ export async function bindPullRequest(input: {
     targetFingerprint: route.route_fingerprint
   })
   if (comment?.body !== summary) {
-    requireLease()
+    try {
+      requireLease()
+    } catch (error) {
+      input.ledger.resolveMutationIntent?.({
+        attemptId: input.attemptId,
+        intentSha256: managedCommentIntent,
+        reason: 'lease-lost',
+        runId: input.runId
+      })
+      throw error
+    }
     commentMutated = true
     try {
       if (comment) {
@@ -284,7 +294,15 @@ export async function bindPullRequest(input: {
         await input.authority.createIssueComment({ body: summary, subjectId: pullRequest.id })
       }
     } catch (error) {
-      if (!(error instanceof GithubAuthorityError) || error.kind !== 'mutation-indeterminate') throw error
+      if (!(error instanceof GithubAuthorityError) || error.kind !== 'mutation-indeterminate') {
+        input.ledger.resolveMutationIntent?.({
+          attemptId: input.attemptId,
+          intentSha256: managedCommentIntent,
+          reason: 'definite-failure',
+          runId: input.runId
+        })
+        throw error
+      }
     }
     comments = await input.authority.observeIssueComments(pullRequest.id)
     comment = ownedComment(comments, {
