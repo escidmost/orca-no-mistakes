@@ -24,7 +24,7 @@ export type PresentationFinding = {
 export type PresentationTransition =
   | { kind: "run-started" }
   | { attempt: number; kind: "attempt-started" }
-  | { enabled: boolean; kind: "mode-changed" }
+  | { enabled: boolean; kind: "mode-changed"; source?: "initial" | "operator" }
   | { kind: "stage-started"; stage: StageName }
   | { kind: "round-started"; round: number; stage: StageName }
   | {

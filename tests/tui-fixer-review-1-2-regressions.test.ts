@@ -88,7 +88,7 @@ test("rail keeps the retained marker inside the rail width", async () => {
   try {
     renderer.render(snapshot);
     await nextDraw();
-    assert.match(screen(output), /5\. Document cancelled retained/u);
+    assert.match(screen(output), /Document.*retained/u);
   } finally {
     renderer.close();
     rmSync(artifactsDir, { force: true, recursive: true });

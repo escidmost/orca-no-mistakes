@@ -88,6 +88,7 @@ test("log tail keeps redaction and printable mapping in the batched path", async
   );
   try {
     renderer.render(snapshot());
+    input.emit("data", "\r");
     await new Promise((resolve) => setImmediate(resolve));
     const screen = (output.writes.at(-1) ?? "")
       .replace(new RegExp("^.*\\x1b\\[H\\x1b\\[2J", "u"), "")

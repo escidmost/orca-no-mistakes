@@ -46,11 +46,13 @@ function gateSnapshot(
   state: "open" | "resolved",
   sequence: number,
   decision?: string,
+  autoFix = false,
 ): PresentationSnapshot {
   const base = snapshot("review", sequence);
   const options = ["approve", "fix", "skip", "stop"];
   return {
     ...base,
+    mode: { autoFix },
     gate: {
       decision,
       id: "gate-review",
@@ -432,15 +434,315 @@ if (process.env.TUI_FIXTURE === "1") {
     await nextDraw();
 
     const screen = cleanScreen(output.writes.at(-1) ?? "");
-    assert.match(screen, /auto-fix on/iu);
-    assert.match(screen, /Review blocked retained/iu);
-    assert.match(screen, /2\/4 fixed 1 approved 1 open/iu);
-    assert.match(screen, /6\. Lint/iu);
+    assert.match(screen, /auto-fix off/iu);
+    assert.match(screen, /Review\s+retained\s+4 found.{1,3}2 fixed/u);
+    assert.match(screen, /Lint/u);
     assert.match(screen, /A Auto-fix/iu);
     input.emit("data", "A");
     await new Promise((resolve) => setImmediate(resolve));
-    assert.deepEqual(toggles, [false]);
+    assert.deepEqual(toggles, [true]);
     assert.deepEqual(resolutions, []);
+
+    input.emit("data", "\u001b");
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    input.emit("data", "\u001b[B\u001b[B");
+    await nextDraw();
+    const summaryScreen = cleanScreen(output.writes.at(-1) ?? "");
+    assert.match(summaryScreen, /1 open/u);
+    assert.match(summaryScreen, /1 approved/u);
+    renderer.close();
+  });
+
+  test("auto-responder auto-resolves gates with fix for actionable findings and approve on re-review", async () => {
+    const input = new FakeInput();
+    const output = new FakeOutput();
+    output.rows = 20;
+    const resolutions: string[] = [];
+    const renderer = new RailTuiRenderer(
+      input,
+      output,
+      "/unused",
+      new Map(),
+      async (_gateId, resolution) => {
+        resolutions.push(resolution);
+      },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      true,
+    );
+
+    const base = gateSnapshot("open", 2, undefined, true);
+    renderer.render({
+      ...base,
+      stages: base.stages.map((stage) =>
+        stage.id === "review"
+          ? {
+              ...stage,
+              actionableFindings: 1,
+              openFindings: 1,
+              totalFindings: 1,
+            }
+          : stage,
+      ),
+    });
+    await nextDraw();
+    assert.deepEqual(resolutions, ["fix"]);
+
+    renderer.render(gateSnapshot("resolved", 3, "fix", true));
+    await nextDraw();
+
+    const round2 = gateSnapshot("open", 4, undefined, true);
+    renderer.render({
+      ...round2,
+      gate: {
+        ...round2.gate!,
+        id: "gate-review-2",
+      },
+      stages: base.stages.map((stage) =>
+        stage.id === "review"
+          ? {
+              ...stage,
+              fixedFindings: 1,
+              openFindings: 0,
+              round: 2,
+              totalFindings: 1,
+            }
+          : stage,
+      ),
+    });
+    await nextDraw();
+    assert.deepEqual(resolutions, ["fix", "approve"]);
+    renderer.close();
+  });
+
+  test("mode-changed transition synchronizes autoFix mode", async () => {
+    const input = new FakeInput();
+    const output = new FakeOutput();
+    output.columns = 100;
+    output.rows = 24;
+    const renderer = new RailTuiRenderer(input, output, "/unused");
+
+    const base = snapshot("review", 1);
+    const resumed = {
+      ...base,
+      mode: { autoFix: true },
+      transition: { kind: "mode-changed" as const, enabled: true },
+    };
+    renderer.render(resumed);
+    await nextDraw();
+    const screen = cleanScreen(output.writes.at(-1) ?? "");
+    assert.match(screen, /auto-fix on/iu);
+    renderer.close();
+  });
+
+  test("initial mode-changed transition does not enable autoFix", async () => {
+    const input = new FakeInput();
+    const output = new FakeOutput();
+    output.columns = 100;
+    output.rows = 24;
+    const renderer = new RailTuiRenderer(input, output, "/unused");
+
+    const base = snapshot("review", 1);
+    const initial = {
+      ...base,
+      mode: { autoFix: true },
+      transition: { enabled: true, kind: "mode-changed" as const, source: "initial" as const },
+    };
+    renderer.render(initial);
+    await nextDraw();
+    const screen = cleanScreen(output.writes.at(-1) ?? "");
+    assert.match(screen, /auto-fix off/iu);
+    renderer.close();
+  });
+
+  test("narrow findings stack description below ID at narrow pane width", async () => {
+    const input = new FakeInput();
+    const output = new FakeOutput();
+    output.columns = 40;
+    output.rows = 24;
+    const renderer = new RailTuiRenderer(input, output, "/unused");
+
+    const base = snapshot("review", 1);
+    renderer.render({
+      ...base,
+      stages: base.stages.map((stage) =>
+        stage.id === "review"
+          ? {
+              ...stage,
+              findings: [
+                {
+                  description: "Full description readable without truncation",
+                  disposition: "open" as const,
+                  file: "scripts/tui.ts",
+                  id: "narrow-findings-truncate",
+                  line: 1179,
+                  severity: "error" as const,
+                },
+              ],
+              totalFindings: 1,
+            }
+          : stage,
+      ),
+      transition: { kind: "findings-recorded" as const, actionable: 1, round: 1, stage: "review" as const, total: 1 },
+    });
+    await nextDraw();
+    const screen = cleanScreen(output.writes.at(-1) ?? "");
+    assert.match(screen, /Full description/u);
+    assert.match(screen, /scripts\/tui\.ts:1179/u);
+    renderer.close();
+  });
+
+  test("narrow screen stacks stages, activity, and detail vertically", async () => {
+    const input = new FakeInput();
+    const output = new FakeOutput();
+    output.columns = 72;
+    output.rows = 24;
+    const renderer = new RailTuiRenderer(input, output, "/unused");
+
+    const base = snapshot("review", 1);
+    renderer.render({
+      ...base,
+      transition: { kind: "round-started", round: 0, stage: "review" },
+    });
+    await nextDraw();
+
+    const screen = cleanScreen(output.writes.at(-1) ?? "");
+    assert.match(screen, /STAGES/u);
+    assert.match(screen, /ACTIVITY/u);
+    assert.match(screen, /REVIEW/u);
+    renderer.close();
+  });
+
+  test("narrow footer uses ASCII ^v under ASCII locale without Unicode arrows", async () => {
+    const input = new FakeInput();
+    const output = new FakeOutput();
+    output.columns = 50;
+    output.rows = 24;
+    const oldLang = process.env.LANG;
+    const oldLcAll = process.env.LC_ALL;
+    const oldLcCtype = process.env.LC_CTYPE;
+    process.env.LANG = "C";
+    delete process.env.LC_ALL;
+    delete process.env.LC_CTYPE;
+    try {
+      const renderer = new RailTuiRenderer(input, output, "/unused");
+      const base = snapshot("review", 1);
+      renderer.render(base);
+      await nextDraw();
+      const screen = cleanScreen(output.writes.at(-1) ?? "");
+      assert.match(screen, /\^v move/u);
+      assert.ok(!screen.includes("\u2191\u2193"));
+      renderer.close();
+    } finally {
+      if (oldLang !== undefined) process.env.LANG = oldLang;
+      else delete process.env.LANG;
+      if (oldLcAll !== undefined) process.env.LC_ALL = oldLcAll;
+      else delete process.env.LC_ALL;
+      if (oldLcCtype !== undefined) process.env.LC_CTYPE = oldLcCtype;
+      else delete process.env.LC_CTYPE;
+    }
+  });
+
+  test("detail scroll resets when stage changes", async () => {
+    const input = new FakeInput();
+    const output = new FakeOutput();
+    output.columns = 100;
+    output.rows = 20;
+    const renderer = new RailTuiRenderer(input, output, "/unused");
+
+    const base = snapshot("review", 1);
+    renderer.render(base);
+    await nextDraw();
+
+    input.emit("data", "\t\t\u001b[B\u001b[B\u001b[B");
+    await nextDraw();
+
+    input.emit("data", "\t\u001b[B");
+    await nextDraw();
+
+    const screen = cleanScreen(output.writes.at(-1) ?? "");
+    assert.match(screen, /> · Test/u);
+    assert.match(screen, /TEST/u);
+    assert.match(screen, /Not started\./u);
+    renderer.close();
+  });
+
+  test("de-noised activity log consolidates rounds, findings, and fix progress", async () => {
+    const input = new FakeInput();
+    const output = new FakeOutput();
+    output.columns = 100;
+    output.rows = 24;
+    const renderer = new RailTuiRenderer(input, output, "/unused");
+
+    const base = snapshot("intent", 1);
+    renderer.render({ ...base, transition: { attempt: 1, kind: "attempt-started" } });
+    renderer.render({ ...base, transition: { kind: "stage-started", stage: "intent" } });
+    renderer.render({ ...base, transition: { kind: "stage-started", stage: "rebase" } });
+    renderer.render({ ...base, transition: { kind: "round-started", round: 0, stage: "review" } });
+    renderer.render({ ...base, transition: { actionable: 5, kind: "findings-recorded", round: 0, stage: "review", total: 6 } });
+    renderer.render({ ...base, transition: { decision: "fix", gateId: "g1", kind: "gate-resolved", round: 0, stage: "review" } });
+    const withFixed = {
+      ...base,
+      stages: base.stages.map((s) => (s.id === "review" ? { ...s, fixedFindings: 5 } : s)),
+    };
+    renderer.render({
+      ...withFixed,
+      transition: { kind: "round-started", round: 1, stage: "review" },
+    });
+    renderer.render({ ...withFixed, transition: { actionable: 3, kind: "findings-recorded", round: 1, stage: "review", total: 3 } });
+    renderer.render({ ...withFixed, transition: { kind: "round-started", round: 0, stage: "test" } });
+
+    await nextDraw();
+    const screen = cleanScreen(output.writes.at(-1) ?? "");
+    assert.match(screen, /Run 1 started/u);
+    assert.match(screen, /Intent started/u);
+    assert.match(screen, /Rebase started/u);
+    assert.match(screen, /Review round 1 · 5 found/u);
+    assert.match(screen, /Review fix 1 · 5 fixed/u);
+    assert.match(screen, /Review round 2 · 3 found/u);
+    assert.match(screen, /Test round 1/u);
+    renderer.close();
+  });
+
+  test("finding names wrap on hyphens without truncation", async () => {
+    const input = new FakeInput();
+    const output = new FakeOutput();
+    output.columns = 120;
+    output.rows = 24;
+    const renderer = new RailTuiRenderer(input, output, "/unused");
+
+    const base = snapshot("review", 1);
+    const withLongFinding = {
+      ...base,
+      stages: base.stages.map((s) =>
+        s.id === "review"
+          ? {
+              ...s,
+              findings: [
+                {
+                  description: "Long finding explanation that wraps cleanly across multiple lines.",
+                  disposition: "open" as const,
+                  file: "scripts/tui.ts",
+                  id: "unexplained-policy-relaxation",
+                  line: 437,
+                  severity: "error" as const,
+                },
+              ],
+              openFindings: 1,
+              totalFindings: 1,
+            }
+          : s,
+      ),
+    };
+
+    renderer.render(withLongFinding);
+    await nextDraw();
+    const screen = cleanScreen(output.writes.at(-1) ?? "");
+    assert.doesNotMatch(screen, /~/u);
+    assert.match(screen, /unexplained-policy-/u);
+    assert.match(screen, /relaxation/u);
     renderer.close();
   });
 
@@ -501,13 +803,13 @@ if (process.env.TUI_FIXTURE === "1") {
       assert.equal(frame.includes("\u4e2d"), false);
       assert.equal(frame.includes("\u0301"), false);
       assert.match(frame, /\[REDACTED\]/u);
-      assert.match(frame, /> \[>\] 3\. Review active retained/u);
+      assert.match(frame, /> (?:\u25cf|\[>\]) Review/u);
       assert.equal(frame.split("\n").length, output.rows);
       assert.ok(
         frame
           .split("\n")
           .every(
-            (line) => line.length <= output.columns && /^[\x20-\x7e]*$/u.test(line),
+            (line) => line.length <= output.columns && /^[\x20-\x7e\u00b7\u2191\u2193\u2502\u2713\u2717\u25cb\u25cf]*$/u.test(line),
           ),
       );
       assert.doesNotMatch(frame, new RegExp("x{100}|y{100}", "u"));
@@ -567,12 +869,12 @@ if (process.env.TUI_FIXTURE === "1") {
     assert.equal(available, 1);
     assert.match(screen(), /RUN ERROR \(RESUMABLE\)/u);
     assert.doesNotMatch(screen(), /CANCEL RUN\?/u);
-    assert.match(screen(), /R Resume/u);
+    assert.match(screen(), /R resume/u);
     input.emit("data", "R");
     await nextDraw();
     assert.equal(requested, 1);
     assert.match(screen(), /Resume requested\. Waiting for the next attempt\./u);
-    assert.doesNotMatch(screen(), /R Resume/u);
+    assert.doesNotMatch(screen(), /R resume/u);
 
     renderer.render({
       ...resumable,
@@ -583,7 +885,7 @@ if (process.env.TUI_FIXTURE === "1") {
     });
     await nextDraw();
     assert.match(screen(), /Resume requested\. Waiting for the next attempt\./u);
-    assert.doesNotMatch(screen(), /R Resume/u);
+    assert.doesNotMatch(screen(), /R resume/u);
     input.emit("data", "R");
     assert.equal(requested, 1);
 
@@ -596,11 +898,11 @@ if (process.env.TUI_FIXTURE === "1") {
       transition: { attempt: 3, kind: "attempt-started" },
     });
     await nextDraw();
-    assert.match(screen(), /RECENT ACTIVITY/u);
-    assert.match(screen(), /Test LOG/u);
+    assert.match(screen(), /ACTIVITY/u);
+    assert.match(screen(), /TEST\s+active/u);
     assert.doesNotMatch(screen(), /pinned Review/u);
-    assert.match(screen(), /> RAIL \(focused\)/u);
-    assert.match(screen(), /> \[>\] 4\. Test active/u);
+    assert.match(screen(), /> STAGES/u);
+    assert.match(screen(), /> (?:\u25cf|\[>\]) Test/u);
     input.emit("data", "R");
     assert.equal(requested, 1);
 
@@ -612,7 +914,7 @@ if (process.env.TUI_FIXTURE === "1") {
       transition: { kind: "error-recorded", resumable: false },
     });
     await nextDraw();
-    assert.doesNotMatch(screen(), /R Resume/u);
+    assert.doesNotMatch(screen(), /R resume/u);
     input.emit("data", "R");
     assert.equal(requested, 1);
     input.emit("data", "C");
@@ -667,7 +969,7 @@ if (process.env.TUI_FIXTURE === "1") {
     assert.equal(resumes, 0);
     assert.deepEqual(toggles, []);
     assert.doesNotMatch(cleanScreen(output.writes.at(-1) ?? ""), /CANCEL RUN\?/u);
-    assert.match(cleanScreen(output.writes.at(-1) ?? ""), /> \[ \] 2\. Rebase/u);
+    assert.match(cleanScreen(output.writes.at(-1) ?? ""), /> (?:\u00b7|\[ \]) Rebase/u);
     renderer.close();
   });
 
@@ -692,8 +994,8 @@ if (process.env.TUI_FIXTURE === "1") {
     await nextDraw();
     assert.equal(cancellations, 0);
     assert.match(screen(), /CANCEL RUN\?/u);
-    assert.match(screen(), /run-tui-test.*in-progress/u);
-    assert.match(screen(), /3\. Review/u);
+    assert.match(screen(), /run-tui-test.*attempt 1/u);
+    assert.match(screen(), /Review/u);
     input.emit("data", "\u001b");
     const deadline = Date.now() + 1_000;
     while (/CANCEL RUN\?/u.test(screen())) {
@@ -778,7 +1080,7 @@ if (process.env.TUI_FIXTURE === "1") {
     assert.deepEqual(resolutions, [["gate-review", "fix"]]);
     input.emit("data", "\u001bg\r");
     assert.equal(resolutions.length, 1);
-    assert.match(screen(), /Waiting for canonical gate settlement/u);
+    assert.match(screen(), /Waiting for gate settlement/u);
     renderer.render(gateSnapshot("resolved", 3, "fix"));
     await nextDraw();
     assert.doesNotMatch(screen(), /DECISION REQUIRED/u);
@@ -879,17 +1181,17 @@ if (process.env.TUI_FIXTURE === "1") {
       try {
         await waitFor(
           () =>
-            screen().includes("RECENT ACTIVITY") &&
-            screen().includes("6. Lint"),
+            screen().includes("ACTIVITY") &&
+            screen().includes("Lint"),
         );
-        const initial = screen();
+        const initial = screen().slice(screen().indexOf("STAGES"));
         const labels = [
-          "1. Intent",
-          "2. Rebase",
-          "3. Review",
-          "4. Test",
-          "5. Document",
-          "6. Lint",
+          "Intent",
+          "Rebase",
+          "Review",
+          "Test",
+          "Document",
+          "Lint",
         ];
         assert.ok(
           labels.every(
@@ -898,7 +1200,7 @@ if (process.env.TUI_FIXTURE === "1") {
               initial.indexOf(labels[index - 1]) < initial.indexOf(label),
           ),
         );
-        assert.equal(initial.match(/\[>\]/gu)?.length, 1);
+        assert.equal(initial.match(/(?:\u25cf|\[>\]) (?:Intent|Rebase|Review|Test|Document|Lint)/gu)?.length, 1);
 
         terminal.write("\r");
         await waitFor(
@@ -932,13 +1234,13 @@ if (process.env.TUI_FIXTURE === "1") {
         terminal.write("n");
         await waitFor(
           () =>
-            screen().includes("6. Lint active") &&
+            /(?:\u25cf|\[>\]) Lint/u.test(screen()) &&
             screen().includes("pinned Review"),
         );
-        assert.match(screen(), /6\. Lint active/u);
-        assert.equal(screen().match(/\[>\]/gu)?.length, 1);
+        assert.match(screen(), /(?:\u25cf|\[>\]) Lint/u);
+        assert.equal(screen().match(/(?:\u25cf|\[>\]) (?:Intent|Rebase|Review|Test|Document|Lint)/gu)?.length, 1);
 
-        terminal.resize(60, 15);
+        terminal.resize(30, 10);
         await waitFor(() => screen().includes("Terminal too small"));
         terminal.resize(100, 24);
         await waitFor(
@@ -951,10 +1253,10 @@ if (process.env.TUI_FIXTURE === "1") {
         await waitFor(
           () =>
             !screen().includes("pinned Review") &&
-            screen().includes("> [>] 6. Lint"),
+            /> (?:\u25cf|\[>\]) Lint/u.test(screen()),
         );
         terminal.write("\u001b[Z");
-        await waitFor(() => screen().includes("Up/Down scroll"));
+        await waitFor(() => screen().includes("scroll"));
         assert.ok(!screen().includes("Enter open"));
         terminal.write("\t\t");
         await waitFor(() => screen().includes("Enter open"));
@@ -964,21 +1266,20 @@ if (process.env.TUI_FIXTURE === "1") {
         terminal.resize(72, 18);
         await waitFor(
           () =>
-            screen().includes("RAIL") && !screen().includes("RECENT ACTIVITY"),
+            screen().includes("STAGES") && screen().includes("ACTIVITY"),
         );
         terminal.write("c");
         await waitFor(
           () =>
             screen().includes("CANCEL RUN?") &&
             screen().includes("run-tui-test") &&
-            screen().includes("in-progress") &&
-            screen().includes("3. Review"),
+            screen().includes("Review"),
         );
         terminal.write("\u001b");
         await waitFor(
           () =>
             !screen().includes("CANCEL RUN?") &&
-            screen().includes("Review LOG (PINNED)"),
+            screen().includes("REVIEW LOG"),
         );
         terminal.write("C\r");
         assert.equal(await exited, 0);
