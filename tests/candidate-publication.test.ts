@@ -95,7 +95,7 @@ async function fixture(
     submissionCommitOid: base
   })
   const lintCheckpoints: Array<[string, string, number]> = options.multiAttemptChain
-    ? [[base, firstCandidate, 1], [firstCandidate, candidate, 2], [base, candidate, 2]]
+    ? [[base, firstCandidate, 1], [base, firstCandidate, 1], [firstCandidate, candidate, 2], [firstCandidate, candidate, 2]]
     : [[base, candidate, 0]]
   for (const [inputCommitOid, outputCommitOid, roundIndex] of lintCheckpoints) {
     ledger.recordCheckpoint({

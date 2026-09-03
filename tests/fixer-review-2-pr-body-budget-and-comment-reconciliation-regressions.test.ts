@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -288,6 +288,7 @@ test('bindPullRequest caps generated pull request body within GitHub budget', as
     assert.ok(Buffer.byteLength(createdBody) <= 65536)
   } finally {
     ledger.close()
+    await rm(home, { force: true, recursive: true })
   }
 })
 
@@ -394,5 +395,6 @@ test('indeterminate comment create fails closed when comment is absent, and reco
     assert.equal(ledger.unresolvedManagedCommentCreateIntent('run-reconcile'), undefined)
   } finally {
     ledger.close()
+    await rm(home, { force: true, recursive: true })
   }
 })

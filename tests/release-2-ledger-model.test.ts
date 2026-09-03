@@ -185,10 +185,12 @@ test('reopening removes the legacy unique route fingerprint constraint', async (
     ledger.setRepositoryPublicationRoute(publicationRoute)
     for (const runId of ['route-reuse-1', 'route-reuse-2']) {
       ledger.startRun({
-        baseBranch: 'main', branch: runId, intent: 'Reuse one route.',
+        baseBranch: 'main', branch: 'feature', intent: 'Reuse one route.',
         policySha256: policy, repoRoot: '/repo', runId, submissionCommitOid: commit
       })
     }
+    assert.ok(ledger.publicationRoute('route-reuse-1')?.route_fingerprint)
+    assert.ok(ledger.publicationRoute('route-reuse-2')?.route_fingerprint)
     assert.equal(
       ledger.publicationRoute('route-reuse-1')?.route_fingerprint,
       ledger.publicationRoute('route-reuse-2')?.route_fingerprint

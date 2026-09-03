@@ -2816,7 +2816,7 @@ export async function runPipeline(
         stage === "intent" && options.intentTaskId
           ? options.intentTaskId
           : await orca.createTask(
-              `[${stage}] no-mistakes stage ${pipelineSteps.indexOf(stage) + 1}/${pipelineSteps.length}. Intent: ${intent}`,
+              stageTaskSpec(stage, intent, pipelineSteps),
               {
               deps: previousTask ? [previousTask] : [],
               },
@@ -3819,13 +3819,20 @@ export async function runPipeline(
       const localDecision = waitForResume();
       if (resumeDecision) {
         const { gateId, taskId } = resumeDecision;
-        const durableDecision = orca.waitForGate(gateId).then((resolution) => {
-          if (resolution === "resume") return true;
-          if (resolution === "stop") return false;
-          throw new Error(
-            `resume gate ${gateId} returned unsupported resolution ${resolution}`,
-          );
-        });
+        const durableDecision = orca.waitForGate(gateId)
+          .then((resolution) => {
+            if (resolution === "resume") return true;
+            if (resolution === "stop") return false;
+            throw new Error(
+              `resume gate ${gateId} returned unsupported resolution ${resolution}`,
+            );
+          })
+          .catch((gateError: unknown) => {
+            throw new Error(
+              `resume decision failed after ${failure instanceof Error ? failure.message : String(failure)}: ${String(gateError)}`,
+              { cause: failure },
+            );
+          });
         const decision = await Promise.race([
           localDecision.then((resume) => ({ resume, source: "local" as const })),
           durableDecision.then((resume) => ({ resume, source: "durable" as const })),

@@ -6,7 +6,7 @@ import { homedir } from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
-import type { GuardrailMode } from './config.ts'
+import { PIPELINE_STEPS, type GuardrailMode } from './config.ts'
 import type { PresentationSnapshot } from './presentation.ts'
 
 const { O_APPEND, O_CREAT, O_EXCL, O_NOFOLLOW, O_RDONLY, O_RDWR, O_WRONLY } = constants
@@ -118,11 +118,7 @@ export const LEGACY_STAGE_PLAN = [
   'lint'
 ] as const
 
-export const RELEASE_2_STAGE_PLAN = [
-  ...LEGACY_STAGE_PLAN,
-  'push',
-  'pr'
-] as const
+export const RELEASE_2_STAGE_PLAN = PIPELINE_STEPS
 
 export type GateKind = 'exhaustion' | 'finding' | 'guardrail'
 

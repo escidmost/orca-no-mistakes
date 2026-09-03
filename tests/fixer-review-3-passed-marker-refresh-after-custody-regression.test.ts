@@ -28,6 +28,7 @@ function markerPath(repo: string, gateId: string): string {
 }
 
 test("Release 2 pipeline settles passed and commits attestation when post-custody marker refresh fails", async (t) => {
+  if (process.getuid?.() === 0) return t.skip("permission failure requires a non-root user");
   const temp = await mkdtemp(path.join(tmpdir(), "onm-r2-marker-refresh-fail-"));
   const repo = path.join(temp, "repo");
   const remote = path.join(temp, "origin.git");
@@ -232,6 +233,7 @@ test("Release 2 pipeline settles passed and commits attestation when post-custod
 });
 
 test("local pipeline settles passed and commits attestation when post-custody marker refresh fails", async (t) => {
+  if (process.getuid?.() === 0) return t.skip("permission failure requires a non-root user");
   const temp = await mkdtemp(path.join(tmpdir(), "onm-local-marker-refresh-fail-"));
   const repo = path.join(temp, "repo");
   const remote = path.join(temp, "origin.git");
