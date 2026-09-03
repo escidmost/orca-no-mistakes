@@ -1190,7 +1190,10 @@ async function writeMarker(
   const temporaryPath = `${markerPath}.${randomUUID()}.tmp`;
   await mkdir(path.dirname(markerPath), { recursive: true });
   try {
-    await writeFile(temporaryPath, `${JSON.stringify(marker, null, 2)}\n`);
+    await writeFile(temporaryPath, `${JSON.stringify(marker, null, 2)}\n`, {
+      flag: "wx",
+      mode: 0o600,
+    });
     const temporaryHandle = await open(temporaryPath, "r");
     try {
       await temporaryHandle.sync();
@@ -1335,6 +1338,18 @@ function writeForceStopMarker(): void {
     runId: orchestrationRunId ?? runId,
     ...(orchestrationRunId && orchestrationRunId !== runId
       ? { domainRunId: runId }
+      : {}),
+    ...(abortReap.notifyHandle !== undefined
+      ? { notifyHandle: abortReap.notifyHandle }
+      : {}),
+    ...(abortReap.pendingOutcome !== undefined
+      ? { pendingOutcome: abortReap.pendingOutcome }
+      : {}),
+    ...(abortReap.pendingSummary !== undefined
+      ? { pendingSummary: abortReap.pendingSummary }
+      : {}),
+    ...(abortReap.outcomeDelivered === true
+      ? { outcomeDelivered: true }
       : {}),
   };
   writeMarkerSync(directRunMarkerPath(run.repo_root, runId), marker);
@@ -1656,6 +1671,9 @@ export async function installAbortReaping(
     | "workers"
   >,
 ): Promise<void> {
+  if (!state.gate && state.notifyHandle) {
+    throw new Error("notification delivery requires a gate worktree");
+  }
   // Replace, never merge: a stale gate or runId from an earlier registration
   // must not leak into this run's reap.
   for (const key of Object.keys(abortReap) as (keyof AbortReapState)[]) {
@@ -14022,6 +14040,9 @@ Run options:
           }
         : undefined;
   const notifyHandle = stringFlag(parsed.flags, "notify");
+  if (!gate && notifyHandle) {
+    throw new Error("--notify is not supported for direct attached runs");
+  }
   const orca = new CliOrca({
     cwd: gatePath,
     notifyHandle,
