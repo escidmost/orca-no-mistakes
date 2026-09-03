@@ -2045,6 +2045,26 @@ export async function runPipeline(
       );
     }
   }
+  if (
+    !options.resumeRunId &&
+    pipelineSteps.includes("push") &&
+    options.admission?.source === "direct"
+  ) {
+    let storedRoute = ledger.repositoryPublicationRoute(deliveryRepo.root);
+    if (!storedRoute) {
+      try {
+        storedRoute = ledger.repositoryPublicationRoute(
+          path.resolve(repositoryGatePaths(deliveryRepo.root).commonDir),
+        );
+      } catch {}
+    }
+    if (!storedRoute) {
+      throw new Error("new GitHub runs require successful orca-no-mistakes init");
+    }
+    if (!remotePublication) {
+      throw new Error("Release 2 direct run requires initialized GitHub publication");
+    }
+  }
   let domainRunStarted = false;
   let generationToken: number | undefined;
   let presentation!: PresentationPublisher;

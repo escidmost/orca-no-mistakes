@@ -21,14 +21,14 @@ During installation, a default configuration template is automatically copied to
 
 ## Run
 
-Direct invocation returns a meaningful process exit status:
+New direct runs require successful `orca-no-mistakes init` to configure GitHub publication and persist the repository route before execution. Direct invocation returns a meaningful process exit status:
 
 ```bash
 orca-no-mistakes run --repo /path/to/repo --intent "Add X without changing Y"
 orca-no-mistakes run --repo /path/to/repo --resume <failed-run-id>
 ```
 
-New runs require an explicit single-line `--intent`; failed runs can instead use `--resume` without repeating the intent. The runner requires a clean committed named feature branch, refuses the default base branch, and requires a configured `origin`. It rebases onto the detected default branch unless `--base` is supplied, publishes the validated candidate with an exact force-with-lease, and creates or adopts the exact ready-for-review pull request. Detached resume reuses the failed run's ledger and evidence, reconstructs the isolated gate worktree at its last durable checkpoint, and skips completed stages whose commit-bound evidence is still valid. Leave the clean initiating checkout at the failed run's original submission commit so successful custody transfer can advance it automatically.
+New runs require an explicit single-line `--intent` and prior `orca-no-mistakes init`; failed runs can instead use `--resume` without repeating the intent. The runner requires a clean committed named feature branch, refuses the default base branch, and requires a configured `origin`. It rebases onto the detected default branch unless `--base` is supplied, publishes the validated candidate with an exact force-with-lease, and creates or adopts the exact ready-for-review pull request. Detached resume reuses the failed run's ledger and evidence, reconstructs the isolated gate worktree at its last durable checkpoint, and skips completed stages whose commit-bound evidence is still valid. Leave the clean initiating checkout at the failed run's original submission commit so successful custody transfer can advance it automatically.
 
 ## Local gate
 

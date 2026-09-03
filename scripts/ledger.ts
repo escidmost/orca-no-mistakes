@@ -3476,15 +3476,29 @@ export class DomainLedger {
     targetFingerprint: string
   } | undefined {
     const settledReceipts = this.#db.prepare(
-      `SELECT created_at, receipt_json FROM remote_receipts
-       WHERE run_id = ? AND kind = 'pull-request-binding'`
-    ).all(runId) as Array<{ created_at: string; receipt_json: string }>
+      `SELECT r.created_at, r.receipt_json, a.generation_token, r.rowid
+       FROM remote_receipts r
+       JOIN remote_observations o ON o.run_id = r.run_id AND o.observation_sha256 = r.authoritative_post_observation_sha256
+       JOIN run_attempts a ON a.attempt_id = o.attempt_id AND a.run_id = o.run_id
+       WHERE r.run_id = ? AND r.kind = 'pull-request-binding'`
+    ).all(runId) as Array<{
+      created_at: string
+      generation_token: number | bigint
+      receipt_json: string
+      rowid: number | bigint
+    }>
 
     const resolvedIntents = new Set<string>()
-    let latestReceiptCreatedAt: string | undefined
+    let maxReceiptGeneration: number | bigint | undefined
+    let maxReceiptRowid: number | bigint | undefined
+
     for (const receipt of settledReceipts) {
-      if (latestReceiptCreatedAt === undefined || receipt.created_at > latestReceiptCreatedAt) {
-        latestReceiptCreatedAt = receipt.created_at
+      const gen = Number(receipt.generation_token)
+      const rid = Number(receipt.rowid)
+      if (maxReceiptGeneration === undefined || gen > Number(maxReceiptGeneration) ||
+          (gen === Number(maxReceiptGeneration) && rid > Number(maxReceiptRowid))) {
+        maxReceiptGeneration = gen
+        maxReceiptRowid = rid
       }
       try {
         const parsed = JSON.parse(receipt.receipt_json) as {
@@ -3499,15 +3513,19 @@ export class DomainLedger {
     }
 
     const rows = this.#db.prepare(
-      `SELECT attempt_id, created_at, intent_sha256, payload_json, target_fingerprint
-       FROM mutation_intents
-       WHERE run_id = ? AND kind = 'managed-comment'
-       ORDER BY created_at ASC, rowid ASC`
+      `SELECT m.attempt_id, m.created_at, m.intent_sha256, m.payload_json, m.target_fingerprint,
+              a.generation_token, m.rowid
+       FROM mutation_intents m
+       JOIN run_attempts a ON a.attempt_id = m.attempt_id AND a.run_id = m.run_id
+       WHERE m.run_id = ? AND m.kind = 'managed-comment'
+       ORDER BY a.generation_token ASC, m.rowid ASC`
     ).all(runId) as Array<{
       attempt_id: string
       created_at: string
+      generation_token: number | bigint
       intent_sha256: string
       payload_json: string
+      rowid: number | bigint
       target_fingerprint: string
     }>
 
@@ -3515,8 +3533,15 @@ export class DomainLedger {
       if (resolvedIntents.has(row.intent_sha256)) {
         continue
       }
-      if (latestReceiptCreatedAt !== undefined && row.created_at <= latestReceiptCreatedAt) {
-        continue
+      if (maxReceiptGeneration !== undefined) {
+        const rowGen = Number(row.generation_token)
+        const maxGen = Number(maxReceiptGeneration)
+        if (rowGen < maxGen) {
+          continue
+        }
+        if (rowGen === maxGen && Number(row.rowid) < Number(maxReceiptRowid)) {
+          continue
+        }
       }
       try {
         const payload = JSON.parse(row.payload_json) as Record<string, unknown>
