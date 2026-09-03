@@ -729,7 +729,10 @@ type AbortReapState = {
   generationToken?: number;
   launcherPid?: number;
   ledger?: DomainLedger;
-  notify?: (summary: string) => Promise<void>;
+  notify?: (
+    summary: string,
+    outcome?: "passed" | "failed" | "cancelled",
+  ) => Promise<void>;
   notifyHandle?: string;
   orca?: OrcaOperations;
   orcaCommand?: string;
@@ -1488,11 +1491,12 @@ export async function reapAbortedRun(reason: string): Promise<void> {
   let cancelled = abortReap.runId === undefined;
   let settled = abortReap.runId === undefined;
   let shouldFailOrcaRun = false;
+  let run: ReturnType<DomainLedger["runIdentity"]>;
   if (preserved && abortReap.ledger && abortReap.runId) {
     try {
       const ledger = abortReap.ledger;
       const runId = abortReap.runId;
-      const run = ledger.runIdentity(runId);
+      run = ledger.runIdentity(runId);
       const presentation = new PresentationPublisher(
         ledger,
         runId,
@@ -1502,8 +1506,7 @@ export async function reapAbortedRun(reason: string): Promise<void> {
         () => new Date(),
         (error) => abortLog(String(error)),
       );
-      cancelled = run !== undefined;
-      if (run) {
+      if (run?.status === "in-progress") {
         const summary = recoverRef
           ? `No-mistakes cancelled: ${reason}\n${recoveryInstructions(recoverRef)}`
           : `No-mistakes cancelled: ${reason}`;
@@ -1517,13 +1520,15 @@ export async function reapAbortedRun(reason: string): Promise<void> {
               runId,
               "cancelled",
               {
-                branch: run.branch,
+                branch: run!.branch,
                 generationToken: abortReap.generationToken,
-                repoRoot: run.repo_root,
+                repoRoot: run!.repo_root,
               },
               { eventKey, snapshot },
             )),
         );
+      } else {
+        cancelled = false;
       }
       const status = ledger.runStatus(runId);
       settled = status !== "in-progress";
@@ -1568,7 +1573,7 @@ export async function reapAbortedRun(reason: string): Promise<void> {
       }
     }
     try {
-      await abortReap.notify(summary);
+      await abortReap.notify(summary, "cancelled");
       await clearOutcomeDeliveryPending().catch((markerError) =>
         abortLog(
           `warning: could not clear the delivered cancelled outcome: ${String(markerError)}`,
@@ -1580,6 +1585,37 @@ export async function reapAbortedRun(reason: string): Promise<void> {
         `warning: abort could not deliver the cancelled outcome, retaining the gate for recovery: ${String(error)}`,
       );
     }
+  } else if (!cancelled && abortReap.pendingOutcome !== undefined) {
+    const outcome = abortReap.pendingOutcome;
+    const summary = abortReap.pendingSummary ?? "";
+    try {
+      if (abortReap.notify) {
+        await abortReap.notify(summary, outcome);
+      } else if (abortReap.orca instanceof CliOrca) {
+        await abortReap.orca.notifyRunResult(outcome, summary);
+      } else {
+        outcomeDelivered = false;
+      }
+      if (outcomeDelivered) {
+        await clearOutcomeDeliveryPending().catch((markerError) =>
+          abortLog(
+            `warning: could not clear the delivered ${outcome} outcome: ${String(markerError)}`,
+          ),
+        );
+      }
+    } catch (error) {
+      outcomeDelivered = false;
+      abortLog(
+        `warning: abort could not deliver the ${outcome} outcome, retaining the gate for recovery: ${String(error)}`,
+      );
+    }
+  } else if (
+    !cancelled &&
+    run &&
+    run.status === "passed" &&
+    abortReap.outcomeDelivered !== true
+  ) {
+    outcomeDelivered = false;
   }
   if (preserved && settled && abortReap.orca) {
     for (const worker of workers) {
@@ -11807,7 +11843,7 @@ async function reapConfiguredLauncher(
       if (!isConsumerFenced(error)) {
         return false;
       }
-      if (run?.status === "in-progress") {
+      if (run === undefined || run.status === "in-progress") {
         console.error(
           `no-mistakes: retained configured launcher marker ${markerFile}; its Orca run is owned by another consumer`,
         );
@@ -14157,7 +14193,8 @@ Run options:
       ...(deliveryGit ? { deliveryGit } : {}),
       git,
       ledger,
-      notify: (summary) => orca.notifyRunResult("cancelled", summary),
+      notify: (summary, outcome = "cancelled") =>
+        orca.notifyRunResult(outcome, summary),
       notifyHandle,
       orca,
       orcaCommand: resolveOrcaCommand(),
