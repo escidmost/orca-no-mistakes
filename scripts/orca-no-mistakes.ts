@@ -5101,19 +5101,50 @@ async function validateReport(
         isNoOpSeverity && isAbsentOrNoOpAction
           ? "info"
           : (rawSeverity as "error" | "info" | "warning");
+      const rawLocation = aliases.location;
+      const hasLocationObject =
+        rawLocation &&
+        typeof rawLocation === "object" &&
+        !Array.isArray(rawLocation);
+      const rawLocationPath = hasLocationObject
+        ? (rawLocation as { path?: unknown }).path
+        : undefined;
+      const rawLocationLine = hasLocationObject
+        ? (rawLocation as { line?: unknown }).line
+        : undefined;
+
       const file =
-        typeof finding.file === "string" && finding.file.trim()
-          ? finding.file.trim()
-          : typeof aliases.location?.path === "string" && aliases.location.path.trim()
-            ? aliases.location.path.trim()
+        finding.file !== undefined
+          ? typeof finding.file === "string" && finding.file.trim()
+            ? finding.file.trim()
+            : finding.file
+          : rawLocation !== undefined
+            ? hasLocationObject
+              ? rawLocationPath !== undefined
+                ? typeof rawLocationPath === "string" && rawLocationPath.trim()
+                  ? rawLocationPath.trim()
+                  : rawLocationPath
+                : undefined
+              : rawLocation
             : undefined;
+
       const line =
-        typeof finding.line === "number" && Number.isInteger(finding.line) && finding.line >= 1
-          ? finding.line
-          : typeof aliases.location?.line === "number" &&
-              Number.isInteger(aliases.location.line) &&
-              aliases.location.line >= 1
-            ? aliases.location.line
+        finding.line !== undefined
+          ? typeof finding.line === "number" &&
+            Number.isInteger(finding.line) &&
+            finding.line >= 1
+            ? finding.line
+            : finding.line
+          : rawLocation !== undefined
+            ? hasLocationObject
+              ? rawLocationLine !== undefined
+                ? typeof rawLocationLine === "number" &&
+                  Number.isInteger(rawLocationLine) &&
+                  rawLocationLine >= 1
+                  ? rawLocationLine
+                  : rawLocationLine
+                : undefined
+              : (rawLocation as unknown as number)
             : undefined;
       const id =
         typeof finding.id === "string" &&

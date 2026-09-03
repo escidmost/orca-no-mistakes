@@ -884,15 +884,23 @@ export class RailTuiRenderer implements PresentationRenderer {
     } else {
       const stages = this.#stages(now);
       const remainingRows = bodyRows - stages.length - 2;
+      const minDetail = this.#focus === "logs" ? 2 : 1;
+      const maxActivity = Math.max(1, remainingRows - minDetail);
       const activityTarget = Math.max(
-        3,
+        1,
         Math.min(
-          this.#activities.length + 1,
-          Math.max(3, Math.floor(remainingRows * 0.35)),
+          maxActivity,
+          Math.max(
+            3,
+            Math.min(
+              this.#activities.length + 1,
+              Math.max(3, Math.floor(remainingRows * 0.35)),
+            ),
+          ),
         ),
       );
       const activity = this.#activity(activityTarget);
-      const detailRows = Math.max(1, remainingRows - activity.length);
+      const detailRows = Math.max(minDetail, remainingRows - activity.length);
       const detail = this.#detail(detailRows, columns, now);
       const all = [...stages, {}, ...activity, {}, ...detail];
       body = Array.from({ length: bodyRows }, (_, index) =>
