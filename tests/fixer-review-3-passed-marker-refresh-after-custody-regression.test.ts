@@ -27,13 +27,18 @@ function markerPath(repo: string, gateId: string): string {
   return path.join(repo, ".orca", "no-mistakes", `gate-${digest}.json`);
 }
 
-test("Release 2 pipeline settles passed and commits attestation when post-custody marker refresh fails", async () => {
+test("Release 2 pipeline settles passed and commits attestation when post-custody marker refresh fails", async (t) => {
   const temp = await mkdtemp(path.join(tmpdir(), "onm-r2-marker-refresh-fail-"));
   const repo = path.join(temp, "repo");
   const remote = path.join(temp, "origin.git");
   const gatePath = path.join(temp, "gate");
   const priorHome = process.env.ORCA_NO_MISTAKES_HOME;
   process.env.ORCA_NO_MISTAKES_HOME = path.join(temp, "home");
+  t.after(async () => {
+    if (priorHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME;
+    else process.env.ORCA_NO_MISTAKES_HOME = priorHome;
+    await rm(temp, { force: true, recursive: true });
+  });
 
   await mkdir(repo);
   execFileSync("git", ["-c", "init.templateDir=", "init", "--bare", "-b", "main", remote]);
@@ -60,6 +65,7 @@ test("Release 2 pipeline settles passed and commits attestation when post-custod
     return runCommand(executable, args.map((arg) => (arg === destination ? remote : arg)), options);
   };
   const ledger = new DomainLedger(":memory:");
+  t.after(() => ledger.close());
   const runId = "run-r2-marker-refresh-fail";
 
   let task = 0;
@@ -221,21 +227,22 @@ test("Release 2 pipeline settles passed and commits attestation when post-custod
     assert.ok(markerContent.pendingSummary?.includes("passed all 8 stages"));
   } finally {
     await chmod(markerDir, 0o700).catch(() => {});
-    ledger.close();
     await installAbortReaping({ pid: process.pid });
-    if (priorHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME;
-    else process.env.ORCA_NO_MISTAKES_HOME = priorHome;
-    await rm(temp, { force: true, recursive: true });
   }
 });
 
-test("local pipeline settles passed and commits attestation when post-custody marker refresh fails", async () => {
+test("local pipeline settles passed and commits attestation when post-custody marker refresh fails", async (t) => {
   const temp = await mkdtemp(path.join(tmpdir(), "onm-local-marker-refresh-fail-"));
   const repo = path.join(temp, "repo");
   const remote = path.join(temp, "origin.git");
   const gatePath = path.join(temp, "gate");
   const priorHome = process.env.ORCA_NO_MISTAKES_HOME;
   process.env.ORCA_NO_MISTAKES_HOME = path.join(temp, "home");
+  t.after(async () => {
+    if (priorHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME;
+    else process.env.ORCA_NO_MISTAKES_HOME = priorHome;
+    await rm(temp, { force: true, recursive: true });
+  });
 
   await mkdir(repo);
   execFileSync("git", ["-c", "init.templateDir=", "init", "--bare", "-b", "main", remote]);
@@ -255,6 +262,7 @@ test("local pipeline settles passed and commits attestation when post-custody ma
   const candidate = git(repo, "rev-parse", "HEAD");
 
   const ledger = new DomainLedger(":memory:");
+  t.after(() => ledger.close());
   const runId = "run-local-marker-refresh-fail";
 
   let task = 0;
@@ -350,10 +358,6 @@ test("local pipeline settles passed and commits attestation when post-custody ma
     assert.ok(markerContent.pendingSummary?.includes(`passed all ${result.steps.length} stages`));
   } finally {
     await chmod(markerDir, 0o700).catch(() => {});
-    ledger.close();
     await installAbortReaping({ pid: process.pid });
-    if (priorHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME;
-    else process.env.ORCA_NO_MISTAKES_HOME = priorHome;
-    await rm(temp, { force: true, recursive: true });
   }
 });

@@ -628,7 +628,7 @@ test('Release 2 resume reconciles approved stage settlement and contiguous check
 
     // Verified: publication and completion succeeded
     assert.equal(result.verdict, 'passed')
-    assert.ok(result.completionAttestation || result.attestation)
+    assert.equal(result.completionAttestation?.version, '2.0.0')
 
     // Verified: review checkpoint and disposition were reconciled
     const postCheckpoints = ledger.listCheckpoints('domain-run-r2')
