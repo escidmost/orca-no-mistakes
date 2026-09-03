@@ -177,9 +177,14 @@ class ChainOrca implements OrcaOperations {
   async setWorktreeStatus(): Promise<void> {}
 }
 
-test("release 2 resume walks the final checkpoint of each stage", async () => {
+test("release 2 resume walks the final checkpoint of each stage", async (t) => {
   const root = await mkdtemp(path.join(tmpdir(), "onm-resume-chain-"));
   const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
+  t.after(async () => {
+    if (previousHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME;
+    else process.env.ORCA_NO_MISTAKES_HOME = previousHome;
+    await rm(root, { force: true, recursive: true });
+  });
   process.env.ORCA_NO_MISTAKES_HOME = root;
   const runId = "resume-checkpoint-chain";
   const intent = "Resume past a committed fixer round.";
@@ -235,15 +240,17 @@ test("release 2 resume walks the final checkpoint of each stage", async () => {
     );
   } finally {
     ledger.close();
-    if (previousHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME;
-    else process.env.ORCA_NO_MISTAKES_HOME = previousHome;
-    await rm(root, { force: true, recursive: true });
   }
 });
 
-test("approved fixer-no-change stages bind worker evidence durably", async () => {
+test("approved fixer-no-change stages bind worker evidence durably", async (t) => {
   const root = await mkdtemp(path.join(tmpdir(), "onm-no-change-approve-"));
   const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
+  t.after(async () => {
+    if (previousHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME;
+    else process.env.ORCA_NO_MISTAKES_HOME = previousHome;
+    await rm(root, { force: true, recursive: true });
+  });
   process.env.ORCA_NO_MISTAKES_HOME = root;
   const runId = "no-change-approve";
   const intent = "Approve a fixer that produced no change.";
@@ -315,8 +322,5 @@ test("approved fixer-no-change stages bind worker evidence durably", async () =>
     );
   } finally {
     ledger.close();
-    if (previousHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME;
-    else process.env.ORCA_NO_MISTAKES_HOME = previousHome;
-    await rm(root, { force: true, recursive: true });
   }
 });

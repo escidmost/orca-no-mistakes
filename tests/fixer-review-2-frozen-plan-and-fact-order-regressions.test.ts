@@ -376,6 +376,7 @@ test("pull-request settlement rejects when managed-comment mutation postdates ob
               mutationIntent: prMutation,
               number: 123,
               outcome: "created",
+              pipelineEvidenceRoot: "d".repeat(64),
               postRead: prPostRead,
               routeFingerprint: storedRoute.route_fingerprint,
             },

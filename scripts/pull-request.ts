@@ -247,12 +247,18 @@ export async function bindPullRequest(input: {
   const receiptNodeId = typeof previousObservation?.payload.managedCommentNodeId === 'string'
     ? previousObservation.payload.managedCommentNodeId
     : undefined
-  let comments = await input.authority.observeIssueComments(pullRequest.id)
-  let comment = ownedComment(comments, {
-    login: repositoryRoute.actor_login,
-    nodeId: repositoryRoute.actor_node_id
-  }, receiptNodeId)
   const unresolvedCreate = input.ledger.unresolvedManagedCommentCreateIntent(input.runId)
+  let comments = await input.authority.observeIssueComments(pullRequest.id)
+  let comment = ownedComment(
+    unresolvedCreate && receiptNodeId
+      ? comments.filter((candidate) => candidate.id !== receiptNodeId)
+      : comments,
+    {
+      login: repositoryRoute.actor_login,
+      nodeId: repositoryRoute.actor_node_id
+    },
+    unresolvedCreate ? undefined : receiptNodeId
+  )
   if (!comment && unresolvedCreate) {
     throw new PullRequestBindingError(
       `unresolved managed comment create intent (${unresolvedCreate.intentSha256}) requires manual resolution: managed comment is absent on pull request #${pullRequest.number}`

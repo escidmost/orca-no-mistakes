@@ -14,6 +14,7 @@ import {
   type GithubIssueCommentObservation,
   type GithubPullRequestObservation
 } from '../scripts/github.ts'
+import { PIPELINE_STEPS } from '../scripts/config.ts'
 import { DomainLedger, evidenceSha256, sha256 } from '../scripts/ledger.ts'
 import { main } from '../scripts/orca-no-mistakes.ts'
 import {
@@ -24,7 +25,7 @@ import {
 const OID = 'a'.repeat(40)
 const BASE = 'b'.repeat(40)
 const REPO_ROOT = '/repo'
-const STAGES = ['intent', 'rebase', 'review', 'test', 'document', 'lint', 'push', 'pr']
+const STAGES = PIPELINE_STEPS
 
 function localStageEvidence(stage: string, round: number, artifactPath: string, runId: string) {
   const entry = {

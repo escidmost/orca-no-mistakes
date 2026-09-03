@@ -148,6 +148,73 @@ test('adopts an open pull request without mutating human content', async () => {
   }
 })
 
+test('reconciles an unresolved create against the new marker, not the prior receipt comment', async () => {
+  const { ledger: baseLedger } = harness()
+  const existing = pullRequest()
+  const resolved: Array<Record<string, unknown>> = []
+  let updatedCommentId: string | undefined
+  let comments: GithubIssueCommentObservation[] = [
+    {
+      author: { id: 'actor-node', login: 'bot' },
+      body: '<!-- orca-no-mistakes:managed-summary:v1 -->\nold receipt comment',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      id: 'old-comment',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+      url: 'https://example.test/comment/old'
+    },
+    {
+      author: { id: 'actor-node', login: 'bot' },
+      body: '<!-- orca-no-mistakes:managed-summary:v1 -->\ncreated by unresolved mutation',
+      createdAt: '2026-01-01T00:00:01.000Z',
+      id: 'new-comment',
+      updatedAt: '2026-01-01T00:00:01.000Z',
+      url: 'https://example.test/comment/new'
+    }
+  ]
+  const ledger = {
+    ...baseLedger,
+    remoteObservation: () => ({
+      kind: 'pull-request',
+      payload: { managedCommentNodeId: 'old-comment' },
+      subject: 'github.com/1#7'
+    }),
+    remoteReceipt: (_runId: string, kind: string) => kind === 'candidate-publication'
+      ? { candidate_commit_oid: OID, receipt_sha256: 'push-receipt' }
+      : { authoritative_post_observation_sha256: 'prior-pr-read', receipt_sha256: 'prior-pr-receipt' },
+    resolveMutationIntent: (input: Record<string, unknown>) => resolved.push(input),
+    unresolvedManagedCommentCreateIntent: () => ({
+      attemptId: 'prior-attempt',
+      createdAt: '2026-01-01T00:00:01.000Z',
+      intentSha256: 'unresolved-intent',
+      payload: { action: 'ensure-managed-summary', managedCommentNodeId: null },
+      targetFingerprint: 'route'
+    })
+  }
+  const authority = {
+    createIssueComment: async () => assert.fail('unexpected createIssueComment'),
+    createPullRequest: async () => assert.fail('unexpected createPullRequest'),
+    observeIssueComments: async () => comments,
+    observePullRequests: async () => ({ exact: existing, nearMatches: [] }),
+    updateIssueComment: async ({ body, commentId }: { body: string; commentId: string }) => {
+      updatedCommentId = commentId
+      comments = comments.map((comment) => comment.id === commentId ? { ...comment, body } : comment)
+    }
+  }
+  const directory = await mkdtemp(path.join(tmpdir(), 'onm-pr-reconcile-'))
+  try {
+    await bindPullRequest({
+      artifactPath: path.join(directory, 'pr.json'), attemptId: 'attempt', authority,
+      candidateCommitOid: OID, generationToken: 1, intent: 'intent', ledger: ledger as never,
+      pipelineEvidenceRoot: 'root', runId: 'run', stageSummaries: [], workerIdentity: 'coordinator'
+    })
+    assert.equal(updatedCommentId, 'new-comment')
+    assert.equal(resolved[0]?.attemptId, 'prior-attempt')
+    assert.equal(resolved[0]?.intentSha256, 'unresolved-intent')
+  } finally {
+    await rm(directory, { force: true, recursive: true })
+  }
+})
+
 test('rejects conflicting near matches and deterministically caps managed summaries', async () => {
   const { ledger } = harness()
   const authority = {

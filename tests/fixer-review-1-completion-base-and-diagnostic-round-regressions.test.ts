@@ -532,9 +532,14 @@ class ChainOrca implements OrcaOperations {
   async setWorktreeStatus(): Promise<void> {}
 }
 
-test('settleLocalStage settles checkpoint round from authoritative evidence when diagnostic approved', async () => {
+test('settleLocalStage settles checkpoint round from authoritative evidence when diagnostic approved', async (t) => {
   const root = await mkdtemp(path.join(tmpdir(), 'onm-diagnostic-round-'));
   const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
+  t.after(async () => {
+    if (previousHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME;
+    else process.env.ORCA_NO_MISTAKES_HOME = previousHome;
+    await rm(root, { force: true, recursive: true });
+  });
   process.env.ORCA_NO_MISTAKES_HOME = root;
   const runId = 'diagnostic-round-settlement-test';
   const intent = 'Verify diagnostic round approval settles authoritative round.';
@@ -590,8 +595,5 @@ test('settleLocalStage settles checkpoint round from authoritative evidence when
     );
   } finally {
     ledger.close();
-    if (previousHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME;
-    else process.env.ORCA_NO_MISTAKES_HOME = previousHome;
-    await rm(root, { force: true, recursive: true });
   }
 });

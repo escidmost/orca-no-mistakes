@@ -207,9 +207,14 @@ function pullRequestFixture(overrides: Partial<GithubPullRequestObservation> = {
   }
 }
 
-test('Release 2 resume reconciles clean stage settlement without approval before candidate publication', async () => {
+test('Release 2 resume reconciles clean stage settlement without approval before candidate publication', async (t) => {
   const root = await mkdtemp(path.join(tmpdir(), 'onm-clean-resume-r2-'))
   const previousHome = process.env.ORCA_NO_MISTAKES_HOME
+  t.after(async () => {
+    if (previousHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME
+    else process.env.ORCA_NO_MISTAKES_HOME = previousHome
+    await rm(root, { force: true, recursive: true })
+  })
   process.env.ORCA_NO_MISTAKES_HOME = root
   const runId = 'clean-resume-r2'
   const submission = oid(1)
@@ -363,8 +368,5 @@ test('Release 2 resume reconciles clean stage settlement without approval before
     assert.equal(reviewDisposition?.disposition, 'satisfied')
   } finally {
     ledger.close()
-    if (previousHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME
-    else process.env.ORCA_NO_MISTAKES_HOME = previousHome
-    await rm(root, { force: true, recursive: true })
   }
 })

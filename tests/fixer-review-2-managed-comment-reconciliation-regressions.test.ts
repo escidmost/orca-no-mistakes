@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -331,5 +331,6 @@ test('managed comment reconciliation is deferred until after settleRemoteStage s
     assert.equal(ledger.unresolvedManagedCommentCreateIntent(runId), undefined)
   } finally {
     ledger.close()
+    await rm(home, { force: true, recursive: true })
   }
 })
