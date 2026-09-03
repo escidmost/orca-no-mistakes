@@ -57,7 +57,7 @@ The immutable per-run identity of the base repository, head repository, head own
 _Avoid_: Origin, current remotes, push URL
 
 **Repository publication route**:
-The durable, mutable publication route persisted once per repository and bound to the authenticated actor and backend. It is guarded against authenticated-actor drift and against change while active runs or resumable failed runs depend on it, and each run snapshots it as its immutable per-run Publication route.
+The durable, mutable publication route persisted once per repository and bound to the authenticated actor and backend. It is guarded against authenticated-actor drift and against change while active runs or resumable failed runs depend on it; matching Release 2 runs whose head and base branches match the stored route snapshot it as their immutable per-run Publication route, while legacy, provider-neutral, or unmatched runs do not.
 _Avoid_: Per-run route, origin, ambient remote
 
 **Publication head ref**:
@@ -189,7 +189,7 @@ A deterministic root binding the frozen stage plan and evidence through candidat
 _Avoid_: Completion-attestation root, remote trust anchor, raw evidence link
 
 **Pipeline completion attestation**:
-A portable, tamper-evident manifest using the version 2 completion schema for a run with a `passed` verdict. It binds the frozen stage plan, recorded stage dispositions and evidence, candidate-publication and pull-request-binding receipt digests, prior attempt-outcome digests, custody facts, and explicit assurance claims to the candidate commit. It proves historical observations, not current remote state or independent authenticity.
+A portable, tamper-evident manifest using the version 2 completion schema for a run with a `passed` verdict. It binds the frozen stage plan, recorded stage dispositions and evidence, candidate-publication and pull-request-binding receipt digests, all attempt-outcome digests (explicitly including the terminal passed attempt; only pipelineEvidenceRoot excludes that final digest), custody facts, and explicit assurance claims to the candidate commit. It proves historical observations, not current remote state or independent authenticity.
 _Avoid_: Passed, signature, live-status certificate
 
 **Passed attestation**:
