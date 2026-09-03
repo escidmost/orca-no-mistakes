@@ -3564,7 +3564,6 @@ export async function runPipeline(
         `Candidate commit: ${terminalCommitOid}.`,
       ].join("\n");
       await markOutcomeDeliveryPending("passed", passedSummary);
-      const eventKey = "run:completed:passed";
       const custodyNote = await presentation.publishAsync(
         { kind: "run-completed", status: "passed" },
         (snapshot) =>
