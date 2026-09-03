@@ -723,9 +723,9 @@ function isDirectRunMarker(
 type AbortReapState = {
   artifactsDir?: string;
   cleanupPending?: boolean;
-  deliveryGit?: GitOperations;
+  deliveryGit?: Pick<GitOperations, "anchorRecoveryRef">;
   gate?: GateWorktree;
-  git?: GitOperations;
+  git?: Pick<GitOperations, "head" | "headOf">;
   generationToken?: number;
   launcherPid?: number;
   ledger?: DomainLedger;
@@ -954,8 +954,8 @@ function beginAbortAllocation(): () => void {
 async function anchorAbortWorkerTips(
   workers: WorkerResult[],
   runId: string,
-  sourceGit: GitOperations,
-  recoveryGit: GitOperations,
+  sourceGit: Pick<GitOperations, "headOf">,
+  recoveryGit: Pick<GitOperations, "anchorRecoveryRef">,
 ): Promise<Error[]> {
   const failures: Error[] = [];
   for (const worker of workers) {
