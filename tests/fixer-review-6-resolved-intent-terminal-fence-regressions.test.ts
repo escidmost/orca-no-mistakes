@@ -11,6 +11,53 @@ const commit = 'a'.repeat(40)
 const policy = 'b'.repeat(64)
 const stages = [{ requirement: 'required' as const, stageId: 'intent' }]
 
+test('reopening adds reconciled mutation intent resolutions', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'onm-reconciled-intent-'))
+  const dbPath = path.join(temp, 'ledger.sqlite')
+  const raw = new DatabaseSync(dbPath)
+  raw.exec(`CREATE TABLE resolved_mutation_intents (
+    resolution_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    attempt_id TEXT NOT NULL,
+    intent_sha256 TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK(reason IN ('definite-failure', 'lease-lost')),
+    resolved_at TEXT NOT NULL,
+    UNIQUE(run_id, intent_sha256)
+  )`)
+  raw.close()
+
+  const ledger = new DomainLedger(dbPath)
+  try {
+    const runId = 'reconciled-run'
+    ledger.startRun({
+      baseBranch: 'main', branch: 'feature', intent: 'Reconcile intent.',
+      policySha256: policy, repoRoot: '/repo', runId, stagePlan: stages,
+      submissionCommitOid: commit
+    })
+    const generationToken = ledger.acquireLease({ branch: 'feature', repoRoot: '/repo', runId })
+    const attemptId = 'attempt-1'
+    ledger.startAttempt({
+      actorIdentity: 'operator', attemptId, coordinatorIdentity: 'coordinator',
+      generationToken, runId, startedAt: new Date().toISOString()
+    })
+    const intentSha256 = ledger.recordMutationIntent({
+      attemptId, createdAt: new Date().toISOString(), kind: 'managed-comment',
+      payload: { action: 'ensure-managed-summary', managedCommentNodeId: null },
+      runId, targetFingerprint: 'target-1'
+    })
+    ledger.resolveMutationIntent({ attemptId, intentSha256, reason: 'reconciled', runId })
+    ledger.resolveMutationIntent({ attemptId, intentSha256, reason: 'reconciled', runId })
+    assert.equal(ledger.unresolvedManagedCommentCreateIntent(runId), undefined)
+    assert.throws(
+      () => ledger.resolveMutationIntent({ attemptId, intentSha256, reason: 'definite-failure', runId }),
+      /different resolution/
+    )
+  } finally {
+    ledger.close()
+    await rm(temp, { force: true, recursive: true })
+  }
+})
+
 test('terminal failed runs reject resolved mutation intent insertion', async () => {
   const temp = await mkdtemp(path.join(tmpdir(), 'onm-term-res-fail-'))
   const dbPath = path.join(temp, 'ledger.sqlite')

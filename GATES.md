@@ -10,9 +10,9 @@ Scope: New direct and gate runs execute and recover the complete Release 2 publi
   EVIDENCE: exit=0; shell=/bin/sh; cwd=/Users/host/repo/orca-no-mistakes/.orca/workspaces/onm-80-bind-pull-requests-and-settle-remote-runs; path=891ea4e2ea56/12 entries; EXPECT=matched; output-sha256=6525bbd0bf4f2030c3cffeb6cb58862218dbb78b255b8a8596f680dca3c52136; output-bytes=302
 
 - [x] G1: Release 2 pull-request publication and settlement behavior passes focused tests
-  CHECK: node --test tests/github-authority.test.ts tests/candidate-publication.test.ts tests/pull-request-binding.test.ts tests/pull-request-route-facts.test.ts tests/pipeline-release-2-integration.test.ts tests/pipeline-completion-attestation.test.ts tests/presentation-plan-stages.test.ts tests/release-2-ledger-model.test.ts tests/fixer-review-2-frozen-plan-and-fact-order-regressions.test.ts tests/fixer-review-3-upstream-route-and-evidence-root-regressions.test.ts tests/fixer-review-5-pr-binding-resume-regression.test.ts tests/fixer-review-publication-route-and-forge-regressions.test.ts && node -e "console.log('release 2 focused verification passed')"
+  CHECK: node --test tests/github-authority.test.ts tests/candidate-publication.test.ts tests/pull-request-binding.test.ts tests/pull-request-route-facts.test.ts tests/pipeline-release-2-integration.test.ts tests/pipeline-completion-attestation.test.ts tests/presentation-plan-stages.test.ts tests/release-2-ledger-model.test.ts tests/fixer-review-1-completion-base-and-diagnostic-round-regressions.test.ts tests/fixer-review-2-frozen-plan-and-fact-order-regressions.test.ts tests/fixer-review-2-pr-body-budget-and-comment-reconciliation-regressions.test.ts tests/fixer-review-3-comment-receipt-and-release2-approved-resume-regressions.test.ts tests/fixer-review-3-upstream-route-and-evidence-root-regressions.test.ts tests/fixer-review-4-clock-rollback-and-direct-run-route-regressions.test.ts tests/fixer-review-5-managed-comment-definite-failure-regressions.test.ts tests/fixer-review-5-pr-binding-resume-regression.test.ts tests/fixer-review-6-resolved-intent-terminal-fence-regressions.test.ts tests/fixer-review-publication-route-and-forge-regressions.test.ts && node -e "console.log('release 2 focused verification passed')"
   EXPECT: release 2 focused verification passed
-  EVIDENCE: exit=0; shell=/bin/sh; cwd=/Users/host/repo/orca-no-mistakes/.orca/workspaces/onm-80-bind-pull-requests-and-settle-remote-runs; path=891ea4e2ea56/12 entries; EXPECT=matched; output-sha256=2acf18b165a05639537df8a63b2c60c7205f5d18d2b3ddced72cd4692d99c72f; output-bytes=9699
+  EVIDENCE: exit=0; shell=/bin/sh; cwd=/Users/host/repo/orca-no-mistakes/.orca/workspaces/onm-80-bind-pull-requests-and-settle-remote-runs; path=891ea4e2ea56/12 entries; EXPECT=matched; output-sha256=2297a7c57ee18c80293d9d4c96fb68fcca0b806000415606f2e487585a066b9d; output-bytes=11886
 
 - [x] G2: the complete TypeScript project typechecks
   CHECK: npm run typecheck && node -e "console.log('typecheck verification passed')"
@@ -22,7 +22,7 @@ Scope: New direct and gate runs execute and recover the complete Release 2 publi
 - [x] G3: the complete regression suite passes
   CHECK: npm test && node -e "console.log('full regression verification passed')"
   EXPECT: full regression verification passed
-  EVIDENCE: exit=0; shell=/bin/sh; cwd=/Users/host/repo/orca-no-mistakes/.orca/workspaces/onm-80-bind-pull-requests-and-settle-remote-runs; path=891ea4e2ea56/12 entries; EXPECT=matched; output-sha256=4de83ba67ba376a24f54754dc1e567b1f7e52918afeb8d1ab1825bda7d71f2f3; output-bytes=103857
+  EVIDENCE: exit=0; shell=/bin/sh; cwd=/Users/host/repo/orca-no-mistakes/.orca/workspaces/onm-80-bind-pull-requests-and-settle-remote-runs; path=891ea4e2ea56/12 entries; EXPECT=matched; output-sha256=6c5b74b6a0eff43a6ec36fbc19dccf09ad9599f2cc48928816b8422ef267d6e8; output-bytes=106054
 
 - [ ] G4: the pull request has the ONM-80 prefix and CodeRabbit reports no issues
   EVIDENCE: pending

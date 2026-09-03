@@ -18,7 +18,7 @@ function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
 }
 
-test('runPipeline settles all eight stages before exposing Release 2 completion', async () => {
+async function runRelease2Pipeline(failAfter?: 'push' | 'pr'): Promise<void> {
   const temp = await mkdtemp(path.join(tmpdir(), 'onm-release-2-pipeline-'))
   const repo = path.join(temp, 'repo')
   const remote = path.join(temp, 'origin.git')
@@ -41,19 +41,27 @@ test('runPipeline settles all eight stages before exposing Release 2 completion'
   const candidate = git(repo, 'rev-parse', 'HEAD')
   const base = git(repo, 'rev-parse', 'origin/main')
   const destination = 'https://github.com/owner/repo.git'
+  let pushCount = 0
   const runner: CommandRunner = (executable, args, options) => {
     if (args[0] === 'config' && args[1] === '--get-regexp') {
       return Promise.resolve({ code: 1, stderr: '', stdout: '' })
     }
+    if (args[0] === 'push') pushCount += 1
     return runCommand(executable, args.map((arg) => arg === destination ? remote : arg), options)
   }
   const ledger = new DomainLedger(':memory:')
   const completedStages: string[] = []
   let task = 0
   let dispatch = 0
+  let failedTaskUpdate = false
+  const taskStages = new Map<string, string>()
   const orca: OrcaOperations = {
     createRun: async () => 'run-release-2',
-    createTask: async () => `task-${++task}`,
+    createTask: async (spec) => {
+      const taskId = `task-${++task}`
+      taskStages.set(taskId, spec.match(/^\[([^\]]+)\]/)?.[1] ?? '')
+      return taskId
+    },
     startWorker: async (taskId, launch) => ({
       dispatchId: `dispatch-${++dispatch}`,
       report: { findings: [], summary: `${launch.stage} passed` },
@@ -66,7 +74,12 @@ test('runPipeline settles all eight stages before exposing Release 2 completion'
     finishWorker: async (worker) => { worker.shutdownConfirmed = true },
     removeWorktree: async () => {},
     completeTask: async (taskId) => {
-      completedStages.push(PIPELINE_STEPS[Number(taskId.slice(5)) - 1]!)
+      const stage = taskStages.get(taskId)!
+      if (stage === failAfter && !failedTaskUpdate) {
+        failedTaskUpdate = true
+        throw new Error(`simulated ${stage} task update failure`)
+      }
+      completedStages.push(stage)
     },
     createGate: async () => 'gate',
     waitForGate: async () => 'approve',
@@ -75,10 +88,14 @@ test('runPipeline settles all eight stages before exposing Release 2 completion'
   }
   let pullRequest: Record<string, unknown> | null = null
   let comments: Record<string, unknown>[] = []
+  let pullRequestCreateCount = 0
+  let commentCreateCount = 0
+  let commentUpdateCount = 0
   const authority = {
     observeRepository: async () => ({ id: 'R_repo', nodeId: 'RN_repo' }),
     observePullRequests: async () => ({ exact: pullRequest, nearMatches: [] }),
     createPullRequest: async () => {
+      pullRequestCreateCount += 1
       pullRequest = {
         baseBranch: 'main', baseOid: base, baseRepositoryId: 'R_repo',
         baseRepositoryNodeId: 'RN_repo', body: 'body', draft: false,
@@ -89,13 +106,17 @@ test('runPipeline settles all eight stages before exposing Release 2 completion'
     },
     observeIssueComments: async () => comments,
     createIssueComment: async ({ body }: { body: string }) => {
+      commentCreateCount += 1
       comments = [{
         author: { id: 'AN_actor', login: 'owner' }, body,
         createdAt: '2026-09-02T00:00:00.000Z', id: 'IC_node',
         updatedAt: '2026-09-02T00:00:00.000Z', url: 'https://github.com/owner/repo/pull/80#issuecomment-1',
       }]
     },
-    updateIssueComment: async () => assert.fail('unexpected comment update'),
+    updateIssueComment: async ({ body }: { body: string }) => {
+      commentUpdateCount += 1
+      comments = comments.map((comment) => ({ ...comment, body }))
+    },
   } as unknown as GithubAuthority
 
   try {
@@ -109,15 +130,26 @@ test('runPipeline settles all eight stages before exposing Release 2 completion'
       headRepositoryNodeId: 'RN_repo', networkRootRepositoryId: 'R_repo',
       observedAt: '2026-09-02T00:00:00.000Z', repoRoot,
     })
-    const result = await runPipeline({
+    const pipelineOptions = {
       githubAuthority: authority,
       intent: 'ONM-80: integration',
       publicationDestination: destination,
       publicationRunner: runner,
+    }
+    if (failAfter) {
+      await assert.rejects(
+        runPipeline(pipelineOptions, orca, new GitShell({ repo: repoRoot }), ledger),
+        new RegExp(`simulated ${failAfter} task update failure`),
+      )
+      assert.equal(ledger.runStatus('run-release-2'), 'failed')
+    }
+    const result = await runPipeline({
+      ...pipelineOptions,
+      ...(failAfter ? { resumeRunId: 'run-release-2' } : {}),
     }, orca, new GitShell({ repo: repoRoot }), ledger)
 
     assert.deepEqual(result.steps, PIPELINE_STEPS)
-    assert.deepEqual(completedStages, PIPELINE_STEPS)
+    if (!failAfter) assert.deepEqual(completedStages, PIPELINE_STEPS)
     assert.equal(result.verdict, 'passed')
     assert.equal(result.completionAttestation?.version, '2.0.0')
     assert.equal(ledger.runStatus(result.runId), 'passed')
@@ -125,10 +157,22 @@ test('runPipeline settles all eight stages before exposing Release 2 completion'
     assert.ok(ledger.remoteReceipt(result.runId, 'pull-request-binding'))
     assert.equal(ledger.stageDispositions(result.runId).length, PIPELINE_STEPS.length)
     assert.equal(git(remote, 'rev-parse', 'refs/heads/feature'), candidate)
+    assert.equal(pushCount, 1)
+    assert.equal(pullRequestCreateCount, 1)
+    assert.equal(commentCreateCount, 1)
+    assert.equal(commentUpdateCount, failAfter === 'pr' ? 1 : 0)
   } finally {
     ledger.close()
     if (priorHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME
     else process.env.ORCA_NO_MISTAKES_HOME = priorHome
     await rm(temp, { force: true, recursive: true })
   }
-})
+}
+
+test('runPipeline settles all eight stages before exposing Release 2 completion', () =>
+  runRelease2Pipeline())
+
+for (const stage of ['push', 'pr'] as const) {
+  test(`runPipeline resumes after ${stage} settlement bookkeeping fails without replaying creation`, () =>
+    runRelease2Pipeline(stage))
+}

@@ -1786,7 +1786,7 @@ CREATE TABLE IF NOT EXISTS resolved_mutation_intents (
   run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
   attempt_id TEXT NOT NULL REFERENCES run_attempts(attempt_id) ON DELETE CASCADE,
   intent_sha256 TEXT NOT NULL REFERENCES mutation_intents(intent_sha256) ON DELETE CASCADE,
-  reason TEXT NOT NULL CHECK(reason IN ('definite-failure', 'lease-lost')),
+  reason TEXT NOT NULL CHECK(reason IN ('definite-failure', 'lease-lost', 'reconciled')),
   resolved_at TEXT NOT NULL,
   UNIQUE (run_id, intent_sha256)
 );
@@ -2222,6 +2222,32 @@ export class DomainLedger {
                  head_repository_id, head_owner, head_branch, base_branch, created_at
           FROM publication_routes_legacy`)
         this.#db.exec('DROP TABLE publication_routes_legacy')
+        this.#db.exec('COMMIT')
+      } catch (error) {
+        this.#db.exec('ROLLBACK')
+        throw error
+      }
+    }
+    const resolvedIntentSchema = this.#db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'resolved_mutation_intents'")
+      .get() as { sql: string } | undefined
+    if (resolvedIntentSchema && !resolvedIntentSchema.sql.includes("'reconciled'")) {
+      this.#db.exec('BEGIN IMMEDIATE')
+      try {
+        this.#db.exec(`DROP INDEX IF EXISTS idx_resolved_mutation_intents_run;
+          DROP TRIGGER IF EXISTS immutable_resolved_mutation_intents;
+          DROP TRIGGER IF EXISTS immutable_resolved_mutation_intents_delete;
+          DROP TRIGGER IF EXISTS fence_terminal_resolved_mutation_intents;
+          ALTER TABLE resolved_mutation_intents RENAME TO resolved_mutation_intents_legacy`)
+        this.#db.exec(SCHEMA)
+        this.#db.exec(`INSERT INTO resolved_mutation_intents (
+            resolution_id, run_id, attempt_id, intent_sha256, reason, resolved_at
+          )
+          SELECT resolution_id, run_id, attempt_id, intent_sha256, reason, resolved_at
+          FROM resolved_mutation_intents_legacy`)
+        this.#db.exec('DROP TABLE resolved_mutation_intents_legacy')
+        this.#db.exec(`CREATE INDEX IF NOT EXISTS idx_resolved_mutation_intents_run
+          ON resolved_mutation_intents(run_id, intent_sha256)`)
         this.#db.exec('COMMIT')
       } catch (error) {
         this.#db.exec('ROLLBACK')
@@ -3493,11 +3519,31 @@ export class DomainLedger {
   resolveMutationIntent(input: {
     attemptId: string
     intentSha256: string
-    reason: 'definite-failure' | 'lease-lost'
+    reason: 'definite-failure' | 'lease-lost' | 'reconciled'
     runId: string
   }): void {
+    const belongsToRun = this.#db.prepare(
+      `SELECT 1
+       FROM mutation_intents m
+       JOIN run_attempts a ON a.run_id = m.run_id
+       WHERE m.run_id = ? AND m.intent_sha256 = ? AND a.attempt_id = ?`
+    ).get(input.runId, input.intentSha256, input.attemptId)
+    if (!belongsToRun) {
+      throw new Error('mutation intent resolution does not belong to the run and attempt')
+    }
+    const existing = this.#db.prepare(
+      `SELECT reason
+       FROM resolved_mutation_intents
+       WHERE run_id = ? AND intent_sha256 = ?`
+    ).get(input.runId, input.intentSha256) as
+      | { reason: string }
+      | undefined
+    if (existing) {
+      if (existing.reason === input.reason) return
+      throw new Error('mutation intent already has a different resolution')
+    }
     this.#db.prepare(
-      `INSERT OR IGNORE INTO resolved_mutation_intents (
+      `INSERT INTO resolved_mutation_intents (
          resolution_id, run_id, attempt_id, intent_sha256, reason, resolved_at
        ) VALUES (?, ?, ?, ?, ?, ?)`
     ).run(
@@ -3518,16 +3564,11 @@ export class DomainLedger {
     targetFingerprint: string
   } | undefined {
     const settledReceipts = this.#db.prepare(
-      `SELECT r.created_at, r.receipt_json, a.generation_token, r.rowid
-       FROM remote_receipts r
-       JOIN remote_observations o ON o.run_id = r.run_id AND o.observation_sha256 = r.authoritative_post_observation_sha256
-       JOIN run_attempts a ON a.attempt_id = o.attempt_id AND a.run_id = o.run_id
-       WHERE r.run_id = ? AND r.kind = 'pull-request-binding'`
+      `SELECT receipt_json
+       FROM remote_receipts
+       WHERE run_id = ? AND kind = 'pull-request-binding'`
     ).all(runId) as Array<{
-      created_at: string
-      generation_token: number | bigint
       receipt_json: string
-      rowid: number | bigint
     }>
 
     const resolvedIntents = new Set<string>()
@@ -3537,17 +3578,7 @@ export class DomainLedger {
     for (const r of resolvedRows) {
       resolvedIntents.add(r.intent_sha256)
     }
-    let maxReceiptGeneration: number | bigint | undefined
-    let maxReceiptRowid: number | bigint | undefined
-
     for (const receipt of settledReceipts) {
-      const gen = Number(receipt.generation_token)
-      const rid = Number(receipt.rowid)
-      if (maxReceiptGeneration === undefined || gen > Number(maxReceiptGeneration) ||
-          (gen === Number(maxReceiptGeneration) && rid > Number(maxReceiptRowid))) {
-        maxReceiptGeneration = gen
-        maxReceiptRowid = rid
-      }
       try {
         const parsed = JSON.parse(receipt.receipt_json) as {
           managedCommentIntent?: unknown
@@ -3576,7 +3607,6 @@ export class DomainLedger {
     ).all(runId) as Array<{
       attempt_id: string
       created_at: string
-      generation_token: number | bigint
       intent_sha256: string
       payload_json: string
       rowid: number | bigint
@@ -3586,16 +3616,6 @@ export class DomainLedger {
     for (const row of rows) {
       if (resolvedIntents.has(row.intent_sha256)) {
         continue
-      }
-      if (maxReceiptGeneration !== undefined) {
-        const rowGen = Number(row.generation_token)
-        const maxGen = Number(maxReceiptGeneration)
-        if (rowGen < maxGen) {
-          continue
-        }
-        if (rowGen === maxGen && Number(row.rowid) < Number(maxReceiptRowid)) {
-          continue
-        }
       }
       try {
         const payload = JSON.parse(row.payload_json) as Record<string, unknown>
@@ -4226,7 +4246,8 @@ export class DomainLedger {
     const incompatibleEvidence = this.#db
       .prepare(
         `SELECT COUNT(*) AS count FROM stage_evidence
-         WHERE run_id = ? AND (effective_policy_hash IS NULL OR effective_policy_hash <> ?)`
+         WHERE run_id = ? AND stage_id NOT IN ('push', 'pr')
+           AND (effective_policy_hash IS NULL OR effective_policy_hash <> ?)`
       )
       .get(input.runId, input.effectivePolicyHash) as { count: number | bigint }
     if (Number(incompatibleEvidence.count) > 0) {
@@ -4236,11 +4257,13 @@ export class DomainLedger {
       input.baseRefSha === undefined
         ? this.#db.prepare(
             `SELECT COUNT(*) AS count FROM stage_evidence
-             WHERE run_id = ? AND base_ref_sha IS NOT NULL`
+             WHERE run_id = ? AND stage_id NOT IN ('push', 'pr')
+               AND base_ref_sha IS NOT NULL`
           ).get(input.runId)
         : this.#db.prepare(
             `SELECT COUNT(*) AS count FROM stage_evidence
-             WHERE run_id = ? AND (base_ref_sha IS NULL OR base_ref_sha <> ?)`
+             WHERE run_id = ? AND stage_id NOT IN ('push', 'pr')
+               AND (base_ref_sha IS NULL OR base_ref_sha <> ?)`
           ).get(input.runId, input.baseRefSha)
     ) as { count: number | bigint }
     const lintValidated = this.#db.prepare(

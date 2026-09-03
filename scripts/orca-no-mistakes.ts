@@ -246,6 +246,7 @@ type WorkerAllocated = (worker: WorkerResult) => WorkerRegistration;
 type WorkerReportFailure = (worker: WorkerResult, error: Error) => Promise<void>;
 
 export interface OrcaOperations {
+  preflight?(): Promise<void>;
   createRun(objective: string): Promise<string>;
   workerName?(name: string): string;
   createTask(
@@ -2059,9 +2060,13 @@ export async function runPipeline(
       } catch {}
     }
     if (!storedRoute) {
-      throw new Error("new GitHub runs require successful orca-no-mistakes init");
+      const existingLease = ledger.leaseFor(deliveryRepo.root, deliveryRepo.branch);
+      if (!existingLease || options.forceLease) {
+        await orca.preflight?.();
+        throw new Error("new GitHub runs require successful orca-no-mistakes init");
+      }
     }
-    if (!remotePublication) {
+    if (storedRoute && !remotePublication) {
       throw new Error("Release 2 direct run requires initialized GitHub publication");
     }
   }
@@ -2570,11 +2575,9 @@ export async function runPipeline(
             `${stage}:${evidence.round_index}:${evidence.candidate_commit_oid}`,
           );
           finalCheckpointByStage.set(stage, {
-            created_at: new Date().toISOString(),
             input_commit_oid: checkpointCandidate,
             output_commit_oid: evidence.candidate_commit_oid,
             round_index: evidence.round_index,
-            run_id: runId,
             stage_id: stage,
           });
         }
@@ -2916,17 +2919,17 @@ export async function runPipeline(
             workerIdentity: coordinatorIdentity,
           });
         }
+        const entry = appendSettledRemoteEvidence(stage);
+        const report = { findings: [], summary: entry.summary };
+        const eventKey = `stage:${stage}:round:${remoteRound}:completed:${stageInputCommitOid}`;
+        presentation.publish(eventKey, { kind: "stage-completed", round: remoteRound, stage });
+        await orca.completeTask(taskId, report);
         } catch (stageError) {
           throw new ResumableStageError(
             stageError instanceof Error ? stageError.message : String(stageError),
             { cause: stageError },
           );
         }
-        const entry = appendSettledRemoteEvidence(stage);
-        const report = { findings: [], summary: entry.summary };
-        const eventKey = `stage:${stage}:round:${remoteRound}:completed:${stageInputCommitOid}`;
-        presentation.publish(eventKey, { kind: "stage-completed", round: remoteRound, stage });
-        await orca.completeTask(taskId, report);
         continue;
       }
       let attempt = 0;
@@ -5923,6 +5926,10 @@ export class CliOrca implements OrcaOperations {
     this.#parentWorktree = options.parentWorktree ?? options.cwd;
     this.#acpxCommand = options.acpxCommand ?? "acpx";
     this.#runId = options.runId;
+  }
+
+  async preflight(): Promise<void> {
+    await this.#json(["status", "--json"]);
   }
 
   async createRun(objective: string): Promise<string> {
