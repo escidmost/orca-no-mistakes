@@ -4183,7 +4183,7 @@ const WORKER_REPORT_RETRY_LIMIT = 2;
 function isRepairableWorkerReportError(error: unknown): boolean {
   return (
     error instanceof Error &&
-    /(?:returned an invalid report|report could not be read)(?:$|:)/u.test(
+    /(?:returned an invalid (?:report|finding)|report could not be read)(?:$|:)/u.test(
       error.message,
     )
   );
@@ -5019,23 +5019,56 @@ async function validateReport(
     findings: report.findings.map((finding, index) => {
       if (!finding || typeof finding !== "object") return finding;
       const aliases = finding as Finding & {
+        body?: unknown;
+        location?: { line?: unknown; path?: unknown };
         message?: unknown;
         title?: unknown;
       };
       const title =
         typeof aliases.title === "string" ? aliases.title.trim() : "";
       const message =
-        typeof aliases.message === "string" ? aliases.message.trim() : "";
+        typeof aliases.message === "string"
+          ? aliases.message.trim()
+          : typeof aliases.body === "string"
+            ? aliases.body.trim()
+            : "";
       const description =
         typeof finding.description === "string" && finding.description.trim()
           ? finding.description
           : [title, message].filter(Boolean).join(": ");
-      const action =
-        finding.action === undefined ? "ask-user" : finding.action;
+      const rawAction = finding.action as string | undefined;
+      const rawSeverity = finding.severity as string | undefined;
+      const action: FindingAction =
+        rawAction === "no-op" || rawSeverity === "no-op"
+          ? "no-op"
+          : rawAction === "auto-fix" || rawAction === "ask-user"
+            ? rawAction
+            : "ask-user";
+      const severity: "error" | "info" | "warning" =
+        rawSeverity === "no-op"
+          ? "info"
+          : rawSeverity === "error" || rawSeverity === "warning" || rawSeverity === "info"
+            ? rawSeverity
+            : "error";
+      const file =
+        typeof finding.file === "string" && finding.file.trim()
+          ? finding.file.trim()
+          : typeof aliases.location?.path === "string" && aliases.location.path.trim()
+            ? aliases.location.path.trim()
+            : undefined;
+      const line =
+        typeof finding.line === "number" && Number.isInteger(finding.line) && finding.line >= 1
+          ? finding.line
+          : typeof aliases.location?.line === "number" &&
+              Number.isInteger(aliases.location.line) &&
+              aliases.location.line >= 1
+            ? aliases.location.line
+            : undefined;
       return {
         ...finding,
         action,
         description,
+        ...(file !== undefined ? { file } : {}),
         id:
           typeof finding.id === "string" &&
           FINDING_ID_PATTERN.test(finding.id.trim())
@@ -5044,21 +5077,25 @@ async function validateReport(
                 .update(
                   JSON.stringify([
                     index,
-                    finding.file,
-                    finding.line,
+                    file,
+                    line,
                     description,
                     action,
-                    finding.severity,
+                    severity,
                   ]),
                 )
                 .digest("hex")
                 .slice(0, 12)}`,
+        ...(line !== undefined ? { line } : {}),
+        severity,
       };
     }),
   };
   for (const finding of normalizedReport.findings) {
     if (!isValidFinding(finding)) {
-      throw new Error(`${stage} worker returned an invalid finding`);
+      throw new Error(
+        `${stage} worker returned an invalid finding: ${JSON.stringify(finding)}`,
+      );
     }
   }
   const artifacts = normalizedReport.artifacts ?? [];

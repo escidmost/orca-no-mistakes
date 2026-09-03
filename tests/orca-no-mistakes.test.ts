@@ -12912,3 +12912,33 @@ test("Test prompts keep checker read-only and authorize fixer repairs", async ()
   );
   assert.match(fixer, /Do NOT modify or delete pre-existing test files/);
 });
+
+test("review worker accepts findings with severity 'no-op', body, and location aliases without error", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          body: "The assertion was relaxed intentionally.",
+          location: {
+            line: 91,
+            path: "tests/tui-fixer-review-1-2-regressions.test.ts",
+          },
+          severity: "no-op",
+          title: "Cancellation retention assertion is less specific after the rail redesign",
+        } as unknown as Finding,
+      ],
+      summary: "one non-blocking validation-policy note",
+    },
+  ]);
+
+  await runPipeline(
+    { intent: "Accept non-blocking no-op review finding with aliases." },
+    orca,
+    git,
+  );
+
+  const passed = orca.tasks.some((t) => t.spec.includes("review"));
+  assert.ok(passed);
+});
