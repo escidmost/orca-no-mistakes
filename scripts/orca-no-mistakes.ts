@@ -14357,7 +14357,7 @@ Run options:
     } catch (markerError) {
       retainGate = true;
       throw new RunSettlementError(
-        attachedRunId ?? "unknown",
+        abortReap.runId ?? attachedRunId ?? "unknown",
         outcome,
         error,
         markerError,
