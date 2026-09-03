@@ -259,14 +259,6 @@ export async function bindPullRequest(input: {
       `unresolved managed comment create intent (${unresolvedCreate.intentSha256}) requires manual resolution: managed comment is absent on pull request #${pullRequest.number}`
     )
   }
-  if (comment && unresolvedCreate) {
-    input.ledger.resolveMutationIntent?.({
-      attemptId: input.attemptId,
-      intentSha256: unresolvedCreate.intentSha256,
-      reason: 'reconciled',
-      runId: input.runId
-    })
-  }
   let commentMutated = false
   const managedCommentCreatedAt = after(mutationCreatedAt, now())
   const managedCommentIntent = input.ledger.recordMutationIntent({
@@ -410,6 +402,14 @@ export async function bindPullRequest(input: {
     runId: input.runId,
     stageId: 'pr'
   })
+  if (comment && unresolvedCreate) {
+    input.ledger.resolveMutationIntent?.({
+      attemptId: input.attemptId,
+      intentSha256: unresolvedCreate.intentSha256,
+      reason: 'reconciled',
+      runId: input.runId
+    })
+  }
   return {
     commentNodeId: comment.id,
     number: pullRequest.number,
