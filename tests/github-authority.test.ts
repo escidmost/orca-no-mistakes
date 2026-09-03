@@ -315,7 +315,10 @@ test('issue comment observation exhausts every page', async () => {
   ]
   let page = 0
   const provider = await GithubAuthority.connect({
-    runner: githubRunner(() => json({ data: { node: { comments: pages[page++] } } }))
+    runner: githubRunner((_executable, _args, options) => {
+      assert.match(options.input ?? '', /author \{ login \.\.\. on Node \{ id \} \}/)
+      return json({ data: { node: { comments: pages[page++] } } })
+    })
   })
   const comments = await provider.observeIssueComments('PR_1')
   assert.deepEqual(comments.map((comment) => comment.id), ['IC_1', 'IC_2'])

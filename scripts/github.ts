@@ -249,7 +249,7 @@ const COMMENTS_QUERY = `query IssueComments($id: ID!, $cursor: String) {
   node(id: $id) {
     ... on PullRequest {
       comments(first: 100, after: $cursor) {
-        nodes { id body createdAt updatedAt url author { id login } }
+        nodes { id body createdAt updatedAt url author { login ... on Node { id } } }
         pageInfo { hasNextPage endCursor }
       }
     }
