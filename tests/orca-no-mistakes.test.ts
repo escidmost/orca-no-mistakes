@@ -31,6 +31,7 @@ import {
   PostMutationCustodyError,
   RecoveryAnchorError,
   launchAgent,
+  installAbortReaping,
   startWorkerWithFallback,
   buildAttestation,
   capLog,
@@ -1242,7 +1243,9 @@ test("resume preserves a stage's consumed automatic-fix budget", async () => {
   assert.equal(resumed.gates.length, 1);
 });
 
-test("fix rounds reuse one durable fixer terminal and worktree", async () => {
+test("fix rounds reuse one durable fixer and clear its marker ownership", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-retained-fixer-marker-"));
+  const markerDir = path.join(temp, ".orca", "no-mistakes");
   const git = new FakeGit();
   allowReviewAutoFix(git);
   const orca = new FakeOrca(git);
@@ -1260,15 +1263,34 @@ test("fix rounds reuse one durable fixer terminal and worktree", async () => {
     pass("clean rereview"),
   ]);
 
-  await runPipeline({ intent: "Repair the persistent defect." }, orca, git);
+  await installAbortReaping({
+    gate: {
+      branch: "evs/no-mistakes-gate-test",
+      id: "gate-test",
+      kind: "orca",
+      path: path.join(temp, "gate"),
+    },
+    originWorktree: temp,
+    pid: process.pid,
+  });
+  try {
+    await runPipeline({ intent: "Repair the persistent defect." }, orca, git);
 
-  const fixers = orca.launches.filter((launch) => launch.role === "fixer");
-  assert.equal(fixers.length, 2);
-  assert.equal(fixers[0].terminal, undefined);
-  assert.equal(fixers[0].worktree, "new-child");
-  assert.equal(fixers[1].terminal, "term-fixer");
-  assert.equal(fixers[1].worktree, "current");
-  assert.ok(orca.calls.includes(`release:${orca.fixerDispatches.at(-1)}`));
+    const fixers = orca.launches.filter((launch) => launch.role === "fixer");
+    assert.equal(fixers.length, 2);
+    assert.equal(fixers[0].terminal, undefined);
+    assert.equal(fixers[0].worktree, "new-child");
+    assert.equal(fixers[1].terminal, "term-fixer");
+    assert.equal(fixers[1].worktree, "current");
+    assert.ok(orca.calls.includes(`release:${orca.fixerDispatches.at(-1)}`));
+    const marker = JSON.parse(
+      await readFile(path.join(markerDir, (await readdir(markerDir))[0]!), "utf8"),
+    ) as { workers?: unknown[] };
+    assert.equal(marker.workers, undefined);
+  } finally {
+    await installAbortReaping({ pid: process.pid });
+    await rm(temp, { force: true, recursive: true });
+  }
 });
 
 test("a failed retain acknowledgement discards the fixer session", async () => {
@@ -2870,7 +2892,9 @@ if (args[0] === 'terminal' && args[1] === 'send') {
   fs.writeFileSync(markerFile, JSON.stringify(marker))
 }
 const gateName = args[args.indexOf('--name') + 1]
-const result = args[0] === 'worktree' && args[1] === 'create'
+const result = args[0] === 'worktree' && args[1] === 'current'
+  ? { worktree: { displayName: 'ONM-92 Validate the completed Run TUI end to end', linkedLinearIssue: 'ONM-92' } }
+  : args[0] === 'worktree' && args[1] === 'create'
   ? { worktree: { id: 'gate-id', path: ${JSON.stringify(gate)}, branch: 'refs/heads/evs/' + gateName } }
   : args[0] === 'terminal' && args[1] === 'list'
     ? { terminals: [{ handle: 'gate-shell', connected: true, writable: true }] }
@@ -2945,6 +2969,21 @@ console.log(JSON.stringify({ result }))
     assert.equal(
       worktreeSet?.[worktreeSet.indexOf("--parent-worktree") + 1],
       `path:${canonicalRepo}`,
+    );
+    assert.equal(
+      worktreeSet?.[worktreeSet.indexOf("--linear-issue") + 1],
+      "ONM-92",
+    );
+    assert.equal(
+      worktreeSet?.[worktreeSet.indexOf("--display-name") + 1],
+      "ONM-92 Validate the completed Run TUI end to end - no-mistakes",
+    );
+    const terminalRename = calls.find(
+      (args) => args[0] === "terminal" && args[1] === "rename",
+    );
+    assert.equal(
+      terminalRename?.[terminalRename.indexOf("--title") + 1],
+      "ONM-92 no-mistakes",
     );
     assert.equal(
       worktreeCreate?.[worktreeCreate.indexOf("--base-branch") + 1],
@@ -7794,8 +7833,10 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     assert.ok(workerStart?.includes("--effort"));
     assert.ok(workerStart?.includes("--worktree"));
     assert.ok(workerStart?.includes("new-child"));
-    assert.ok(workerStart?.includes("--name"));
-    assert.ok(workerStart?.includes("nm-review"));
+    assert.equal(
+      workerStart?.[workerStart.indexOf("--name") + 1],
+      "nm-review-78b61bd4cb4a",
+    );
     assert.ok(workerStart?.includes("--base-branch"));
     assert.ok(workerStart?.includes("feature"));
     assert.ok(workerStart?.includes("--run"));

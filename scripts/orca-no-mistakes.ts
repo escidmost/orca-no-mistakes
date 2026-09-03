@@ -232,6 +232,7 @@ type WorkerReportFailure = (worker: WorkerResult, error: Error) => Promise<void>
 
 export interface OrcaOperations {
   createRun(objective: string): Promise<string>;
+  workerName?(name: string): string;
   createTask(
     spec: string,
     options?: { deps?: string[]; parent?: string },
@@ -295,6 +296,7 @@ export interface GitOperations {
   diffBase(base: string, headOid: string): Promise<string>;
   rebase(base: string, onOutput?: CommandOutput): Promise<StageReport>;
   resolveRefSha(ref: string): Promise<string | undefined>;
+  isAncestor?(ancestor: string, descendant: string): Promise<boolean>;
   showFile(ref: string, filePath: string): Promise<string | undefined>;
   pathExists(ref: string, filePath: string): Promise<boolean>;
   policySha256(base: string): Promise<string>;
@@ -587,7 +589,10 @@ export class GateStopError extends Error {}
 // branch lease. Closing or signalling its terminal kills only the coordinator
 // process, so those resources used to outlive the run. The registry below
 // tracks everything the run still holds; a signal handler reaps it all,
-// anchors the recovery ref, and only then exits. The marker file under
+// anchors the recovery ref, and only then exits — unless the cancelled
+// outcome cannot be delivered over any notification transport, in which
+// case the gate worktree/branch, terminal, and marker are retained for
+// recovery. The marker file under
 // .orca/no-mistakes/ lets a later `prune --stranded` tell a dead run's
 // leftover gate workspace from a live one's without guessing.
 
@@ -611,7 +616,11 @@ type GateRunMarker = {
   generationToken?: number;
   gate: GateWorktree;
   launcherPid?: number;
+  notifyHandle?: string;
   originWorktree: string;
+  outcomeDelivered?: boolean;
+  pendingOutcome?: "passed" | "failed" | "cancelled";
+  pendingSummary?: string;
   pid?: number;
   resumeClaimId?: string;
   runId?: string;
@@ -640,7 +649,11 @@ type ConfiguredLauncherMarker = {
   intentTaskId?: string;
   kind: "configured-launcher";
   launcherId: string;
+  notifyHandle?: string;
   originWorktree: string;
+  outcomeDelivered?: boolean;
+  pendingOutcome?: "passed" | "failed" | "cancelled";
+  pendingSummary?: string;
   pid: number;
   root: string;
   runObjective: string;
@@ -658,7 +671,11 @@ type OrcaLauncherMarker = {
   gateBranch: string;
   kind: "orca-launcher";
   launcherId: string;
+  notifyHandle?: string;
   originWorktree: string;
+  outcomeDelivered?: boolean;
+  pendingOutcome?: "passed" | "failed" | "cancelled";
+  pendingSummary?: string;
   pid: number;
 };
 
@@ -706,17 +723,24 @@ function isDirectRunMarker(
 type AbortReapState = {
   artifactsDir?: string;
   cleanupPending?: boolean;
-  deliveryGit?: GitOperations;
+  deliveryGit?: Pick<GitOperations, "anchorRecoveryRef">;
   gate?: GateWorktree;
-  git?: GitOperations;
+  git?: Pick<GitOperations, "head" | "headOf">;
   generationToken?: number;
   launcherPid?: number;
   ledger?: DomainLedger;
-  notify?: (summary: string) => Promise<void>;
+  notify?: (
+    summary: string,
+    outcome?: "passed" | "failed" | "cancelled",
+  ) => Promise<void>;
+  notifyHandle?: string;
   orca?: OrcaOperations;
   orcaCommand?: string;
   orchestrationRunId?: string;
   originWorktree?: string;
+  outcomeDelivered?: boolean;
+  pendingOutcome?: "passed" | "failed" | "cancelled";
+  pendingSummary?: string;
   pid?: number;
   plainStatus?: boolean;
   presentationCleanup?: () => void;
@@ -930,8 +954,8 @@ function beginAbortAllocation(): () => void {
 async function anchorAbortWorkerTips(
   workers: WorkerResult[],
   runId: string,
-  sourceGit: GitOperations,
-  recoveryGit: GitOperations,
+  sourceGit: Pick<GitOperations, "headOf">,
+  recoveryGit: Pick<GitOperations, "anchorRecoveryRef">,
 ): Promise<Error[]> {
   const failures: Error[] = [];
   for (const worker of workers) {
@@ -1154,6 +1178,14 @@ async function refreshGateMarker(): Promise<void> {
   if (abortReap.startupReceipt !== undefined)
     marker.startupReceipt = abortReap.startupReceipt;
   if (terminalHandle !== undefined) marker.terminalHandle = terminalHandle;
+  if (abortReap.notifyHandle !== undefined)
+    marker.notifyHandle = abortReap.notifyHandle;
+  if (abortReap.pendingOutcome !== undefined)
+    marker.pendingOutcome = abortReap.pendingOutcome;
+  if (abortReap.pendingSummary !== undefined)
+    marker.pendingSummary = abortReap.pendingSummary;
+  if (abortReap.outcomeDelivered === true)
+    marker.outcomeDelivered = true;
   Object.assign(marker, abortWorkerMarkerState());
   await writeMarker(markerPath, marker);
 }
@@ -1169,7 +1201,10 @@ async function writeMarker(
   const temporaryPath = `${markerPath}.${randomUUID()}.tmp`;
   await mkdir(path.dirname(markerPath), { recursive: true });
   try {
-    await writeFile(temporaryPath, `${JSON.stringify(marker, null, 2)}\n`);
+    await writeFile(temporaryPath, `${JSON.stringify(marker, null, 2)}\n`, {
+      flag: "wx",
+      mode: 0o600,
+    });
     const temporaryHandle = await open(temporaryPath, "r");
     try {
       await temporaryHandle.sync();
@@ -1190,6 +1225,23 @@ async function writeMarker(
 
 async function markGateCleanupPending(): Promise<void> {
   abortReap.cleanupPending = true;
+  await refreshGateMarker();
+}
+
+async function markOutcomeDeliveryPending(
+  outcome: "passed" | "failed" | "cancelled",
+  summary: string,
+): Promise<void> {
+  if (abortReap.notifyHandle === undefined) return;
+  abortReap.pendingOutcome = outcome;
+  abortReap.pendingSummary = summary;
+  await refreshGateMarker();
+}
+
+async function clearOutcomeDeliveryPending(): Promise<void> {
+  delete abortReap.pendingOutcome;
+  delete abortReap.pendingSummary;
+  abortReap.outcomeDelivered = true;
   await refreshGateMarker();
 }
 
@@ -1297,6 +1349,18 @@ function writeForceStopMarker(): void {
     runId: orchestrationRunId ?? runId,
     ...(orchestrationRunId && orchestrationRunId !== runId
       ? { domainRunId: runId }
+      : {}),
+    ...(abortReap.notifyHandle !== undefined
+      ? { notifyHandle: abortReap.notifyHandle }
+      : {}),
+    ...(abortReap.pendingOutcome !== undefined
+      ? { pendingOutcome: abortReap.pendingOutcome }
+      : {}),
+    ...(abortReap.pendingSummary !== undefined
+      ? { pendingSummary: abortReap.pendingSummary }
+      : {}),
+    ...(abortReap.outcomeDelivered === true
+      ? { outcomeDelivered: true }
       : {}),
   };
   writeMarkerSync(directRunMarkerPath(run.repo_root, runId), marker);
@@ -1427,11 +1491,12 @@ export async function reapAbortedRun(reason: string): Promise<void> {
   let cancelled = abortReap.runId === undefined;
   let settled = abortReap.runId === undefined;
   let shouldFailOrcaRun = false;
+  let run: ReturnType<DomainLedger["runIdentity"]>;
   if (preserved && abortReap.ledger && abortReap.runId) {
     try {
       const ledger = abortReap.ledger;
       const runId = abortReap.runId;
-      const run = ledger.runIdentity(runId);
+      run = ledger.runIdentity(runId);
       const presentation = new PresentationPublisher(
         ledger,
         runId,
@@ -1441,8 +1506,11 @@ export async function reapAbortedRun(reason: string): Promise<void> {
         () => new Date(),
         (error) => abortLog(String(error)),
       );
-      cancelled = run !== undefined;
-      if (run) {
+      if (run?.status === "in-progress") {
+        const summary = recoverRef
+          ? `No-mistakes cancelled: ${reason}\n${recoveryInstructions(recoverRef)}`
+          : `No-mistakes cancelled: ${reason}`;
+        await markOutcomeDeliveryPending("cancelled", summary);
         const eventKey = `attempt:${presentation.current.attempt}:cancellation:cancel`;
         presentation.publish(
           eventKey,
@@ -1452,13 +1520,15 @@ export async function reapAbortedRun(reason: string): Promise<void> {
               runId,
               "cancelled",
               {
-                branch: run.branch,
+                branch: run!.branch,
                 generationToken: abortReap.generationToken,
-                repoRoot: run.repo_root,
+                repoRoot: run!.repo_root,
               },
               { eventKey, snapshot },
             )),
         );
+      } else {
+        cancelled = false;
       }
       const status = ledger.runStatus(runId);
       settled = status !== "in-progress";
@@ -1486,14 +1556,66 @@ export async function reapAbortedRun(reason: string): Promise<void> {
       preserved = false;
     }
   }
+  let outcomeDelivered = true;
   if (cancelled && abortReap.notify) {
+    const summary = recoverRef
+      ? `No-mistakes cancelled: ${reason}\n${recoveryInstructions(recoverRef)}`
+      : `No-mistakes cancelled: ${reason}`;
+    if (abortReap.pendingOutcome !== "cancelled") {
+      try {
+        await markOutcomeDeliveryPending("cancelled", summary);
+      } catch (markerError) {
+        outcomeDelivered = false;
+        abortLog(
+          `warning: could not record the write-ahead cancelled outcome: ${String(markerError)}`,
+        );
+        throw markerError;
+      }
+    }
     try {
-      await abortReap.notify(
-        recoverRef
-          ? `No-mistakes cancelled: ${reason}\n${recoveryInstructions(recoverRef)}`
-          : `No-mistakes cancelled: ${reason}`,
+      await abortReap.notify(summary, "cancelled");
+      await clearOutcomeDeliveryPending().catch((markerError) =>
+        abortLog(
+          `warning: could not clear the delivered cancelled outcome: ${String(markerError)}`,
+        ),
       );
-    } catch {}
+    } catch (error) {
+      outcomeDelivered = false;
+      abortLog(
+        `warning: abort could not deliver the cancelled outcome, retaining the gate for recovery: ${String(error)}`,
+      );
+    }
+  } else if (!cancelled && abortReap.pendingOutcome !== undefined) {
+    const outcome = abortReap.pendingOutcome;
+    const summary = abortReap.pendingSummary ?? "";
+    try {
+      if (abortReap.notify) {
+        await abortReap.notify(summary, outcome);
+      } else if (abortReap.orca instanceof CliOrca) {
+        await abortReap.orca.notifyRunResult(outcome, summary);
+      } else {
+        outcomeDelivered = false;
+      }
+      if (outcomeDelivered) {
+        await clearOutcomeDeliveryPending().catch((markerError) =>
+          abortLog(
+            `warning: could not clear the delivered ${outcome} outcome: ${String(markerError)}`,
+          ),
+        );
+      }
+    } catch (error) {
+      outcomeDelivered = false;
+      abortLog(
+        `warning: abort could not deliver the ${outcome} outcome, retaining the gate for recovery: ${String(error)}`,
+      );
+    }
+  } else if (
+    !cancelled &&
+    run &&
+    run.status === "passed" &&
+    abortReap.outcomeDelivered !== true
+  ) {
+    outcomeDelivered = false;
   }
   if (preserved && settled && abortReap.orca) {
     for (const worker of workers) {
@@ -1522,6 +1644,7 @@ export async function reapAbortedRun(reason: string): Promise<void> {
   if (
     preserved &&
     settled &&
+    outcomeDelivered &&
     abortReap.gate &&
     gateOid &&
     abortReap.originWorktree &&
@@ -1592,6 +1715,9 @@ export async function installAbortReaping(
     | "workers"
   >,
 ): Promise<void> {
+  if (!state.gate && state.notifyHandle) {
+    throw new Error("notification delivery requires a gate worktree");
+  }
   // Replace, never merge: a stale gate or runId from an earlier registration
   // must not leak into this run's reap.
   for (const key of Object.keys(abortReap) as (keyof AbortReapState)[]) {
@@ -3069,6 +3195,11 @@ export async function runPipeline(
         runId,
       });
       verifyManifest(attestation, PIPELINE_STEPS);
+      const passedSummary = [
+        `Run ${runId} passed all ${PIPELINE_STEPS.length} stages.`,
+        `Candidate commit: ${terminalCommitOid}.`,
+      ].join("\n");
+      await markOutcomeDeliveryPending("passed", passedSummary);
       const eventKey = "run:completed:passed";
       const custodyNote = await presentation.publishAsync(
         { kind: "run-completed", status: "passed" },
@@ -3098,9 +3229,15 @@ export async function runPipeline(
                 verdict: "passed",
               });
               if (deliveryGit === git && operatorHead === terminalCommitOid) {
-                return operatorHead === submissionCommitOid
-                  ? `branch ${deliveryRepo.branch} already at submission commit ${submissionCommitOid}`
-                  : `branch ${deliveryRepo.branch} carries the terminal commit ${terminalCommitOid}`;
+                const note =
+                  operatorHead === submissionCommitOid
+                    ? `branch ${deliveryRepo.branch} already at submission commit ${submissionCommitOid}`
+                    : `branch ${deliveryRepo.branch} carries the terminal commit ${terminalCommitOid}`;
+                await markOutcomeDeliveryPending(
+                  "passed",
+                  `${passedSummary}\n${note}`,
+                );
+                return note;
               }
               const recoverRef = recoveryRefFor(runId);
               let advanced = false;
@@ -3119,13 +3256,18 @@ export async function runPipeline(
                     error instanceof Error ? error.message : String(error);
                 }
               }
-              return advanced
+              const note = advanced
                 ? `advanced branch ${deliveryRepo.branch} from submission to terminal commit ${terminalCommitOid}`
                 : transferFailure
                   ? `custody transfer failed on the pipeline side (${transferFailure}); ` +
                     recoveryInstructions(recoverRef)
                   : "operator checkout diverged or carries uncommitted changes; " +
                     recoveryInstructions(recoverRef);
+              await markOutcomeDeliveryPending(
+                "passed",
+                `${passedSummary}\n${note}`,
+              );
+              return note;
             },
             { eventKey, snapshot },
           ),
@@ -3236,6 +3378,20 @@ export async function runPipeline(
                 },
               );
             };
+          const recoverRef = (failure as CustodyTaggedError).recoverRef;
+          const failureSummary = recoverRef
+            ? `No-mistakes ${outcome}: ${reason}\n${recoveryInstructions(recoverRef)}`
+            : `No-mistakes ${outcome}: ${reason}`;
+          try {
+            await markOutcomeDeliveryPending(outcome, failureSummary);
+          } catch (journalError) {
+            throw new RunSettlementError(
+              runId,
+              outcome,
+              failure,
+              journalError,
+            );
+          }
           if (outcome === "cancelled") {
             const eventKey =
               `attempt:${presentation.current.attempt}:cancellation:gate-stop`;
@@ -3608,7 +3764,10 @@ export async function startWorkerWithFallback(
     const finishAllocation = beginAbortAllocation();
     const allocationId = randomUUID();
     try {
-      await registerAbortWorkerAllocation(allocationId, launch.name);
+      await registerAbortWorkerAllocation(
+        allocationId,
+        orca.workerName?.(launch.name) ?? launch.name,
+      );
     } catch (error) {
       finishAllocation();
       throw error;
@@ -4273,6 +4432,13 @@ async function runFixer(
         worker.worktreePath = worktreePath;
         try {
           await orca.finishWorker(worker, "retain");
+          if (
+            sessionToReuse &&
+            worker !== sessionToReuse.worker &&
+            worktreeId === sessionToReuse.worker.worktreeId
+          ) {
+            await unregisterAbortWorker(sessionToReuse.worker);
+          }
           worker.deliveryId = undefined;
           retainWorker = true;
         } catch {
@@ -5429,6 +5595,13 @@ export class CliOrca implements OrcaOperations {
     return result.run.id;
   }
 
+  workerName(name: string): string {
+    const runSuffix = this.#runId
+      ? createHash("sha256").update(this.#runId).digest("hex").slice(0, 12)
+      : undefined;
+    return runSuffix ? `${name}-${runSuffix}` : name;
+  }
+
   async notifyRunResult(
     outcome: "passed" | "failed" | "cancelled",
     summary: string,
@@ -5440,6 +5613,7 @@ export class CliOrca implements OrcaOperations {
       return;
     }
     const subject = `no-mistakes run ${outcome}`;
+    const failures: string[] = [];
     await this.#json([
       "orchestration",
       "send",
@@ -5456,8 +5630,8 @@ export class CliOrca implements OrcaOperations {
       outcome === "passed" ? "normal" : "high",
       "--json",
     ]).catch((error) => {
-      console.error(
-        `warning: could not notify terminal ${this.#notifyHandle}: ${String(error)}`,
+      failures.push(
+        `could not notify terminal ${this.#notifyHandle}: ${String(error)}`,
       );
     });
     await this.#json([
@@ -5474,10 +5648,18 @@ export class CliOrca implements OrcaOperations {
       "--enter",
       "--json",
     ]).catch((error) => {
-      console.error(
-        `warning: could not wake terminal ${this.#notifyHandle}: ${String(error)}`,
+      failures.push(
+        `could not wake terminal ${this.#notifyHandle}: ${String(error)}`,
       );
     });
+    if (failures.length > 0) {
+      console.error(`warning: ${failures.join("; ")}`);
+    }
+    if (failures.length === 2) {
+      throw new Error(
+        `no-mistakes run ${outcome} notification could not be delivered to ${this.#notifyHandle} over any transport`,
+      );
+    }
   }
 
   async createTask(
@@ -5945,7 +6127,7 @@ export class CliOrca implements OrcaOperations {
             baseBranch,
             effort: agent.effort,
             model: agent.model,
-            name: launch.name,
+            name: this.workerName(launch.name),
             repoRoot,
             runId: this.#runId,
             taskId,
@@ -6134,7 +6316,7 @@ export class CliOrca implements OrcaOperations {
           "--repo",
           `path:${repoRoot}`,
           "--name",
-          launch.name,
+          this.workerName(launch.name),
           "--base-branch",
           branch,
           "--parent-worktree",
@@ -6741,7 +6923,7 @@ export class CliOrca implements OrcaOperations {
             "--repo",
             `path:${repoRoot}`,
             "--name",
-            launch.name,
+            this.workerName(launch.name),
             "--base-branch",
             branch,
             "--parent-worktree",
@@ -9470,6 +9652,14 @@ export class GitShell implements GitOperations {
     return result.failed ? undefined : result.stdout.trim() || undefined;
   }
 
+  async isAncestor(ancestor: string, descendant: string): Promise<boolean> {
+    const result = await this.#git(
+      ["merge-base", "--is-ancestor", ancestor, descendant],
+      true,
+    );
+    return !result.failed;
+  }
+
   async showFile(ref: string, filePath: string): Promise<string | undefined> {
     const result = await this.#git(["show", `${ref}:${filePath}`], true);
     return result.failed ? undefined : result.stdout;
@@ -10114,9 +10304,14 @@ async function launchDetachedRun(
     userGlobalConfig.worktree_roots,
   );
   const existingRunId = stringFlag(flags, "run-id");
+  const notifyHandle =
+    stringFlag(flags, "notify") ?? process.env.ORCA_TERMINAL_HANDLE;
+  if (notifyHandle !== undefined) abortReap.notifyHandle = notifyHandle;
+  else delete abortReap.notifyHandle;
   let configuredOrca: CliOrca | undefined;
   let intentTaskId = "";
   let terminalHandle = "";
+  let terminalTitle = "no-mistakes";
   let gate: GateWorktree | undefined;
   let launcherMarkerFile: string | undefined;
   let launcherMarker: ConfiguredLauncherMarker | undefined;
@@ -10149,6 +10344,7 @@ async function launchDetachedRun(
     await writeMarker(launcherMarkerFile!, marker);
   };
   const cleanupFailedLaunch = async (error: unknown): Promise<void> => {
+    delete abortReap.notifyHandle;
     const cleanupGate = gate ?? launcherMarker?.gate ?? orcaLauncherMarker?.gate;
     if (launcherMarker && launcherMarkerFile) {
       launcherMarker.cleanupPending = true;
@@ -10270,6 +10466,7 @@ async function launchDetachedRun(
       createdAt: new Date().toISOString(),
       kind: "configured-launcher",
       launcherId,
+      ...(notifyHandle !== undefined ? { notifyHandle } : {}),
       originWorktree: repo.root,
       pid: process.pid,
       root,
@@ -10380,6 +10577,7 @@ async function launchDetachedRun(
       gateBranch,
       kind: "orca-launcher",
       launcherId,
+      ...(notifyHandle !== undefined ? { notifyHandle } : {}),
       originWorktree: repo.root,
       pid: process.pid,
     };
@@ -10422,17 +10620,49 @@ async function launchDetachedRun(
       orcaLauncherMarker = undefined;
     }
     if (gate.kind === "orca") {
+      let originDisplayName: string | undefined;
+      let originLinearIssue: string | undefined;
+      const current = await command(
+        orcaCommand,
+        ["worktree", "current", "--json"],
+        repo.root,
+        { allowFailure: true },
+      );
+      if (current.code === 0) {
+        try {
+          const worktree = unwrapJson<{
+            worktree?: {
+              displayName?: unknown;
+              linkedLinearIssue?: unknown;
+            };
+          }>(current.stdout).worktree;
+          if (typeof worktree?.displayName === "string")
+            originDisplayName = worktree.displayName;
+          if (typeof worktree?.linkedLinearIssue === "string")
+            originLinearIssue = worktree.linkedLinearIssue;
+        } catch {}
+      }
+      const setArgs = [
+        "worktree",
+        "set",
+        "--worktree",
+        `id:${gate.id}`,
+        "--parent-worktree",
+        `path:${repo.root}`,
+      ];
+      if (originDisplayName)
+        setArgs.push(
+          "--display-name",
+          `${originDisplayName} - no-mistakes`,
+        );
+      if (originLinearIssue) {
+        setArgs.push("--linear-issue", originLinearIssue);
+        terminalTitle = `${originLinearIssue} no-mistakes`;
+      }
+      setArgs.push("--json");
       await command(
         orcaCommand,
-        [
-          "worktree",
-          "set",
-          "--worktree",
-          `id:${gate.id}`,
-          "--parent-worktree",
-          `path:${repo.root}`,
-          "--json",
-        ],
+        setArgs,
         repo.root,
       );
       const listed = unwrapJson<{
@@ -10455,6 +10685,21 @@ async function launchDetachedRun(
           (terminal) =>
             terminal.connected !== false && terminal.writable !== false,
         )?.handle ?? "";
+      if (terminalHandle && terminalTitle !== "no-mistakes") {
+        await command(
+          orcaCommand,
+          [
+            "terminal",
+            "rename",
+            "--terminal",
+            terminalHandle,
+            "--title",
+            terminalTitle,
+            "--json",
+          ],
+          repo.root,
+        );
+      }
     }
     if (!terminalHandle) {
       const created = unwrapJson<{ terminal: { handle: string } }>(
@@ -10467,7 +10712,7 @@ async function launchDetachedRun(
               "--worktree",
               `path:${gate.kind === "orca" ? gate.path : repo.root}`,
               "--title",
-              "no-mistakes",
+              terminalTitle,
               "--json",
             ],
             repo.root,
@@ -10497,8 +10742,6 @@ async function launchDetachedRun(
   }
   if (admissionId) attachedArgs.push("--admission-id", admissionId);
   if (flags.tui !== true && flags["no-tui"] !== true) attachedArgs.push("--tui");
-  const notifyHandle =
-    stringFlag(flags, "notify") ?? process.env.ORCA_TERMINAL_HANDLE;
   if (notifyHandle) attachedArgs.push("--notify", notifyHandle);
   const quotedCommand = [
     process.execPath,
@@ -10939,6 +11182,183 @@ async function discoverConfiguredLauncherAllocations(
   return { runId, terminalHandle };
 }
 
+async function deliverPendingOutcome(
+  markerFile: string,
+  marker: GateRunMarker | ConfiguredLauncherMarker,
+  runId: string | undefined,
+  orcaCommand: string,
+  repoRoot: string,
+  ledger?: DomainLedger,
+  gateExists = true,
+): Promise<boolean> {
+  const outcome = marker.pendingOutcome;
+  const domainRunId = (marker as GateRunMarker).domainRunId ?? runId;
+  const run =
+    domainRunId && ledger ? ledger.runIdentity(domainRunId) : undefined;
+  if (marker.notifyHandle === undefined) {
+    if (outcome === undefined) return true;
+    delete marker.pendingOutcome;
+    delete marker.pendingSummary;
+    marker.outcomeDelivered = true;
+    try {
+      await writeMarker(markerFile, marker);
+      return true;
+    } catch (error) {
+      console.error(
+        `no-mistakes: retained gate marker ${markerFile}; could not clear its no-target outcome state: ${String(error)}`,
+      );
+      return false;
+    }
+  }
+  if (outcome === undefined) {
+    if (
+      gateExists &&
+      run &&
+      run.status === "passed" &&
+      marker.outcomeDelivered !== true
+    ) {
+      console.error(
+        `no-mistakes: retained gate marker ${markerFile}; its delivery state is unknown for settled run ${domainRunId}`,
+      );
+      return false;
+    }
+    return true;
+  }
+  if (
+    (outcome !== "passed" && outcome !== "failed" && outcome !== "cancelled") ||
+    typeof marker.pendingSummary !== "string" ||
+    typeof marker.notifyHandle !== "string"
+  ) {
+    console.error(
+      `no-mistakes: retained gate marker ${markerFile}; its pending outcome record is incomplete`,
+    );
+    return false;
+  }
+  if (run !== undefined && run.status !== outcome) {
+    if (run.status === "in-progress") return true;
+    delete marker.pendingOutcome;
+    delete marker.pendingSummary;
+    try {
+      await writeMarker(markerFile, marker);
+    } catch (error) {
+      console.error(
+        `no-mistakes: retained gate marker ${markerFile}; could not clear uncommitted pending outcome: ${String(error)}`,
+      );
+      return false;
+    }
+    return true;
+  }
+  let summary = marker.pendingSummary;
+  if (outcome === "passed") {
+    const hasCustodyStatus =
+      summary.includes("advanced branch") ||
+      summary.includes("carries the terminal commit") ||
+      summary.includes("already at submission commit") ||
+      summary.includes("custody transfer failed") ||
+      summary.includes("operator checkout diverged");
+    if (!hasCustodyStatus) {
+      if (run && domainRunId && run.status === "passed") {
+        const fullRun =
+          ledger ? ledger.run(domainRunId) : undefined;
+        const attestation =
+          ledger ? ledger.findAttestation(domainRunId) : undefined;
+        const terminalCommitOid =
+          attestation?.candidateCommitOid ??
+          summary.match(/Candidate commit: ([0-9a-f]{40,64})/)?.[1];
+        const targetRepo = run.repo_root ?? repoRoot;
+        const branch = run.branch;
+        const recoverRef = recoveryRefFor(domainRunId);
+        let custodyNote: string | undefined;
+        try {
+          const gitShell = new GitShell({ repo: targetRepo });
+          const branchSha = await gitShell.resolveRefSha(`refs/heads/${branch}`);
+          if (terminalCommitOid && branchSha === terminalCommitOid) {
+            custodyNote =
+              fullRun?.submission_commit_oid &&
+              branchSha === fullRun.submission_commit_oid
+                ? `branch ${branch} already at submission commit ${fullRun.submission_commit_oid}`
+                : `advanced branch ${branch} from submission to terminal commit ${terminalCommitOid}`;
+          } else if (
+            terminalCommitOid &&
+            branchSha &&
+            (await gitShell.isAncestor(terminalCommitOid, branchSha))
+          ) {
+            custodyNote = `branch ${branch} carries the terminal commit ${terminalCommitOid}`;
+          } else {
+            custodyNote =
+              "operator checkout diverged or carries uncommitted changes; " +
+              recoveryInstructions(recoverRef);
+          }
+        } catch {
+          custodyNote =
+            "operator checkout diverged or carries uncommitted changes; " +
+            recoveryInstructions(recoverRef);
+        }
+        summary = `${summary}\n${custodyNote}`;
+        marker.pendingSummary = summary;
+        try {
+          await writeMarker(markerFile, marker);
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }
+  try {
+    if (
+      process.env.ORCA_TERMINAL_HANDLE &&
+      marker.notifyHandle === process.env.ORCA_TERMINAL_HANDLE
+    ) {
+      console.error(summary);
+    } else {
+      await new CliOrca({
+        command: orcaCommand,
+        cwd: repoRoot,
+        runId,
+        notifyHandle: marker.notifyHandle,
+      }).notifyRunResult(outcome, summary);
+    }
+  } catch (error) {
+    console.error(
+      `no-mistakes: retained gate marker ${markerFile}; its pending ${outcome} outcome could not be delivered: ${String(error)}`,
+    );
+    return false;
+  }
+  delete marker.pendingOutcome;
+  delete marker.pendingSummary;
+  marker.outcomeDelivered = true;
+  try {
+    await writeMarker(markerFile, marker);
+  } catch (error) {
+    console.error(
+      `no-mistakes: retained gate marker ${markerFile}; could not clear delivered pending outcome: ${String(error)}`,
+    );
+    return false;
+  }
+  return true;
+}
+
+async function journalStrandedCancellation(
+  markerFile: string,
+  marker: GateRunMarker | ConfiguredLauncherMarker,
+  runId: string,
+  reason: string,
+): Promise<boolean> {
+  if (typeof marker.notifyHandle !== "string") return true;
+  marker.pendingOutcome = "cancelled";
+  marker.pendingSummary = `No-mistakes cancelled: ${reason}\n${recoveryInstructions(recoveryRefFor(runId))}`;
+  delete marker.outcomeDelivered;
+  try {
+    await writeMarker(markerFile, marker);
+    return true;
+  } catch (error) {
+    console.error(
+      `no-mistakes: retained gate marker ${markerFile}; could not journal stranded cancellation: ${String(error)}`,
+    );
+    return false;
+  }
+}
+
 async function reapConfiguredGate(
   markerFile: string,
   marker: GateRunMarker,
@@ -11016,6 +11436,18 @@ async function reapConfiguredGate(
     );
     return false;
   }
+  if (
+    !(await deliverPendingOutcome(
+      markerFile,
+      marker,
+      gate.runId,
+      orcaCommand,
+      repoRoot,
+      ledger,
+    ))
+  ) {
+    return false;
+  }
   const worktrees = await listGitWorktrees(repoRoot);
   if (worktrees === undefined) {
     console.error(
@@ -11053,18 +11485,37 @@ async function reapConfiguredGate(
   let generationToken = marker.generationToken;
   const settleConfiguredRun = async (): Promise<boolean> => {
     if (!staleResumeClaim) {
-      if (
-        run?.status === "in-progress" &&
-        !ledger.settleRun(domainRunId, "cancelled", {
-          branch: run.branch,
-          generationToken,
-          repoRoot,
-        })
-      ) {
-        console.error(
-          `no-mistakes: retained gate workspace ${gate.path}; its run ownership changed before cancellation`,
-        );
-        return false;
+      if (run?.status === "in-progress") {
+        if (
+          !(await journalStrandedCancellation(
+            markerFile,
+            marker,
+            domainRunId,
+            "Configured coordinator terminated before cleanup completed",
+          )) ||
+          !ledger.settleRun(domainRunId, "cancelled", {
+            branch: run.branch,
+            generationToken,
+            repoRoot,
+          })
+        ) {
+          console.error(
+            `no-mistakes: retained gate workspace ${gate.path}; its run ownership changed before cancellation`,
+          );
+          return false;
+        }
+        if (
+          !(await deliverPendingOutcome(
+            markerFile,
+            marker,
+            gate.runId,
+            orcaCommand,
+            repoRoot,
+            ledger,
+          ))
+        ) {
+          return false;
+        }
       }
       if (run?.status === "passed") return true;
     }
@@ -11076,6 +11527,7 @@ async function reapConfiguredGate(
       }).failRun("Configured coordinator terminated before cleanup completed");
       return true;
     } catch (error) {
+      if (isConsumerFenced(error)) return true;
       console.error(
         `no-mistakes: retained gate workspace ${gate.path}; its configured run could not be settled: ${String(error)}`,
       );
@@ -11292,7 +11744,17 @@ async function reapConfiguredLauncher(
     (marker.runId !== undefined &&
       (!RUN_ID_PATTERN.test(marker.runId) ||
         configuredRunPath(root, marker.runId) !==
-          path.join(root, marker.runId)))
+          path.join(root, marker.runId))) ||
+    (marker.notifyHandle !== undefined &&
+      (typeof marker.notifyHandle !== "string" || marker.notifyHandle.length === 0)) ||
+    (marker.pendingOutcome !== undefined &&
+      marker.pendingOutcome !== "passed" &&
+      marker.pendingOutcome !== "failed" &&
+      marker.pendingOutcome !== "cancelled") ||
+    (marker.pendingSummary !== undefined &&
+      typeof marker.pendingSummary !== "string") ||
+    (marker.outcomeDelivered !== undefined &&
+      typeof marker.outcomeDelivered !== "boolean")
   ) {
     return false;
   }
@@ -11362,6 +11824,9 @@ async function reapConfiguredLauncher(
         cleanupPending: true,
         createdAt: marker.createdAt,
         gate: marker.gate,
+        ...(marker.notifyHandle !== undefined
+          ? { notifyHandle: marker.notifyHandle }
+          : {}),
         originWorktree: marker.originWorktree,
         pid: marker.pid,
         runId: marker.runId,
@@ -11383,16 +11848,59 @@ async function reapConfiguredLauncher(
         cwd: repoRoot,
         runId: marker.runId,
       }).failRun("Configured launcher terminated before gate allocation");
-    } catch {
+    } catch (error) {
+      if (!isConsumerFenced(error)) {
+        return false;
+      }
+      if (run === undefined || run.status === "in-progress") {
+        console.error(
+          `no-mistakes: retained configured launcher marker ${markerFile}; its Orca run is owned by another consumer`,
+        );
+        return false;
+      }
+    }
+    if (
+      run !== undefined &&
+      run.status === "in-progress" &&
+      (!(await journalStrandedCancellation(
+        markerFile,
+        marker,
+        marker.runId,
+        "Configured launcher terminated before gate allocation",
+      )) ||
+        !ledger.settleRun(marker.runId, "cancelled", {
+          branch: run.branch,
+          repoRoot,
+        }))
+    ) {
       return false;
     }
     if (
       run !== undefined &&
       run.status === "in-progress" &&
-      !ledger.settleRun(marker.runId, "cancelled", {
-        branch: run.branch,
+      !(await deliverPendingOutcome(
+        markerFile,
+        marker,
+        marker.runId,
+        orcaCommand,
         repoRoot,
-      })
+        ledger,
+        false,
+      ))
+    ) {
+      return false;
+    }
+    if (
+      marker.pendingOutcome !== undefined &&
+      !(await deliverPendingOutcome(
+        markerFile,
+        marker,
+        marker.runId,
+        orcaCommand,
+        repoRoot,
+        ledger,
+        false,
+      ))
     ) {
       return false;
     }
@@ -11438,6 +11946,16 @@ async function reapOrcaLauncher(
       typeof marker.allocationPending !== "boolean") ||
     (marker.allocationPid !== undefined &&
       (!Number.isInteger(marker.allocationPid) || marker.allocationPid <= 0)) ||
+    (marker.notifyHandle !== undefined &&
+      (typeof marker.notifyHandle !== "string" || marker.notifyHandle.length === 0)) ||
+    (marker.pendingOutcome !== undefined &&
+      marker.pendingOutcome !== "passed" &&
+      marker.pendingOutcome !== "failed" &&
+      marker.pendingOutcome !== "cancelled") ||
+    (marker.pendingSummary !== undefined &&
+      typeof marker.pendingSummary !== "string") ||
+    (marker.outcomeDelivered !== undefined &&
+      typeof marker.outcomeDelivered !== "boolean") ||
     (await coordinatorIsLive({ pid: marker.pid }, orcaCommand, repoRoot))
   ) {
     return false;
@@ -12014,6 +12532,62 @@ function settleStrandedCancellation(
   return settled;
 }
 
+function isConsumerFenced(error: unknown): boolean {
+  if (!error) return false;
+  if (typeof error === "object") {
+    const candidate = error as {
+      code?: unknown;
+      error?: { code?: unknown };
+    };
+    if (
+      candidate.error?.code === "consumer_fenced" ||
+      candidate.code === "consumer_fenced"
+    ) {
+      return true;
+    }
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  const failedIndex = message.lastIndexOf(" failed (");
+  const colonIndex = failedIndex >= 0 ? message.indexOf("): ", failedIndex) : -1;
+  const outputText =
+    colonIndex >= 0 ? message.slice(colonIndex + 3).trim() : message.trim();
+
+  const candidates: unknown[] = [];
+  for (const line of outputText.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+      try {
+        candidates.push(JSON.parse(trimmed));
+      } catch {}
+    }
+  }
+  if (candidates.length === 0) {
+    const start = outputText.indexOf("{");
+    const end = outputText.lastIndexOf("}");
+    if (start >= 0 && end > start) {
+      try {
+        candidates.push(JSON.parse(outputText.slice(start, end + 1)));
+      } catch {}
+    }
+  }
+
+  for (const candidate of candidates) {
+    if (candidate && typeof candidate === "object") {
+      const payload = candidate as {
+        code?: unknown;
+        error?: { code?: unknown };
+      };
+      if (
+        payload.error?.code === "consumer_fenced" ||
+        payload.code === "consumer_fenced"
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 async function reapDirectRun(
   markerFile: string,
   marker: DirectRunMarker,
@@ -12141,8 +12715,8 @@ async function reapDirectRun(
       cwd: repoRoot,
       runId: marker.runId,
     }).failRun("Coordinator terminated before cleanup completed");
-  } catch {
-    return false;
+  } catch (error) {
+    if (!isConsumerFenced(error)) return false;
   }
   await rm(markerFile);
   console.error(`no-mistakes: reaped stranded direct run ${domainRunId}`);
@@ -12437,6 +13011,20 @@ async function reapStrandedGates(
         }
         if (actualGate === undefined) {
           if (
+            !(await deliverPendingOutcome(
+              markerFile,
+              marker,
+              orchestrationRunId,
+              orcaCommand,
+              repoRoot,
+              ledger,
+              false,
+            ))
+          ) {
+            retained += 1;
+            continue;
+          }
+          if (
             worktrees.some((entry) => entry.path === gate.path) ||
             (!staleResumeClaim && run?.status === "in-progress")
           ) {
@@ -12514,11 +13102,13 @@ async function reapStrandedGates(
                 runId: orchestrationRunId,
               }).failRun("Coordinator terminated before cleanup completed");
             } catch (error) {
-              retained += 1;
-              console.error(
-                `no-mistakes: retained gate workspace ${gate.path}; its Orca run could not be settled: ${String(error)}`,
-              );
-              continue;
+              if (!isConsumerFenced(error)) {
+                retained += 1;
+                console.error(
+                  `no-mistakes: retained gate workspace ${gate.path}; its Orca run could not be settled: ${String(error)}`,
+                );
+                continue;
+              }
             }
           }
           const branch = await command(
@@ -12608,6 +13198,19 @@ async function reapStrandedGates(
           console.error(
             `no-mistakes: retained gate workspace ${gate.path}; its coordinator is still live`,
           );
+          continue;
+        }
+        if (
+          !(await deliverPendingOutcome(
+            markerFile,
+            marker,
+            orchestrationRunId,
+            orcaCommand,
+            repoRoot,
+            ledger,
+          ))
+        ) {
+          retained += 1;
           continue;
         }
         const recoverWorkers =
@@ -12736,16 +13339,36 @@ async function reapStrandedGates(
             }
             if (
               run?.status === "in-progress" &&
-              !settleStrandedCancellation(ledger, domainRunId, {
-                branch: run.branch,
-                generationToken: generationToken!,
-                repoRoot,
-              })
+              (!(await journalStrandedCancellation(
+                markerFile,
+                marker,
+                domainRunId,
+                "Coordinator terminated before cleanup completed",
+              )) ||
+                !settleStrandedCancellation(ledger, domainRunId, {
+                  branch: run.branch,
+                  generationToken: generationToken!,
+                  repoRoot,
+                }))
             ) {
               retained += 1;
               console.error(
                 `no-mistakes: retained gate workspace ${gate.path}; its run ownership changed before cancellation`,
               );
+              continue;
+            }
+            if (
+              run?.status === "in-progress" &&
+              !(await deliverPendingOutcome(
+                markerFile,
+                marker,
+                orchestrationRunId,
+                orcaCommand,
+                repoRoot,
+                ledger,
+              ))
+            ) {
+              retained += 1;
               continue;
             }
           } else {
@@ -12777,11 +13400,13 @@ async function reapStrandedGates(
               runId: orchestrationRunId,
             }).failRun("Coordinator terminated before cleanup completed");
           } catch (error) {
-            retained += 1;
-            console.error(
-              `no-mistakes: retained gate workspace ${gate.path}; its Orca run could not be settled: ${String(error)}`,
-            );
-            continue;
+            if (!isConsumerFenced(error)) {
+              retained += 1;
+              console.error(
+                `no-mistakes: retained gate workspace ${gate.path}; its Orca run could not be settled: ${String(error)}`,
+              );
+              continue;
+            }
           }
         }
         // Orca cannot conditionally remove atomically, so stranded cleanup
@@ -13530,14 +14155,19 @@ Run options:
             path: gatePath,
           }
         : undefined;
+  const notifyHandle = stringFlag(parsed.flags, "notify");
+  if (!gate && notifyHandle) {
+    throw new Error("--notify is not supported for direct attached runs");
+  }
+  const attachedRunId =
+    gate?.kind === "configured"
+      ? gate.runId
+      : admissionRow?.run_id ?? stringFlag(parsed.flags, "run-id");
   const orca = new CliOrca({
     cwd: gatePath,
-    notifyHandle: stringFlag(parsed.flags, "notify"),
+    notifyHandle,
     parentWorktree: gate?.kind === "configured" ? originWorktree : undefined,
-    runId:
-      gate?.kind === "configured"
-        ? gate.runId
-        : admissionRow?.run_id ?? stringFlag(parsed.flags, "run-id"),
+    runId: attachedRunId,
   });
   const deliveryGit = gate
     ? new GitShell({
@@ -13573,7 +14203,9 @@ Run options:
       ...(deliveryGit ? { deliveryGit } : {}),
       git,
       ledger,
-      notify: (summary) => orca.notifyRunResult("cancelled", summary),
+      notify: (summary, outcome = "cancelled") =>
+        orca.notifyRunResult(outcome, summary),
+      notifyHandle,
       orca,
       orcaCommand: resolveOrcaCommand(),
       ...(originWorktree ? { originWorktree } : {}),
@@ -13647,16 +14279,26 @@ Run options:
     );
     closeRenderer();
     gateCleanupOid = result.attestation?.candidateCommitOid ?? gateCleanupOid;
-    await orca.notifyRunResult(
-      "passed",
-      [
-        `Run ${result.runId} passed all ${result.steps.length} stages.`,
-        ...(result.attestation
-          ? [`Candidate commit: ${result.attestation.candidateCommitOid}.`]
-          : []),
-        ...(result.custodyNote ? [result.custodyNote] : []),
-      ].join("\n"),
-    );
+    const passedSummary = [
+      `Run ${result.runId} passed all ${result.steps.length} stages.`,
+      ...(result.attestation
+        ? [`Candidate commit: ${result.attestation.candidateCommitOid}.`]
+        : []),
+      ...(result.custodyNote ? [result.custodyNote] : []),
+    ].join("\n");
+    try {
+      await orca.notifyRunResult("passed", passedSummary);
+      await clearOutcomeDeliveryPending().catch((markerError) =>
+        console.error(
+          `warning: could not clear the delivered passed outcome: ${String(markerError)}`,
+        ),
+      );
+    } catch (notificationError) {
+      retainGate = true;
+      console.error(
+        `warning: could not deliver the passed outcome, retaining the gate for recovery: ${String(notificationError)}`,
+      );
+    }
     console.log(JSON.stringify(result));
   } catch (error) {
     closeRenderer();
@@ -13706,16 +14348,33 @@ Run options:
         );
       }
     }
+    const failedSummary = recoverRef
+      ? `No-mistakes ${outcome}: ${message}\n${recoveryInstructions(recoverRef)}`
+      : `No-mistakes ${outcome}: ${message}`;
+    const shouldRetainGate = retainGate;
     try {
-      await orca.notifyRunResult(
+      await markOutcomeDeliveryPending(outcome, failedSummary);
+    } catch (markerError) {
+      retainGate = true;
+      throw new RunSettlementError(
+        abortReap.runId ?? attachedRunId ?? "unknown",
         outcome,
-        recoverRef
-          ? `No-mistakes ${outcome}: ${message}\n${recoveryInstructions(recoverRef)}`
-          : `No-mistakes ${outcome}: ${message}`,
+        error,
+        markerError,
+      );
+    }
+    try {
+      await orca.notifyRunResult(outcome, failedSummary);
+      retainGate = shouldRetainGate;
+      await clearOutcomeDeliveryPending().catch((markerError) =>
+        console.error(
+          `warning: could not clear the delivered ${outcome} outcome: ${String(markerError)}`,
+        ),
       );
     } catch (notificationError) {
+      retainGate = true;
       console.error(
-        `warning: could not notify Orca about the failed run: ${String(notificationError)}`,
+        `warning: could not notify Orca about the failed run, retaining the gate for recovery: ${String(notificationError)}`,
       );
     }
     throw error;

@@ -180,3 +180,86 @@ test("local settlement failure retains recovery custody", async () => {
     await rm(temp, { force: true, recursive: true });
   }
 });
+
+test("outcome journal failure preserves the original pipeline error", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "onm-journal-custody-"));
+  const markerDir = path.join(temp, ".orca", "no-mistakes");
+  const gatePath = path.join(temp, "gate");
+  const runId = "run-journal-failure";
+  const originalError = new Error("injected pipeline failure");
+  const gitOperations = {
+    async anchorRecoveryRef() {},
+    async assertReady() {
+      return {
+        base: "main",
+        baseOid: "b".repeat(40),
+        branch: "feature",
+        head: "a".repeat(40),
+        root: temp,
+      };
+    },
+    async head() {
+      return "a".repeat(40);
+    },
+    async policySha256() {
+      return "c".repeat(64);
+    },
+    async rebase() {
+      await chmod(markerDir, 0o500);
+      throw originalError;
+    },
+  } as unknown as GitOperations;
+  let task = 0;
+  const orca = {
+    async completeTask() {},
+    async createRun() {
+      return runId;
+    },
+    async createTask() {
+      return `task-${++task}`;
+    },
+    async setWorktreeStatus() {},
+  } as unknown as OrcaOperations;
+  const ledger = new DomainLedger(":memory:");
+  try {
+    await mkdir(markerDir, { recursive: true });
+    await mkdir(gatePath);
+    await installAbortReaping({
+      gate: {
+        branch: "gate",
+        intentTaskId: "task-intent",
+        kind: "configured",
+        path: gatePath,
+        root: temp,
+        runId,
+      },
+      git: gitOperations,
+      ledger,
+      notifyHandle: "origin-term",
+      originWorktree: temp,
+      pid: process.pid,
+      runId,
+    });
+    await assert.rejects(
+      runPipeline(
+        { allowLocalConfig: true, intent: "Preserve journal errors." },
+        orca,
+        gitOperations,
+        ledger,
+      ),
+      (error) => {
+        assert.ok(error instanceof RunSettlementError);
+        assert.ok(error.cause instanceof AggregateError);
+        assert.equal(error.cause.errors[0], originalError);
+        assert.match(String(error.cause.errors[1]), /permission denied|EACCES/u);
+        return true;
+      },
+    );
+    assert.equal(ledger.runStatus(runId), "in-progress");
+  } finally {
+    await chmod(markerDir, 0o700).catch(() => {});
+    await installAbortReaping({ pid: process.pid });
+    ledger.close();
+    await rm(temp, { force: true, recursive: true });
+  }
+});

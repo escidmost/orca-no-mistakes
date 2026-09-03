@@ -174,6 +174,7 @@ test("stranded cleanup waits for a receipted ACP process to exit", async () => {
       createdAt: new Date().toISOString(),
       gate: { branch: "gate", id: gateId, kind: "orca", path: gate },
       originWorktree: seeded.repo,
+      outcomeDelivered: true,
       pid: deadPid(),
       runId,
       workers: [
