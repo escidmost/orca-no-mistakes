@@ -62,10 +62,16 @@ Approving or skipping a stage records the decision in the domain ledger's gate a
 
 ## Result
 
-On direct success the CLI prints JSON containing the completion attestation manifest:
+For Release 2 runs, direct success prints JSON containing the completion attestation manifest under `completionAttestation`:
 
 ```json
 {"runId":"<orca-run-id>","steps":["intent","rebase","review","test","document","lint","push","pr"],"verdict":"passed","custodyNote":"...","completionAttestation":{"version":"2.0.0","assuranceClaims":["configured-pipeline-completed","candidate-publication-verified","pull-request-bound"],"merkleRoot":"..."}}
+```
+
+For migrated Release 1 resumes, direct success prints JSON returning the frozen six-stage plan and the v1.3 manifest under `attestation`:
+
+```json
+{"runId":"<orca-run-id>","steps":["intent","rebase","review","test","document","lint"],"verdict":"passed","custodyNote":"...","attestation":{"version":"1.3.0","merkleRoot":"..."}}
 ```
 
 Export and verify attestations, and prune retained evidence:
