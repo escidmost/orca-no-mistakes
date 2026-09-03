@@ -6,11 +6,11 @@ import { parseGithubRepositoryReference, runCommand } from './github.ts'
 import {
   canonicalJson,
   evidenceSha256,
+  finalContiguousCheckpointByStage,
   gateAuditMatchesEvidence,
   isAuthoritativeStageEvidence,
   sha256,
-  type DomainLedger,
-  type StageCheckpointRow
+  type DomainLedger
 } from './ledger.ts'
 
 const OID_PATTERN = /^[0-9a-f]{40,64}$/
@@ -181,17 +181,17 @@ function terminalCandidate(
   }
 
   const dispositions = new Map(ledger.stageDispositions(runId).map((row) => [row.stage_id, row]))
-  const finalCheckpoint = new Map<string, { checkpoint: StageCheckpointRow; index: number }>()
-  ledger.listCheckpoints(runId).forEach((checkpoint, index) => {
-    finalCheckpoint.set(checkpoint.stage_id, { checkpoint, index })
-  })
+  const finalCheckpoint = finalContiguousCheckpointByStage(
+    plan.slice(0, pushIndex).map((stage) => stage.stage_id),
+    ledger.listCheckpoints(runId),
+    run.submission_commit_oid
+  )
   const evidenceByDigest = new Map(
     ledger.listEvidence(runId).map((row) => [row.evidence_sha256, row])
   )
   const gateAudits = ledger.listGateAudit(runId)
 
   let candidate = run.submission_commit_oid
-  let checkpointIndex = -1
   for (const stage of plan.slice(0, pushIndex)) {
     const disposition = dispositions.get(stage.stage_id)
     if (!disposition) throw new CandidatePublicationError(`stage ${stage.stage_id} has no terminal disposition`)
@@ -207,7 +207,7 @@ function terminalCandidate(
       if (final) throw new CandidatePublicationError(`non-executed stage ${stage.stage_id} has a checkpoint`)
       continue
     }
-    if (!final || final.index <= checkpointIndex || final.checkpoint.input_commit_oid !== candidate) {
+    if (!final) {
       throw new CandidatePublicationError(
         `stage ${stage.stage_id} does not extend the contiguous candidate chain`
       )
@@ -228,8 +228,8 @@ function terminalCandidate(
     )
     if (
       evidence?.stage_id !== stage.stage_id ||
-      evidence.candidate_commit_oid !== final.checkpoint.output_commit_oid ||
-      evidence.round_index !== final.checkpoint.round_index ||
+      evidence.candidate_commit_oid !== final.output_commit_oid ||
+      evidence.round_index !== final.round_index ||
       (evidence.exit_code !== 0 && !approved) ||
       !isAuthoritativeStageEvidence(evidence.worker_identity)
     ) {
@@ -245,8 +245,7 @@ function terminalCandidate(
         `satisfied stage ${stage.stage_id} retained evidence is invalid: ${evidenceProblems.join('; ')}`
       )
     }
-    candidate = final.checkpoint.output_commit_oid
-    checkpointIndex = final.index
+    candidate = final.output_commit_oid
   }
 
   if (!OID_PATTERN.test(candidate)) {

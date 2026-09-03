@@ -242,6 +242,47 @@ export type StageCheckpointRow = {
   stage_id: string
 }
 
+export function finalContiguousCheckpointByStage(
+  stageIds: readonly string[],
+  checkpoints: readonly StageCheckpointRow[],
+  initialCandidate: string
+): Map<string, StageCheckpointRow> {
+  const result = new Map<string, StageCheckpointRow>()
+  const stagePosition = new Map(stageIds.map((stageId, index) => [stageId, index]))
+  let candidate = initialCandidate
+  let previousIndex = -1
+  for (const [position, stageId] of stageIds.entries()) {
+    const seenCandidates = new Set([candidate])
+    let final: { checkpoint: StageCheckpointRow; index: number } | undefined
+    for (let index = previousIndex + 1; index < checkpoints.length; index += 1) {
+      const checkpoint = checkpoints[index]!
+      if (checkpoint.stage_id !== stageId) {
+        const checkpointPosition = stagePosition.get(checkpoint.stage_id)
+        if (checkpointPosition !== undefined && checkpointPosition > position) break
+        continue
+      }
+      if (checkpoint.input_commit_oid === candidate) {
+        candidate = checkpoint.output_commit_oid
+        seenCandidates.add(candidate)
+        final = { checkpoint, index }
+        continue
+      }
+      if (
+        checkpoint.output_commit_oid === candidate &&
+        seenCandidates.has(checkpoint.input_commit_oid)
+      ) {
+        final = { checkpoint, index }
+        continue
+      }
+      return result
+    }
+    if (!final) break
+    result.set(stageId, final.checkpoint)
+    previousIndex = final.index
+  }
+  return result
+}
+
 export type GateDecisionRecord = {
   decision: 'approve' | 'skip'
   gateId: string

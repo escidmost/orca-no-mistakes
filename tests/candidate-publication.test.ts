@@ -20,7 +20,10 @@ function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
 }
 
-async function fixture(name: string): Promise<{
+async function fixture(
+  name: string,
+  options: { multiAttemptChain?: boolean } = {}
+): Promise<{
   artifactPath: string
   attemptId: string
   base: string
@@ -48,9 +51,10 @@ async function fixture(name: string): Promise<{
   git(repo, 'commit', '--allow-empty', '-m', 'base')
   const base = git(repo, 'rev-parse', 'HEAD')
   git(repo, 'commit', '--allow-empty', '-m', 'candidate')
-  const candidate = git(repo, 'rev-parse', 'HEAD')
+  const firstCandidate = git(repo, 'rev-parse', 'HEAD')
   git(repo, 'commit', '--allow-empty', '-m', 'third')
   const third = git(repo, 'rev-parse', 'HEAD')
+  const candidate = options.multiAttemptChain ? third : firstCandidate
   execFileSync('git', ['-c', 'init.templateDir=', 'init', '--bare', remote])
 
   const ledger = new DomainLedger(path.join(temp, 'ledger.sqlite'))
@@ -90,13 +94,18 @@ async function fixture(name: string): Promise<{
     ],
     submissionCommitOid: base
   })
-  ledger.recordCheckpoint({
-    inputCommitOid: base,
-    outputCommitOid: candidate,
-    roundIndex: 0,
-    runId,
-    stageId: 'lint'
-  })
+  const lintCheckpoints: Array<[string, string, number]> = options.multiAttemptChain
+    ? [[base, firstCandidate, 1], [firstCandidate, candidate, 2], [base, candidate, 2]]
+    : [[base, candidate, 0]]
+  for (const [inputCommitOid, outputCommitOid, roundIndex] of lintCheckpoints) {
+    ledger.recordCheckpoint({
+      inputCommitOid,
+      outputCommitOid,
+      roundIndex,
+      runId,
+      stageId: 'lint'
+    })
+  }
   const lintArtifactPath = path.join(temp, 'lint.json')
   const lintArtifact = 'lint passed\n'
   await writeFile(lintArtifactPath, lintArtifact)
@@ -105,7 +114,7 @@ async function fixture(name: string): Promise<{
     baseCommitOid: base,
     candidateCommitOid: candidate,
     exitCode: 0,
-    round: 0,
+    round: options.multiAttemptChain ? 2 : 0,
     runId,
     stage: 'lint',
     summary: 'lint passed',
@@ -119,7 +128,7 @@ async function fixture(name: string): Promise<{
     candidateCommitOid: candidate,
     evidenceSha256: lintEvidenceSha256,
     exitCode: 0,
-    roundIndex: 0,
+    roundIndex: lintEvidence.round,
     runId,
     stageId: 'lint',
     summary: lintEvidence.summary,
@@ -281,6 +290,19 @@ test('an unchanged candidate is reconciled without a push', async () => {
     const result = await publish(context, { runner })
     assert.equal(result.outcome, 'unchanged')
     assert.equal(pushes, 0)
+  } finally {
+    context.ledger.close()
+    await rm(context.temp, { force: true, recursive: true })
+  }
+})
+
+test('publication accepts a stage fixer chain spanning attempts', async () => {
+  const context = await fixture('multi-attempt-chain', { multiAttemptChain: true })
+  try {
+    await admit(context)
+    const result = await publish(context)
+    assert.equal(result.outcome, 'created')
+    assert.equal(remoteHead(context), context.candidate)
   } finally {
     context.ledger.close()
     await rm(context.temp, { force: true, recursive: true })

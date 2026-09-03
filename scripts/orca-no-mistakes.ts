@@ -127,6 +127,7 @@ import {
   canonicalJson,
   capLog,
   evidenceSha256,
+  finalContiguousCheckpointByStage,
   gateAuditMatchesEvidence,
   isAuthoritativeStageEvidence,
   normalizeIntent,
@@ -2499,23 +2500,15 @@ export async function runPipeline(
     let resumeStageIndex = 0;
     if (resumeCheckpoint) {
       const contiguousCheckpoints = new Set<string>();
-      const finalCheckpointByStage = new Map<string, StageCheckpointRow>();
-      for (const checkpoint of priorCheckpoints) {
-        finalCheckpointByStage.set(checkpoint.stage_id, checkpoint);
-      }
-      let checkpointCandidate = submissionCommitOid;
-      for (const stage of pipelineSteps) {
-        const checkpoint = finalCheckpointByStage.get(stage);
-        if (
-          !checkpoint ||
-          checkpoint.input_commit_oid !== checkpointCandidate
-        ) {
-          break;
-        }
+      const finalCheckpointByStage = finalContiguousCheckpointByStage(
+        pipelineSteps,
+        priorCheckpoints,
+        submissionCommitOid,
+      );
+      for (const [stage, checkpoint] of finalCheckpointByStage) {
         contiguousCheckpoints.add(
           `${stage}:${checkpoint.round_index}:${checkpoint.output_commit_oid}`,
         );
-        checkpointCandidate = checkpoint.output_commit_oid;
       }
       for (const stage of pipelineSteps) {
         const evidence = latestEvidenceByStage.get(stage);

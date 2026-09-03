@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp } from 'node:fs/promises'
+import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -243,6 +243,41 @@ test('reconciles indeterminate creation and rejects closed or moved pull request
     candidateCommitOid: OID, generationToken: 1, intent: 'intent', ledger: ledger as never,
     pipelineEvidenceRoot: 'root', runId: 'run', stageSummaries: [], workerIdentity: 'coordinator'
   }), /not open/)
+})
+
+test('rejects a different pull request identity before settlement', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'onm-pr-identity-'))
+  const { ledger } = harness()
+  const original = pullRequest()
+  let observations = 0
+  let comments: GithubIssueCommentObservation[] = []
+  const authority = {
+    createIssueComment: async ({ body }: { body: string }) => {
+      comments = [{
+        author: { id: 'actor-node', login: 'bot' }, body,
+        createdAt: '2026-01-01T00:00:00.000Z', id: 'comment-node',
+        updatedAt: '2026-01-01T00:00:00.000Z', url: 'https://example.test/comment'
+      }]
+    },
+    createPullRequest: async () => assert.fail('unexpected pull request creation'),
+    observeIssueComments: async () => comments,
+    observePullRequests: async () => ({
+      exact: ++observations === 1
+        ? original
+        : pullRequest({ id: 'replacement-pr', number: original.number + 1 }),
+      nearMatches: []
+    }),
+    updateIssueComment: async () => assert.fail('unexpected comment update')
+  }
+  try {
+    await assert.rejects(bindPullRequest({
+      artifactPath: path.join(directory, 'pr.json'), attemptId: 'attempt', authority,
+      candidateCommitOid: OID, generationToken: 1, intent: 'intent', ledger: ledger as never,
+      pipelineEvidenceRoot: 'root', runId: 'run', stageSummaries: [], workerIdentity: 'coordinator'
+    }), /facts changed/)
+  } finally {
+    await rm(directory, { force: true, recursive: true })
+  }
 })
 
 test('does not adopt human-quoted markers and rejects multiple owned markers', async () => {

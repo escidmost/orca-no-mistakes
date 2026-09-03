@@ -234,6 +234,7 @@ export async function bindPullRequest(input: {
     created = true
   }
   if (pullRequest.draft) throw new PullRequestBindingError('the exact pull request is still a draft')
+  const selectedPullRequest = { id: pullRequest.id, number: pullRequest.number }
 
   const summary = managedSummary(input)
   const previousReceipt = input.ledger.remoteReceipt(input.runId, 'pull-request-binding')
@@ -314,15 +315,23 @@ export async function bindPullRequest(input: {
     throw new PullRequestBindingError('managed summary mutation was not proven by the authoritative post-read')
   }
 
-  pullRequest = await observeExact(
+  const finalPullRequest = await observeExact(
     input.authority,
     route,
     repositoryRoute,
     input.candidateCommitOid
   )
-  if (!pullRequest || pullRequest.state !== 'OPEN' || pullRequest.draft || pullRequest.headOid !== input.candidateCommitOid) {
+  if (
+    !finalPullRequest ||
+    finalPullRequest.state !== 'OPEN' ||
+    finalPullRequest.draft ||
+    finalPullRequest.headOid !== input.candidateCommitOid ||
+    finalPullRequest.id !== selectedPullRequest.id ||
+    finalPullRequest.number !== selectedPullRequest.number
+  ) {
     throw new PullRequestBindingError('pull-request facts changed before settlement')
   }
+  pullRequest = finalPullRequest
   const observedAt = after(managedCommentCreatedAt, now())
   const postRead = input.ledger.recordRemoteObservation({
     attemptId: input.attemptId,
