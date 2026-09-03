@@ -1600,6 +1600,7 @@ const RELEASE_2_FACT_TABLES = [
   'attempt_outcomes',
   'remote_observations',
   'mutation_intents',
+  'resolved_mutation_intents',
   'remote_receipts',
   'auto_fix_mode_events'
 ] as const
@@ -2595,6 +2596,7 @@ export class DomainLedger {
         'attempt_outcomes',
         'remote_observations',
         'mutation_intents',
+        'resolved_mutation_intents',
         'remote_receipts',
         'stage_checkpoints',
         'stage_evidence',
