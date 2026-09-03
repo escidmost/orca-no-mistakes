@@ -22,7 +22,7 @@ Scope: New direct and gate runs execute and recover the complete Release 2 publi
 - [x] G3: the complete regression suite passes
   CHECK: npm test && node -e "console.log('full regression verification passed')"
   EXPECT: full regression verification passed
-  EVIDENCE: exit=0; shell=/bin/sh; cwd=/Users/host/repo/orca-no-mistakes/.orca/workspaces/onm-80-bind-pull-requests-and-settle-remote-runs; path=891ea4e2ea56/12 entries; EXPECT=matched; output-sha256=1dcc8bd400d8a443d4caf584e5fc7329d917bc6b4bf826375b17c66451eda022; output-bytes=129613
+  EVIDENCE: exit=0; shell=/bin/sh; cwd=/Users/host/repo/orca-no-mistakes/.orca/workspaces/onm-80-bind-pull-requests-and-settle-remote-runs; path=891ea4e2ea56/12 entries; EXPECT=matched; output-sha256=b278dde3a717f0eaa5b0e8ce43566546f21d46e2ed024174a71ec1c9946b537f; output-bytes=130223
 
 - [ ] G4: the pull request has the ONM-80 prefix and CodeRabbit reports no issues
   EVIDENCE: pending

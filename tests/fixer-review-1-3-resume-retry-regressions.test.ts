@@ -416,7 +416,7 @@ test("an undeliverable detached resume notification leaves the run stopped", { t
   class InterruptedOrca extends FakeOrca {
     notifications = 0;
 
-    async notifyResumeRequired(): Promise<void> {
+    override async createGate(): Promise<string> {
       this.notifications += 1;
       throw new Error("origin unavailable");
     }
@@ -465,13 +465,20 @@ test("same-process resume drains registered attempt workers before retrying", as
   git.policyDigest = "f".repeat(64);
   const deliveryGit = new FakeGit("/origin", "feature");
   const runId = `drain-resume-${randomUUID()}`;
-  let requestResume: (() => void) | undefined;
   class NotifyingOrca extends OrphanAllocationOrca {
     readonly resumeNotifications: string[] = [];
 
-    async notifyResumeRequired(message: string): Promise<void> {
-      this.resumeNotifications.push(message);
-      requestResume?.();
+    override async createGate(
+      _taskId?: string,
+      question = "",
+    ): Promise<string> {
+      this.resumeNotifications.push(question);
+      return "gate-resume";
+    }
+
+    override async waitForGate(gateId = ""): Promise<string> {
+      assert.equal(gateId, "gate-resume");
+      return "resume";
     }
   }
   const orca = new NotifyingOrca(runId);
@@ -481,10 +488,9 @@ test("same-process resume drains registered attempt workers before retrying", as
     _stageLogs: ReadonlyMap<string, StageLog>,
     _resolveGate: unknown,
     _setAutoFix: unknown,
-    resume?: () => void,
+    _resume?: () => void,
     onResumeAvailable?: () => void,
   ) => {
-    requestResume = resume;
     onResumeAvailable?.();
     return {
       render(): void {},
@@ -507,7 +513,67 @@ test("same-process resume drains registered attempt workers before retrying", as
       `expected the orphan worker to be released, saw: ${orca.calls.join(",")}`,
     );
     assert.equal(ledger.listAttemptOutcomes(runId).length, 2);
-    assert.deepEqual(orca.resumeNotifications, ["test worker interrupted"]);
+    assert.equal(orca.resumeNotifications.length, 1);
+    assert.match(orca.resumeNotifications[0]!, /test worker interrupted/);
+  } finally {
+    ledger.close();
+  }
+});
+
+test("a local TUI resume resolves the durable resume gate", async () => {
+  const git = new FakeGit();
+  git.policyDigest = "f".repeat(64);
+  const deliveryGit = new FakeGit("/origin", "feature");
+  const runId = `local-resume-${randomUUID()}`;
+  let requestResume: (() => void) | undefined;
+  let resolveDurableGate: ((resolution: string) => void) | undefined;
+  class LocalResumeOrca extends OrphanAllocationOrca {
+    readonly durableResolutions: string[] = [];
+
+    override async createGate(): Promise<string> {
+      queueMicrotask(() => requestResume?.());
+      return "gate-local-resume";
+    }
+
+    override async waitForGate(): Promise<string> {
+      return await new Promise((resolve) => {
+        resolveDurableGate = resolve;
+      });
+    }
+
+    override async resolveGate(
+      _gateId?: string,
+      resolution = "",
+    ): Promise<void> {
+      this.durableResolutions.push(resolution);
+      resolveDurableGate?.(resolution);
+    }
+  }
+  const orca = new LocalResumeOrca(runId);
+  const ledger = new DomainLedger(":memory:");
+  const rendererFactory = (
+    _artifactsDir: string,
+    _stageLogs: ReadonlyMap<string, StageLog>,
+    _resolveGate: unknown,
+    _setAutoFix: unknown,
+    resume?: () => void,
+    onResumeAvailable?: () => void,
+  ) => {
+    requestResume = resume;
+    onResumeAvailable?.();
+    return { render(): void {} };
+  };
+
+  try {
+    const result = await runPipeline(
+      { deliveryGit, intent: "Record a local resume durably.", rendererFactory },
+      orca,
+      git,
+      ledger,
+    );
+    assert.equal(result.runId, runId);
+    assert.deepEqual(orca.durableResolutions, ["resume"]);
+    assert.equal(ledger.runStatus(runId), "passed");
   } finally {
     ledger.close();
   }

@@ -972,6 +972,37 @@ test("same-process Resume retries repeated failures with one run and one attempt
   const deliveryGit = new FakeGit("/origin", "feature");
   const runId = `same-process-resume-${randomUUID()}`;
   class RepeatedFailureOrca extends FakeOrca {
+    #resolveResumeGate: ((resolution: string) => void) | undefined;
+
+    override async createGate(
+      taskId: string,
+      question: string,
+      options: string[],
+    ): Promise<string> {
+      if (options?.includes("resume")) {
+        return "gate-resume";
+      }
+      return await super.createGate(taskId, question, options);
+    }
+
+    override async waitForGate(gateId: string): Promise<string> {
+      if (gateId !== "gate-resume") return await super.waitForGate(gateId);
+      return await new Promise((resolve) => {
+        this.#resolveResumeGate = resolve;
+      });
+    }
+
+    override async resolveGate(
+      gateId: string,
+      resolution: string,
+    ): Promise<void> {
+      if (gateId === "gate-resume") {
+        this.#resolveResumeGate?.(resolution);
+        return;
+      }
+      await super.resolveGate(gateId, resolution);
+    }
+
     override async startWorker(
       taskId: string,
       launch: WorkerLaunch,
@@ -3299,7 +3330,11 @@ console.log(JSON.stringify({ result }))
     assert.ok(sent?.includes("originating-opencode"));
     assert.ok(sent?.includes("gate-run"));
     assert.ok(sent?.includes("question"));
-    assert.ok(sent?.includes("Choose a review action.\nGate: gate-review"));
+    assert.ok(
+      sent?.some((value) =>
+        value.includes("Choose a review action.\n\nGate: gate-review"),
+      ),
+    );
     assert.ok(wake?.includes("originating-opencode"));
     assert.ok(wake?.includes("--enter"));
     assert.ok(

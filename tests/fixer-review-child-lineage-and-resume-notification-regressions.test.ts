@@ -18,8 +18,12 @@ async function fakeOrca(): Promise<{
     command,
     `#!/usr/bin/env node
 import fs from "node:fs"
-fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify(process.argv.slice(2)) + "\\n")
-console.log(JSON.stringify({ result: {} }))
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify(args) + "\\n")
+const result = args[0] === "orchestration" && args[1] === "gate-create"
+  ? { gate: { id: "gate-resume" } }
+  : {}
+console.log(JSON.stringify({ result }))
 `,
   );
   await chmod(command, 0o755);
@@ -51,7 +55,7 @@ test("managed gate children retain their parent workspace lane", async () => {
   }
 });
 
-test("a detached resumable wait notifies and wakes its spawning terminal", async () => {
+test("a detached resume gate requires a durable orchestration response", async () => {
   const fake = await fakeOrca();
   const priorHandle = process.env.ORCA_TERMINAL_HANDLE;
   process.env.ORCA_TERMINAL_HANDLE = "coordinator-terminal";
@@ -62,24 +66,27 @@ test("a detached resumable wait notifies and wakes its spawning terminal", async
       notifyHandle: "origin-terminal",
       runId: "run-resumable",
     });
-    await (orca as CliOrca & { notifyResumeRequired(message: string): Promise<void> })
-      .notifyResumeRequired("review worker returned an invalid report");
+    await orca.createGate(
+      "task-resume",
+      "Review failed resumably. Resume from the durable checkpoint?",
+      ["resume", "stop"],
+    );
 
     const calls = await invocations(fake.calls);
-    assert.equal(calls.length, 2);
-    assert.deepEqual(calls[0]?.slice(0, 2), ["orchestration", "send"]);
-    assert.ok(calls[0]?.includes("no-mistakes resume decision required"));
-    assert.ok(calls[0]?.includes("question"));
-    const body = calls[0]?.[calls[0].indexOf("--body") + 1] ?? "";
-    assert.match(body, /coordinator-terminal/);
-    assert.match(body, /send R to resume/i);
-    assert.match(body, /send C to leave/i);
-    assert.deepEqual(calls[1]?.slice(0, 2), ["terminal", "send"]);
-    const prompt = calls[1]?.[calls[1].indexOf("--text") + 1] ?? "";
-    assert.match(prompt, /review worker returned an invalid report/);
-    assert.match(prompt, /coordinator-terminal/);
-    assert.match(prompt, /send R to resume/i);
-    assert.match(prompt, /send C to leave/i);
+    assert.equal(calls.length, 3);
+    assert.deepEqual(calls[0]?.slice(0, 2), ["orchestration", "gate-create"]);
+    assert.ok(calls[0]?.includes('["resume","stop"]'));
+    assert.deepEqual(calls[1]?.slice(0, 2), ["orchestration", "send"]);
+    const body = calls[1]?.[calls[1].indexOf("--body") + 1] ?? "";
+    assert.match(body, /Gate: gate-resume/);
+    assert.match(body, /orchestration send/);
+    assert.match(body, /no-mistakes gate response/);
+    assert.match(body, /Do not inject terminal input/);
+    assert.deepEqual(calls[2]?.slice(0, 2), ["terminal", "send"]);
+    const prompt = calls[2]?.[calls[2].indexOf("--text") + 1] ?? "";
+    assert.match(prompt, /Review failed resumably/);
+    assert.match(prompt, /orchestration send/);
+    assert.doesNotMatch(prompt, /send R to resume/i);
   } finally {
     if (priorHandle === undefined) delete process.env.ORCA_TERMINAL_HANDLE;
     else process.env.ORCA_TERMINAL_HANDLE = priorHandle;
