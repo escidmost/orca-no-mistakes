@@ -141,7 +141,7 @@ test("ACP worker worktree creation applies run-scoped worker naming", async () =
   const acpBlock = source.slice(startAcpIdx, endAcpIdx);
   assert.match(
     acpBlock,
-    /"--name",\s*this\.#workerName\(launch\.name\)/u,
-    "#startAcpWorker must pass this.#workerName(launch.name) to worktree create --name",
+    /"--name",\s*this\.workerName\(launch\.name\)/u,
+    "#startAcpWorker must pass this.workerName(launch.name) to worktree create --name",
   );
 });

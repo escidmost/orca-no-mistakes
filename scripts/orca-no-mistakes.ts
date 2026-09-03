@@ -232,6 +232,7 @@ type WorkerReportFailure = (worker: WorkerResult, error: Error) => Promise<void>
 
 export interface OrcaOperations {
   createRun(objective: string): Promise<string>;
+  workerName?(name: string): string;
   createTask(
     spec: string,
     options?: { deps?: string[]; parent?: string },
@@ -3695,7 +3696,10 @@ export async function startWorkerWithFallback(
     const finishAllocation = beginAbortAllocation();
     const allocationId = randomUUID();
     try {
-      await registerAbortWorkerAllocation(allocationId, launch.name);
+      await registerAbortWorkerAllocation(
+        allocationId,
+        orca.workerName?.(launch.name) ?? launch.name,
+      );
     } catch (error) {
       finishAllocation();
       throw error;
@@ -5523,7 +5527,7 @@ export class CliOrca implements OrcaOperations {
     return result.run.id;
   }
 
-  #workerName(name: string): string {
+  workerName(name: string): string {
     const runSuffix = this.#runId
       ? createHash("sha256").update(this.#runId).digest("hex").slice(0, 12)
       : undefined;
@@ -6055,7 +6059,7 @@ export class CliOrca implements OrcaOperations {
             baseBranch,
             effort: agent.effort,
             model: agent.model,
-            name: this.#workerName(launch.name),
+            name: this.workerName(launch.name),
             repoRoot,
             runId: this.#runId,
             taskId,
@@ -6244,7 +6248,7 @@ export class CliOrca implements OrcaOperations {
           "--repo",
           `path:${repoRoot}`,
           "--name",
-          this.#workerName(launch.name),
+          this.workerName(launch.name),
           "--base-branch",
           branch,
           "--parent-worktree",
@@ -6851,7 +6855,7 @@ export class CliOrca implements OrcaOperations {
             "--repo",
             `path:${repoRoot}`,
             "--name",
-            this.#workerName(launch.name),
+            this.workerName(launch.name),
             "--base-branch",
             branch,
             "--parent-worktree",
@@ -11143,6 +11147,7 @@ async function deliverPendingOutcome(
     return false;
   }
   if (run !== undefined && run.status !== outcome) {
+    if (run.status === "in-progress") return true;
     delete marker.pendingOutcome;
     delete marker.pendingSummary;
     try {
@@ -11243,6 +11248,27 @@ async function deliverPendingOutcome(
     return false;
   }
   return true;
+}
+
+async function journalStrandedCancellation(
+  markerFile: string,
+  marker: GateRunMarker,
+  runId: string,
+  reason: string,
+): Promise<boolean> {
+  if (typeof marker.notifyHandle !== "string") return true;
+  marker.pendingOutcome = "cancelled";
+  marker.pendingSummary = `No-mistakes cancelled: ${reason}\n${recoveryInstructions(recoveryRefFor(runId))}`;
+  delete marker.outcomeDelivered;
+  try {
+    await writeMarker(markerFile, marker);
+    return true;
+  } catch (error) {
+    console.error(
+      `no-mistakes: retained gate marker ${markerFile}; could not journal stranded cancellation: ${String(error)}`,
+    );
+    return false;
+  }
 }
 
 async function reapConfiguredGate(
@@ -11371,18 +11397,37 @@ async function reapConfiguredGate(
   let generationToken = marker.generationToken;
   const settleConfiguredRun = async (): Promise<boolean> => {
     if (!staleResumeClaim) {
-      if (
-        run?.status === "in-progress" &&
-        !ledger.settleRun(domainRunId, "cancelled", {
-          branch: run.branch,
-          generationToken,
-          repoRoot,
-        })
-      ) {
-        console.error(
-          `no-mistakes: retained gate workspace ${gate.path}; its run ownership changed before cancellation`,
-        );
-        return false;
+      if (run?.status === "in-progress") {
+        if (
+          !(await journalStrandedCancellation(
+            markerFile,
+            marker,
+            domainRunId,
+            "Configured coordinator terminated before cleanup completed",
+          )) ||
+          !ledger.settleRun(domainRunId, "cancelled", {
+            branch: run.branch,
+            generationToken,
+            repoRoot,
+          })
+        ) {
+          console.error(
+            `no-mistakes: retained gate workspace ${gate.path}; its run ownership changed before cancellation`,
+          );
+          return false;
+        }
+        if (
+          !(await deliverPendingOutcome(
+            markerFile,
+            marker,
+            gate.runId,
+            orcaCommand,
+            repoRoot,
+            ledger,
+          ))
+        ) {
+          return false;
+        }
       }
       if (run?.status === "passed") return true;
     }
@@ -13142,16 +13187,36 @@ async function reapStrandedGates(
             }
             if (
               run?.status === "in-progress" &&
-              !settleStrandedCancellation(ledger, domainRunId, {
-                branch: run.branch,
-                generationToken: generationToken!,
-                repoRoot,
-              })
+              (!(await journalStrandedCancellation(
+                markerFile,
+                marker,
+                domainRunId,
+                "Coordinator terminated before cleanup completed",
+              )) ||
+                !settleStrandedCancellation(ledger, domainRunId, {
+                  branch: run.branch,
+                  generationToken: generationToken!,
+                  repoRoot,
+                }))
             ) {
               retained += 1;
               console.error(
                 `no-mistakes: retained gate workspace ${gate.path}; its run ownership changed before cancellation`,
               );
+              continue;
+            }
+            if (
+              run?.status === "in-progress" &&
+              !(await deliverPendingOutcome(
+                markerFile,
+                marker,
+                orchestrationRunId,
+                orcaCommand,
+                repoRoot,
+                ledger,
+              ))
+            ) {
+              retained += 1;
               continue;
             }
           } else {

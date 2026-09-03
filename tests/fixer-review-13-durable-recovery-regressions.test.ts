@@ -89,7 +89,16 @@ test("worker allocation and release update the durable gate marker", async () =>
   const orca = {
     async finishWorker() {},
     async removeWorktree() {},
+    workerName(name: string) {
+      return `${name}-scoped`;
+    },
     async startWorker(_taskId: string, _launch: unknown, _fence: unknown, onAllocated: ((worker: WorkerResult) => { ready: Promise<void> }) | undefined) {
+      const allocating = JSON.parse(await readFile(marker, "utf8")) as {
+        workerAllocationNames?: Record<string, string>;
+      };
+      assert.deepEqual(Object.values(allocating.workerAllocationNames ?? {}), [
+        "durable-scoped",
+      ]);
       const registration = onAllocated?.(worker);
       await registration?.ready;
       const persisted = JSON.parse(await readFile(marker, "utf8")) as {

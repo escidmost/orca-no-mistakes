@@ -152,6 +152,23 @@ out({ accepted: true });
       undefined,
       "precommit passed outcome must NOT be delivered when run is in-progress",
     );
+    const cancelledNotify = calls.find(
+      (args) =>
+        args.includes("orchestration") &&
+        args.includes("send") &&
+        args.includes("no-mistakes run cancelled"),
+    );
+    assert.ok(
+      cancelledNotify,
+      "stranded cancellation must be delivered before cleanup",
+    );
+    assert.ok(
+      cancelledNotify.includes("--body") &&
+        cancelledNotify[cancelledNotify.indexOf("--body") + 1]?.includes(
+          `refs/no-mistakes/recover/${runId}`,
+        ),
+      "stranded cancellation must include recovery instructions",
+    );
 
     const checkLedger = new DomainLedger({ repositoryPath: canonicalRepo });
     const runState = checkLedger.runIdentity(runId);
@@ -169,15 +186,15 @@ out({ accepted: true });
   }
 });
 
-test("#workerName avoids collisions for distinct run IDs via stable hash", async () => {
+test("workerName avoids collisions for distinct run IDs via stable hash", async () => {
   const source = await readFile(
     new URL("../scripts/orca-no-mistakes.ts", import.meta.url),
     "utf8",
   );
   assert.match(
     source,
-    /#workerName\(name:\s*string\):\s*string\s*\{[\s\S]*?createHash\("sha256"\)\.update\(this\.#runId\)\.digest\("hex"\)\.slice\(0,\s*12\)/u,
-    "#workerName must scope worker names with sha256 hash of complete run ID",
+    /workerName\(name:\s*string\):\s*string\s*\{[\s\S]*?createHash\("sha256"\)\.update\(this\.#runId\)\.digest\("hex"\)\.slice\(0,\s*12\)/u,
+    "workerName must scope worker names with sha256 hash of complete run ID",
   );
 
   const hashSuffix = (runId: string) =>
