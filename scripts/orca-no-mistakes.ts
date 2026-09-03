@@ -3333,19 +3333,20 @@ export async function runPipeline(
       }
 
       const stageOutputCommitOid = await git.head();
-      const eventKey = `stage:${stage}:round:${round}:completed:${stageOutputCommitOid}`;
+      const authoritativeEntry = latestEntryByStage.get(stage)!;
+      const eventKey = `stage:${stage}:round:${authoritativeEntry.round}:completed:${stageOutputCommitOid}`;
       presentation.publish(
         eventKey,
-        { kind: "stage-completed", round, stage },
+        { kind: "stage-completed", round: authoritativeEntry.round, stage },
         (snapshot) =>
           ledger.settleLocalStage(
             {
               checkpoint: {
                 inputCommitOid: stageInputCommitOid,
                 outputCommitOid: stageOutputCommitOid,
-                roundIndex: round,
+                roundIndex: authoritativeEntry.round,
               },
-              evidenceSha256: latestEntryByStage.get(stage)!.evidenceSha256,
+              evidenceSha256: authoritativeEntry.evidenceSha256,
               runId,
               stageId: stage,
             },

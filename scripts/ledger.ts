@@ -5009,9 +5009,14 @@ export class DomainLedger {
     ) {
       problems.push('stage dispositions')
     }
-    const baseDisposition = manifest.stageDispositions.find(
-      (disposition) => disposition.evidenceSha256 !== undefined
-    )
+    const baseDisposition =
+      manifest.stageDispositions.find(
+        (disposition) =>
+          disposition.stage === 'rebase' && disposition.evidenceSha256 !== undefined
+      ) ??
+      manifest.stageDispositions.find(
+        (disposition) => disposition.evidenceSha256 !== undefined
+      )
     const baseEvidence = manifest.stageEvidence.find(
       (evidence) => evidence.evidenceSha256 === baseDisposition?.evidenceSha256
     )
