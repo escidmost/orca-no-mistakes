@@ -320,9 +320,17 @@ export async function bindPullRequest(input: {
       if (!(error instanceof GithubAuthorityError) || error.kind !== 'mutation-indeterminate') throw error
     }
     pullRequest = await observeExact(input.authority, route, repositoryRoute, input.candidateCommitOid)
-    if (!pullRequest || pullRequest.body !== content.body || pullRequest.title !== content.title) {
+    if (
+      !pullRequest ||
+      pullRequest.id !== selectedPullRequest.id ||
+      pullRequest.number !== selectedPullRequest.number ||
+      pullRequest.body !== content.body ||
+      pullRequest.title !== content.title
+    ) {
       throw new PullRequestBindingError('pull-request body update was not proven by the authoritative post-read')
     }
+    if (pullRequest.state === 'CLOSED') throw new PullRequestBindingError('the exact pull request was closed without merging')
+    if (pullRequest.draft) throw new PullRequestBindingError('the exact pull request is still a draft')
     updated = true
   }
 

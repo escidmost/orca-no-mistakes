@@ -5368,7 +5368,7 @@ export async function pullRequestArtifacts(
       );
       try {
         const stats = await handle.stat();
-        if (!stats.isFile()) continue;
+        if (!stats.isFile() || stats.nlink !== 1) continue;
         const maxRead = 16 * 1024 + knownSecretPrefixBytes();
         const buffer = Buffer.alloc(maxRead);
         const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
