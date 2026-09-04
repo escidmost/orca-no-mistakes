@@ -10,7 +10,10 @@ import { spawn } from "node-pty";
 
 import { PIPELINE_STEPS, type StageName } from "../scripts/config.ts";
 import { StageLog } from "../scripts/ledger.ts";
-import type { PresentationSnapshot } from "../scripts/presentation.ts";
+import {
+  PresentationPublisher,
+  type PresentationSnapshot,
+} from "../scripts/presentation.ts";
 import {
   createRailTuiRenderer,
   createRunRenderer,
@@ -777,6 +780,222 @@ if (process.env.TUI_FIXTURE === "1") {
     assert.match(screen, /Review fix 1/u);
     assert.doesNotMatch(screen, /Review analysis 2/u);
     assert.match(screen, /REVIEW.*fix 1/u);
+    renderer.close();
+  });
+
+  test("selective fixes show provisional, verified, open, and approved counts consistently", async () => {
+    const input = new FakeInput();
+    const output = new FakeOutput();
+    output.columns = 140;
+    output.rows = 24;
+    const renderer = new RailTuiRenderer(input, output, "/unused");
+    const snapshots: PresentationSnapshot[] = [];
+    const publisher = new PresentationPublisher(
+      {
+        listPresentationSnapshots: () => snapshots,
+        recordPresentationSnapshot: (_runId, _key, value) =>
+          (snapshots.push(value), true),
+      },
+      "selective-fix-display",
+      renderer,
+    );
+    const findings = ["a", "b", "c"].map((id) => ({
+      description: id,
+      id,
+      severity: "error" as const,
+    }));
+
+    publisher.publish("stage", { kind: "stage-started", stage: "review" });
+    publisher.publish("analysis-1", {
+      analysis: 1,
+      kind: "round-started",
+      role: "reviewer",
+      round: 0,
+      stage: "review",
+    });
+    publisher.publish("findings-1", {
+      analysis: 1,
+      actionable: 3,
+      findings,
+      kind: "findings-recorded",
+      round: 0,
+      stage: "review",
+      total: 3,
+    });
+    publisher.publish("gate", {
+      decision: "fix",
+      gateId: "g1",
+      kind: "gate-resolved",
+      round: 0,
+      stage: "review",
+      targetFindingIds: ["a", "b"],
+    });
+    publisher.publish("fix-1", {
+      kind: "round-started",
+      role: "fixer",
+      round: 1,
+      stage: "review",
+      targetFindingIds: ["a", "b"],
+    });
+    publisher.publish("fix-1-completed", {
+      approvedFindings: 1,
+      findingIds: ["a", "b"],
+      kind: "fix-completed",
+      round: 1,
+      stage: "review",
+    });
+    await nextDraw();
+    let screen = cleanScreen(output.writes.at(-1) ?? "");
+    assert.match(screen, /Review fix 1\s+· 2 fixes applied · 1 approved/u);
+    assert.match(screen, /Review\s+3 found · 0 fixed · 1 approved/u);
+
+    publisher.publish("analysis-2", {
+      analysis: 2,
+      kind: "round-started",
+      role: "reviewer",
+      round: 1,
+      stage: "review",
+    });
+    publisher.publish("findings-2", {
+      analysis: 2,
+      actionable: 1,
+      findings: [findings[1]],
+      kind: "findings-recorded",
+      round: 1,
+      stage: "review",
+      total: 1,
+    });
+
+    await nextDraw();
+    screen = cleanScreen(output.writes.at(-1) ?? "");
+    assert.match(screen, /Review analysis 1 · 3 found/u);
+    assert.match(screen, /Review fix 1\s+· 1 fixed · 1 still open · 1 approved/u);
+    assert.match(screen, /Review analysis 2 · 1 found/u);
+    assert.match(screen, /Review\s+3 found · 1 fixed · 1 approved/u);
+    assert.doesNotMatch(screen, /applied.*fixed|fixed.*applied/u);
+    renderer.close();
+  });
+
+  test("blocked fix retries keep stage counts visible and reviewer analyses sequential", async () => {
+    const input = new FakeInput();
+    const output = new FakeOutput();
+    output.columns = 140;
+    output.rows = 24;
+    const renderer = new RailTuiRenderer(input, output, "/unused");
+    const snapshots: PresentationSnapshot[] = [];
+    const publisher = new PresentationPublisher(
+      {
+        listPresentationSnapshots: () => snapshots,
+        recordPresentationSnapshot: (_runId, _key, value) =>
+          (snapshots.push(value), true),
+      },
+      "blocked-fix-display",
+      renderer,
+    );
+    const findings = ["a", "b"].map((id) => ({
+      description: id,
+      id,
+      severity: "error" as const,
+    }));
+    const policy = {
+      description: "fixer changed a protected test",
+      id: "fixer-policy-violation",
+      severity: "error" as const,
+    };
+
+    publisher.publish("stage", { kind: "stage-started", stage: "review" });
+    publisher.publish("analysis-1", {
+      analysis: 1,
+      kind: "round-started",
+      role: "reviewer",
+      round: 0,
+      stage: "review",
+    });
+    publisher.publish("findings-1", {
+      analysis: 1,
+      actionable: 2,
+      findings,
+      kind: "findings-recorded",
+      round: 0,
+      stage: "review",
+      total: 2,
+    });
+    publisher.publish("fix-1", {
+      kind: "round-started",
+      role: "fixer",
+      round: 1,
+      stage: "review",
+      targetFindingIds: ["a", "b"],
+    });
+    publisher.publish("fix-1-blocked", {
+      actionable: 3,
+      findings: [...findings, policy],
+      kind: "fix-blocked",
+      round: 1,
+      stage: "review",
+      total: 3,
+    });
+    publisher.publish("gate-2-open", {
+      gateId: "g2",
+      kind: "gate-opened",
+      options: ["fix", "approve"],
+      question: "Retry the safe findings?",
+      round: 1,
+      stage: "review",
+    });
+    await nextDraw();
+    assert.match(
+      cleanScreen(output.writes.at(-1) ?? ""),
+      /Review fix 1 · waiting/u,
+    );
+    publisher.publish("gate-2", {
+      decision: "fix",
+      gateId: "g2",
+      kind: "gate-resolved",
+      round: 1,
+      stage: "review",
+      targetFindingIds: ["a", "b"],
+    });
+    publisher.publish("fix-2", {
+      kind: "round-started",
+      role: "fixer",
+      round: 2,
+      stage: "review",
+      targetFindingIds: ["a", "b"],
+    });
+    publisher.publish("fix-2-completed", {
+      approvedFindings: 1,
+      findingIds: ["a", "b"],
+      kind: "fix-completed",
+      round: 2,
+      stage: "review",
+    });
+    publisher.publish("analysis-2", {
+      analysis: 2,
+      kind: "round-started",
+      role: "reviewer",
+      round: 2,
+      stage: "review",
+    });
+    publisher.publish("findings-2", {
+      analysis: 2,
+      actionable: 0,
+      findings: [],
+      kind: "findings-recorded",
+      round: 2,
+      stage: "review",
+      total: 0,
+    });
+
+    await nextDraw();
+    const screen = cleanScreen(output.writes.at(-1) ?? "");
+    assert.match(screen, /Review analysis 1 · 2 found/u);
+    assert.match(screen, /Review fix 1\s+· blocked/u);
+    assert.match(screen, /Review fix 2\s+· 2 fixed · 1 approved/u);
+    assert.match(screen, /Review analysis 2/u);
+    assert.doesNotMatch(screen, /Review analysis 3/u);
+    assert.match(screen, /Review\s+3 found · 2 fixed · 1 approved/u);
+    assert.match(screen, /REVIEW.*analysis 2/u);
     renderer.close();
   });
 

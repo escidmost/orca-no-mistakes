@@ -1637,6 +1637,7 @@ test("protected fixer commits are rejected at a resumable human gate", async () 
   allowReviewAutoFix(git);
   git.protectedTestMutation = "tests/existing.test.ts";
   const orca = new FakeOrca(git);
+  const ledger = new DomainLedger(":memory:");
   orca.gateResolution = "fix review-1";
   orca.reports.set("review", [
     {
@@ -1661,7 +1662,12 @@ test("protected fixer commits are rejected at a resumable human gate", async () 
     pass("clean rereview"),
   ]);
 
-  await runPipeline({ intent: "Protect existing assertions." }, orca, git);
+  const result = await runPipeline(
+    { intent: "Protect existing assertions." },
+    orca,
+    git,
+    ledger,
+  );
 
   assert.equal(orca.gates.length, 2);
   assert.match(orca.gates[0].question, /^\[guardrails: strict\] /);
@@ -1671,7 +1677,7 @@ test("protected fixer commits are rejected at a resumable human gate", async () 
     orca.gates[1].question,
     /fixer modified pre-existing test files: tests\/existing\.test\.ts/,
   );
-  assert.match(orca.gates[1].question, /"id":"review-2"/);
+  assert.doesNotMatch(orca.gates[1].question, /"id":"review-2"/);
   assert.equal(
     orca.launches.filter((launch) => launch.role === "fixer").length,
     2,
@@ -1683,6 +1689,36 @@ test("protected fixer commits are rejected at a resumable human gate", async () 
     git.calls.filter((call) => call.startsWith("apply:/worktrees/")).length,
     1,
   );
+  const presentation = ledger.listPresentationSnapshots(result.runId);
+  assert.deepEqual(
+    presentation
+      .flatMap((snapshot) =>
+        snapshot.transition.kind === "round-started" &&
+        snapshot.transition.role === "reviewer" &&
+        snapshot.transition.stage === "review"
+          ? [snapshot.transition.analysis]
+          : [],
+      ),
+    [1, 2],
+  );
+  const blocked = presentation.find(
+    (snapshot) => snapshot.transition.kind === "fix-blocked",
+  );
+  assert.equal(blocked?.transition.kind, "fix-blocked");
+  assert.equal(blocked?.transition.total, 3);
+  assert.equal(blocked?.transition.actionable, 2);
+  const blockedStage = blocked?.stages.find((stage) => stage.id === "review");
+  assert.deepEqual(
+    [blockedStage?.totalFindings, blockedStage?.openFindings, blockedStage?.approvedFindings],
+    [3, 2, 1],
+  );
+  const completedFix = presentation.find(
+    (snapshot) => snapshot.transition.kind === "fix-completed" && snapshot.transition.round === 2,
+  );
+  assert.equal(completedFix?.transition.kind, "fix-completed");
+  assert.equal(completedFix?.transition.findingIds.length, 1);
+  assert.equal(completedFix?.transition.approvedFindings, 1);
+  ledger.close();
 });
 
 test("a policy-violation approval waives the authoritative worker evidence", async () => {

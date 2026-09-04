@@ -2733,6 +2733,7 @@ export async function runPipeline(
       report: StageReport,
       fallback: { attempts: FallbackAttempt[]; resolvedAgent: string },
       evidenceCommitOid?: string,
+      analysis?: number,
     ): Promise<boolean> => {
       const candidate = evidenceCommitOid ?? (await git.head());
       const evidenceBaseCommitOid =
@@ -2814,6 +2815,7 @@ export async function runPipeline(
       const autoFixModeAtFindings = autoFixMode;
       if (isAuthoritativeStageEvidence(workerIdentity)) {
         presentation.publish(`findings:${entry.evidenceSha256}`, {
+          ...(analysis !== undefined ? { analysis } : {}),
           actionable: actionableFindings(report).length,
           findings: presentationFindingDetails(actionableFindings(report)),
           kind: "findings-recorded",
@@ -3148,9 +3150,10 @@ export async function runPipeline(
           : undefined;
       let autoFixModeForReport = resumedFindingMode ?? autoFixMode;
       const runStage = async () => {
+        const analysis = (reportsByStage.get(stage)?.length ?? 0) + 1;
         presentation.publish(
           `attempt:${presentation.current.attempt}:stage:${stage}:round:${round}:started`,
-          { kind: "round-started", role: "reviewer", round, stage },
+          { analysis, kind: "round-started", role: "reviewer", round, stage },
         );
         let execution: StageExecution;
         try {
@@ -3211,6 +3214,7 @@ export async function runPipeline(
             resolvedAgent: execution.resolvedAgent,
           },
           execution.evidenceCommitOid,
+          analysis,
         );
         return reconcileReportWithPreservedDispositions(
           execution.report,
@@ -3508,10 +3512,15 @@ export async function runPipeline(
           }
           fixerSession = undefined;
           const noChange = error instanceof FixerNoChangeError;
+          const preservedReport = reconcileReportWithPreservedDispositions(
+            report,
+            stage,
+            presentation,
+          );
           report = {
-            ...report,
+            ...preservedReport,
             findings: [
-              ...report.findings.filter(
+              ...preservedReport.findings.filter(
                 (finding) =>
                   finding.id !== "fixer-policy-violation" &&
                   finding.id !== "fixer-no-change",
@@ -3542,6 +3551,17 @@ export async function runPipeline(
             1,
             report,
             { attempts: [], resolvedAgent: "coordinator" },
+          );
+          presentation.publish(
+            `attempt:${presentation.current.attempt}:stage:${stage}:round:${round}:fixer:blocked`,
+            {
+              actionable: actionableFindings(report).length,
+              findings: presentationFindingDetails(actionableFindings(report)),
+              kind: "fix-blocked",
+              round,
+              stage,
+              total: report.findings.length,
+            },
           );
           continue;
         } finally {

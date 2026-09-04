@@ -27,6 +27,7 @@ export type PresentationTransition =
   | { enabled: boolean; kind: "mode-changed"; source?: "initial" | "operator" }
   | { kind: "stage-started"; stage: StageName }
   | {
+      analysis?: number;
       kind: "round-started";
       role?: "fixer" | "reviewer";
       round: number;
@@ -42,6 +43,15 @@ export type PresentationTransition =
       summary?: string;
     }
   | {
+      actionable: number;
+      findings: readonly Omit<PresentationFinding, "disposition">[];
+      kind: "fix-blocked";
+      round: number;
+      stage: StageName;
+      total: number;
+    }
+  | {
+      analysis?: number;
       actionable: number;
       findings?: readonly Omit<PresentationFinding, "disposition">[];
       kind: "findings-recorded";
@@ -96,6 +106,7 @@ export type PresentationSnapshot = {
   sequence: number;
   stages: readonly {
     actionableFindings: number;
+    analysis?: number;
     approvedFindings?: number;
     findings?: readonly PresentationFinding[];
     fixSummaries?: readonly string[];
@@ -139,6 +150,7 @@ function initialSnapshot(
     sequence: 0,
     stages: stages.map((id) => ({
       actionableFindings: 0,
+      analysis: 0,
       approvedFindings: 0,
       findings: [],
       fixSummaries: [],
@@ -342,12 +354,16 @@ function nextSnapshot(
         stages: updateStage(next, transition.stage, { status: "active" }),
       };
       break;
-    case "round-started":
+    case "round-started": {
+      const stage = next.stages.find((item) => item.id === transition.stage);
       next = {
         ...next,
         currentStage: transition.stage,
         stages: updateStage(next, transition.stage, {
           phase: transition.role,
+          ...(transition.role === "reviewer"
+            ? { analysis: transition.analysis ?? (stage?.analysis ?? 0) + 1 }
+            : {}),
           round: transition.round,
           status: "active",
           ...(transition.targetFindingIds !== undefined
@@ -358,6 +374,7 @@ function nextSnapshot(
         }),
       };
       break;
+    }
     case "fix-completed": {
       next = {
         ...next,
@@ -376,6 +393,32 @@ function nextSnapshot(
               }
             : {}),
           targetFindingIds: undefined,
+        }),
+      };
+      break;
+    }
+    case "fix-blocked": {
+      const stage = next.stages.find((item) => item.id === transition.stage);
+      const findings = updateFindings(stage?.findings ?? [], transition.findings);
+      const fixed = findings.filter((finding) => finding.disposition === "fixed").length;
+      const approved = findings.filter(
+        (finding) => finding.disposition === "approved",
+      ).length;
+      const open = findings.filter((finding) => finding.disposition === "open").length;
+      next = {
+        ...next,
+        currentStage: transition.stage,
+        stages: updateStage(next, transition.stage, {
+          actionableFindings: open,
+          approvedFindings: approved,
+          findings,
+          fixedFindings: fixed,
+          openFindings: open,
+          phase: "fixer",
+          round: transition.round,
+          status: "blocked",
+          targetFindingIds: undefined,
+          totalFindings: findings.length,
         }),
       };
       break;
@@ -399,6 +442,9 @@ function nextSnapshot(
             ? {
                 ...item,
                 actionableFindings: open ?? transition.actionable,
+                ...(transition.analysis !== undefined
+                  ? { analysis: transition.analysis }
+                  : {}),
                 approvedFindings: approved,
                 findings,
                 fixedFindings: fixed,
@@ -682,6 +728,9 @@ export class PlainStatusRenderer implements PresentationRenderer {
         break;
       case "fix-completed":
         line = `${prefix} ${event.stage} fix ${event.round} completed applied=${event.findingIds.length} approved=${event.approvedFindings}`;
+        break;
+      case "fix-blocked":
+        line = `${prefix} ${event.stage} fix ${event.round} blocked open=${event.actionable}`;
         break;
       case "findings-recorded":
         {
