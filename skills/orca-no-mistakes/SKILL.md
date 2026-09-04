@@ -10,7 +10,7 @@ Drive the implemented `orca-no-mistakes` CLI. It runs the eight validation and d
 
 `intent -> rebase -> review -> test -> document -> lint -> push -> pr`
 
-The default Release 2 run validates candidate changes, publishes them to GitHub, binds or creates a pull request, and records durable receipts. Success produces a v2 completion attestation manifest (`completionAttestation`) bound to the validated commit. Migrated Release 1 runs preserve their six local validation stages without remote publication.
+The default Release 2 run validates candidate changes, publishes them to GitHub, publishes the owned title/body report, notifies the origin of readiness, remains active while the pull request is open, and settles the receipt only after an authoritative matching MERGED observation. Success produces a v2 completion attestation manifest (`completionAttestation`) bound to the validated commit. Migrated Release 1 runs preserve their six local validation stages without remote publication.
 
 If your assigned task explicitly says you are already a no-mistakes stage worker, complete only that stage and return its structured report. Do not start a nested pipeline.
 
