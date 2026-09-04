@@ -241,7 +241,9 @@ function nextSnapshot(
           status: "active",
           ...(transition.targetFindingIds !== undefined
             ? { targetFindingIds: transition.targetFindingIds }
-            : {}),
+            : transition.role !== "fixer"
+              ? { targetFindingIds: undefined }
+              : {}),
         }),
       };
       break;
