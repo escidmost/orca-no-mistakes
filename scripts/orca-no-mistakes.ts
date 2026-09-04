@@ -14533,12 +14533,11 @@ async function runPruneCommand(flags: RawCliFlags): Promise<void> {
 async function runInitCommand(flags: RawCliFlags): Promise<void> {
   const repo = stringFlag(flags, "repo") ?? process.cwd();
   const requestedPaths = repositoryGatePaths(repo);
-  const metadata = existsSync(path.join(requestedPaths.stateDir, "gate.json"))
-    ? await readGateMetadata(requestedPaths.gatePath)
-    : await initializeLocalGate(
-        repo,
-        path.resolve(process.argv[1] ?? fileURLToPath(import.meta.url)),
-      );
+  const metadata = await initializeLocalGate(
+    repo,
+    path.resolve(process.argv[1] ?? fileURLToPath(import.meta.url)),
+    { allowLinkedWorktree: true },
+  );
   const repoRoot = requestedPaths.repoRoot;
   const ledger = openRepositoryLedger(repoRoot);
   try {

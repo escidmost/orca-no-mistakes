@@ -92,7 +92,7 @@ function capText(content: string, budget: number): string {
 }
 
 function htmlEscape(content: string): string {
-  return content
+  return redactKnownSecrets(content)
     .replaceAll('&', '&amp;')
     .replaceAll('<', '&lt;')
     .replaceAll('>', '&gt;')
@@ -105,12 +105,17 @@ function testingSection(testing: PullRequestReport['testing']): string {
   let remaining = TOTAL_ARTIFACT_BUDGET
   const artifacts: string[] = []
   for (const artifact of testing.artifacts) {
-    if (remaining <= 0) break
-    const content = capText(htmlEscape(artifact.content), Math.min(ARTIFACT_BUDGET, remaining))
-    remaining -= Buffer.byteLength(content)
-    artifacts.push(
-      `<details>\n<summary>${capText(htmlEscape(artifact.name), 512)}</summary>\n\n<pre>${content}</pre>\n\n</details>`
-    )
+    const separatorBytes = artifacts.length > 0 ? Buffer.byteLength('\n\n') : 0
+    const name = capText(htmlEscape(artifact.name), 512)
+    const framingBytes = Buffer.byteLength(`<details>\n<summary>${name}</summary>\n\n<pre></pre>\n\n</details>`) + separatorBytes
+    if (remaining <= framingBytes) break
+    const contentBudget = Math.min(ARTIFACT_BUDGET, remaining - framingBytes)
+    const content = capText(htmlEscape(artifact.content), contentBudget)
+    const entry = `<details>\n<summary>${name}</summary>\n\n<pre>${content}</pre>\n\n</details>`
+    const entryBytes = Buffer.byteLength(entry) + separatorBytes
+    if (entryBytes > remaining) break
+    remaining -= entryBytes
+    artifacts.push(entry)
   }
   return `## Testing\n\n${capText(testing.summary, 4096)}${commands}${artifacts.length > 0 ? `\n\n${artifacts.join('\n\n')}` : ''}`
 }
@@ -124,13 +129,17 @@ function pipelineSection(candidateCommitOid: string, steps: PullRequestPipelineS
   const details: string[] = []
   for (const step of steps) {
     if (!step.details || remaining <= 0) continue
-    const content = capText(step.details, Math.min(4096, remaining))
     const name = capText(htmlEscape(step.name), 128)
     const status = capText(htmlEscape(step.status), 128)
-    remaining -= Buffer.byteLength(content)
-    details.push(
-      `<details>\n<summary>${name}: ${status}</summary>\n\n${content}\n\n</details>`
-    )
+    const separatorBytes = details.length > 0 ? Buffer.byteLength('\n\n') : 0
+    const framingBytes = Buffer.byteLength(`<details>\n<summary>${name}: ${status}</summary>\n\n\n\n</details>`) + separatorBytes
+    if (remaining <= framingBytes) break
+    const content = capText(step.details, Math.min(4096, remaining - framingBytes))
+    const entry = `<details>\n<summary>${name}: ${status}</summary>\n\n${content}\n\n</details>`
+    const entryBytes = Buffer.byteLength(entry) + separatorBytes
+    if (entryBytes > remaining) break
+    remaining -= entryBytes
+    details.push(entry)
   }
   return `## Pipeline\n\n${PIPELINE_SIGNATURE}\n\n${ATTESTATION_PREFIX}${attestation} -->${details.length > 0 ? `\n\n${details.join('\n\n')}` : ''}`
 }
@@ -142,15 +151,39 @@ export function pullRequestContent(intent: string, report: PullRequestReport): {
     ? firstLine
     : `chore: ${firstLine}`
   const riskEmoji = report.risk.level === 'high' ? '🚨' : report.risk.level === 'medium' ? '⚠️' : '✅'
-  const suffix = [
-    `## What Changed\n\n${capText(report.whatChanged, 8192)}`,
+  const otherSections = [
     `## Risk Assessment\n\n${riskEmoji} ${report.risk.level[0].toUpperCase()}${report.risk.level.slice(1)} - ${capText(report.risk.rationale, 2048)}`,
     testingSection(report.testing),
     pipelineSection(report.candidateCommitOid, report.pipelineSteps)
   ].join('\n\n')
+
   const intentPrefix = '## Intent\n\n'
-  const availableIntentBytes = Math.max(256, PULL_REQUEST_BODY_BUDGET - Buffer.byteLength(intentPrefix) - Buffer.byteLength('\n\n\n') - Buffer.byteLength(suffix))
-  const body = `${intentPrefix}${capText(redactedIntent, availableIntentBytes)}\n\n${suffix}\n`
+  const whatChangedPrefix = '## What Changed\n\n'
+  const framingBytes = Buffer.byteLength(`${intentPrefix}\n\n${whatChangedPrefix}\n\n${otherSections}\n`)
+  const totalAvailable = Math.max(0, PULL_REQUEST_BODY_BUDGET - framingBytes)
+
+  const sanitizedWhatChanged = redactKnownSecrets(report.whatChanged).replaceAll(ATTESTATION_PREFIX, '&lt;!-- inert-attestation:v1 ')
+  const sanitizedIntent = redactedIntent.replaceAll(ATTESTATION_PREFIX, '&lt;!-- inert-attestation:v1 ')
+
+  const whatChangedBytes = Buffer.byteLength(sanitizedWhatChanged)
+  const intentBytes = Buffer.byteLength(sanitizedIntent)
+
+  let finalIntent: string
+  let finalWhatChanged: string
+
+  if (whatChangedBytes + intentBytes <= totalAvailable) {
+    finalWhatChanged = sanitizedWhatChanged
+    finalIntent = sanitizedIntent
+  } else if (whatChangedBytes + 256 <= totalAvailable) {
+    finalWhatChanged = sanitizedWhatChanged
+    finalIntent = capText(sanitizedIntent, totalAvailable - whatChangedBytes)
+  } else {
+    finalIntent = capText(sanitizedIntent, Math.min(256, totalAvailable))
+    const availableForWhatChanged = Math.max(0, totalAvailable - Buffer.byteLength(finalIntent))
+    finalWhatChanged = capText(sanitizedWhatChanged, availableForWhatChanged)
+  }
+
+  const body = `${intentPrefix}${finalIntent}\n\n${whatChangedPrefix}${finalWhatChanged}\n\n${otherSections}\n`
   if (Buffer.byteLength(body) > PULL_REQUEST_BODY_BUDGET) {
     throw new PullRequestBindingError('generated pull-request body exceeds GitHub limit')
   }
@@ -290,24 +323,41 @@ export async function bindPullRequest(input: {
   }
 
   const outcome = created ? 'created' : updated ? 'updated' : 'unchanged'
-  await input.onReady?.({
-    number: pullRequest.number,
-    outcome,
-    title: content.title,
-    url: pullRequest.url
-  })
+  if (pullRequest.state === 'OPEN') {
+    await input.onReady?.({
+      number: pullRequest.number,
+      outcome,
+      title: content.title,
+      url: pullRequest.url
+    })
+  }
   while (pullRequest.state === 'OPEN') {
     await sleep(input.pollIntervalMs ?? 15_000)
     input.ledger.heartbeatLease(run.repo_root, run.branch, input.runId)
     requireLease()
     const observed = await observeExact(input.authority, route, repositoryRoute, input.candidateCommitOid)
-    if (!observed || observed.id !== selectedPullRequest.id || observed.number !== selectedPullRequest.number || observed.headOid !== input.candidateCommitOid) {
+    if (
+      !observed ||
+      observed.id !== selectedPullRequest.id ||
+      observed.number !== selectedPullRequest.number ||
+      observed.headOid !== input.candidateCommitOid ||
+      observed.draft ||
+      observed.title !== content.title ||
+      observed.body !== content.body
+    ) {
       throw new PullRequestBindingError('pull-request facts changed while awaiting merge')
     }
     pullRequest = observed
   }
   if (pullRequest.state !== 'MERGED') {
     throw new PullRequestBindingError('the exact pull request was closed without merging')
+  }
+  if (
+    pullRequest.draft ||
+    pullRequest.title !== content.title ||
+    pullRequest.body !== content.body
+  ) {
+    throw new PullRequestBindingError('pull-request facts changed before merge')
   }
 
   const observedAt = after(mutationCreatedAt, now())
@@ -317,11 +367,11 @@ export async function bindPullRequest(input: {
     observedAt,
     payload: {
       ...routeFacts,
-      bodySha256: sha256(content.body),
+      bodySha256: sha256(pullRequest.body),
       number: pullRequest.number,
       pullRequestNodeId: pullRequest.id,
       state: 'merged',
-      titleSha256: sha256(content.title)
+      titleSha256: sha256(pullRequest.title)
     },
     runId: input.runId,
     subject: `${route.forge_host}/${route.base_repository_id}#${pullRequest.number}`
@@ -365,7 +415,7 @@ export async function bindPullRequest(input: {
       candidateCommitOid: input.candidateCommitOid,
       kind: 'pull-request-binding',
       payload: {
-        bodySha256: sha256(content.body),
+        bodySha256: sha256(pullRequest.body),
         mutationIntent,
         number: pullRequest.number,
         outcome,
@@ -373,7 +423,7 @@ export async function bindPullRequest(input: {
         postRead,
         routeFingerprint: route.route_fingerprint,
         state: 'merged',
-        titleSha256: sha256(content.title)
+        titleSha256: sha256(pullRequest.title)
       }
     },
     runId: input.runId,
