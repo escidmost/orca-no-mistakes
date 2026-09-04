@@ -163,48 +163,113 @@ function updateStage(
   );
 }
 
+function isExactFindingMatch(
+  prev: PresentationFinding,
+  curr: Omit<PresentationFinding, "disposition">,
+): boolean {
+  return (
+    prev.id === curr.id &&
+    prev.description === curr.description &&
+    prev.severity === curr.severity &&
+    prev.file === curr.file &&
+    prev.line === curr.line
+  );
+}
+
 function updateFindings(
   previous: readonly PresentationFinding[],
   current: readonly Omit<PresentationFinding, "disposition">[],
 ): PresentationFinding[] {
-  const pending = new Map<string, Omit<PresentationFinding, "disposition">[]>();
-  for (const finding of current) {
-    const queue = pending.get(finding.id);
-    if (queue) queue.push(finding);
-    else pending.set(finding.id, [finding]);
-  }
-  const approvedMatches = new Map<
-    PresentationFinding,
+  const matchedInPrevious = new Map<
+    number,
     Omit<PresentationFinding, "disposition">
   >();
-  for (const finding of previous) {
-    if (finding.disposition === "approved" && pending.get(finding.id)?.length) {
-      const reported = pending.get(finding.id)!.shift()!;
-      approvedMatches.set(finding, reported);
-      if (pending.get(finding.id)?.length === 0) pending.delete(finding.id);
+  const usedCurrent = new Set<number>();
+
+  for (let ci = 0; ci < current.length; ci++) {
+    const curr = current[ci];
+    let matchIndex = -1;
+    for (let pi = 0; pi < previous.length; pi++) {
+      if (
+        !matchedInPrevious.has(pi) &&
+        previous[pi].disposition === "open" &&
+        isExactFindingMatch(previous[pi], curr)
+      ) {
+        matchIndex = pi;
+        break;
+      }
+    }
+    if (matchIndex === -1) {
+      for (let pi = 0; pi < previous.length; pi++) {
+        if (
+          !matchedInPrevious.has(pi) &&
+          previous[pi].disposition !== "open" &&
+          isExactFindingMatch(previous[pi], curr)
+        ) {
+          matchIndex = pi;
+          break;
+        }
+      }
+    }
+    if (matchIndex !== -1) {
+      matchedInPrevious.set(matchIndex, curr);
+      usedCurrent.add(ci);
     }
   }
-  const next = previous.map((finding) => {
-    const approvedReported = approvedMatches.get(finding);
-    if (approvedReported) {
-      return { ...approvedReported, disposition: "approved" as const };
+
+  for (let ci = 0; ci < current.length; ci++) {
+    if (usedCurrent.has(ci)) continue;
+    const curr = current[ci];
+    let matchIndex = -1;
+    for (let pi = 0; pi < previous.length; pi++) {
+      if (
+        !matchedInPrevious.has(pi) &&
+        previous[pi].disposition === "open" &&
+        previous[pi].id === curr.id
+      ) {
+        matchIndex = pi;
+        break;
+      }
     }
-    const reported = pending.get(finding.id)?.shift();
+    if (matchIndex === -1) {
+      for (let pi = 0; pi < previous.length; pi++) {
+        if (
+          !matchedInPrevious.has(pi) &&
+          previous[pi].disposition !== "open" &&
+          previous[pi].id === curr.id
+        ) {
+          matchIndex = pi;
+          break;
+        }
+      }
+    }
+    if (matchIndex !== -1) {
+      matchedInPrevious.set(matchIndex, curr);
+      usedCurrent.add(ci);
+    }
+  }
+
+  const next = previous.map((prev, pi) => {
+    const reported = matchedInPrevious.get(pi);
     if (reported) {
-      if (pending.get(finding.id)?.length === 0) pending.delete(finding.id);
+      if (prev.disposition === "approved") {
+        return { ...reported, disposition: "approved" as const };
+      }
       return { ...reported, disposition: "open" as const };
     }
-    return finding.disposition === "open"
-      ? { ...finding, disposition: "fixed" as const }
-      : finding;
+    return prev.disposition === "open"
+      ? { ...prev, disposition: "fixed" as const }
+      : prev;
   });
-  return [
-    ...next,
-    ...[...pending.values()].flat().map((finding) => ({
-      ...finding,
-      disposition: "open" as const,
-    })),
-  ];
+
+  const remaining: PresentationFinding[] = [];
+  for (let ci = 0; ci < current.length; ci++) {
+    if (!usedCurrent.has(ci)) {
+      remaining.push({ ...current[ci], disposition: "open" as const });
+    }
+  }
+
+  return [...next, ...remaining];
 }
 
 function updateSelectedFindings(
