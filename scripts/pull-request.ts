@@ -330,6 +330,21 @@ export async function bindPullRequest(input: {
       title: content.title,
       url: pullRequest.url
     })
+    if (input.onReady) {
+      const observed = await observeExact(input.authority, route, repositoryRoute, input.candidateCommitOid)
+      if (
+        !observed ||
+        observed.id !== selectedPullRequest.id ||
+        observed.number !== selectedPullRequest.number ||
+        observed.headOid !== input.candidateCommitOid ||
+        observed.draft ||
+        observed.title !== content.title ||
+        observed.body !== content.body
+      ) {
+        throw new PullRequestBindingError('pull-request facts changed after readiness notification')
+      }
+      pullRequest = observed
+    }
   }
   while (pullRequest.state === 'OPEN') {
     await sleep(input.pollIntervalMs ?? 15_000)

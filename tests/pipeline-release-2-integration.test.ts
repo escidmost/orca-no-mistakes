@@ -88,7 +88,10 @@ async function runRelease2Pipeline(failAfter?: 'push' | 'pr'): Promise<void> {
     waitForGate: async () => 'approve',
     resolveGate: async () => {},
     setWorktreeStatus: async () => {},
-    notifyPullRequestReady: async (_number, _title, url) => { readyNotifications.push(url) },
+    notifyPullRequestReady: async (_number, _title, url) => {
+      readyNotifications.push(url)
+      pullRequest = { ...pullRequest!, state: 'MERGED' }
+    },
   }
   let pullRequest: Record<string, unknown> | null = null
   let comments: Record<string, unknown>[] = []
@@ -105,7 +108,7 @@ async function runRelease2Pipeline(failAfter?: 'push' | 'pr'): Promise<void> {
         baseRepositoryNodeId: 'RN_repo', body, draft: false,
         headBranch: 'feature', headOid: candidate, headRepositoryId: 'R_repo',
         headRepositoryNodeId: 'RN_repo', id: 'PR_node', number: 80,
-        state: 'MERGED', title, url: 'https://github.com/owner/repo/pull/80',
+        state: 'OPEN', title, url: 'https://github.com/owner/repo/pull/80',
       }
     },
     observeIssueComments: async () => comments,

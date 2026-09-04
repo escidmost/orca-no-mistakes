@@ -3961,6 +3961,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       { type: 'heartbeat', body: 'malformed stale heartbeat', payload: '{not-json' },
       { type: 'heartbeat', body: 'non-object stale heartbeat', payload: 'null' },
       { type: 'heartbeat', body: 'stale fixer heartbeat', payload: JSON.stringify({ taskId: 'task-stale', dispatchId: 'dispatch-stale' }) },
+      { type: 'heartbeat', body: 'malformed active heartbeat', payload: JSON.stringify({ dispatchId: 'dispatch-review' }) },
       { type: 'heartbeat', body: 'still reviewing', payload: JSON.stringify({ taskId: 'task-review', dispatchId: 'dispatch-review' }) }
     ] })
   } else {

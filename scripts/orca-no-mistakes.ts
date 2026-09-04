@@ -8784,10 +8784,9 @@ export class CliOrca implements OrcaOperations {
         }
         if (message.type === "heartbeat") {
           if (payload.taskId !== taskId) {
-            return {
-              deliveryId: result.deliveryId,
-              error: `worker ${dispatchId} heartbeated for the wrong task`,
-            };
+            // Heartbeats carry no completion authority. Ignore malformed or
+            // stale liveness signals and wait for a valid report.
+            continue;
           }
           activity.lastActivityAt = Date.now();
           if (log && source)
