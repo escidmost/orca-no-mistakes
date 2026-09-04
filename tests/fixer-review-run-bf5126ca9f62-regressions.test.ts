@@ -309,7 +309,7 @@ test("Finding 3: wrap respects width when hyphen is at boundary column", () => {
   }
 });
 
-test("Finding 2: RailTuiRenderer records each completed fix cycle immediately", async () => {
+test("Finding 2: RailTuiRenderer replaces applied fixes with verified outcomes per cycle", async () => {
   const input = new FakeInput();
   const output = new FakeOutput();
   output.columns = 100;
@@ -330,7 +330,14 @@ test("Finding 2: RailTuiRenderer records each completed fix cycle immediately", 
 
   renderer.render({
     ...base,
-    stages: base.stages.map((s) => (s.id === "review" ? { ...s, fixedFindings: 1 } : s)),
+    stages: base.stages.map((s) => (s.id === "review" ? {
+      ...s,
+      findings: [
+        { description: "first", disposition: "fixed" as const, id: "first", severity: "error" as const },
+        { description: "second", disposition: "open" as const, id: "second", severity: "error" as const },
+      ],
+      fixedFindings: 1,
+    } : s)),
     transition: {
       approvedFindings: 0,
       findingIds: ["first"],
@@ -348,7 +355,14 @@ test("Finding 2: RailTuiRenderer records each completed fix cycle immediately", 
   // Cycle 1 re-analysis records one remaining finding.
   renderer.render({
     ...base,
-    stages: base.stages.map((s) => (s.id === "review" ? { ...s, fixedFindings: 1 } : s)),
+    stages: base.stages.map((s) => (s.id === "review" ? {
+      ...s,
+      findings: [
+        { description: "first", disposition: "fixed" as const, id: "first", severity: "error" as const },
+        { description: "second", disposition: "open" as const, id: "second", severity: "error" as const },
+      ],
+      fixedFindings: 1,
+    } : s)),
     transition: { actionable: 1, kind: "findings-recorded", round: 1, stage: "review", total: 2 },
   });
 
@@ -360,7 +374,14 @@ test("Finding 2: RailTuiRenderer records each completed fix cycle immediately", 
 
   renderer.render({
     ...base,
-    stages: base.stages.map((s) => (s.id === "review" ? { ...s, fixedFindings: 2 } : s)),
+    stages: base.stages.map((s) => (s.id === "review" ? {
+      ...s,
+      findings: [
+        { description: "first", disposition: "fixed" as const, id: "first", severity: "error" as const },
+        { description: "second", disposition: "fixed" as const, id: "second", severity: "error" as const },
+      ],
+      fixedFindings: 2,
+    } : s)),
     transition: {
       approvedFindings: 0,
       findingIds: ["second"],
@@ -373,19 +394,40 @@ test("Finding 2: RailTuiRenderer records each completed fix cycle immediately", 
   // Each fix row reports that cycle, not the cumulative fixed total.
   await nextDraw();
   let screen = cleanScreen(output.writes.at(-1) ?? "");
-  assert.match(screen, /Review fix 1\s+·  1 applied/u);
-  assert.match(screen, /Review fix 2\s+·  1 applied/u);
+  assert.match(screen, /Review fix 1\s+·  1 fixed/u);
+  assert.match(screen, /Review fix 2\s+·  1 fixes applied/u);
 
   // Analysis 3 starts only after fix 2 has been recorded.
   renderer.render({
     ...base,
-    stages: base.stages.map((s) => (s.id === "review" ? { ...s, fixedFindings: 2 } : s)),
+    stages: base.stages.map((s) => (s.id === "review" ? {
+      ...s,
+      findings: [
+        { description: "first", disposition: "fixed" as const, id: "first", severity: "error" as const },
+        { description: "second", disposition: "fixed" as const, id: "second", severity: "error" as const },
+      ],
+      fixedFindings: 2,
+    } : s)),
     transition: { kind: "round-started", round: 2, stage: "review" },
+  });
+  renderer.render({
+    ...base,
+    stages: base.stages.map((s) => (s.id === "review" ? {
+      ...s,
+      findings: [
+        { description: "first", disposition: "fixed" as const, id: "first", severity: "error" as const },
+        { description: "second", disposition: "fixed" as const, id: "second", severity: "error" as const },
+      ],
+      fixedFindings: 2,
+    } : s)),
+    transition: { actionable: 0, kind: "findings-recorded", round: 2, stage: "review", total: 2 },
   });
 
   await nextDraw();
   screen = cleanScreen(output.writes.at(-1) ?? "");
   assert.match(screen, /Review analysis 3/u);
+  assert.match(screen, /Review fix 2\s+·  1 fixed/u);
+  assert.doesNotMatch(screen, /Review fix \d+.*applied.*fixed/u);
   renderer.close();
 });
 

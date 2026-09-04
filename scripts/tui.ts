@@ -252,7 +252,17 @@ export function supportsRailTui(
 }
 
 export class RailTuiRenderer implements PresentationRenderer {
-  readonly #activities: { at: string; label: string; stage?: StageName }[] = [];
+  readonly #activities: {
+    at: string;
+    fix?: {
+      approvedFindings: number;
+      findingIds: readonly string[];
+      round: number;
+      verified: boolean;
+    };
+    label: string;
+    stage?: StageName;
+  }[] = [];
   readonly #artifactsDir: string;
   readonly #input: Input;
   readonly #inputWasPaused: boolean;
@@ -638,7 +648,7 @@ export class RailTuiRenderer implements PresentationRenderer {
       case "fix-completed": {
         const stageName = title(transition.stage);
         const fixPrefix = fixLabel(stageName, transition.round);
-        const results = [activityCount(transition.findingIds.length, "applied")];
+        const results = [activityCount(transition.findingIds.length, "fixes applied")];
         if (transition.approvedFindings > 0) {
           results.push(activityCount(transition.approvedFindings, "approved"));
         }
@@ -651,8 +661,18 @@ export class RailTuiRenderer implements PresentationRenderer {
         const entry = this.#activities.findLast(
           (activity) => activity.stage === stage && activity.label === fixPrefix,
         );
-        if (entry) entry.label = label;
-        else this.#activities.push({ at: clock(now), label, stage });
+        const fix = {
+          approvedFindings: transition.approvedFindings,
+          findingIds: transition.findingIds,
+          round: transition.round,
+          verified: false,
+        };
+        if (entry) {
+          entry.fix = fix;
+          entry.label = label;
+        } else {
+          this.#activities.push({ at: clock(now), fix, label, stage });
+        }
         break;
       }
 
@@ -668,7 +688,37 @@ export class RailTuiRenderer implements PresentationRenderer {
             : "clean";
 
         const stageState = snapshot.stages.find((s) => s.id === transition.stage);
-        if (stageState?.fixedFindings) {
+        const completedFix = this.#activities.findLast(
+          (activity) => activity.stage === transition.stage && activity.fix && !activity.fix.verified,
+        );
+        if (completedFix?.fix && stageState?.findings) {
+          const remaining = new Map<string, number>();
+          for (const id of completedFix.fix.findingIds) {
+            remaining.set(id, (remaining.get(id) ?? 0) + 1);
+          }
+          let fixed = 0;
+          let open = 0;
+          for (const finding of stageState.findings) {
+            const count = remaining.get(finding.id) ?? 0;
+            if (count === 0) continue;
+            remaining.set(finding.id, count - 1);
+            if (finding.disposition === "fixed") fixed++;
+            else if (finding.disposition === "open") open++;
+          }
+          const results = [];
+          if (fixed > 0) results.push(activityCount(fixed, "fixed"));
+          if (open > 0) results.push(activityCount(open, "still open"));
+          if (completedFix.fix.approvedFindings > 0) {
+            results.push(activityCount(completedFix.fix.approvedFindings, "approved"));
+          }
+          completedFix.fix.verified = true;
+          completedFix.label = activityResult(
+            fixLabel(stageName, completedFix.fix.round),
+            stageName,
+            completedFix.fix.round,
+            results,
+          );
+        } else if (!completedFix && stageState?.fixedFindings) {
           for (let i = this.#activities.length - 1; i >= 0; i--) {
             const entry = this.#activities[i];
             if (

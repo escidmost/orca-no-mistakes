@@ -688,7 +688,26 @@ if (process.env.TUI_FIXTURE === "1") {
       ...base,
       stages: base.stages.map((s) =>
         s.id === "review"
-          ? { ...s, approvedFindings: 1, fixedFindings: 5, totalFindings: 6 }
+          ? {
+              ...s,
+              approvedFindings: 1,
+              findings: [
+                ...["a", "b", "c", "d", "e"].map((id) => ({
+                  description: id,
+                  disposition: "fixed" as const,
+                  id,
+                  severity: "error" as const,
+                })),
+                {
+                  description: "approved",
+                  disposition: "approved" as const,
+                  id: "approved",
+                  severity: "warning" as const,
+                },
+              ],
+              fixedFindings: 5,
+              totalFindings: 6,
+            }
           : s,
       ),
     };
@@ -702,6 +721,11 @@ if (process.env.TUI_FIXTURE === "1") {
         stage: "review",
       },
     });
+    await nextDraw();
+    assert.match(
+      cleanScreen(output.writes.at(-1) ?? ""),
+      /Review fix 1\s+·  5 fixes applied ·  1 approved/u,
+    );
     renderer.render({
       ...withFixed,
       transition: { kind: "round-started", round: 1, stage: "review" },
@@ -715,7 +739,8 @@ if (process.env.TUI_FIXTURE === "1") {
     assert.match(screen, /Intent started/u);
     assert.match(screen, /Rebase started/u);
     assert.match(screen, /Review analysis 1 ·  5 found/u);
-    assert.match(screen, /Review fix 1\s+·  5 applied ·  1 approved/u);
+    assert.match(screen, /Review fix 1\s+·  5 fixed ·  1 approved/u);
+    assert.doesNotMatch(screen, /Review fix 1.*applied.*fixed/u);
     assert.match(screen, /Review analysis 2 ·  3 found/u);
     assert.match(screen, /Test analysis 1/u);
     const activityLines = screen.split("\n").filter((line) => /Review (?:analysis|fix)/u.test(line));
