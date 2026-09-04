@@ -194,7 +194,9 @@ function isExactFindingMatch(
 function updateFindings(
   previous: readonly PresentationFinding[],
   current: readonly Omit<PresentationFinding, "disposition">[],
+  options?: { inheritApproval?: boolean },
 ): PresentationFinding[] {
+  const inheritApproval = options?.inheritApproval ?? true;
   const matchedInPrevious = new Map<
     number,
     Omit<PresentationFinding, "disposition">
@@ -214,7 +216,7 @@ function updateFindings(
         break;
       }
     }
-    if (matchIndex === -1) {
+    if (matchIndex === -1 && inheritApproval) {
       for (let pi = 0; pi < previous.length; pi++) {
         if (
           !matchedInPrevious.has(pi) &&
@@ -246,7 +248,7 @@ function updateFindings(
         break;
       }
     }
-    if (matchIndex === -1) {
+    if (matchIndex === -1 && inheritApproval) {
       for (let pi = 0; pi < previous.length; pi++) {
         if (
           !matchedInPrevious.has(pi) &&
@@ -267,12 +269,12 @@ function updateFindings(
   const next = previous.map((prev, pi) => {
     const reported = matchedInPrevious.get(pi);
     if (reported) {
-      if (prev.disposition === "approved") {
+      if (prev.disposition === "approved" && inheritApproval) {
         return { ...reported, disposition: "approved" as const };
       }
       return { ...reported, disposition: "open" as const };
     }
-    return prev.disposition === "open"
+    return prev.disposition === "open" && inheritApproval
       ? { ...prev, disposition: "fixed" as const }
       : prev;
   });
@@ -399,7 +401,9 @@ function nextSnapshot(
     }
     case "fix-blocked": {
       const stage = next.stages.find((item) => item.id === transition.stage);
-      const findings = updateFindings(stage?.findings ?? [], transition.findings);
+      const findings = updateFindings(stage?.findings ?? [], transition.findings, {
+        inheritApproval: false,
+      });
       const fixed = findings.filter((finding) => finding.disposition === "fixed").length;
       const approved = findings.filter(
         (finding) => finding.disposition === "approved",

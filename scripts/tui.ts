@@ -699,7 +699,9 @@ export class RailTuiRenderer implements PresentationRenderer {
         const stageName = title(transition.stage);
         const fixPrefix = fixLabel(stageName, transition.round);
         const entry = this.#activities.findLast(
-          (activity) => activity.stage === stage && activity.label === fixPrefix,
+          (activity) =>
+            activity.stage === stage &&
+            (activity.label === fixPrefix || activity.label.startsWith(`${fixPrefix} `)),
         );
         if (entry) {
           entry.label = activityResult(
@@ -716,6 +718,9 @@ export class RailTuiRenderer implements PresentationRenderer {
         if (transition.stage === "intent" || transition.stage === "rebase") return;
         const stageName = title(transition.stage);
         const stageState = snapshot.stages.find((s) => s.id === transition.stage);
+        if (stageState?.phase === "fixer" && transition.analysis === undefined) {
+          return;
+        }
         const roundNum = transition.analysis ?? stageState?.analysis ?? transition.round + 1;
         const roundPrefix = analysisLabel(stageName, roundNum);
         const actionableCount = transition.actionable ?? transition.total;
