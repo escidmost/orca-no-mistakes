@@ -137,6 +137,25 @@ test('init refuses to re-route the repository gate from a linked worktree', asyn
   }
 })
 
+test('init reuses the repository gate while configuring a linked worktree', async () => {
+  const fixture = await gateFixture('onm-init-linked-route-', 'Configure this branch without rerouting the gate.')
+  try {
+    const worktree = path.join(fixture.temp, 'worktree-b')
+    git(fixture.repo, 'worktree', 'add', '-b', 'feature-b', worktree, 'main')
+    const metadataBefore = await readFile(
+      path.join(fixture.metadata.stateDir, 'gate.json'),
+      'utf8'
+    )
+
+    await main(['init', '--repo', worktree])
+
+    const metadataAfter = await readFile(path.join(fixture.metadata.stateDir, 'gate.json'), 'utf8')
+    strictEqual(metadataAfter, metadataBefore)
+  } finally {
+    await rm(fixture.temp, { force: true, recursive: true })
+  }
+})
+
 test('direct submissions from a linked worktree follow the routed gate', async () => {
   const fixture = await gateFixture('onm-direct-route-', 'Route direct submissions through one worktree.')
   const previousOrcaCommand = process.env.ORCA_CLI_COMMAND
