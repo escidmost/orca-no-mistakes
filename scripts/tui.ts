@@ -258,6 +258,7 @@ export class RailTuiRenderer implements PresentationRenderer {
       approvedFindings: number;
       findingIds: readonly string[];
       round: number;
+      targetIndices?: readonly number[];
       verified: boolean;
     };
     label: string;
@@ -661,10 +662,27 @@ export class RailTuiRenderer implements PresentationRenderer {
         const entry = this.#activities.findLast(
           (activity) => activity.stage === stage && activity.label === fixPrefix,
         );
+        const stageState = snapshot.stages.find((s) => s.id === transition.stage);
+        const targetIndices: number[] = [];
+        if (stageState?.findings) {
+          const remainingIds = new Map<string, number>();
+          for (const id of transition.findingIds) {
+            remainingIds.set(id, (remainingIds.get(id) ?? 0) + 1);
+          }
+          for (let i = 0; i < stageState.findings.length; i++) {
+            const finding = stageState.findings[i];
+            const count = remainingIds.get(finding.id) ?? 0;
+            if (count > 0 && finding.disposition === "open") {
+              remainingIds.set(finding.id, count - 1);
+              targetIndices.push(i);
+            }
+          }
+        }
         const fix = {
           approvedFindings: transition.approvedFindings,
           findingIds: transition.findingIds,
           round: transition.round,
+          targetIndices,
           verified: false,
         };
         if (entry) {
@@ -692,18 +710,28 @@ export class RailTuiRenderer implements PresentationRenderer {
           (activity) => activity.stage === transition.stage && activity.fix && !activity.fix.verified,
         );
         if (completedFix?.fix && stageState?.findings) {
-          const remaining = new Map<string, number>();
-          for (const id of completedFix.fix.findingIds) {
-            remaining.set(id, (remaining.get(id) ?? 0) + 1);
-          }
           let fixed = 0;
           let open = 0;
-          for (const finding of stageState.findings) {
-            const count = remaining.get(finding.id) ?? 0;
-            if (count === 0) continue;
-            remaining.set(finding.id, count - 1);
-            if (finding.disposition === "fixed") fixed++;
-            else if (finding.disposition === "open") open++;
+          if (completedFix.fix.targetIndices?.length) {
+            for (const idx of completedFix.fix.targetIndices) {
+              const finding = stageState.findings[idx];
+              if (!finding) continue;
+              if (finding.disposition === "fixed") fixed++;
+              else if (finding.disposition === "open") open++;
+            }
+          } else {
+            const remaining = new Map<string, number>();
+            for (const id of completedFix.fix.findingIds) {
+              remaining.set(id, (remaining.get(id) ?? 0) + 1);
+            }
+            for (const finding of stageState.findings) {
+              if (finding.disposition !== "fixed" && finding.disposition !== "open") continue;
+              const count = remaining.get(finding.id) ?? 0;
+              if (count === 0) continue;
+              remaining.set(finding.id, count - 1);
+              if (finding.disposition === "fixed") fixed++;
+              else if (finding.disposition === "open") open++;
+            }
           }
           const results = [];
           if (fixed > 0) results.push(activityCount(fixed, "fixed"));

@@ -3175,13 +3175,21 @@ export async function runPipeline(
           },
           execution.evidenceCommitOid,
         );
-        return execution.report;
+        return reconcileReportWithPreservedDispositions(
+          execution.report,
+          stage,
+          presentation,
+        );
       };
       let report = resumedFixDecision
-        ? {
-            findings: resumedFindings,
-            summary: resumedEvidence!.summary,
-          }
+        ? reconcileReportWithPreservedDispositions(
+            {
+              findings: resumedFindings,
+              summary: resumedEvidence!.summary,
+            },
+            stage,
+            presentation,
+          )
         : await runStage();
       if (
         resumedFindingMode !== undefined &&
@@ -3593,6 +3601,7 @@ export async function runPipeline(
             { eventKey, snapshot },
           ),
       );
+      latestReportByStage.set(stage, report);
       await orca.completeTask(taskId, report);
     }
 
@@ -5143,6 +5152,78 @@ function presentationFindingDetails(findings: readonly Finding[]) {
     ...(line ? { line } : {}),
     severity,
   }));
+}
+
+export function reconcileReportWithPreservedDispositions(
+  report: StageReport,
+  stage: StageName,
+  presentation: PresentationPublisher | PresentationSnapshot,
+): StageReport {
+  const snapshot = "current" in presentation ? presentation.current : presentation;
+  const stageState = snapshot.stages.find((s) => s.id === stage);
+  if (!stageState?.findings?.length) return report;
+
+  const openOccurrences = stageState.findings.filter(
+    (f) => f.disposition === "open",
+  );
+  if (openOccurrences.length === 0) {
+    return {
+      ...report,
+      findings: report.findings.map((f) =>
+        f.action !== "no-op" ? { ...f, action: "no-op" as const } : f,
+      ),
+    };
+  }
+
+  const matchedOpen = new Set<number>();
+  const openReportIndices = new Set<number>();
+
+  for (let ri = 0; ri < report.findings.length; ri++) {
+    const rf = report.findings[ri];
+    if (rf.action === "no-op") continue;
+    for (let oi = 0; oi < openOccurrences.length; oi++) {
+      if (!matchedOpen.has(oi)) {
+        const of = openOccurrences[oi];
+        if (
+          rf.id === of.id &&
+          rf.description === of.description &&
+          rf.severity === of.severity &&
+          rf.file === of.file &&
+          rf.line === of.line
+        ) {
+          matchedOpen.add(oi);
+          openReportIndices.add(ri);
+          break;
+        }
+      }
+    }
+  }
+
+  for (let ri = 0; ri < report.findings.length; ri++) {
+    if (openReportIndices.has(ri)) continue;
+    const rf = report.findings[ri];
+    if (rf.action === "no-op") continue;
+    for (let oi = 0; oi < openOccurrences.length; oi++) {
+      if (!matchedOpen.has(oi)) {
+        const of = openOccurrences[oi];
+        if (rf.id === of.id) {
+          matchedOpen.add(oi);
+          openReportIndices.add(ri);
+          break;
+        }
+      }
+    }
+  }
+
+  return {
+    ...report,
+    findings: report.findings.map((f, ri) => {
+      if (f.action !== "no-op" && !openReportIndices.has(ri)) {
+        return { ...f, action: "no-op" as const };
+      }
+      return f;
+    }),
+  };
 }
 
 function isValidFinding(value: unknown): value is Finding {
