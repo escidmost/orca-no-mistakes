@@ -79,8 +79,16 @@ function after(earlier: string, candidate: string): string {
   return candidate > earlier ? candidate : new Date(Date.parse(earlier) + 1).toISOString()
 }
 
+export function neutralizeHtmlComments(content: string): string {
+  return redactKnownSecrets(content)
+    .replaceAll(ATTESTATION_PREFIX, '&lt;!-- inert-attestation:v1 ')
+    .replaceAll('<!--', '&lt;!--')
+    .replaceAll('-->', '--&gt;')
+    .replaceAll('--!>', '--!&gt;')
+}
+
 function capText(content: string, budget: number): string {
-  const redacted = redactKnownSecrets(content).replaceAll(ATTESTATION_PREFIX, '&lt;!-- inert-attestation:v1 ')
+  const redacted = neutralizeHtmlComments(content)
   if (Buffer.byteLength(redacted) <= budget) return redacted
   const marker = '\n\n_[truncated to fit GitHub PR body limits]_'
   const markerBytes = Buffer.byteLength(marker)
@@ -172,8 +180,8 @@ export function pullRequestContent(intent: string, report: PullRequestReport): {
   const framingBytes = Buffer.byteLength(`${intentPrefix}\n\n${whatChangedPrefix}\n\n${otherSections}\n`)
   const totalAvailable = Math.max(0, PULL_REQUEST_BODY_BUDGET - framingBytes)
 
-  const sanitizedWhatChanged = redactKnownSecrets(report.whatChanged).replaceAll(ATTESTATION_PREFIX, '&lt;!-- inert-attestation:v1 ')
-  const sanitizedIntent = redactedIntent.replaceAll(ATTESTATION_PREFIX, '&lt;!-- inert-attestation:v1 ')
+  const sanitizedWhatChanged = neutralizeHtmlComments(report.whatChanged)
+  const sanitizedIntent = neutralizeHtmlComments(redactedIntent)
 
   const whatChangedBytes = Buffer.byteLength(sanitizedWhatChanged)
   const intentBytes = Buffer.byteLength(sanitizedIntent)
