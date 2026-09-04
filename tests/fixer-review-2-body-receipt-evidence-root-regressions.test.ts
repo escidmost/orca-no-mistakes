@@ -1,0 +1,338 @@
+import assert from 'node:assert/strict'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import test from 'node:test'
+
+import {
+  buildPipelineCompletionAttestation,
+  buildPipelineEvidenceRoot,
+  DomainLedger,
+  evidenceSha256,
+  sha256,
+  type StageEvidenceManifestEntry
+} from '../scripts/ledger.ts'
+
+const base = 'a'.repeat(40)
+const candidate = 'b'.repeat(40)
+const submission = 'c'.repeat(40)
+const policy = 'd'.repeat(64)
+const stages = ['intent', 'rebase', 'review', 'test', 'document', 'lint', 'push', 'pr']
+
+async function bodyReceiptFixture(options: { mismatchRoot?: boolean } = {}) {
+  const temp = await mkdtemp(path.join(tmpdir(), 'onm-body-evidence-root-'))
+  const ledger = new DomainLedger(path.join(temp, 'ledger.sqlite'))
+  const runId = 'body-evidence-root-run'
+  const intent = 'Verify body receipt pipeline evidence root.'
+  const artifact = Buffer.from('{}')
+  const entries: (StageEvidenceManifestEntry & { artifactPath: string })[] = []
+  for (const [round, stage] of stages.entries()) {
+    const artifactPath = path.join(temp, `${stage}.json`)
+    await writeFile(artifactPath, artifact)
+    const entry = {
+      artifactPath,
+      artifactSha256: sha256(artifact),
+      baseCommitOid: base,
+      candidateCommitOid: candidate,
+      evidenceSha256: '',
+      exitCode: 0,
+      round,
+      stage,
+      summary: `${stage} completed.`,
+      workerIdentity: 'coordinator'
+    }
+    entry.evidenceSha256 = evidenceSha256({ ...entry, runId })
+    entries.push(entry)
+  }
+  ledger.startRun({
+    baseBranch: 'main',
+    branch: 'feature',
+    intent,
+    policySha256: policy,
+    repoRoot: '/repo',
+    runId,
+    stagePlan: stages.map((stageId) => ({ requirement: 'required', stageId })),
+    submissionCommitOid: submission
+  })
+  const generationToken = ledger.acquireLease({ branch: 'feature', repoRoot: '/repo', runId })
+  for (const entry of entries) {
+    ledger.recordStageDisposition({
+      disposition: 'satisfied',
+      evidenceSha256: entry.evidenceSha256,
+      runId,
+      stageId: entry.stage
+    })
+    if (entry.stage !== 'push' && entry.stage !== 'pr') {
+      ledger.recordEvidence({
+        artifactPath: entry.artifactPath,
+        artifactSha256: entry.artifactSha256,
+        baseCommitOid: entry.baseCommitOid,
+        candidateCommitOid: entry.candidateCommitOid,
+        evidenceSha256: entry.evidenceSha256,
+        exitCode: entry.exitCode,
+        roundIndex: entry.round,
+        runId,
+        stageId: entry.stage,
+        summary: entry.summary,
+        workerIdentity: entry.workerIdentity
+      })
+    }
+  }
+  const publicationRoute = {
+    baseBranch: 'main',
+    baseRepositoryId: 'R_base',
+    forgeHost: 'github.com',
+    headBranch: 'feature',
+    headOwner: 'owner',
+    headRepositoryId: 'R_head'
+  }
+  const routeFingerprint = ledger.recordPublicationRoute({ ...publicationRoute, runId })
+  const attemptId = `${runId}-attempt`
+  ledger.startAttempt({
+    actorIdentity: 'operator',
+    attemptId,
+    coordinatorIdentity: 'coordinator',
+    generationToken,
+    runId,
+    startedAt: '2026-08-30T12:00:00.000Z'
+  })
+
+  ledger.recordPublicationBaseline({
+    headCommitOid: null,
+    observedAt: '2026-08-30T12:00:00.000Z',
+    routeFingerprint,
+    runId,
+    transportUrl: 'github.com/owner/repo'
+  })
+
+  const pushEntry = entries.find((entry) => entry.stage === 'push')!
+  const pushPreRead = ledger.recordRemoteObservation({
+    attemptId,
+    kind: 'publication-head',
+    observedAt: '2026-08-30T12:00:01.000Z',
+    payload: {
+      forgeHost: 'github.com',
+      headBranch: 'feature',
+      headOwner: 'owner',
+      repositoryId: 'R_head',
+      state: 'absent'
+    },
+    runId,
+    subject: 'github.com/R_head:refs/heads/feature'
+  })
+  const pushIntent = ledger.recordMutationIntent({
+    attemptId,
+    createdAt: '2026-08-30T12:00:02.000Z',
+    kind: 'candidate-publication',
+    payload: { expected: 'absent', update: candidate },
+    runId,
+    targetFingerprint: routeFingerprint
+  })
+  const pushPostRead = ledger.recordRemoteObservation({
+    attemptId,
+    kind: 'publication-head',
+    observedAt: '2026-08-30T12:00:04.000Z',
+    payload: {
+      forgeHost: 'github.com',
+      headBranch: 'feature',
+      headOwner: 'owner',
+      oid: candidate,
+      repositoryId: 'R_head'
+    },
+    runId,
+    subject: 'github.com/R_head:refs/heads/feature'
+  })
+  const publicationReceipt = ledger.settleRemoteStage({
+    checkpoint: { inputCommitOid: candidate, outputCommitOid: candidate, roundIndex: 6 },
+    evidence: {
+      artifactPath: pushEntry.artifactPath,
+      artifactSha256: pushEntry.artifactSha256,
+      baseCommitOid: base,
+      candidateCommitOid: candidate,
+      evidenceSha256: pushEntry.evidenceSha256,
+      exitCode: 0,
+      roundIndex: pushEntry.round,
+      runId,
+      stageId: 'push',
+      summary: pushEntry.summary,
+      workerIdentity: pushEntry.workerIdentity
+    },
+    receipt: {
+      authoritativePostObservationSha256: pushPostRead,
+      candidateCommitOid: candidate,
+      kind: 'candidate-publication',
+      payload: {
+        mutationIntent: pushIntent,
+        outcome: 'created',
+        postRead: pushPostRead,
+        preRead: pushPreRead,
+        routeFingerprint
+      }
+    },
+    ownership: { branch: 'feature', generationToken, repoRoot: '/repo' },
+    runId,
+    stageId: 'push'
+  }).receiptSha256
+
+  const stageEvidence = entries.map(({ artifactPath: _artifactPath, ...entry }) => entry)
+  const calculatedEvidenceRoot = buildPipelineEvidenceRoot(stageEvidence, {
+    attemptOutcomeDigests: [],
+    baseCommitOid: base,
+    candidateCommitOid: candidate,
+    candidatePublicationReceiptSha256: publicationReceipt,
+    intent,
+    policySha256: policy,
+    publicationRoute: { ...publicationRoute, routeFingerprint },
+    runId,
+    stageDispositions: stageEvidence.map((entry) => ({
+      disposition: 'satisfied',
+      evidenceSha256: entry.evidenceSha256,
+      stage: entry.stage
+    })),
+    stagePlan: stages.map((stage) => ({ requirement: 'required', stage }))
+  })
+
+  const receiptEvidenceRoot = options.mismatchRoot
+    ? 'e'.repeat(64)
+    : calculatedEvidenceRoot
+
+  const prBody = 'Complete pipeline PR body.'
+  const prTitle = 'feat: complete PR title'
+  const pullRequestIntent = ledger.recordMutationIntent({
+    attemptId,
+    createdAt: '2026-08-30T12:00:05.000Z',
+    kind: 'pull-request',
+    payload: {
+      action: 'ensure-body-and-await-merge',
+      baseBranch: 'main',
+      baseRepositoryId: 'R_base',
+      body: prBody,
+      candidateCommitOid: candidate,
+      forgeHost: 'github.com',
+      headBranch: 'feature',
+      headOwner: 'owner',
+      headRepositoryId: 'R_head',
+      title: prTitle
+    },
+    runId,
+    targetFingerprint: routeFingerprint
+  })
+  const pullRequestObservation = ledger.recordRemoteObservation({
+    attemptId,
+    kind: 'pull-request',
+    observedAt: '2026-08-30T12:00:06.000Z',
+    payload: {
+      baseBranch: 'main',
+      baseRepositoryId: 'R_base',
+      bodySha256: sha256(prBody),
+      candidateCommitOid: candidate,
+      forgeHost: 'github.com',
+      headBranch: 'feature',
+      headOwner: 'owner',
+      headRepositoryId: 'R_head',
+      number: 77,
+      pullRequestNodeId: 'PR_77',
+      state: 'merged',
+      titleSha256: sha256(prTitle)
+    },
+    runId,
+    subject: 'github.com/R_base#77'
+  })
+  const prEntry = entries.find((entry) => entry.stage === 'pr')!
+  const pullRequestReceipt = ledger.settleRemoteStage({
+    checkpoint: { inputCommitOid: candidate, outputCommitOid: candidate, roundIndex: 7 },
+    evidence: {
+      artifactPath: prEntry.artifactPath,
+      artifactSha256: prEntry.artifactSha256,
+      baseCommitOid: base,
+      candidateCommitOid: candidate,
+      evidenceSha256: prEntry.evidenceSha256,
+      exitCode: 0,
+      roundIndex: prEntry.round,
+      runId,
+      stageId: 'pr',
+      summary: prEntry.summary,
+      workerIdentity: prEntry.workerIdentity
+    },
+    receipt: {
+      authoritativePostObservationSha256: pullRequestObservation,
+      candidateCommitOid: candidate,
+      kind: 'pull-request-binding',
+      payload: {
+        bodySha256: sha256(prBody),
+        mutationIntent: pullRequestIntent,
+        number: 77,
+        outcome: 'created',
+        pipelineEvidenceRoot: receiptEvidenceRoot,
+        postRead: pullRequestObservation,
+        routeFingerprint,
+        state: 'merged',
+        titleSha256: sha256(prTitle)
+      }
+    },
+    ownership: { branch: 'feature', generationToken, repoRoot: '/repo' },
+    runId,
+    stageId: 'pr'
+  }).receiptSha256
+
+  const custody = { recoveryRef: `refs/no-mistakes/recover/${runId}` }
+  const outcome = ledger.recordAttemptOutcome({
+    actorIdentity: 'operator',
+    attemptId,
+    candidateCommitOid: candidate,
+    completedAt: '2026-08-30T12:00:07.000Z',
+    coordinatorIdentity: 'coordinator',
+    custody,
+    reason: 'pipeline completed',
+    receiptDigests: [publicationReceipt, pullRequestReceipt],
+    resumeEligible: false,
+    runId,
+    stoppingFact: 'pull-request-bound',
+    verdict: 'passed'
+  })
+  ledger.finishRun(runId, 'passed', candidate)
+  const manifest = buildPipelineCompletionAttestation(stageEvidence, {
+    attemptOutcomeDigests: [outcome],
+    baseCommitOid: base,
+    candidateCommitOid: candidate,
+    candidatePublicationReceiptSha256: publicationReceipt,
+    custody,
+    intent,
+    policySha256: policy,
+    publicationRoute: { ...publicationRoute, routeFingerprint },
+    pullRequestBindingReceiptSha256: pullRequestReceipt,
+    runId,
+    stageDispositions: stageEvidence.map((entry) => ({
+      disposition: 'satisfied',
+      evidenceSha256: entry.evidenceSha256,
+      stage: entry.stage
+    })),
+    stagePlan: stages.map((stage) => ({ requirement: 'required', stage }))
+  })
+  return { ledger, manifest, temp }
+}
+
+test('v2 retained completion attestation verifies matching body receipt pipeline evidence root', async () => {
+  const fixture = await bodyReceiptFixture({ mismatchRoot: false })
+  try {
+    assert.doesNotThrow(() =>
+      fixture.ledger.verifyRetainedCompletionAttestation(fixture.manifest)
+    )
+  } finally {
+    fixture.ledger.close()
+    await rm(fixture.temp, { recursive: true, force: true })
+  }
+})
+
+test('v2 retained completion attestation rejects body receipt with divergent pipeline evidence root', async () => {
+  const fixture = await bodyReceiptFixture({ mismatchRoot: true })
+  try {
+    assert.throws(
+      () => fixture.ledger.verifyRetainedCompletionAttestation(fixture.manifest),
+      /pipeline evidence root/
+    )
+  } finally {
+    fixture.ledger.close()
+    await rm(fixture.temp, { recursive: true, force: true })
+  }
+})
