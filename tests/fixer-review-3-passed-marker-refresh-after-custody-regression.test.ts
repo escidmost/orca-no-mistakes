@@ -99,13 +99,13 @@ test("Release 2 pipeline settles passed and commits attestation when post-custod
   const authority = {
     observeRepository: async () => ({ id: "R_repo", nodeId: "RN_repo" }),
     observePullRequests: async () => ({ exact: pullRequest, nearMatches: [] }),
-    createPullRequest: async () => {
+    createPullRequest: async ({ body, title }: { body: string; title: string }) => {
       pullRequest = {
         baseBranch: "main",
         baseOid: "base",
         baseRepositoryId: "R_repo",
         baseRepositoryNodeId: "RN_repo",
-        body: "body",
+        body,
         draft: false,
         headBranch: "feature",
         headOid: candidate,
@@ -113,8 +113,8 @@ test("Release 2 pipeline settles passed and commits attestation when post-custod
         headRepositoryNodeId: "RN_repo",
         id: "PR_node",
         number: 80,
-        state: "OPEN",
-        title: "ONM-80: marker fail test",
+        state: "MERGED",
+        title,
         url: "https://github.com/owner/repo/pull/80",
       };
     },
@@ -133,6 +133,9 @@ test("Release 2 pipeline settles passed and commits attestation when post-custod
     },
     updateIssueComment: async ({ body }: { body: string }) => {
       comments = comments.map((comment) => ({ ...comment, body }));
+    },
+    updatePullRequest: async ({ body, title }: { body: string; title: string }) => {
+      pullRequest = { ...pullRequest!, body, title };
     },
   } as unknown as GithubAuthority;
 

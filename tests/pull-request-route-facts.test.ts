@@ -3,7 +3,6 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
-import type { GithubIssueCommentObservation } from '../scripts/github.ts'
 import { DomainLedger, evidenceSha256, sha256 } from '../scripts/ledger.ts'
 import { bindPullRequest } from '../scripts/pull-request.ts'
 
@@ -27,13 +26,13 @@ function localStageEvidence(stage: string, round: number, artifactPath: string) 
   return { ...entry, artifactPath }
 }
 
-function observedPullRequest() {
+function observedPullRequest(body = 'human body', title = 'human title', state: 'MERGED' | 'OPEN' = 'OPEN') {
   return {
     baseBranch: 'main',
     baseOid: 'b'.repeat(40),
     baseRepositoryId: '1',
     baseRepositoryNodeId: 'R_base',
-    body: 'human body',
+    body,
     draft: false,
     headBranch: 'feature',
     headOid: OID,
@@ -41,8 +40,8 @@ function observedPullRequest() {
     headRepositoryNodeId: 'R_head',
     id: 'PR_node',
     number: 7,
-    state: 'OPEN' as const,
-    title: 'human title',
+    state,
+    title,
     url: 'https://github.com/acme/repo/pull/7'
   }
 }
@@ -205,44 +204,43 @@ test('bindPullRequest settles through a real DomainLedger with full route facts'
     })
 
     let pullRequest: ReturnType<typeof observedPullRequest> | null = null
-    let comments: GithubIssueCommentObservation[] = []
     let createdTitle: string | undefined
+    let sleepCalls = 0
+    const content = { body: 'complete body', title: 'ONM-80: bind exact GitHub pull requests' }
     const authority = {
-      createIssueComment: async ({ body }: { body: string }) => {
-        comments = [{
-          author: { id: 'A_node', login: 'bot' },
-          body,
-          createdAt: '2026-09-01T00:00:20.000Z',
-          id: 'IC_comment',
-          updatedAt: '2026-09-01T00:00:20.000Z',
-          url: 'https://github.com/acme/repo/pull/7#issuecomment-1'
-        }]
-      },
-      createPullRequest: async (input: { title: string }) => {
+      createPullRequest: async (input: { body: string; title: string }) => {
         createdTitle = input.title
-        pullRequest = observedPullRequest()
+        pullRequest = observedPullRequest(input.body, input.title)
       },
-      observeIssueComments: async () => comments,
       observePullRequests: async () => ({ exact: pullRequest, nearMatches: [] }),
-      updateIssueComment: async () => assert.fail('unexpected comment update')
+      updatePullRequest: async () => assert.fail('unexpected PR update')
     }
     const result = await bindPullRequest({
       artifactPath: path.join(home, 'pr.json'),
       attemptId: 'attempt',
       authority,
       candidateCommitOid: OID,
+      content,
       generationToken: generation,
-      intent: 'ONM-80: bind exact GitHub pull requests',
       ledger,
       now: (() => { let tick = 0; return () => `2026-09-01T00:00:1${tick++}.000Z` })(),
       pipelineEvidenceRoot: 'c'.repeat(64),
       runId: 'run',
-      stageSummaries: ['lint: passed'],
+      sleep: async () => {
+        sleepCalls += 1
+        assert.equal(
+          ledger.stageDispositions('run').some((entry) => entry.stage_id === 'pr'),
+          false,
+          'the PR stage must remain incomplete while the PR is open'
+        )
+        pullRequest = observedPullRequest(content.body, content.title, 'MERGED')
+      },
       workerIdentity: 'coordinator'
     })
 
     assert.equal(result.outcome, 'created')
     assert.equal(result.number, 7)
+    assert.equal(sleepCalls, 1)
     assert.equal(createdTitle, 'ONM-80: bind exact GitHub pull requests')
     const prReceipt = ledger.remoteReceipt('run', 'pull-request-binding')
     assert.equal(prReceipt?.candidate_commit_oid, OID)

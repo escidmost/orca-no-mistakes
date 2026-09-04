@@ -85,20 +85,16 @@ A complete, typed, timestamped set of repository or pull-request facts obtained 
 _Avoid_: CLI success, truncated summary, ambient repository, raw API payload
 
 **Pull-request binding**:
-The association of a publication route and candidate commit with one exact open pull request identified by stable forge repository, pull-request, base-ref, and head-ref identities.
+The association of a publication route and candidate commit with one exact pull request identified by stable forge repository, pull-request, base-ref, and head-ref identities, retained until the forge reports that pull request merged.
 _Avoid_: PR URL, branch-name match, latest pull request
 
-**Human-owned pull-request content**:
-The pull-request title, body, and draft state after the pull request exists. Orca No-Mistakes may supply their initial values but does not subsequently normalize or overwrite them.
-_Avoid_: Generated PR state, managed summary, binding proof
-
-**Managed pull-request summary**:
-The single Orca No-Mistakes-owned forge comment that presents redacted run and stage information while authoritative evidence remains local.
-_Avoid_: Pull-request body, trust anchor, remote evidence store
+**Managed pull-request report**:
+The Orca No-Mistakes-owned title and original pull-request body containing the complete branch intent, final-diff change summary, risk assessment, testing evidence, and pipeline attestation. The coordinator creates or refreshes this report, notifies the originating terminal that the pull request is ready, and then awaits merge; it does not move pipeline detail into a comment.
+_Avoid_: Managed comment, trust anchor, remote evidence store
 
 **Pull-request binding receipt**:
-A durable local record binding exact pull-request and managed-summary identities to the publication route, candidate commit, forge observations, and operation outcome.
-_Avoid_: PR URL, comment text, create response
+A durable local record binding the exact merged pull request and managed report hashes to the publication route, candidate commit, forge observations, and operation outcome.
+_Avoid_: PR URL, body text, create response
 
 **Required policy**:
 A validation or delivery rule that must be satisfied for Passed to be available.
@@ -185,7 +181,7 @@ An immutable, digestible settlement record for one run attempt, including its ve
 _Avoid_: Current status row, mutable failure message, console exit
 
 **Pipeline evidence root**:
-A deterministic root binding the frozen stage plan and evidence through candidate publication. It may be published in the managed pull-request summary after the exact pull request is identified and before the pull-request binding receipt exists.
+A deterministic root binding the frozen stage plan and evidence through candidate publication. Its stage facts are published in the managed pull-request report before the pull-request binding receipt exists.
 _Avoid_: Completion-attestation root, remote trust anchor, raw evidence link
 
 **Pipeline completion attestation**:

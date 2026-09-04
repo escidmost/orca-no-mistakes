@@ -480,12 +480,18 @@ test('route resolution canonicalizes same-repository and fork routes without per
 
 test('mutations are single-attempt and return only a reconciliation requirement', async () => {
   let mutations = 0
+  const mutationInputs: unknown[] = []
   const provider = await GithubAuthority.connect({
     runner: githubRunner((_executable, _args, options) => {
       mutations += 1
-      const query = JSON.parse(options.input ?? '{}').query as string
+      const request = JSON.parse(options.input ?? '{}') as { query: string; variables: { input: unknown } }
+      const query = request.query
+      mutationInputs.push(request.variables.input)
       if (query.includes('CreatePullRequest')) {
         return json({ data: { createPullRequest: { pullRequest: { id: 'PR_1' } } } })
+      }
+      if (query.includes('UpdatePullRequest')) {
+        return json({ data: { updatePullRequest: { pullRequest: { id: 'PR_1' } } } })
       }
       if (query.includes('AddComment')) {
         return json({ data: { addComment: { commentEdge: { node: { id: 'IC_1' } } } } })
@@ -501,9 +507,23 @@ test('mutations are single-attempt and return only a reconciliation requirement'
     headRefName: 'fork:feature',
     title: 'title'
   })).requiresReconciliation, true)
+  await provider.updatePullRequest({ body: 'complete body', pullRequestId: 'PR_1', title: 'updated title' })
   await provider.createIssueComment({ body: 'summary', subjectId: 'PR_1' })
   await provider.updateIssueComment({ body: 'updated', commentId: 'IC_1' })
-  assert.equal(mutations, 3)
+  assert.equal(mutations, 4)
+  assert.deepEqual(mutationInputs[1], {
+    body: 'complete body',
+    pullRequestId: 'PR_1',
+    title: 'updated title'
+  })
+
+  const mismatched = await GithubAuthority.connect({
+    runner: githubRunner(() => json({ data: { updatePullRequest: { pullRequest: { id: 'PR_other' } } } }))
+  })
+  await assert.rejects(
+    () => mismatched.updatePullRequest({ body: 'body', pullRequestId: 'PR_1', title: 'title' }),
+    (error: unknown) => error instanceof GithubAuthorityError && error.kind === 'mutation-indeterminate'
+  )
 
   let attempted = 0
   const uncertain = await GithubAuthority.connect({
@@ -513,8 +533,9 @@ test('mutations are single-attempt and return only a reconciliation requirement'
     })
   })
   await assert.rejects(
-    () => uncertain.createIssueComment({ body: 'summary', subjectId: 'PR_1' }),
-    (error: unknown) => error instanceof GithubAuthorityError && error.kind === 'mutation-indeterminate'
+    () => uncertain.updatePullRequest({ body: 'body', pullRequestId: 'PR_1', title: 'title' }),
+    (error: unknown) => error instanceof GithubAuthorityError &&
+      error.kind === 'mutation-indeterminate' && error.operation === 'update-pull-request'
   )
   assert.equal(attempted, 1)
 })

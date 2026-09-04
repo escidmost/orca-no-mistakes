@@ -4,7 +4,6 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import {
-  GithubAuthorityError,
   type GithubAuthority,
   type GithubIssueCommentObservation,
   type GithubPullRequestObservation
@@ -20,11 +19,6 @@ import {
   type WorkerLaunch,
   type WorkerResult
 } from '../scripts/orca-no-mistakes.ts'
-import {
-  bindPullRequest,
-  PullRequestBindingError
-} from '../scripts/pull-request.ts'
-
 const OID = 'a'.repeat(40)
 const BASE = 'b'.repeat(40)
 const REPO_ROOT = '/repo'
@@ -238,152 +232,6 @@ async function setupLedgerWithSettledPush(home: string, runId: string, intent: s
   return { ledger }
 }
 
-test('prior pull-request-binding receipt does not mask later unresolved comment create intent after deletion', async () => {
-  const home = await mkdtemp(path.join(tmpdir(), 'onm-prior-receipt-comment-'))
-  const intent = 'ONM-80: reconcile deleted comment after prior receipt'
-  const { ledger } = await setupLedgerWithSettledPush(home, 'run-prior-rcpt', intent)
-
-  try {
-    const existingPr = pullRequestFixture()
-    let initialComment: GithubIssueCommentObservation = {
-      author: { id: 'A_node', login: 'bot' },
-      body: '<!-- orca-no-mistakes:managed-summary:v1 -->\ninitial summary',
-      createdAt: '2026-09-01T00:00:05.000Z',
-      id: 'comment-initial-c1',
-      updatedAt: '2026-09-01T00:00:05.000Z',
-      url: 'https://example.test/comment/c1'
-    }
-
-    // Step 1: settle initial PR binding with comment C1
-    const gen1 = startNextAttempt(ledger, 'run-prior-rcpt', 'att-pr-initial')
-    const initialAuthority = {
-      createIssueComment: async () => assert.fail('unexpected create'),
-      createPullRequest: async () => assert.fail('unexpected create PR'),
-      observeIssueComments: async () => [initialComment],
-      observePullRequests: async () => ({ exact: existingPr, nearMatches: [] }),
-      updateIssueComment: async (input: { body: string }) => {
-        initialComment = { ...initialComment, body: input.body }
-      }
-    }
-
-    const initResult = await bindPullRequest({
-      artifactPath: path.join(home, 'pr-init.json'),
-      attemptId: 'att-pr-initial',
-      authority: initialAuthority,
-      candidateCommitOid: OID,
-      generationToken: gen1,
-      intent,
-      ledger,
-      pipelineEvidenceRoot: 'c'.repeat(64),
-      runId: 'run-prior-rcpt',
-      stageSummaries: ['summary'],
-      workerIdentity: 'coordinator'
-    })
-
-    assert.equal(initResult.commentNodeId, 'comment-initial-c1')
-    assert.ok(ledger.remoteReceipt('run-prior-rcpt', 'pull-request-binding'))
-    assert.equal(ledger.unresolvedManagedCommentCreateIntent('run-prior-rcpt'), undefined)
-
-    // Step 2: comment C1 is deleted remotely. Next attempt tries to recreate comment C2,
-    // which fails with mutation-indeterminate and is not exposed in immediate post-read.
-    let createCommentCalls = 0
-    let c2ExposedComments: GithubIssueCommentObservation[] = []
-    let createdCommentBody = ''
-
-    const attempt2Authority = {
-      createIssueComment: async (input: { body: string; subjectId: string }) => {
-        createCommentCalls += 1
-        createdCommentBody = input.body
-        throw new GithubAuthorityError('mutation-indeterminate', 'create-issue-comment', 'socket reset')
-      },
-      createPullRequest: async () => assert.fail('unexpected createPullRequest'),
-      observeIssueComments: async () => c2ExposedComments,
-      observePullRequests: async () => ({ exact: existingPr, nearMatches: [] }),
-      updateIssueComment: async () => {}
-    }
-
-    const gen2 = startNextAttempt(ledger, 'run-prior-rcpt', 'att-pr-create-c2')
-    await assert.rejects(
-      bindPullRequest({
-        artifactPath: path.join(home, 'pr-att2.json'),
-        attemptId: 'att-pr-create-c2',
-        authority: attempt2Authority,
-        candidateCommitOid: OID,
-        generationToken: gen2,
-        intent,
-        ledger,
-        pipelineEvidenceRoot: 'c'.repeat(64),
-        runId: 'run-prior-rcpt',
-        stageSummaries: ['summary'],
-        workerIdentity: 'coordinator'
-      }),
-      (err: unknown) => err instanceof PullRequestBindingError && /managed summary mutation was not proven/.test(err.message)
-    )
-
-    assert.equal(createCommentCalls, 1)
-
-    // Verify unresolved create intent C2 is detected despite the prior receipt from step 1!
-    const pendingIntent = ledger.unresolvedManagedCommentCreateIntent('run-prior-rcpt')
-    assert.ok(pendingIntent, 'unresolved create intent must not be masked by prior receipt')
-    assert.equal(pendingIntent.payload.managedCommentNodeId, null)
-
-    // Step 3: Fast resume while comment C2 is still absent must fail closed without issuing another create
-    const gen3 = startNextAttempt(ledger, 'run-prior-rcpt', 'att-pr-fast-resume')
-    await assert.rejects(
-      bindPullRequest({
-        artifactPath: path.join(home, 'pr-att3.json'),
-        attemptId: 'att-pr-fast-resume',
-        authority: attempt2Authority,
-        candidateCommitOid: OID,
-        generationToken: gen3,
-        intent,
-        ledger,
-        pipelineEvidenceRoot: 'c'.repeat(64),
-        runId: 'run-prior-rcpt',
-        stageSummaries: ['summary'],
-        workerIdentity: 'coordinator'
-      }),
-      (err: unknown) =>
-        err instanceof PullRequestBindingError &&
-        /unresolved managed comment create intent .* requires manual resolution/.test(err.message)
-    )
-
-    assert.equal(createCommentCalls, 1, 'must not issue a second create')
-
-    // Step 4: Resume once comment C2 is exposed reconciles without calling createIssueComment
-    const gen4 = startNextAttempt(ledger, 'run-prior-rcpt', 'att-pr-reconcile')
-    c2ExposedComments = [{
-      author: { id: 'A_node', login: 'bot' },
-      body: createdCommentBody,
-      createdAt: '2026-09-01T00:00:15.000Z',
-      id: 'comment-c2-reconciled',
-      updatedAt: '2026-09-01T00:00:15.000Z',
-      url: 'https://example.test/comment/c2'
-    }]
-
-    const result = await bindPullRequest({
-      artifactPath: path.join(home, 'pr-att4.json'),
-      attemptId: 'att-pr-reconcile',
-      authority: attempt2Authority,
-      candidateCommitOid: OID,
-      generationToken: gen4,
-      intent,
-      ledger,
-      pipelineEvidenceRoot: 'c'.repeat(64),
-      roundIndex: 1,
-      runId: 'run-prior-rcpt',
-      stageSummaries: ['summary'],
-      workerIdentity: 'coordinator'
-    })
-
-    assert.equal(createCommentCalls, 1)
-    assert.equal(result.commentNodeId, 'comment-c2-reconciled')
-    assert.equal(ledger.unresolvedManagedCommentCreateIntent('run-prior-rcpt'), undefined)
-  } finally {
-    ledger.close()
-  }
-})
-
 class FailAfterApprovalLedgerR2 extends ExportedDomainLedger {
   #failReviewCheckpoint = true
 
@@ -526,18 +374,21 @@ test('Release 2 resume reconciles approved stage settlement and contiguous check
         url: 'https://github.com/owner/repo/pull/80#issuecomment-1'
       }]
     },
-    createPullRequest: async () => {
-      pullRequest = pullRequestFixture({
+    createPullRequest: async ({ body, title }: { body: string; title: string }) => {
+      pullRequest = { ...pullRequestFixture({
         baseRepositoryId: 'R_repo',
         baseRepositoryNodeId: 'RN_repo',
         headRepositoryId: 'R_repo',
         headRepositoryNodeId: 'RN_repo'
-      })
+      }), body, state: 'MERGED', title }
     },
     observeIssueComments: async () => comments,
     observePullRequests: async () => ({ exact: pullRequest, nearMatches: [] }),
     observeRepository: async () => ({ id: 'R_repo', nodeId: 'RN_repo' }),
-    updateIssueComment: async () => {}
+    updateIssueComment: async () => {},
+    updatePullRequest: async ({ body, title }: { body: string; title: string }) => {
+      pullRequest = { ...pullRequest!, body, title }
+    }
   } as unknown as GithubAuthority
 
   let remoteRefHead = ''

@@ -219,7 +219,7 @@ export type GithubIssueCommentObservation = {
 export type GithubMutationAttempt = {
   attemptedAt: string
   backend: GithubBackend
-  operation: 'create-pull-request' | 'create-comment' | 'update-comment'
+  operation: 'create-pull-request' | 'create-comment' | 'update-comment' | 'update-pull-request'
   requiresReconciliation: true
 }
 
@@ -470,6 +470,27 @@ export class GithubAuthority {
       z.object({ createPullRequest: z.object({ pullRequest: z.object({ id: NodeIdSchema }) }) })
     )
     return this.#mutationAttempt('create-pull-request')
+  }
+
+  async updatePullRequest(input: {
+    body: string
+    pullRequestId: string
+    title: string
+  }): Promise<GithubMutationAttempt> {
+    const variables = z.object({
+      body: z.string(),
+      pullRequestId: NodeIdSchema,
+      title: z.string().min(1)
+    }).parse(input)
+    await this.#graphqlMutation(
+      'update-pull-request',
+      `mutation UpdatePullRequest($input: UpdatePullRequestInput!) {
+        updatePullRequest(input: $input) { pullRequest { id } }
+      }`,
+      { input: { body: variables.body, pullRequestId: variables.pullRequestId, title: variables.title } },
+      z.object({ updatePullRequest: z.object({ pullRequest: z.object({ id: z.literal(variables.pullRequestId) }) }) })
+    )
+    return this.#mutationAttempt('update-pull-request')
   }
 
   async createIssueComment(input: { body: string; subjectId: string }): Promise<GithubMutationAttempt> {

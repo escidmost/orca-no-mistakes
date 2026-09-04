@@ -3377,6 +3377,11 @@ console.log(JSON.stringify({ result }))
       "passed",
       "Run completed-run passed all 6 stages. Candidate commit: abc123.",
     );
+    await orca.notifyPullRequestReady(
+      42,
+      "ONM-42: publish complete report",
+      "https://github.com/owner/repo/pull/42",
+    );
 
     const calls = (await readFile(callsPath, "utf8"))
       .trim()
@@ -3401,6 +3406,18 @@ console.log(JSON.stringify({ result }))
     assert.ok(
       wake?.some((value) => value.includes("Report this result to the user")),
     );
+    const readySent = calls.find(
+      (args) => args.includes("orca-no-mistakes pull request #42 ready"),
+    );
+    const readyWake = calls.find(
+      (args) => args.some((value) => value.includes("Notify the user now")),
+    );
+    assert.ok(
+      readySent?.some((value) =>
+        value.includes("https://github.com/owner/repo/pull/42"),
+      ),
+    );
+    assert.ok(readyWake?.includes("--enter"));
   } finally {
     if (previousHandle === undefined) delete process.env.ORCA_TERMINAL_HANDLE;
     else process.env.ORCA_TERMINAL_HANDLE = previousHandle;

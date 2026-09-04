@@ -3823,10 +3823,13 @@ export class DomainLedger {
     }
     const receipt = input.receiptPayload
     const hasManagedComment = Object.hasOwn(receipt, 'managedCommentIntent')
+    const hasBodyReport = Object.hasOwn(receipt, 'bodySha256')
     const hasPipelineEvidenceRoot = Object.hasOwn(receipt, 'pipelineEvidenceRoot')
-    if (hasManagedComment !== hasPipelineEvidenceRoot) return false
+    if (hasManagedComment && hasBodyReport) return false
+    if ((hasManagedComment || hasBodyReport) !== hasPipelineEvidenceRoot) return false
     if (!hasOnlyOwnProperties(receipt, new Set([
       ...(hasManagedComment ? ['managedCommentIntent'] : []),
+      ...(hasBodyReport ? ['bodySha256', 'state', 'titleSha256'] : []),
       ...(hasPipelineEvidenceRoot ? ['pipelineEvidenceRoot'] : []),
       'mutationIntent', 'number', 'outcome', 'postRead', 'routeFingerprint'
     ])) || !Number.isInteger(receipt.number) || Number(receipt.number) <= 0 ||
@@ -3835,6 +3838,10 @@ export class DomainLedger {
       (hasPipelineEvidenceRoot &&
         (typeof receipt.pipelineEvidenceRoot !== 'string' ||
           !/^[0-9a-f]{64}$/.test(receipt.pipelineEvidenceRoot))) ||
+      (hasBodyReport &&
+        (typeof receipt.bodySha256 !== 'string' || !HEX_64.test(receipt.bodySha256) ||
+          typeof receipt.titleSha256 !== 'string' || !HEX_64.test(receipt.titleSha256) ||
+          receipt.state !== 'merged')) ||
       typeof receipt.mutationIntent !== 'string' ||
       receipt.postRead !== input.observationSha256) return false
     const mutation = this.#db.prepare(
@@ -3910,10 +3917,22 @@ export class DomainLedger {
       observation.subject === `${route.forge_host}/${route.base_repository_id}#${String(receipt.number)}` &&
       Object.entries(routeFacts).every(([key, value]) =>
         payload[key] === value && mutationPayload[key] === value
-      ) &&
-      payload.number === receipt.number && payload.state === 'open' &&
-      mutationPayload.action === 'ensure-open'
+      ) && payload.number === receipt.number
     if (!commonMatch) return false
+    if (hasBodyReport) {
+      return payload.state === 'merged' && mutationPayload.action === 'ensure-body-and-await-merge' &&
+        payload.bodySha256 === receipt.bodySha256 &&
+        payload.titleSha256 === receipt.titleSha256 &&
+        hasOnlyOwnProperties(payload, new Set([
+          ...Object.keys(routeFacts), 'bodySha256', 'number', 'pullRequestNodeId', 'state', 'titleSha256'
+        ])) && hasOnlyOwnProperties(mutationPayload, new Set([
+          ...Object.keys(routeFacts), 'action', 'body', 'title'
+        ])) &&
+        typeof payload.pullRequestNodeId === 'string' && payload.pullRequestNodeId !== '' &&
+        sha256(String(mutationPayload.body)) === receipt.bodySha256 &&
+        sha256(String(mutationPayload.title)) === receipt.titleSha256
+    }
+    if (payload.state !== 'open' || mutationPayload.action !== 'ensure-open') return false
     if (!hasManagedComment) {
       return hasOnlyOwnProperties(payload, new Set([
         ...Object.keys(routeFacts), 'number', 'state'
@@ -4063,6 +4082,7 @@ export class DomainLedger {
         'SELECT 1 FROM stage_dispositions WHERE run_id = ? AND stage_id = ? LIMIT 1'
       ).get(input.runId, input.stageId)
       const settlesDisposition = input.stageId !== 'pr' ||
+        input.receipt.payload.state === 'merged' ||
         (Object.hasOwn(input.receipt.payload, 'managedCommentIntent') &&
           (input.evidence.roundIndex === 0 || priorDisposition === undefined))
       const priorEvidence = this.#db.prepare(
@@ -5353,7 +5373,9 @@ export class DomainLedger {
       pullRequest?.receipt_sha256 !== manifest.pullRequestBindingReceiptSha256 ||
       pullRequest.candidate_commit_oid !== manifest.candidateCommitOid
     ) {
-      problems.push('pull-request-binding receipt')
+      problems.push(
+        `pull-request-binding receipt (receipt ${pullRequest?.receipt_sha256 ?? 'missing'} / candidate ${pullRequest?.candidate_commit_oid ?? 'missing'})`
+      )
     }
     for (const receipt of [publication, pullRequest]) {
       if (!receipt) continue
@@ -5375,7 +5397,8 @@ export class DomainLedger {
         problems.push(`${receipt.kind} receipt digest`)
       }
       if (!this.#remoteObservationMatches({
-        allowHistoricalAttempt: receipt.kind === 'candidate-publication',
+        allowHistoricalAttempt: receipt.kind === 'candidate-publication' ||
+          (receipt.kind === 'pull-request-binding' && payload.state === 'merged'),
         candidateCommitOid: receipt.candidate_commit_oid,
         kind: receipt.kind,
         observationSha256: receipt.authoritative_post_observation_sha256,
@@ -5386,11 +5409,18 @@ export class DomainLedger {
       }
       if (receipt.kind === 'pull-request-binding') {
         const hasManagedComment = Object.hasOwn(payload, 'managedCommentIntent')
+        const hasBody = Object.hasOwn(payload, 'bodySha256')
+        const hasTitle = Object.hasOwn(payload, 'titleSha256')
         const hasPipelineEvidenceRoot = Object.hasOwn(payload, 'pipelineEvidenceRoot')
-        if (hasManagedComment !== hasPipelineEvidenceRoot) {
+        if (
+          (hasManagedComment && hasBody) ||
+          hasBody !== hasTitle ||
+          ((hasManagedComment || hasBody) && !hasPipelineEvidenceRoot) ||
+          (!hasManagedComment && !hasBody && hasPipelineEvidenceRoot)
+        ) {
           problems.push('pull-request-binding receipt')
         }
-        if (hasPipelineEvidenceRoot && payload.pipelineEvidenceRoot !== manifest.pipelineEvidenceRoot) {
+        if (hasManagedComment && payload.pipelineEvidenceRoot !== manifest.pipelineEvidenceRoot) {
           problems.push('pipeline evidence root')
         }
       }

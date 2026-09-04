@@ -56,6 +56,7 @@ async function runRelease2Pipeline(failAfter?: 'push' | 'pr'): Promise<void> {
   let task = 0
   let dispatch = 0
   let failedTaskUpdate = false
+  const readyNotifications: string[] = []
   const taskStages = new Map<string, string>()
   const orca: OrcaOperations = {
     createRun: async () => 'run-release-2',
@@ -87,6 +88,7 @@ async function runRelease2Pipeline(failAfter?: 'push' | 'pr'): Promise<void> {
     waitForGate: async () => 'approve',
     resolveGate: async () => {},
     setWorktreeStatus: async () => {},
+    notifyPullRequestReady: async (_number, _title, url) => { readyNotifications.push(url) },
   }
   let pullRequest: Record<string, unknown> | null = null
   let comments: Record<string, unknown>[] = []
@@ -96,14 +98,14 @@ async function runRelease2Pipeline(failAfter?: 'push' | 'pr'): Promise<void> {
   const authority = {
     observeRepository: async () => ({ id: 'R_repo', nodeId: 'RN_repo' }),
     observePullRequests: async () => ({ exact: pullRequest, nearMatches: [] }),
-    createPullRequest: async () => {
+    createPullRequest: async ({ body, title }: { body: string; title: string }) => {
       pullRequestCreateCount += 1
       pullRequest = {
         baseBranch: 'main', baseOid: base, baseRepositoryId: 'R_repo',
-        baseRepositoryNodeId: 'RN_repo', body: 'body', draft: false,
+        baseRepositoryNodeId: 'RN_repo', body, draft: false,
         headBranch: 'feature', headOid: candidate, headRepositoryId: 'R_repo',
         headRepositoryNodeId: 'RN_repo', id: 'PR_node', number: 80,
-        state: 'OPEN', title: 'ONM-80: integration', url: 'https://github.com/owner/repo/pull/80',
+        state: 'MERGED', title, url: 'https://github.com/owner/repo/pull/80',
       }
     },
     observeIssueComments: async () => comments,
@@ -118,6 +120,9 @@ async function runRelease2Pipeline(failAfter?: 'push' | 'pr'): Promise<void> {
     updateIssueComment: async ({ body }: { body: string }) => {
       commentUpdateCount += 1
       comments = comments.map((comment) => ({ ...comment, body }))
+    },
+    updatePullRequest: async ({ body, title }: { body: string; title: string }) => {
+      pullRequest = { ...pullRequest!, body, title }
     },
   } as unknown as GithubAuthority
 
@@ -160,8 +165,9 @@ async function runRelease2Pipeline(failAfter?: 'push' | 'pr'): Promise<void> {
     assert.equal(git(remote, 'rev-parse', 'refs/heads/feature'), candidate)
     assert.equal(pushCount, 1)
     assert.equal(pullRequestCreateCount, 1)
-    assert.equal(commentCreateCount, 1)
-    assert.equal(commentUpdateCount, failAfter === 'pr' ? 1 : 0)
+    assert.deepEqual(readyNotifications, ['https://github.com/owner/repo/pull/80'])
+    assert.equal(commentCreateCount, 0)
+    assert.equal(commentUpdateCount, 0)
   } finally {
     ledger?.close()
     if (priorHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME

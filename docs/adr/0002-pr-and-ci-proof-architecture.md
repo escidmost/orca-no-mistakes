@@ -2,7 +2,7 @@
 status: accepted
 date: 2026-08-20
 scope: target architecture
-implementation: partially implemented (Release 2; CI, branch-protection, merge, and delivery proof pending)
+implementation: partially implemented (Release 2; merge-state waiting implemented, CI, branch-protection, and delivered-tree proof pending)
 ---
 
 # PR and CI Proof Architecture

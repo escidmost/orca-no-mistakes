@@ -92,13 +92,13 @@ test('runPipeline in Release 2 journals passed outcome before settlement and upd
   const authority = {
     observeRepository: async () => ({ id: 'R_repo', nodeId: 'RN_repo' }),
     observePullRequests: async () => ({ exact: pullRequest, nearMatches: [] }),
-    createPullRequest: async () => {
+    createPullRequest: async ({ body, title }: { body: string; title: string }) => {
       pullRequest = {
         baseBranch: 'main', baseOid: 'base', baseRepositoryId: 'R_repo',
-        baseRepositoryNodeId: 'RN_repo', body: 'body', draft: false,
+        baseRepositoryNodeId: 'RN_repo', body, draft: false,
         headBranch: 'feature', headOid: candidate, headRepositoryId: 'R_repo',
         headRepositoryNodeId: 'RN_repo', id: 'PR_node', number: 80,
-        state: 'OPEN', title: 'ONM-80: journal test', url: 'https://github.com/owner/repo/pull/80',
+        state: 'MERGED', title, url: 'https://github.com/owner/repo/pull/80',
       }
     },
     observeIssueComments: async () => comments,
@@ -111,6 +111,9 @@ test('runPipeline in Release 2 journals passed outcome before settlement and upd
     },
     updateIssueComment: async ({ body }: { body: string }) => {
       comments = comments.map((comment) => ({ ...comment, body }))
+    },
+    updatePullRequest: async ({ body, title }: { body: string; title: string }) => {
+      pullRequest = { ...pullRequest!, body, title }
     },
   } as unknown as GithubAuthority
 

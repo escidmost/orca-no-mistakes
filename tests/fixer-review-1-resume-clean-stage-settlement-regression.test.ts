@@ -234,18 +234,21 @@ test('Release 2 resume reconciles clean stage settlement without approval before
         url: 'https://github.com/owner/repo/pull/80#issuecomment-1'
       }]
     },
-    createPullRequest: async () => {
-      pullRequest = pullRequestFixture({
+    createPullRequest: async ({ body, title }: { body: string; title: string }) => {
+      pullRequest = { ...pullRequestFixture({
         baseRepositoryId: 'R_repo',
         baseRepositoryNodeId: 'RN_repo',
         headRepositoryId: 'R_repo',
         headRepositoryNodeId: 'RN_repo'
-      })
+      }), body, state: 'MERGED', title }
     },
     observeIssueComments: async () => comments,
     observePullRequests: async () => ({ exact: pullRequest, nearMatches: [] }),
     observeRepository: async () => ({ id: 'R_repo', nodeId: 'RN_repo' }),
-    updateIssueComment: async () => {}
+    updateIssueComment: async () => {},
+    updatePullRequest: async ({ body, title }: { body: string; title: string }) => {
+      pullRequest = { ...pullRequest!, body, title }
+    }
   } as unknown as GithubAuthority
 
   let remoteRefHead = ''

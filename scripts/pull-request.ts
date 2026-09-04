@@ -1,8 +1,8 @@
 import { mkdir, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
+
 import {
   GithubAuthorityError,
-  type GithubIssueCommentObservation,
   type GithubPullRequestObservation
 } from './github.ts'
 import {
@@ -13,12 +13,33 @@ import {
   sha256
 } from './ledger.ts'
 
-const MANAGED_SUMMARY_MARKER = '<!-- orca-no-mistakes:managed-summary:v1 -->'
-const SUMMARY_BUDGET = 32 * 1024
-const PULL_REQUEST_BODY_BUDGET = 65536
+const PULL_REQUEST_BODY_BUDGET = 63_488
+const PIPELINE_SIGNATURE = 'Updates from [git push orca-no-mistakes](https://github.com/Filamess/orca-no-mistakes)'
+const ATTESTATION_PREFIX = '<!-- orca-no-mistakes-pipeline-attestation:v1 '
+const ARTIFACT_BUDGET = 16 * 1024
+const TOTAL_ARTIFACT_BUDGET = 24 * 1024
+const PIPELINE_DETAILS_BUDGET = 16 * 1024
+
+export type PullRequestArtifact = { content: string; name: string }
+export type PullRequestPipelineStep = {
+  details?: string
+  name: string
+  status: string
+}
+export type PullRequestReport = {
+  candidateCommitOid: string
+  pipelineSteps: PullRequestPipelineStep[]
+  risk: { level: 'high' | 'low' | 'medium'; rationale: string }
+  testing: {
+    artifacts: PullRequestArtifact[]
+    summary: string
+    tested: string[]
+  }
+  title?: string
+  whatChanged: string
+}
 
 type PullRequestAuthority = {
-  createIssueComment(input: { body: string; subjectId: string }): Promise<unknown>
   createPullRequest(input: {
     baseBranch: string
     baseRepositoryNodeId: string
@@ -27,7 +48,6 @@ type PullRequestAuthority = {
     headRefName: string
     title: string
   }): Promise<unknown>
-  observeIssueComments(pullRequestNodeId: string): Promise<GithubIssueCommentObservation[]>
   observePullRequests(input: {
     baseBranch: string
     baseRepositoryId: string
@@ -41,7 +61,11 @@ type PullRequestAuthority = {
     exact: GithubPullRequestObservation | null
     nearMatches: GithubPullRequestObservation[]
   }>
-  updateIssueComment(input: { body: string; commentId: string }): Promise<unknown>
+  updatePullRequest(input: {
+    body: string
+    pullRequestId: string
+    title: string
+  }): Promise<unknown>
 }
 
 export class PullRequestBindingError extends Error {
@@ -55,46 +79,85 @@ function after(earlier: string, candidate: string): string {
   return candidate > earlier ? candidate : new Date(Date.parse(earlier) + 1).toISOString()
 }
 
-function capSummary(content: string, budget: number): string {
-  if (Buffer.byteLength(content) <= budget) return content
-  let capped = Buffer.from(content).subarray(0, budget).toString('utf8').replace(/\uFFFD$/u, '')
-  while (Buffer.byteLength(capped) > budget) capped = capped.slice(0, -1)
-  return capped
+function capText(content: string, budget: number): string {
+  const redacted = redactKnownSecrets(content).replaceAll(ATTESTATION_PREFIX, '&lt;!-- inert-attestation:v1 ')
+  if (Buffer.byteLength(redacted) <= budget) return redacted
+  const marker = '\n\n_[truncated to fit GitHub PR body limits]_'
+  const markerBytes = Buffer.byteLength(marker)
+  const available = Math.max(0, budget - (budget >= markerBytes ? markerBytes : 0))
+  let capped = Buffer.from(redacted).subarray(0, available).toString('utf8').replace(/\uFFFD$/u, '')
+  if (budget < markerBytes) return capped
+  while (Buffer.byteLength(capped + marker) > budget) capped = capped.slice(0, -1)
+  return capped + marker
 }
 
-export function pullRequestContent(intent: string): { body: string; title: string } {
-  const redacted = redactKnownSecrets(intent).trim() || 'Complete the validated pipeline changes.'
-  const firstLine = redacted.split('\n', 1)[0].trim()
-  const title = /^(?:[a-z]+(?:\([^)]+\))?!?:\s|[A-Z][A-Z0-9]+-\d+:\s)/.test(firstLine)
+function htmlEscape(content: string): string {
+  return content
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+}
+
+function testingSection(testing: PullRequestReport['testing']): string {
+  const commands = testing.tested.length > 0
+    ? `\n\nCommands and checks:\n${capText(testing.tested.map((command) => `- ${command}`).join('\n'), 4096)}`
+    : ''
+  let remaining = TOTAL_ARTIFACT_BUDGET
+  const artifacts: string[] = []
+  for (const artifact of testing.artifacts) {
+    if (remaining <= 0) break
+    const content = capText(htmlEscape(artifact.content), Math.min(ARTIFACT_BUDGET, remaining))
+    remaining -= Buffer.byteLength(content)
+    artifacts.push(
+      `<details>\n<summary>${capText(htmlEscape(artifact.name), 512)}</summary>\n\n<pre>${content}</pre>\n\n</details>`
+    )
+  }
+  return `## Testing\n\n${capText(testing.summary, 4096)}${commands}${artifacts.length > 0 ? `\n\n${artifacts.join('\n\n')}` : ''}`
+}
+
+function pipelineSection(candidateCommitOid: string, steps: PullRequestPipelineStep[]): string {
+  const attestation = JSON.stringify({
+    head_sha: candidateCommitOid,
+    steps: steps.map((step) => ({ step: capText(step.name, 128), status: capText(step.status, 128) }))
+  })
+  let remaining = PIPELINE_DETAILS_BUDGET
+  const details: string[] = []
+  for (const step of steps) {
+    if (!step.details || remaining <= 0) continue
+    const content = capText(step.details, Math.min(4096, remaining))
+    const name = capText(htmlEscape(step.name), 128)
+    const status = capText(htmlEscape(step.status), 128)
+    remaining -= Buffer.byteLength(content)
+    details.push(
+      `<details>\n<summary>${name}: ${status}</summary>\n\n${content}\n\n</details>`
+    )
+  }
+  return `## Pipeline\n\n${PIPELINE_SIGNATURE}\n\n${ATTESTATION_PREFIX}${attestation} -->${details.length > 0 ? `\n\n${details.join('\n\n')}` : ''}`
+}
+
+export function pullRequestContent(intent: string, report: PullRequestReport): { body: string; title: string } {
+  const redactedIntent = redactKnownSecrets(intent).trim() || 'Complete the validated pipeline changes.'
+  const firstLine = redactedIntent.split('\n', 1)[0].trim()
+  const fallbackTitle = /^(?:[a-z]+(?:\([^)]+\))?!?:\s|[A-Z][A-Z0-9]+-\d+:\s)/.test(firstLine)
     ? firstLine
     : `chore: ${firstLine}`
-  const prefix = '## Intent\n\n'
-  const suffix = '\n\n## What Changed\n\nCompleted the validated pipeline changes for this run.\n'
-  const cappedIntent = capSummary(
-    redacted,
-    PULL_REQUEST_BODY_BUDGET - Buffer.byteLength(prefix) - Buffer.byteLength(suffix)
-  )
-  return {
-    title: title.slice(0, 256),
-    body: `${prefix}${cappedIntent}${suffix}`
+  const riskEmoji = report.risk.level === 'high' ? '🚨' : report.risk.level === 'medium' ? '⚠️' : '✅'
+  const suffix = [
+    `## What Changed\n\n${capText(report.whatChanged, 8192)}`,
+    `## Risk Assessment\n\n${riskEmoji} ${report.risk.level[0].toUpperCase()}${report.risk.level.slice(1)} - ${capText(report.risk.rationale, 2048)}`,
+    testingSection(report.testing),
+    pipelineSection(report.candidateCommitOid, report.pipelineSteps)
+  ].join('\n\n')
+  const intentPrefix = '## Intent\n\n'
+  const availableIntentBytes = Math.max(256, PULL_REQUEST_BODY_BUDGET - Buffer.byteLength(intentPrefix) - Buffer.byteLength('\n\n\n') - Buffer.byteLength(suffix))
+  const body = `${intentPrefix}${capText(redactedIntent, availableIntentBytes)}\n\n${suffix}\n`
+  if (Buffer.byteLength(body) > PULL_REQUEST_BODY_BUDGET) {
+    throw new PullRequestBindingError('generated pull-request body exceeds GitHub limit')
   }
-}
-
-export function managedSummary(input: {
-  candidateCommitOid: string
-  pipelineEvidenceRoot: string
-  runId: string
-  stageSummaries: string[]
-}): string {
-  const details = input.stageSummaries.length > 0
-    ? input.stageSummaries.map((summary) => `- ${redactKnownSecrets(summary)}`).join('\n')
-    : '- Pipeline stages completed without publishable details.'
-  const prefix = `${MANAGED_SUMMARY_MARKER}\n## Pipeline Summary\n\n`
-  const suffix = `\n\n` +
-    `- Candidate: \`${input.candidateCommitOid}\`\n` +
-    `- Pipeline Evidence Root: \`${input.pipelineEvidenceRoot}\`\n` +
-    `- Run: \`${input.runId}\`\n`
-  return `${prefix}${capSummary(details, SUMMARY_BUDGET - Buffer.byteLength(prefix) - Buffer.byteLength(suffix))}${suffix}`
+  return {
+    body,
+    title: capText(report.title?.trim() || fallbackTitle, 256)
+  }
 }
 
 async function observeExact(
@@ -119,60 +182,42 @@ async function observeExact(
   return observed.exact
 }
 
-function ownedComment(
-  comments: GithubIssueCommentObservation[],
-  actor: { login?: string; nodeId?: string | null },
-  receiptNodeId?: string
-): GithubIssueCommentObservation | undefined {
-  const exactReceipt = receiptNodeId
-    ? comments.find((comment) => comment.id === receiptNodeId)
-    : undefined
-  if (exactReceipt) return exactReceipt
-  const owned = (comment: GithubIssueCommentObservation): boolean =>
-    actor.nodeId != null
-      ? comment.author?.id === actor.nodeId
-      : actor.login != null && comment.author?.login === actor.login
-  const marked = comments.filter((comment) =>
-    owned(comment) && comment.body.startsWith(MANAGED_SUMMARY_MARKER)
-  )
-  if (marked.length > 1) {
-    throw new PullRequestBindingError('multiple managed summary markers are ambiguous')
-  }
-  return marked[0]
-}
-
 export async function bindPullRequest(input: {
   artifactPath: string
   attemptId: string
   authority: PullRequestAuthority
   candidateCommitOid: string
+  content: { body: string; title: string }
   generationToken: number
-  intent: string
   ledger: DomainLedger
   now?: () => string
+  onReady?: (pullRequest: {
+    number: number
+    outcome: 'created' | 'unchanged' | 'updated'
+    title: string
+    url: string
+  }) => Promise<void>
   pipelineEvidenceRoot: string
+  pollIntervalMs?: number
   roundIndex?: number
   runId: string
-  stageSummaries: string[]
+  sleep?: (milliseconds: number) => Promise<void>
   workerIdentity: string
-}): Promise<{ commentNodeId: string; number: number; outcome: 'created' | 'unchanged' | 'updated'; receiptSha256: string; url: string }> {
+}): Promise<{ number: number; outcome: 'created' | 'unchanged' | 'updated'; receiptSha256: string; url: string }> {
   const now = input.now ?? (() => new Date().toISOString())
+  const sleep = input.sleep ?? ((milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds)))
+  const content = input.content
   const run = input.ledger.run(input.runId)
   const route = input.ledger.publicationRoute(input.runId)
   const repositoryRoute = run ? input.ledger.repositoryPublicationRoute(run.repo_root) : undefined
-  if (!run || !route || !repositoryRoute ||
-      repositoryRoute.route_fingerprint !== route.route_fingerprint) {
+  if (!run || !route || !repositoryRoute || repositoryRoute.route_fingerprint !== route.route_fingerprint) {
     throw new PullRequestBindingError('run publication route is not durable')
   }
   const publicationReceipt = input.ledger.remoteReceipt(input.runId, 'candidate-publication')
   if (!publicationReceipt || publicationReceipt.candidate_commit_oid !== input.candidateCommitOid) {
     throw new PullRequestBindingError('candidate publication must settle before PR binding')
   }
-  const ownership = {
-    branch: run.branch,
-    generationToken: input.generationToken,
-    repoRoot: run.repo_root
-  }
+  const ownership = { branch: run.branch, generationToken: input.generationToken, repoRoot: run.repo_root }
   const requireLease = (): void => {
     if (!input.ledger.ownsLease(input.runId, ownership)) {
       throw new PullRequestBindingError('pull-request binding lease is no longer owned by this run generation')
@@ -180,7 +225,6 @@ export async function bindPullRequest(input: {
   }
   requireLease()
 
-  const content = pullRequestContent(input.intent)
   const routeFacts = {
     baseBranch: route.base_branch,
     baseRepositoryId: route.base_repository_id,
@@ -191,24 +235,19 @@ export async function bindPullRequest(input: {
     headRepositoryId: route.head_repository_id
   }
   const mutationCreatedAt = now()
-  const pullRequestIntent = input.ledger.recordMutationIntent({
+  const mutationIntent = input.ledger.recordMutationIntent({
     attemptId: input.attemptId,
     createdAt: mutationCreatedAt,
     kind: 'pull-request',
-    payload: { action: 'ensure-open', ...routeFacts, body: content.body, title: content.title },
+    payload: { action: 'ensure-body-and-await-merge', ...routeFacts, body: content.body, title: content.title },
     runId: input.runId,
     targetFingerprint: route.route_fingerprint
   })
 
-  let pullRequest = await observeExact(
-    input.authority,
-    route,
-    repositoryRoute,
-    input.candidateCommitOid
-  )
+  let pullRequest = await observeExact(input.authority, route, repositoryRoute, input.candidateCommitOid)
   let created = false
-  if (pullRequest?.state !== 'OPEN') {
-    if (pullRequest) throw new PullRequestBindingError('the exact pull request is not open')
+  let updated = false
+  if (!pullRequest) {
     requireLease()
     try {
       await input.authority.createPullRequest({
@@ -222,150 +261,77 @@ export async function bindPullRequest(input: {
     } catch (error) {
       if (!(error instanceof GithubAuthorityError) || error.kind !== 'mutation-indeterminate') throw error
     }
-    pullRequest = await observeExact(
-      input.authority,
-      route,
-      repositoryRoute,
-      input.candidateCommitOid
-    )
-    if (!pullRequest || pullRequest.state !== 'OPEN') {
+    pullRequest = await observeExact(input.authority, route, repositoryRoute, input.candidateCommitOid)
+    if (!pullRequest) {
       throw new PullRequestBindingError('pull-request creation was not proven by the authoritative post-read')
     }
     created = true
   }
+  if (pullRequest.state === 'CLOSED') throw new PullRequestBindingError('the exact pull request was closed without merging')
   if (pullRequest.draft) throw new PullRequestBindingError('the exact pull request is still a draft')
   const selectedPullRequest = { id: pullRequest.id, number: pullRequest.number }
 
-  const summary = managedSummary(input)
-  const previousReceipt = input.ledger.remoteReceipt(input.runId, 'pull-request-binding')
-  const previousObservation = previousReceipt
-    ? input.ledger.remoteObservation(
-        input.runId,
-        previousReceipt.authoritative_post_observation_sha256
-      )
-    : undefined
-  const receiptNodeId = typeof previousObservation?.payload.managedCommentNodeId === 'string'
-    ? previousObservation.payload.managedCommentNodeId
-    : undefined
-  const unresolvedCreate = input.ledger.unresolvedManagedCommentCreateIntent(input.runId)
-  let comments = await input.authority.observeIssueComments(pullRequest.id)
-  let comment = ownedComment(
-    unresolvedCreate && receiptNodeId
-      ? comments.filter((candidate) => candidate.id !== receiptNodeId)
-      : comments,
-    {
-      login: repositoryRoute.actor_login,
-      nodeId: repositoryRoute.actor_node_id
-    },
-    unresolvedCreate ? undefined : receiptNodeId
-  )
-  if (!comment && unresolvedCreate) {
-    throw new PullRequestBindingError(
-      `unresolved managed comment create intent (${unresolvedCreate.intentSha256}) requires manual resolution: managed comment is absent on pull request #${pullRequest.number}`
-    )
-  }
-  let commentMutated = false
-  const managedCommentCreatedAt = after(mutationCreatedAt, now())
-  const managedCommentIntent = input.ledger.recordMutationIntent({
-    attemptId: input.attemptId,
-    createdAt: managedCommentCreatedAt,
-    kind: 'managed-comment',
-    payload: {
-      action: 'ensure-managed-summary',
-      bodySha256: sha256(summary),
-      managedCommentNodeId: comment?.id ?? null,
-      number: pullRequest.number
-    },
-    runId: input.runId,
-    targetFingerprint: route.route_fingerprint
-  })
-  if (comment?.body !== summary) {
+  if (pullRequest.body !== content.body || pullRequest.title !== content.title) {
+    requireLease()
     try {
-      requireLease()
-    } catch (error) {
-      input.ledger.resolveMutationIntent({
-        attemptId: input.attemptId,
-        intentSha256: managedCommentIntent,
-        reason: 'lease-lost',
-        runId: input.runId
+      await input.authority.updatePullRequest({
+        body: content.body,
+        pullRequestId: pullRequest.id,
+        title: content.title
       })
-      throw error
-    }
-    commentMutated = true
-    try {
-      if (comment) {
-        await input.authority.updateIssueComment({ body: summary, commentId: comment.id })
-      } else {
-        await input.authority.createIssueComment({ body: summary, subjectId: pullRequest.id })
-      }
     } catch (error) {
-      if (!(error instanceof GithubAuthorityError) || error.kind !== 'mutation-indeterminate') {
-        input.ledger.resolveMutationIntent({
-          attemptId: input.attemptId,
-          intentSha256: managedCommentIntent,
-          reason: 'definite-failure',
-          runId: input.runId
-        })
-        throw error
-      }
+      if (!(error instanceof GithubAuthorityError) || error.kind !== 'mutation-indeterminate') throw error
     }
-    comments = await input.authority.observeIssueComments(pullRequest.id)
-    comment = ownedComment(comments, {
-      login: repositoryRoute.actor_login,
-      nodeId: repositoryRoute.actor_node_id
-    }, comment?.id)
-  }
-  if (!comment || comment.body !== summary) {
-    throw new PullRequestBindingError('managed summary mutation was not proven by the authoritative post-read')
+    pullRequest = await observeExact(input.authority, route, repositoryRoute, input.candidateCommitOid)
+    if (!pullRequest || pullRequest.body !== content.body || pullRequest.title !== content.title) {
+      throw new PullRequestBindingError('pull-request body update was not proven by the authoritative post-read')
+    }
+    updated = true
   }
 
-  const finalPullRequest = await observeExact(
-    input.authority,
-    route,
-    repositoryRoute,
-    input.candidateCommitOid
-  )
-  if (
-    !finalPullRequest ||
-    finalPullRequest.state !== 'OPEN' ||
-    finalPullRequest.draft ||
-    finalPullRequest.headOid !== input.candidateCommitOid ||
-    finalPullRequest.id !== selectedPullRequest.id ||
-    finalPullRequest.number !== selectedPullRequest.number
-  ) {
-    throw new PullRequestBindingError('pull-request facts changed before settlement')
+  const outcome = created ? 'created' : updated ? 'updated' : 'unchanged'
+  await input.onReady?.({
+    number: pullRequest.number,
+    outcome,
+    title: content.title,
+    url: pullRequest.url
+  })
+  while (pullRequest.state === 'OPEN') {
+    await sleep(input.pollIntervalMs ?? 15_000)
+    input.ledger.heartbeatLease(run.repo_root, run.branch, input.runId)
+    requireLease()
+    const observed = await observeExact(input.authority, route, repositoryRoute, input.candidateCommitOid)
+    if (!observed || observed.id !== selectedPullRequest.id || observed.number !== selectedPullRequest.number || observed.headOid !== input.candidateCommitOid) {
+      throw new PullRequestBindingError('pull-request facts changed while awaiting merge')
+    }
+    pullRequest = observed
   }
-  pullRequest = finalPullRequest
-  const observedAt = after(managedCommentCreatedAt, now())
+  if (pullRequest.state !== 'MERGED') {
+    throw new PullRequestBindingError('the exact pull request was closed without merging')
+  }
+
+  const observedAt = after(mutationCreatedAt, now())
   const postRead = input.ledger.recordRemoteObservation({
     attemptId: input.attemptId,
     kind: 'pull-request',
     observedAt,
     payload: {
       ...routeFacts,
-      managedCommentBodySha256: sha256(summary),
-      managedCommentNodeId: comment.id,
+      bodySha256: sha256(content.body),
       number: pullRequest.number,
       pullRequestNodeId: pullRequest.id,
-      state: 'open'
+      state: 'merged',
+      titleSha256: sha256(content.title)
     },
     runId: input.runId,
     subject: `${route.forge_host}/${route.base_repository_id}#${pullRequest.number}`
   })
-  const outcome = created ? 'created' : commentMutated ? 'updated' : 'unchanged'
   const roundIndex = input.roundIndex ?? 0
-  const artifactBytes = `${canonicalJson({
-    findings: [],
-    managedCommentIntent,
-    mutationIntent: pullRequestIntent,
-    number: pullRequest.number,
-    outcome,
-    postRead
-  })}\n`
+  const artifactBytes = `${canonicalJson({ findings: [], mutationIntent, number: pullRequest.number, outcome, postRead })}\n`
   await mkdir(dirname(input.artifactPath), { recursive: true })
   await writeFile(input.artifactPath, artifactBytes)
   const artifactSha256 = sha256(artifactBytes)
-  const evidenceSummary = `Bound pull request #${pullRequest.number} and managed summary (${outcome})`
+  const evidenceSummary = `Pull request #${pullRequest.number} merged after publishing the complete pipeline report (${outcome})`
   const evidenceDigest = evidenceSha256({
     artifactSha256,
     baseCommitOid: input.candidateCommitOid,
@@ -378,11 +344,7 @@ export async function bindPullRequest(input: {
     workerIdentity: input.workerIdentity
   })
   const settlement = input.ledger.settleRemoteStage({
-    checkpoint: {
-      inputCommitOid: input.candidateCommitOid,
-      outputCommitOid: input.candidateCommitOid,
-      roundIndex
-    },
+    checkpoint: { inputCommitOid: input.candidateCommitOid, outputCommitOid: input.candidateCommitOid, roundIndex },
     evidence: {
       artifactPath: input.artifactPath,
       artifactSha256,
@@ -403,28 +365,21 @@ export async function bindPullRequest(input: {
       candidateCommitOid: input.candidateCommitOid,
       kind: 'pull-request-binding',
       payload: {
-        managedCommentIntent,
-        mutationIntent: pullRequestIntent,
+        bodySha256: sha256(content.body),
+        mutationIntent,
         number: pullRequest.number,
         outcome,
         pipelineEvidenceRoot: input.pipelineEvidenceRoot,
         postRead,
-        routeFingerprint: route.route_fingerprint
+        routeFingerprint: route.route_fingerprint,
+        state: 'merged',
+        titleSha256: sha256(content.title)
       }
     },
     runId: input.runId,
     stageId: 'pr'
   })
-  if (comment && unresolvedCreate) {
-    input.ledger.resolveMutationIntent({
-      attemptId: unresolvedCreate.attemptId,
-      intentSha256: unresolvedCreate.intentSha256,
-      reason: 'reconciled',
-      runId: input.runId
-    })
-  }
   return {
-    commentNodeId: comment.id,
     number: pullRequest.number,
     outcome,
     receiptSha256: settlement.receiptSha256,

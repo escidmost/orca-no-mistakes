@@ -9,19 +9,10 @@ import {
   deriveFallbackGateIdentity,
   repositoryGatePaths
 } from '../scripts/admission.ts'
-import {
-  GithubAuthorityError,
-  type GithubIssueCommentObservation,
-  type GithubPullRequestObservation
-} from '../scripts/github.ts'
+import type { GithubPullRequestObservation } from '../scripts/github.ts'
 import { PIPELINE_STEPS } from '../scripts/config.ts'
 import { DomainLedger, evidenceSha256, sha256 } from '../scripts/ledger.ts'
 import { main } from '../scripts/orca-no-mistakes.ts'
-import {
-  bindPullRequest,
-  PullRequestBindingError
-} from '../scripts/pull-request.ts'
-
 const OID = 'a'.repeat(40)
 const BASE = 'b'.repeat(40)
 const REPO_ROOT = '/repo'
@@ -272,154 +263,6 @@ const scrubLaunchEnvironment = (): (() => void) => {
     }
   }
 }
-
-test('clock rollback does not hide unresolved managed-comment create intents across resumes', async () => {
-  const home = await mkdtemp(path.join(tmpdir(), 'onm-clock-rollback-comment-'))
-  const intent = 'ONM-80: reconcile comment create intent after clock rollback'
-  const { ledger } = await setupLedgerWithSettledPush(home, 'run-clock-rollback', intent)
-
-  try {
-    const existingPr = pullRequestFixture()
-    let initialComment: GithubIssueCommentObservation = {
-      author: { id: 'A_node', login: 'bot' },
-      body: '<!-- orca-no-mistakes:managed-summary:v1 -->\ninitial summary',
-      createdAt: '2026-09-01T12:00:05.000Z',
-      id: 'comment-initial-c1',
-      updatedAt: '2026-09-01T12:00:05.000Z',
-      url: 'https://example.test/comment/c1'
-    }
-
-    // Step 1: Initial PR binding settles at 12:00 with comment C1
-    const gen1 = startNextAttempt(ledger, 'run-clock-rollback', 'att-pr-initial', '2026-09-01T12:00:00.000Z')
-    const initialAuthority = {
-      createIssueComment: async () => assert.fail('unexpected create'),
-      createPullRequest: async () => assert.fail('unexpected create PR'),
-      observeIssueComments: async () => [initialComment],
-      observePullRequests: async () => ({ exact: existingPr, nearMatches: [] }),
-      updateIssueComment: async (input: { body: string }) => {
-        initialComment = { ...initialComment, body: input.body }
-      }
-    }
-
-    const initResult = await bindPullRequest({
-      artifactPath: path.join(home, 'pr-init.json'),
-      attemptId: 'att-pr-initial',
-      authority: initialAuthority,
-      candidateCommitOid: OID,
-      generationToken: gen1,
-      intent,
-      ledger,
-      pipelineEvidenceRoot: 'c'.repeat(64),
-      runId: 'run-clock-rollback',
-      stageSummaries: ['summary'],
-      workerIdentity: 'coordinator'
-    })
-
-    assert.equal(initResult.commentNodeId, 'comment-initial-c1')
-    assert.ok(ledger.remoteReceipt('run-clock-rollback', 'pull-request-binding'))
-    assert.equal(ledger.unresolvedManagedCommentCreateIntent('run-clock-rollback'), undefined)
-
-    // Step 2: Comment C1 is deleted remotely.
-    // Wall clock rolls back to 11:00:00 (earlier than the 12:00 receipt from Step 1).
-    // Attempt 2 runs at 11:00 and attempts to recreate comment C2, but hits mutation-indeterminate.
-    let createCommentCalls = 0
-    let createdCommentBody = ''
-    let c2ExposedComments: GithubIssueCommentObservation[] = []
-
-    const attempt2Authority = {
-      createIssueComment: async (input: { body: string; subjectId: string }) => {
-        createCommentCalls += 1
-        createdCommentBody = input.body
-        throw new GithubAuthorityError('mutation-indeterminate', 'create-issue-comment', 'socket reset')
-      },
-      createPullRequest: async () => assert.fail('unexpected createPullRequest'),
-      observeIssueComments: async () => c2ExposedComments,
-      observePullRequests: async () => ({ exact: existingPr, nearMatches: [] }),
-      updateIssueComment: async () => {}
-    }
-
-    const gen2 = startNextAttempt(ledger, 'run-clock-rollback', 'att-pr-create-c2', '2026-09-01T11:00:00.000Z')
-    await assert.rejects(
-      bindPullRequest({
-        artifactPath: path.join(home, 'pr-att2.json'),
-        attemptId: 'att-pr-create-c2',
-        authority: attempt2Authority,
-        candidateCommitOid: OID,
-        generationToken: gen2,
-        intent,
-        ledger,
-        pipelineEvidenceRoot: 'c'.repeat(64),
-        runId: 'run-clock-rollback',
-        stageSummaries: ['summary'],
-        workerIdentity: 'coordinator'
-      }),
-      (err: unknown) => err instanceof PullRequestBindingError && /managed summary mutation was not proven/.test(err.message)
-    )
-
-    assert.equal(createCommentCalls, 1)
-
-    // Step 3: Verify unresolved create intent C2 is detected despite clock rollback (created_at 11:00 < receipt 12:00)
-    const pendingIntent = ledger.unresolvedManagedCommentCreateIntent('run-clock-rollback')
-    assert.ok(pendingIntent, 'unresolved create intent must not be hidden by wall-clock rollback')
-    assert.equal(pendingIntent.payload.managedCommentNodeId, null)
-
-    // Fast resume while comment C2 is still absent must fail closed without issuing a second create
-    const gen3 = startNextAttempt(ledger, 'run-clock-rollback', 'att-pr-fast-resume', '2026-09-01T11:05:00.000Z')
-    await assert.rejects(
-      bindPullRequest({
-        artifactPath: path.join(home, 'pr-att3.json'),
-        attemptId: 'att-pr-fast-resume',
-        authority: attempt2Authority,
-        candidateCommitOid: OID,
-        generationToken: gen3,
-        intent,
-        ledger,
-        pipelineEvidenceRoot: 'c'.repeat(64),
-        runId: 'run-clock-rollback',
-        stageSummaries: ['summary'],
-        workerIdentity: 'coordinator'
-      }),
-      (err: unknown) =>
-        err instanceof PullRequestBindingError &&
-        /unresolved managed comment create intent .* requires manual resolution/.test(err.message)
-    )
-
-    assert.equal(createCommentCalls, 1, 'must not issue a duplicate create')
-
-    // Step 4: Resume once comment C2 is observed reconciles and clears unresolved intent
-    const gen4 = startNextAttempt(ledger, 'run-clock-rollback', 'att-pr-reconcile', '2026-09-01T11:10:00.000Z')
-    c2ExposedComments = [{
-      author: { id: 'A_node', login: 'bot' },
-      body: createdCommentBody,
-      createdAt: '2026-09-01T11:00:05.000Z',
-      id: 'comment-c2-reconciled',
-      updatedAt: '2026-09-01T11:00:05.000Z',
-      url: 'https://example.test/comment/c2'
-    }]
-
-    const result = await bindPullRequest({
-      artifactPath: path.join(home, 'pr-att4.json'),
-      attemptId: 'att-pr-reconcile',
-      authority: attempt2Authority,
-      candidateCommitOid: OID,
-      generationToken: gen4,
-      intent,
-      ledger,
-      pipelineEvidenceRoot: 'c'.repeat(64),
-      roundIndex: 1,
-      runId: 'run-clock-rollback',
-      stageSummaries: ['summary'],
-      workerIdentity: 'coordinator'
-    })
-
-    assert.equal(createCommentCalls, 1)
-    assert.equal(result.commentNodeId, 'comment-c2-reconciled')
-    assert.equal(ledger.unresolvedManagedCommentCreateIntent('run-clock-rollback'), undefined)
-  } finally {
-    ledger.close()
-    await rm(home, { force: true, recursive: true })
-  }
-})
 
 test('new direct Release 2 run without init fails after admission before creating Orca or domain run', async () => {
   const restore = scrubLaunchEnvironment()
