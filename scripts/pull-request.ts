@@ -91,6 +91,16 @@ function capText(content: string, budget: number): string {
   return capped + marker
 }
 
+export function capTitle(content: string, budget = 256): string {
+  const singleLine = redactKnownSecrets(content)
+    .replaceAll(/[\r\n]+/gu, ' ')
+    .trim()
+  if (Buffer.byteLength(singleLine) <= budget) return singleLine
+  let capped = Buffer.from(singleLine).subarray(0, budget).toString('utf8').replace(/\uFFFD$/u, '')
+  while (Buffer.byteLength(capped) > budget) capped = capped.slice(0, -1)
+  return capped
+}
+
 function htmlEscape(content: string): string {
   return redactKnownSecrets(content)
     .replaceAll('&', '&amp;')
@@ -189,7 +199,7 @@ export function pullRequestContent(intent: string, report: PullRequestReport): {
   }
   return {
     body,
-    title: capText(report.title?.trim() || fallbackTitle, 256)
+    title: capTitle(report.title?.trim() || fallbackTitle, 256)
   }
 }
 

@@ -2558,6 +2558,17 @@ export async function runPipeline(
               evidence.candidate_commit_oid ===
                 resumeCheckpoint.output_commit_oid);
         if (!complete || !commitStillValid) break;
+        if (stage === "pr") {
+          const prReceipt = ledger.remoteReceipt(runId, "pull-request-binding");
+          const payload = prReceipt
+            ? (JSON.parse(prReceipt.receipt_json) as Record<string, unknown>)
+            : undefined;
+          const isMergedBodyReceipt =
+            payload !== undefined &&
+            Object.hasOwn(payload, "bodySha256") &&
+            payload.state === "merged";
+          if (!isMergedBodyReceipt) break;
+        }
         resumeStageIndex += 1;
       }
       for (const stage of pipelineSteps.slice(0, resumeStageIndex)) {
@@ -3525,15 +3536,9 @@ export async function runPipeline(
             resolvedAgent: nextFixer.resolvedAgent,
           };
         }
-        ledger.recordCheckpoint({
-          inputCommitOid: nextFixer.before,
-          outputCommitOid: nextFixer.after,
-          roundIndex: round,
-          runId,
-          stageId: stage,
-        });
+        const eventKey = `attempt:${presentation.current.attempt}:stage:${stage}:round:${round}:fixer:completed:${nextFixer.after}`;
         presentation.publish(
-          `attempt:${presentation.current.attempt}:stage:${stage}:round:${round}:fixer:completed:${nextFixer.after}`,
+          eventKey,
           {
             approvedFindings: actionable.length - targetFindings.length,
             findingIds: targetFindings.map((finding) => finding.id),
@@ -3541,6 +3546,17 @@ export async function runPipeline(
             round,
             stage,
           },
+          (snapshot) =>
+            ledger.recordCheckpoint(
+              {
+                inputCommitOid: nextFixer.before,
+                outputCommitOid: nextFixer.after,
+                roundIndex: round,
+                runId,
+                stageId: stage,
+              },
+              { eventKey, snapshot },
+            ),
         );
         report = await runStage();
       }
