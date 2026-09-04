@@ -24,9 +24,15 @@ export type PresentationFinding = {
 export type PresentationTransition =
   | { kind: "run-started" }
   | { attempt: number; kind: "attempt-started" }
-  | { enabled: boolean; kind: "mode-changed" }
+  | { enabled: boolean; kind: "mode-changed"; source?: "initial" | "operator" }
   | { kind: "stage-started"; stage: StageName }
-  | { kind: "round-started"; round: number; stage: StageName }
+  | {
+      kind: "round-started";
+      role?: "fixer" | "reviewer";
+      round: number;
+      stage: StageName;
+      targetFindingIds?: readonly string[];
+    }
   | {
       actionable: number;
       findings?: readonly Omit<PresentationFinding, "disposition">[];
@@ -50,6 +56,7 @@ export type PresentationTransition =
       kind: "gate-resolved";
       round: number;
       stage: StageName;
+      targetFindingIds?: readonly string[];
     }
   | { kind: "stage-completed"; round: number; stage: StageName }
   | { kind: "error-recorded"; resumable: boolean }
@@ -86,9 +93,11 @@ export type PresentationSnapshot = {
     fixedFindings?: number;
     id: StageName;
     openFindings?: number;
+    phase?: "fixer" | "reviewer";
     retainedFixer?: boolean;
     round: number;
     status: "pending" | "active" | "blocked" | "passed" | "failed" | "cancelled";
+    targetFindingIds?: readonly string[];
     totalFindings: number;
   }[];
   status: PresentationStatus;
@@ -201,8 +210,11 @@ function nextSnapshot(
         gate: undefined,
         stages: next.stages.map((stage) => ({
           ...stage,
+          phase: stage.status === "passed" ? stage.phase : undefined,
           round: stage.status === "passed" ? stage.round : 0,
           status: stage.status === "passed" ? "passed" : "pending",
+          targetFindingIds:
+            stage.status === "passed" ? stage.targetFindingIds : undefined,
         })),
         status: "in-progress",
       };
@@ -224,8 +236,14 @@ function nextSnapshot(
         ...next,
         currentStage: transition.stage,
         stages: updateStage(next, transition.stage, {
+          phase: transition.role,
           round: transition.round,
           status: "active",
+          ...(transition.targetFindingIds !== undefined
+            ? { targetFindingIds: transition.targetFindingIds }
+            : transition.role !== "fixer"
+              ? { targetFindingIds: undefined }
+              : {}),
         }),
       };
       break;
@@ -255,6 +273,7 @@ function nextSnapshot(
                 retainedFixer: transition.retainedFixer,
                 round: transition.round,
                 status: (open ?? transition.actionable) > 0 ? "blocked" : "active",
+                targetFindingIds: undefined,
                 totalFindings: findings?.length ?? transition.total,
               }
             : { ...item, retainedFixer: false },
@@ -275,7 +294,12 @@ function nextSnapshot(
         },
         stages: next.stages.map((item) =>
           item.id === transition.stage
-            ? { ...item, retainedFixer: false, status: "blocked" as const }
+            ? {
+                ...item,
+                retainedFixer: false,
+                status: "blocked" as const,
+                targetFindingIds: undefined,
+              }
             : { ...item, retainedFixer: false },
         ),
       };
@@ -309,6 +333,9 @@ function nextSnapshot(
           openFindings: approved?.filter(
             (finding) => finding.disposition === "open",
           ).length,
+          ...(transition.targetFindingIds !== undefined
+            ? { targetFindingIds: transition.targetFindingIds }
+            : {}),
         }),
       };
       }
@@ -321,6 +348,7 @@ function nextSnapshot(
         stages: updateStage(next, transition.stage, {
           round: transition.round,
           status: "passed",
+          targetFindingIds: undefined,
         }),
       };
       break;

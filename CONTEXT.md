@@ -145,7 +145,7 @@ A non-interactive, line-oriented view of meaningful transitions in one pipeline 
 _Avoid_: Raw subprocess stream, static final report, screen-reader-only mode
 
 **Auto-fix mode**:
-A durable run-level mode that may be changed while a run is active and automatically starts fix rounds for future findings classified as eligible for automatic repair. Resumed attempts inherit the run's latest setting. It never waives required policy or answers decision gates that require human judgment.
+A durable run-level mode that automatically starts fix rounds for findings eligible for automatic repair, distinct from the Run TUI's local gate auto-responder; see [Findings and gates](docs/current-architecture.md#findings-and-gates). Resumed attempts inherit the run's latest durable setting. It never waives required policy or answers decision gates that require human judgment.
 _Avoid_: YOLO mode, unattended approval, policy bypass
 
 **Run cancellation**:

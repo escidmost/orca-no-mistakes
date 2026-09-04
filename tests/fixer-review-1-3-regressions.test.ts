@@ -519,6 +519,9 @@ test("synchronous setAutoFix failures keep the TUI alive", async () => {
       failures.push(enabled);
       throw new Error("ledger exploded");
     },
+    undefined,
+    undefined,
+    true,
   );
 
   try {

@@ -3408,6 +3408,109 @@ console.log(JSON.stringify({ result }))
   }
 });
 
+test("runPipeline notifies Orca when stopped on a resumable error awaiting resume", async () => {
+  const git = new FakeGit();
+  class CrashingReviewerOrca extends FakeOrca {
+    notified: { outcome: string; summary: string }[] = [];
+    attempts = 0;
+    async notifyRunResult(
+      outcome: "passed" | "failed" | "cancelled" | "stopped",
+      summary: string,
+    ): Promise<void> {
+      this.notified.push({ outcome, summary });
+    }
+    override async startWorker(
+      taskId: string,
+      launch: WorkerLaunch,
+    ): Promise<WorkerResult> {
+      const worker = await super.startWorker(taskId, launch);
+      if (launch.role === "reviewer") {
+        this.attempts += 1;
+        if (this.attempts === 1) {
+          worker.failedOutcome = true;
+        }
+      }
+      return worker;
+    }
+    #resolveResumeGate?: (resolution: string) => void;
+    override async createGate(
+      taskId: string,
+      question: string,
+      options: string[] = [],
+    ): Promise<string> {
+      if (options.includes("resume")) return "gate-resume";
+      return await super.createGate(taskId, question, options);
+    }
+    override async waitForGate(gateId: string): Promise<string> {
+      if (gateId === "gate-resume") {
+        return await new Promise((resolve) => {
+          this.#resolveResumeGate = resolve;
+        });
+      }
+      return await super.waitForGate(gateId);
+    }
+    override async resolveGate(
+      gateId: string,
+      resolution: string,
+    ): Promise<void> {
+      if (gateId === "gate-resume") {
+        this.#resolveResumeGate?.(resolution);
+        return;
+      }
+      await super.resolveGate(gateId, resolution);
+    }
+  }
+  const orca = new CrashingReviewerOrca(git);
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          id: "crash-finding",
+          severity: "error",
+          action: "auto-fix",
+          description: "Crash",
+        },
+      ],
+      summary: "one finding",
+    },
+    pass("clean review"),
+  ]);
+
+  let resumeTriggered = false;
+  await runPipeline(
+    {
+      intent: "Notify on stop",
+      rendererFactory: (
+        _artifactsDir,
+        _stageLogs,
+        _resolveGate,
+        _setAutoFix,
+        requestResume,
+        onResumeAvailable,
+      ) => {
+        onResumeAvailable?.();
+        setTimeout(() => {
+          if (!resumeTriggered) {
+            resumeTriggered = true;
+            requestResume?.();
+          }
+        }, 50);
+        return {
+          close() {},
+          render() {},
+        };
+      },
+    },
+    orca,
+    git,
+  );
+
+  assert.equal(resumeTriggered, true);
+  assert.ok(orca.notified.length > 0);
+  assert.equal(orca.notified[0].outcome, "stopped");
+  assert.match(orca.notified[0].summary, /No-mistakes stopped:/);
+});
+
 test("CliOrca inline canonical gate resolver uses gate-resolve", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "orca-inline-gate-resolve-"));
   const fakeOrca = path.join(temp, "orca");
@@ -12808,4 +12911,34 @@ test("Test prompts keep checker read-only and authorize fixer repairs", async ()
     /add the smallest focused regression test file or repair product code/i,
   );
   assert.match(fixer, /Do NOT modify or delete pre-existing test files/);
+});
+
+test("review worker accepts findings with severity 'no-op', body, and location aliases without error", async () => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  orca.reports.set("review", [
+    {
+      findings: [
+        {
+          body: "The assertion was relaxed intentionally.",
+          location: {
+            line: 91,
+            path: "tests/tui-fixer-review-1-2-regressions.test.ts",
+          },
+          severity: "no-op",
+          title: "Cancellation retention assertion is less specific after the rail redesign",
+        } as unknown as Finding,
+      ],
+      summary: "one non-blocking validation-policy note",
+    },
+  ]);
+
+  await runPipeline(
+    { intent: "Accept non-blocking no-op review finding with aliases." },
+    orca,
+    git,
+  );
+
+  const passed = orca.tasks.some((t) => t.spec.includes("review"));
+  assert.ok(passed);
 });

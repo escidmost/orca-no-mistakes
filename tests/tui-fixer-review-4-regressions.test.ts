@@ -99,6 +99,7 @@ test("log reads stay bound when artifact ancestors are replaced", async () => {
   );
   try {
     renderer.render(snapshot(1));
+    input.emit("data", "\r");
     await new Promise((resolve) => setImmediate(resolve));
     assert.match(output.writes.at(-1) ?? "", /trusted log/u);
 

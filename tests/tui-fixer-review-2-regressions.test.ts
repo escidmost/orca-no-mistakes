@@ -69,7 +69,10 @@ class FakeOutput extends EventEmitter {
 }
 
 function screen(output: FakeOutput): string {
-  return output.writes.at(-1) ?? "";
+  return (output.writes.at(-1) ?? "").replaceAll(
+    new RegExp("\\x1b\\[[0-?]*[ -/]*[@-~]", "gu"),
+    "",
+  );
 }
 
 async function renderOnce(
@@ -81,6 +84,7 @@ async function renderOnce(
   const renderer = new RailTuiRenderer(input, output, artifactsDir, stageLogs);
   try {
     renderer.render(snapshot(0));
+    input.emit("data", "\r");
     await new Promise((resolve) => setImmediate(resolve));
     return screen(output);
   } finally {
@@ -120,11 +124,11 @@ test("split escape sequences remain single navigation keys", async () => {
       input.emit("data", "\u001b");
       input.emit("data", "[A");
       await new Promise((resolve) => setImmediate(resolve));
-      assert.match(screen(output), /> Review round 2/u);
+      assert.match(screen(output), /> Review round 3/u);
       input.emit("data", "\u001b");
       input.emit("data", "[Z");
       await new Promise((resolve) => setImmediate(resolve));
-      assert.match(screen(output), /> RAIL/u);
+      assert.match(screen(output), /> STAGES/u);
     } finally {
       renderer.close();
       rmSync(artifactsDir, { force: true, recursive: true });

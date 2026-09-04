@@ -47,7 +47,7 @@ function stageSnapshot(sequence: number): PresentationSnapshot {
   return {
     attempt: 1,
     currentStage: "review",
-    mode: { autoFix: true },
+    mode: { autoFix: false },
     runId: "run-tui-fixer-review-1",
     sequence,
     stages: PIPELINE_STEPS.map((id) => ({

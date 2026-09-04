@@ -36,21 +36,87 @@ type Output = {
   write(chunk: string): unknown;
 };
 
-type Region = "activity" | "logs" | "rail";
+export type TerminalInput = Input;
+export type TerminalOutput = Output;
+
+
+type Region = "activity" | "detail" | "logs" | "rail";
 
 type GateReturnState = {
   activityIndex: number;
+  detailOffset: number;
   focus: Region;
   logOffset: number;
   pinnedStage?: StageName;
   selectedStage: number;
 };
 
-const REGIONS: readonly Region[] = ["rail", "activity", "logs"];
-const MIN_COLUMNS = 72;
+type Seg = string | readonly [text: string, sgr: string];
+type Row = { bar?: string; right?: Seg[]; segs?: Seg[] };
+
+const REGIONS: readonly Region[] = ["rail", "activity", "detail"];
+const MIN_COLUMNS = 40;
 const MIN_ROWS = 18;
-const FULL_COLUMNS = 100;
-const FULL_ROWS = 24;
+const WIDE_COLUMNS = 90;
+const LEFT_WIDTH = 44;
+const SGR = {
+  accent: "36",
+  amber: "33",
+  bold: "1",
+  dim: "2",
+  green: "32",
+  red: "31",
+  reverse: "7",
+} as const;
+const GLYPHS = {
+  ascii: {
+    active: "[>]",
+    approved: "[approved]",
+    arrows: "Up/Down",
+    bar: " | ",
+    blocked: "[?]",
+    cancelled: "[-]",
+    failed: "[!]",
+    fixed: "[fixed]",
+    fixing: "[F]",
+    narrowArrows: "^v",
+    open: "[open]",
+    passed: "[x]",
+    pending: "[ ]",
+    sep: ", ",
+  },
+  unicode: {
+    active: "\u25cf",
+    approved: "~",
+    arrows: "\u2191\u2193",
+    bar: " \u2502 ",
+    blocked: "?",
+    cancelled: "\u2298",
+    failed: "\u2717",
+    fixed: "\u2713",
+    fixing: "F",
+    narrowArrows: "\u2191\u2193",
+    open: "\u25cb",
+    passed: "\u2713",
+    pending: "\u00b7",
+    sep: " \u00b7 ",
+  },
+} as const;
+
+function elapsed(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1_000));
+  const seconds = String(total % 60).padStart(2, "0");
+  const minutes = Math.floor(total / 60) % 60;
+  const hours = Math.floor(total / 3_600);
+  return hours
+    ? `${hours}:${String(minutes).padStart(2, "0")}:${seconds}`
+    : `${minutes}:${seconds}`;
+}
+
+function clock(now: number): string {
+  const date = new Date(now);
+  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+}
 
 function title(stage: StageName): string {
   return `${stage[0].toUpperCase()}${stage.slice(1)}`;
@@ -70,15 +136,6 @@ function safeText(text: string, maxLength = Number.POSITIVE_INFINITY): string {
   return redactKnownSecrets(
     printableText(stripVTControlCharacters(redactKnownSecrets(text))),
   ).slice(0, maxLength);
-}
-
-function fit(text: string, width: number): string {
-  if (width <= 0) return "";
-  const value = safeText(text, width + 1);
-  if (value.length > width) {
-    return width === 1 ? value.slice(0, 1) : `${value.slice(0, width - 1)}~`;
-  }
-  return value.padEnd(width);
 }
 
 function logTail(
@@ -111,35 +168,6 @@ function logTail(
   }
 }
 
-function activity(transition: PresentationTransition): string {
-  switch (transition.kind) {
-    case "run-started":
-      return "Run started";
-    case "attempt-started":
-      return `Attempt ${transition.attempt} started`;
-    case "mode-changed":
-      return `Auto-fix ${transition.enabled ? "on" : "off"}`;
-    case "stage-started":
-      return `${title(transition.stage)} started`;
-    case "round-started":
-      return `${title(transition.stage)} round ${transition.round}`;
-    case "findings-recorded":
-      return `${title(transition.stage)} findings ${transition.actionable}/${transition.total}`;
-    case "gate-opened":
-      return `${title(transition.stage)} gate opened`;
-    case "gate-resolved":
-      return `${title(transition.stage)} gate resolved`;
-    case "stage-completed":
-      return `${title(transition.stage)} completed`;
-    case "error-recorded":
-      return `Run error${transition.resumable ? " (resumable)" : ""}`;
-    case "cancellation-recorded":
-      return `Cancellation: ${transition.action}`;
-    case "run-completed":
-      return `Run ${transition.status}`;
-  }
-}
-
 function gateConsequence(option: string, stage?: StageName): string {
   switch (option) {
     case "approve":
@@ -153,11 +181,11 @@ function gateConsequence(option: string, stage?: StageName): string {
     case "stop":
       return "Stop and cancel this run.";
     default:
-      return "Resolve the canonical gate with this choice.";
+      return "Resolve the gate with this choice.";
   }
 }
 
-function wrap(text: string, width: number): string[] {
+export function wrap(text: string, width: number): string[] {
   if (width <= 0) return [];
   const lines: string[] = [];
   let rest = redactKnownSecrets(
@@ -165,7 +193,15 @@ function wrap(text: string, width: number): string[] {
   ).trim();
   while (rest.length > width) {
     const space = rest.lastIndexOf(" ", width);
-    const end = space > 0 ? space : width;
+    const hyphen = rest.lastIndexOf("-", width - 1);
+    let end: number;
+    if (space > 0 && space >= hyphen) {
+      end = space;
+    } else if (hyphen > 0) {
+      end = hyphen + 1;
+    } else {
+      end = width;
+    }
     lines.push(rest.slice(0, end));
     rest = rest.slice(end).trimStart();
   }
@@ -195,7 +231,7 @@ export function supportsRailTui(
 }
 
 export class RailTuiRenderer implements PresentationRenderer {
-  readonly #activities: { label: string; stage?: StageName }[] = [];
+  readonly #activities: { at: string; label: string; stage?: StageName }[] = [];
   readonly #artifactsDir: string;
   readonly #input: Input;
   readonly #inputWasPaused: boolean;
@@ -210,7 +246,19 @@ export class RailTuiRenderer implements PresentationRenderer {
   readonly #resolveGate?: GateResolver;
   readonly #setAutoFix?: (enabled: boolean) => Promise<void> | void;
   readonly #stageLogs: ReadonlyMap<string, StageLog>;
+  readonly #color = process.env.NO_COLOR === undefined && process.env.TERM !== "dumb";
+  readonly #glyph = /utf-?8/iu.test(
+    process.env.LC_ALL || process.env.LC_CTYPE || process.env.LANG || "",
+  )
+    ? GLYPHS.unicode
+    : GLYPHS.ascii;
+  readonly #stageTimes = new Map<StageName, { end?: number; start: number }>();
+  readonly #startedAt = Date.now();
+  readonly #autoFixedStages = new Set<string>();
+  readonly #autoResolvedGateIds = new Set<string>();
   #activityIndex = 0;
+  #autoFix = false;
+  #bell = "";
   #cancelVisible = false;
   #closed = false;
   #escapeTimer?: ReturnType<typeof setTimeout>;
@@ -219,9 +267,11 @@ export class RailTuiRenderer implements PresentationRenderer {
   #gateChoice = 0;
   #gateConfirm = false;
   #gateMessage?: string;
+  #gateOpenedAt = 0;
   #gateReturn?: GateReturnState;
   #gateSubmitting = false;
   #gateVisible = false;
+  #detailOffset = 0;
   #inputBuffer = "";
   #lastFrame?: string;
   #logOffset = 0;
@@ -280,7 +330,9 @@ export class RailTuiRenderer implements PresentationRenderer {
     setAutoFix?: (enabled: boolean) => Promise<void> | void,
     requestResume?: () => void,
     onFailure?: (error: unknown, snapshot?: PresentationSnapshot) => void,
+    initialAutoFix = false,
   ) {
+    this.#autoFix = initialAutoFix;
     this.#input = input;
     this.#output = output;
     this.#artifactsDir = path.resolve(artifactsDir);
@@ -300,7 +352,7 @@ export class RailTuiRenderer implements PresentationRenderer {
       process.on("SIGCONT", this.#onContinue);
       process.on("SIGTSTP", this.#onSuspend);
       this.#enterTerminal();
-      this.#refreshTimer = setInterval(this.#onResize, 1_000);
+      this.#refreshTimer = setInterval(this.#onResize, 200);
       this.#refreshTimer.unref();
     } catch (error) {
       this.close();
@@ -335,23 +387,50 @@ export class RailTuiRenderer implements PresentationRenderer {
         (snapshot.gate?.state !== "open" ||
           snapshot.gate.id !== this.#snapshot?.gate?.id);
       this.#snapshot = snapshot;
+      const now = Date.now();
+      for (const stage of snapshot.stages) {
+        const time = this.#stageTimes.get(stage.id);
+        if (stage.status === "active" || stage.status === "blocked") {
+          if (!time || time.end !== undefined) {
+            this.#stageTimes.set(stage.id, { start: now });
+          }
+        } else if (stage.status !== "pending" && time && time.end === undefined) {
+          time.end = now;
+        }
+      }
       if (snapshot.error) this.#cancelVisible = false;
       if (snapshot.transition.kind === "attempt-started") {
         this.#resumeVisible = false;
         this.#returnToRail();
-      } else if (snapshot.transition.kind === "error-recorded") {
+        this.#autoFixedStages.clear();
+        this.#autoResolvedGateIds.clear();
+      } else if (snapshot.transition.kind === "stage-completed") {
+        this.#autoFixedStages.delete(snapshot.transition.stage);
+      } else if (
+        snapshot.transition.kind === "mode-changed" &&
+        snapshot.transition.source !== "initial"
+      ) {
+        this.#autoFix = snapshot.mode.autoFix;
+      }
+      if (snapshot.transition.kind === "error-recorded") {
         this.#resumeVisible = Boolean(snapshot.error?.resumable);
       }
-      if (opensGate) this.#showGate();
-      this.#activities.push({
-        label: safeText(activity(snapshot.transition), 240),
-        stage: transitionStage(snapshot.transition),
-      });
-      if (this.#activities.length > 50) this.#activities.shift();
-      this.#activityIndex = this.#activities.length - 1;
+      if (opensGate) {
+        this.#gateOpenedAt = now;
+        this.#bell = "\u0007";
+        this.#showGate();
+        this.#maybeAutoRespondGate();
+      } else if (snapshot.gate?.state === "open") {
+        this.#maybeAutoRespondGate();
+      }
+      this.#logActivity(snapshot.transition, now, snapshot);
       if (settlesGate) this.#leaveGate();
       if (!opensGate && !settlesGate && !this.#pinnedStage && snapshot.currentStage) {
-        this.#selectedStage = this.#stageIds().indexOf(snapshot.currentStage);
+        const next = this.#stageIds().indexOf(snapshot.currentStage);
+        if (next !== -1 && next !== this.#selectedStage) {
+          this.#selectedStage = next;
+          this.#detailOffset = 0;
+        }
       }
       this.#scheduleDraw();
     } catch (error) {
@@ -426,6 +505,7 @@ export class RailTuiRenderer implements PresentationRenderer {
     if (gate?.state !== "open" || !gate.options?.length || this.#gateVisible) return;
     this.#gateReturn = {
       activityIndex: this.#activityIndex,
+      detailOffset: this.#detailOffset,
       focus: this.#focus,
       logOffset: this.#logOffset,
       pinnedStage: this.#pinnedStage,
@@ -441,6 +521,7 @@ export class RailTuiRenderer implements PresentationRenderer {
   #leaveGate(): void {
     if (this.#gateReturn) {
       this.#activityIndex = this.#gateReturn.activityIndex;
+      this.#detailOffset = this.#gateReturn.detailOffset;
       this.#focus = this.#gateReturn.focus;
       this.#logOffset = this.#gateReturn.logOffset;
       this.#pinnedStage = this.#gateReturn.pinnedStage;
@@ -451,6 +532,288 @@ export class RailTuiRenderer implements PresentationRenderer {
     this.#gateConfirm = false;
     this.#gateMessage = undefined;
     this.#gateSubmitting = false;
+  }
+
+  #logActivity(
+    transition: PresentationTransition,
+    now: number,
+    snapshot: PresentationSnapshot,
+  ): void {
+    const stage = transitionStage(transition);
+    const last = this.#activities.at(-1);
+
+    switch (transition.kind) {
+      case "run-started":
+        return;
+
+      case "attempt-started":
+        this.#activities.push({
+          at: clock(now),
+          label: `Run ${transition.attempt} started`,
+        });
+        break;
+
+      case "mode-changed":
+        if (this.#activities.length > 1) {
+          this.#activities.push({
+            at: clock(now),
+            label: `Auto-fix ${transition.enabled ? "on" : "off"}`,
+          });
+        }
+        break;
+
+      case "stage-started":
+        if (transition.stage === "intent" || transition.stage === "rebase") {
+          this.#activities.push({
+            at: clock(now),
+            label: `${title(transition.stage)} started`,
+            stage,
+          });
+        }
+        break;
+
+      case "round-started": {
+        if (transition.stage === "intent" || transition.stage === "rebase") return;
+        const stageName = title(transition.stage);
+        const roundNum = transition.round + 1;
+
+        if (transition.role === "fixer") {
+          const fixPrefix = `${stageName} fix ${transition.round}`;
+          if (!this.#activities.some((a) => a.stage === stage && a.label.startsWith(fixPrefix))) {
+            this.#activities.push({
+              at: clock(now),
+              label: fixPrefix,
+              stage,
+            });
+          }
+          break;
+        }
+
+        if (roundNum > 1) {
+          const priorRoundPrefix = `${stageName} round ${roundNum - 1}`;
+          const priorFixPrefix = `${stageName} fix ${roundNum - 1}`;
+          const priorRoundHadFindings = this.#activities.some(
+            (a) => a.stage === stage && a.label.startsWith(priorRoundPrefix) && a.label.includes("found"),
+          );
+          const hasFix = this.#activities.some(
+            (a) => a.stage === stage && a.label.startsWith(priorFixPrefix),
+          );
+          if (priorRoundHadFindings && !hasFix) {
+            this.#activities.push({
+              at: clock(now),
+              label: priorFixPrefix,
+              stage,
+            });
+          }
+        }
+        this.#activities.push({
+          at: clock(now),
+          label: `${stageName} round ${roundNum}`,
+          stage,
+        });
+        break;
+      }
+
+      case "findings-recorded": {
+        if (transition.stage === "intent" || transition.stage === "rebase") return;
+        const stageName = title(transition.stage);
+        const roundNum = transition.round + 1;
+        const roundPrefix = `${stageName} round ${roundNum}`;
+        const actionableCount = transition.actionable ?? transition.total;
+        const countText =
+          actionableCount > 0
+            ? `${actionableCount} found`
+            : "clean";
+
+        const stageState = snapshot.stages.find((s) => s.id === transition.stage);
+        if (stageState?.fixedFindings) {
+          for (let i = this.#activities.length - 1; i >= 0; i--) {
+            const entry = this.#activities[i];
+            if (
+              entry.stage === transition.stage &&
+              entry.label.includes("fix") &&
+              !entry.label.includes("fixed")
+            ) {
+              entry.label = `${entry.label} · ${stageState.fixedFindings} fixed`;
+              break;
+            }
+          }
+        }
+
+        if (
+          last &&
+          last.stage === transition.stage &&
+          last.label === roundPrefix
+        ) {
+          last.label = `${roundPrefix} · ${countText}`;
+        } else if (actionableCount > 0) {
+          this.#activities.push({
+            at: clock(now),
+            label: `${roundPrefix} · ${countText}`,
+            stage,
+          });
+        }
+        break;
+      }
+
+      case "gate-opened":
+        if (!this.#autoFix) {
+          this.#activities.push({
+            at: clock(now),
+            label: `${title(transition.stage)} decision needed`,
+            stage,
+          });
+        }
+        break;
+
+      case "gate-resolved": {
+        const roundNum = (transition.round ?? 0) + 1;
+        const stageName = title(transition.stage);
+        if (transition.decision === "fix") {
+          if (
+            last &&
+            last.stage === transition.stage &&
+            last.label.endsWith("decision needed")
+          ) {
+            last.label = `${stageName} fix ${roundNum}`;
+          } else {
+            this.#activities.push({
+              at: clock(now),
+              label: `${stageName} fix ${roundNum}`,
+              stage,
+            });
+          }
+        } else if (transition.decision === "approve") {
+          if (
+            last &&
+            last.stage === transition.stage &&
+            last.label.endsWith("decision needed")
+          ) {
+            last.label = `${stageName} approved`;
+          } else {
+            this.#activities.push({
+              at: clock(now),
+              label: `${stageName} approved`,
+              stage,
+            });
+          }
+        } else if (transition.decision) {
+          this.#activities.push({
+            at: clock(now),
+            label: `${stageName} ${transition.decision}`,
+            stage,
+          });
+        }
+        break;
+      }
+
+      case "stage-completed": {
+        if (
+          last &&
+          last.stage === transition.stage &&
+          last.label.includes("fix") &&
+          !last.label.includes("fixed")
+        ) {
+          const stageState = snapshot.stages.find((s) => s.id === transition.stage);
+          if (stageState?.fixedFindings) {
+            last.label = `${last.label} · ${stageState.fixedFindings} fixed`;
+          }
+        }
+        const stageStatus = snapshot.stages.find((s) => s.id === transition.stage)?.status;
+        if (stageStatus === "failed" || stageStatus === "cancelled") {
+          this.#activities.push({
+            at: clock(now),
+            label: `${title(transition.stage)} ${stageStatus}`,
+            stage,
+          });
+        }
+        break;
+      }
+
+      case "error-recorded":
+        this.#activities.push({
+          at: clock(now),
+          label: `Run error${transition.resumable ? " (resumable)" : ""}`,
+        });
+        break;
+
+      case "cancellation-recorded":
+        this.#activities.push({
+          at: clock(now),
+          label: `Cancelled: ${transition.action}`,
+        });
+        break;
+
+      case "run-completed":
+        this.#activities.push({
+          at: clock(now),
+          label: `Run ${transition.status}`,
+        });
+        break;
+    }
+
+    if (this.#activities.length > 50) this.#activities.shift();
+    this.#activityIndex = this.#activities.length - 1;
+  }
+
+  #maybeAutoRespondGate(): void {
+    const snapshot = this.#snapshot;
+    const gate = snapshot?.gate;
+    if (
+      !gate ||
+      gate.state !== "open" ||
+      !gate.options?.length ||
+      !this.#autoFix ||
+      !this.#resolveGate ||
+      this.#gateSubmitting ||
+      this.#autoResolvedGateIds.has(gate.id)
+    ) {
+      return;
+    }
+
+    const stage = gate.stage;
+    const stageState = stage
+      ? snapshot.stages.find((s) => s.id === stage)
+      : undefined;
+    const actionable =
+      (stageState?.openFindings ?? stageState?.actionableFindings ?? 0) > 0;
+
+    let resolution: string | undefined;
+    if (actionable) {
+      if (stage && !this.#autoFixedStages.has(stage) && gate.options.includes("fix")) {
+        resolution = "fix";
+      }
+    } else if (gate.options.includes("approve")) {
+      resolution = "approve";
+    }
+
+    if (!resolution) return;
+
+    this.#autoResolvedGateIds.add(gate.id);
+    this.#gateSubmitting = true;
+    this.#gateMessage = `Auto-resolving gate with ${resolution}...`;
+    this.#scheduleDraw();
+
+    void this.#resolveGate(gate.id, resolution).then(
+      () => {
+        if (resolution === "fix" && stage) {
+          this.#autoFixedStages.add(stage);
+        }
+        if (this.#gateVisible && this.#snapshot?.gate?.id === gate.id) {
+          this.#gateMessage = "Decision sent; waiting for settlement.";
+          this.#scheduleDraw();
+        }
+      },
+      (error) => {
+        this.#autoResolvedGateIds.delete(gate.id);
+        if (stage) this.#autoFixedStages.delete(stage);
+        this.#gateSubmitting = false;
+        if (this.#gateVisible && this.#snapshot?.gate?.id === gate.id) {
+          this.#gateMessage = `Auto-resolve failed: ${String(error)}`;
+          this.#scheduleDraw();
+        }
+      },
+    );
   }
 
   #submitGate(): void {
@@ -491,12 +854,11 @@ export class RailTuiRenderer implements PresentationRenderer {
     const screen =
       columns < MIN_COLUMNS || rows < MIN_ROWS
         ? this.#minimal(columns, rows)
-        : columns >= FULL_COLUMNS && rows >= FULL_ROWS
-          ? this.#full(columns, rows)
-          : this.#compact(columns, rows);
+        : this.#screen(columns, rows, Date.now());
     const frame = screen.join("\n");
     if (frame === this.#lastFrame) return;
-    this.#output.write(`\u001b[H\u001b[2J${frame}`);
+    this.#output.write(`${this.#bell}\u001b[H\u001b[2J${frame}`);
+    this.#bell = "";
     this.#lastFrame = frame;
   }
 
@@ -509,207 +871,227 @@ export class RailTuiRenderer implements PresentationRenderer {
     if (middle + 1 < lines.length) {
       lines[middle + 1] = hint.padStart(Math.floor((columns + hint.length) / 2));
     }
-    return lines.map((line) => fit(line, columns));
+    return lines.map((line) => this.#paint({ segs: [line] }, columns));
   }
 
-  #header(width: number): string {
+  #screen(columns: number, rows: number, now: number): string[] {
+    const bodyRows = rows - 3;
+    let body: string[];
+    if (columns >= WIDE_COLUMNS) {
+      const rightWidth = columns - LEFT_WIDTH - this.#glyph.bar.length;
+      const stages = this.#stages(now);
+      const left = [
+        ...stages,
+        {},
+        ...this.#activity(bodyRows - stages.length - 1),
+      ];
+      const right = this.#detail(bodyRows, rightWidth, now);
+      const bar = this.#sgr(this.#glyph.bar, SGR.dim);
+      body = Array.from(
+        { length: bodyRows },
+        (_, index) =>
+          `${this.#paint(left[index] ?? {}, LEFT_WIDTH)}${bar}${this.#paint(right[index] ?? {}, rightWidth)}`,
+      );
+    } else if (this.#overlay()) {
+      const all = this.#detail(bodyRows, columns, now);
+      body = Array.from({ length: bodyRows }, (_, index) =>
+        this.#paint(all[index] ?? {}, columns),
+      );
+    } else {
+      const stages = this.#stages(now);
+      const remainingRows = bodyRows - stages.length - 2;
+      const minDetail = this.#focus === "logs" ? 2 : 1;
+      const maxActivity = Math.max(1, remainingRows - minDetail);
+      const activityTarget = Math.max(
+        1,
+        Math.min(
+          maxActivity,
+          Math.max(
+            3,
+            Math.min(
+              this.#activities.length + 1,
+              Math.max(3, Math.floor(remainingRows * 0.35)),
+            ),
+          ),
+        ),
+      );
+      const activity = this.#activity(activityTarget);
+      const detailRows = Math.max(minDetail, remainingRows - activity.length);
+      const detail = this.#detail(detailRows, columns, now);
+      const all = [...stages, {}, ...activity, {}, ...detail];
+      body = Array.from({ length: bodyRows }, (_, index) =>
+        this.#paint(all[index] ?? {}, columns),
+      );
+    }
+    return [this.#header(columns, now), "", ...body, this.#footer(columns)];
+  }
+
+  #overlay(): boolean {
+    return this.#cancelVisible || this.#gateVisible || Boolean(this.#snapshot?.error);
+  }
+
+  #sgr(text: string, sgr?: string, bar?: string): string {
+    if (!sgr || !this.#color || !text) return text;
+    return `\u001b[${sgr}m${text}\u001b[0m${bar ? `\u001b[${bar}m` : ""}`;
+  }
+
+  #segs(
+    segs: readonly Seg[],
+    width: number,
+    bar?: string,
+  ): { text: string; used: number } {
+    let text = "";
+    let used = 0;
+    for (const seg of segs) {
+      const [raw, sgr] = typeof seg === "string" ? [seg, undefined] : seg;
+      const room = width - used;
+      if (!raw || room <= 0) continue;
+      const piece =
+        raw.length <= room
+          ? raw
+          : room === 1
+            ? raw.slice(0, 1)
+            : `${raw.slice(0, room - 1)}~`;
+      used += piece.length;
+      text += this.#sgr(piece, sgr, bar);
+    }
+    return { text, used };
+  }
+
+  #paint(row: Row, width: number): string {
+    if (width <= 0) return "";
+    const right = row.right
+      ? this.#segs(row.right, width, row.bar)
+      : { text: "", used: 0 };
+    const left = this.#segs(
+      row.segs ?? [],
+      right.used ? Math.max(0, width - right.used - 1) : width,
+      row.bar,
+    );
+    const pad = " ".repeat(Math.max(0, width - left.used - right.used));
+    const body = `${left.text}${pad}${right.text}`;
+    return row.bar && this.#color ? `\u001b[${row.bar}m${body}\u001b[0m` : body;
+  }
+
+  #stageDuration(stage: StageName, now: number): string {
+    const time = this.#stageTimes.get(stage);
+    return time ? elapsed((time.end ?? now) - time.start) : "";
+  }
+
+  #header(width: number, now: number): string {
     const snapshot = this.#snapshot!;
-    const pin = this.#pinnedStage ? ` | pinned ${title(this.#pinnedStage)}` : "";
-    return fit(
-      `ORCA NO-MISTAKES | ${snapshot.runId} | attempt ${snapshot.attempt} | ${snapshot.status} | auto-fix ${snapshot.mode.autoFix ? "on" : "off"}${pin}`,
+    const segs: Seg[] = width >= 60 ? [safeText(snapshot.runId, 60)] : [];
+    if (width >= WIDE_COLUMNS) segs.push([`  attempt ${snapshot.attempt}`, SGR.dim]);
+    if (width >= 120) segs.unshift(["orca no-mistakes", SGR.bold], "  ");
+    if (this.#pinnedStage) {
+      segs.push([`  pinned ${title(this.#pinnedStage)}`, SGR.dim]);
+    }
+    const autoFix = this.#autoFix;
+    return this.#paint(
+      {
+        right: [
+          this.#badge(now),
+          "   ",
+          [`auto-fix ${autoFix ? "on" : "off"}`, autoFix ? SGR.dim : SGR.amber],
+          ...(width >= 120
+            ? ["   ", [`run ${elapsed(now - this.#startedAt)}`, SGR.dim] as Seg]
+            : []),
+        ],
+        segs,
+      },
       width,
     );
   }
 
-  #full(columns: number, rows: number): string[] {
-    const railWidth = 36;
-    const bodyRows = rows - 3;
-    const rail = this.#rail(bodyRows, railWidth);
-    if (this.#cancelVisible || this.#gateVisible) {
-      const detail = this.#cancelVisible
-        ? this.#cancelPanel(bodyRows, columns - railWidth - 3)
-        : this.#gatePanel(bodyRows, columns - railWidth - 3);
-      return [
-        this.#header(columns),
-        fit("=".repeat(columns), columns),
-        ...Array.from(
-          { length: bodyRows },
-          (_, index) => `${rail[index]} | ${detail[index]}`,
-        ),
-        this.#footer(columns),
-      ];
-    }
-    if (this.#snapshot?.error) {
-      const detail = this.#errorPanel(bodyRows, columns - railWidth - 3);
-      return [
-        this.#header(columns),
-        fit("=".repeat(columns), columns),
-        ...Array.from(
-          { length: bodyRows },
-          (_, index) => `${rail[index]} | ${detail[index]}`,
-        ),
-        this.#footer(columns),
-      ];
-    }
-    const activityWidth = 31;
-    const logWidth = columns - railWidth - activityWidth - 6;
-    const recent = this.#recent(bodyRows, activityWidth);
-    const logs = this.#logs(bodyRows, logWidth);
-    return [
-      this.#header(columns),
-      fit("=".repeat(columns), columns),
-      ...Array.from(
-        { length: bodyRows },
-        (_, index) => `${rail[index]} | ${recent[index]} | ${logs[index]}`,
-      ),
-      this.#footer(columns),
-    ];
-  }
-
-  #compact(columns: number, rows: number): string[] {
-    const railWidth = 36;
-    const detailWidth = columns - railWidth - 3;
-    const bodyRows = rows - 3;
-    const rail = this.#rail(bodyRows, railWidth);
-    const detail = this.#cancelVisible
-      ? this.#cancelPanel(bodyRows, detailWidth)
-      : this.#gateVisible
-        ? this.#gatePanel(bodyRows, detailWidth)
-        : this.#snapshot?.error
-          ? this.#errorPanel(bodyRows, detailWidth)
-        : this.#focus === "activity"
-          ? this.#recent(bodyRows, detailWidth)
-          : this.#logs(bodyRows, detailWidth);
-    return [
-      this.#header(columns),
-      fit("=".repeat(columns), columns),
-      ...Array.from(
-        { length: bodyRows },
-        (_, index) => `${rail[index]} | ${detail[index]}`,
-      ),
-      this.#footer(columns),
-    ];
-  }
-
-  #rail(rows: number, width: number): string[] {
+  #badge(now: number): Seg {
     const snapshot = this.#snapshot!;
-    const lines = [this.#regionTitle("RAIL", "rail", width), ""];
+    if (snapshot.gate?.state === "open") {
+      return [
+        `${this.#glyph.blocked} decision needed ${elapsed(now - this.#gateOpenedAt)}`,
+        `${SGR.amber};${SGR.bold}`,
+      ];
+    }
+    if (snapshot.error) {
+      return [
+        `${this.#glyph.failed} error${snapshot.error.resumable ? ", resumable" : ""}`,
+        `${SGR.red};${SGR.bold}`,
+      ];
+    }
+    if (snapshot.cancellation && snapshot.status === "in-progress") {
+      return ["cancelling", SGR.amber];
+    }
+    if (snapshot.status === "passed") return [`${this.#glyph.passed} passed`, SGR.green];
+    if (snapshot.status === "failed") return [`${this.#glyph.failed} failed`, SGR.red];
+    if (snapshot.status === "cancelled") return ["cancelled", SGR.amber];
+    const stage = snapshot.currentStage;
+    if (!stage) return ["starting", SGR.dim];
+    return [
+      `${title(stage)} ${this.#stageDuration(stage, now)}`.trimEnd(),
+      `${SGR.accent};${SGR.bold}`,
+    ];
+  }
+
+  #regionTitle(label: string, region: Region): Row {
+    const focused = this.#focus === region;
+    return {
+      segs: [
+        `${focused ? ">" : " "} `,
+        [label, focused ? `${SGR.accent};${SGR.bold}` : SGR.bold],
+      ],
+    };
+  }
+
+  #stages(now: number): Row[] {
+    const snapshot = this.#snapshot!;
+    const glyph = this.#glyph;
+    const rows = [this.#regionTitle("STAGES", "rail")];
     for (const [index, stage] of this.#stageIds().entries()) {
       const state = snapshot.stages.find((item) => item.id === stage);
-      const status = state?.status ?? "pending";
-      const active = snapshot.currentStage === stage && status === "active";
-      const marker = active
-        ? ">"
-        : status === "passed"
-          ? "x"
-          : status === "failed" || status === "cancelled"
-            ? "!"
+      const status =
+        state?.status === "active" && stage !== snapshot.currentStage
+          ? "pending"
+          : (state?.status ?? "pending");
+      const [marker, color] =
+        status === "active"
+          ? [glyph.active, SGR.accent]
+          : status === "passed"
+            ? [glyph.passed, SGR.green]
             : status === "blocked"
-              ? "-"
-              : " ";
-      const selected = index === this.#selectedStage ? ">" : " ";
-      lines.push(
-        `${selected} [${marker}] ${index + 1}. ${title(stage)} ${status}${state?.retainedFixer ? " retained" : ""}`,
-      );
-      lines.push(
-        `    ${state?.fixedFindings ?? 0}/${state?.totalFindings ?? 0} fixed ${state?.approvedFindings ?? 0} approved ${state?.openFindings ?? state?.actionableFindings ?? 0} open`,
-      );
+              ? [glyph.blocked, SGR.amber]
+              : status === "cancelled"
+                ? [glyph.cancelled, SGR.dim]
+                : status === "pending"
+                  ? [glyph.pending, SGR.dim]
+                  : [glyph.failed, SGR.red];
+      const selected = index === this.#selectedStage;
+      const total = state?.totalFindings ?? 0;
+      const fixed = state?.fixedFindings ?? 0;
+      const open = state?.openFindings ?? state?.actionableFindings ?? 0;
+      const segs: Seg[] = [
+        `${selected ? ">" : " "} `,
+        [marker, color],
+        " ",
+        [title(stage).padEnd(8), status === "pending" ? SGR.dim : ""],
+      ];
+      if (state?.retainedFixer) {
+        segs.push(" ", ["retained", SGR.dim]);
+      }
+      if (total > 0) {
+        segs.push(" ", [
+          `${total} found${glyph.sep}${fixed} fixed`,
+          open > 0 ? SGR.amber : SGR.dim,
+        ]);
+      }
+      rows.push({
+        right: [[this.#stageDuration(stage, now), SGR.dim]],
+        segs,
+      });
     }
-    return Array.from({ length: rows }, (_, index) => fit(lines[index] ?? "", width));
+    return rows;
   }
 
-  #gatePanel(rows: number, width: number): string[] {
-    const gate = this.#snapshot?.gate;
-    if (!gate) return Array.from({ length: rows }, () => fit("", width));
-    const options = gate.options ?? [];
-    const choice = options[this.#gateChoice];
-    const question = wrap(gate.question ?? "Human decision required.", width).slice(
-      0,
-      2,
-    );
-    const lines = [
-      fit("> DECISION REQUIRED", width),
-      fit(
-        `${title(gate.stage ?? this.#snapshot!.currentStage ?? "intent")} round ${gate.round ?? 0} | ${gate.id}`,
-        width,
-      ),
-      ...question.map((line) => fit(line, width)),
-      fit("Canonical choices:", width),
-    ];
-    for (const [index, option] of options.entries()) {
-      lines.push(fit(`${index === this.#gateChoice ? ">" : " "} ${option}`, width));
-      lines.push(fit(`  ${gateConsequence(option, gate.stage)}`, width));
-    }
-    lines.push(
-      fit(
-        this.#gateConfirm
-          ? `Confirm ${choice}? Press Enter again.`
-          : this.#gateMessage ?? "Enter selects. Esc returns unanswered.",
-        width,
-      ),
-    );
-    if (this.#gateConfirm || this.#gateSubmitting) {
-      lines.push(
-        fit(
-          this.#gateMessage ?? "Esc returns without resolving the gate.",
-          width,
-        ),
-      );
-    }
-    return Array.from({ length: rows }, (_, index) => fit(lines[index] ?? "", width));
-  }
-
-  #cancelPanel(rows: number, width: number): string[] {
-    const stage = this.#snapshot?.currentStage;
-    const lines = [
-      fit("> CANCEL RUN?", width),
-      fit(
-        `${stage ? `${title(stage)} | ` : ""}${this.#snapshot?.status ?? "in-progress"}`,
-        width,
-      ),
-      "",
-      ...wrap(
-        "Cancel stops new work, preserves recovery evidence, and cleans up resources.",
-        width,
-      ),
-      "",
-      fit("Press Enter to confirm Cancel.", width),
-      fit("Press Esc to keep the run active.", width),
-    ];
-    return Array.from({ length: rows }, (_, index) => fit(lines[index] ?? "", width));
-  }
-
-  #errorPanel(rows: number, width: number): string[] {
-    const resumable = this.#snapshot?.error?.resumable === true;
-    const stage = this.#snapshot?.currentStage;
-    const lines = [
-      fit(`> RUN ERROR${resumable ? " (RESUMABLE)" : ""}`, width),
-      fit(
-        `${stage ? `${title(stage)} | ` : ""}attempt ${this.#snapshot?.attempt ?? 0} settled`,
-        width,
-      ),
-      "",
-      ...wrap(
-        resumable
-          ? "The failed attempt is settled and cleaned. Resume reconstructs the next attempt from its durable checkpoint."
-          : "This error is not safe to resume in the current process.",
-        width,
-      ),
-      "",
-      fit(
-        resumable && this.#requestResume
-          ? this.#resumeVisible
-            ? "Press R to resume, or C to leave the run stopped."
-            : "Resume requested. Waiting for the next attempt."
-          : "Press C to leave the run stopped.",
-        width,
-      ),
-    ];
-    return Array.from({ length: rows }, (_, index) => fit(lines[index] ?? "", width));
-  }
-
-  #recent(rows: number, width: number): string[] {
-    const lines = [this.#regionTitle("RECENT ACTIVITY", "activity", width)];
+  #activity(rows: number): Row[] {
+    const lines = [this.#regionTitle("ACTIVITY", "activity")];
     const room = Math.max(0, rows - 1);
     const start = Math.max(
       0,
@@ -720,83 +1102,412 @@ export class RailTuiRenderer implements PresentationRenderer {
       index < Math.min(this.#activities.length, start + room);
       index += 1
     ) {
-      const selected = index === this.#activityIndex ? ">" : " ";
-      lines.push(`${selected} ${this.#activities[index].label}`);
+      const selected = index === this.#activityIndex;
+      const entry = this.#activities[index];
+      lines.push({
+        right: [[entry.at, SGR.dim]],
+        segs: [`${selected ? ">" : " "} `, entry.label],
+      });
     }
-    return Array.from({ length: rows }, (_, index) => fit(lines[index] ?? "", width));
+    return lines.slice(0, rows);
   }
 
-  #logs(rows: number, width: number): string[] {
-    const snapshot = this.#snapshot!;
-    const stage = this.#pinnedStage ?? this.#stageIds()[this.#selectedStage];
-    const state = snapshot.stages.find((item) => item.id === stage);
-    const round = state?.round ?? 0;
-    const all = [
-      `Findings: ${state?.fixedFindings ?? 0}/${state?.totalFindings ?? 0} fixed | ${state?.approvedFindings ?? 0} approved | ${state?.openFindings ?? state?.actionableFindings ?? 0} open${state?.retainedFixer ? " | fixer retained" : ""}`,
-      ...(state?.findings ?? []).map(
-        (finding) =>
-          `[${finding.disposition}] ${finding.id}: ${finding.description}${finding.file ? ` (${finding.file}${finding.line ? `:${finding.line}` : ""})` : ""}`,
-      ),
-      ...logTail(
-        this.#artifactsDir,
-        `${stage}_r${round}.log`,
-        this.#stageLogs,
-      ),
-    ];
-    const room = Math.max(0, rows - 1);
-    this.#logOffset = Math.min(
-      this.#logOffset,
-      Math.max(0, all.length - room),
+  #detail(rows: number, width: number, now: number): Row[] {
+    const panel = this.#cancelVisible
+      ? this.#cancelPanel(width)
+      : this.#gateVisible
+        ? this.#gatePanel(width, now)
+        : this.#snapshot?.error
+          ? this.#errorPanel(width)
+          : this.#focus === "logs"
+            ? this.#logs(rows)
+            : this.#summary(width, now);
+    const room = Math.max(1, rows);
+    this.#detailOffset = Math.max(
+      0,
+      Math.min(this.#detailOffset, Math.max(0, panel.length - room)),
     );
+    return panel.slice(this.#detailOffset, this.#detailOffset + rows);
+  }
+
+  #selectedStageId(): StageName {
+    return this.#pinnedStage ?? this.#stageIds()[this.#selectedStage];
+  }
+
+  #isFixingStage(
+    stage: StageName,
+    state = this.#snapshot?.stages.find((item) => item.id === stage),
+  ): boolean {
+    if (state?.phase !== undefined) {
+      return state.phase === "fixer";
+    }
+    return (
+      (state?.status === "active" && (state?.round ?? 0) > 0) ||
+      this.#autoFixedStages.has(stage)
+    );
+  }
+
+  #summary(width: number, now: number): Row[] {
+    const snapshot = this.#snapshot!;
+    const glyph = this.#glyph;
+    const stage = this.#selectedStageId();
+    const state = snapshot.stages.find((item) => item.id === stage);
+    const status = state?.status ?? "pending";
+    const isFixing = this.#isFixingStage(stage, state);
+    const roundLabel =
+      state?.round !== undefined && status !== "pending"
+        ? isFixing
+          ? `fix ${state.round}`
+          : `round ${state.round + 1}`
+        : "";
+    const meta = [
+      status === "pending" ? "" : status,
+      roundLabel,
+      this.#stageDuration(stage, now),
+      state?.retainedFixer ? "fixer retained" : "",
+    ]
+      .filter(Boolean)
+      .join(glyph.sep);
+    const focused = this.#focus === "detail";
+    const rows: Row[] = [
+      {
+        segs: [
+          `${focused ? ">" : " "} `,
+          [title(stage).toUpperCase(), focused ? `${SGR.accent};${SGR.bold}` : SGR.bold],
+          ["  " + meta, SGR.dim],
+        ],
+      },
+    ];
+    const total = state?.totalFindings ?? 0;
+    const open = state?.openFindings ?? state?.actionableFindings ?? 0;
+    const fixed = state?.fixedFindings ?? 0;
+    const approved = state?.approvedFindings ?? 0;
+    if (total > 0) {
+      rows.push({
+        segs: [
+          ["  Findings  ", SGR.dim],
+          [`${open} open`, open > 0 ? SGR.amber : SGR.dim],
+          [glyph.sep, SGR.dim],
+          [`${fixed} fixed`, fixed > 0 ? SGR.green : SGR.dim],
+          [glyph.sep, SGR.dim],
+          [`${approved} approved`, SGR.dim],
+        ],
+      });
+    }
+    if (snapshot.gate?.state === "open" && snapshot.gate.stage === stage) {
+      rows.push({
+        segs: ["  ", ["Waiting for your decision. Press G to open the gate.", SGR.amber]],
+      });
+    }
+    rows.push({});
+    const findings = state?.findings ?? [];
+    if (findings.length === 0) {
+      rows.push({
+        segs: [
+          "  ",
+          [
+            status === "pending"
+              ? "Not started."
+              : status === "active" || status === "blocked"
+                ? "No findings yet."
+                : "No findings.",
+            SGR.dim,
+          ],
+        ],
+      });
+    }
+    const targetFindingIds = state?.targetFindingIds
+      ? new Set(state.targetFindingIds)
+      : undefined;
+
+    for (const finding of findings) {
+      let dispGlyph: string;
+      let color: string;
+      const isTargetFixing =
+        targetFindingIds !== undefined
+          ? targetFindingIds.has(finding.id)
+          : true;
+      if (finding.disposition === "fixed") {
+        dispGlyph = glyph.fixed;
+        color = SGR.green;
+      } else if (finding.disposition === "approved") {
+        dispGlyph = glyph.approved;
+        color = SGR.dim;
+      } else if (isFixing && isTargetFixing) {
+        dispGlyph = glyph.fixing;
+        color = SGR.amber;
+      } else {
+        dispGlyph = glyph.open;
+        color =
+          finding.severity === "error"
+            ? SGR.red
+            : finding.severity === "warning"
+              ? SGR.amber
+              : SGR.accent;
+      }
+      const head = `  ${dispGlyph} `;
+      const idWidth = 24;
+      const idLines = wrap(finding.id, idWidth);
+      const location = finding.file
+        ? safeText(
+            `${finding.file}${finding.line ? `:${finding.line}` : ""}`,
+            120,
+          )
+        : "";
+
+      const stack = width - (head.length + idWidth + 2) < 16;
+      if (stack) {
+        for (let i = 0; i < idLines.length; i++) {
+          if (i === 0) {
+            rows.push({
+              segs: ["  ", [dispGlyph, color], " ", [idLines[i] ?? "", SGR.bold]],
+            });
+          } else {
+            rows.push({
+              segs: [" ".repeat(head.length), [idLines[i] ?? "", SGR.bold]],
+            });
+          }
+        }
+        const descIndent = " ".repeat(head.length);
+        const descLines = wrap(finding.description, Math.max(8, width - descIndent.length));
+        for (const descLine of descLines) {
+          rows.push({ segs: [descIndent, descLine] });
+        }
+        if (location) {
+          rows.push({ segs: [descIndent, [location, SGR.dim]] });
+        }
+      } else {
+        const indent = " ".repeat(head.length + idWidth + 2);
+        const descLines = wrap(finding.description, width - indent.length);
+        const lineCount = Math.max(idLines.length, descLines.length);
+
+        for (let i = 0; i < lineCount; i++) {
+          const idPart = (idLines[i] ?? "").padEnd(idWidth);
+          const descPart = descLines[i] ?? "";
+          if (i === 0) {
+            rows.push({
+              segs: ["  ", [dispGlyph, color], " ", [idPart, SGR.bold], "  ", descPart],
+            });
+          } else {
+            rows.push({
+              segs: [" ".repeat(head.length), [idPart, SGR.bold], "  ", descPart],
+            });
+          }
+        }
+        if (location) {
+          const last = rows[rows.length - 1];
+          const used = (last?.segs ?? []).reduce(
+            (sum, seg) => sum + (typeof seg === "string" ? seg : seg[0]).length,
+            0,
+          );
+          if (last && used + location.length + 2 <= width) {
+            last.right = [[location, SGR.dim]];
+          } else {
+            rows.push({ segs: [indent, [location, SGR.dim]] });
+          }
+        }
+      }
+    }
+    return rows;
+  }
+
+  #logs(rows: number): Row[] {
+    const snapshot = this.#snapshot!;
+    const stage = this.#selectedStageId();
+    const state = snapshot.stages.find((item) => item.id === stage);
+    const isFixing = this.#isFixingStage(stage, state);
+    const round = state?.round ?? 0;
+    const roundLabel =
+      round !== undefined
+        ? isFixing
+          ? `  fix ${round}`
+          : `  round ${round + 1}`
+        : "";
+    const all = logTail(this.#artifactsDir, `${stage}_r${round}.log`, this.#stageLogs);
+    const room = Math.max(0, rows - 1);
+    this.#logOffset = Math.min(this.#logOffset, Math.max(0, all.length - room));
     const bottom = Math.max(0, all.length - this.#logOffset);
     const visible = all.slice(Math.max(0, bottom - room), bottom);
-    const lines = [
-      this.#regionTitle(
-        `${title(stage)} LOG${this.#pinnedStage ? " (PINNED)" : ""}`,
-        "logs",
-        width,
-      ),
-      ...visible,
+    const focused = this.#focus === "logs";
+    return [
+      {
+        segs: [
+          `${focused ? ">" : " "} `,
+          [`${title(stage).toUpperCase()} LOG`, focused ? `${SGR.accent};${SGR.bold}` : SGR.bold],
+          [roundLabel, SGR.dim],
+        ],
+      },
+      ...visible.map((line) => ({ segs: [line] })),
     ];
-    return Array.from({ length: rows }, (_, index) => fit(lines[index] ?? "", width));
   }
 
-  #regionTitle(label: string, region: Region, width: number): string {
-    const focused = this.#focus === region;
-    return fit(`${focused ? ">" : " "} ${label}${focused ? " (focused)" : ""}`, width);
+  #gatePanel(width: number, now: number): Row[] {
+    const gate = this.#snapshot?.gate;
+    if (!gate) return [];
+    const options = gate.options ?? [];
+    const choice = options[this.#gateChoice];
+    const stage = gate.stage ?? this.#snapshot!.currentStage ?? "intent";
+    const rows: Row[] = [
+      { segs: ["  ", ["DECISION REQUIRED", `${SGR.amber};${SGR.bold}`]] },
+      {
+        segs: [
+          "  ",
+          [
+            `${title(stage)} round ${(gate.round ?? 0) + 1}${this.#glyph.sep}waiting ${elapsed(now - this.#gateOpenedAt)}`,
+            SGR.dim,
+          ],
+        ],
+      },
+      {},
+      ...wrap(gate.question ?? "Human decision required.", width - 2)
+        .slice(0, 4)
+        .map((line) => ({ segs: ["  ", line] })),
+      {},
+    ];
+    for (const [index, option] of options.entries()) {
+      const selected = index === this.#gateChoice;
+      rows.push({
+        bar: selected ? SGR.reverse : undefined,
+        segs: [
+          `${selected ? ">" : " "} `,
+          [safeText(option, 16).padEnd(8), selected ? SGR.bold : ""],
+          ["  " + gateConsequence(option, gate.stage), SGR.dim],
+        ],
+      });
+    }
+    rows.push({});
+    rows.push({
+      segs: [
+        "  ",
+        this.#gateConfirm
+          ? [`Confirm ${safeText(choice ?? "", 16)}? Press Enter again.`, SGR.amber]
+          : this.#gateMessage
+            ? [safeText(this.#gateMessage, 240), SGR.amber]
+            : ["Enter selects. Esc returns unanswered.", SGR.dim],
+      ],
+    });
+    if (this.#gateConfirm || this.#gateSubmitting) {
+      rows.push({
+        segs: [
+          "  ",
+          [
+            this.#gateMessage
+              ? safeText(this.#gateMessage, 240)
+              : "Esc returns without resolving the gate.",
+            SGR.dim,
+          ],
+        ],
+      });
+    }
+    return rows;
+  }
+
+  #cancelPanel(width: number): Row[] {
+    const stage = this.#snapshot?.currentStage;
+    return [
+      { segs: ["  ", ["CANCEL RUN?", `${SGR.red};${SGR.bold}`]] },
+      {
+        segs: [
+          "  ",
+          [
+            `${stage ? `${title(stage)}${this.#glyph.sep}` : ""}${this.#snapshot?.status ?? "in-progress"}`,
+            SGR.dim,
+          ],
+        ],
+      },
+      {},
+      ...wrap(
+        "Cancel stops new work, preserves recovery evidence, and cleans up resources.",
+        width - 2,
+      ).map((line) => ({ segs: ["  ", line] })),
+      {},
+      { segs: ["  Press Enter to confirm Cancel."] },
+      { segs: ["  Press Esc to keep the run active."] },
+    ];
+  }
+
+  #errorPanel(width: number): Row[] {
+    const resumable = this.#snapshot?.error?.resumable === true;
+    const stage = this.#snapshot?.currentStage;
+    return [
+      {
+        segs: [
+          "  ",
+          [`RUN ERROR${resumable ? " (RESUMABLE)" : ""}`, `${SGR.red};${SGR.bold}`],
+        ],
+      },
+      {
+        segs: [
+          "  ",
+          [
+            `${stage ? `${title(stage)}${this.#glyph.sep}` : ""}attempt ${this.#snapshot?.attempt ?? 0} settled`,
+            SGR.dim,
+          ],
+        ],
+      },
+      {},
+      ...wrap(
+        resumable
+          ? "The failed attempt is settled and cleaned. Resume reconstructs the next attempt from its durable checkpoint."
+          : "This error is not safe to resume in the current process.",
+        width - 2,
+      ).map((line) => ({ segs: ["  ", line] })),
+      {},
+      {
+        segs: [
+          "  ",
+          resumable && this.#requestResume
+            ? this.#resumeVisible
+              ? "Press R to resume, or C to leave the run stopped."
+              : "Resume requested. Waiting for the next attempt."
+            : "Press C to leave the run stopped.",
+        ],
+      },
+    ];
   }
 
   #footer(width: number): string {
+    const isNarrow = width < 60;
+    const arrows = isNarrow ? this.#glyph.narrowArrows : this.#glyph.arrows;
+    const hints: [string, string][] = [];
     if (this.#cancelVisible) {
-      return fit("Enter confirm Cancel | Esc keep running", width);
+      hints.push(["Enter", "confirm cancel"], ["Esc", "keep running"]);
+    } else if (this.#gateVisible) {
+      if (this.#gateSubmitting) hints.push(["", "Waiting for gate settlement"]);
+      else {
+        hints.push(
+          [arrows, "choose"],
+          ["Enter", isNarrow ? "select" : "select/confirm"],
+          ["Esc", isNarrow ? "back" : "return unanswered"],
+        );
+      }
+      if (this.#setAutoFix) hints.push(["A", "auto-fix"]);
+      hints.push(["C", "cancel"]);
+    } else if (this.#snapshot?.error) {
+      if (this.#snapshot.error.resumable && this.#requestResume && this.#resumeVisible) {
+        hints.push(["R", "resume"]);
+      }
+      hints.push(["C", "leave stopped"]);
+    } else {
+      hints.push(["Tab", "pane"]);
+      if (this.#focus === "logs" || this.#focus === "detail") hints.push([arrows, "scroll"]);
+      else {
+        hints.push([arrows, "move"]);
+        if (!isNarrow) hints.push(["Enter", "open"]);
+      }
+      if (!isNarrow && (this.#pinnedStage || this.#focus === "logs" || this.#focus === "detail")) hints.push(["Esc", "back"]);
+      if (!isNarrow && this.#snapshot?.gate?.state === "open") hints.push(["G", "gate"]);
+      if (this.#setAutoFix) hints.push(["A", "auto-fix"]);
+      hints.push(["C", "cancel"]);
     }
-    if (this.#gateVisible) {
-      return fit(
-        this.#gateSubmitting
-          ? `Waiting for canonical gate settlement${this.#setAutoFix ? " | A Auto-fix" : ""} | C Cancel`
-          : `Up/Down choice | Enter select/confirm | Esc return unanswered${this.#setAutoFix ? " | A Auto-fix" : ""} | C Cancel`,
-        width,
-      );
+    const segs: Seg[] = [" "];
+    const separator = isNarrow ? "  " : "   ";
+    for (const [key, action] of hints) {
+      if (segs.length > 1) segs.push(separator);
+      if (key) segs.push([key, SGR.bold], " ");
+      segs.push([action, key === "G" ? SGR.amber : SGR.dim]);
     }
-    if (this.#snapshot?.error) {
-      const keys = [
-        this.#snapshot.error.resumable &&
-        this.#requestResume &&
-        this.#resumeVisible
-          ? "R Resume"
-          : "",
-        "C Leave stopped",
-      ].filter(Boolean);
-      return fit(keys.join(" | "), width);
-    }
-    const keys = ["Tab/Shift-Tab region"];
-    if (this.#focus === "logs") keys.push("Up/Down scroll");
-    else keys.push("Up/Down move", "Enter open");
-    if (this.#pinnedStage || this.#focus === "logs") keys.push("Esc return");
-    if (this.#snapshot?.gate?.state === "open") keys.push("G open gate");
-    if (this.#setAutoFix) keys.push("A Auto-fix");
-    keys.push("C Cancel");
-    return fit(keys.join(" | "), width);
+    return this.#paint({ segs }, width);
   }
 
   #handleInput(input: string): void {
@@ -852,7 +1563,7 @@ export class RailTuiRenderer implements PresentationRenderer {
         this.#requestResume
       ) {
         this.#resumeVisible = false;
-        this.#activities.push({ label: "Resume requested" });
+        this.#activities.push({ at: clock(Date.now()), label: "Resume requested" });
         this.#requestResume();
       } else if (this.#gateVisible) {
         if (key === "\u001b" && !this.#gateSubmitting) {
@@ -921,19 +1632,30 @@ export class RailTuiRenderer implements PresentationRenderer {
   }
 
   #toggleAutoFix(): void {
-    if (!this.#setAutoFix || !this.#snapshot || this.#modeSubmitting) return;
+    if (this.#modeSubmitting) return;
+    this.#autoFix = !this.#autoFix;
+    const enabled = this.#autoFix;
+    this.#scheduleDraw();
+    if (!this.#setAutoFix) {
+      if (enabled) this.#maybeAutoRespondGate();
+      return;
+    }
     this.#modeSubmitting = true;
-    const enabled = !this.#snapshot.mode.autoFix;
     void Promise.resolve()
       .then(() => this.#setAutoFix!(enabled))
       .then(
         () => {
           this.#modeSubmitting = false;
+          if (enabled && this.#snapshot?.mode.autoFix === enabled) {
+            this.#maybeAutoRespondGate();
+          }
           this.#scheduleDraw();
         },
         (error) => {
           this.#modeSubmitting = false;
+          this.#autoFix = !enabled;
           this.#activities.push({
+            at: clock(Date.now()),
             label: safeText(`Auto-fix unchanged: ${String(error)}`, 240),
           });
           this.#scheduleDraw();
@@ -945,20 +1667,32 @@ export class RailTuiRenderer implements PresentationRenderer {
     this.#pinnedStage = undefined;
     this.#focus = "rail";
     const current = this.#snapshot?.currentStage;
-    if (current) this.#selectedStage = this.#stageIds().indexOf(current);
+    if (current) {
+      const next = this.#stageIds().indexOf(current);
+      if (next !== -1 && next !== this.#selectedStage) {
+        this.#selectedStage = next;
+        this.#detailOffset = 0;
+      }
+    }
   }
 
   #move(direction: -1 | 1): void {
     if (this.#focus === "rail") {
-      this.#selectedStage = Math.max(
+      const next = Math.max(
         0,
         Math.min(this.#stageIds().length - 1, this.#selectedStage + direction),
       );
+      if (next !== this.#selectedStage) {
+        this.#selectedStage = next;
+        this.#detailOffset = 0;
+      }
     } else if (this.#focus === "activity") {
       this.#activityIndex = Math.max(
         0,
         Math.min(this.#activities.length - 1, this.#activityIndex + direction),
       );
+    } else if (this.#focus === "detail") {
+      this.#detailOffset = Math.max(0, this.#detailOffset + direction);
     } else {
       this.#logOffset = Math.max(0, this.#logOffset - direction);
     }
@@ -968,7 +1702,13 @@ export class RailTuiRenderer implements PresentationRenderer {
     if (this.#focus === "logs") return;
     if (this.#focus === "activity") {
       const stage = this.#activities[this.#activityIndex]?.stage;
-      if (stage) this.#selectedStage = this.#stageIds().indexOf(stage);
+      if (stage) {
+        const next = this.#stageIds().indexOf(stage);
+        if (next !== -1 && next !== this.#selectedStage) {
+          this.#selectedStage = next;
+          this.#detailOffset = 0;
+        }
+      }
     }
     this.#pinnedStage = this.#stageIds()[this.#selectedStage];
     this.#logOffset = 0;
@@ -987,6 +1727,7 @@ export function createRailTuiRenderer(
   requestResume?: () => void,
   onResumeAvailable?: () => void,
   onFailure?: (error: unknown, snapshot?: PresentationSnapshot) => void,
+  initialAutoFix = false,
 ): RailTuiRenderer | undefined {
   if (!supportsRailTui(input, output)) return undefined;
   let renderer: RailTuiRenderer | undefined;
@@ -1001,6 +1742,7 @@ export function createRailTuiRenderer(
       setAutoFix,
       requestResume,
       onFailure,
+      initialAutoFix,
     );
     onResumeAvailable?.();
     return renderer;
@@ -1022,6 +1764,7 @@ export function createRunRenderer(
   requestResume?: () => void,
   onResumeAvailable?: () => void,
   onFailure?: (error: unknown) => void,
+  initialAutoFix = false,
 ): PresentationRenderer & { close?: () => void } {
   let fallback: PlainStatusRenderer | undefined;
   let failed = false;
@@ -1061,6 +1804,7 @@ export function createRunRenderer(
     requestResume,
     undefined,
     switchToPlain,
+    initialAutoFix,
   );
   if (!rail || failed) return plain();
   try {

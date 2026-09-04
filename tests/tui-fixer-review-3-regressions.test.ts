@@ -90,6 +90,7 @@ test("live log redraws reuse StageLog redaction and stop on close", async () => 
   );
   try {
     renderer.render(snapshot());
+    input.emit("data", "\r");
     await new Promise((resolve) => setImmediate(resolve));
     const initial = output.writes.at(-1) ?? "";
     assert.doesNotMatch(initial, new RegExp(secret, "u"));

@@ -148,9 +148,9 @@ if (process.env.TUI_CTRL_C_FIXTURE === "1") {
 
       input.emit("data", `\t${"\u001b[A".repeat(21)}`);
       await nextDraw();
-      assert.match(screen(output), /> Review round 9/u);
+      assert.match(screen(output), /> Review round 10/u);
 
-      input.emit("data", `\t${"\u001b[A".repeat(100)}`);
+      input.emit("data", `\r${"\u001b[A".repeat(100)}`);
       await nextDraw();
       assert.match(screen(output), /third line/u);
     } finally {
@@ -200,7 +200,7 @@ if (process.env.TUI_CTRL_C_FIXTURE === "1") {
         }
       };
       const count = (sequence: string): number => output.split(sequence).length - 1;
-      await waitFor(() => output.includes("RECENT ACTIVITY"));
+      await waitFor(() => output.includes("ACTIVITY"));
 
       terminal.write("\u001a");
       await waitFor(() => count("\u001b[?25h\u001b[?1049l") === 1);
@@ -208,7 +208,7 @@ if (process.env.TUI_CTRL_C_FIXTURE === "1") {
       await waitFor(
         () =>
           count("\u001b[?1049h\u001b[?25l") === 2 &&
-          output.includes("RECENT ACTIVITY"),
+          output.includes("ACTIVITY"),
       );
 
       terminal.write("\u0003");
