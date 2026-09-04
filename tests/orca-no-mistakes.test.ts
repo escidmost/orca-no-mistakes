@@ -2358,6 +2358,27 @@ test("ONM-88 Auto-fix changes apply only to findings arriving after the toggle",
       .map((snapshot) => snapshot.mode.autoFix),
     [false, true],
   );
+  assert.deepEqual(
+    ledger
+      .listPresentationSnapshots(result.runId)
+      .filter(
+        (snapshot) =>
+          "stage" in snapshot.transition &&
+          snapshot.transition.stage === "review" &&
+          ["round-started", "fix-completed"].includes(snapshot.transition.kind),
+      )
+      .map((snapshot) => snapshot.transition.kind),
+    [
+      "round-started",
+      "round-started",
+      "fix-completed",
+      "round-started",
+      "round-started",
+      "fix-completed",
+      "round-started",
+    ],
+    "each applied fixer round must complete before the next analysis starts",
+  );
   assert.equal(ledger.listGateAudit(result.runId)[0]?.decision, "fix");
 });
 

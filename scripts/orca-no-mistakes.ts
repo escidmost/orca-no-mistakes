@@ -3509,6 +3509,16 @@ export async function runPipeline(
           runId,
           stageId: stage,
         });
+        presentation.publish(
+          `attempt:${presentation.current.attempt}:stage:${stage}:round:${round}:fixer:completed:${nextFixer.after}`,
+          {
+            approvedFindings: actionable.length - targetFindings.length,
+            findingIds: targetFindings.map((finding) => finding.id),
+            kind: "fix-completed",
+            round,
+            stage,
+          },
+        );
         report = await runStage();
       }
 

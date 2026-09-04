@@ -124,7 +124,7 @@ test("split escape sequences remain single navigation keys", async () => {
       input.emit("data", "\u001b");
       input.emit("data", "[A");
       await new Promise((resolve) => setImmediate(resolve));
-      assert.match(screen(output), /> Review round 3/u);
+      assert.match(screen(output), /> Review analysis 3/u);
       input.emit("data", "\u001b");
       input.emit("data", "[Z");
       await new Promise((resolve) => setImmediate(resolve));

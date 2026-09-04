@@ -391,6 +391,7 @@ if (process.env.TUI_FIXTURE === "1") {
   test("ONM-88 shows finding dispositions and toggles Auto-fix without settling a gate", async () => {
     const input = new FakeInput();
     const output = new FakeOutput();
+    output.columns = 140;
     output.rows = 20;
     const toggles: boolean[] = [];
     const resolutions: string[] = [];
@@ -435,7 +436,7 @@ if (process.env.TUI_FIXTURE === "1") {
 
     const screen = cleanScreen(output.writes.at(-1) ?? "");
     assert.match(screen, /auto-fix off/iu);
-    assert.match(screen, /Review\s+retained\s+4 found.{1,3}2 fixed/u);
+    assert.match(screen, /Review\s+retained\s+4 found .*2 fixed .*1 approved/u);
     assert.match(screen, /Lint/u);
     assert.match(screen, /A Auto-fix/iu);
     input.emit("data", "A");
@@ -672,7 +673,7 @@ if (process.env.TUI_FIXTURE === "1") {
   test("de-noised activity log consolidates rounds, findings, and fix progress", async () => {
     const input = new FakeInput();
     const output = new FakeOutput();
-    output.columns = 100;
+    output.columns = 140;
     output.rows = 24;
     const renderer = new RailTuiRenderer(input, output, "/unused");
 
@@ -685,8 +686,22 @@ if (process.env.TUI_FIXTURE === "1") {
     renderer.render({ ...base, transition: { decision: "fix", gateId: "g1", kind: "gate-resolved", round: 0, stage: "review" } });
     const withFixed = {
       ...base,
-      stages: base.stages.map((s) => (s.id === "review" ? { ...s, fixedFindings: 5 } : s)),
+      stages: base.stages.map((s) =>
+        s.id === "review"
+          ? { ...s, approvedFindings: 1, fixedFindings: 5, totalFindings: 6 }
+          : s,
+      ),
     };
+    renderer.render({
+      ...withFixed,
+      transition: {
+        approvedFindings: 1,
+        findingIds: ["a", "b", "c", "d", "e"],
+        kind: "fix-completed",
+        round: 1,
+        stage: "review",
+      },
+    });
     renderer.render({
       ...withFixed,
       transition: { kind: "round-started", round: 1, stage: "review" },
@@ -699,14 +714,18 @@ if (process.env.TUI_FIXTURE === "1") {
     assert.match(screen, /Run 1 started/u);
     assert.match(screen, /Intent started/u);
     assert.match(screen, /Rebase started/u);
-    assert.match(screen, /Review round 1 · 5 found/u);
-    assert.match(screen, /Review fix 1 · 5 fixed/u);
-    assert.match(screen, /Review round 2 · 3 found/u);
-    assert.match(screen, /Test round 1/u);
+    assert.match(screen, /Review analysis 1 ·  5 found/u);
+    assert.match(screen, /Review fix 1\s+·  5 fixed ·  1 approved/u);
+    assert.match(screen, /Review analysis 2 ·  3 found/u);
+    assert.match(screen, /Test analysis 1/u);
+    const activityLines = screen.split("\n").filter((line) => /Review (?:analysis|fix)/u.test(line));
+    assert.ok(activityLines.length >= 3);
+    assert.equal(activityLines[0].indexOf("·"), activityLines[1].indexOf("·"));
+    assert.equal(activityLines[1].indexOf("·"), activityLines[2].indexOf("·"));
     renderer.close();
   });
 
-  test("fixer execution displays fix 1 instead of round 2 in activity, detail header, and log header", async () => {
+  test("fixer execution displays fix 1 instead of analysis 2 in activity, detail header, and log header", async () => {
     const input = new FakeInput();
     const output = new FakeOutput();
     output.columns = 100;
@@ -731,7 +750,7 @@ if (process.env.TUI_FIXTURE === "1") {
     await nextDraw();
     const screen = cleanScreen(output.writes.at(-1) ?? "");
     assert.match(screen, /Review fix 1/u);
-    assert.doesNotMatch(screen, /Review round 2/u);
+    assert.doesNotMatch(screen, /Review analysis 2/u);
     assert.match(screen, /REVIEW.*fix 1/u);
     renderer.close();
   });

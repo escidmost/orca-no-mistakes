@@ -309,7 +309,7 @@ test("Finding 3: wrap respects width when hyphen is at boundary column", () => {
   }
 });
 
-test("Finding 2: RailTuiRenderer activity does not reuse prior fixed total on successive fix cycles", async () => {
+test("Finding 2: RailTuiRenderer records each completed fix cycle immediately", async () => {
   const input = new FakeInput();
   const output = new FakeOutput();
   output.columns = 100;
@@ -328,48 +328,64 @@ test("Finding 2: RailTuiRenderer activity does not reuse prior fixed total on su
     transition: { decision: "fix", gateId: "g1", kind: "gate-resolved", round: 0, stage: "review" },
   });
 
-  // Cycle 1: round 2 starts (no fixed findings yet attached to Review fix 1)
+  renderer.render({
+    ...base,
+    stages: base.stages.map((s) => (s.id === "review" ? { ...s, fixedFindings: 1 } : s)),
+    transition: {
+      approvedFindings: 0,
+      findingIds: ["first"],
+      kind: "fix-completed",
+      round: 1,
+      stage: "review",
+    },
+  });
+  // Cycle 1: analysis 2 starts after fix 1 has been recorded.
   renderer.render({
     ...base,
     stages: base.stages.map((s) => (s.id === "review" ? { ...s, fixedFindings: 0 } : s)),
     transition: { kind: "round-started", round: 1, stage: "review" },
   });
-  // Cycle 1 re-review records 1 fixed
+  // Cycle 1 re-analysis records one remaining finding.
   renderer.render({
     ...base,
     stages: base.stages.map((s) => (s.id === "review" ? { ...s, fixedFindings: 1 } : s)),
     transition: { actionable: 1, kind: "findings-recorded", round: 1, stage: "review", total: 2 },
   });
 
-  // Cycle 2: gate resolved with fix round 2
+  // Cycle 2: gate resolved with fix 2.
   renderer.render({
     ...base,
     transition: { decision: "fix", gateId: "g2", kind: "gate-resolved", round: 1, stage: "review" },
   });
 
-  // Cycle 2: round 3 starts (review still has fixedFindings: 1 from round 2 in snapshot)
-  renderer.render({
-    ...base,
-    stages: base.stages.map((s) => (s.id === "review" ? { ...s, fixedFindings: 1 } : s)),
-    transition: { kind: "round-started", round: 2, stage: "review" },
-  });
-
-  // Verify Review fix 2 does not prematurely have "1 fixed"
-  await nextDraw();
-  let screen = cleanScreen(output.writes.at(-1) ?? "");
-  assert.ok(!screen.includes("Review fix 2 · 1 fixed"), `Must not prematurely attach stale fixed count: ${screen}`);
-
-  // Cycle 2 re-review records 2 fixed
   renderer.render({
     ...base,
     stages: base.stages.map((s) => (s.id === "review" ? { ...s, fixedFindings: 2 } : s)),
-    transition: { actionable: 0, kind: "findings-recorded", round: 2, stage: "review", total: 2 },
+    transition: {
+      approvedFindings: 0,
+      findingIds: ["second"],
+      kind: "fix-completed",
+      round: 2,
+      stage: "review",
+    },
+  });
+
+  // Each fix row reports that cycle, not the cumulative fixed total.
+  await nextDraw();
+  let screen = cleanScreen(output.writes.at(-1) ?? "");
+  assert.match(screen, /Review fix 1\s+·  1 fixed/u);
+  assert.match(screen, /Review fix 2\s+·  1 fixed/u);
+
+  // Analysis 3 starts only after fix 2 has been recorded.
+  renderer.render({
+    ...base,
+    stages: base.stages.map((s) => (s.id === "review" ? { ...s, fixedFindings: 2 } : s)),
+    transition: { kind: "round-started", round: 2, stage: "review" },
   });
 
   await nextDraw();
   screen = cleanScreen(output.writes.at(-1) ?? "");
-  assert.match(screen, /Review fix 1 · 1 fixed/u);
-  assert.match(screen, /Review fix 2 · 2 fixed/u);
+  assert.match(screen, /Review analysis 3/u);
   renderer.close();
 });
 

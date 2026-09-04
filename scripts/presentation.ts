@@ -34,6 +34,13 @@ export type PresentationTransition =
       targetFindingIds?: readonly string[];
     }
   | {
+      approvedFindings: number;
+      findingIds: readonly string[];
+      kind: "fix-completed";
+      round: number;
+      stage: StageName;
+    }
+  | {
       actionable: number;
       findings?: readonly Omit<PresentationFinding, "disposition">[];
       kind: "findings-recorded";
@@ -185,6 +192,27 @@ function updateFindings(
   ];
 }
 
+function updateSelectedFindings(
+  findings: readonly PresentationFinding[],
+  selectedIds: readonly string[],
+  selectedDisposition: PresentationFinding["disposition"],
+  unselectedDisposition?: PresentationFinding["disposition"],
+): PresentationFinding[] {
+  const remaining = new Map<string, number>();
+  for (const id of selectedIds) remaining.set(id, (remaining.get(id) ?? 0) + 1);
+  return findings.map((finding) => {
+    if (finding.disposition !== "open") return finding;
+    const count = remaining.get(finding.id) ?? 0;
+    if (count > 0) {
+      remaining.set(finding.id, count - 1);
+      return { ...finding, disposition: selectedDisposition };
+    }
+    return unselectedDisposition
+      ? { ...finding, disposition: unselectedDisposition }
+      : finding;
+  });
+}
+
 function nextSnapshot(
   previous: PresentationSnapshot,
   transition: PresentationTransition,
@@ -247,6 +275,30 @@ function nextSnapshot(
         }),
       };
       break;
+    case "fix-completed": {
+      const stage = next.stages.find((item) => item.id === transition.stage);
+      const findings = updateSelectedFindings(
+        stage?.findings ?? [],
+        transition.findingIds,
+        "fixed",
+      );
+      next = {
+        ...next,
+        currentStage: transition.stage,
+        stages: updateStage(next, transition.stage, {
+          actionableFindings: findings.filter((finding) => finding.disposition === "open").length,
+          approvedFindings: findings.filter((finding) => finding.disposition === "approved").length,
+          findings,
+          fixedFindings: findings.filter((finding) => finding.disposition === "fixed").length,
+          openFindings: findings.filter((finding) => finding.disposition === "open").length,
+          phase: "fixer",
+          round: transition.round,
+          status: "active",
+          targetFindingIds: undefined,
+        }),
+      };
+      break;
+    }
     case "findings-recorded":
       {
         const stage = next.stages.find((item) => item.id === transition.stage);
@@ -313,6 +365,13 @@ function nextSnapshot(
                 ? { ...finding, disposition: "approved" as const }
                 : finding,
             )
+          : transition.decision === "fix" && transition.targetFindingIds
+            ? updateSelectedFindings(
+                stage?.findings ?? [],
+                transition.targetFindingIds,
+                "open",
+                "approved",
+              )
           : stage?.findings;
       next = {
         ...next,
@@ -539,6 +598,9 @@ export class PlainStatusRenderer implements PresentationRenderer {
         break;
       case "round-started":
         line = `${prefix} ${event.stage} round ${event.round} started`;
+        break;
+      case "fix-completed":
+        line = `${prefix} ${event.stage} fix ${event.round} completed fixed=${event.findingIds.length} approved=${event.approvedFindings}`;
         break;
       case "findings-recorded":
         {

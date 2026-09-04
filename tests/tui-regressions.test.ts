@@ -148,7 +148,7 @@ if (process.env.TUI_CTRL_C_FIXTURE === "1") {
 
       input.emit("data", `\t${"\u001b[A".repeat(21)}`);
       await nextDraw();
-      assert.match(screen(output), /> Review round 10/u);
+      assert.match(screen(output), /> Review analysis 10/u);
 
       input.emit("data", `\r${"\u001b[A".repeat(100)}`);
       await nextDraw();

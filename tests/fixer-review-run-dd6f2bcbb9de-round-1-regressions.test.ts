@@ -231,8 +231,8 @@ test("TUI treats explicit stage.phase as authoritative over historical autoFixed
   await nextDraw();
 
   screen = cleanScreen(output.writes.at(-1) ?? "");
-  // Must authoritative say "round 2", NOT "fix 1"
-  assert.match(screen, /REVIEW.*round 2/);
+  // Must authoritatively say "analysis 2", NOT "fix 1"
+  assert.match(screen, /REVIEW.*analysis 2/);
   assert.doesNotMatch(screen, /REVIEW.*fix 1/);
   // Finding must NOT have the fixing glyph 'F'
   assert.doesNotMatch(screen, /F\s+sample-finding-2/);

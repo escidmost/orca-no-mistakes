@@ -122,6 +122,27 @@ function title(stage: StageName): string {
   return `${stage[0].toUpperCase()}${stage.slice(1)}`;
 }
 
+function analysisLabel(stageName: string, round: number): string {
+  return `${stageName} analysis ${round}`;
+}
+
+function fixLabel(stageName: string, round: number): string {
+  return `${stageName} fix ${round}`;
+}
+
+function activityCount(value: number, label: string): string {
+  return `${String(value).padStart(2)} ${label}`;
+}
+
+function activityResult(
+  prefix: string,
+  stageName: string,
+  round: number,
+  results: string[],
+): string {
+  return `${prefix.padEnd(analysisLabel(stageName, round).length)} · ${results.join(" · ")}`;
+}
+
 function printableText(text: string): string {
   let result = "";
   for (const character of text) {
@@ -578,7 +599,7 @@ export class RailTuiRenderer implements PresentationRenderer {
         const roundNum = transition.round + 1;
 
         if (transition.role === "fixer") {
-          const fixPrefix = `${stageName} fix ${transition.round}`;
+          const fixPrefix = fixLabel(stageName, transition.round);
           if (!this.#activities.some((a) => a.stage === stage && a.label.startsWith(fixPrefix))) {
             this.#activities.push({
               at: clock(now),
@@ -590,8 +611,8 @@ export class RailTuiRenderer implements PresentationRenderer {
         }
 
         if (roundNum > 1) {
-          const priorRoundPrefix = `${stageName} round ${roundNum - 1}`;
-          const priorFixPrefix = `${stageName} fix ${roundNum - 1}`;
+          const priorRoundPrefix = analysisLabel(stageName, roundNum - 1);
+          const priorFixPrefix = fixLabel(stageName, roundNum - 1);
           const priorRoundHadFindings = this.#activities.some(
             (a) => a.stage === stage && a.label.startsWith(priorRoundPrefix) && a.label.includes("found"),
           );
@@ -608,9 +629,30 @@ export class RailTuiRenderer implements PresentationRenderer {
         }
         this.#activities.push({
           at: clock(now),
-          label: `${stageName} round ${roundNum}`,
+          label: analysisLabel(stageName, roundNum),
           stage,
         });
+        break;
+      }
+
+      case "fix-completed": {
+        const stageName = title(transition.stage);
+        const fixPrefix = fixLabel(stageName, transition.round);
+        const results = [activityCount(transition.findingIds.length, "fixed")];
+        if (transition.approvedFindings > 0) {
+          results.push(activityCount(transition.approvedFindings, "approved"));
+        }
+        const label = activityResult(
+          fixPrefix,
+          stageName,
+          transition.round,
+          results,
+        );
+        const entry = this.#activities.findLast(
+          (activity) => activity.stage === stage && activity.label === fixPrefix,
+        );
+        if (entry) entry.label = label;
+        else this.#activities.push({ at: clock(now), label, stage });
         break;
       }
 
@@ -618,11 +660,11 @@ export class RailTuiRenderer implements PresentationRenderer {
         if (transition.stage === "intent" || transition.stage === "rebase") return;
         const stageName = title(transition.stage);
         const roundNum = transition.round + 1;
-        const roundPrefix = `${stageName} round ${roundNum}`;
+        const roundPrefix = analysisLabel(stageName, roundNum);
         const actionableCount = transition.actionable ?? transition.total;
         const countText =
           actionableCount > 0
-            ? `${actionableCount} found`
+            ? activityCount(actionableCount, "found")
             : "clean";
 
         const stageState = snapshot.stages.find((s) => s.id === transition.stage);
@@ -634,7 +676,13 @@ export class RailTuiRenderer implements PresentationRenderer {
               entry.label.includes("fix") &&
               !entry.label.includes("fixed")
             ) {
-              entry.label = `${entry.label} · ${stageState.fixedFindings} fixed`;
+              const fixRound = Number(entry.label.match(/ fix (\d+)/u)?.[1] ?? roundNum - 1);
+              entry.label = activityResult(
+                entry.label,
+                stageName,
+                fixRound,
+                [activityCount(stageState.fixedFindings, "fixed")],
+              );
               break;
             }
           }
@@ -645,11 +693,11 @@ export class RailTuiRenderer implements PresentationRenderer {
           last.stage === transition.stage &&
           last.label === roundPrefix
         ) {
-          last.label = `${roundPrefix} · ${countText}`;
+          last.label = activityResult(roundPrefix, stageName, roundNum, [countText]);
         } else if (actionableCount > 0) {
           this.#activities.push({
             at: clock(now),
-            label: `${roundPrefix} · ${countText}`,
+            label: activityResult(roundPrefix, stageName, roundNum, [countText]),
             stage,
           });
         }
@@ -675,11 +723,11 @@ export class RailTuiRenderer implements PresentationRenderer {
             last.stage === transition.stage &&
             last.label.endsWith("decision needed")
           ) {
-            last.label = `${stageName} fix ${roundNum}`;
+            last.label = fixLabel(stageName, roundNum);
           } else {
             this.#activities.push({
               at: clock(now),
-              label: `${stageName} fix ${roundNum}`,
+              label: fixLabel(stageName, roundNum),
               stage,
             });
           }
@@ -878,7 +926,8 @@ export class RailTuiRenderer implements PresentationRenderer {
     const bodyRows = rows - 3;
     let body: string[];
     if (columns >= WIDE_COLUMNS) {
-      const rightWidth = columns - LEFT_WIDTH - this.#glyph.bar.length;
+      const leftWidth = Math.max(LEFT_WIDTH, Math.min(64, Math.floor(columns * 0.46)));
+      const rightWidth = columns - leftWidth - this.#glyph.bar.length;
       const stages = this.#stages(now);
       const left = [
         ...stages,
@@ -890,7 +939,7 @@ export class RailTuiRenderer implements PresentationRenderer {
       body = Array.from(
         { length: bodyRows },
         (_, index) =>
-          `${this.#paint(left[index] ?? {}, LEFT_WIDTH)}${bar}${this.#paint(right[index] ?? {}, rightWidth)}`,
+          `${this.#paint(left[index] ?? {}, leftWidth)}${bar}${this.#paint(right[index] ?? {}, rightWidth)}`,
       );
     } else if (this.#overlay()) {
       const all = this.#detail(bodyRows, columns, now);
@@ -1066,6 +1115,7 @@ export class RailTuiRenderer implements PresentationRenderer {
       const selected = index === this.#selectedStage;
       const total = state?.totalFindings ?? 0;
       const fixed = state?.fixedFindings ?? 0;
+      const approved = state?.approvedFindings ?? 0;
       const open = state?.openFindings ?? state?.actionableFindings ?? 0;
       const segs: Seg[] = [
         `${selected ? ">" : " "} `,
@@ -1077,8 +1127,13 @@ export class RailTuiRenderer implements PresentationRenderer {
         segs.push(" ", ["retained", SGR.dim]);
       }
       if (total > 0) {
+        const findings = [
+          activityCount(total, "found"),
+          activityCount(fixed, "fixed"),
+          ...(approved > 0 ? [activityCount(approved, "approved")] : []),
+        ];
         segs.push(" ", [
-          `${total} found${glyph.sep}${fixed} fixed`,
+          findings.join(glyph.sep),
           open > 0 ? SGR.amber : SGR.dim,
         ]);
       }
@@ -1158,7 +1213,7 @@ export class RailTuiRenderer implements PresentationRenderer {
       state?.round !== undefined && status !== "pending"
         ? isFixing
           ? `fix ${state.round}`
-          : `round ${state.round + 1}`
+          : `analysis ${state.round + 1}`
         : "";
     const meta = [
       status === "pending" ? "" : status,
@@ -1321,7 +1376,7 @@ export class RailTuiRenderer implements PresentationRenderer {
       round !== undefined
         ? isFixing
           ? `  fix ${round}`
-          : `  round ${round + 1}`
+          : `  analysis ${round + 1}`
         : "";
     const all = logTail(this.#artifactsDir, `${stage}_r${round}.log`, this.#stageLogs);
     const room = Math.max(0, rows - 1);
@@ -1353,7 +1408,7 @@ export class RailTuiRenderer implements PresentationRenderer {
         segs: [
           "  ",
           [
-            `${title(stage)} round ${(gate.round ?? 0) + 1}${this.#glyph.sep}waiting ${elapsed(now - this.#gateOpenedAt)}`,
+            `${title(stage)} analysis ${(gate.round ?? 0) + 1}${this.#glyph.sep}waiting ${elapsed(now - this.#gateOpenedAt)}`,
             SGR.dim,
           ],
         ],

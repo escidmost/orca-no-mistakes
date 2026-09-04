@@ -385,6 +385,61 @@ test("ONM-88 tracks fixed, approved, open, and retained findings separately", ()
   }
 });
 
+test("targeted fixes preserve unselected findings as approved", () => {
+  const ledger = new DomainLedger(":memory:");
+  try {
+    const runId = "targeted-finding-dispositions";
+    startRun(ledger, runId);
+    const publisher = new PresentationPublisher(ledger, runId);
+    publisher.publish("findings", {
+      actionable: 2,
+      findings: [
+        { description: "Fix this", id: "fix-this", severity: "error" },
+        { description: "Accept this", id: "accept-this", severity: "warning" },
+      ],
+      kind: "findings-recorded",
+      round: 0,
+      stage: "review",
+      total: 2,
+    });
+    publisher.publish("gate:targeted-fix", {
+      decision: "fix",
+      gateId: "gate-review",
+      kind: "gate-resolved",
+      round: 0,
+      stage: "review",
+      targetFindingIds: ["fix-this"],
+    });
+
+    const stage = publisher.current.stages.find((item) => item.id === "review")!;
+    assert.deepEqual(
+      stage.findings?.map((finding) => [finding.id, finding.disposition]),
+      [
+        ["fix-this", "open"],
+        ["accept-this", "approved"],
+      ],
+    );
+    assert.deepEqual(
+      [stage.fixedFindings, stage.approvedFindings, stage.openFindings],
+      [0, 1, 1],
+    );
+    publisher.publish("fix:completed", {
+      approvedFindings: 1,
+      findingIds: ["fix-this"],
+      kind: "fix-completed",
+      round: 1,
+      stage: "review",
+    });
+    const completed = publisher.current.stages.find((item) => item.id === "review")!;
+    assert.deepEqual(
+      [completed.fixedFindings, completed.approvedFindings, completed.openFindings],
+      [1, 1, 0],
+    );
+  } finally {
+    ledger.close();
+  }
+});
+
 test("plain status uses stderr while structured result remains on stdout", () => {
   const moduleUrl = new URL("../scripts/presentation.ts", import.meta.url).href;
   const script = `

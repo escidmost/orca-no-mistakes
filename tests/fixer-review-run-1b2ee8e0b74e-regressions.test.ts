@@ -301,7 +301,7 @@ test("invalid finding error message is structural and does not disclose payload 
   );
 });
 
-test("selective fixes display fixing glyph only for targeted findings while unselected findings remain open", async () => {
+test("selective fixes distinguish targeted fixes from approved findings", async () => {
   const ledger = new DomainLedger(":memory:");
   const runId = "selective-fix-glyphs";
   ledger.startRun({
@@ -369,7 +369,7 @@ test("selective fixes display fixing glyph only for targeted findings while unse
 
   const screen = cleanScreen(output.writes.at(-1) ?? "");
   assert.match(screen, /F\s+finding-fix/);
-  assert.match(screen, /○\s+finding-leave/);
+  assert.match(screen, /~\s+finding-leave/);
 
   renderer.close();
 });
