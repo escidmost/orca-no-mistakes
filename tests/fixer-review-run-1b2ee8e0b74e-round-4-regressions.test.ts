@@ -304,7 +304,7 @@ test("narrow 80x18 terminal reserves at least two detail rows when logs are focu
   ledger.close();
 });
 
-test("validateReport rejects invalid file and line types instead of silently dropping them", async () => {
+test("validateReport repairs invalid file and line types instead of silently dropping them", async () => {
   const git = new FakeGit();
   const orca = new FakeOrca("run-invalid-location");
 
@@ -324,12 +324,12 @@ test("validateReport rejects invalid file and line types instead of silently dro
     },
   ]);
 
-  await assert.rejects(
-    runPipeline(
-      { intent: "Handle report rejection when invalid location fields are rejected" },
-      orca,
-      git,
-    ),
-    /review worker returned an invalid finding: index 0 \(invalid fields: file, line\)/,
+  await runPipeline(
+    { intent: "Handle report rejection when invalid location fields are rejected" },
+    orca,
+    git,
   );
+  const reviewTasks = orca.tasks.filter((task) => task.spec.startsWith("[review check 1]"));
+  assert.equal(reviewTasks.length, 2);
+  assert.match(reviewTasks[1].spec, /REPORT REPAIR/);
 });

@@ -638,7 +638,7 @@ export class RailTuiRenderer implements PresentationRenderer {
       case "fix-completed": {
         const stageName = title(transition.stage);
         const fixPrefix = fixLabel(stageName, transition.round);
-        const results = [activityCount(transition.findingIds.length, "fixed")];
+        const results = [activityCount(transition.findingIds.length, "applied")];
         if (transition.approvedFindings > 0) {
           results.push(activityCount(transition.approvedFindings, "approved"));
         }

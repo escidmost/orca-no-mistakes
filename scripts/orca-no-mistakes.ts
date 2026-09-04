@@ -3001,16 +3001,27 @@ export async function runPipeline(
                 : "low";
             const pipelineReportSteps: PullRequestPipelineStep[] = pipelineSteps
               .slice(0, pipelineSteps.indexOf("pr"))
-              .map((completedStage) => ({
-                details: pullRequestStageDetails(
+              .map((completedStage) => {
+                const decision = latestEntryByStage.get(completedStage)?.waiverOrApproval?.decision;
+                const status = decision === "approve"
+                  ? "approved"
+                  : decision === "skip"
+                    ? "skipped"
+                    : "success";
+                const details = pullRequestStageDetails(
                   reportsByStage.get(completedStage) ?? [{
                     findings: [],
                     summary: `${completedStage} passed.`,
                   }],
-                ),
-                name: completedStage,
-                status: "success",
-              }));
+                );
+                return {
+                  details: status === "success"
+                    ? details
+                    : `${details}\n\nPipeline decision: ${status}.`,
+                  name: completedStage,
+                  status,
+                };
+              });
             content = pullRequestContent(intent, {
               candidateCommitOid: stageInputCommitOid,
               pipelineSteps: pipelineReportSteps,
@@ -4336,12 +4347,15 @@ export type WorkerLaunchOutcome = {
 // ponytail: two repair retries; repeated invalid or unreadable output remains a hard failure.
 const WORKER_REPORT_RETRY_LIMIT = 2;
 
+class WorkerReportValidationError extends Error {}
+
 function isRepairableWorkerReportError(error: unknown): boolean {
   return (
-    error instanceof Error &&
-    /(?:returned an invalid report|report could not be read)(?:$|:)/u.test(
-      error.message,
-    )
+    error instanceof WorkerReportValidationError ||
+    (error instanceof Error &&
+      /(?:returned an invalid report|report could not be read)(?:$|:)/u.test(
+        error.message,
+      ))
   );
 }
 
@@ -4356,7 +4370,7 @@ function repairWorkerReportLaunch(launch: WorkerLaunch): WorkerLaunch {
     prompt: `${launch.prompt}
 
 REPORT REPAIR: the previous response did not produce a valid report. Retry the task and follow the delivery contract exactly.
-${deliveryInstruction(delivery, launch.reportPath ?? "", shape)}`,
+${deliveryInstruction(delivery, launch.reportPath ?? "", shape, launch.stage, launch.role)}`,
     ...(launch.retainedWorktreeId || launch.terminal
       ? {
           retainedWorktreeId: undefined,
@@ -5211,7 +5225,7 @@ async function validateReport(
     (report.riskRationale !== undefined &&
       typeof report.riskRationale !== "string")
   ) {
-    throw new Error(`${stage} worker returned an invalid report`);
+    throw new WorkerReportValidationError(`${stage} worker returned an invalid report`);
   }
   const normalizedReport = {
     ...report,
@@ -5326,8 +5340,8 @@ async function validateReport(
   for (const [index, finding] of normalizedReport.findings.entries()) {
     if (!isValidFinding(finding)) {
       const invalidFields = invalidFindingFields(finding);
-      throw new Error(
-        `${stage} worker returned an invalid finding: index ${index} (invalid fields: ${invalidFields.join(", ")})`,
+      throw new WorkerReportValidationError(
+        `${stage} worker returned an invalid finding: index ${index} (invalid fields: ${invalidFields.join(", ")}). Allowed actions: auto-fix, ask-user, no-op. Allowed severities: error, warning, info, no-op`,
       );
     }
   }
@@ -5337,17 +5351,17 @@ async function validateReport(
   for (const artifact of artifacts) {
     const resolved = path.resolve(evidenceRoot, artifact);
     if (!isWithin(evidenceRoot, resolved)) {
-      throw new Error(`${stage} worker returned an unsafe artifact path`);
+      throw new WorkerReportValidationError(`${stage} worker returned an unsafe artifact path`);
     }
     let canonicalArtifact: string;
     try {
       await stat(resolved);
       canonicalArtifact = await realpath(resolved);
     } catch {
-      throw new Error(`${stage} worker returned a missing artifact`);
+      throw new WorkerReportValidationError(`${stage} worker returned a missing artifact`);
     }
     if (!isWithin(canonicalEvidenceRoot, canonicalArtifact)) {
-      throw new Error(`${stage} worker returned an unsafe artifact path`);
+      throw new WorkerReportValidationError(`${stage} worker returned an unsafe artifact path`);
     }
   }
   return normalizedReport as StageReport;
@@ -5359,7 +5373,7 @@ async function validateFixerReport(
   evidenceRoot: string,
 ): Promise<StageReport> {
   if (!Array.isArray(report?.findings)) {
-    throw new Error(`${stage} fixer returned an invalid report`);
+    throw new WorkerReportValidationError(`${stage} fixer returned an invalid report`);
   }
   return validateReport({ ...report, findings: [] }, stage, evidenceRoot);
 }
@@ -5672,7 +5686,7 @@ ${checkerInstructions(stage)}
 
 Do not edit or commit files. Do not invoke no-mistakes or Orca pipeline controls. Inspect the actual diff and execute only focused checks needed for this phase.
 
-${deliveryInstruction(delivery, reportPath, shape)} Use auto-fix only for a concrete mechanical repair. Use ask-user for product choices, intent conflicts, destructive actions, credentials, or uncertain delivery state. An empty findings array means this phase passed.`;
+${deliveryInstruction(delivery, reportPath, shape, stage, "reviewer")} Use auto-fix only for a concrete mechanical repair. Use ask-user for product choices, intent conflicts, destructive actions, credentials, or uncertain delivery state. An empty findings array means this phase passed.`;
 }
 
 function fixerInstructions(stage: StageName): string {
@@ -5751,6 +5765,8 @@ function deliveryInstruction(
   delivery: DeliveryChannel,
   reportPath: string,
   shape: string,
+  stage: StageName,
+  role: WorkerLaunch["role"],
 ): string {
   if (delivery === "acp") {
     return `Reply with exactly one JSON object as your final message, with nothing before or after it, in this shape:
@@ -5758,10 +5774,13 @@ ${shape}
 
 Do not write a report file and do not call worker_done: your final message is the report.`;
   }
-  return `Evidence belongs outside the repository at ${reportPath}. Write one JSON object to ${reportPath} with this shape:
+  return `Evidence belongs outside the repository at ${reportPath}. Produce one JSON object with this shape:
 ${shape}
 
-Create the parent directory if needed. Then report exactly once with worker_done: keep --body to the required three-sentence executive summary and pass --report-path ${reportPath}.`;
+Pipe that object to this command instead of writing the report directly:
+./bin/orca-no-mistakes report --stage ${stage} --role ${role} --out ${shellQuote(reportPath)}
+
+The command rejects invalid values and writes the report only after validation. Correct any reported error before continuing. Then report exactly once with worker_done: keep --body to the required three-sentence executive summary and pass --report-path ${reportPath}.`;
 }
 
 function fixerPrompt(
@@ -5786,7 +5805,7 @@ Protected policy guardrails:
 - If a valid fix appears to require a protected change, make no such change and report the conflict in your summary.
 ${fixerInstructions(stage)}
 
-${deliveryInstruction(delivery, reportPath, `{"findings":[],"summary":"what was fixed and committed","tested":["focused command"]}`)}`;
+${deliveryInstruction(delivery, reportPath, `{"findings":[],"summary":"what was fixed and committed","tested":["focused command"]}`, stage, "fixer")}`;
 }
 
 const FINDING_DECISION_HISTORY_LIMIT_BYTES = 16 * 1024;
@@ -10644,9 +10663,11 @@ const VALUE_FLAGS = new Set([
   "repo",
   "resume",
   "reviewer-model",
+  "role",
   "readiness",
   "run-id",
   "gate",
+  "stage",
   "upstream",
 ]);
 const COMMAND_FLAGS: Record<string, Set<string>> = {
@@ -10654,6 +10675,7 @@ const COMMAND_FLAGS: Record<string, Set<string>> = {
   gate: new Set(["admission-id", "gate", "launch-nonce", "readiness", "run-id"]),
   init: new Set(["base-branch", "fork", "head-branch", "repo", "upstream"]),
   prune: new Set(["before", "repo", "stranded"]),
+  report: new Set(["out", "role", "stage"]),
   run: new Set([
     "admission-id",
     "admission-materialized",
@@ -14658,6 +14680,51 @@ async function readStandardInput(): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
+async function runWorkerReportCommand(flags: RawCliFlags): Promise<void> {
+  const stageValue = stringFlag(flags, "stage");
+  const role = stringFlag(flags, "role");
+  const outputValue = stringFlag(flags, "out");
+  if (!stageValue || !PIPELINE_STEPS.includes(stageValue as StageName)) {
+    throw new Error(`report requires --stage <${PIPELINE_STEPS.join("|")}>`);
+  }
+  if (role !== "reviewer" && role !== "fixer") {
+    throw new Error("report requires --role <reviewer|fixer>");
+  }
+  if (!outputValue || !path.isAbsolute(outputValue)) {
+    throw new Error("report requires an absolute --out path");
+  }
+
+  let report: StageReport;
+  try {
+    report = JSON.parse(await readStandardInput()) as StageReport;
+  } catch {
+    throw new WorkerReportValidationError("report stdin must be exactly one JSON object");
+  }
+
+  const stage = stageValue as StageName;
+  const output = path.resolve(outputValue);
+  if (!isWithin(path.resolve(artifactsRoot()), output)) {
+    throw new Error("report --out must be inside the orca-no-mistakes artifacts directory");
+  }
+  const evidenceRoot = path.dirname(output);
+  const validated = role === "fixer"
+    ? await validateFixerReport(report, stage, evidenceRoot)
+    : await validateReport(report, stage, evidenceRoot);
+  await mkdir(evidenceRoot, { recursive: true, mode: 0o700 });
+  const temporary = `${output}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporary, `${JSON.stringify(validated, null, 2)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600,
+    });
+    await rename(temporary, output);
+  } finally {
+    await rm(temporary, { force: true });
+  }
+  console.log(JSON.stringify({ ok: true, reportPath: output }));
+}
+
 async function spawnAdmissionCoordinator(
   metadata: GateMetadata,
   admissionId: string,
@@ -14944,6 +15011,7 @@ export async function main(argv: string[]): Promise<void> {
   orca-no-mistakes init [--repo <path>] [--upstream <url|nwo>] [--fork <url|nwo>] [--base-branch <branch>] [--head-branch <branch>]
   orca-no-mistakes gate admit --gate <path>
   orca-no-mistakes gate coordinator --gate <path> --admission-id <id> --readiness <path> --launch-nonce <nonce>
+  orca-no-mistakes report --stage <stage> --role <reviewer|fixer> --out <absolute-path>
   orca-no-mistakes attestation export <run-id|commit-sha> [--out <path>] [--repo <path>]
   orca-no-mistakes attestation verify <manifest-file|run-id|commit-sha> [--repo <path>]
   orca-no-mistakes prune [--before <date>] [--repo <path>]
@@ -14992,6 +15060,10 @@ Run options:
   }
   if (parsed.command === "attestation") {
     await runAttestationCommand(parsed.positionals, parsed.flags);
+    return;
+  }
+  if (parsed.command === "report") {
+    await runWorkerReportCommand(parsed.flags);
     return;
   }
   if (parsed.command === "prune") {

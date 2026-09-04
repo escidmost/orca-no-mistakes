@@ -715,7 +715,7 @@ if (process.env.TUI_FIXTURE === "1") {
     assert.match(screen, /Intent started/u);
     assert.match(screen, /Rebase started/u);
     assert.match(screen, /Review analysis 1 ·  5 found/u);
-    assert.match(screen, /Review fix 1\s+·  5 fixed ·  1 approved/u);
+    assert.match(screen, /Review fix 1\s+·  5 applied ·  1 approved/u);
     assert.match(screen, /Review analysis 2 ·  3 found/u);
     assert.match(screen, /Test analysis 1/u);
     const activityLines = screen.split("\n").filter((line) => /Review (?:analysis|fix)/u.test(line));

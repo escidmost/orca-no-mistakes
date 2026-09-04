@@ -358,7 +358,7 @@ test("historical open PR receipt does not bypass PR stage on resume", async () =
           githubAuthority: authority as any,
           intent: "Resume with open PR",
           publicationDestination: "owner/repo",
-          publicationRunner: async () => ({ exitCode: 0, stderr: "", stdout: "" }),
+          publicationRunner: async () => ({ code: 0, stderr: "", stdout: "" }),
           resumeRunId: runId,
         },
         operations,
@@ -411,7 +411,7 @@ test("ledger recordCheckpoint atomically commits checkpoint and presentation sna
         stage: "review" as const,
       },
       updatedAt: new Date().toISOString(),
-      version: 1,
+      version: 1 as const,
     };
 
     ledger.recordCheckpoint(

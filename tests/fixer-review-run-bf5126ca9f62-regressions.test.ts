@@ -373,8 +373,8 @@ test("Finding 2: RailTuiRenderer records each completed fix cycle immediately", 
   // Each fix row reports that cycle, not the cumulative fixed total.
   await nextDraw();
   let screen = cleanScreen(output.writes.at(-1) ?? "");
-  assert.match(screen, /Review fix 1\s+·  1 fixed/u);
-  assert.match(screen, /Review fix 2\s+·  1 fixed/u);
+  assert.match(screen, /Review fix 1\s+·  1 applied/u);
+  assert.match(screen, /Review fix 2\s+·  1 applied/u);
 
   // Analysis 3 starts only after fix 2 has been recorded.
   renderer.render({

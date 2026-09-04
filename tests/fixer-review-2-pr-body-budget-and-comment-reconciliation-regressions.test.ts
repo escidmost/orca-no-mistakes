@@ -52,3 +52,17 @@ test('pullRequestContent bounds escaped evidence and tiny remaining detail budge
   assert.doesNotMatch(result.body, /<pre><+/)
   assert.match(result.body, /<summary>&lt;&lt;/)
 })
+
+test('pullRequestContent attests approved stages without calling them successful', () => {
+  const result = pullRequestContent('docs: publish reviewed change', {
+    candidateCommitOid: OID,
+    pipelineSteps: [{ details: 'One finding was approved as-is.\n\nPipeline decision: approved.', name: 'review', status: 'approved' }],
+    risk: { level: 'low', rationale: 'The remaining finding was accepted.' },
+    testing: { artifacts: [], summary: 'No runtime behavior changed.', tested: [] },
+    whatChanged: 'Updated documentation.'
+  })
+
+  assert.match(result.body, /<summary>review: approved<\/summary>/)
+  assert.match(result.body, /"step":"review","status":"approved"/)
+  assert.doesNotMatch(result.body, /"step":"review","status":"success"/)
+})

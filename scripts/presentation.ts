@@ -600,7 +600,7 @@ export class PlainStatusRenderer implements PresentationRenderer {
         line = `${prefix} ${event.stage} round ${event.round} started`;
         break;
       case "fix-completed":
-        line = `${prefix} ${event.stage} fix ${event.round} completed fixed=${event.findingIds.length} approved=${event.approvedFindings}`;
+        line = `${prefix} ${event.stage} fix ${event.round} completed applied=${event.findingIds.length} approved=${event.approvedFindings}`;
         break;
       case "findings-recorded":
         {

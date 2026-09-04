@@ -288,10 +288,10 @@ test('runPipeline reuses published PR content on stage resume without redrafting
     )
 
     assert.equal(prDraftCount, 1)
-    assert.equal(pullRequest?.state, 'OPEN')
+    assert.equal((pullRequest as Record<string, unknown> | null)?.state, 'OPEN')
 
     pullRequest = {
-      ...pullRequest!,
+      ...(pullRequest as unknown as Record<string, unknown>),
       state: 'MERGED'
     }
     failAwaitingMerge = false

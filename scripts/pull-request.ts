@@ -79,21 +79,23 @@ function after(earlier: string, candidate: string): string {
   return candidate > earlier ? candidate : new Date(Date.parse(earlier) + 1).toISOString()
 }
 
-export function neutralizeHtmlComments(content: string): string {
+export function escapeUntrustedMarkdown(content: string): string {
   return redactKnownSecrets(content)
-    .replaceAll(ATTESTATION_PREFIX, '&lt;!-- inert-attestation:v1 ')
-    .replaceAll('<!--', '&lt;!--')
-    .replaceAll('-->', '--&gt;')
-    .replaceAll('--!>', '--!&gt;')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
 }
 
 function capText(content: string, budget: number): string {
-  const redacted = neutralizeHtmlComments(content)
-  if (Buffer.byteLength(redacted) <= budget) return redacted
+  return capEscapedText(escapeUntrustedMarkdown(content), budget)
+}
+
+function capEscapedText(content: string, budget: number): string {
+  if (Buffer.byteLength(content) <= budget) return content
   const marker = '\n\n_[truncated to fit GitHub PR body limits]_'
   const markerBytes = Buffer.byteLength(marker)
   const available = Math.max(0, budget - (budget >= markerBytes ? markerBytes : 0))
-  let capped = Buffer.from(redacted).subarray(0, available).toString('utf8').replace(/\uFFFD$/u, '')
+  let capped = Buffer.from(content).subarray(0, available).toString('utf8').replace(/\uFFFD$/u, '')
   if (budget < markerBytes) return capped
   while (Buffer.byteLength(capped + marker) > budget) capped = capped.slice(0, -1)
   return capped + marker
@@ -109,13 +111,6 @@ export function capTitle(content: string, budget = 256): string {
   return capped
 }
 
-function htmlEscape(content: string): string {
-  return redactKnownSecrets(content)
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-}
-
 function testingSection(testing: PullRequestReport['testing']): string {
   const commands = testing.tested.length > 0
     ? `\n\nCommands and checks:\n${capText(testing.tested.map((command) => `- ${command}`).join('\n'), 4096)}`
@@ -124,11 +119,11 @@ function testingSection(testing: PullRequestReport['testing']): string {
   const artifacts: string[] = []
   for (const artifact of testing.artifacts) {
     const separatorBytes = artifacts.length > 0 ? Buffer.byteLength('\n\n') : 0
-    const name = capText(htmlEscape(artifact.name), 512)
+    const name = capText(artifact.name, 512)
     const framingBytes = Buffer.byteLength(`<details>\n<summary>${name}</summary>\n\n<pre></pre>\n\n</details>`) + separatorBytes
     if (remaining <= framingBytes) break
     const contentBudget = Math.min(ARTIFACT_BUDGET, remaining - framingBytes)
-    const content = capText(htmlEscape(artifact.content), contentBudget)
+    const content = capText(artifact.content, contentBudget)
     const entry = `<details>\n<summary>${name}</summary>\n\n<pre>${content}</pre>\n\n</details>`
     const entryBytes = Buffer.byteLength(entry) + separatorBytes
     if (entryBytes > remaining) break
@@ -147,8 +142,8 @@ function pipelineSection(candidateCommitOid: string, steps: PullRequestPipelineS
   const details: string[] = []
   for (const step of steps) {
     if (!step.details || remaining <= 0) continue
-    const name = capText(htmlEscape(step.name), 128)
-    const status = capText(htmlEscape(step.status), 128)
+    const name = capText(step.name, 128)
+    const status = capText(step.status, 128)
     const separatorBytes = details.length > 0 ? Buffer.byteLength('\n\n') : 0
     const framingBytes = Buffer.byteLength(`<details>\n<summary>${name}: ${status}</summary>\n\n\n\n</details>`) + separatorBytes
     if (remaining <= framingBytes) break
@@ -180,8 +175,8 @@ export function pullRequestContent(intent: string, report: PullRequestReport): {
   const framingBytes = Buffer.byteLength(`${intentPrefix}\n\n${whatChangedPrefix}\n\n${otherSections}\n`)
   const totalAvailable = Math.max(0, PULL_REQUEST_BODY_BUDGET - framingBytes)
 
-  const sanitizedWhatChanged = neutralizeHtmlComments(report.whatChanged)
-  const sanitizedIntent = neutralizeHtmlComments(redactedIntent)
+  const sanitizedWhatChanged = escapeUntrustedMarkdown(report.whatChanged)
+  const sanitizedIntent = escapeUntrustedMarkdown(redactedIntent)
 
   const whatChangedBytes = Buffer.byteLength(sanitizedWhatChanged)
   const intentBytes = Buffer.byteLength(sanitizedIntent)
@@ -194,11 +189,11 @@ export function pullRequestContent(intent: string, report: PullRequestReport): {
     finalIntent = sanitizedIntent
   } else if (whatChangedBytes + 256 <= totalAvailable) {
     finalWhatChanged = sanitizedWhatChanged
-    finalIntent = capText(sanitizedIntent, totalAvailable - whatChangedBytes)
+    finalIntent = capEscapedText(sanitizedIntent, totalAvailable - whatChangedBytes)
   } else {
-    finalIntent = capText(sanitizedIntent, Math.min(256, totalAvailable))
+    finalIntent = capEscapedText(sanitizedIntent, Math.min(256, totalAvailable))
     const availableForWhatChanged = Math.max(0, totalAvailable - Buffer.byteLength(finalIntent))
-    finalWhatChanged = capText(sanitizedWhatChanged, availableForWhatChanged)
+    finalWhatChanged = capEscapedText(sanitizedWhatChanged, availableForWhatChanged)
   }
 
   const body = `${intentPrefix}${finalIntent}\n\n${whatChangedPrefix}${finalWhatChanged}\n\n${otherSections}\n`

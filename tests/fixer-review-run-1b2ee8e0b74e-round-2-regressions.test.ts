@@ -239,7 +239,7 @@ function cleanScreen(text: string): string {
     .replaceAll("\r", "");
 }
 
-test("validateReport rejects contradictory severity no-op with explicit action auto-fix", async () => {
+test("validateReport repairs contradictory severity no-op with explicit action auto-fix", async () => {
   const git = new FakeGit();
   const orca = new FakeOrca("run-contradictory-report");
   orca.reports.set("review", [
@@ -256,17 +256,17 @@ test("validateReport rejects contradictory severity no-op with explicit action a
     },
   ]);
 
-  await assert.rejects(
-    runPipeline(
-      { intent: "Handle report rejection when contradictory finding is rejected" },
-      orca,
-      git,
-    ),
-    /review worker returned an invalid finding: index 0 \(invalid fields: severity\)/,
+  await runPipeline(
+    { intent: "Handle report rejection when contradictory finding is rejected" },
+    orca,
+    git,
   );
+  const reviewTasks = orca.tasks.filter((task) => task.spec.startsWith("[review check 1]"));
+  assert.equal(reviewTasks.length, 2);
+  assert.match(reviewTasks[1].spec, /REPORT REPAIR/);
 });
 
-test("validateReport rejects unsupported action or severity enum values", async () => {
+test("validateReport repairs unsupported action or severity enum values", async () => {
   const git = new FakeGit();
   const orca = new FakeOrca("run-unsupported-enum-report");
   orca.reports.set("review", [
@@ -283,14 +283,14 @@ test("validateReport rejects unsupported action or severity enum values", async 
     },
   ]);
 
-  await assert.rejects(
-    runPipeline(
-      { intent: "Handle report rejection when unsupported enums are rejected" },
-      orca,
-      git,
-    ),
-    /review worker returned an invalid finding: index 0 \(invalid fields: action\)/,
+  await runPipeline(
+    { intent: "Handle report rejection when unsupported enums are rejected" },
+    orca,
+    git,
   );
+  const reviewTasks = orca.tasks.filter((task) => task.spec.startsWith("[review check 1]"));
+  assert.equal(reviewTasks.length, 2);
+  assert.match(reviewTasks[1].spec, /REPORT REPAIR/);
 });
 
 test("matching auto-fix mode toggle persists operator event and restores on resume", async () => {

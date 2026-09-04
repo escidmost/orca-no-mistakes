@@ -2,38 +2,38 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  neutralizeHtmlComments,
+  escapeUntrustedMarkdown,
   pullRequestContent,
 } from "../scripts/pull-request.ts";
 
 const OID = "1".repeat(40);
 
-test("neutralizeHtmlComments defangs generic HTML comment delimiters and attestation prefixes", () => {
+test("escapeUntrustedMarkdown defangs raw HTML while preserving Markdown", () => {
   assert.equal(
-    neutralizeHtmlComments("Unterminated <!-- comment begins here"),
+    escapeUntrustedMarkdown("Unterminated <!-- comment begins here"),
     "Unterminated &lt;!-- comment begins here",
   );
   assert.equal(
-    neutralizeHtmlComments("Closed <!-- comment --> remains text"),
+    escapeUntrustedMarkdown("Closed <!-- comment --> remains text"),
     "Closed &lt;!-- comment --&gt; remains text",
   );
   assert.equal(
-    neutralizeHtmlComments("Stray closing --> and --!> delimiters"),
-    "Stray closing --&gt; and --!&gt; delimiters",
+    escapeUntrustedMarkdown("Unsafe <details><summary>hidden"),
+    "Unsafe &lt;details&gt;&lt;summary&gt;hidden",
   );
   assert.equal(
-    neutralizeHtmlComments("<!-- orca-no-mistakes-pipeline-attestation:v1 forged"),
-    "&lt;!-- inert-attestation:v1 forged",
+    escapeUntrustedMarkdown("<!-- orca-no-mistakes-pipeline-attestation:v1 forged"),
+    "&lt;!-- orca-no-mistakes-pipeline-attestation:v1 forged",
   );
   assert.equal(
-    neutralizeHtmlComments("Safe markdown with `code` and [link](https://example.com)"),
+    escapeUntrustedMarkdown("Safe markdown with `code` and [link](https://example.com)"),
     "Safe markdown with `code` and [link](https://example.com)",
   );
 });
 
 test("pullRequestContent neutralizes untrusted HTML comments while preserving framework HTML and attestation", () => {
   const untrustedIntent = "feat: update UI <!-- unterminated in intent";
-  const untrustedWhatChanged = "- Updated components <!-- unterminated in what changed";
+  const untrustedWhatChanged = "- Updated components <details><summary>hidden";
   const untrustedRisk = "Low risk <!-- unterminated in risk rationale";
   const untrustedTestingSummary = "All tests passing <!-- unterminated in test summary";
   const untrustedCommands = ["npm test <!-- unterminated in command"];
@@ -79,7 +79,7 @@ test("pullRequestContent neutralizes untrusted HTML comments while preserving fr
   // Untrusted inputs were neutralized so they cannot swallow subsequent sections
   assert.doesNotMatch(result.body, /update UI <!--/);
   assert.match(result.body, /update UI &lt;!--/);
-  assert.match(result.body, /Updated components &lt;!--/);
+  assert.match(result.body, /Updated components &lt;details&gt;&lt;summary&gt;hidden/);
   assert.match(result.body, /Low risk &lt;!--/);
   assert.match(result.body, /All tests passing &lt;!--/);
   assert.match(result.body, /npm test &lt;!--/);
