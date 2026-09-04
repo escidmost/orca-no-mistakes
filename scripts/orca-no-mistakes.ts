@@ -2987,7 +2987,7 @@ export async function runPipeline(
       const runStage = async () => {
         presentation.publish(
           `attempt:${presentation.current.attempt}:stage:${stage}:round:${round}:started`,
-          { kind: "round-started", round, stage },
+          { kind: "round-started", role: "reviewer", round, stage },
         );
         let execution: StageExecution;
         try {
@@ -3267,9 +3267,10 @@ export async function runPipeline(
 
         round += 1;
         presentation.publish(
-          `attempt:${presentation.current.attempt}:stage:${stage}:round:${round}:started`,
+          `attempt:${presentation.current.attempt}:stage:${stage}:round:${round}:fixer:started`,
           {
             kind: "round-started",
+            role: "fixer",
             round,
             stage,
             targetFindingIds: targetFindings.map((finding) => finding.id),
@@ -4194,7 +4195,7 @@ const WORKER_REPORT_RETRY_LIMIT = 2;
 function isRepairableWorkerReportError(error: unknown): boolean {
   return (
     error instanceof Error &&
-    /(?:returned an invalid (?:report|finding)|report could not be read)(?:$|:)/u.test(
+    /(?:returned an invalid report|report could not be read)(?:$|:)/u.test(
       error.message,
     )
   );
@@ -5164,10 +5165,10 @@ async function validateReport(
               .digest("hex")
               .slice(0, 12)}`;
       return {
+        id,
         action,
         description,
         ...(file !== undefined ? { file } : {}),
-        id,
         ...(line !== undefined ? { line } : {}),
         severity,
       };
@@ -5200,7 +5201,7 @@ async function validateReport(
       throw new Error(`${stage} worker returned an unsafe artifact path`);
     }
   }
-  return normalizedReport;
+  return normalizedReport as StageReport;
 }
 
 async function validateFixerReport(

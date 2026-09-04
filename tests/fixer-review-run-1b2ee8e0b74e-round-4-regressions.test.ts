@@ -322,48 +322,14 @@ test("validateReport rejects invalid file and line types instead of silently dro
       ],
       summary: "invalid report with bad file and line",
     },
-    {
-      findings: [
-        {
-          action: "auto-fix",
-          description: "Actionable finding with invalid location alias",
-          id: "invalid-loc-2",
-          location: {
-            line: -5,
-            path: "   ",
-          },
-          severity: "error",
-        } as unknown as Finding,
-      ],
-      summary: "invalid report with bad location alias",
-    },
-    {
-      findings: [
-        {
-          action: "auto-fix",
-          description: "Repaired finding with valid file and line",
-          file: "scripts/orca-no-mistakes.ts",
-          id: "valid-loc-1",
-          line: 42,
-          severity: "error",
-        },
-      ],
-      summary: "valid repaired report",
-    },
   ]);
-  orca.reports.set("fix", [
-    {
-      findings: [],
-      summary: "fixed the issue",
-    },
-  ]);
-  orca.reports.set("test", [pass("clean test")]);
 
-  await runPipeline(
-    { intent: "Handle report retry when invalid location fields are rejected" },
-    orca,
-    git,
+  await assert.rejects(
+    runPipeline(
+      { intent: "Handle report rejection when invalid location fields are rejected" },
+      orca,
+      git,
+    ),
+    /review worker returned an invalid finding: index 0 \(invalid fields: file, line\)/,
   );
-
-  assert.equal(orca.reports.get("review")?.length, 0);
 });

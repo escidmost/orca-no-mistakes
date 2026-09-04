@@ -36,6 +36,10 @@ type Output = {
   write(chunk: string): unknown;
 };
 
+export type TerminalInput = Input;
+export type TerminalOutput = Output;
+
+
 type Region = "activity" | "detail" | "logs" | "rail";
 
 type GateReturnState = {
@@ -242,7 +246,7 @@ export class RailTuiRenderer implements PresentationRenderer {
   readonly #resolveGate?: GateResolver;
   readonly #setAutoFix?: (enabled: boolean) => Promise<void> | void;
   readonly #stageLogs: ReadonlyMap<string, StageLog>;
-  readonly #color = !process.env.NO_COLOR && process.env.TERM !== "dumb";
+  readonly #color = process.env.NO_COLOR === undefined && process.env.TERM !== "dumb";
   readonly #glyph = /utf-?8/iu.test(
     process.env.LC_ALL || process.env.LC_CTYPE || process.env.LANG || "",
   )
@@ -572,6 +576,18 @@ export class RailTuiRenderer implements PresentationRenderer {
         if (transition.stage === "intent" || transition.stage === "rebase") return;
         const stageName = title(transition.stage);
         const roundNum = transition.round + 1;
+
+        if (transition.role === "fixer") {
+          const fixPrefix = `${stageName} fix ${transition.round}`;
+          if (!this.#activities.some((a) => a.stage === stage && a.label.startsWith(fixPrefix))) {
+            this.#activities.push({
+              at: clock(now),
+              label: fixPrefix,
+              stage,
+            });
+          }
+          break;
+        }
 
         if (roundNum > 1) {
           const priorRoundPrefix = `${stageName} round ${roundNum - 1}`;
@@ -1124,9 +1140,19 @@ export class RailTuiRenderer implements PresentationRenderer {
     const stage = this.#selectedStageId();
     const state = snapshot.stages.find((item) => item.id === stage);
     const status = state?.status ?? "pending";
+    const isFixing =
+      state?.phase === "fixer" ||
+      (state?.status === "active" && (state?.round ?? 0) > 0) ||
+      this.#autoFixedStages.has(stage);
+    const roundLabel =
+      state?.round !== undefined && status !== "pending"
+        ? isFixing
+          ? `fix ${state.round}`
+          : `round ${state.round + 1}`
+        : "";
     const meta = [
       status === "pending" ? "" : status,
-      state?.round !== undefined && status !== "pending" ? `round ${state.round + 1}` : "",
+      roundLabel,
       this.#stageDuration(stage, now),
       state?.retainedFixer ? "fixer retained" : "",
     ]
@@ -1180,9 +1206,6 @@ export class RailTuiRenderer implements PresentationRenderer {
         ],
       });
     }
-    const isFixing =
-      (state?.status === "active" && (state?.round ?? 0) > 0) ||
-      this.#autoFixedStages.has(stage);
     const targetFindingIds = state?.targetFindingIds
       ? new Set(state.targetFindingIds)
       : undefined;
@@ -1193,7 +1216,7 @@ export class RailTuiRenderer implements PresentationRenderer {
       const isTargetFixing =
         targetFindingIds !== undefined
           ? targetFindingIds.has(finding.id)
-          : false;
+          : true;
       if (finding.disposition === "fixed") {
         dispGlyph = glyph.fixed;
         color = SGR.green;
@@ -1282,7 +1305,17 @@ export class RailTuiRenderer implements PresentationRenderer {
     const snapshot = this.#snapshot!;
     const stage = this.#selectedStageId();
     const state = snapshot.stages.find((item) => item.id === stage);
+    const isFixing =
+      state?.phase === "fixer" ||
+      (state?.status === "active" && (state?.round ?? 0) > 0) ||
+      this.#autoFixedStages.has(stage);
     const round = state?.round ?? 0;
+    const roundLabel =
+      round !== undefined
+        ? isFixing
+          ? `  fix ${round}`
+          : `  round ${round + 1}`
+        : "";
     const all = logTail(this.#artifactsDir, `${stage}_r${round}.log`, this.#stageLogs);
     const room = Math.max(0, rows - 1);
     this.#logOffset = Math.min(this.#logOffset, Math.max(0, all.length - room));
@@ -1294,7 +1327,7 @@ export class RailTuiRenderer implements PresentationRenderer {
         segs: [
           `${focused ? ">" : " "} `,
           [`${title(stage).toUpperCase()} LOG`, focused ? `${SGR.accent};${SGR.bold}` : SGR.bold],
-          [round !== undefined ? `  round ${round + 1}` : "", SGR.dim],
+          [roundLabel, SGR.dim],
         ],
       },
       ...visible.map((line) => ({ segs: [line] })),

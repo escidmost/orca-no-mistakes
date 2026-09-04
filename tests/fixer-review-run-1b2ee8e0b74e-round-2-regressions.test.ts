@@ -239,7 +239,7 @@ function cleanScreen(text: string): string {
     .replaceAll("\r", "");
 }
 
-test("validateReport rejects contradictory severity no-op with explicit action auto-fix and retries report", async () => {
+test("validateReport rejects contradictory severity no-op with explicit action auto-fix", async () => {
   const git = new FakeGit();
   const orca = new FakeOrca("run-contradictory-report");
   orca.reports.set("review", [
@@ -254,38 +254,19 @@ test("validateReport rejects contradictory severity no-op with explicit action a
       ],
       summary: "first invalid report with contradictory finding",
     },
-    {
-      findings: [
-        {
-          action: "auto-fix",
-          description: "Repaired finding with valid error severity",
-          id: "valid-1",
-          severity: "error",
-        },
-      ],
-      summary: "repaired report with valid finding",
-    },
   ]);
-  orca.reports.set("fix", [
-    {
-      findings: [],
-      summary: "fixed the issue",
-    },
-  ]);
-  orca.reports.set("test", [pass("clean test")]);
 
-  await runPipeline(
-    { intent: "Handle report retry when contradictory finding is rejected" },
-    orca,
-    git,
+  await assert.rejects(
+    runPipeline(
+      { intent: "Handle report rejection when contradictory finding is rejected" },
+      orca,
+      git,
+    ),
+    /review worker returned an invalid finding: index 0 \(invalid fields: severity\)/,
   );
-
-  const reviewDispatches = orca.calls.filter((c) => c.startsWith("run:") || orca.tasks.some((t) => t.spec.includes("review")));
-  assert.ok(reviewDispatches.length > 0);
-  assert.equal(orca.reports.get("review")?.length, 0);
 });
 
-test("validateReport rejects unsupported action or severity enum values and retries report", async () => {
+test("validateReport rejects unsupported action or severity enum values", async () => {
   const git = new FakeGit();
   const orca = new FakeOrca("run-unsupported-enum-report");
   orca.reports.set("review", [
@@ -300,38 +281,16 @@ test("validateReport rejects unsupported action or severity enum values and retr
       ],
       summary: "first invalid report with unsupported action",
     },
-    {
-      findings: [
-        {
-          action: "ask-user",
-          description: "Finding with unsupported severity enum",
-          id: "unsupported-2",
-          severity: "critical",
-        } as unknown as Finding,
-      ],
-      summary: "second invalid report with unsupported severity",
-    },
-    {
-      findings: [
-        {
-          body: "A valid non-blocking note.",
-          location: { line: 5, path: "file.ts" },
-          severity: "no-op",
-          title: "Valid no-op note",
-        } as unknown as Finding,
-      ],
-      summary: "repaired report with valid no-op alias",
-    },
   ]);
-  orca.reports.set("test", [pass("clean test")]);
 
-  await runPipeline(
-    { intent: "Handle report retry when unsupported enums are rejected" },
-    orca,
-    git,
+  await assert.rejects(
+    runPipeline(
+      { intent: "Handle report rejection when unsupported enums are rejected" },
+      orca,
+      git,
+    ),
+    /review worker returned an invalid finding: index 0 \(invalid fields: action\)/,
   );
-
-  assert.equal(orca.reports.get("review")?.length, 0);
 });
 
 test("matching auto-fix mode toggle persists operator event and restores on resume", async () => {

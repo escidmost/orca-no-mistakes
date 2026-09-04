@@ -706,6 +706,36 @@ if (process.env.TUI_FIXTURE === "1") {
     renderer.close();
   });
 
+  test("fixer execution displays fix 1 instead of round 2 in activity, detail header, and log header", async () => {
+    const input = new FakeInput();
+    const output = new FakeOutput();
+    output.columns = 100;
+    output.rows = 24;
+    const renderer = new RailTuiRenderer(input, output, "/unused");
+
+    const base = snapshot("review", 1);
+    renderer.render({ ...base, transition: { kind: "round-started", role: "reviewer", round: 0, stage: "review" } });
+    renderer.render({ ...base, transition: { actionable: 2, kind: "findings-recorded", round: 0, stage: "review", total: 2 } });
+    renderer.render({ ...base, transition: { decision: "fix", gateId: "g1", kind: "gate-resolved", round: 0, stage: "review" } });
+
+    // Fixer starts (round-started with role: "fixer", round: 1)
+    const fixingSnapshot = {
+      ...base,
+      stages: base.stages.map((s) => (s.id === "review" ? { ...s, phase: "fixer" as const, round: 1, status: "active" as const } : s)),
+    };
+    renderer.render({
+      ...fixingSnapshot,
+      transition: { kind: "round-started", role: "fixer", round: 1, stage: "review" },
+    });
+
+    await nextDraw();
+    const screen = cleanScreen(output.writes.at(-1) ?? "");
+    assert.match(screen, /Review fix 1/u);
+    assert.doesNotMatch(screen, /Review round 2/u);
+    assert.match(screen, /REVIEW.*fix 1/u);
+    renderer.close();
+  });
+
   test("finding names wrap on hyphens without truncation", async () => {
     const input = new FakeInput();
     const output = new FakeOutput();
@@ -821,6 +851,30 @@ if (process.env.TUI_FIXTURE === "1") {
       else process.env.ONM_TEST_PASSWORD = previousPassword;
       if (previousNoColor === undefined) delete process.env.NO_COLOR;
       else process.env.NO_COLOR = previousNoColor;
+    }
+  });
+
+  test("empty NO_COLOR presence disables color styling", async () => {
+    const previousNoColor = process.env.NO_COLOR;
+    const previousTerm = process.env.TERM;
+    process.env.NO_COLOR = "";
+    process.env.TERM = "xterm-256color";
+    const input = new FakeInput();
+    const output = new FakeOutput();
+    const renderer = new RailTuiRenderer(input, output, "/unused");
+    const base = snapshot("review", 1);
+    try {
+      renderer.render(base);
+      await nextDraw();
+      const frame = output.writes.at(-1) ?? "";
+      assert.equal(frame.includes("\u001b[3"), false);
+      assert.equal(frame.includes("\u001b[0m"), false);
+    } finally {
+      renderer.close();
+      if (previousNoColor === undefined) delete process.env.NO_COLOR;
+      else process.env.NO_COLOR = previousNoColor;
+      if (previousTerm === undefined) delete process.env.TERM;
+      else process.env.TERM = previousTerm;
     }
   });
 

@@ -28,6 +28,7 @@ export type PresentationTransition =
   | { kind: "stage-started"; stage: StageName }
   | {
       kind: "round-started";
+      role?: "fixer" | "reviewer";
       round: number;
       stage: StageName;
       targetFindingIds?: readonly string[];
@@ -92,6 +93,7 @@ export type PresentationSnapshot = {
     fixedFindings?: number;
     id: StageName;
     openFindings?: number;
+    phase?: "fixer" | "reviewer";
     retainedFixer?: boolean;
     round: number;
     status: "pending" | "active" | "blocked" | "passed" | "failed" | "cancelled";
@@ -231,6 +233,7 @@ function nextSnapshot(
         ...next,
         currentStage: transition.stage,
         stages: updateStage(next, transition.stage, {
+          phase: transition.role,
           round: transition.round,
           status: "active",
           ...(transition.targetFindingIds !== undefined
