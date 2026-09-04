@@ -3679,6 +3679,36 @@ export class DomainLedger {
     return undefined
   }
 
+  publishedPullRequestContent(
+    runId: string,
+    candidateCommitOid?: string
+  ): { body: string; title: string } | undefined {
+    const route = this.publicationRoute(runId)
+    if (!route) return undefined
+    const rows = this.#db.prepare(
+      `SELECT m.payload_json
+       FROM mutation_intents m
+       JOIN run_attempts a ON a.attempt_id = m.attempt_id AND a.run_id = m.run_id
+       WHERE m.run_id = ? AND m.kind = 'pull-request' AND m.target_fingerprint = ?
+       ORDER BY a.generation_token DESC, m.rowid DESC`
+    ).all(runId, route.route_fingerprint) as Array<{ payload_json: string }>
+    for (const row of rows) {
+      try {
+        const payload = JSON.parse(row.payload_json) as Record<string, unknown>
+        if (
+          payload.action === 'ensure-body-and-await-merge' &&
+          typeof payload.title === 'string' &&
+          typeof payload.body === 'string' &&
+          (!candidateCommitOid || payload.candidateCommitOid === candidateCommitOid)
+        ) {
+          return { body: payload.body, title: payload.title }
+        }
+      } catch {
+      }
+    }
+    return undefined
+  }
+
   #remoteObservationMatches(input: {
     allowHistoricalAttempt?: boolean
     candidateCommitOid: string

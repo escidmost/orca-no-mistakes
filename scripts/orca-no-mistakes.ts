@@ -2952,66 +2952,75 @@ export async function runPipeline(
               stage: entry.stage_id,
             })),
           });
-          const draft = await executeStage(
-            "pr",
-            0,
-            remoteRound,
-            taskId,
-            intent,
-            artifactsDir,
-            repo,
-            orca,
-            git,
-            pipelineConfig.stages.pr,
-            stageLogs,
-            decisionHistory(),
+          const retainedContent = ledger.publishedPullRequestContent(
+            runId,
+            stageInputCommitOid,
           );
-          if (draft.report.findings.length > 0) {
-            throw new Error("PR drafting worker returned findings instead of PR content");
+          let content: { body: string; title: string };
+          if (retainedContent) {
+            content = retainedContent;
+          } else {
+            const draft = await executeStage(
+              "pr",
+              0,
+              remoteRound,
+              taskId,
+              intent,
+              artifactsDir,
+              repo,
+              orca,
+              git,
+              pipelineConfig.stages.pr,
+              stageLogs,
+              decisionHistory(),
+            );
+            if (draft.report.findings.length > 0) {
+              throw new Error("PR drafting worker returned findings instead of PR content");
+            }
+            const reviewReport = latestReportByStage.get("review");
+            const testReport = latestReportByStage.get("test");
+            const inferredRisk = reviewReport?.findings.some(
+              (finding) => finding.severity === "error",
+            )
+              ? "high"
+              : reviewReport?.findings.some(
+                    (finding) => finding.severity === "warning",
+                  )
+                ? "medium"
+                : "low";
+            const pipelineReportSteps: PullRequestPipelineStep[] = pipelineSteps
+              .slice(0, pipelineSteps.indexOf("pr"))
+              .map((completedStage) => ({
+                details: pullRequestStageDetails(
+                  reportsByStage.get(completedStage) ?? [{
+                    findings: [],
+                    summary: `${completedStage} passed.`,
+                  }],
+                ),
+                name: completedStage,
+                status: "success",
+              }));
+            content = pullRequestContent(intent, {
+              candidateCommitOid: stageInputCommitOid,
+              pipelineSteps: pipelineReportSteps,
+              risk: {
+                level: reviewReport?.riskLevel ?? inferredRisk,
+                rationale:
+                  reviewReport?.riskRationale ??
+                  reviewReport?.summary ??
+                  "The validated pipeline found no material review risk.",
+              },
+              testing: {
+                artifacts: await pullRequestArtifacts(artifactsDir, testReport),
+                summary:
+                  testReport?.summary ??
+                  "No dedicated test stage was required by the validated pipeline plan.",
+                tested: testReport?.tested ?? [],
+              },
+              title: draft.report.title,
+              whatChanged: draft.report.summary,
+            });
           }
-          const reviewReport = latestReportByStage.get("review");
-          const testReport = latestReportByStage.get("test");
-          const inferredRisk = reviewReport?.findings.some(
-            (finding) => finding.severity === "error",
-          )
-            ? "high"
-            : reviewReport?.findings.some(
-                  (finding) => finding.severity === "warning",
-                )
-              ? "medium"
-              : "low";
-          const pipelineReportSteps: PullRequestPipelineStep[] = pipelineSteps
-            .slice(0, pipelineSteps.indexOf("pr"))
-            .map((completedStage) => ({
-              details: pullRequestStageDetails(
-                reportsByStage.get(completedStage) ?? [{
-                  findings: [],
-                  summary: `${completedStage} passed.`,
-                }],
-              ),
-              name: completedStage,
-              status: "success",
-            }));
-          const content = pullRequestContent(intent, {
-            candidateCommitOid: stageInputCommitOid,
-            pipelineSteps: pipelineReportSteps,
-            risk: {
-              level: reviewReport?.riskLevel ?? inferredRisk,
-              rationale:
-                reviewReport?.riskRationale ??
-                reviewReport?.summary ??
-                "The validated pipeline found no material review risk.",
-            },
-            testing: {
-              artifacts: await pullRequestArtifacts(artifactsDir, testReport),
-              summary:
-                testReport?.summary ??
-                "No dedicated test stage was required by the validated pipeline plan.",
-              tested: testReport?.tested ?? [],
-            },
-            title: draft.report.title,
-            whatChanged: draft.report.summary,
-          });
           await bindPullRequest({
             artifactPath: path.join(artifactsDir, `pr-r${remoteRound}.json`),
             attemptId,
