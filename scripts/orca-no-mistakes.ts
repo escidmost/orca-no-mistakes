@@ -185,7 +185,7 @@ export * from "./admission.ts";
 export * from "./presentation.ts";
 export type FindingAction = "ask-user" | "auto-fix" | "no-op";
 
-const { O_APPEND, O_NOFOLLOW, O_NONBLOCK = 0, O_RDONLY = 0, O_WRONLY } = constants;
+const { O_APPEND, O_CREAT, O_EXCL, O_NOFOLLOW, O_NONBLOCK = 0, O_RDONLY = 0, O_WRONLY } = constants;
 const FINDING_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
 
 export type Finding = {
@@ -3022,8 +3022,27 @@ export async function runPipeline(
                   [...(stageState?.fixSummaries ?? [])],
                   stageState?.findings ?? [],
                 );
+                const seenApproved = new Set<string>();
+                const approvedFindingDetails: PullRequestPipelineFinding[] = [];
+                for (const finding of stageState?.findings ?? []) {
+                  if (finding.disposition === "approved") {
+                    const key = pullRequestFindingKey(finding);
+                    if (!seenApproved.has(key)) {
+                      seenApproved.add(key);
+                      approvedFindingDetails.push({
+                        description: finding.description,
+                        ...(finding.file ? { file: finding.file } : {}),
+                        ...(finding.line ? { line: finding.line } : {}),
+                        severity: finding.severity,
+                      });
+                    }
+                  }
+                }
                 return {
-                  approvedFindings: stageState?.approvedFindings ?? 0,
+                  ...(approvedFindingDetails.length > 0
+                    ? { approvedFindingDetails }
+                    : {}),
+                  approvedFindings: stageState?.approvedFindings ?? approvedFindingDetails.length,
                   fixedFindings: stageState?.fixedFindings ?? 0,
                   name: completedStage,
                   openFindings: stageState?.openFindings ?? 0,
@@ -14826,6 +14845,37 @@ async function readStandardInput(): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
+async function assertNoSymlinkParentChain(rootPath: string, targetPath: string): Promise<void> {
+  const root = path.resolve(rootPath);
+  const target = path.resolve(targetPath);
+  const relative = path.relative(root, target);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error("report --out must be inside the orca-no-mistakes artifacts directory");
+  }
+  let current = root;
+  for (const component of ["", ...relative.split(path.sep).filter(Boolean)]) {
+    if (component) current = path.join(current, component);
+    let entry: Awaited<ReturnType<typeof lstat>>;
+    try {
+      entry = await lstat(current);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      return;
+    }
+    if (entry.isSymbolicLink()) {
+      throw new Error("report --out parent must not contain symlinks");
+    }
+  }
+}
+
+async function verifyCanonicalContainment(rootPath: string, parentPath: string): Promise<void> {
+  const canonicalRoot = await realpath(path.resolve(rootPath));
+  const canonicalParent = await realpath(path.resolve(parentPath));
+  if (!isWithin(canonicalRoot, canonicalParent)) {
+    throw new Error("report --out must be inside the orca-no-mistakes artifacts directory");
+  }
+}
+
 async function runWorkerReportCommand(flags: RawCliFlags): Promise<void> {
   const stageValue = stringFlag(flags, "stage");
   const role = stringFlag(flags, "role");
@@ -14848,22 +14898,41 @@ async function runWorkerReportCommand(flags: RawCliFlags): Promise<void> {
   }
 
   const stage = stageValue as StageName;
+  const artifactsBase = path.resolve(artifactsRoot());
   const output = path.resolve(outputValue);
-  if (!isWithin(path.resolve(artifactsRoot()), output)) {
+  if (!isWithin(artifactsBase, output) || output === artifactsBase) {
     throw new Error("report --out must be inside the orca-no-mistakes artifacts directory");
   }
   const evidenceRoot = path.dirname(output);
+  await assertNoSymlinkParentChain(artifactsBase, evidenceRoot);
   const validated = role === "fixer"
     ? await validateFixerReport(report, stage, evidenceRoot)
     : await validateReport(report, stage, evidenceRoot);
   await mkdir(evidenceRoot, { recursive: true, mode: 0o700 });
+  await assertNoSymlinkParentChain(artifactsBase, evidenceRoot);
+  await verifyCanonicalContainment(artifactsBase, evidenceRoot);
   const temporary = `${output}.${process.pid}.${randomUUID()}.tmp`;
   try {
-    await writeFile(temporary, `${JSON.stringify(validated, null, 2)}\n`, {
-      encoding: "utf8",
-      flag: "wx",
-      mode: 0o600,
-    });
+    const handle = await open(
+      temporary,
+      O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW,
+      0o600,
+    );
+    try {
+      await handle.writeFile(`${JSON.stringify(validated, null, 2)}\n`, "utf8");
+    } finally {
+      await handle.close();
+    }
+    await assertNoSymlinkParentChain(artifactsBase, evidenceRoot);
+    await verifyCanonicalContainment(artifactsBase, evidenceRoot);
+    try {
+      const existing = await lstat(output);
+      if (existing.isSymbolicLink()) {
+        throw new Error("report --out must not be a symlink");
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
     await rename(temporary, output);
   } finally {
     await rm(temporary, { force: true });

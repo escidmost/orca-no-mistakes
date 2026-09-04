@@ -34,6 +34,7 @@ export type PullRequestPipelineRound = {
   tested?: string[]
 }
 export type PullRequestPipelineStep = {
+  approvedFindingDetails?: PullRequestPipelineFinding[]
   approvedFindings?: number
   details?: string
   fixedFindings?: number
@@ -174,7 +175,7 @@ function pipelineStepSummary(step: PullRequestPipelineStep): string {
       return `❌ ${name} - failed`
   }
   const fixed = step.fixedFindings ?? 0
-  const approved = step.approvedFindings ?? 0
+  const approved = step.approvedFindings ?? step.approvedFindingDetails?.length ?? 0
   const open = step.openFindings ?? 0
   const total = fixed + approved + open
   if (fixed > 0) {
@@ -211,8 +212,12 @@ function pipelineStepDetails(step: PullRequestPipelineStep): string | undefined 
       sections.push(round.tested.map((command) => `- ${command}`).join('\n'))
     }
   }
-  if ((step.approvedFindings ?? 0) > 0) {
-    sections.push(`⚠️ ${issueLabel(step.approvedFindings ?? 0)} approved as-is.`)
+  const approvedCount = step.approvedFindings ?? step.approvedFindingDetails?.length ?? 0
+  if (approvedCount > 0) {
+    const details = step.approvedFindingDetails?.length
+      ? `\n${step.approvedFindingDetails.map(pipelineFinding).join('\n')}`
+      : ''
+    sections.push(`⚠️ ${issueLabel(approvedCount)} approved as-is.${details}`)
   }
   return sections.join('\n\n')
 }
