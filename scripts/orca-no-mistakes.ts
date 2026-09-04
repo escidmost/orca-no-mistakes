@@ -130,9 +130,11 @@ import {
   finalContiguousCheckpointByStage,
   gateAuditMatchesEvidence,
   isAuthoritativeStageEvidence,
+  knownSecretPrefixBytes,
   normalizeIntent,
   noMistakesHome,
   legacyLedgerPath,
+  redactKnownSecrets,
   repositoryLedgerPath,
   sha256,
   verifyCompletionAttestation,
@@ -180,7 +182,7 @@ export * from "./admission.ts";
 export * from "./presentation.ts";
 export type FindingAction = "ask-user" | "auto-fix" | "no-op";
 
-const { O_APPEND, O_NOFOLLOW, O_WRONLY } = constants;
+const { O_APPEND, O_NOFOLLOW, O_NONBLOCK = 0, O_RDONLY = 0, O_WRONLY } = constants;
 const FINDING_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
 
 export type Finding = {
@@ -5343,21 +5345,43 @@ function pullRequestStageDetails(reports: StageReport[]): string {
   }).join("\n\n");
 }
 
-async function pullRequestArtifacts(
+export async function pullRequestArtifacts(
   artifactsDir: string,
   report: StageReport | undefined,
 ): Promise<PullRequestArtifact[]> {
   const artifacts: PullRequestArtifact[] = [];
+  let canonicalArtifactsDir: string;
+  try {
+    canonicalArtifactsDir = await realpath(artifactsDir);
+  } catch {
+    return artifacts;
+  }
   for (const artifact of report?.artifacts ?? []) {
     const resolved = path.resolve(artifactsDir, artifact);
     if (!isWithin(artifactsDir, resolved)) continue;
     try {
-      const handle = await open(resolved, "r");
+      const canonicalArtifact = await realpath(resolved);
+      if (!isWithin(canonicalArtifactsDir, canonicalArtifact)) continue;
+      const handle = await open(
+        resolved,
+        O_RDONLY | O_NOFOLLOW | O_NONBLOCK,
+      );
       try {
-        const buffer = Buffer.alloc(16 * 1024);
+        const stats = await handle.stat();
+        if (!stats.isFile()) continue;
+        const maxRead = 16 * 1024 + knownSecretPrefixBytes();
+        const buffer = Buffer.alloc(maxRead);
         const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-        const content = buffer.subarray(0, bytesRead).toString("utf8");
-        if (!content.includes("\0")) {
+        const raw = buffer.subarray(0, bytesRead).toString("utf8");
+        if (!raw.includes("\0")) {
+          const redacted = redactKnownSecrets(raw);
+          const content =
+            Buffer.byteLength(redacted) <= 16 * 1024
+              ? redacted
+              : Buffer.from(redacted)
+                  .subarray(0, 16 * 1024)
+                  .toString("utf8")
+                  .replace(/\uFFFD$/u, "");
           artifacts.push({ content, name: path.basename(artifact) });
         }
       } finally {

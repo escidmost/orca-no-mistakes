@@ -304,7 +304,11 @@ export async function bindPullRequest(input: {
   if (pullRequest.draft) throw new PullRequestBindingError('the exact pull request is still a draft')
   const selectedPullRequest = { id: pullRequest.id, number: pullRequest.number }
 
-  if (pullRequest.body !== content.body || pullRequest.title !== content.title) {
+  if (pullRequest.state === 'MERGED') {
+    if (pullRequest.body !== content.body || pullRequest.title !== content.title) {
+      throw new PullRequestBindingError('pull-request facts changed before merge')
+    }
+  } else if (pullRequest.body !== content.body || pullRequest.title !== content.title) {
     requireLease()
     try {
       await input.authority.updatePullRequest({
