@@ -173,7 +173,22 @@ function updateFindings(
     if (queue) queue.push(finding);
     else pending.set(finding.id, [finding]);
   }
+  const approvedMatches = new Map<
+    PresentationFinding,
+    Omit<PresentationFinding, "disposition">
+  >();
+  for (const finding of previous) {
+    if (finding.disposition === "approved" && pending.get(finding.id)?.length) {
+      const reported = pending.get(finding.id)!.shift()!;
+      approvedMatches.set(finding, reported);
+      if (pending.get(finding.id)?.length === 0) pending.delete(finding.id);
+    }
+  }
   const next = previous.map((finding) => {
+    const approvedReported = approvedMatches.get(finding);
+    if (approvedReported) {
+      return { ...approvedReported, disposition: "approved" as const };
+    }
     const reported = pending.get(finding.id)?.shift();
     if (reported) {
       if (pending.get(finding.id)?.length === 0) pending.delete(finding.id);
