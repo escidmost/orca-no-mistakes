@@ -471,6 +471,13 @@ export class RailTuiRenderer implements PresentationRenderer {
     }
   }
 
+  seed(snapshots: readonly PresentationSnapshot[]): void {
+    for (const snapshot of snapshots) {
+      const now = Date.parse(snapshot.updatedAt) || Date.now();
+      this.#logActivity(snapshot.transition, now, snapshot);
+    }
+  }
+
   #enterTerminal(): void {
     if (this.#closed || this.#terminalActive) return;
     this.#terminalActive = true;
@@ -723,7 +730,7 @@ export class RailTuiRenderer implements PresentationRenderer {
         }
         const roundNum = transition.analysis ?? stageState?.analysis ?? transition.round + 1;
         const roundPrefix = analysisLabel(stageName, roundNum);
-        const actionableCount = transition.actionable ?? transition.total;
+        const actionableCount = stageState?.openFindings ?? transition.actionable ?? transition.total;
         const countText =
           actionableCount > 0
             ? activityCount(actionableCount, "found")
@@ -1412,7 +1419,7 @@ export class RailTuiRenderer implements PresentationRenderer {
       } else if (finding.disposition === "approved") {
         dispGlyph = glyph.approved;
         color = SGR.dim;
-      } else if (isFixing && isTargetFixing) {
+      } else if (isFixing && status === "active" && isTargetFixing) {
         dispGlyph = glyph.fixing;
         color = SGR.amber;
       } else {

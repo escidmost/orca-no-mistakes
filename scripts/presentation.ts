@@ -137,6 +137,7 @@ export interface PresentationStore {
 
 export interface PresentationRenderer {
   render(snapshot: PresentationSnapshot): void;
+  seed?(snapshots: readonly PresentationSnapshot[]): void;
 }
 
 function initialSnapshot(
@@ -614,6 +615,9 @@ export class PresentationPublisher {
     this.#current = snapshots.at(-1) ?? initialSnapshot(runId, stages);
     this.#fallbackRenderer = fallbackRenderer;
     this.#renderer = renderer;
+    if (snapshots.length > 0 && renderer?.seed) {
+      renderer.seed(snapshots);
+    }
   }
 
   get current(): PresentationSnapshot {
@@ -638,6 +642,10 @@ export class PresentationPublisher {
           try {
             this.#renderer = fallback();
             this.#rendererFailed = false;
+            const history = this.store.listPresentationSnapshots(this.runId);
+            if (history.length > 0 && this.#renderer?.seed) {
+              this.#renderer.seed(history);
+            }
           } catch (fallbackError) {
             this.onRendererError(fallbackError);
           }

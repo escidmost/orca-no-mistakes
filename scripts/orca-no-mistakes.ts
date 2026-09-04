@@ -198,6 +198,7 @@ export type Finding = {
 };
 
 export type StageReport = {
+  artifactDigests?: Record<string, string>;
   artifacts?: string[];
   findings: Finding[];
   rebaseUpstreamHead?: string;
@@ -2491,7 +2492,9 @@ export async function runPipeline(
     for (const entry of priorEvidence) {
       if (
         pipelineSteps.includes(entry.stage_id as StageName) &&
-        isAuthoritativeStageEvidence(entry.worker_identity)
+        (isAuthoritativeStageEvidence(entry.worker_identity) ||
+          entry.worker_identity === "coordinator:fixer-no-change" ||
+          entry.worker_identity === "coordinator:fixer-policy")
       ) {
         const stage = entry.stage_id as StageName;
         latestEvidenceByStage.set(stage, entry);
@@ -2750,6 +2753,7 @@ export async function runPipeline(
         JSON.stringify(
           {
             exitCode,
+            artifactDigests: report.artifactDigests,
             artifacts: report.artifacts,
             findings: report.findings,
             rebaseUpstreamHead: report.rebaseUpstreamHead,
@@ -3057,7 +3061,7 @@ export async function runPipeline(
               { name: "ci", status: "pending" },
             );
             const branchIntent = [...new Set(
-              ledger.branchIntents(deliveryRepo.root, deliveryRepo.branch)
+              ledger.branchIntents(deliveryRepo.root, deliveryRepo.branch, runId)
                 .map((value) => value.trim())
                 .filter(Boolean),
             )].join("\n\n");
@@ -3114,11 +3118,16 @@ export async function runPipeline(
       }
       let attempt = 0;
       const resumedEvidence = latestEvidenceByStage.get(stage);
+      const resumedBlocker =
+        resumedEvidence !== undefined &&
+        (resumedEvidence.worker_identity === "coordinator:fixer-no-change" ||
+          resumedEvidence.worker_identity === "coordinator:fixer-policy");
       const resumedFindings = JSON.parse(
         resumedEvidence?.findings_json ?? "[]",
       ) as Finding[];
       let resumedFixDecision =
         resumedEvidence &&
+        !resumedBlocker &&
         resumedEvidence.candidate_commit_oid === stageInputCommitOid
           ? priorGateAudit.findLast(
               (audit) =>
@@ -3132,11 +3141,12 @@ export async function runPipeline(
                 audit.decision === "fix",
             )
           : undefined;
-      if (resumedFixDecision) round = resumedEvidence!.round_index;
+      if (resumedFixDecision || resumedBlocker) round = resumedEvidence!.round_index;
       let inheritedFallback:
         { attempts: FallbackAttempt[]; resolvedAgent: string } | undefined;
       const resumedFindingMode =
         resumedEvidence &&
+        !resumedBlocker &&
         resumedEvidence.candidate_commit_oid === stageInputCommitOid &&
         resumedEvidence.round_index === round
           ? ledger
@@ -3148,7 +3158,9 @@ export async function runPipeline(
                   snapshot.transition.round === resumedEvidence.round_index,
               )?.mode.autoFix
           : undefined;
-      let autoFixModeForReport = resumedFindingMode ?? autoFixMode;
+      let autoFixModeForReport = resumedBlocker
+        ? false
+        : (resumedFindingMode ?? autoFixMode);
       const runStage = async () => {
         const analysis = (reportsByStage.get(stage)?.length ?? 0) + 1;
         presentation.publish(
@@ -3222,7 +3234,7 @@ export async function runPipeline(
           presentation,
         );
       };
-      let report = resumedFixDecision
+      let report = resumedFixDecision || resumedBlocker
         ? reconcileReportWithPreservedDispositions(
             {
               findings: resumedFindings,
@@ -5348,6 +5360,16 @@ function invalidFindingFields(value: unknown): string[] {
   return invalid;
 }
 
+function optionalStringRecord(value: unknown): boolean {
+  return (
+    value === undefined ||
+    (typeof value === "object" &&
+      value !== null &&
+      !Array.isArray(value) &&
+      Object.values(value).every((item) => typeof item === "string"))
+  );
+}
+
 async function validateReport(
   report: StageReport,
   stage: StageName,
@@ -5358,6 +5380,7 @@ async function validateReport(
     !Array.isArray(report.findings) ||
     typeof report.summary !== "string" ||
     !report.summary.trim() ||
+    !optionalStringRecord(report.artifactDigests) ||
     !optionalStringArray(report.artifacts) ||
     !optionalStringArray(report.tested) ||
     (report.title !== undefined && typeof report.title !== "string") ||
@@ -5489,6 +5512,9 @@ async function validateReport(
   const artifacts = normalizedReport.artifacts ?? [];
   const canonicalEvidenceRoot =
     artifacts.length > 0 ? await realpath(evidenceRoot) : evidenceRoot;
+  const artifactDigests: Record<string, string> = {
+    ...(normalizedReport.artifactDigests ?? {}),
+  };
   for (const artifact of artifacts) {
     const resolved = path.resolve(evidenceRoot, artifact);
     if (!isWithin(evidenceRoot, resolved)) {
@@ -5504,8 +5530,13 @@ async function validateReport(
     if (!isWithin(canonicalEvidenceRoot, canonicalArtifact)) {
       throw new WorkerReportValidationError(`${stage} worker returned an unsafe artifact path`);
     }
+    const content = await readFile(canonicalArtifact);
+    artifactDigests[artifact] = createHash("sha256").update(content).digest("hex");
   }
-  return normalizedReport as StageReport;
+  return {
+    ...normalizedReport,
+    ...(artifacts.length > 0 ? { artifactDigests } : {}),
+  } as StageReport;
 }
 
 async function validateFixerReport(
@@ -5614,6 +5645,14 @@ export async function pullRequestArtifacts(
       try {
         const stats = await handle.stat();
         if (!stats.isFile() || stats.nlink !== 1) continue;
+        const fileBytes = await readFile(canonicalArtifact);
+        const digest = createHash("sha256").update(fileBytes).digest("hex");
+        if (
+          report?.artifactDigests !== undefined &&
+          report.artifactDigests[artifact] !== digest
+        ) {
+          continue;
+        }
         const maxRead = 16 * 1024 + knownSecretPrefixBytes();
         const buffer = Buffer.alloc(maxRead);
         const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
