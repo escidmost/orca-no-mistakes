@@ -276,21 +276,10 @@ function nextSnapshot(
       };
       break;
     case "fix-completed": {
-      const stage = next.stages.find((item) => item.id === transition.stage);
-      const findings = updateSelectedFindings(
-        stage?.findings ?? [],
-        transition.findingIds,
-        "fixed",
-      );
       next = {
         ...next,
         currentStage: transition.stage,
         stages: updateStage(next, transition.stage, {
-          actionableFindings: findings.filter((finding) => finding.disposition === "open").length,
-          approvedFindings: findings.filter((finding) => finding.disposition === "approved").length,
-          findings,
-          fixedFindings: findings.filter((finding) => finding.disposition === "fixed").length,
-          openFindings: findings.filter((finding) => finding.disposition === "open").length,
           phase: "fixer",
           round: transition.round,
           status: "active",

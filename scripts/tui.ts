@@ -711,6 +711,21 @@ export class RailTuiRenderer implements PresentationRenderer {
           if (completedFix.fix.approvedFindings > 0) {
             results.push(activityCount(completedFix.fix.approvedFindings, "approved"));
           }
+          if (results.length === 0) {
+            results.push(activityCount(stageState.fixedFindings ?? 0, "fixed"));
+          }
+          completedFix.fix.verified = true;
+          completedFix.label = activityResult(
+            fixLabel(stageName, completedFix.fix.round),
+            stageName,
+            completedFix.fix.round,
+            results,
+          );
+        } else if (completedFix?.fix && stageState?.fixedFindings) {
+          const results = [activityCount(stageState.fixedFindings, "fixed")];
+          if (completedFix.fix.approvedFindings > 0) {
+            results.push(activityCount(completedFix.fix.approvedFindings, "approved"));
+          }
           completedFix.fix.verified = true;
           completedFix.label = activityResult(
             fixLabel(stageName, completedFix.fix.round),
@@ -728,7 +743,7 @@ export class RailTuiRenderer implements PresentationRenderer {
             ) {
               const fixRound = Number(entry.label.match(/ fix (\d+)/u)?.[1] ?? roundNum - 1);
               entry.label = activityResult(
-                entry.label,
+                fixLabel(stageName, fixRound),
                 stageName,
                 fixRound,
                 [activityCount(stageState.fixedFindings, "fixed")],
@@ -814,7 +829,15 @@ export class RailTuiRenderer implements PresentationRenderer {
         ) {
           const stageState = snapshot.stages.find((s) => s.id === transition.stage);
           if (stageState?.fixedFindings) {
-            last.label = `${last.label} · ${stageState.fixedFindings} fixed`;
+            const stageName = title(transition.stage);
+            const fixRound = Number(last.label.match(/ fix (\d+)/u)?.[1] ?? 1);
+            last.label = activityResult(
+              fixLabel(stageName, fixRound),
+              stageName,
+              fixRound,
+              [activityCount(stageState.fixedFindings, "fixed")],
+            );
+            if (last.fix) last.fix.verified = true;
           }
         }
         const stageStatus = snapshot.stages.find((s) => s.id === transition.stage)?.status;
