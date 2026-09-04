@@ -1134,16 +1134,26 @@ export class RailTuiRenderer implements PresentationRenderer {
     return this.#pinnedStage ?? this.#stageIds()[this.#selectedStage];
   }
 
+  #isFixingStage(
+    stage: StageName,
+    state = this.#snapshot?.stages.find((item) => item.id === stage),
+  ): boolean {
+    if (state?.phase !== undefined) {
+      return state.phase === "fixer";
+    }
+    return (
+      (state?.status === "active" && (state?.round ?? 0) > 0) ||
+      this.#autoFixedStages.has(stage)
+    );
+  }
+
   #summary(width: number, now: number): Row[] {
     const snapshot = this.#snapshot!;
     const glyph = this.#glyph;
     const stage = this.#selectedStageId();
     const state = snapshot.stages.find((item) => item.id === stage);
     const status = state?.status ?? "pending";
-    const isFixing =
-      state?.phase === "fixer" ||
-      (state?.status === "active" && (state?.round ?? 0) > 0) ||
-      this.#autoFixedStages.has(stage);
+    const isFixing = this.#isFixingStage(stage, state);
     const roundLabel =
       state?.round !== undefined && status !== "pending"
         ? isFixing
@@ -1305,10 +1315,7 @@ export class RailTuiRenderer implements PresentationRenderer {
     const snapshot = this.#snapshot!;
     const stage = this.#selectedStageId();
     const state = snapshot.stages.find((item) => item.id === stage);
-    const isFixing =
-      state?.phase === "fixer" ||
-      (state?.status === "active" && (state?.round ?? 0) > 0) ||
-      this.#autoFixedStages.has(stage);
+    const isFixing = this.#isFixingStage(stage, state);
     const round = state?.round ?? 0;
     const roundLabel =
       round !== undefined

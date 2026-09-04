@@ -210,8 +210,11 @@ function nextSnapshot(
         gate: undefined,
         stages: next.stages.map((stage) => ({
           ...stage,
+          phase: stage.status === "passed" ? stage.phase : undefined,
           round: stage.status === "passed" ? stage.round : 0,
           status: stage.status === "passed" ? "passed" : "pending",
+          targetFindingIds:
+            stage.status === "passed" ? stage.targetFindingIds : undefined,
         })),
         status: "in-progress",
       };
