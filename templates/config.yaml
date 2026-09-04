@@ -20,7 +20,8 @@ worktree_roots: {}
 # Global Auto-Fix Settings
 # ------------------------------------------------------------------------------
 auto_fix:
-  # Master toggle for automatic repair attempts across stages (default: true)
+  # Toggle for durable pipeline automatic repair attempts across stages (default: true).
+  # Controls durable pipeline auto-fix only and does not enable the TUI-local responder.
   enabled: true
 
   # Maximum number of fix/retry rounds before requiring human intervention (default: 3)
