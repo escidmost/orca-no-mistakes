@@ -5450,7 +5450,7 @@ export class DomainLedger {
         ) {
           problems.push('pull-request-binding receipt')
         }
-        if (hasManagedComment && payload.pipelineEvidenceRoot !== manifest.pipelineEvidenceRoot) {
+        if ((hasManagedComment || hasBody) && payload.pipelineEvidenceRoot !== manifest.pipelineEvidenceRoot) {
           problems.push('pipeline evidence root')
         }
       }

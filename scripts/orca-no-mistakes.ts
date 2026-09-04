@@ -3228,8 +3228,12 @@ export async function runPipeline(
             report = await runStage();
             continue;
           }
+          const selectedFindingIds =
+            recordedDecision.selected_finding_ids !== null
+              ? (JSON.parse(recordedDecision.selected_finding_ids) as string[])
+              : undefined;
           const selectedIds = new Set(
-            JSON.parse(recordedDecision.selected_finding_ids ?? "[]") as string[],
+            selectedFindingIds ?? actionable.map((finding) => finding.id),
           );
           targetFindings = actionable.filter((finding) =>
             selectedIds.has(finding.id),
@@ -3240,6 +3244,16 @@ export async function runPipeline(
             );
           }
           guidance = recordedDecision.guidance ?? "";
+          presentation.publish(`gate:${recordedDecision.gate_id}:resolved`, {
+            decision: recordedDecision.decision,
+            gateId: recordedDecision.gate_id,
+            kind: "gate-resolved",
+            round,
+            stage,
+            ...(selectedFindingIds !== undefined
+              ? { targetFindingIds: selectedFindingIds }
+              : {}),
+          });
           shouldFix = true;
         } else if (!shouldFix) {
           if (fixerSession) {
