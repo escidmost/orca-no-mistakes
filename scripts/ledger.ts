@@ -5715,6 +5715,17 @@ export class DomainLedger {
       .get(runId) as RunRecord | undefined
   }
 
+  branchIntents(repoRoot: string, branch: string): string[] {
+    return this.#db
+      .prepare(
+        `SELECT intent FROM runs
+         WHERE repo_root = ? AND branch = ?
+         ORDER BY created_at, rowid`,
+      )
+      .all(repoRoot, branch)
+      .map((row) => (row as { intent: string }).intent)
+  }
+
   listRuns(): { intent: string; run_id: string }[] {
     return this.#db.prepare('SELECT intent, run_id FROM runs ORDER BY created_at').all() as {
       intent: string

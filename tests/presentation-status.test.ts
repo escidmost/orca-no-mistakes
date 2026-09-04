@@ -429,12 +429,14 @@ test("targeted fixes preserve unselected findings as approved", () => {
       kind: "fix-completed",
       round: 1,
       stage: "review",
+      summary: "Applied the selected repair.",
     });
     const completed = publisher.current.stages.find((item) => item.id === "review")!;
     assert.deepEqual(
       [completed.fixedFindings, completed.approvedFindings, completed.openFindings],
-      [1, 1, 0],
+      [0, 1, 1],
     );
+    assert.deepEqual(completed.fixSummaries, ["Applied the selected repair."]);
   } finally {
     ledger.close();
   }

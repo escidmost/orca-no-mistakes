@@ -394,8 +394,8 @@ test("Finding 2: RailTuiRenderer replaces applied fixes with verified outcomes p
   // Each fix row reports that cycle, not the cumulative fixed total.
   await nextDraw();
   let screen = cleanScreen(output.writes.at(-1) ?? "");
-  assert.match(screen, /Review fix 1\s+·  1 fixed/u);
-  assert.match(screen, /Review fix 2\s+·  1 fixes applied/u);
+  assert.match(screen, /Review fix 1\s+· 1 fixed/u);
+  assert.match(screen, /Review fix 2\s+· 1 fix applied/u);
 
   // Analysis 3 starts only after fix 2 has been recorded.
   renderer.render({
@@ -426,7 +426,7 @@ test("Finding 2: RailTuiRenderer replaces applied fixes with verified outcomes p
   await nextDraw();
   screen = cleanScreen(output.writes.at(-1) ?? "");
   assert.match(screen, /Review analysis 3/u);
-  assert.match(screen, /Review fix 2\s+·  1 fixed/u);
+  assert.match(screen, /Review fix 2\s+· 1 fixed/u);
   assert.doesNotMatch(screen, /Review fix \d+.*applied.*fixed/u);
   renderer.close();
 });

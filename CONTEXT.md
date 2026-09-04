@@ -89,7 +89,7 @@ The association of a publication route and candidate commit with one exact pull 
 _Avoid_: PR URL, branch-name match, latest pull request
 
 **Managed pull-request report**:
-The Orca No-Mistakes-owned title and original pull-request body containing the bounded branch intent, final-diff change summary, risk assessment, testing evidence, and pipeline attestation under a 63,488-byte budget, truncating oversized intent or What Changed sections with an explicit marker (`_[truncated to fit GitHub PR body limits]_`) when necessary. The coordinator creates or refreshes this report, notifies the originating terminal that the pull request is ready, and then awaits merge; it does not move pipeline detail into a comment.
+The Orca No-Mistakes-owned title and original pull-request body containing the bounded accumulated branch intent, final-diff change summary, risk assessment, testing evidence, and pipeline attestation under a 63,488-byte budget, truncating oversized intent or What Changed sections with an explicit marker (`_[truncated to fit GitHub PR body limits]_`) when necessary. Pipeline details present analysis findings, applied fixer summaries, approvals, and clean re-checks as a concise narrative instead of raw report dumps; the attestation includes completed stages plus the running PR and pending CI lifecycle states. The coordinator creates or refreshes this report, notifies the originating terminal that the pull request is ready, and then awaits merge; it does not move pipeline detail into a comment.
 _Avoid_: Managed comment, trust anchor, remote evidence store
 
 **Pull-request binding receipt**:

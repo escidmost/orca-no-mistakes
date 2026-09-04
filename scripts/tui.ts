@@ -131,7 +131,7 @@ function fixLabel(stageName: string, round: number): string {
 }
 
 function activityCount(value: number, label: string): string {
-  return `${String(value).padStart(2)} ${label}`;
+  return `${value} ${label}`;
 }
 
 function activityResult(
@@ -649,7 +649,8 @@ export class RailTuiRenderer implements PresentationRenderer {
       case "fix-completed": {
         const stageName = title(transition.stage);
         const fixPrefix = fixLabel(stageName, transition.round);
-        const results = [activityCount(transition.findingIds.length, "fixes applied")];
+        const appliedLabel = transition.findingIds.length === 1 ? "fix applied" : "fixes applied";
+        const results = [activityCount(transition.findingIds.length, appliedLabel)];
         if (transition.approvedFindings > 0) {
           results.push(activityCount(transition.approvedFindings, "approved"));
         }
@@ -1027,7 +1028,7 @@ export class RailTuiRenderer implements PresentationRenderer {
     const bodyRows = rows - 3;
     let body: string[];
     if (columns >= WIDE_COLUMNS) {
-      const leftWidth = Math.max(LEFT_WIDTH, Math.min(80, Math.floor(columns * 0.54)));
+      const leftWidth = Math.max(LEFT_WIDTH, Math.min(64, Math.floor(columns * 0.46)));
       const rightWidth = columns - leftWidth - this.#glyph.bar.length;
       const stages = this.#stages(now);
       const left = [

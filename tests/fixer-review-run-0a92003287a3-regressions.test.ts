@@ -196,7 +196,7 @@ test("RailTuiRenderer shows provisional applied counts and reconciles to verifie
 
     await new Promise((resolve) => setImmediate(resolve));
     let screen = cleanScreen(output.writes.at(-1) ?? "");
-    assert.match(screen, /Review fix 1\s+·  2 fixes applied/u);
+    assert.match(screen, /Review fix 1\s+· 2 fixes applied/u);
     assert.doesNotMatch(screen, /Review fix 1.*applied.*fixed/u);
 
     renderer.render({
@@ -220,7 +220,7 @@ test("RailTuiRenderer shows provisional applied counts and reconciles to verifie
 
     await new Promise((resolve) => setImmediate(resolve));
     screen = cleanScreen(output.writes.at(-1) ?? "");
-    assert.match(screen, /Review fix 1\s+·  1 fixed ·  1 still open/u);
+    assert.match(screen, /Review fix 1\s+· 1 fixed · 1 still open/u);
     assert.doesNotMatch(screen, /Review fix 1.*applied.*fixed/u);
   } finally {
     renderer.close();

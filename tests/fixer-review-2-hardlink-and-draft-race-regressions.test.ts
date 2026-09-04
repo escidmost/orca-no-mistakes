@@ -79,7 +79,7 @@ test('pullRequestArtifacts rejects hard-linked artifacts with multiple links', a
     })
 
     assert.equal(artifacts.length, 1)
-    assert.equal(artifacts[0]?.name, 'single.txt')
+    assert.equal(artifacts[0]?.name, 'Single')
     assert.equal(artifacts[0]?.content, 'normal data')
   } finally {
     await rm(directory, { force: true, recursive: true })

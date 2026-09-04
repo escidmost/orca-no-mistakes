@@ -212,7 +212,7 @@ test('pullRequestArtifacts rejects symlinks and fifos without hanging', async ()
     })
 
     assert.equal(artifacts.length, 1)
-    assert.equal(artifacts[0]?.name, 'valid.txt')
+    assert.equal(artifacts[0]?.name, 'Valid')
     assert.equal(artifacts[0]?.content, 'valid-artifact-content')
   } finally {
     await rm(directory, { force: true, recursive: true })

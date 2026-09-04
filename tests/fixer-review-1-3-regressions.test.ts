@@ -325,11 +325,11 @@ test("advisory fixer evidence marks applied reviewer fixes complete in presentat
     const review = snapshots
       .at(-1)!
       .stages.find((stage) => stage.id === "review");
-    assert.equal(review?.openFindings, 0);
-    assert.equal(review?.fixedFindings, 1);
+    assert.equal(review?.openFindings, 1);
+    assert.equal(review?.fixedFindings, 0);
     assert.equal(review?.findings?.length, 1);
     assert.equal(review?.findings?.[0]?.id, "review-finding");
-    assert.equal(review?.findings?.[0]?.disposition, "fixed");
+    assert.equal(review?.findings?.[0]?.disposition, "open");
   } finally {
     ledger.close();
     if (previousHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME;

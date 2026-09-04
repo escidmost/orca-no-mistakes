@@ -128,7 +128,7 @@ test("RailTuiRenderer does not let earlier approved occurrence steal target quot
 
     await new Promise((resolve) => setImmediate(resolve));
     let screen = cleanScreen(output.writes.at(-1) ?? "");
-    assert.match(screen, /Review fix 1\s+·  1 fixes applied ·  1 approved/u);
+    assert.match(screen, /Review fix 1\s+· 1 fix applied · 1 approved/u);
 
     // Analysis verifies target was fixed; only approved item remains
     renderer.render({
@@ -153,7 +153,7 @@ test("RailTuiRenderer does not let earlier approved occurrence steal target quot
 
     await new Promise((resolve) => setImmediate(resolve));
     screen = cleanScreen(output.writes.at(-1) ?? "");
-    assert.match(screen, /Review fix 1\s+·  1 fixed ·  1 approved/u);
+    assert.match(screen, /Review fix 1\s+· 1 fixed · 1 approved/u);
     assert.doesNotMatch(screen, /Review fix 1.*applied.*fixed/u);
   } finally {
     renderer.close();

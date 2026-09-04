@@ -79,6 +79,7 @@ import {
   PlainStatusRenderer,
   PresentationPublisher,
   type GateResolver,
+  type PresentationFinding,
   type PresentationRenderer,
   type PresentationSnapshot,
 } from "./presentation.ts";
@@ -162,6 +163,8 @@ import {
   bindPullRequest,
   pullRequestContent,
   type PullRequestArtifact,
+  type PullRequestPipelineFinding,
+  type PullRequestPipelineRound,
   type PullRequestPipelineStep,
 } from "./pull-request.ts";
 export {
@@ -2698,8 +2701,8 @@ export async function runPipeline(
           summary: evidence.summary,
         };
       }
-      reportsByStage.set(stage, [...(reportsByStage.get(stage) ?? []), report]);
       if (isAuthoritativeStageEvidence(evidence.worker_identity)) {
+        reportsByStage.set(stage, [...(reportsByStage.get(stage) ?? []), report]);
         latestReportByStage.set(stage, report);
       }
     }
@@ -2824,8 +2827,8 @@ export async function runPipeline(
       if (isAuthoritativeStageEvidence(workerIdentity)) {
         latestEntryByStage.set(stage, entry);
         latestReportByStage.set(stage, report);
+        reportsByStage.set(stage, [...(reportsByStage.get(stage) ?? []), report]);
       }
-      reportsByStage.set(stage, [...(reportsByStage.get(stage) ?? []), report]);
       return autoFixModeAtFindings;
     };
 
@@ -3007,22 +3010,37 @@ export async function runPipeline(
                   ? "approved"
                   : decision === "skip"
                     ? "skipped"
-                    : "success";
-                const details = pullRequestStageDetails(
+                    : "completed";
+                const stageState = presentation.current.stages.find(
+                  (candidate) => candidate.id === completedStage,
+                );
+                const rounds = pullRequestPipelineRounds(
                   reportsByStage.get(completedStage) ?? [{
                     findings: [],
                     summary: `${completedStage} passed.`,
                   }],
+                  [...(stageState?.fixSummaries ?? [])],
+                  stageState?.findings ?? [],
                 );
                 return {
-                  details: status === "success"
-                    ? details
-                    : `${details}\n\nPipeline decision: ${status}.`,
+                  approvedFindings: stageState?.approvedFindings ?? 0,
+                  fixedFindings: stageState?.fixedFindings ?? 0,
                   name: completedStage,
+                  openFindings: stageState?.openFindings ?? 0,
+                  rounds,
                   status,
                 };
               });
-            content = pullRequestContent(intent, {
+            pipelineReportSteps.push(
+              { name: "pr", status: "running" },
+              { name: "ci", status: "pending" },
+            );
+            const branchIntent = [...new Set(
+              ledger.branchIntents(deliveryRepo.root, deliveryRepo.branch)
+                .map((value) => value.trim())
+                .filter(Boolean),
+            )].join("\n\n");
+            content = pullRequestContent(branchIntent || intent, {
               candidateCommitOid: stageInputCommitOid,
               pipelineSteps: pipelineReportSteps,
               risk: {
@@ -3564,6 +3582,7 @@ export async function runPipeline(
             kind: "fix-completed",
             round,
             stage,
+            summary: nextFixer.report.summary,
           },
           (snapshot) =>
             ledger.recordCheckpoint(
@@ -4903,6 +4922,7 @@ async function runFixer(
   before: string;
   fallbackAttempts?: FallbackAttempt[];
   guardrailViolations: string[];
+  report: StageReport;
   resolvedAgent: string;
   session?: FixerSession;
 }> {
@@ -5105,6 +5125,7 @@ async function runFixer(
         after,
         before,
         guardrailViolations: verdict?.guardrailViolations ?? [],
+        report: validatedReport,
         resolvedAgent: outcome.resolvedAgent,
         ...(retainWorker
           ? {
@@ -5466,27 +5487,68 @@ function optionalStringArray(value: string[] | undefined): boolean {
   );
 }
 
-function pullRequestStageDetails(reports: StageReport[]): string {
-  return reports.map((report, index) => {
-  const sections = [report.summary?.trim() ?? "Stage passed."];
-  if (report.findings?.length > 0) {
-    sections.push(
-      report.findings
-        .map((finding) => {
-          const location = finding.file
-            ? ` (${finding.file}${finding.line ? `:${finding.line}` : ""})`
-            : "";
-          return `- ${finding.severity}: ${finding.description}${location}`;
-        })
-        .join("\n"),
-    );
+function pullRequestFindingKey(
+  finding: Pick<PresentationFinding, "description" | "file" | "id" | "line" | "severity">,
+): string {
+  return JSON.stringify([
+    finding.id,
+    finding.description,
+    finding.file ?? null,
+    finding.line ?? null,
+    finding.severity,
+  ]);
+}
+
+function pullRequestPipelineRounds(
+  reports: StageReport[],
+  fixSummaries: string[],
+  finalFindings: readonly PresentationFinding[],
+): PullRequestPipelineRound[] {
+  const dispositions = new Map<string, Set<PresentationFinding["disposition"]>>();
+  for (const finding of finalFindings) {
+    const key = pullRequestFindingKey(finding);
+    const values = dispositions.get(key) ?? new Set();
+    values.add(finding.disposition);
+    dispositions.set(key, values);
   }
-  if (report.tested?.length) {
-    sections.push(`Checks:\n${report.tested.map((command) => `- ${command}`).join("\n")}`);
-  }
-    const details = sections.filter(Boolean).join("\n\n");
-    return reports.length > 1 ? `### Pass ${index + 1}\n\n${details}` : details;
-  }).join("\n\n");
+  const approvedOnly = new Set(
+    [...dispositions.entries()]
+      .filter(([, values]) => values.size === 1 && values.has("approved"))
+      .map(([key]) => key),
+  );
+  return reports.map((report, index) => ({
+    findings: (report.findings ?? [])
+      .filter((finding) => !approvedOnly.has(pullRequestFindingKey(finding)))
+      .map((finding): PullRequestPipelineFinding => ({
+        description: finding.description,
+        ...(finding.file ? { file: finding.file } : {}),
+        ...(finding.line ? { line: finding.line } : {}),
+        severity: finding.severity,
+      })),
+    ...(index > 0 && fixSummaries[index - 1]
+      ? { fixSummary: fixSummaries[index - 1] }
+      : {}),
+    summary: report.summary?.trim() || "Stage passed.",
+    ...(report.tested?.length ? { tested: report.tested } : {}),
+  }));
+}
+
+function pullRequestArtifactLabel(fileName: string): string {
+  const acronyms = new Map([
+    ["ci", "CI"],
+    ["http", "HTTP"],
+    ["json", "JSON"],
+    ["tls", "TLS"],
+    ["tui", "TUI"],
+    ["ui", "UI"],
+  ]);
+  const words = fileName
+    .replace(/\.[^.]+$/u, "")
+    .split(/[-_\s]+/u)
+    .filter(Boolean)
+    .map((word) => acronyms.get(word.toLowerCase()) ?? word.toLowerCase());
+  const label = words.join(" ");
+  return label ? label[0].toUpperCase() + label.slice(1) : "Test evidence";
 }
 
 export async function pullRequestArtifacts(
@@ -5526,7 +5588,10 @@ export async function pullRequestArtifacts(
                   .subarray(0, 16 * 1024)
                   .toString("utf8")
                   .replace(/\uFFFD$/u, "");
-          artifacts.push({ content, name: path.basename(artifact) });
+          artifacts.push({
+            content,
+            name: pullRequestArtifactLabel(path.basename(artifact)),
+          });
         }
       } finally {
         await handle.close();

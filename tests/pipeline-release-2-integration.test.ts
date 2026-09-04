@@ -169,6 +169,10 @@ async function runRelease2Pipeline(failAfter?: 'push' | 'pr'): Promise<void> {
     assert.equal(pushCount, 1)
     assert.equal(pullRequestCreateCount, 1)
     assert.deepEqual(readyNotifications, ['https://github.com/owner/repo/pull/80'])
+    const publishedBody = String((pullRequest as unknown as Record<string, unknown>).body)
+    assert.match(publishedBody, /"step":"pr","status":"running"/)
+    assert.match(publishedBody, /"step":"ci","status":"pending"/)
+    assert.match(publishedBody, /<summary>✅ \*\*Review\*\* - passed<\/summary>/)
     assert.equal(commentCreateCount, 0)
     assert.equal(commentUpdateCount, 0)
   } finally {

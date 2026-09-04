@@ -39,6 +39,7 @@ export type PresentationTransition =
       kind: "fix-completed";
       round: number;
       stage: StageName;
+      summary?: string;
     }
   | {
       actionable: number;
@@ -97,6 +98,7 @@ export type PresentationSnapshot = {
     actionableFindings: number;
     approvedFindings?: number;
     findings?: readonly PresentationFinding[];
+    fixSummaries?: readonly string[];
     fixedFindings?: number;
     id: StageName;
     openFindings?: number;
@@ -139,6 +141,7 @@ function initialSnapshot(
       actionableFindings: 0,
       approvedFindings: 0,
       findings: [],
+      fixSummaries: [],
       fixedFindings: 0,
       id,
       openFindings: 0,
@@ -363,6 +366,15 @@ function nextSnapshot(
           phase: "fixer",
           round: transition.round,
           status: "active",
+          ...(transition.summary?.trim()
+            ? {
+                fixSummaries: [
+                  ...(next.stages.find((item) => item.id === transition.stage)
+                    ?.fixSummaries ?? []),
+                  transition.summary.trim(),
+                ],
+              }
+            : {}),
           targetFindingIds: undefined,
         }),
       };

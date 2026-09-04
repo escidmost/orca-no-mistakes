@@ -724,7 +724,7 @@ if (process.env.TUI_FIXTURE === "1") {
     await nextDraw();
     assert.match(
       cleanScreen(output.writes.at(-1) ?? ""),
-      /Review fix 1\s+·  5 fixes applied ·  1 approved/u,
+      /Review fix 1\s+· 5 fixes applied · 1 approved/u,
     );
     renderer.render({
       ...withFixed,
@@ -738,10 +738,10 @@ if (process.env.TUI_FIXTURE === "1") {
     assert.match(screen, /Run 1 started/u);
     assert.match(screen, /Intent started/u);
     assert.match(screen, /Rebase started/u);
-    assert.match(screen, /Review analysis 1 ·  5 found/u);
-    assert.match(screen, /Review fix 1\s+·  5 fixed ·  1 approved/u);
+    assert.match(screen, /Review analysis 1 · 5 found/u);
+    assert.match(screen, /Review fix 1\s+· 5 fixed · 1 approved/u);
     assert.doesNotMatch(screen, /Review fix 1.*applied.*fixed/u);
-    assert.match(screen, /Review analysis 2 ·  3 found/u);
+    assert.match(screen, /Review analysis 2 · 3 found/u);
     assert.match(screen, /Test analysis 1/u);
     const activityLines = screen.split("\n").filter((line) => /Review (?:analysis|fix)/u.test(line));
     assert.ok(activityLines.length >= 3);

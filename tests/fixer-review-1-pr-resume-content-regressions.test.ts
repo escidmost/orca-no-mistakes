@@ -13,6 +13,33 @@ function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
 }
 
+test('DomainLedger returns branch intent history in run order', () => {
+  const ledger = new DomainLedger(':memory:')
+  try {
+    for (const [runId, branch, intent] of [
+      ['run-1', 'feature', 'Publish the complete PR report.'],
+      ['run-2', 'other', 'Unrelated branch work.'],
+      ['run-3', 'feature', 'Correct fixer activity accounting.']
+    ] as const) {
+      ledger.startRun({
+        baseBranch: 'main',
+        branch,
+        intent,
+        policySha256: runId.repeat(16).slice(0, 64),
+        repoRoot: '/repo',
+        runId,
+        submissionCommitOid: runId.repeat(10).slice(0, 40)
+      })
+    }
+    assert.deepEqual(ledger.branchIntents('/repo', 'feature'), [
+      'Publish the complete PR report.',
+      'Correct fixer activity accounting.'
+    ])
+  } finally {
+    ledger.close()
+  }
+})
+
 test('DomainLedger.publishedPullRequestContent returns latest published PR content for run and candidate', () => {
   const ledger = new DomainLedger(':memory:')
   try {

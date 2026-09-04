@@ -146,7 +146,7 @@ for (const columns of [140, 200]) {
 
       await new Promise((resolve) => setImmediate(resolve));
       const screen = cleanScreen(output.writes.at(-1) ?? "");
-      assert.match(screen, /Review fix 1\s+·  1 fixed ·  1 still open ·  1 approved/u);
+      assert.match(screen, /Review fix 1\s+· 1 fixed · 1 still open · 1 approved/u);
       assert.doesNotMatch(screen, /1 appro~/u);
     } finally {
       renderer.close();

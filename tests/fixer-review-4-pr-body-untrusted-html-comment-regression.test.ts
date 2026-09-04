@@ -42,7 +42,7 @@ test("pullRequestContent neutralizes untrusted HTML comments while preserving fr
   const result = pullRequestContent(untrustedIntent, {
     candidateCommitOid: OID,
     pipelineSteps: [
-      { details: untrustedStepDetails, name: "review", status: "success" },
+      { details: untrustedStepDetails, name: "review", status: "completed" },
     ],
     risk: { level: "low", rationale: untrustedRisk },
     testing: {
@@ -60,12 +60,12 @@ test("pullRequestContent neutralizes untrusted HTML comments while preserving fr
 
   // Framework details elements remain literal HTML
   assert.match(result.body, /<details>\n<summary>output\.txt<\/summary>/);
-  assert.match(result.body, /<details>\n<summary>review: success<\/summary>/);
+  assert.match(result.body, /<details>\n<summary>✅ \*\*Review\*\* - passed<\/summary>/);
 
   // Authoritative attestation remains literal HTML comment
   assert.match(
     result.body,
-    /<!-- orca-no-mistakes-pipeline-attestation:v1 \{"head_sha":"1{40}","steps":\[\{"step":"review","status":"success"\}\]\} -->/,
+    /<!-- orca-no-mistakes-pipeline-attestation:v1 \{"head_sha":"1{40}","steps":\[\{"step":"review","status":"completed"\}\]\} -->/,
   );
 
   // Exactly one literal <!-- comment exists in the entire PR body (the framework attestation)

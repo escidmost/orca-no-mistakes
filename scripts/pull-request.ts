@@ -21,9 +21,25 @@ const TOTAL_ARTIFACT_BUDGET = 24 * 1024
 const PIPELINE_DETAILS_BUDGET = 16 * 1024
 
 export type PullRequestArtifact = { content: string; name: string }
+export type PullRequestPipelineFinding = {
+  description: string
+  file?: string
+  line?: number
+  severity: 'error' | 'info' | 'warning'
+}
+export type PullRequestPipelineRound = {
+  findings: PullRequestPipelineFinding[]
+  fixSummary?: string
+  summary: string
+  tested?: string[]
+}
 export type PullRequestPipelineStep = {
+  approvedFindings?: number
   details?: string
+  fixedFindings?: number
   name: string
+  openFindings?: number
+  rounds?: PullRequestPipelineRound[]
   status: string
 }
 export type PullRequestReport = {
@@ -133,6 +149,74 @@ function testingSection(testing: PullRequestReport['testing']): string {
   return `## Testing\n\n${capText(testing.summary, 4096)}${commands}${artifacts.length > 0 ? `\n\n${artifacts.join('\n\n')}` : ''}`
 }
 
+function displayStepName(name: string): string {
+  const normalized = name.toLowerCase()
+  if (normalized === 'ci' || normalized === 'pr') return normalized.toUpperCase()
+  return normalized.length > 0 ? normalized[0].toUpperCase() + normalized.slice(1) : 'Stage'
+}
+
+function issueLabel(count: number): string {
+  return `${count} ${count === 1 ? 'issue' : 'issues'}`
+}
+
+function pipelineStepSummary(step: PullRequestPipelineStep): string {
+  const name = `**${displayStepName(step.name)}**`
+  switch (step.status) {
+    case 'pending':
+      return `⏳ ${name} - pending`
+    case 'running':
+      return `⏳ ${name} - running`
+    case 'skipped':
+      return `⏭️ ${name} - skipped`
+    case 'approved':
+      return `⚠️ ${name} - ${step.approvedFindings ? `${issueLabel(step.approvedFindings)} approved` : 'approved'}`
+    case 'failed':
+      return `❌ ${name} - failed`
+  }
+  const fixed = step.fixedFindings ?? 0
+  const approved = step.approvedFindings ?? 0
+  const open = step.openFindings ?? 0
+  const total = fixed + approved + open
+  if (fixed > 0) {
+    const outcome = [`${fixed} auto-fixed`, ...(approved > 0 ? [`${approved} approved`] : [])].join(' · ')
+    return `🔧 ${name} - ${issueLabel(total)} found → ${outcome} ✅`
+  }
+  if (approved > 0) return `⚠️ ${name} - ${issueLabel(approved)} approved`
+  if (open > 0) return `⚠️ ${name} - ${issueLabel(open)} remain`
+  return `✅ ${name} - passed`
+}
+
+function pipelineFinding(finding: PullRequestPipelineFinding): string {
+  const emoji = finding.severity === 'error' ? '🚨' : finding.severity === 'warning' ? '⚠️' : 'ℹ️'
+  const location = finding.file
+    ? `\`${finding.file}${finding.line ? `:${finding.line}` : ''}\` - `
+    : ''
+  return `- ${emoji} ${location}${finding.description}`
+}
+
+function pipelineStepDetails(step: PullRequestPipelineStep): string | undefined {
+  if (!step.rounds || step.rounds.length === 0) return step.details
+  const sections: string[] = []
+  for (const [index, round] of step.rounds.entries()) {
+    if (round.fixSummary) sections.push(`🔧 Fix: ${round.fixSummary}`)
+    if (round.findings.length > 0) {
+      if (index > 0) sections.push(`${issueLabel(round.findings.length)} still open:`)
+      sections.push(round.findings.map(pipelineFinding).join('\n'))
+    } else if (round.fixSummary) {
+      sections.push('✅ Re-checked - no issues remain.')
+    } else if (round.summary.trim()) {
+      sections.push(round.summary)
+    }
+    if (round.tested?.length) {
+      sections.push(round.tested.map((command) => `- ${command}`).join('\n'))
+    }
+  }
+  if ((step.approvedFindings ?? 0) > 0) {
+    sections.push(`⚠️ ${issueLabel(step.approvedFindings ?? 0)} approved as-is.`)
+  }
+  return sections.join('\n\n')
+}
+
 function pipelineSection(candidateCommitOid: string, steps: PullRequestPipelineStep[]): string {
   const attestation = JSON.stringify({
     head_sha: candidateCommitOid,
@@ -141,14 +225,14 @@ function pipelineSection(candidateCommitOid: string, steps: PullRequestPipelineS
   let remaining = PIPELINE_DETAILS_BUDGET
   const details: string[] = []
   for (const step of steps) {
-    if (!step.details || remaining <= 0) continue
-    const name = capText(step.name, 128)
-    const status = capText(step.status, 128)
+    const stepDetails = pipelineStepDetails(step)
+    if (!stepDetails || remaining <= 0) continue
+    const summary = capText(pipelineStepSummary(step), 512)
     const separatorBytes = details.length > 0 ? Buffer.byteLength('\n\n') : 0
-    const framingBytes = Buffer.byteLength(`<details>\n<summary>${name}: ${status}</summary>\n\n\n\n</details>`) + separatorBytes
+    const framingBytes = Buffer.byteLength(`<details>\n<summary>${summary}</summary>\n\n\n\n</details>`) + separatorBytes
     if (remaining <= framingBytes) break
-    const content = capText(step.details, Math.min(4096, remaining - framingBytes))
-    const entry = `<details>\n<summary>${name}: ${status}</summary>\n\n${content}\n\n</details>`
+    const content = capText(stepDetails, Math.min(4096, remaining - framingBytes))
+    const entry = `<details>\n<summary>${summary}</summary>\n\n${content}\n\n</details>`
     const entryBytes = Buffer.byteLength(entry) + separatorBytes
     if (entryBytes > remaining) break
     remaining -= entryBytes
@@ -165,7 +249,7 @@ export function pullRequestContent(intent: string, report: PullRequestReport): {
     : `chore: ${firstLine}`
   const riskEmoji = report.risk.level === 'high' ? '🚨' : report.risk.level === 'medium' ? '⚠️' : '✅'
   const otherSections = [
-    `## Risk Assessment\n\n${riskEmoji} ${report.risk.level[0].toUpperCase()}${report.risk.level.slice(1)} - ${capText(report.risk.rationale, 2048)}`,
+    `## Risk Assessment\n\n${riskEmoji} ${report.risk.level[0].toUpperCase()}${report.risk.level.slice(1)}: ${capText(report.risk.rationale, 2048)}`,
     testingSection(report.testing),
     pipelineSection(report.candidateCommitOid, report.pipelineSteps)
   ].join('\n\n')
