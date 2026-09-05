@@ -5981,7 +5981,7 @@ export async function pullRequestArtifacts(
     return artifacts;
   }
   const trustedApprovals = new Set(
-    options instanceof Set || Array.isArray(options)
+    options && Symbol.iterator in options
       ? options
       : options?.trustedPublicationApprovals,
   );

@@ -78,13 +78,15 @@ class MockGit implements GitOperations {
   }
   async applyWorktreeCommits(
     _sourcePath: string,
-    _branch: string,
-    targetCommitOid?: string,
-  ): Promise<string> {
-    if (targetCommitOid) this.headOid = targetCommitOid;
-    return this.headOid;
+    expectedHead: string,
+    targetCommitOid: string,
+  ): Promise<boolean> {
+    if (this.headOid !== expectedHead) return false;
+    this.headOid = targetCommitOid;
+    return true;
   }
   async anchorRecoveryRef(): Promise<void> {}
+  async worktreeIsReusable(): Promise<boolean> { return false; }
   async verifyBranchSync(): Promise<void> {}
   async hasUntrackedChanges(): Promise<boolean> {
     return false;

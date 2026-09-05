@@ -655,7 +655,8 @@ export class RailTuiRenderer implements PresentationRenderer {
           const priorRoundPrefix = analysisLabel(stageName, roundNum - 1);
           const priorFixPrefix = fixLabel(stageName, roundNum - 1);
           const priorRoundHadFindings = this.#activities.some(
-            (a) => a.stage === stage && a.label.startsWith(priorRoundPrefix) && a.label.includes("found"),
+            (a) => a.stage === stage && a.label.startsWith(priorRoundPrefix) &&
+              /· [1-9]\d* (?:found|new|still open|reopened)/u.test(a.label),
           );
           const hasFix = this.#activities.some(
             (a) => a.stage === stage && a.label.startsWith(priorFixPrefix),
@@ -760,10 +761,14 @@ export class RailTuiRenderer implements PresentationRenderer {
         const roundNum = transition.analysis ?? stageState?.analysis ?? transition.round + 1;
         const roundPrefix = analysisLabel(stageName, roundNum);
         const actionableCount = stageState?.openFindings ?? transition.actionable ?? transition.total;
-        const countText =
-          actionableCount > 0
-            ? activityCount(actionableCount, "found")
-            : "clean";
+        const breakdown = stageState?.analysisFindings;
+        const countText = roundNum > 1 && breakdown && actionableCount > 0
+          ? [
+              breakdown.new > 0 ? activityCount(breakdown.new, "new") : "",
+              breakdown.stillOpen > 0 ? activityCount(breakdown.stillOpen, "still open") : "",
+              breakdown.reopened > 0 ? activityCount(breakdown.reopened, "reopened") : "",
+            ].filter(Boolean).join(" · ")
+          : activityCount(actionableCount, "found");
 
         const completedFix = this.#activities.findLast(
           (activity) => activity.stage === transition.stage && activity.fix && !activity.fix.verified,
@@ -1226,8 +1231,8 @@ export class RailTuiRenderer implements PresentationRenderer {
         ],
         segs,
       },
-      width,
-    );
+      width - 2,
+    ) + "  ";
   }
 
   #badge(now: number): Seg {

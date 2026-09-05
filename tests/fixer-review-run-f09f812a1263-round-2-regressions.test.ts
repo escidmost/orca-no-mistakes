@@ -329,7 +329,7 @@ test("rereported approved findings do not inflate found count in activity", asyn
 
   await nextDraw();
   const screen = cleanScreen(output.writes.at(-1) ?? "");
-  assert.match(screen, /Review analysis 2\s+· 1 found/u);
+  assert.match(screen, /Review analysis 2\s+· 1 still open/u);
   renderer.close();
 });
 

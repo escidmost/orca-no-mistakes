@@ -117,6 +117,7 @@ export type PresentationSnapshot = {
   stages: readonly {
     actionableFindings: number;
     analysis?: number;
+    analysisFindings?: { new: number; stillOpen: number; reopened: number };
     approvedFindings?: number;
     findings?: readonly PresentationFinding[];
     fixRecords?: readonly FixRecord[];
@@ -377,6 +378,7 @@ function nextSnapshot(
         gate: undefined,
         stages: updateStage(next, transition.stage, {
           actionableFindings: open,
+          analysisFindings: undefined,
           approvedFindings: 0,
           findings: invalidatedFindings,
           fixAttempt: undefined,
@@ -495,6 +497,19 @@ function nextSnapshot(
         const findings = transition.findings
           ? updateFindings(stage?.findings ?? [], transition.findings)
           : undefined;
+        const analysisFindings = findings && stage?.findings
+          ? { new: 0, stillOpen: 0, reopened: 0 }
+          : undefined;
+        if (analysisFindings) {
+          // Reconciliation retains previous occurrence indices and appends new ones.
+          findings!.forEach((finding, index) => {
+            if (finding.disposition !== "open") return;
+            const prior = stage?.findings?.[index];
+            if (!prior) analysisFindings.new++;
+            else if (prior.disposition === "fixed") analysisFindings.reopened++;
+            else analysisFindings.stillOpen++;
+          });
+        }
         const fixed = findings?.filter((finding) => finding.disposition === "fixed").length;
         const approved = findings?.filter(
           (finding) => finding.disposition === "approved",
@@ -508,6 +523,7 @@ function nextSnapshot(
             ? {
                 ...item,
                 actionableFindings: open ?? transition.actionable,
+                analysisFindings,
                 ...(transition.analysis !== undefined
                   ? { analysis: transition.analysis }
                   : {}),

@@ -872,10 +872,140 @@ if (process.env.TUI_FIXTURE === "1") {
     screen = cleanScreen(output.writes.at(-1) ?? "");
     assert.match(screen, /Review analysis 1 · 3 found/u);
     assert.match(screen, /Review fix 1\s+· 1 fixed · 1 still open · 1 approved/u);
-    assert.match(screen, /Review analysis 2 · 1 found/u);
+    assert.match(screen, /Review analysis 2 · 1 still open/u);
     assert.match(screen, /Review\s+3 found · 1 fixed · 1 approved/u);
     assert.doesNotMatch(screen, /applied.*fixed|fixed.*applied/u);
     renderer.close();
+  });
+
+  test("analysis activity reconciles occurrences and survives snapshot restoration", async (t) => {
+    const output = new FakeOutput();
+    output.columns = 140;
+    output.rows = 40;
+    const renderer = new RailTuiRenderer(new FakeInput(), output, "/unused");
+    t.after(() => renderer.close());
+    const snapshots: PresentationSnapshot[] = [];
+    const store = {
+      listPresentationSnapshots: () => snapshots,
+      recordPresentationSnapshot: (_runId: string, _key: string, value: PresentationSnapshot) =>
+        (snapshots.push(value), true),
+    };
+    const publisher = new PresentationPublisher(store, "analysis-occurrences", renderer);
+    const fixed = { id: "dup", description: "fixed", severity: "error" as const };
+    const carried = { ...fixed, description: "carried" };
+    const approved = { ...fixed, id: "approved", description: "approved" };
+    const fresh = { ...fixed, id: "new", description: "new" };
+    const analyze = (analysis: number, findings: typeof fixed[]) => {
+      publisher.publish(`analysis-${analysis}`, {
+        kind: "round-started", role: "reviewer", stage: "review", round: analysis - 1, analysis,
+      });
+      publisher.publish(`findings-${analysis}`, {
+        kind: "findings-recorded", stage: "review", round: analysis - 1, analysis,
+        findings, actionable: findings.length, total: findings.length,
+      });
+    };
+    const fix = (analysis: number, findingIds: string[], approvedFindings: number) => {
+      publisher.publish(`fix-${analysis}`, {
+        kind: "round-started", role: "fixer", stage: "review", round: analysis, analysis,
+        targetFindingIds: findingIds,
+      });
+      publisher.publish(`fixed-${analysis}`, {
+        kind: "fix-completed", stage: "review", round: analysis, findingIds, approvedFindings,
+      });
+    };
+    publisher.publish("stage", { kind: "stage-started", stage: "review" });
+    analyze(1, [fixed, carried, carried, approved, approved]);
+    publisher.publish("approve", {
+      kind: "gate-resolved", decision: "fix", gateId: "g", stage: "review", round: 0,
+      targetFindingIds: ["dup", "dup", "dup"],
+    });
+    fix(1, ["dup", "dup", "dup"], 2);
+    analyze(2, [carried, approved, approved]);
+    fix(2, ["dup"], 2);
+    analyze(3, [
+      approved, { ...carried, description: "carried revised" },
+      { ...fixed, description: "fixed revised" }, fresh, fresh, approved, approved,
+    ]);
+    await nextDraw();
+    const expected = [
+      /Review analysis 1 · 5 found/u,
+      /Review analysis 2 · 1 still open/u,
+      /Review analysis 3 · 3 new · 1 still open · 1 reopened/u,
+    ];
+    let screen = cleanScreen(output.writes.at(-1) ?? "");
+    for (const label of expected) assert.match(screen, label);
+    assert.match(screen, /Review fix 1\s+· 2 fixed · 1 still open · 2 approved/u);
+    const stage = publisher.current.stages.find((item) => item.id === "review")!;
+    assert.equal(stage.openFindings, 5);
+    assert.equal(stage.approvedFindings, 2);
+    assert.deepEqual(stage.analysisFindings, { new: 3, stillOpen: 1, reopened: 1 });
+
+    fix(3, ["dup", "dup", "new", "new", "approved"], 2);
+    analyze(4, []);
+    await nextDraw();
+    screen = cleanScreen(output.writes.at(-1) ?? "");
+    expected.push(/Review analysis 4 · 0 found/u);
+    assert.match(screen, expected.at(-1)!);
+    assert.match(screen, /Review fix 3\s+· 5 fixed · 2 approved/u);
+    assert.deepEqual(publisher.current.stages.find((item) => item.id === "review")?.analysisFindings,
+      { new: 0, stillOpen: 0, reopened: 0 });
+
+    for (const legacy of [false, true]) {
+      const restored: PresentationSnapshot[] = JSON.parse(JSON.stringify(snapshots));
+      if (legacy) {
+        for (const value of restored) {
+          value.stages = value.stages.map((item) => ({ ...item, analysisFindings: undefined }));
+        }
+      }
+      const restoredOutput = new FakeOutput();
+      restoredOutput.columns = 140;
+      restoredOutput.rows = 40;
+      const restoredRenderer = new RailTuiRenderer(new FakeInput(), restoredOutput, "/unused");
+      t.after(() => restoredRenderer.close());
+      const resumed = new PresentationPublisher({
+        ...store, listPresentationSnapshots: () => restored,
+        recordPresentationSnapshot: () => true,
+      }, "analysis-occurrences", restoredRenderer);
+      resumed.publish("stage", { kind: "stage-started", stage: "review" });
+      await nextDraw();
+      screen = cleanScreen(restoredOutput.writes.at(-1) ?? "");
+      if (legacy) {
+        assert.match(screen, /Review analysis 3 · 5 found/u);
+        assert.doesNotMatch(screen, /3 new/u);
+      } else {
+        for (const label of expected) assert.match(screen, label);
+      }
+    }
+
+    analyze(5, [{ ...fixed, description: "fixed revised" }]);
+    await nextDraw();
+    screen = cleanScreen(output.writes.at(-1) ?? "");
+    assert.match(screen, /Review analysis 5 · 1 reopened/u);
+    assert.doesNotMatch(screen, /Review fix 4/u);
+    assert.deepEqual(publisher.current.stages.find((item) => item.id === "review")?.analysisFindings,
+      { new: 0, stillOpen: 0, reopened: 1 });
+  });
+
+  test("top header reserves two columns without narrowing either pane", async (t) => {
+    for (const columns of [100, 140]) {
+      const output = new FakeOutput();
+      output.columns = columns;
+      const renderer = new RailTuiRenderer(new FakeInput(), output, "/unused");
+      t.after(() => renderer.close());
+      const publisher = new PresentationPublisher({
+        listPresentationSnapshots: () => [], recordPresentationSnapshot: () => true,
+      }, "header-margin", renderer);
+      publisher.publish("stage", { kind: "stage-started", stage: "review" });
+      await nextDraw();
+      const lines = cleanScreen(output.writes.at(-1) ?? "").split("\n");
+      assert.equal(lines[0].length, columns);
+      assert.equal(lines[0].slice(-2), "  ");
+      assert.match(lines[0], /Review \d+:\d+\s+auto-fix off/u);
+      if (columns === 140) assert.match(lines[0], /run \d+:\d+  $/u);
+      assert.equal(lines[2].length, columns);
+      assert.equal(lines[2].search(/[│|]/u), Math.min(64, Math.floor(columns * 0.46)) + 1);
+      assert.match(lines[2], /REVIEW/u);
+    }
   });
 
   test("blocked fix retries keep stage counts visible and reviewer analyses sequential", async () => {

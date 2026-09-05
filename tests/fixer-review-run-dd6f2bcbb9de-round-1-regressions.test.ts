@@ -240,7 +240,7 @@ test("TUI treats explicit stage.phase as authoritative over historical autoFixed
   renderer.close();
 });
 
-test("attempt-started clears phase and targetFindingIds for non-passed stages", () => {
+test("attempt-started preserves fixer identity but clears active targets", () => {
   class MemoryStore {
     snapshots: PresentationSnapshot[] = [];
     listPresentationSnapshots(): PresentationSnapshot[] {
@@ -291,7 +291,7 @@ test("attempt-started clears phase and targetFindingIds for non-passed stages", 
   assert.equal(reviewStage?.status, "failed");
   assert.equal(reviewStage?.phase, "fixer");
 
-  // Step 4: Attempt-started resets non-passed stages
+  // Step 4: Resume keeps retry identity without claiming the worker is active.
   publisher.publish("attempt-2", {
     attempt: 2,
     kind: "attempt-started",
@@ -300,8 +300,10 @@ test("attempt-started clears phase and targetFindingIds for non-passed stages", 
   current = publisher.current;
   reviewStage = current.stages.find((s) => s.id === "review");
   assert.equal(reviewStage?.status, "pending");
-  assert.equal(reviewStage?.round, 0);
-  assert.equal(reviewStage?.phase, undefined);
+  assert.equal(reviewStage?.round, 1);
+  assert.equal(reviewStage?.phase, "fixer");
+  assert.equal(reviewStage?.analysis, 1);
+  assert.equal(reviewStage?.fixAttempt, 0);
   assert.equal(reviewStage?.targetFindingIds, undefined);
 
   // Passed stage preserves passed status
