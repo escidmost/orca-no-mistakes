@@ -822,24 +822,6 @@ export class RailTuiRenderer implements PresentationRenderer {
             completedFix.fix.analysis,
             results,
           );
-        } else if (!completedFix && stageState?.fixedFindings) {
-          for (let i = this.#activities.length - 1; i >= 0; i--) {
-            const entry = this.#activities[i];
-            if (
-              entry.stage === transition.stage &&
-              entry.label.includes("fix") &&
-              !entry.label.includes("fixed")
-            ) {
-              const fixRound = Number(entry.label.match(/ fix (\d+)/u)?.[1] ?? roundNum - 1);
-              entry.label = activityResult(
-                fixLabel(stageName, fixRound),
-                stageName,
-                fixRound,
-                [activityCount(stageState.fixedFindings, "fixed")],
-              );
-              break;
-            }
-          }
         }
 
         if (
@@ -894,21 +876,21 @@ export class RailTuiRenderer implements PresentationRenderer {
         if (
           last &&
           last.stage === transition.stage &&
-          last.label.includes("fix") &&
-          !last.label.includes("fixed")
+          last.fix &&
+          !last.fix.verified
         ) {
           const stageState = snapshot.stages.find((s) => s.id === transition.stage);
           if (stageState?.fixedFindings) {
             const stageName = title(transition.stage);
-            const fixAnalysis = last.fix?.analysis ?? Number(last.label.match(/ fix (\d+)/u)?.[1] ?? 1);
-            const fixAttempt = last.fix?.fixAttempt ?? 0;
+            const fixAnalysis = last.fix.analysis;
+            const fixAttempt = last.fix.fixAttempt;
             last.label = activityResult(
               fixLabel(stageName, fixAnalysis, fixAttempt),
               stageName,
               fixAnalysis,
               [activityCount(stageState.fixedFindings, "fixed")],
             );
-            if (last.fix) last.fix.verified = true;
+            last.fix.verified = true;
           }
         }
         const stageStatus = snapshot.stages.find((s) => s.id === transition.stage)?.status;
