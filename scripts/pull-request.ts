@@ -100,6 +100,7 @@ function after(earlier: string, candidate: string): string {
 
 export function escapeUntrustedMarkdown(content: string): string {
   return redactKnownSecrets(content)
+    .replaceAll(/\r\n?/gu, '\n')
     .replaceAll('&', '&amp;')
     .replaceAll('<', '&lt;')
     .replaceAll('>', '&gt;')
@@ -121,7 +122,7 @@ function capEscapedText(content: string, budget: number): string {
 }
 
 export function findUnclosedFence(content: string): { char: string; length: number } | null {
-  const lines = content.split(/\r?\n/)
+  const lines = content.split(/\r\n|\r|\n/u)
   let currentFence: { char: string; length: number } | null = null
   for (const line of lines) {
     if (!currentFence) {
