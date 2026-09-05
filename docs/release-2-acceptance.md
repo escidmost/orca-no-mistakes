@@ -57,27 +57,32 @@ git -C /path/to/same-repository-checkout push origin "$default_oid:refs/heads/on
 git -C /path/to/fork-checkout push upstream "$default_oid:refs/heads/onm-79/run/base-fork"
 ```
 
-Initialize each fixture checkout on its clean committed feature branch against its recorded base branch:
+Check out the exact clean committed feature branch each example submits before initializing: `onm-79/run/same` in the same-repository checkout and `onm-79/run/fork` in the fork checkout. Without `--head-branch`, `init` persists the currently checked-out branch as the head route, gate admission requires a checked-out worktree on exactly the submitted ref and candidate, and direct `run` submits the checked-out branch rather than the init override. An arbitrarily named feature branch therefore fails admission or route matching. Then initialize each checkout against its recorded base branch:
 
 ```sh
+git -C /path/to/same-repository-checkout switch -c onm-79/run/same
+git -C /path/to/fork-checkout switch -c onm-79/run/fork
 /path/to/package/bin/orca-no-mistakes init --repo /path/to/same-repository-checkout --base-branch onm-79/run/base-same
 /path/to/package/bin/orca-no-mistakes init --repo /path/to/fork-checkout --upstream upstream/fixture --fork contributor/fixture --base-branch onm-79/run/base-fork --head-branch onm-79/run/fork
 ```
 
-Verify that the persisted route's base branch matches the recorded per-run branch before submitting.
+Before submitting, verify that the persisted route's base branch matches the recorded per-run base branch and that its head branch equals the branch currently checked out in that checkout (`git branch --show-current`): `onm-79/run/same` and `onm-79/run/fork` respectively.
 
-Submit the same-repository fixture through the installed local gate:
+The same-repository installed-gate scenario is **blocked pending isolated-base gate support**. The gate launches the admitted pipeline without `--base`, so the run detects `origin/HEAD` (or `main`/`master`) as its base, does not match the persisted isolated-base route, and fails closed before publication. Do not work around this by initializing against the persistent default branch; that would let the fixture merge mutate it and lose fixture isolation. Once the gate can pass the persisted base through to the run, the intended submission is:
 
 ```sh
 intent=$(node -e 'process.stdout.write(Buffer.from(process.argv[1]).toString("base64url"))' 'ONM-79: accept same-repository publication')
 git -C /path/to/same-repository-checkout push --push-option="no-mistakes.intent=$intent" orca-no-mistakes HEAD:refs/heads/onm-79/run/same
 ```
 
-Submit the fork fixture through direct ingress:
+Submit the fork fixture through direct ingress with an explicit `--base`. Direct `run` resolves the base only from `origin/<base>` or a local `<base>` ref, and the fork checkout's `origin` is the fork, so first materialize the upstream base branch locally:
 
 ```sh
-/path/to/package/bin/orca-no-mistakes run --repo /path/to/fork-checkout --intent 'ONM-79: accept fork publication'
+git -C /path/to/fork-checkout fetch upstream onm-79/run/base-fork:onm-79/run/base-fork
+/path/to/package/bin/orca-no-mistakes run --repo /path/to/fork-checkout --base onm-79/run/base-fork --intent 'ONM-79: accept fork publication'
 ```
+
+Confirm the local `onm-79/run/base-fork` OID equals the recorded upstream base OID before running. Omitting `--base` selects the default branch, which does not match the stored isolated-base route and fails closed.
 
 Retain the returned admission/run identity. Detached runs return immediately; handle their notifications and decisions through Orca. Do not infer completion from command return, PR creation or readiness notification. Verify the exact base/head repositories, branches and candidate OID on the created PR. Exercise a later candidate against that same still-open PR, checking PR identity reuse and owned report replacement, then merge only the exact fixture PR as part of the test driver. Record the authoritative matching merged observation. A later run against an already merged PR is a different scenario.
 
