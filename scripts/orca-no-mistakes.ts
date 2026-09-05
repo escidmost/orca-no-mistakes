@@ -5882,14 +5882,14 @@ export function recoverFixRecords(
     | undefined,
   snapshots: readonly PresentationSnapshot[],
 ): readonly (string | FixRecord)[] {
-  if (stageState?.fixRecords && stageState.fixRecords.length > 0) {
-    return stageState.fixRecords;
+  const structuredRecords = stageState?.fixRecords ?? [];
+  const summaries = stageState?.fixSummaries ?? [];
+
+  if (summaries.length === 0) {
+    return structuredRecords;
   }
-  const legacySummaries = stageState?.fixSummaries ?? [];
-  if (legacySummaries.length === 0) {
-    return [];
-  }
-  const recovered: FixRecord[] = [];
+
+  const snapshotRecords: FixRecord[] = [];
   let currentAnalysis = 0;
   let fixAttempt = 0;
   for (const snapshot of snapshots) {
@@ -5912,7 +5912,7 @@ export function recoverFixRecords(
       } else if (transition.kind === "fix-completed") {
         const summary = transition.summary?.trim();
         if (summary) {
-          recovered.push({
+          snapshotRecords.push({
             analysis: transition.analysis ?? currentAnalysis,
             fixAttempt: transition.fixAttempt ?? fixAttempt,
             summary,
@@ -5922,21 +5922,63 @@ export function recoverFixRecords(
       }
     }
   }
-  if (recovered.length > 0) {
-    const matched: (string | FixRecord)[] = [];
-    const available = [...recovered];
-    for (const summary of legacySummaries) {
-      const idx = available.findIndex((rec) => rec.summary === summary);
-      if (idx !== -1) {
-        matched.push(available[idx]);
-        available.splice(idx, 1);
-      } else {
-        matched.push(summary);
+
+  const availableSnapshotRecords = [...snapshotRecords];
+  for (const rec of structuredRecords) {
+    const idx = availableSnapshotRecords.findIndex(
+      (s) =>
+        s.summary === rec.summary &&
+        s.analysis === rec.analysis &&
+        s.fixAttempt === rec.fixAttempt,
+    );
+    if (idx !== -1) {
+      availableSnapshotRecords.splice(idx, 1);
+    }
+  }
+
+  const result: (string | FixRecord)[] = new Array(summaries.length);
+  const matchedSummaries = new Set<number>();
+
+  const offset = summaries.length - structuredRecords.length;
+  const isTailMatch =
+    offset >= 0 &&
+    structuredRecords.length > 0 &&
+    structuredRecords.every(
+      (rec, k) => rec.summary === summaries[offset + k],
+    );
+
+  if (isTailMatch) {
+    for (let k = 0; k < structuredRecords.length; k++) {
+      const idx = offset + k;
+      result[idx] = structuredRecords[k];
+      matchedSummaries.add(idx);
+    }
+  } else {
+    const remainingStructured = [...structuredRecords];
+    for (let i = 0; i < summaries.length; i++) {
+      const summary = summaries[i];
+      const recIdx = remainingStructured.findIndex((r) => r.summary === summary);
+      if (recIdx !== -1) {
+        result[i] = remainingStructured[recIdx];
+        remainingStructured.splice(recIdx, 1);
+        matchedSummaries.add(i);
       }
     }
-    return matched;
   }
-  return legacySummaries;
+
+  for (let i = 0; i < summaries.length; i++) {
+    if (matchedSummaries.has(i)) continue;
+    const summary = summaries[i];
+    const snapIdx = availableSnapshotRecords.findIndex((r) => r.summary === summary);
+    if (snapIdx !== -1) {
+      result[i] = availableSnapshotRecords[snapIdx];
+      availableSnapshotRecords.splice(snapIdx, 1);
+    } else {
+      result[i] = summary;
+    }
+  }
+
+  return result;
 }
 
 export function pullRequestPipelineRounds(

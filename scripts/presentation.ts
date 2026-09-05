@@ -465,7 +465,27 @@ function nextSnapshot(
     }
     case "fix-blocked": {
       const stage = next.stages.find((item) => item.id === transition.stage);
-      const findings = updateFindings(stage?.findings ?? [], transition.findings, {
+      const isCoordinatorBlocker = (
+        finding: PresentationFinding | Omit<PresentationFinding, "disposition">,
+      ) =>
+        (finding.id === "fixer-no-change" || finding.id === "fixer-policy-violation") &&
+        finding.file === undefined &&
+        finding.line === undefined &&
+        finding.severity === "error";
+
+      const priorFindings = (stage?.findings ?? []).filter((prev) => {
+        if (
+          prev.disposition === "open" &&
+          isCoordinatorBlocker(prev) &&
+          !transition.findings.some(
+            (curr) => isCoordinatorBlocker(curr) && curr.id === prev.id,
+          )
+        ) {
+          return false;
+        }
+        return true;
+      });
+      const findings = updateFindings(priorFindings, transition.findings, {
         inheritApproval: false,
       });
       const fixed = findings.filter((finding) => finding.disposition === "fixed").length;
