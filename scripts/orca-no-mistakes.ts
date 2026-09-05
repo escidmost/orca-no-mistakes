@@ -393,6 +393,7 @@ export type PipelineOptions = {
     onRendererFailure?: (error: unknown) => void,
   ) => PresentationRenderer;
   resumeRunId?: string;
+  trustedArtifactDigests?: readonly string[] | ReadonlySet<string>;
   userGlobalConfig?: OrcaNoMistakesConfig;
 };
 
@@ -3003,18 +3004,41 @@ export async function runPipeline(
       const priorDisposition = ledger
         .stageDispositions(runId)
         .find((entry) => entry.stage_id === stage);
-      if (
+      const gateAudits = ledger.listGateAudit(runId);
+      const isApprovedByAudit = priorAuthoritativeEvidence
+        ? gateAudits.some(
+            (audit) =>
+              audit.resolved_at !== null &&
+              (audit.decision === "approve" || audit.decision === "skip") &&
+              gateAuditMatchesEvidence(
+                audit,
+                stage,
+                priorAuthoritativeEvidence.round_index,
+                priorAuthoritativeEvidence.evidence_sha256,
+              ),
+          )
+        : false;
+      const isCandidateMismatched =
+        priorAuthoritativeEvidence !== undefined &&
+        priorAuthoritativeEvidence.candidate_commit_oid !== stageInputCommitOid;
+      const isSatisfiedDisposition =
+        priorDisposition?.disposition === "satisfied" &&
+        priorAuthoritativeEvidence !== undefined &&
+        priorDisposition.evidence_sha256 === priorAuthoritativeEvidence.evidence_sha256;
+      const shouldReopen =
         stage !== "push" &&
         stage !== "pr" &&
-        priorDisposition?.disposition === "satisfied" &&
-        priorAuthoritativeEvidence &&
-        priorDisposition.evidence_sha256 === priorAuthoritativeEvidence.evidence_sha256 &&
-        priorAuthoritativeEvidence.candidate_commit_oid !== stageInputCommitOid
-      ) {
+        isCandidateMismatched &&
+        (priorDisposition ? isSatisfiedDisposition : isApprovedByAudit);
+      if (shouldReopen) {
         presentation.publish(
-          `stage:${stage}:reopened:${priorAuthoritativeEvidence.evidence_sha256}:${stageInputCommitOid}`,
+          `stage:${stage}:reopened:${priorAuthoritativeEvidence!.evidence_sha256}:${stageInputCommitOid}`,
           { kind: "stage-reopened", stage },
         );
+        const priorStageEntry = latestEntryByStage.get(stage);
+        if (priorStageEntry) {
+          priorStageEntry.waiverOrApproval = undefined;
+        }
       }
       if (stage === "push" || stage === "pr") {
         if (!options.githubAuthority || !options.publicationDestination || !attemptId) {
@@ -3182,6 +3206,19 @@ export async function runPipeline(
                 .map((value) => value.trim())
                 .filter(Boolean),
             )].join("\n\n");
+            const trustedPublicationApprovals = new Set<string>(
+              options.trustedArtifactDigests ?? [],
+            );
+            for (const audit of ledger.listGateAudit(runId)) {
+              if (
+                audit.resolved_at !== null &&
+                (audit.decision === "approve" || audit.decision === "publish-artifact") &&
+                audit.resolution === "publish-artifact" &&
+                audit.evidence_sha256
+              ) {
+                trustedPublicationApprovals.add(audit.evidence_sha256);
+              }
+            }
             content = pullRequestContent(branchIntent || intent, {
               candidateCommitOid: stageInputCommitOid,
               pipelineSteps: pipelineReportSteps,
@@ -3193,7 +3230,11 @@ export async function runPipeline(
                   "The validated pipeline found no material review risk.",
               },
               testing: {
-                artifacts: await pullRequestArtifacts(artifactsDir, testReport),
+                artifacts: await pullRequestArtifacts(
+                  artifactsDir,
+                  testReport,
+                  trustedPublicationApprovals,
+                ),
                 summary:
                   testReport?.summary ??
                   "No dedicated test stage was required by the validated pipeline plan.",
@@ -3807,7 +3848,12 @@ export async function runPipeline(
 
       const stageOutputCommitOid = await git.head();
       const authoritativeEntry = latestEntryByStage.get(stage)!;
-      if (authoritativeEntry.exitCode !== 0 && !authoritativeEntry.waiverOrApproval) {
+      if (
+        authoritativeEntry.exitCode !== 0 &&
+        !authoritativeEntry.waiverOrApproval &&
+        !shouldReopen &&
+        !reopenedStages.has(stage)
+      ) {
         const priorAudit = ledger
           .listGateAudit(runId)
           .findLast(
@@ -3816,7 +3862,9 @@ export async function runPipeline(
               audit.resolved_at !== null &&
               (audit.decision === "approve" ||
                 audit.decision === "skip" ||
-                audit.decision === "fix"),
+                audit.decision === "fix") &&
+              (!priorAuthoritativeEvidence ||
+                priorAuthoritativeEvidence.candidate_commit_oid === stageInputCommitOid),
           );
         if (priorAudit) {
           const preservedGateId = `${priorAudit.gate_id}:preserved-approval`;
@@ -5916,9 +5964,14 @@ function pullRequestArtifactLabel(fileName: string): string {
   return label ? label[0].toUpperCase() + label.slice(1) : "Test evidence";
 }
 
+export type PullRequestArtifactTrustOptions = {
+  trustedPublicationApprovals?: ReadonlySet<string> | readonly string[];
+};
+
 export async function pullRequestArtifacts(
   artifactsDir: string,
   report: StageReport | undefined,
+  options?: PullRequestArtifactTrustOptions | ReadonlySet<string> | readonly string[],
 ): Promise<PullRequestArtifact[]> {
   const artifacts: PullRequestArtifact[] = [];
   let canonicalArtifactsDir: string;
@@ -5927,6 +5980,12 @@ export async function pullRequestArtifacts(
   } catch {
     return artifacts;
   }
+  const trustedApprovals = new Set(
+    options instanceof Set || Array.isArray(options)
+      ? options
+      : options?.trustedPublicationApprovals,
+  );
+
   for (const artifact of report?.artifacts ?? []) {
     const resolved = path.resolve(artifactsDir, artifact);
     if (!isWithin(artifactsDir, resolved)) continue;
@@ -5949,19 +6008,35 @@ export async function pullRequestArtifacts(
         if (typeof expectedDigest !== "string" || expectedDigest !== digest) {
           continue;
         }
-        const raw = previewBytes.toString("utf8");
-        if (!raw.includes("\0")) {
-          const redacted = redactKnownSecrets(raw);
-          const content =
-            Buffer.byteLength(redacted) <= 16 * 1024
-              ? redacted
-              : Buffer.from(redacted)
-                  .subarray(0, 16 * 1024)
-                  .toString("utf8")
-                  .replace(/\uFFFD$/u, "");
+        const label = pullRequestArtifactLabel(path.basename(artifact));
+        const isApproved = trustedApprovals.has(digest);
+        if (isApproved) {
+          const raw = previewBytes.toString("utf8");
+          if (!raw.includes("\0")) {
+            const redacted = redactKnownSecrets(raw);
+            const content =
+              Buffer.byteLength(redacted) <= 16 * 1024
+                ? redacted
+                : Buffer.from(redacted)
+                    .subarray(0, 16 * 1024)
+                    .toString("utf8")
+                    .replace(/\uFFFD$/u, "");
+            artifacts.push({
+              content,
+              name: label,
+            });
+          }
+        } else {
+          const content = [
+            `Artifact: ${path.basename(artifact)}`,
+            `SHA-256: ${digest}`,
+            `Size: ${stats.size} bytes`,
+            "",
+            "[Artifact content withheld: exact-content publication approval required to embed artifact bytes in pull request body. Content withheld to prevent credential and secret exfiltration; digest recorded above provides pipeline integrity verification.]",
+          ].join("\n");
           artifacts.push({
             content,
-            name: pullRequestArtifactLabel(path.basename(artifact)),
+            name: label,
           });
         }
       } finally {
