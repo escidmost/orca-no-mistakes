@@ -6010,7 +6010,7 @@ export function pullRequestPipelineRounds(
     const fixSummary = fixByOriginatingAnalysis.get(analysisNumber - 1);
     const isLastRound = index === reports.length - 1;
     return {
-      findings: (report.findings ?? [])
+      findings: actionableFindings(report)
         .filter((finding) => !approvedOnly.has(pullRequestFindingKey(finding)))
         .map((finding): PullRequestPipelineFinding => ({
           description: finding.description,
