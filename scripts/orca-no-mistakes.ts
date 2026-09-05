@@ -2998,60 +2998,74 @@ export async function runPipeline(
         `attempt:${presentation.current.attempt}:stage:${stage}:started`,
         { kind: "stage-started", stage },
       );
-      const priorAuthoritativeEvidence = latestAuthoritativeEvidenceByStage.get(stage);
       const priorDisposition = ledger
         .stageDispositions(runId)
         .find((entry) => entry.stage_id === stage);
-      const gateAudits = ledger.listGateAudit(runId);
-      const isApprovedByAudit = priorAuthoritativeEvidence
-        ? gateAudits.some(
-            (audit) =>
-              audit.resolved_at !== null &&
-              (audit.decision === "approve" ||
-                audit.decision === "skip" ||
-                audit.decision === "fix") &&
-              gateAuditMatchesEvidence(
-                audit,
-                stage,
-                priorAuthoritativeEvidence.round_index,
-                priorAuthoritativeEvidence.evidence_sha256,
-              ),
-          )
-        : false;
-      const isCandidateMismatched =
-        priorAuthoritativeEvidence !== undefined &&
-        priorAuthoritativeEvidence.candidate_commit_oid !== stageInputCommitOid;
-      const isSatisfiedDisposition =
-        priorDisposition?.disposition === "satisfied" &&
-        priorAuthoritativeEvidence !== undefined &&
-        priorDisposition.evidence_sha256 === priorAuthoritativeEvidence.evidence_sha256;
-      const stagePresentationState = presentation.current.stages.find(
-        (item) => item.id === stage,
-      );
-      const hasCandidatePresentationApproval =
-        (stagePresentationState?.approvedFindings ?? 0) > 0 ||
-        Boolean(
-          stagePresentationState?.findings?.some(
-            (finding) => finding.disposition === "approved",
-          ),
-        );
-      const shouldReopen =
-        stage !== "push" &&
-        stage !== "pr" &&
-        isCandidateMismatched &&
-        (priorDisposition
-          ? isSatisfiedDisposition || hasCandidatePresentationApproval
-          : isApprovedByAudit || hasCandidatePresentationApproval);
-      if (shouldReopen) {
-        presentation.publish(
-          `stage:${stage}:reopened:${priorAuthoritativeEvidence!.evidence_sha256}:${stageInputCommitOid}`,
-          { kind: "stage-reopened", stage },
-        );
-        const priorStageEntry = latestEntryByStage.get(stage);
-        if (priorStageEntry) {
-          priorStageEntry.waiverOrApproval = undefined;
+      let shouldReopen = false;
+      const invalidatedEvidenceTargets = new Set<string>();
+      const invalidateCandidateBoundApprovals = (targetCommitOid: string): boolean => {
+        if (stage === "push" || stage === "pr") return false;
+        const currentAuthoritative = latestAuthoritativeEvidenceByStage.get(stage);
+        if (
+          !currentAuthoritative ||
+          currentAuthoritative.candidate_commit_oid === targetCommitOid
+        ) {
+          return false;
         }
-      }
+        const reopenKey = `${currentAuthoritative.evidence_sha256}:${targetCommitOid}`;
+        if (invalidatedEvidenceTargets.has(reopenKey)) {
+          return true;
+        }
+        const currentDisposition = ledger
+          .stageDispositions(runId)
+          .find((entry) => entry.stage_id === stage);
+        const audits = ledger.listGateAudit(runId);
+        const isApprovedByAudit = audits.some(
+          (audit) =>
+            audit.resolved_at !== null &&
+            (audit.decision === "approve" ||
+              audit.decision === "skip" ||
+              audit.decision === "fix") &&
+            gateAuditMatchesEvidence(
+              audit,
+              stage,
+              currentAuthoritative.round_index,
+              currentAuthoritative.evidence_sha256,
+            ),
+        );
+        const isSatisfiedDisposition =
+          currentDisposition?.disposition === "satisfied" &&
+          currentDisposition.evidence_sha256 === currentAuthoritative.evidence_sha256;
+        const stagePresentationState = presentation.current.stages.find(
+          (item) => item.id === stage,
+        );
+        const hasCandidatePresentationApproval =
+          (stagePresentationState?.approvedFindings ?? 0) > 0 ||
+          Boolean(
+            stagePresentationState?.findings?.some(
+              (finding) => finding.disposition === "approved",
+            ),
+          );
+        const mustReopen = currentDisposition
+          ? isSatisfiedDisposition || hasCandidatePresentationApproval
+          : isApprovedByAudit || hasCandidatePresentationApproval;
+        if (mustReopen) {
+          shouldReopen = true;
+          reopenedStages.add(stage);
+          invalidatedEvidenceTargets.add(reopenKey);
+          presentation.publish(
+            `stage:${stage}:reopened:${currentAuthoritative.evidence_sha256}:${targetCommitOid}`,
+            { kind: "stage-reopened", stage },
+          );
+          const priorStageEntry = latestEntryByStage.get(stage);
+          if (priorStageEntry) {
+            priorStageEntry.waiverOrApproval = undefined;
+          }
+          return true;
+        }
+        return false;
+      };
+      invalidateCandidateBoundApprovals(stageInputCommitOid);
       if (stage === "push" || stage === "pr") {
         if (!options.githubAuthority || !options.publicationDestination || !attemptId) {
           throw new Error(`${stage} requires initialized GitHub publication`);
@@ -3333,6 +3347,8 @@ export async function runPipeline(
         ? false
         : (resumedFindingMode ?? autoFixMode);
       const runStage = async () => {
+        const executionHead = await git.head();
+        invalidateCandidateBoundApprovals(executionHead);
         const analysis = (reportsByStage.get(stage)?.length ?? 0) + 1;
         presentation.publish(
           `attempt:${presentation.current.attempt}:stage:${stage}:round:${round}:started`,
@@ -3855,6 +3871,9 @@ export async function runPipeline(
               { eventKey, snapshot },
             ),
         );
+        if (nextFixer.after !== nextFixer.before) {
+          invalidateCandidateBoundApprovals(nextFixer.after);
+        }
         report = await runStage();
       }
 
@@ -3866,22 +3885,25 @@ export async function runPipeline(
         !shouldReopen &&
         !reopenedStages.has(stage)
       ) {
+        const evidenceRows = ledger.listEvidence(runId);
+        const evidenceBySha = new Map(
+          evidenceRows.map((row) => [row.evidence_sha256, row]),
+        );
         const priorAudit = ledger
           .listGateAudit(runId)
           .findLast(
             (audit) =>
               audit.stage_id === stage &&
               audit.resolved_at !== null &&
-              (audit.decision === "approve" ||
-                audit.decision === "skip" ||
-                audit.decision === "fix") &&
-              (!priorAuthoritativeEvidence ||
-                priorAuthoritativeEvidence.candidate_commit_oid === stageInputCommitOid),
+              (audit.decision === "approve" || audit.decision === "skip") &&
+              audit.evidence_sha256 !== null &&
+              evidenceBySha.get(audit.evidence_sha256)?.candidate_commit_oid ===
+                authoritativeEntry.candidateCommitOid,
           );
         if (priorAudit) {
           const preservedGateId = `${priorAudit.gate_id}:preserved-approval`;
           ledger.recordGateAudit({
-            decision: priorAudit.decision === "fix" ? "approve" : priorAudit.decision,
+            decision: priorAudit.decision,
             evidenceSha256: authoritativeEntry.evidenceSha256,
             gateId: preservedGateId,
             guidance: priorAudit.guidance || undefined,
@@ -3894,7 +3916,7 @@ export async function runPipeline(
             stageId: stage,
           });
           authoritativeEntry.waiverOrApproval = {
-            decision: priorAudit.decision === "fix" ? "approve" : (priorAudit.decision as "approve" | "skip"),
+            decision: priorAudit.decision as "approve" | "skip",
             gateId: preservedGateId,
             resolvedAt: new Date().toISOString(),
           };
