@@ -21,6 +21,12 @@ export type PresentationFinding = {
   severity: "error" | "info" | "warning";
 };
 
+export type FixRecord = {
+  analysis: number;
+  fixAttempt?: number;
+  summary: string;
+};
+
 export type PresentationTransition =
   | { kind: "run-started" }
   | { attempt: number; kind: "attempt-started" }
@@ -37,8 +43,10 @@ export type PresentationTransition =
       targetFindingIds?: readonly string[];
     }
   | {
+      analysis?: number;
       approvedFindings: number;
       findingIds: readonly string[];
+      fixAttempt?: number;
       kind: "fix-completed";
       round: number;
       stage: StageName;
@@ -111,6 +119,7 @@ export type PresentationSnapshot = {
     analysis?: number;
     approvedFindings?: number;
     findings?: readonly PresentationFinding[];
+    fixRecords?: readonly FixRecord[];
     fixSummaries?: readonly string[];
     fixAttempt?: number;
     fixedFindings?: number;
@@ -157,6 +166,7 @@ function initialSnapshot(
       analysis: 0,
       approvedFindings: 0,
       findings: [],
+      fixRecords: [],
       fixSummaries: [],
       fixedFindings: 0,
       id,
@@ -364,6 +374,8 @@ function nextSnapshot(
           approvedFindings: 0,
           findings: [],
           fixAttempt: undefined,
+          fixRecords: [],
+          fixSummaries: [],
           fixedFindings: 0,
           openFindings: 0,
           phase: undefined,
@@ -407,6 +419,17 @@ function nextSnapshot(
       break;
     }
     case "fix-completed": {
+      const stage = next.stages.find((item) => item.id === transition.stage);
+      const fixAnalysis =
+        transition.analysis ??
+        (stage?.analysis && stage.analysis > 0
+          ? stage.analysis
+          : transition.round);
+      const fixAttempt = transition.fixAttempt ?? stage?.fixAttempt ?? 0;
+      const summary = transition.summary?.trim();
+      const newRecord: FixRecord | undefined = summary
+        ? { analysis: fixAnalysis, fixAttempt, summary }
+        : undefined;
       next = {
         ...next,
         currentStage: transition.stage,
@@ -414,12 +437,15 @@ function nextSnapshot(
           phase: "fixer",
           round: transition.round,
           status: "active",
-          ...(transition.summary?.trim()
+          ...(summary
             ? {
+                fixRecords: [
+                  ...(stage?.fixRecords ?? []),
+                  newRecord!,
+                ],
                 fixSummaries: [
-                  ...(next.stages.find((item) => item.id === transition.stage)
-                    ?.fixSummaries ?? []),
-                  transition.summary.trim(),
+                  ...(stage?.fixSummaries ?? []),
+                  summary,
                 ],
               }
             : {}),

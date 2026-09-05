@@ -31,6 +31,7 @@ import {
   rm,
   stat,
   writeFile,
+  type FileHandle,
 } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -2845,6 +2846,17 @@ export async function runPipeline(
       stageEntries.push(entry);
       if (isAuthoritativeStageEvidence(workerIdentity)) {
         latestEntryByStage.set(stage, entry);
+        latestAuthoritativeEvidenceByStage.set(stage, {
+          artifact_sha256: entry.artifactSha256,
+          base_commit_oid: entry.baseCommitOid,
+          candidate_commit_oid: entry.candidateCommitOid,
+          evidence_sha256: entry.evidenceSha256,
+          exit_code: entry.exitCode,
+          round_index: entry.round,
+          stage_id: stage,
+          summary: entry.summary,
+          worker_identity: entry.workerIdentity,
+        } as StageEvidenceRow);
         latestReportByStage.set(stage, report);
         reportsByStage.set(stage, [...(reportsByStage.get(stage) ?? []), report]);
       }
@@ -2910,8 +2922,65 @@ export async function runPipeline(
       )
       .catch(() => {});
 
-    for (const stage of stagesToRun) {
-      const taskId = stageTasks.get(stage)!;
+    const getInvalidatedApprovalStage = async (): Promise<StageName | undefined> => {
+      const currentHead = await git.head();
+      const dispositions = ledger.stageDispositions(runId);
+      const gateAudits = ledger.listGateAudit(runId);
+      for (const candidateStage of pipelineSteps) {
+        if (candidateStage === "push" || candidateStage === "pr") break;
+        const disposition = dispositions.find(
+          (entry) => entry.stage_id === candidateStage && entry.disposition === "satisfied",
+        );
+        if (!disposition?.evidence_sha256) continue;
+        const evidence = latestAuthoritativeEvidenceByStage.get(candidateStage);
+        if (!evidence || evidence.evidence_sha256 !== disposition.evidence_sha256) continue;
+        const isApproved = gateAudits.some(
+          (audit) =>
+            audit.resolved_at !== null &&
+            (audit.decision === "approve" || audit.decision === "skip") &&
+            gateAuditMatchesEvidence(
+              audit,
+              candidateStage,
+              evidence.round_index,
+              evidence.evidence_sha256,
+            ),
+        );
+        if (isApproved && evidence.candidate_commit_oid !== currentHead) {
+          return candidateStage;
+        }
+      }
+      return undefined;
+    };
+
+    const stageQueue: StageName[] = [...stagesToRun];
+    const reopenedStages = new Set<StageName>();
+    while (stageQueue.length > 0) {
+      const stage = stageQueue.shift()!;
+      if (stage === "push" || stage === "pr") {
+        const invalidatedStage = await getInvalidatedApprovalStage();
+        if (invalidatedStage) {
+          const restartIndex = pipelineSteps.indexOf(invalidatedStage);
+          const pushIndex = pipelineSteps.indexOf("push");
+          const stagesToRevalidate = pipelineSteps.slice(restartIndex, pushIndex);
+          for (const s of stagesToRevalidate) {
+            reopenedStages.add(s);
+          }
+          stageQueue.unshift(...stagesToRevalidate, stage);
+          continue;
+        }
+      }
+
+      let taskId = stageTasks.get(stage);
+      if (!taskId || reopenedStages.has(stage)) {
+        taskId = await orca.createTask(
+          stageTaskSpec(stage, intent, pipelineSteps),
+          {
+            deps: previousTask ? [previousTask] : [],
+          },
+        );
+        stageTasks.set(stage, taskId);
+      }
+      previousTask = taskId;
       const stageInputCommitOid = await git.head();
       ledger.heartbeatLease(deliveryRepo.root, deliveryRepo.branch, runId);
       await orca
@@ -3062,7 +3131,7 @@ export async function runPipeline(
                     findings: [],
                     summary: `${completedStage} passed.`,
                   }],
-                  [...(stageState?.fixSummaries ?? [])],
+                  [...(stageState?.fixRecords ?? stageState?.fixSummaries ?? [])],
                   stageState?.findings ?? [],
                 );
                 const seenApproved = new Set<string>();
@@ -3701,8 +3770,10 @@ export async function runPipeline(
         presentation.publish(
           eventKey,
           {
+            analysis: fixAnalysis,
             approvedFindings: actionable.length - targetFindings.length,
             findingIds: targetFindings.map((finding) => finding.id),
+            fixAttempt,
             kind: "fix-completed",
             round,
             stage,
@@ -3749,8 +3820,21 @@ export async function runPipeline(
             { eventKey, snapshot },
           ),
       );
+      priorRoundByStage.set(stage, authoritativeEntry.round + 1);
+      reopenedStages.delete(stage);
       latestReportByStage.set(stage, report);
       await orca.completeTask(taskId, report);
+      if (stageQueue.length === 0 && !pipelineSteps.includes("push")) {
+        const invalidatedStage = await getInvalidatedApprovalStage();
+        if (invalidatedStage) {
+          const restartIndex = pipelineSteps.indexOf(invalidatedStage);
+          const stagesToRevalidate = pipelineSteps.slice(restartIndex);
+          for (const s of stagesToRevalidate) {
+            reopenedStages.add(s);
+          }
+          stageQueue.push(...stagesToRevalidate);
+        }
+      }
     }
 
     if (fixerSession) {
@@ -5598,18 +5682,33 @@ async function validateReport(
     if (!isWithin(evidenceRoot, resolved)) {
       throw new WorkerReportValidationError(`${stage} worker returned an unsafe artifact path`);
     }
-    let canonicalArtifact: string;
+    let handle: FileHandle | undefined;
     try {
-      await stat(resolved);
-      canonicalArtifact = await realpath(resolved);
-    } catch {
-      throw new WorkerReportValidationError(`${stage} worker returned a missing artifact`);
-    }
-    if (!isWithin(canonicalEvidenceRoot, canonicalArtifact)) {
+      handle = await open(resolved, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+      const stats = await handle.stat();
+      if (!stats.isFile()) {
+        throw new WorkerReportValidationError(`${stage} worker returned an unsafe artifact path`);
+      }
+      const canonicalArtifact = await realpath(resolved);
+      if (!isWithin(canonicalEvidenceRoot, canonicalArtifact)) {
+        throw new WorkerReportValidationError(`${stage} worker returned an unsafe artifact path`);
+      }
+      const content = await handle.readFile();
+      artifactDigests[artifact] = createHash("sha256").update(content).digest("hex");
+    } catch (error) {
+      if (error instanceof WorkerReportValidationError) throw error;
+      if (
+        typeof error === "object" &&
+        error !== null &&
+        "code" in error &&
+        (error as { code?: string }).code === "ENOENT"
+      ) {
+        throw new WorkerReportValidationError(`${stage} worker returned a missing artifact`);
+      }
       throw new WorkerReportValidationError(`${stage} worker returned an unsafe artifact path`);
+    } finally {
+      await handle?.close();
     }
-    const content = await readFile(canonicalArtifact);
-    artifactDigests[artifact] = createHash("sha256").update(content).digest("hex");
   }
   return {
     ...normalizedReport,
@@ -5649,7 +5748,7 @@ function pullRequestFindingKey(
 
 function pullRequestPipelineRounds(
   reports: StageReport[],
-  fixSummaries: string[],
+  fixSummaries: readonly (string | FixRecord)[],
   finalFindings: readonly PresentationFinding[],
 ): PullRequestPipelineRound[] {
   const dispositions = new Map<string, Set<PresentationFinding["disposition"]>>();
@@ -5664,21 +5763,29 @@ function pullRequestPipelineRounds(
       .filter(([, values]) => values.size === 1 && values.has("approved"))
       .map(([key]) => key),
   );
-  return reports.map((report, index) => ({
-    findings: (report.findings ?? [])
-      .filter((finding) => !approvedOnly.has(pullRequestFindingKey(finding)))
-      .map((finding): PullRequestPipelineFinding => ({
-        description: finding.description,
-        ...(finding.file ? { file: finding.file } : {}),
-        ...(finding.line ? { line: finding.line } : {}),
-        severity: finding.severity,
-      })),
-    ...(index > 0 && fixSummaries[index - 1]
-      ? { fixSummary: fixSummaries[index - 1] }
-      : {}),
-    summary: report.summary?.trim() || "Stage passed.",
-    ...(report.tested?.length ? { tested: report.tested } : {}),
-  }));
+  const fixByOriginatingAnalysis = new Map<number, string>();
+  for (const item of fixSummaries) {
+    if (typeof item === "object" && item !== null && typeof item.analysis === "number") {
+      fixByOriginatingAnalysis.set(item.analysis, item.summary);
+    }
+  }
+  return reports.map((report, index) => {
+    const analysisNumber = index + 1;
+    const fixSummary = fixByOriginatingAnalysis.get(analysisNumber - 1);
+    return {
+      findings: (report.findings ?? [])
+        .filter((finding) => !approvedOnly.has(pullRequestFindingKey(finding)))
+        .map((finding): PullRequestPipelineFinding => ({
+          description: finding.description,
+          ...(finding.file ? { file: finding.file } : {}),
+          ...(finding.line ? { line: finding.line } : {}),
+          severity: finding.severity,
+        })),
+      ...(fixSummary ? { fixSummary } : {}),
+      summary: report.summary?.trim() || "Stage passed.",
+      ...(report.tested?.length ? { tested: report.tested } : {}),
+    };
+  });
 }
 
 function pullRequestArtifactLabel(fileName: string): string {
@@ -5723,7 +5830,7 @@ export async function pullRequestArtifacts(
       try {
         const stats = await handle.stat();
         if (!stats.isFile() || stats.nlink !== 1) continue;
-        const fileBytes = await readFile(canonicalArtifact);
+        const fileBytes = await handle.readFile();
         const digest = createHash("sha256").update(fileBytes).digest("hex");
         if (
           report?.artifactDigests !== undefined &&
@@ -5732,9 +5839,8 @@ export async function pullRequestArtifacts(
           continue;
         }
         const maxRead = 16 * 1024 + knownSecretPrefixBytes();
-        const buffer = Buffer.alloc(maxRead);
-        const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-        const raw = buffer.subarray(0, bytesRead).toString("utf8");
+        const previewBytes = fileBytes.subarray(0, maxRead);
+        const raw = previewBytes.toString("utf8");
         if (!raw.includes("\0")) {
           const redacted = redactKnownSecrets(raw);
           const content =
@@ -6063,6 +6169,12 @@ function deliveryChannel(agent: WorkerAgent | undefined): DeliveryChannel {
   return agent && classifyHarness(agent.harness) === "acp" ? "acp" : "orca";
 }
 
+function trustedCoordinatorExecutable(): string {
+  return path.resolve(
+    fileURLToPath(new URL("../bin/orca-no-mistakes", import.meta.url)),
+  );
+}
+
 function deliveryInstruction(
   delivery: DeliveryChannel,
   reportPath: string,
@@ -6080,7 +6192,7 @@ Do not write a report file and do not call worker_done: your final message is th
 ${shape}
 
 Pipe that object to this command instead of writing the report directly:
-./bin/orca-no-mistakes report --stage ${stage} --role ${role} --out ${shellQuote(reportPath)}
+${shellQuote(trustedCoordinatorExecutable())} report --stage ${stage} --role ${role} --out ${shellQuote(reportPath)}
 
 The command rejects invalid values and writes the report only after validation. Correct any reported error before continuing. Then report exactly once with worker_done: keep --body to the required three-sentence executive summary and pass --report-path ${reportPath}.`;
 }

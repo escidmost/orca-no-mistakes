@@ -165,7 +165,7 @@ async function requireStoredRepositoryIdentity(
   }
 }
 
-function terminalCandidate(
+export function terminalCandidate(
   ledger: DomainLedger,
   runId: string,
   verifyRetainedArtifacts = true
@@ -246,6 +246,29 @@ function terminalCandidate(
       )
     }
     candidate = final.output_commit_oid
+  }
+
+  for (const stage of plan.slice(0, pushIndex)) {
+    const disposition = dispositions.get(stage.stage_id)
+    if (disposition?.disposition !== 'satisfied' || !disposition.evidence_sha256) continue
+    const evidence = evidenceByDigest.get(disposition.evidence_sha256)
+    if (!evidence) continue
+    const approved = gateAudits.some(
+      (audit) =>
+        audit.resolved_at !== null &&
+        (audit.decision === 'approve' || audit.decision === 'skip') &&
+        gateAuditMatchesEvidence(
+          audit,
+          evidence.stage_id,
+          evidence.round_index,
+          evidence.evidence_sha256
+        )
+    )
+    if (approved && evidence.candidate_commit_oid !== candidate) {
+      throw new CandidatePublicationError(
+        `satisfied stage ${stage.stage_id} does not bind successful authoritative evidence`
+      )
+    }
   }
 
   if (!OID_PATTERN.test(candidate)) {
