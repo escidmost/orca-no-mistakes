@@ -5536,7 +5536,32 @@ function optionalStringRecord(value: unknown): boolean {
   );
 }
 
-async function validateReport(
+export async function streamArtifactHashAndPreview(
+  handle: FileHandle,
+  maxPreviewBytes = 0,
+): Promise<{ digest: string; previewBytes: Buffer }> {
+  const hash = createHash("sha256");
+  const previewChunks: Buffer[] = [];
+  let previewBytesRead = 0;
+  const chunk = Buffer.alloc(64 * 1024);
+  while (true) {
+    const { bytesRead } = await handle.read(chunk, 0, chunk.length);
+    if (bytesRead === 0) break;
+    const slice = chunk.subarray(0, bytesRead);
+    hash.update(slice);
+    if (previewBytesRead < maxPreviewBytes) {
+      const needed = Math.min(bytesRead, maxPreviewBytes - previewBytesRead);
+      previewChunks.push(Buffer.from(slice.subarray(0, needed)));
+      previewBytesRead += needed;
+    }
+  }
+  return {
+    digest: hash.digest("hex"),
+    previewBytes: Buffer.concat(previewChunks),
+  };
+}
+
+export async function validateReport(
   report: StageReport,
   stage: StageName,
   evidenceRoot: string,
@@ -5697,8 +5722,8 @@ async function validateReport(
       if (!isWithin(canonicalEvidenceRoot, canonicalArtifact)) {
         throw new WorkerReportValidationError(`${stage} worker returned an unsafe artifact path`);
       }
-      const content = await handle.readFile();
-      artifactDigests[artifact] = createHash("sha256").update(content).digest("hex");
+      const { digest } = await streamArtifactHashAndPreview(handle);
+      artifactDigests[artifact] = digest;
     } catch (error) {
       if (error instanceof WorkerReportValidationError) throw error;
       if (
@@ -5834,16 +5859,17 @@ export async function pullRequestArtifacts(
       try {
         const stats = await handle.stat();
         if (!stats.isFile() || stats.nlink !== 1) continue;
-        const fileBytes = await handle.readFile();
-        const digest = createHash("sha256").update(fileBytes).digest("hex");
+        const maxRead = 16 * 1024 + knownSecretPrefixBytes();
+        const { digest, previewBytes } = await streamArtifactHashAndPreview(
+          handle,
+          maxRead,
+        );
         if (
           report?.artifactDigests !== undefined &&
           report.artifactDigests[artifact] !== digest
         ) {
           continue;
         }
-        const maxRead = 16 * 1024 + knownSecretPrefixBytes();
-        const previewBytes = fileBytes.subarray(0, maxRead);
         const raw = previewBytes.toString("utf8");
         if (!raw.includes("\0")) {
           const redacted = redactKnownSecrets(raw);
