@@ -132,7 +132,7 @@ export function findUnclosedFence(content: string): { char: string; length: numb
         const rest = match[2]
         if (fenceChar === '`' && !rest.includes('`')) {
           currentFence = { char: fenceChar, length: fenceStr.length }
-        } else if (fenceChar === '~' && !rest.includes('~')) {
+        } else if (fenceChar === '~') {
           currentFence = { char: fenceChar, length: fenceStr.length }
         }
       }
@@ -196,7 +196,7 @@ export function capTitle(content: string, budget = 256): string {
 
 function testingSection(testing: PullRequestReport['testing']): string {
   const commands = testing.tested.length > 0
-    ? `\n\nCommands and checks:\n${capText(testing.tested.map((command) => `- ${command}`).join('\n'), 4096)}`
+    ? `\n\nCommands and checks:\n${capMarkdownText(testing.tested.map((command) => `- ${command}`).join('\n'), 4096)}`
     : ''
   let remaining = TOTAL_ARTIFACT_BUDGET
   const artifacts: string[] = []
