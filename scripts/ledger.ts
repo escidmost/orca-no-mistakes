@@ -128,6 +128,7 @@ export type GateAuditRow = {
   gate_id: string
   gate_kind: GateKind
   guidance: string | null
+  options_json?: string
   question: string
   resolution: string
   resolved_at: string | null
@@ -5870,7 +5871,7 @@ export class DomainLedger {
       .prepare(
         `SELECT run_id, intent FROM runs
          WHERE repo_root = ? AND branch = ?
-         ORDER BY created_at, rowid`,
+         ORDER BY rowid`,
       )
       .all(repoRoot, branch) as Array<{
         intent: string
@@ -5924,7 +5925,7 @@ export class DomainLedger {
   listGateAudit(runId: string): GateAuditRow[] {
     return this.#db
       .prepare(
-        `SELECT decision, evidence_sha256, gate_id, stage_id, round_index, gate_kind, guidance, question, resolution,
+        `SELECT decision, evidence_sha256, gate_id, stage_id, round_index, gate_kind, guidance, options_json, question, resolution,
                 resolved_at, selected_finding_ids
          FROM gate_audit WHERE run_id = ? ORDER BY opened_at, rowid`
       )

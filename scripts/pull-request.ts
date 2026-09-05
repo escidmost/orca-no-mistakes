@@ -30,6 +30,7 @@ export type PullRequestPipelineFinding = {
 export type PullRequestPipelineRound = {
   findings: PullRequestPipelineFinding[]
   fixSummary?: string
+  historicalFixSummaries?: string[]
   summary: string
   tested?: string[]
 }
@@ -38,6 +39,7 @@ export type PullRequestPipelineStep = {
   approvedFindings?: number
   details?: string
   fixedFindings?: number
+  historicalFixSummaries?: string[]
   name: string
   openFindings?: number
   rounds?: PullRequestPipelineRound[]
@@ -215,6 +217,11 @@ function pipelineStepDetails(step: PullRequestPipelineStep): string | undefined 
     if (round.tested?.length) {
       sections.push(round.tested.map((command) => `- ${command}`).join('\n'))
     }
+    if (round.historicalFixSummaries && round.historicalFixSummaries.length > 0) {
+      for (const summary of round.historicalFixSummaries) {
+        sections.push(`🔧 Historical fix: ${summary}`)
+      }
+    }
   }
   const approvedCount = step.approvedFindings ?? step.approvedFindingDetails?.length ?? 0
   if (approvedCount > 0) {
@@ -222,6 +229,11 @@ function pipelineStepDetails(step: PullRequestPipelineStep): string | undefined 
       ? `\n${step.approvedFindingDetails.map(pipelineFinding).join('\n')}`
       : ''
     sections.push(`⚠️ ${issueLabel(approvedCount)} approved as-is.${details}`)
+  }
+  if (step.historicalFixSummaries && step.historicalFixSummaries.length > 0) {
+    for (const summary of step.historicalFixSummaries) {
+      sections.push(`🔧 Historical fix: ${summary}`)
+    }
   }
   return sections.join('\n\n')
 }
@@ -231,21 +243,82 @@ function pipelineSection(candidateCommitOid: string, steps: PullRequestPipelineS
     head_sha: candidateCommitOid,
     steps: steps.map((step) => ({ step: capText(step.name, 128), status: capText(step.status, 128) }))
   })
-  let remaining = PIPELINE_DETAILS_BUDGET
-  const details: string[] = []
+  type DetailCandidate = {
+    desiredBytes: number
+    escaped: string
+    framingBytes: number
+    summary: string
+  }
+  const candidates: DetailCandidate[] = []
   for (const step of steps) {
     const stepDetails = pipelineStepDetails(step)
-    if (!stepDetails || remaining <= 0) continue
+    if (!stepDetails) continue
     const summary = capText(pipelineStepSummary(step), 512)
-    const separatorBytes = details.length > 0 ? Buffer.byteLength('\n\n') : 0
+    const separatorBytes = candidates.length > 0 ? Buffer.byteLength('\n\n') : 0
     const framingBytes = Buffer.byteLength(`<details>\n<summary>${summary}</summary>\n\n\n\n</details>`) + separatorBytes
-    if (remaining <= framingBytes) break
-    const content = capText(stepDetails, Math.min(4096, remaining - framingBytes))
-    const entry = `<details>\n<summary>${summary}</summary>\n\n${content}\n\n</details>`
-    const entryBytes = Buffer.byteLength(entry) + separatorBytes
-    if (entryBytes > remaining) break
-    remaining -= entryBytes
-    details.push(entry)
+    const escaped = escapeUntrustedMarkdown(stepDetails)
+    candidates.push({
+      desiredBytes: Buffer.byteLength(escaped),
+      escaped,
+      framingBytes,
+      summary
+    })
+  }
+
+  const details: string[] = []
+  let totalFraming = 0
+  for (const c of candidates) {
+    totalFraming += c.framingBytes
+  }
+  const totalDesired = totalFraming + candidates.reduce((acc, c) => acc + c.desiredBytes, 0)
+
+  if (totalDesired <= PIPELINE_DETAILS_BUDGET) {
+    for (const c of candidates) {
+      details.push(`<details>\n<summary>${c.summary}</summary>\n\n${c.escaped}\n\n</details>`)
+    }
+  } else {
+    const activeCandidates: DetailCandidate[] = []
+    let framingBudget = 0
+    for (const c of candidates) {
+      const sep = activeCandidates.length > 0 ? Buffer.byteLength('\n\n') : 0
+      const fb = Buffer.byteLength(`<details>\n<summary>${c.summary}</summary>\n\n\n\n</details>`) + sep
+      if (framingBudget + fb >= PIPELINE_DETAILS_BUDGET) break
+      framingBudget += fb
+      activeCandidates.push({ ...c, framingBytes: fb })
+    }
+
+    if (activeCandidates.length > 0) {
+      let contentBudgetPool = Math.max(0, PIPELINE_DETAILS_BUDGET - framingBudget)
+      const allocatedBudgets = new Map<number, number>()
+      const unsatisfied = new Set<number>(activeCandidates.keys())
+
+      while (unsatisfied.size > 0 && contentBudgetPool > 0) {
+        const fairShare = Math.floor(contentBudgetPool / unsatisfied.size)
+        let foundSatisfied = false
+        for (const idx of unsatisfied) {
+          const desired = activeCandidates[idx].desiredBytes
+          if (desired <= fairShare) {
+            allocatedBudgets.set(idx, desired)
+            contentBudgetPool -= desired
+            unsatisfied.delete(idx)
+            foundSatisfied = true
+          }
+        }
+        if (!foundSatisfied) {
+          for (const idx of unsatisfied) {
+            allocatedBudgets.set(idx, fairShare)
+          }
+          break
+        }
+      }
+
+      for (let i = 0; i < activeCandidates.length; i++) {
+        const c = activeCandidates[i]
+        const budget = allocatedBudgets.get(i) ?? 0
+        const content = capEscapedText(c.escaped, budget)
+        details.push(`<details>\n<summary>${c.summary}</summary>\n\n${content}\n\n</details>`)
+      }
+    }
   }
   return `## Pipeline\n\n${PIPELINE_SIGNATURE}\n\n${ATTESTATION_PREFIX}${attestation} -->${details.length > 0 ? `\n\n${details.join('\n\n')}` : ''}`
 }

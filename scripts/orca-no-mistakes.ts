@@ -79,6 +79,7 @@ import {
 import {
   PlainStatusRenderer,
   PresentationPublisher,
+  type FixRecord,
   type GateResolver,
   type PresentationFinding,
   type PresentationRenderer,
@@ -3130,12 +3131,18 @@ export async function runPipeline(
                 const stageState = presentation.current.stages.find(
                   (candidate) => candidate.id === completedStage,
                 );
+                const stageSnapshots = presentation.store.listPresentationSnapshots(runId);
+                const stageFixes = recoverFixRecords(
+                  completedStage,
+                  stageState,
+                  stageSnapshots,
+                );
                 const rounds = pullRequestPipelineRounds(
                   reportsByStage.get(completedStage) ?? [{
                     findings: [],
                     summary: `${completedStage} passed.`,
                   }],
-                  [...(stageState?.fixRecords ?? stageState?.fixSummaries ?? [])],
+                  stageFixes,
                   stageState?.findings ?? [],
                 );
                 const seenApproved = new Set<string>();
@@ -5775,7 +5782,74 @@ function pullRequestFindingKey(
   ]);
 }
 
-function pullRequestPipelineRounds(
+export function recoverFixRecords(
+  stage: StageName,
+  stageState:
+    | {
+        fixRecords?: readonly FixRecord[];
+        fixSummaries?: readonly string[];
+      }
+    | undefined,
+  snapshots: readonly PresentationSnapshot[],
+): readonly (string | FixRecord)[] {
+  if (stageState?.fixRecords && stageState.fixRecords.length > 0) {
+    return stageState.fixRecords;
+  }
+  const legacySummaries = stageState?.fixSummaries ?? [];
+  if (legacySummaries.length === 0) {
+    return [];
+  }
+  const recovered: FixRecord[] = [];
+  let currentAnalysis = 0;
+  let fixAttempt = 0;
+  for (const snapshot of snapshots) {
+    const transition = snapshot.transition;
+    if ("stage" in transition && transition.stage === stage) {
+      if (transition.kind === "round-started" && transition.role !== "fixer") {
+        currentAnalysis = transition.analysis ?? (currentAnalysis + 1);
+        fixAttempt = 0;
+      } else if (transition.kind === "findings-recorded") {
+        if (transition.analysis !== undefined) {
+          currentAnalysis = transition.analysis;
+        }
+      } else if (transition.kind === "round-started" && transition.role === "fixer") {
+        if (transition.analysis !== undefined) {
+          currentAnalysis = transition.analysis;
+        }
+        if (transition.fixAttempt !== undefined) {
+          fixAttempt = transition.fixAttempt;
+        }
+      } else if (transition.kind === "fix-completed") {
+        const summary = transition.summary?.trim();
+        if (summary) {
+          recovered.push({
+            analysis: transition.analysis ?? currentAnalysis,
+            fixAttempt: transition.fixAttempt ?? fixAttempt,
+            summary,
+          });
+          fixAttempt += 1;
+        }
+      }
+    }
+  }
+  if (recovered.length > 0) {
+    const matched: (string | FixRecord)[] = [];
+    const available = [...recovered];
+    for (const summary of legacySummaries) {
+      const idx = available.findIndex((rec) => rec.summary === summary);
+      if (idx !== -1) {
+        matched.push(available[idx]);
+        available.splice(idx, 1);
+      } else {
+        matched.push(summary);
+      }
+    }
+    return matched;
+  }
+  return legacySummaries;
+}
+
+export function pullRequestPipelineRounds(
   reports: StageReport[],
   fixSummaries: readonly (string | FixRecord)[],
   finalFindings: readonly PresentationFinding[],
@@ -5793,14 +5867,18 @@ function pullRequestPipelineRounds(
       .map(([key]) => key),
   );
   const fixByOriginatingAnalysis = new Map<number, string>();
+  const unassociatedSummaries: string[] = [];
   for (const item of fixSummaries) {
     if (typeof item === "object" && item !== null && typeof item.analysis === "number") {
       fixByOriginatingAnalysis.set(item.analysis, item.summary);
+    } else if (typeof item === "string" && item.trim()) {
+      unassociatedSummaries.push(item.trim());
     }
   }
   return reports.map((report, index) => {
     const analysisNumber = index + 1;
     const fixSummary = fixByOriginatingAnalysis.get(analysisNumber - 1);
+    const isLastRound = index === reports.length - 1;
     return {
       findings: (report.findings ?? [])
         .filter((finding) => !approvedOnly.has(pullRequestFindingKey(finding)))
@@ -5811,6 +5889,9 @@ function pullRequestPipelineRounds(
           severity: finding.severity,
         })),
       ...(fixSummary ? { fixSummary } : {}),
+      ...(isLastRound && unassociatedSummaries.length > 0
+        ? { historicalFixSummaries: unassociatedSummaries }
+        : {}),
       summary: report.summary?.trim() || "Stage passed.",
       ...(report.tested?.length ? { tested: report.tested } : {}),
     };
@@ -5864,10 +5945,8 @@ export async function pullRequestArtifacts(
           handle,
           maxRead,
         );
-        if (
-          report?.artifactDigests !== undefined &&
-          report.artifactDigests[artifact] !== digest
-        ) {
+        const expectedDigest = report?.artifactDigests?.[artifact];
+        if (typeof expectedDigest !== "string" || expectedDigest !== digest) {
           continue;
         }
         const raw = previewBytes.toString("utf8");
