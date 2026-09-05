@@ -831,6 +831,8 @@ if (process.env.TUI_FIXTURE === "1") {
       targetFindingIds: ["a", "b"],
     });
     publisher.publish("fix-1", {
+      analysis: 1,
+      fixAttempt: 0,
       kind: "round-started",
       role: "fixer",
       round: 1,
@@ -957,12 +959,19 @@ if (process.env.TUI_FIXTURE === "1") {
       targetFindingIds: ["a", "b"],
     });
     publisher.publish("fix-2", {
+      analysis: 1,
+      fixAttempt: 1,
       kind: "round-started",
       role: "fixer",
       round: 2,
       stage: "review",
       targetFindingIds: ["a", "b"],
     });
+    await nextDraw();
+    let screen = cleanScreen(output.writes.at(-1) ?? "");
+    assert.match(screen, /Review fix 1 retry 1/u);
+    assert.doesNotMatch(screen, /Review fix 2/u);
+    assert.match(screen, /REVIEW.*fix 1 retry 1/u);
     publisher.publish("fix-2-completed", {
       approvedFindings: 1,
       findingIds: ["a", "b"],
@@ -988,10 +997,11 @@ if (process.env.TUI_FIXTURE === "1") {
     });
 
     await nextDraw();
-    const screen = cleanScreen(output.writes.at(-1) ?? "");
+    screen = cleanScreen(output.writes.at(-1) ?? "");
     assert.match(screen, /Review analysis 1 · 2 found/u);
     assert.match(screen, /Review fix 1\s+· blocked/u);
-    assert.match(screen, /Review fix 2\s+· 2 fixed · 1 approved/u);
+    assert.match(screen, /Review fix 1 retry 1\s+· 2 fixed · 1 approved/u);
+    assert.doesNotMatch(screen, /Review fix 2/u);
     assert.match(screen, /Review analysis 2/u);
     assert.doesNotMatch(screen, /Review analysis 3/u);
     assert.match(screen, /Review\s+3 found · 2 fixed · 1 approved/u);

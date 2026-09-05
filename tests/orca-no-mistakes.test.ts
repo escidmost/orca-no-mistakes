@@ -1701,6 +1701,24 @@ test("protected fixer commits are rejected at a resumable human gate", async () 
       ),
     [1, 2],
   );
+  assert.deepEqual(
+    presentation.flatMap((snapshot) =>
+      snapshot.transition.kind === "round-started" &&
+      snapshot.transition.role === "fixer" &&
+      snapshot.transition.stage === "review"
+        ? [
+            {
+              analysis: snapshot.transition.analysis,
+              fixAttempt: snapshot.transition.fixAttempt,
+            },
+          ]
+        : [],
+    ),
+    [
+      { analysis: 1, fixAttempt: 0 },
+      { analysis: 1, fixAttempt: 1 },
+    ],
+  );
   const blocked = presentation.find(
     (snapshot) => snapshot.transition.kind === "fix-blocked",
   );

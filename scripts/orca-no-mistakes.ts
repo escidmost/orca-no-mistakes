@@ -2925,6 +2925,23 @@ export async function runPipeline(
         `attempt:${presentation.current.attempt}:stage:${stage}:started`,
         { kind: "stage-started", stage },
       );
+      const priorAuthoritativeEvidence = latestAuthoritativeEvidenceByStage.get(stage);
+      const priorDisposition = ledger
+        .stageDispositions(runId)
+        .find((entry) => entry.stage_id === stage);
+      if (
+        stage !== "push" &&
+        stage !== "pr" &&
+        priorDisposition?.disposition === "satisfied" &&
+        priorAuthoritativeEvidence &&
+        priorDisposition.evidence_sha256 === priorAuthoritativeEvidence.evidence_sha256 &&
+        priorAuthoritativeEvidence.candidate_commit_oid !== stageInputCommitOid
+      ) {
+        presentation.publish(
+          `stage:${stage}:reopened:${priorAuthoritativeEvidence.evidence_sha256}:${stageInputCommitOid}`,
+          { kind: "stage-reopened", stage },
+        );
+      }
       if (stage === "push" || stage === "pr") {
         if (!options.githubAuthority || !options.publicationDestination || !attemptId) {
           throw new Error(`${stage} requires initialized GitHub publication`);
@@ -3140,6 +3157,7 @@ export async function runPipeline(
       const resumedEvidence = latestEvidenceByStage.get(stage);
       const resumedBlocker =
         resumedEvidence !== undefined &&
+        resumedEvidence.candidate_commit_oid === stageInputCommitOid &&
         (resumedEvidence.worker_identity === "coordinator:fixer-no-change" ||
           resumedEvidence.worker_identity === "coordinator:fixer-policy");
       const resumedFindings = JSON.parse(
@@ -3510,10 +3528,21 @@ export async function runPipeline(
           break;
         }
 
+        const stagePresentation = presentation.current.stages.find(
+          (item) => item.id === stage,
+        );
+        const fixAnalysis =
+          stagePresentation?.analysis ?? reportsByStage.get(stage)?.length ?? 1;
+        const fixAttempt =
+          stagePresentation?.fixAttempt !== undefined
+            ? stagePresentation.fixAttempt + 1
+            : 0;
         round += 1;
         presentation.publish(
           `attempt:${presentation.current.attempt}:stage:${stage}:round:${round}:fixer:started`,
           {
+            analysis: fixAnalysis,
+            fixAttempt,
             kind: "round-started",
             role: "fixer",
             round,
@@ -3696,7 +3725,11 @@ export async function runPipeline(
 
       const stageOutputCommitOid = await git.head();
       const authoritativeEntry = latestEntryByStage.get(stage)!;
-      const eventKey = `stage:${stage}:round:${authoritativeEntry.round}:completed:${stageOutputCommitOid}`;
+      const settlementSuffix = priorDisposition?.evidence_sha256 &&
+        priorDisposition.evidence_sha256 !== authoritativeEntry.evidenceSha256
+          ? `:evidence:${authoritativeEntry.evidenceSha256}`
+          : "";
+      const eventKey = `stage:${stage}:round:${authoritativeEntry.round}:completed:${stageOutputCommitOid}${settlementSuffix}`;
       presentation.publish(
         eventKey,
         { kind: "stage-completed", round: authoritativeEntry.round, stage },
@@ -3709,6 +3742,7 @@ export async function runPipeline(
                 roundIndex: authoritativeEntry.round,
               },
               evidenceSha256: authoritativeEntry.evidenceSha256,
+              supersedesEvidenceSha256: priorDisposition?.evidence_sha256 ?? undefined,
               runId,
               stageId: stage,
             },

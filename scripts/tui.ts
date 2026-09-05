@@ -126,8 +126,16 @@ function analysisLabel(stageName: string, round: number): string {
   return `${stageName} analysis ${round}`;
 }
 
-function fixLabel(stageName: string, round: number): string {
-  return `${stageName} fix ${round}`;
+function fixPhaseLabel(analysis: number, fixAttempt = 0): string {
+  return `fix ${analysis}${fixAttempt > 0 ? ` retry ${fixAttempt}` : ""}`;
+}
+
+function analysisNumber(value: number | undefined, fallback: number): number {
+  return value !== undefined && value > 0 ? value : fallback;
+}
+
+function fixLabel(stageName: string, analysis: number, fixAttempt = 0): string {
+  return `${stageName} ${fixPhaseLabel(analysis, fixAttempt)}`;
 }
 
 function activityCount(value: number, label: string): string {
@@ -255,9 +263,10 @@ export class RailTuiRenderer implements PresentationRenderer {
   readonly #activities: {
     at: string;
     fix?: {
+      analysis: number;
       approvedFindings: number;
+      fixAttempt: number;
       findingIds: readonly string[];
-      round: number;
       targetIndices?: readonly number[];
       verified: boolean;
     };
@@ -611,13 +620,27 @@ export class RailTuiRenderer implements PresentationRenderer {
         }
         break;
 
+      case "stage-reopened":
+        this.#activities.push({
+          at: clock(now),
+          label: `${title(transition.stage)} reopened`,
+          stage,
+        });
+        break;
+
       case "round-started": {
         if (transition.stage === "intent" || transition.stage === "rebase") return;
         const stageName = title(transition.stage);
         const roundNum = transition.analysis ?? transition.round + 1;
 
         if (transition.role === "fixer") {
-          const fixPrefix = fixLabel(stageName, transition.round);
+          const stageState = snapshot.stages.find((item) => item.id === transition.stage);
+          const fixAnalysis = analysisNumber(
+            transition.analysis ?? stageState?.analysis,
+            transition.round,
+          );
+          const fixAttempt = transition.fixAttempt ?? stageState?.fixAttempt ?? 0;
+          const fixPrefix = fixLabel(stageName, fixAnalysis, fixAttempt);
           if (!this.#activities.some((a) => a.stage === stage && a.label.startsWith(fixPrefix))) {
             this.#activities.push({
               at: clock(now),
@@ -655,7 +678,10 @@ export class RailTuiRenderer implements PresentationRenderer {
 
       case "fix-completed": {
         const stageName = title(transition.stage);
-        const fixPrefix = fixLabel(stageName, transition.round);
+        const stageState = snapshot.stages.find((s) => s.id === transition.stage);
+        const fixAnalysis = analysisNumber(stageState?.analysis, transition.round);
+        const fixAttempt = stageState?.fixAttempt ?? 0;
+        const fixPrefix = fixLabel(stageName, fixAnalysis, fixAttempt);
         const appliedLabel = transition.findingIds.length === 1 ? "fix applied" : "fixes applied";
         const results = [activityCount(transition.findingIds.length, appliedLabel)];
         if (transition.approvedFindings > 0) {
@@ -664,13 +690,12 @@ export class RailTuiRenderer implements PresentationRenderer {
         const label = activityResult(
           fixPrefix,
           stageName,
-          transition.round,
+          fixAnalysis,
           results,
         );
         const entry = this.#activities.findLast(
           (activity) => activity.stage === stage && activity.label === fixPrefix,
         );
-        const stageState = snapshot.stages.find((s) => s.id === transition.stage);
         const targetIndices: number[] = [];
         if (stageState?.findings) {
           const remainingIds = new Map<string, number>();
@@ -687,9 +712,10 @@ export class RailTuiRenderer implements PresentationRenderer {
           }
         }
         const fix = {
+          analysis: fixAnalysis,
           approvedFindings: transition.approvedFindings,
+          fixAttempt,
           findingIds: transition.findingIds,
-          round: transition.round,
           targetIndices,
           verified: false,
         };
@@ -704,7 +730,10 @@ export class RailTuiRenderer implements PresentationRenderer {
 
       case "fix-blocked": {
         const stageName = title(transition.stage);
-        const fixPrefix = fixLabel(stageName, transition.round);
+        const stageState = snapshot.stages.find((item) => item.id === transition.stage);
+        const fixAnalysis = analysisNumber(stageState?.analysis, transition.round);
+        const fixAttempt = stageState?.fixAttempt ?? 0;
+        const fixPrefix = fixLabel(stageName, fixAnalysis, fixAttempt);
         const entry = this.#activities.findLast(
           (activity) =>
             activity.stage === stage &&
@@ -714,7 +743,7 @@ export class RailTuiRenderer implements PresentationRenderer {
           entry.label = activityResult(
             fixPrefix,
             stageName,
-            transition.round,
+            fixAnalysis,
             ["blocked"],
           );
         }
@@ -774,9 +803,13 @@ export class RailTuiRenderer implements PresentationRenderer {
           }
           completedFix.fix.verified = true;
           completedFix.label = activityResult(
-            fixLabel(stageName, completedFix.fix.round),
+            fixLabel(
+              stageName,
+              completedFix.fix.analysis,
+              completedFix.fix.fixAttempt,
+            ),
             stageName,
-            completedFix.fix.round,
+            completedFix.fix.analysis,
             results,
           );
         } else if (completedFix?.fix && stageState?.fixedFindings) {
@@ -786,9 +819,13 @@ export class RailTuiRenderer implements PresentationRenderer {
           }
           completedFix.fix.verified = true;
           completedFix.label = activityResult(
-            fixLabel(stageName, completedFix.fix.round),
+            fixLabel(
+              stageName,
+              completedFix.fix.analysis,
+              completedFix.fix.fixAttempt,
+            ),
             stageName,
-            completedFix.fix.round,
+            completedFix.fix.analysis,
             results,
           );
         } else if (!completedFix && stageState?.fixedFindings) {
@@ -838,19 +875,28 @@ export class RailTuiRenderer implements PresentationRenderer {
         break;
 
       case "gate-resolved": {
-        const roundNum = (transition.round ?? 0) + 1;
         const stageName = title(transition.stage);
         if (transition.decision === "fix") {
+          const stageState = snapshot.stages.find((item) => item.id === transition.stage);
+          const analysis = analysisNumber(
+            stageState?.analysis,
+            stageState?.phase === "fixer"
+              ? (transition.round ?? 1)
+              : (transition.round ?? 0) + 1,
+          );
+          const fixAttempt =
+            stageState?.phase === "fixer" ? (stageState.fixAttempt ?? 0) + 1 : 0;
+          const fixPrefix = fixLabel(stageName, analysis, fixAttempt);
           if (
             last &&
             last.stage === transition.stage &&
             last.label.endsWith("decision needed")
           ) {
-            last.label = fixLabel(stageName, roundNum);
+            last.label = fixPrefix;
           } else {
             this.#activities.push({
               at: clock(now),
-              label: fixLabel(stageName, roundNum),
+              label: fixPrefix,
               stage,
             });
           }
@@ -888,11 +934,12 @@ export class RailTuiRenderer implements PresentationRenderer {
           const stageState = snapshot.stages.find((s) => s.id === transition.stage);
           if (stageState?.fixedFindings) {
             const stageName = title(transition.stage);
-            const fixRound = Number(last.label.match(/ fix (\d+)/u)?.[1] ?? 1);
+            const fixAnalysis = last.fix?.analysis ?? Number(last.label.match(/ fix (\d+)/u)?.[1] ?? 1);
+            const fixAttempt = last.fix?.fixAttempt ?? 0;
             last.label = activityResult(
-              fixLabel(stageName, fixRound),
+              fixLabel(stageName, fixAnalysis, fixAttempt),
               stageName,
-              fixRound,
+              fixAnalysis,
               [activityCount(stageState.fixedFindings, "fixed")],
             );
             if (last.fix) last.fix.verified = true;
@@ -1343,7 +1390,7 @@ export class RailTuiRenderer implements PresentationRenderer {
     const roundLabel =
       state?.round !== undefined && status !== "pending"
         ? isFixing
-          ? `fix ${state.round}`
+          ? fixPhaseLabel(analysisNumber(state.analysis, state.round), state.fixAttempt)
           : `analysis ${state.analysis ?? state.round + 1}`
         : "";
     const meta = [
@@ -1506,7 +1553,7 @@ export class RailTuiRenderer implements PresentationRenderer {
     const roundLabel =
       round !== undefined
         ? isFixing
-          ? `  fix ${round}`
+          ? `  ${fixPhaseLabel(analysisNumber(state?.analysis, round), state?.fixAttempt)}`
           : `  analysis ${state?.analysis ?? round + 1}`
         : "";
     const all = logTail(this.#artifactsDir, `${stage}_r${round}.log`, this.#stageLogs);
@@ -1535,7 +1582,13 @@ export class RailTuiRenderer implements PresentationRenderer {
     const stage = gate.stage ?? this.#snapshot!.currentStage ?? "intent";
     const stageState = this.#snapshot?.stages.find((item) => item.id === stage);
     const gateLabel = this.#isFixingStage(stage, stageState)
-      ? `fix ${stageState?.round ?? gate.round ?? 1}`
+      ? fixPhaseLabel(
+          analysisNumber(
+            stageState?.analysis,
+            stageState?.round ?? gate.round ?? 1,
+          ),
+          stageState?.fixAttempt,
+        )
       : `analysis ${stageState?.analysis ?? (gate.round ?? 0) + 1}`;
     const rows: Row[] = [
       { segs: ["  ", ["DECISION REQUIRED", `${SGR.amber};${SGR.bold}`]] },

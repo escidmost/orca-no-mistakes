@@ -26,8 +26,10 @@ export type PresentationTransition =
   | { attempt: number; kind: "attempt-started" }
   | { enabled: boolean; kind: "mode-changed"; source?: "initial" | "operator" }
   | { kind: "stage-started"; stage: StageName }
+  | { kind: "stage-reopened"; stage: StageName }
   | {
       analysis?: number;
+      fixAttempt?: number;
       kind: "round-started";
       role?: "fixer" | "reviewer";
       round: number;
@@ -110,6 +112,7 @@ export type PresentationSnapshot = {
     approvedFindings?: number;
     findings?: readonly PresentationFinding[];
     fixSummaries?: readonly string[];
+    fixAttempt?: number;
     fixedFindings?: number;
     id: StageName;
     openFindings?: number;
@@ -249,17 +252,10 @@ function updateFindings(
         break;
       }
     }
-    if (matchIndex === -1 && inheritApproval) {
-      for (let pi = 0; pi < previous.length; pi++) {
-        if (
-          !matchedInPrevious.has(pi) &&
-          previous[pi].disposition !== "open" &&
-          previous[pi].id === curr.id
-        ) {
-          matchIndex = pi;
-          break;
-        }
-      }
+    if (matchIndex === -1) {
+      matchIndex = previous.findIndex((prev, pi) =>
+        !matchedInPrevious.has(pi) && prev.disposition === "fixed" && prev.id === curr.id,
+      );
     }
     if (matchIndex !== -1) {
       matchedInPrevious.set(matchIndex, curr);
@@ -336,8 +332,8 @@ function nextSnapshot(
         gate: undefined,
         stages: next.stages.map((stage) => ({
           ...stage,
-          phase: stage.status === "passed" ? stage.phase : undefined,
-          round: stage.status === "passed" ? stage.round : 0,
+          phase: stage.status === "passed" || stage.fixAttempt !== undefined ? stage.phase : undefined,
+          round: stage.status === "passed" || stage.fixAttempt !== undefined ? stage.round : 0,
           status: stage.status === "passed" ? "passed" : "pending",
           targetFindingIds:
             stage.status === "passed" ? stage.targetFindingIds : undefined,
@@ -357,6 +353,26 @@ function nextSnapshot(
         stages: updateStage(next, transition.stage, { status: "active" }),
       };
       break;
+    case "stage-reopened":
+      next = {
+        ...next,
+        currentStage: transition.stage,
+        error: undefined,
+        gate: undefined,
+        stages: updateStage(next, transition.stage, {
+          actionableFindings: 0,
+          approvedFindings: 0,
+          findings: [],
+          fixAttempt: undefined,
+          fixedFindings: 0,
+          openFindings: 0,
+          phase: undefined,
+          status: "active",
+          targetFindingIds: undefined,
+          totalFindings: 0,
+        }),
+      };
+      break;
     case "round-started": {
       const stage = next.stages.find((item) => item.id === transition.stage);
       next = {
@@ -365,8 +381,20 @@ function nextSnapshot(
         stages: updateStage(next, transition.stage, {
           phase: transition.role,
           ...(transition.role === "reviewer"
-            ? { analysis: transition.analysis ?? (stage?.analysis ?? 0) + 1 }
-            : {}),
+            ? {
+                analysis: transition.analysis ?? (stage?.analysis ?? 0) + 1,
+                fixAttempt: undefined,
+              }
+            : {
+                analysis:
+                  transition.analysis ??
+                  (stage?.analysis && stage.analysis > 0
+                    ? stage.analysis
+                    : transition.round),
+                fixAttempt:
+                  transition.fixAttempt ??
+                  (stage?.fixAttempt !== undefined ? stage.fixAttempt + 1 : 0),
+              }),
           round: transition.round,
           status: "active",
           ...(transition.targetFindingIds !== undefined
@@ -735,14 +763,34 @@ export class PlainStatusRenderer implements PresentationRenderer {
       case "stage-started":
         line = `${prefix} stage ${stageNumber}/${snapshot.stages.length} ${event.stage} started`;
         break;
+      case "stage-reopened":
+        line = `${prefix} ${event.stage} reopened for a changed candidate`;
+        break;
       case "round-started":
-        line = `${prefix} ${event.stage} round ${event.round} started`;
+        {
+          const stage = snapshot.stages.find((item) => item.id === event.stage);
+          const analysis =
+            (stage?.analysis ?? event.analysis ?? 0) > 0
+              ? (stage?.analysis ?? event.analysis)!
+              : event.round;
+          line = event.role === "fixer"
+            ? `${prefix} ${event.stage} fix ${analysis}${(stage?.fixAttempt ?? event.fixAttempt ?? 0) > 0 ? ` retry ${stage?.fixAttempt ?? event.fixAttempt}` : ""} started`
+            : `${prefix} ${event.stage} analysis ${event.analysis ?? stage?.analysis ?? event.round + 1} started`;
+        }
         break;
       case "fix-completed":
-        line = `${prefix} ${event.stage} fix ${event.round} completed applied=${event.findingIds.length} approved=${event.approvedFindings}`;
+        {
+          const stage = snapshot.stages.find((item) => item.id === event.stage);
+          const analysis = stage?.analysis && stage.analysis > 0 ? stage.analysis : event.round;
+          line = `${prefix} ${event.stage} fix ${analysis}${(stage?.fixAttempt ?? 0) > 0 ? ` retry ${stage?.fixAttempt}` : ""} completed applied=${event.findingIds.length} approved=${event.approvedFindings}`;
+        }
         break;
       case "fix-blocked":
-        line = `${prefix} ${event.stage} fix ${event.round} blocked open=${event.actionable}`;
+        {
+          const stage = snapshot.stages.find((item) => item.id === event.stage);
+          const analysis = stage?.analysis && stage.analysis > 0 ? stage.analysis : event.round;
+          line = `${prefix} ${event.stage} fix ${analysis}${(stage?.fixAttempt ?? 0) > 0 ? ` retry ${stage?.fixAttempt}` : ""} blocked open=${event.actionable}`;
+        }
         break;
       case "findings-recorded":
         {

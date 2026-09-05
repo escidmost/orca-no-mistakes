@@ -1638,6 +1638,7 @@ export type PrunableRun = {
 const RELEASE_2_FACT_TABLES = [
   'stage_plan_entries',
   'stage_dispositions',
+  'stage_disposition_supersessions',
   'publication_routes',
   'publication_baselines',
   'run_attempts',
@@ -1750,6 +1751,17 @@ CREATE TABLE IF NOT EXISTS stage_dispositions (
   evidence_sha256 TEXT,
   recorded_at TEXT NOT NULL,
   PRIMARY KEY (run_id, stage_id),
+  FOREIGN KEY (run_id, stage_id) REFERENCES stage_plan_entries(run_id, stage_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS stage_disposition_supersessions (
+  run_id TEXT NOT NULL,
+  stage_id TEXT NOT NULL,
+  disposition TEXT NOT NULL CHECK(disposition IN ('satisfied', 'failed', 'skipped', 'waived', 'disabled')),
+  prior_evidence_sha256 TEXT NOT NULL,
+  evidence_sha256 TEXT NOT NULL,
+  recorded_at TEXT NOT NULL,
+  PRIMARY KEY (run_id, stage_id, evidence_sha256),
   FOREIGN KEY (run_id, stage_id) REFERENCES stage_plan_entries(run_id, stage_id) ON DELETE CASCADE
 );
 
@@ -1977,6 +1989,10 @@ CREATE TRIGGER IF NOT EXISTS immutable_stage_dispositions
 BEFORE UPDATE ON stage_dispositions
 BEGIN SELECT RAISE(ABORT, 'stage_dispositions rows are immutable'); END;
 
+CREATE TRIGGER IF NOT EXISTS immutable_stage_disposition_supersessions
+BEFORE UPDATE ON stage_disposition_supersessions
+BEGIN SELECT RAISE(ABORT, 'stage_disposition_supersessions rows are immutable'); END;
+
 CREATE TRIGGER IF NOT EXISTS immutable_publication_routes
 BEFORE UPDATE ON publication_routes
 BEGIN SELECT RAISE(ABORT, 'publication_routes rows are immutable'); END;
@@ -2018,6 +2034,11 @@ CREATE TRIGGER IF NOT EXISTS immutable_stage_dispositions_delete
 BEFORE DELETE ON stage_dispositions
 WHEN EXISTS (SELECT 1 FROM runs WHERE run_id = OLD.run_id)
 BEGIN SELECT RAISE(ABORT, 'stage_dispositions rows are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_stage_disposition_supersessions_delete
+BEFORE DELETE ON stage_disposition_supersessions
+WHEN EXISTS (SELECT 1 FROM runs WHERE run_id = OLD.run_id)
+BEGIN SELECT RAISE(ABORT, 'stage_disposition_supersessions rows are immutable'); END;
 
 CREATE TRIGGER IF NOT EXISTS immutable_publication_routes_delete
 BEFORE DELETE ON publication_routes
@@ -2660,6 +2681,7 @@ export class DomainLedger {
       for (const table of [
         'resume_claims',
         'stage_dispositions',
+        'stage_disposition_supersessions',
         'publication_routes',
         'publication_baselines',
         'run_attempts',
@@ -3136,7 +3158,15 @@ export class DomainLedger {
 
   stageDispositions(runId: string): StageDispositionRow[] {
     return this.#db.prepare(
-      `SELECT d.stage_id, d.disposition, d.evidence_sha256
+      `SELECT d.stage_id,
+              COALESCE((SELECT s.disposition
+                        FROM stage_disposition_supersessions s
+                        WHERE s.run_id = d.run_id AND s.stage_id = d.stage_id
+                        ORDER BY s.rowid DESC LIMIT 1), d.disposition) AS disposition,
+              COALESCE((SELECT s.evidence_sha256
+                        FROM stage_disposition_supersessions s
+                        WHERE s.run_id = d.run_id AND s.stage_id = d.stage_id
+                        ORDER BY s.rowid DESC LIMIT 1), d.evidence_sha256) AS evidence_sha256
        FROM stage_dispositions d
        JOIN stage_plan_entries p ON p.run_id = d.run_id AND p.stage_id = d.stage_id
        WHERE d.run_id = ? ORDER BY p.position`
@@ -4798,6 +4828,7 @@ export class DomainLedger {
         roundIndex: number
       }
       evidenceSha256: string
+      supersedesEvidenceSha256?: string
       runId: string
       stageId: string
     },
@@ -4808,15 +4839,45 @@ export class DomainLedger {
       const settlesDisposition = this.stagePlan(input.runId).some(
         (entry) => entry.stage_id === 'push'
       )
-      const disposition = this.#db.prepare(
-        'SELECT disposition, evidence_sha256 FROM stage_dispositions WHERE run_id = ? AND stage_id = ?'
-      ).get(input.runId, input.stageId) as
-        | { disposition: string; evidence_sha256: string | null }
-        | undefined
-      if (settlesDisposition && disposition &&
-          (disposition.disposition !== 'satisfied' ||
-            disposition.evidence_sha256 !== input.evidenceSha256)) {
-        throw new Error(`${input.stageId} is already settled with a different disposition`)
+      const disposition = this.stageDispositions(input.runId)
+        .find((entry) => entry.stage_id === input.stageId)
+      const dispositionChanged = settlesDisposition && disposition &&
+        (disposition.disposition !== 'satisfied' ||
+          disposition.evidence_sha256 !== input.evidenceSha256)
+      if (dispositionChanged) {
+        const candidates = this.#db.prepare(
+          `SELECT rowid AS sequence, evidence_sha256, candidate_commit_oid, worker_identity FROM stage_evidence
+           WHERE run_id = ? AND stage_id = ? AND evidence_sha256 IN (?, ?)`
+        ).all(input.runId, input.stageId, disposition.evidence_sha256, input.evidenceSha256) as Array<{
+          sequence: number
+          worker_identity: string
+          candidate_commit_oid: string
+          evidence_sha256: string
+        }>
+        const priorEvidence = candidates.find(
+          (row) => row.evidence_sha256 === disposition.evidence_sha256
+        )
+        const nextEvidence = candidates.find(
+          (row) => row.evidence_sha256 === input.evidenceSha256
+        )
+        if (disposition.disposition !== 'satisfied' ||
+            input.supersedesEvidenceSha256 !== disposition.evidence_sha256 ||
+            !priorEvidence || !nextEvidence || nextEvidence.sequence <= priorEvidence.sequence ||
+            !isAuthoritativeStageEvidence(nextEvidence.worker_identity) ||
+            nextEvidence.candidate_commit_oid !== input.checkpoint.outputCommitOid) {
+          throw new Error(`${input.stageId} is already settled with a different disposition`)
+        }
+        this.#db.prepare(
+          `INSERT INTO stage_disposition_supersessions
+             (run_id, stage_id, disposition, prior_evidence_sha256, evidence_sha256, recorded_at)
+           VALUES (?, ?, 'satisfied', ?, ?, ?)`
+        ).run(
+          input.runId,
+          input.stageId,
+          disposition.evidence_sha256,
+          input.evidenceSha256,
+          new Date().toISOString()
+        )
       }
       this.recordCheckpoint({ ...input.checkpoint, runId: input.runId, stageId: input.stageId })
       if (settlesDisposition && !disposition) {

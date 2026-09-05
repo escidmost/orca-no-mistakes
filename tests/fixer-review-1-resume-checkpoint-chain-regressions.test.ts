@@ -243,6 +243,76 @@ test("release 2 resume walks the final checkpoint of each stage", async (t) => {
   }
 });
 
+for (const decision of ["stop", "approve"]) {
+test(`candidate drift reaches a fresh ${decision} decision`, async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "onm-candidate-drift-"));
+  const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
+  process.env.ORCA_NO_MISTAKES_HOME = root;
+  const ledger = new DomainLedger(":memory:");
+  t.after(async () => {
+    ledger.close();
+    if (previousHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME;
+    else process.env.ORCA_NO_MISTAKES_HOME = previousHome;
+    await rm(root, { force: true, recursive: true });
+  });
+  const runId = "candidate-drift";
+  const git = new ChainGit(root, oid(1), AUTO_FIX_CONFIG);
+  let workerHead = oid(1);
+  git.headOf = async () => workerHead;
+  class DriftOrca extends ChainOrca {
+    gates = 0;
+    override async createGate(): Promise<string> {
+      return `${this.runId}-gate-${++this.gates}`;
+    }
+    override async startWorker(taskId: string, launch: WorkerLaunch) {
+      if (launch.stage === "document" && launch.role === "fixer") workerHead = oid(2);
+      return super.startWorker(taskId, launch);
+    }
+  }
+  const options = {
+    githubAuthority: {} as GithubAuthority,
+    intent: "Revalidate approved findings after a later fixer changes the candidate.",
+    publicationDestination: "https://github.com/owner/repo.git",
+  };
+  const first = new DriftOrca(runId);
+  first.reviewReports = [
+    { findings: [finding], summary: "review finding on A" },
+    pass("tests passed"),
+    { findings: [{ ...finding, id: "document-change" }], summary: "document change" },
+  ];
+  await assert.rejects(runPipeline(options, first, git, ledger), /no publication route/);
+  assert.equal(git.headOid, oid(2));
+  const original = ledger.stageDispositions(runId).find((row) => row.stage_id === "review")!;
+
+  await installAbortReaping({ pid: process.pid });
+  const stopped = new DriftOrca("fresh-stop");
+  stopped.gateDecision = decision;
+  stopped.reviewReports = [{ findings: [{ ...finding, action: "ask-user" }], summary: "same finding on B" }];
+  await assert.rejects(
+    runPipeline({ ...options, resumeRunId: runId }, stopped, git, ledger),
+    decision === "stop" ? /stopped|stop requested|requested stop/i : /no publication route/,
+  );
+  assert.equal(stopped.gates, 1);
+
+  if (decision === "approve") {
+  assert.notEqual(
+    ledger.stageDispositions(runId).find((row) => row.stage_id === "review")!.evidence_sha256,
+    original.evidence_sha256,
+  );
+  const effective = ledger.stageDispositions(runId).find((row) => row.stage_id === "review")!;
+  assert.ok(ledger.listEvidence(runId).some((row) => row.evidence_sha256 === original.evidence_sha256));
+  assert.throws(() => ledger.settleLocalStage({
+    checkpoint: { inputCommitOid: oid(1), outputCommitOid: oid(1), roundIndex: 0 },
+    evidenceSha256: original.evidence_sha256!,
+    supersedesEvidenceSha256: effective.evidence_sha256!,
+    runId,
+    stageId: "review",
+  }), /already settled/);
+  assert.deepEqual(ledger.stageDispositions(runId).find((row) => row.stage_id === "review"), effective);
+  }
+});
+}
+
 test("approved fixer-no-change stages bind worker evidence durably", async (t) => {
   const root = await mkdtemp(path.join(tmpdir(), "onm-no-change-approve-"));
   const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
