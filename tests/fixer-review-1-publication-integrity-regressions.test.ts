@@ -338,7 +338,13 @@ test('a satisfied pre-push stage must bind successful authoritative evidence', a
         await admit(context, remote, context.destination)
         await assert.rejects(
           publish(context, remote, context.destination),
-          /does not bind successful authoritative evidence/
+          {
+            name: 'CandidatePublicationError',
+            // Candidate-bound checkpoint selection precedes evidence validation.
+            message: mode === 'mismatched'
+              ? 'stage lint does not extend the contiguous candidate chain'
+              : 'satisfied stage lint does not bind successful authoritative evidence'
+          }
         )
         assert.equal(remote.counts().reads, 1)
         assert.equal(remote.counts().pushes, 0)

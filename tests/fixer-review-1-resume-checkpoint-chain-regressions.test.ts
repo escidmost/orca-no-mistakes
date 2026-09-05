@@ -280,19 +280,50 @@ test(`candidate drift reaches a fresh ${decision} decision`, async (t) => {
     pass("tests passed"),
     { findings: [{ ...finding, id: "document-change" }], summary: "document change" },
   ];
-  await assert.rejects(runPipeline(options, first, git, ledger), /no publication route/);
+  // Task completion follows settlement, but precedes push-stage revalidation.
+  first.completeTask = async () => {
+    if (ledger.stageDispositions(runId).some((row) => row.stage_id === "lint")) {
+      throw new Error("fixture interrupted after lint settlement");
+    }
+  };
+  await assert.rejects(runPipeline(options, first, git, ledger), /fixture interrupted after lint settlement/);
   assert.equal(git.headOid, oid(2));
+  assert.equal(first.launches.filter((launch) => launch.stage === "review" && launch.role === "reviewer").length, 1);
   const original = ledger.stageDispositions(runId).find((row) => row.stage_id === "review")!;
+  const originalEvidence = ledger.listEvidence(runId);
+  const originalAudits = ledger.listGateAudit(runId);
+  const originalCheckpoints = ledger.listCheckpoints(runId);
+  assert.equal(originalEvidence.find((row) => row.evidence_sha256 === original.evidence_sha256)?.candidate_commit_oid, oid(1));
+  assert.ok(originalAudits.some((row) => row.stage_id === "review" && row.decision === "approve" && row.evidence_sha256 === original.evidence_sha256));
+  assert.equal(originalCheckpoints.at(-1)?.stage_id, "lint");
+  assert.equal(originalCheckpoints.at(-1)?.output_commit_oid, oid(2));
 
   await installAbortReaping({ pid: process.pid });
-  const stopped = new DriftOrca("fresh-stop");
-  stopped.gateDecision = decision;
-  stopped.reviewReports = [{ findings: [{ ...finding, action: "ask-user" }], summary: "same finding on B" }];
+  const resumed = new DriftOrca(`fresh-${decision}`);
+  resumed.gateDecision = decision;
+  resumed.reviewReports = [{ findings: [{ ...finding, action: "ask-user" }], summary: "same finding on B" }];
   await assert.rejects(
-    runPipeline({ ...options, resumeRunId: runId }, stopped, git, ledger),
+    runPipeline({ ...options, resumeRunId: runId }, resumed, git, ledger),
     decision === "stop" ? /stopped|stop requested|requested stop/i : /no publication route/,
   );
-  assert.equal(stopped.gates, 1);
+  assert.equal(resumed.gates, 1);
+  assert.equal(resumed.launches.filter((launch) => launch.stage === "review" && launch.role === "reviewer").length, 1);
+  const freshEvidence = ledger.listEvidence(runId).find((row) => row.summary === "same finding on B");
+  assert.ok(freshEvidence);
+  assert.equal(freshEvidence.stage_id, "review");
+  assert.equal(freshEvidence.candidate_commit_oid, oid(2));
+  assert.notEqual(freshEvidence.evidence_sha256, original.evidence_sha256);
+  const freshAudits = ledger.listGateAudit(runId).filter((row) => !originalAudits.some((prior) => prior.gate_id === row.gate_id));
+  assert.equal(freshAudits.length, 1);
+  assert.equal(freshAudits[0].gate_id, `fresh-${decision}-gate-1`);
+  assert.equal(freshAudits[0].decision, decision);
+  assert.equal(freshAudits[0].stage_id, "review");
+  assert.equal(freshAudits[0].round_index, freshEvidence.round_index);
+  assert.equal(freshAudits[0].evidence_sha256, freshEvidence.evidence_sha256);
+  assert.ok(freshAudits[0].resolved_at);
+  assert.deepEqual(ledger.listEvidence(runId).slice(0, originalEvidence.length), originalEvidence);
+  assert.deepEqual(ledger.listGateAudit(runId).slice(0, originalAudits.length), originalAudits);
+  assert.deepEqual(ledger.listCheckpoints(runId).slice(0, originalCheckpoints.length), originalCheckpoints);
 
   if (decision === "approve") {
   assert.notEqual(
@@ -300,6 +331,8 @@ test(`candidate drift reaches a fresh ${decision} decision`, async (t) => {
     original.evidence_sha256,
   );
   const effective = ledger.stageDispositions(runId).find((row) => row.stage_id === "review")!;
+  assert.equal(effective.evidence_sha256, freshEvidence.evidence_sha256);
+  const checkpoints = ledger.listCheckpoints(runId);
   assert.ok(ledger.listEvidence(runId).some((row) => row.evidence_sha256 === original.evidence_sha256));
   assert.throws(() => ledger.settleLocalStage({
     checkpoint: { inputCommitOid: oid(1), outputCommitOid: oid(1), roundIndex: 0 },
@@ -309,6 +342,10 @@ test(`candidate drift reaches a fresh ${decision} decision`, async (t) => {
     stageId: "review",
   }), /already settled/);
   assert.deepEqual(ledger.stageDispositions(runId).find((row) => row.stage_id === "review"), effective);
+  assert.deepEqual(ledger.listCheckpoints(runId), checkpoints);
+  } else {
+  assert.deepEqual(ledger.stageDispositions(runId).find((row) => row.stage_id === "review"), original);
+  assert.deepEqual(ledger.listCheckpoints(runId), originalCheckpoints);
   }
 });
 }

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { link, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -72,11 +73,16 @@ test('pullRequestArtifacts rejects hard-linked artifacts with multiple links', a
     const single = path.join(directory, 'single.txt')
     await writeFile(single, 'normal data')
 
+    const artifactDigests = {
+      'hardlink.txt': createHash('sha256').update('secret data').digest('hex'),
+      'single.txt': createHash('sha256').update('normal data').digest('hex')
+    }
     const artifacts = await pullRequestArtifacts(directory, {
+      artifactDigests,
       artifacts: ['hardlink.txt', 'single.txt'],
       findings: [],
       summary: 'test'
-    })
+    }, { trustedPublicationApprovals: Object.values(artifactDigests) })
 
     assert.equal(artifacts.length, 1)
     assert.equal(artifacts[0]?.name, 'Single')

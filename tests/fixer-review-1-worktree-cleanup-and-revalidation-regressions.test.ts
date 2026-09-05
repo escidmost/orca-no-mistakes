@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -280,11 +281,13 @@ test("pullRequestArtifacts reads digest and preview from the same checked descri
   const filePath = path.join(directory, "log.txt");
   await writeFile(filePath, "artifact log content for pr preview");
 
+  const digest = createHash("sha256").update("artifact log content for pr preview").digest("hex");
   const artifacts = await pullRequestArtifacts(directory, {
+    artifactDigests: { "log.txt": digest },
     artifacts: ["log.txt"],
     findings: [],
     summary: "pr artifacts test",
-  });
+  }, { trustedPublicationApprovals: [digest] });
 
   assert.equal(artifacts.length, 1);
   assert.equal(artifacts[0].name, "Log");

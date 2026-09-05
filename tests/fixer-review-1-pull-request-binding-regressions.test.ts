@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { execSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -205,11 +206,17 @@ test('pullRequestArtifacts rejects symlinks and fifos without hanging', async ()
     const regularFile = path.join(directory, 'valid.txt')
     await writeFile(regularFile, 'valid-artifact-content')
 
+    const artifactDigests = {
+      'symlink.txt': createHash('sha256').update('outside-content').digest('hex'),
+      'fifo.pipe': createHash('sha256').update('').digest('hex'),
+      'valid.txt': createHash('sha256').update('valid-artifact-content').digest('hex')
+    }
     const artifacts = await pullRequestArtifacts(directory, {
+      artifactDigests,
       artifacts: ['symlink.txt', 'fifo.pipe', 'valid.txt'],
       findings: [],
       summary: 'test'
-    })
+    }, { trustedPublicationApprovals: Object.values(artifactDigests) })
 
     assert.equal(artifacts.length, 1)
     assert.equal(artifacts[0]?.name, 'Valid')
@@ -231,11 +238,13 @@ test('pullRequestArtifacts redacts secrets crossing the 16 KiB boundary without 
     const artifactPath = path.join(directory, 'secret-cross.txt')
     await writeFile(artifactPath, fileContent)
 
+    const digest = createHash('sha256').update(fileContent).digest('hex')
     const artifacts = await pullRequestArtifacts(directory, {
+      artifactDigests: { 'secret-cross.txt': digest },
       artifacts: ['secret-cross.txt'],
       findings: [],
       summary: 'test'
-    })
+    }, { trustedPublicationApprovals: [digest] })
 
     assert.equal(artifacts.length, 1)
     assert.ok(!artifacts[0]?.content.includes(secretToken))

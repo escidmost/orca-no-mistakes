@@ -1250,7 +1250,7 @@ export class RailTuiRenderer implements PresentationRenderer {
         [title(stage).padEnd(8), status === "pending" ? SGR.dim : ""],
       ];
       if (state?.retainedFixer) {
-        segs.push(" ", ["retained", SGR.dim]);
+        segs.push(" ", ["fixer retained", SGR.dim]);
       }
       if (total > 0) {
         const findings = [

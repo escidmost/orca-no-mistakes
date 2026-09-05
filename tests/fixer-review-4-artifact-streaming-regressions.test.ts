@@ -94,7 +94,8 @@ test('pullRequestArtifacts streams large artifact and bounds preview content to 
       summary: 'build succeeded'
     }
 
-    const extracted = await pullRequestArtifacts(dir, report)
+    const trustedPublicationApprovals = [expectedDigest]
+    const extracted = await pullRequestArtifacts(dir, report, { trustedPublicationApprovals })
     assert.equal(extracted.length, 1)
     assert.equal(extracted[0].name, 'Build')
     assert.ok(Buffer.byteLength(extracted[0].content) <= 16 * 1024)
@@ -109,7 +110,7 @@ test('pullRequestArtifacts streams large artifact and bounds preview content to 
       findings: [],
       summary: 'build succeeded'
     }
-    const skipped = await pullRequestArtifacts(dir, mismatchedReport)
+    const skipped = await pullRequestArtifacts(dir, mismatchedReport, { trustedPublicationApprovals })
     assert.equal(skipped.length, 0)
   } finally {
     await rm(dir, { force: true, recursive: true })

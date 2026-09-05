@@ -617,7 +617,7 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
 
   assert.match(result.runId, /^test-run-/);
   assert.deepEqual(result.steps, LEGACY_STAGE_PLAN);
-  assert.deepEqual(orca.completedStages, LEGACY_STAGE_PLAN);
+  assert.deepEqual(orca.completedStages, [...LEGACY_STAGE_PLAN, "document", "lint"]);
 
   const stageTasks = orca.tasks.slice(0, LEGACY_STAGE_PLAN.length);
   assert.equal(stageTasks.length, LEGACY_STAGE_PLAN.length);
@@ -794,9 +794,11 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
       ["document", 0],
       ["lint", 1],
       ["lint", 1],
+      ["document", 1],
+      ["lint", 2],
     ],
   );
-  for (const index of [0, 4, 5]) {
+  for (const index of [0, 4, 5, 8, 9]) {
     assert.equal(
       checkpoints[index].input_commit_oid,
       checkpoints[index].output_commit_oid,
@@ -808,7 +810,7 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
   }
   assert.ok(result.attestation);
   verifyManifest(result.attestation);
-  assert.equal(result.attestation.stageEvidence.length, 8);
+  assert.equal(result.attestation.stageEvidence.length, 10);
   assert.ok(git.calls.some((call) => call.startsWith("recover:")));
   assert.match(result.custodyNote ?? "", /carries the terminal commit/);
   assert.equal(
@@ -826,13 +828,13 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
         ? [snapshot.transition.stage]
         : [],
     ),
-    LEGACY_STAGE_PLAN,
+    [...LEGACY_STAGE_PLAN, "document", "lint"],
   );
   assert.equal(
     presentation.filter(
       (snapshot) => snapshot.transition.kind === "findings-recorded",
     ).length,
-    8,
+    10,
   );
   assert.deepEqual(presentation.at(-1)?.transition, {
     kind: "run-completed",
@@ -9220,7 +9222,7 @@ test("an unreadable worker report gets one contract-repair retry", async () => {
 
   assert.equal(outcome.worker.report.summary, "review");
   assert.equal(orca.tasks.length, 2);
-  assert.match(orca.launches[1].prompt, /orca-no-mistakes report --stage review --role reviewer/);
+  assert.match(orca.launches[1].prompt, /\/bin\/orca-no-mistakes' report --stage review --role reviewer/);
 });
 
 test("report repair preserves the selected fallback launch", async () => {

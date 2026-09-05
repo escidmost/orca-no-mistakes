@@ -23,6 +23,7 @@ test('pullRequestArtifacts requires recorded expected digest and skips missing-d
     const artifactPath = path.join(dir, artifactName)
     const content = 'valid artifact preview content'
     const expectedDigest = createHash('sha256').update(content).digest('hex')
+    const trustedPublicationApprovals = [expectedDigest]
     await writeFile(artifactPath, content)
 
     // 1. Missing artifactDigests entirely -> skipped
@@ -31,7 +32,7 @@ test('pullRequestArtifacts requires recorded expected digest and skips missing-d
       findings: [],
       summary: 'no digests record'
     }
-    const skippedMissing = await pullRequestArtifacts(dir, reportNoDigests)
+    const skippedMissing = await pullRequestArtifacts(dir, reportNoDigests, { trustedPublicationApprovals })
     assert.equal(skippedMissing.length, 0)
 
     // 2. artifactDigests present but missing this artifact -> skipped
@@ -41,17 +42,25 @@ test('pullRequestArtifacts requires recorded expected digest and skips missing-d
       findings: [],
       summary: 'empty digests record'
     }
-    const skippedEmpty = await pullRequestArtifacts(dir, reportEmptyDigests)
+    const skippedEmpty = await pullRequestArtifacts(dir, reportEmptyDigests, { trustedPublicationApprovals })
     assert.equal(skippedEmpty.length, 0)
 
-    // 3. artifactDigests has matching expected digest -> included
+    // 3. Matching digest without trusted approval -> metadata only
     const reportValid: StageReport = {
       artifactDigests: { [artifactName]: expectedDigest },
       artifacts: [artifactName],
       findings: [],
       summary: 'valid digest record'
     }
-    const included = await pullRequestArtifacts(dir, reportValid)
+    const withheld = await pullRequestArtifacts(dir, reportValid)
+    assert.equal(withheld.length, 1)
+    assert.ok(withheld[0].content.includes(`SHA-256: ${expectedDigest}`))
+    assert.ok(withheld[0].content.includes(`Size: ${Buffer.byteLength(content)} bytes`))
+    assert.match(withheld[0].content, /Artifact content withheld/)
+    assert.ok(!withheld[0].content.includes(content))
+
+    // Exact-content trusted approval permits the preview
+    const included = await pullRequestArtifacts(dir, reportValid, { trustedPublicationApprovals })
     assert.equal(included.length, 1)
     assert.equal(included[0]?.content, content)
 
@@ -62,7 +71,7 @@ test('pullRequestArtifacts requires recorded expected digest and skips missing-d
       findings: [],
       summary: 'mismatched digest record'
     }
-    const skippedMismatch = await pullRequestArtifacts(dir, reportMismatch)
+    const skippedMismatch = await pullRequestArtifacts(dir, reportMismatch, { trustedPublicationApprovals })
     assert.equal(skippedMismatch.length, 0)
   } finally {
     await rm(dir, { force: true, recursive: true })

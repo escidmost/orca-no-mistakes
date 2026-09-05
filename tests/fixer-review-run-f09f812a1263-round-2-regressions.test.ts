@@ -165,13 +165,14 @@ test("pullRequestArtifacts rejects auxiliary artifacts with tampered digests", a
       summary: "test passed",
     };
 
-    const embedded = await pullRequestArtifacts(dir, validReport);
+    const trustedPublicationApprovals = [digest];
+    const embedded = await pullRequestArtifacts(dir, validReport, { trustedPublicationApprovals });
     assert.equal(embedded.length, 1);
     assert.equal(embedded[0]?.content, "original valid content");
 
     await writeFile(fullPath, "tampered malicious content");
 
-    const tampered = await pullRequestArtifacts(dir, validReport);
+    const tampered = await pullRequestArtifacts(dir, validReport, { trustedPublicationApprovals });
     assert.equal(tampered.length, 0);
   } finally {
     await rm(dir, { force: true, recursive: true });

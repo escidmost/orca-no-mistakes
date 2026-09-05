@@ -439,7 +439,8 @@ if (process.env.TUI_FIXTURE === "1") {
 
     const screen = cleanScreen(output.writes.at(-1) ?? "");
     assert.match(screen, /auto-fix off/iu);
-    assert.match(screen, /Review\s+retained\s+4 found .*2 fixed .*1 approved/u);
+    assert.match(screen, /Review\s+fixer retained\s+4 found .*2 fixed/u);
+    assert.match(screen, /1 approved/u);
     assert.match(screen, /Lint/u);
     assert.match(screen, /A Auto-fix/iu);
     input.emit("data", "A");
