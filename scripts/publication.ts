@@ -196,6 +196,7 @@ export function terminalCandidate(
   const gateAudits = ledger.listGateAudit(runId)
 
   let candidate = run.submission_commit_oid
+  let currentCandidate: string | undefined = undefined
   for (const stage of plan.slice(0, pushIndex)) {
     const disposition = dispositions.get(stage.stage_id)
     if (!disposition) throw new CandidatePublicationError(`stage ${stage.stage_id} has no terminal disposition`)
@@ -212,6 +213,11 @@ export function terminalCandidate(
       continue
     }
     if (!final) {
+      throw new CandidatePublicationError(
+        `stage ${stage.stage_id} does not extend the contiguous candidate chain`
+      )
+    }
+    if (currentCandidate !== undefined && final.input_commit_oid !== currentCandidate) {
       throw new CandidatePublicationError(
         `stage ${stage.stage_id} does not extend the contiguous candidate chain`
       )
@@ -250,6 +256,7 @@ export function terminalCandidate(
       )
     }
     candidate = final.output_commit_oid
+    currentCandidate = final.output_commit_oid
   }
 
   for (const stage of plan.slice(0, pushIndex)) {

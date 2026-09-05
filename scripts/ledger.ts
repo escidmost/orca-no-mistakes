@@ -288,25 +288,31 @@ export function finalContiguousCheckpointByStage(
     }
   }
 
+  let currentCandidate: string | undefined = undefined
   for (const stageId of stageIds) {
-    if (brokenStages.has(stageId)) continue
+    if (brokenStages.has(stageId)) break
 
     const expected = expectedByStage.get(stageId)
-    if (expected) {
-      const match = validCheckpoints.findLast(
-        (cp) =>
-          cp.stage_id === stageId &&
-          cp.round_index === expected.roundIndex &&
-          cp.output_commit_oid === expected.candidateCommitOid
-      )
-      if (match) {
-        result.set(stageId, match)
+    const match = validCheckpoints.findLast((cp) => {
+      if (cp.stage_id !== stageId) return false
+      if (
+        expected &&
+        (cp.round_index !== expected.roundIndex ||
+          cp.output_commit_oid !== expected.candidateCommitOid)
+      ) {
+        return false
       }
-    } else {
-      const match = validCheckpoints.findLast((cp) => cp.stage_id === stageId)
-      if (match) {
-        result.set(stageId, match)
+      if (currentCandidate !== undefined && cp.input_commit_oid !== currentCandidate) {
+        return false
       }
+      return true
+    })
+
+    if (match) {
+      currentCandidate = match.output_commit_oid
+      result.set(stageId, match)
+    } else if (expected || validCheckpoints.some((cp) => cp.stage_id === stageId)) {
+      break
     }
   }
 
@@ -4222,7 +4228,7 @@ export class DomainLedger {
             priorPayload.state === 'open'
           ) && priorPayload.state !== 'merged'
           const matchesSuperseded =
-            input.supersedesEvidenceSha256 === undefined ||
+            typeof input.supersedesEvidenceSha256 === 'string' &&
             input.supersedesEvidenceSha256 === priorDispositionRow.evidence_sha256
           if (
             isManagedComment &&

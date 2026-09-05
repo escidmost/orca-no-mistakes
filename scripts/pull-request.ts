@@ -160,8 +160,13 @@ function issueLabel(count: number): string {
   return `${count} ${count === 1 ? 'issue' : 'issues'}`
 }
 
-function pipelineStepSummary(step: PullRequestPipelineStep): string {
+export function pipelineStepSummary(step: PullRequestPipelineStep): string {
   const name = `**${displayStepName(step.name)}**`
+  const fixed = step.fixedFindings ?? 0
+  const approved = step.approvedFindings ?? step.approvedFindingDetails?.length ?? 0
+  const open = step.openFindings ?? 0
+  const total = fixed + approved + open
+
   switch (step.status) {
     case 'pending':
       return `⏳ ${name} - pending`
@@ -170,14 +175,13 @@ function pipelineStepSummary(step: PullRequestPipelineStep): string {
     case 'skipped':
       return `⏭️ ${name} - skipped`
     case 'approved':
-      return `⚠️ ${name} - ${step.approvedFindings ? `${issueLabel(step.approvedFindings)} approved` : 'approved'}`
+      if (fixed === 0) {
+        return `⚠️ ${name} - ${approved > 0 ? `${issueLabel(approved)} approved` : 'approved'}`
+      }
+      break
     case 'failed':
       return `❌ ${name} - failed`
   }
-  const fixed = step.fixedFindings ?? 0
-  const approved = step.approvedFindings ?? step.approvedFindingDetails?.length ?? 0
-  const open = step.openFindings ?? 0
-  const total = fixed + approved + open
   if (fixed > 0) {
     const outcome = [`${fixed} auto-fixed`, ...(approved > 0 ? [`${approved} approved`] : [])].join(' · ')
     return `🔧 ${name} - ${issueLabel(total)} found → ${outcome} ✅`
