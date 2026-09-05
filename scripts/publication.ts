@@ -199,6 +199,7 @@ export function terminalCandidate(
 
   let candidate = run.submission_commit_oid
   let currentCandidate: string | undefined = run.submission_commit_oid
+  let lastCheckpointIndex = -1
   for (const stage of plan.slice(0, pushIndex)) {
     const disposition = dispositions.get(stage.stage_id)
     if (!disposition) throw new CandidatePublicationError(`stage ${stage.stage_id} has no terminal disposition`)
@@ -219,9 +220,21 @@ export function terminalCandidate(
         `stage ${stage.stage_id} does not extend the contiguous candidate chain`
       )
     }
+    const finalIndex = checkpoints.findIndex(
+      (cp) =>
+        cp === final ||
+        (cp.stage_id === final.stage_id &&
+          cp.round_index === final.round_index &&
+          cp.input_commit_oid === final.input_commit_oid &&
+          cp.output_commit_oid === final.output_commit_oid)
+    )
+    const connecting = checkpoints.slice(
+      lastCheckpointIndex + 1,
+      finalIndex >= 0 ? finalIndex : 0
+    )
     if (
       currentCandidate !== undefined &&
-      !isCandidateReachable(currentCandidate, final.input_commit_oid, checkpoints)
+      !isCandidateReachable(currentCandidate, final.input_commit_oid, connecting)
     ) {
       throw new CandidatePublicationError(
         `stage ${stage.stage_id} does not extend the contiguous candidate chain`
@@ -262,6 +275,7 @@ export function terminalCandidate(
     }
     candidate = final.output_commit_oid
     currentCandidate = final.output_commit_oid
+    lastCheckpointIndex = finalIndex
   }
 
   for (const stage of plan.slice(0, pushIndex)) {

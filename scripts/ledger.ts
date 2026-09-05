@@ -245,16 +245,11 @@ export function isCandidateReachable(
   checkpoints: readonly StageCheckpointRow[]
 ): boolean {
   if (fromCommitOid === toCommitOid) return true
-  const visited = new Set<string>([fromCommitOid])
-  const queue = [fromCommitOid]
-  while (queue.length > 0) {
-    const curr = queue.shift()!
-    for (const cp of checkpoints) {
-      if (cp.input_commit_oid === curr && !visited.has(cp.output_commit_oid)) {
-        if (cp.output_commit_oid === toCommitOid) return true
-        visited.add(cp.output_commit_oid)
-        queue.push(cp.output_commit_oid)
-      }
+  const reachable = new Set<string>([fromCommitOid])
+  for (const cp of checkpoints) {
+    if (reachable.has(cp.input_commit_oid)) {
+      reachable.add(cp.output_commit_oid)
+      if (cp.output_commit_oid === toCommitOid) return true
     }
   }
   return false
@@ -321,7 +316,7 @@ export function finalContiguousCheckpointByStage(
     for (let i = validCheckpoints.length - 1; i >= 0; i--) {
       const cp = validCheckpoints[i]
       if (cp.stage_id !== stageId) continue
-      if (i < lastCheckpointIndex) continue
+      if (i <= lastCheckpointIndex) continue
       if (
         expected &&
         (cp.round_index !== expected.roundIndex ||
@@ -329,7 +324,8 @@ export function finalContiguousCheckpointByStage(
       ) {
         continue
       }
-      if (!isCandidateReachable(currentCandidate, cp.input_commit_oid, validCheckpoints)) {
+      const connecting = validCheckpoints.slice(lastCheckpointIndex + 1, i)
+      if (!isCandidateReachable(currentCandidate, cp.input_commit_oid, connecting)) {
         continue
       }
       match = cp
