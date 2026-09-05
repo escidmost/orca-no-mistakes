@@ -3,6 +3,7 @@ status: accepted
 date: 2026-08-20
 scope: target roadmap
 implementation: partially implemented
+acceptance: Release 2 live proof pending
 ---
 
 # Four Shippable Parity Releases
@@ -36,6 +37,10 @@ The repository-local admission gate is also pulled forward from item 2 into Rele
 ## Amendment 2026-09-02
 
 Release 2 now runs `push` and `pr` after the six local validation stages for both direct and gate ingress. Candidate publication and pull-request report publication settle only with authoritative post-reads, keeping the PR stage active while the exact pull request is open and settling only after an authoritative matching MERGED observation with atomic receipts, evidence, dispositions, and checkpoints; successful runs store a v2 completion attestation and expose lowercase `passed`. Resume remains limited to durably failed runs: adopting a stranded `in-progress` remote run remains a Release 4 limitation.
+
+## Acceptance status 2026-09-05
+
+[Release 2 acceptance](../release-2-acceptance.md) defines the local matrix, live fixtures, evidence and operator procedure for the current title/body and matching-merge contract. The local matrix alone does not satisfy this decision: release acceptance remains pending until macOS, Linux and protected live same-repository/fork results are retained.
 
 ## Consequences
 
