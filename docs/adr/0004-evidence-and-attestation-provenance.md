@@ -16,7 +16,7 @@ The target pipeline keeps detailed evidence locally and publishes only a compact
 - Cap each captured stage output at 50MB. Record whether content was truncated, the original byte count when known, and the retained byte range; never describe truncated output as a full log.
 - Avoid broad environment capture, redact known credentials and tokens before persistence, and create ledger and artifact files with owner-only permissions.
 - Build a deterministic JSON manifest and Merkle root over ordered stage records, effective policy, intent hash, candidate commit, delivery proof, and coordinator version.
-- A sticky PR comment may present the manifest hash and stage summary, but the editable comment is not a trust anchor.
+- The managed PR report presents the manifest hash and stage summary, but the editable body is not a trust anchor.
 - Retain evidence until an explicit operator deletion operation. Deletion must report what was removed and preserve no claim that deleted raw evidence remains independently verifiable.
 
 ## Consequences
