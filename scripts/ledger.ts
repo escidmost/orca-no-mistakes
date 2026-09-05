@@ -128,6 +128,7 @@ export type GateAuditRow = {
   gate_id: string
   gate_kind: GateKind
   guidance: string | null
+  options_json?: string
   question: string
   resolution: string
   resolved_at: string | null
@@ -238,46 +239,112 @@ export type StageCheckpointRow = {
   stage_id: string
 }
 
+export function isCandidateReachable(
+  fromCommitOid: string,
+  toCommitOid: string,
+  checkpoints: readonly StageCheckpointRow[]
+): boolean {
+  if (fromCommitOid === toCommitOid) return true
+  const reachable = new Set<string>([fromCommitOid])
+  for (const cp of checkpoints) {
+    if (reachable.has(cp.input_commit_oid)) {
+      reachable.add(cp.output_commit_oid)
+      if (cp.output_commit_oid === toCommitOid) return true
+    }
+  }
+  return false
+}
+
 export function finalContiguousCheckpointByStage(
   stageIds: readonly string[],
   checkpoints: readonly StageCheckpointRow[],
-  initialCandidate: string
+  initialCandidate: string,
+  evidenceByStage?:
+    | ReadonlyMap<string, { candidate_commit_oid?: string; candidateCommitOid?: string; round_index?: number; roundIndex?: number }>
+    | readonly { stage_id?: string; stage?: string; candidate_commit_oid?: string; candidateCommitOid?: string; round_index?: number; roundIndex?: number }[]
 ): Map<string, StageCheckpointRow> {
   const result = new Map<string, StageCheckpointRow>()
   const stagePosition = new Map(stageIds.map((stageId, index) => [stageId, index]))
-  let candidate = initialCandidate
-  let previousIndex = -1
-  for (const [position, stageId] of stageIds.entries()) {
-    const seenCandidates = new Set([candidate])
-    let final: { checkpoint: StageCheckpointRow; index: number } | undefined
-    for (let index = previousIndex + 1; index < checkpoints.length; index += 1) {
-      const checkpoint = checkpoints[index]!
-      if (checkpoint.stage_id !== stageId) {
-        const checkpointPosition = stagePosition.get(checkpoint.stage_id)
-        if (checkpointPosition !== undefined && checkpointPosition > position) break
-        continue
+
+  const expectedByStage = new Map<string, { candidateCommitOid: string; roundIndex: number }>()
+  if (evidenceByStage) {
+    if (evidenceByStage instanceof Map || (typeof (evidenceByStage as any).get === 'function' && typeof (evidenceByStage as any).entries === 'function')) {
+      for (const [key, val] of (evidenceByStage as Map<string, any>).entries()) {
+        if (!val) continue
+        const candidateCommitOid = val.candidate_commit_oid ?? val.candidateCommitOid
+        const roundIndex = val.round_index ?? val.roundIndex
+        if (candidateCommitOid !== undefined && roundIndex !== undefined) {
+          expectedByStage.set(key, { candidateCommitOid, roundIndex })
+        }
       }
-      if (checkpoint.input_commit_oid === candidate) {
-        candidate = checkpoint.output_commit_oid
-        seenCandidates.add(candidate)
-        final = { checkpoint, index }
-        continue
+    } else if (Array.isArray(evidenceByStage)) {
+      for (const item of evidenceByStage) {
+        if (!item) continue
+        const stageId = item.stage_id ?? item.stage
+        const candidateCommitOid = item.candidate_commit_oid ?? item.candidateCommitOid
+        const roundIndex = item.round_index ?? item.roundIndex
+        if (stageId && candidateCommitOid !== undefined && roundIndex !== undefined) {
+          expectedByStage.set(stageId, { candidateCommitOid, roundIndex })
+        }
       }
-      if (
-        checkpoint.output_commit_oid === candidate &&
-        seenCandidates.has(checkpoint.input_commit_oid)
-      ) {
-        final = { checkpoint, index }
-        continue
-      }
-      return result
     }
-    if (!final) break
-    result.set(stageId, final.checkpoint)
-    previousIndex = final.index
   }
+
+  const reachable = new Set<string>([initialCandidate])
+  const validCheckpoints: StageCheckpointRow[] = []
+  const brokenStages = new Set<string>()
+
+  for (const checkpoint of checkpoints) {
+    if (!stagePosition.has(checkpoint.stage_id)) continue
+
+    if (reachable.has(checkpoint.input_commit_oid)) {
+      reachable.add(checkpoint.output_commit_oid)
+      validCheckpoints.push(checkpoint)
+    } else {
+      brokenStages.add(checkpoint.stage_id)
+    }
+  }
+
+  let currentCandidate = initialCandidate
+  let lastCheckpointIndex = -1
+  for (const stageId of stageIds) {
+    if (brokenStages.has(stageId)) break
+
+    const expected = expectedByStage.get(stageId)
+    let match: StageCheckpointRow | undefined
+    let matchIndex = -1
+    for (let i = validCheckpoints.length - 1; i >= 0; i--) {
+      const cp = validCheckpoints[i]
+      if (cp.stage_id !== stageId) continue
+      if (i <= lastCheckpointIndex) continue
+      if (
+        expected &&
+        (cp.round_index !== expected.roundIndex ||
+          cp.output_commit_oid !== expected.candidateCommitOid)
+      ) {
+        continue
+      }
+      const connecting = validCheckpoints.slice(lastCheckpointIndex + 1, i)
+      if (!isCandidateReachable(currentCandidate, cp.input_commit_oid, connecting)) {
+        continue
+      }
+      match = cp
+      matchIndex = i
+      break
+    }
+
+    if (match) {
+      currentCandidate = match.output_commit_oid
+      lastCheckpointIndex = matchIndex
+      result.set(stageId, match)
+    } else if (expected || validCheckpoints.some((cp) => cp.stage_id === stageId)) {
+      break
+    }
+  }
+
   return result
 }
+
 
 export type GateDecisionRecord = {
   decision: 'approve' | 'skip'
@@ -1638,6 +1705,7 @@ export type PrunableRun = {
 const RELEASE_2_FACT_TABLES = [
   'stage_plan_entries',
   'stage_dispositions',
+  'stage_disposition_supersessions',
   'publication_routes',
   'publication_baselines',
   'run_attempts',
@@ -1750,6 +1818,17 @@ CREATE TABLE IF NOT EXISTS stage_dispositions (
   evidence_sha256 TEXT,
   recorded_at TEXT NOT NULL,
   PRIMARY KEY (run_id, stage_id),
+  FOREIGN KEY (run_id, stage_id) REFERENCES stage_plan_entries(run_id, stage_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS stage_disposition_supersessions (
+  run_id TEXT NOT NULL,
+  stage_id TEXT NOT NULL,
+  disposition TEXT NOT NULL CHECK(disposition IN ('satisfied', 'failed', 'skipped', 'waived', 'disabled')),
+  prior_evidence_sha256 TEXT NOT NULL,
+  evidence_sha256 TEXT NOT NULL,
+  recorded_at TEXT NOT NULL,
+  PRIMARY KEY (run_id, stage_id, evidence_sha256),
   FOREIGN KEY (run_id, stage_id) REFERENCES stage_plan_entries(run_id, stage_id) ON DELETE CASCADE
 );
 
@@ -1977,6 +2056,10 @@ CREATE TRIGGER IF NOT EXISTS immutable_stage_dispositions
 BEFORE UPDATE ON stage_dispositions
 BEGIN SELECT RAISE(ABORT, 'stage_dispositions rows are immutable'); END;
 
+CREATE TRIGGER IF NOT EXISTS immutable_stage_disposition_supersessions
+BEFORE UPDATE ON stage_disposition_supersessions
+BEGIN SELECT RAISE(ABORT, 'stage_disposition_supersessions rows are immutable'); END;
+
 CREATE TRIGGER IF NOT EXISTS immutable_publication_routes
 BEFORE UPDATE ON publication_routes
 BEGIN SELECT RAISE(ABORT, 'publication_routes rows are immutable'); END;
@@ -2018,6 +2101,11 @@ CREATE TRIGGER IF NOT EXISTS immutable_stage_dispositions_delete
 BEFORE DELETE ON stage_dispositions
 WHEN EXISTS (SELECT 1 FROM runs WHERE run_id = OLD.run_id)
 BEGIN SELECT RAISE(ABORT, 'stage_dispositions rows are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_stage_disposition_supersessions_delete
+BEFORE DELETE ON stage_disposition_supersessions
+WHEN EXISTS (SELECT 1 FROM runs WHERE run_id = OLD.run_id)
+BEGIN SELECT RAISE(ABORT, 'stage_disposition_supersessions rows are immutable'); END;
 
 CREATE TRIGGER IF NOT EXISTS immutable_publication_routes_delete
 BEFORE DELETE ON publication_routes
@@ -2660,6 +2748,7 @@ export class DomainLedger {
       for (const table of [
         'resume_claims',
         'stage_dispositions',
+        'stage_disposition_supersessions',
         'publication_routes',
         'publication_baselines',
         'run_attempts',
@@ -3136,7 +3225,15 @@ export class DomainLedger {
 
   stageDispositions(runId: string): StageDispositionRow[] {
     return this.#db.prepare(
-      `SELECT d.stage_id, d.disposition, d.evidence_sha256
+      `SELECT d.stage_id,
+              COALESCE((SELECT s.disposition
+                        FROM stage_disposition_supersessions s
+                        WHERE s.run_id = d.run_id AND s.stage_id = d.stage_id
+                        ORDER BY s.rowid DESC LIMIT 1), d.disposition) AS disposition,
+              COALESCE((SELECT s.evidence_sha256
+                        FROM stage_disposition_supersessions s
+                        WHERE s.run_id = d.run_id AND s.stage_id = d.stage_id
+                        ORDER BY s.rowid DESC LIMIT 1), d.evidence_sha256) AS evidence_sha256
        FROM stage_dispositions d
        JOIN stage_plan_entries p ON p.run_id = d.run_id AND p.stage_id = d.stage_id
        WHERE d.run_id = ? ORDER BY p.position`
@@ -3679,6 +3776,36 @@ export class DomainLedger {
     return undefined
   }
 
+  publishedPullRequestContent(
+    runId: string,
+    candidateCommitOid?: string
+  ): { body: string; title: string } | undefined {
+    const route = this.publicationRoute(runId)
+    if (!route) return undefined
+    const rows = this.#db.prepare(
+      `SELECT m.payload_json
+       FROM mutation_intents m
+       JOIN run_attempts a ON a.attempt_id = m.attempt_id AND a.run_id = m.run_id
+       WHERE m.run_id = ? AND m.kind = 'pull-request' AND m.target_fingerprint = ?
+       ORDER BY a.generation_token DESC, m.rowid DESC`
+    ).all(runId, route.route_fingerprint) as Array<{ payload_json: string }>
+    for (const row of rows) {
+      try {
+        const payload = JSON.parse(row.payload_json) as Record<string, unknown>
+        if (
+          payload.action === 'ensure-body-and-await-merge' &&
+          typeof payload.title === 'string' &&
+          typeof payload.body === 'string' &&
+          (!candidateCommitOid || payload.candidateCommitOid === candidateCommitOid)
+        ) {
+          return { body: payload.body, title: payload.title }
+        }
+      } catch {
+      }
+    }
+    return undefined
+  }
+
   #remoteObservationMatches(input: {
     allowHistoricalAttempt?: boolean
     candidateCommitOid: string
@@ -3823,10 +3950,13 @@ export class DomainLedger {
     }
     const receipt = input.receiptPayload
     const hasManagedComment = Object.hasOwn(receipt, 'managedCommentIntent')
+    const hasBodyReport = Object.hasOwn(receipt, 'bodySha256')
     const hasPipelineEvidenceRoot = Object.hasOwn(receipt, 'pipelineEvidenceRoot')
-    if (hasManagedComment !== hasPipelineEvidenceRoot) return false
+    if (hasManagedComment && hasBodyReport) return false
+    if ((hasManagedComment || hasBodyReport) !== hasPipelineEvidenceRoot) return false
     if (!hasOnlyOwnProperties(receipt, new Set([
       ...(hasManagedComment ? ['managedCommentIntent'] : []),
+      ...(hasBodyReport ? ['bodySha256', 'state', 'titleSha256'] : []),
       ...(hasPipelineEvidenceRoot ? ['pipelineEvidenceRoot'] : []),
       'mutationIntent', 'number', 'outcome', 'postRead', 'routeFingerprint'
     ])) || !Number.isInteger(receipt.number) || Number(receipt.number) <= 0 ||
@@ -3835,6 +3965,10 @@ export class DomainLedger {
       (hasPipelineEvidenceRoot &&
         (typeof receipt.pipelineEvidenceRoot !== 'string' ||
           !/^[0-9a-f]{64}$/.test(receipt.pipelineEvidenceRoot))) ||
+      (hasBodyReport &&
+        (typeof receipt.bodySha256 !== 'string' || !HEX_64.test(receipt.bodySha256) ||
+          typeof receipt.titleSha256 !== 'string' || !HEX_64.test(receipt.titleSha256) ||
+          receipt.state !== 'merged')) ||
       typeof receipt.mutationIntent !== 'string' ||
       receipt.postRead !== input.observationSha256) return false
     const mutation = this.#db.prepare(
@@ -3910,10 +4044,22 @@ export class DomainLedger {
       observation.subject === `${route.forge_host}/${route.base_repository_id}#${String(receipt.number)}` &&
       Object.entries(routeFacts).every(([key, value]) =>
         payload[key] === value && mutationPayload[key] === value
-      ) &&
-      payload.number === receipt.number && payload.state === 'open' &&
-      mutationPayload.action === 'ensure-open'
+      ) && payload.number === receipt.number
     if (!commonMatch) return false
+    if (hasBodyReport) {
+      return payload.state === 'merged' && mutationPayload.action === 'ensure-body-and-await-merge' &&
+        payload.bodySha256 === receipt.bodySha256 &&
+        payload.titleSha256 === receipt.titleSha256 &&
+        hasOnlyOwnProperties(payload, new Set([
+          ...Object.keys(routeFacts), 'bodySha256', 'number', 'pullRequestNodeId', 'state', 'titleSha256'
+        ])) && hasOnlyOwnProperties(mutationPayload, new Set([
+          ...Object.keys(routeFacts), 'action', 'body', 'title'
+        ])) &&
+        typeof payload.pullRequestNodeId === 'string' && payload.pullRequestNodeId !== '' &&
+        sha256(String(mutationPayload.body)) === receipt.bodySha256 &&
+        sha256(String(mutationPayload.title)) === receipt.titleSha256
+    }
+    if (payload.state !== 'open' || mutationPayload.action !== 'ensure-open') return false
     if (!hasManagedComment) {
       return hasOnlyOwnProperties(payload, new Set([
         ...Object.keys(routeFacts), 'number', 'state'
@@ -3956,6 +4102,7 @@ export class DomainLedger {
     }
     runId: string
     stageId: 'pr' | 'push'
+    supersedesEvidenceSha256?: string
     ownership: { branch: string; generationToken: number; repoRoot: string }
   }): { evidenceId: string; receiptSha256: string } {
     const expectedKind: RemoteReceiptKind =
@@ -4059,10 +4206,12 @@ export class DomainLedger {
          WHERE run_id = ? AND stage_id = ? AND disposition = 'satisfied'
            AND evidence_sha256 = ?`
       ).get(input.runId, input.stageId, input.evidence.evidenceSha256)
-      const priorDisposition = this.#db.prepare(
-        'SELECT 1 FROM stage_dispositions WHERE run_id = ? AND stage_id = ? LIMIT 1'
-      ).get(input.runId, input.stageId)
+      const priorDispositionRow = this.#db.prepare(
+        'SELECT disposition, evidence_sha256 FROM stage_dispositions WHERE run_id = ? AND stage_id = ? LIMIT 1'
+      ).get(input.runId, input.stageId) as { disposition: string; evidence_sha256: string } | undefined
+      const priorDisposition = priorDispositionRow !== undefined ? 1 : undefined
       const settlesDisposition = input.stageId !== 'pr' ||
+        input.receipt.payload.state === 'merged' ||
         (Object.hasOwn(input.receipt.payload, 'managedCommentIntent') &&
           (input.evidence.roundIndex === 0 || priorDisposition === undefined))
       const priorEvidence = this.#db.prepare(
@@ -4082,7 +4231,41 @@ export class DomainLedger {
         }
         throw new Error(`${input.stageId} round ${input.checkpoint.roundIndex} is already settled with different facts`)
       }
-      if (settlesDisposition && priorDisposition !== undefined && existingDisposition === undefined) {
+      let isHistoricalPrUpgrade = false
+      if (
+        settlesDisposition &&
+        priorDispositionRow !== undefined &&
+        existingDisposition === undefined &&
+        input.stageId === 'pr' &&
+        input.receipt.payload.state === 'merged' &&
+        priorDispositionRow.disposition === 'satisfied'
+      ) {
+        const priorPrReceipt = this.#db.prepare(
+          `SELECT receipt_json, candidate_commit_oid FROM remote_receipts
+           WHERE run_id = ? AND kind = 'pull-request-binding'
+           ORDER BY rowid DESC LIMIT 1`
+        ).get(input.runId) as { receipt_json: string; candidate_commit_oid: string } | undefined
+        if (priorPrReceipt) {
+          const parsedReceipt = JSON.parse(priorPrReceipt.receipt_json) as Record<string, unknown>
+          const priorPayload = (parsedReceipt.payload as Record<string, unknown> | undefined) ?? parsedReceipt
+          const isManagedComment = priorPayload && (
+            Object.hasOwn(priorPayload, 'managedCommentIntent') ||
+            priorPayload.managedCommentNodeId !== undefined ||
+            priorPayload.state === 'open'
+          ) && priorPayload.state !== 'merged'
+          const matchesSuperseded =
+            typeof input.supersedesEvidenceSha256 === 'string' &&
+            input.supersedesEvidenceSha256 === priorDispositionRow.evidence_sha256
+          if (
+            isManagedComment &&
+            matchesSuperseded &&
+            priorPrReceipt.candidate_commit_oid === input.receipt.candidateCommitOid
+          ) {
+            isHistoricalPrUpgrade = true
+          }
+        }
+      }
+      if (settlesDisposition && priorDisposition !== undefined && existingDisposition === undefined && !isHistoricalPrUpgrade) {
         throw new Error(`${input.stageId} is already settled with a different disposition`)
       }
 
@@ -4116,7 +4299,19 @@ export class DomainLedger {
         runId: input.runId,
         stageId: input.stageId
       })
-      if (settlesDisposition && existingDisposition === undefined) {
+      if (isHistoricalPrUpgrade) {
+        this.#db.prepare(
+          `INSERT INTO stage_disposition_supersessions
+             (run_id, stage_id, disposition, prior_evidence_sha256, evidence_sha256, recorded_at)
+           VALUES (?, ?, 'satisfied', ?, ?, ?)`
+        ).run(
+          input.runId,
+          input.stageId,
+          priorDispositionRow!.evidence_sha256,
+          input.evidence.evidenceSha256,
+          createdAt
+        )
+      } else if (settlesDisposition && existingDisposition === undefined) {
         this.recordStageDisposition({
           disposition: 'satisfied',
           evidenceSha256: input.evidence.evidenceSha256,
@@ -4748,6 +4943,7 @@ export class DomainLedger {
         roundIndex: number
       }
       evidenceSha256: string
+      supersedesEvidenceSha256?: string
       runId: string
       stageId: string
     },
@@ -4758,15 +4954,45 @@ export class DomainLedger {
       const settlesDisposition = this.stagePlan(input.runId).some(
         (entry) => entry.stage_id === 'push'
       )
-      const disposition = this.#db.prepare(
-        'SELECT disposition, evidence_sha256 FROM stage_dispositions WHERE run_id = ? AND stage_id = ?'
-      ).get(input.runId, input.stageId) as
-        | { disposition: string; evidence_sha256: string | null }
-        | undefined
-      if (settlesDisposition && disposition &&
-          (disposition.disposition !== 'satisfied' ||
-            disposition.evidence_sha256 !== input.evidenceSha256)) {
-        throw new Error(`${input.stageId} is already settled with a different disposition`)
+      const disposition = this.stageDispositions(input.runId)
+        .find((entry) => entry.stage_id === input.stageId)
+      const dispositionChanged = settlesDisposition && disposition &&
+        (disposition.disposition !== 'satisfied' ||
+          disposition.evidence_sha256 !== input.evidenceSha256)
+      if (dispositionChanged) {
+        const candidates = this.#db.prepare(
+          `SELECT rowid AS sequence, evidence_sha256, candidate_commit_oid, worker_identity FROM stage_evidence
+           WHERE run_id = ? AND stage_id = ? AND evidence_sha256 IN (?, ?)`
+        ).all(input.runId, input.stageId, disposition.evidence_sha256, input.evidenceSha256) as Array<{
+          sequence: number
+          worker_identity: string
+          candidate_commit_oid: string
+          evidence_sha256: string
+        }>
+        const priorEvidence = candidates.find(
+          (row) => row.evidence_sha256 === disposition.evidence_sha256
+        )
+        const nextEvidence = candidates.find(
+          (row) => row.evidence_sha256 === input.evidenceSha256
+        )
+        if (disposition.disposition !== 'satisfied' ||
+            input.supersedesEvidenceSha256 !== disposition.evidence_sha256 ||
+            !priorEvidence || !nextEvidence || nextEvidence.sequence <= priorEvidence.sequence ||
+            !isAuthoritativeStageEvidence(nextEvidence.worker_identity) ||
+            nextEvidence.candidate_commit_oid !== input.checkpoint.outputCommitOid) {
+          throw new Error(`${input.stageId} is already settled with a different disposition`)
+        }
+        this.#db.prepare(
+          `INSERT INTO stage_disposition_supersessions
+             (run_id, stage_id, disposition, prior_evidence_sha256, evidence_sha256, recorded_at)
+           VALUES (?, ?, 'satisfied', ?, ?, ?)`
+        ).run(
+          input.runId,
+          input.stageId,
+          disposition.evidence_sha256,
+          input.evidenceSha256,
+          new Date().toISOString()
+        )
       }
       this.recordCheckpoint({ ...input.checkpoint, runId: input.runId, stageId: input.stageId })
       if (settlesDisposition && !disposition) {
@@ -5353,7 +5579,9 @@ export class DomainLedger {
       pullRequest?.receipt_sha256 !== manifest.pullRequestBindingReceiptSha256 ||
       pullRequest.candidate_commit_oid !== manifest.candidateCommitOid
     ) {
-      problems.push('pull-request-binding receipt')
+      problems.push(
+        `pull-request-binding receipt (receipt ${pullRequest?.receipt_sha256 ?? 'missing'} / candidate ${pullRequest?.candidate_commit_oid ?? 'missing'})`
+      )
     }
     for (const receipt of [publication, pullRequest]) {
       if (!receipt) continue
@@ -5375,7 +5603,8 @@ export class DomainLedger {
         problems.push(`${receipt.kind} receipt digest`)
       }
       if (!this.#remoteObservationMatches({
-        allowHistoricalAttempt: receipt.kind === 'candidate-publication',
+        allowHistoricalAttempt: receipt.kind === 'candidate-publication' ||
+          (receipt.kind === 'pull-request-binding' && payload.state === 'merged'),
         candidateCommitOid: receipt.candidate_commit_oid,
         kind: receipt.kind,
         observationSha256: receipt.authoritative_post_observation_sha256,
@@ -5386,11 +5615,18 @@ export class DomainLedger {
       }
       if (receipt.kind === 'pull-request-binding') {
         const hasManagedComment = Object.hasOwn(payload, 'managedCommentIntent')
+        const hasBody = Object.hasOwn(payload, 'bodySha256')
+        const hasTitle = Object.hasOwn(payload, 'titleSha256')
         const hasPipelineEvidenceRoot = Object.hasOwn(payload, 'pipelineEvidenceRoot')
-        if (hasManagedComment !== hasPipelineEvidenceRoot) {
+        if (
+          (hasManagedComment && hasBody) ||
+          hasBody !== hasTitle ||
+          ((hasManagedComment || hasBody) && !hasPipelineEvidenceRoot) ||
+          (!hasManagedComment && !hasBody && hasPipelineEvidenceRoot)
+        ) {
           problems.push('pull-request-binding receipt')
         }
-        if (hasPipelineEvidenceRoot && payload.pipelineEvidenceRoot !== manifest.pipelineEvidenceRoot) {
+        if (hasManagedComment && payload.pipelineEvidenceRoot !== manifest.pipelineEvidenceRoot) {
           problems.push('pipeline evidence root')
         }
       }
@@ -5655,6 +5891,41 @@ export class DomainLedger {
       .get(runId) as RunRecord | undefined
   }
 
+  branchIntents(repoRoot: string, branch: string, runId?: string): string[] {
+    const runs = this.#db
+      .prepare(
+        `SELECT run_id, intent FROM runs
+         WHERE repo_root = ? AND branch = ?
+         ORDER BY rowid`,
+      )
+      .all(repoRoot, branch) as Array<{
+        intent: string
+        run_id: string
+      }>
+    if (runs.length === 0) return []
+
+    const targetIndex = runId ? runs.findIndex((r) => r.run_id === runId) : -1
+    const limitIndex = targetIndex !== -1 ? targetIndex : runs.length
+
+    let boundaryIndex = 0
+    for (let i = 0; i < limitIndex; i++) {
+      const receipt = this.remoteReceipt(runs[i].run_id, 'pull-request-binding')
+      if (receipt) {
+        try {
+          const payload = JSON.parse(receipt.receipt_json) as { state?: unknown }
+          if (payload?.state === 'merged') {
+            boundaryIndex = i + 1
+          }
+        } catch {}
+      }
+    }
+    const sliceEnd = targetIndex !== -1 ? targetIndex + 1 : runs.length
+    if (boundaryIndex >= sliceEnd && sliceEnd > 0) {
+      boundaryIndex = sliceEnd - 1
+    }
+    return runs.slice(boundaryIndex, sliceEnd).map((row) => row.intent)
+  }
+
   listRuns(): { intent: string; run_id: string }[] {
     return this.#db.prepare('SELECT intent, run_id FROM runs ORDER BY created_at').all() as {
       intent: string
@@ -5679,7 +5950,7 @@ export class DomainLedger {
   listGateAudit(runId: string): GateAuditRow[] {
     return this.#db
       .prepare(
-        `SELECT decision, evidence_sha256, gate_id, stage_id, round_index, gate_kind, guidance, question, resolution,
+        `SELECT decision, evidence_sha256, gate_id, stage_id, round_index, gate_kind, guidance, options_json, question, resolution,
                 resolved_at, selected_finding_ids
          FROM gate_audit WHERE run_id = ? ORDER BY opened_at, rowid`
       )

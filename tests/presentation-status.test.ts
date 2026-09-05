@@ -385,6 +385,162 @@ test("ONM-88 tracks fixed, approved, open, and retained findings separately", ()
   }
 });
 
+test("changed findings do not inherit approval from an older matching ID", () => {
+  const ledger = new DomainLedger(":memory:");
+  try {
+    const runId = "changed-approved-finding";
+    startRun(ledger, runId);
+    const publisher = new PresentationPublisher(ledger, runId);
+    publisher.publish("findings:1", {
+      actionable: 1,
+      findings: [{ description: "Original issue", id: "same-id", severity: "error" }],
+      kind: "findings-recorded",
+      round: 0,
+      stage: "review",
+      total: 1,
+    });
+    publisher.publish("gate:1", {
+      decision: "approve",
+      gateId: "gate-1",
+      kind: "gate-resolved",
+      round: 0,
+      stage: "review",
+    });
+    publisher.publish("findings:2", {
+      actionable: 1,
+      findings: [{ description: "Changed issue", id: "same-id", severity: "error" }],
+      kind: "findings-recorded",
+      round: 1,
+      stage: "review",
+      total: 1,
+    });
+
+    const stage = publisher.current.stages.find((item) => item.id === "review");
+    assert.equal(stage?.openFindings, 1);
+    assert.equal(
+      stage?.findings?.find((finding) => finding.description === "Changed issue")?.disposition,
+      "open",
+    );
+  } finally {
+    ledger.close();
+  }
+});
+
+test("plain status binds fixer retries to their originating analysis", () => {
+  const ledger = new DomainLedger(":memory:");
+  const lines: string[] = [];
+  try {
+    const runId = "fixer-retry-labels";
+    startRun(ledger, runId);
+    const publisher = new PresentationPublisher(
+      ledger,
+      runId,
+      new PlainStatusRenderer({ write: (line) => lines.push(line) }),
+    );
+    publisher.publish("analysis-3", {
+      analysis: 3,
+      kind: "round-started",
+      role: "reviewer",
+      round: 2,
+      stage: "review",
+    });
+    publisher.publish("fix-3", {
+      analysis: 3,
+      fixAttempt: 0,
+      kind: "round-started",
+      role: "fixer",
+      round: 3,
+      stage: "review",
+    });
+    publisher.publish("fix-3-blocked", {
+      actionable: 1,
+      findings: [{ description: "Blocked fix", id: "blocked", severity: "error" }],
+      kind: "fix-blocked",
+      round: 3,
+      stage: "review",
+      total: 1,
+    });
+    const resumed = new PresentationPublisher(
+      ledger, runId, new PlainStatusRenderer({ write: (line) => lines.push(line) }),
+    );
+    resumed.publish("resume", { attempt: 2, kind: "attempt-started" });
+    assert.equal(resumed.current.stages.find((stage) => stage.id === "review")?.phase, "fixer");
+    assert.equal(resumed.current.stages.find((stage) => stage.id === "review")?.round, 3);
+    resumed.publish("fix-3-retry", {
+      analysis: 3,
+      kind: "round-started",
+      role: "fixer",
+      round: 4,
+      stage: "review",
+    });
+
+    assert.ok(lines.some((line) => line.includes("review fix 3 started")));
+    assert.ok(lines.some((line) => line.includes("review fix 3 blocked")));
+    assert.ok(lines.some((line) => line.includes("review fix 3 retry 1 started")));
+    assert.ok(lines.every((line) => !line.includes("review fix 4")));
+    assert.equal(resumed.current.stages.find((stage) => stage.id === "review")?.fixAttempt, 1);
+  } finally {
+    ledger.close();
+  }
+});
+
+test("targeted fixes preserve unselected findings as approved", () => {
+  const ledger = new DomainLedger(":memory:");
+  try {
+    const runId = "targeted-finding-dispositions";
+    startRun(ledger, runId);
+    const publisher = new PresentationPublisher(ledger, runId);
+    publisher.publish("findings", {
+      actionable: 2,
+      findings: [
+        { description: "Fix this", id: "fix-this", severity: "error" },
+        { description: "Accept this", id: "accept-this", severity: "warning" },
+      ],
+      kind: "findings-recorded",
+      round: 0,
+      stage: "review",
+      total: 2,
+    });
+    publisher.publish("gate:targeted-fix", {
+      decision: "fix",
+      gateId: "gate-review",
+      kind: "gate-resolved",
+      round: 0,
+      stage: "review",
+      targetFindingIds: ["fix-this"],
+    });
+
+    const stage = publisher.current.stages.find((item) => item.id === "review")!;
+    assert.deepEqual(
+      stage.findings?.map((finding) => [finding.id, finding.disposition]),
+      [
+        ["fix-this", "open"],
+        ["accept-this", "approved"],
+      ],
+    );
+    assert.deepEqual(
+      [stage.fixedFindings, stage.approvedFindings, stage.openFindings],
+      [0, 1, 1],
+    );
+    publisher.publish("fix:completed", {
+      approvedFindings: 1,
+      findingIds: ["fix-this"],
+      kind: "fix-completed",
+      round: 1,
+      stage: "review",
+      summary: "Applied the selected repair.",
+    });
+    const completed = publisher.current.stages.find((item) => item.id === "review")!;
+    assert.deepEqual(
+      [completed.fixedFindings, completed.approvedFindings, completed.openFindings],
+      [0, 1, 1],
+    );
+    assert.deepEqual(completed.fixSummaries, ["Applied the selected repair."]);
+  } finally {
+    ledger.close();
+  }
+});
+
 test("plain status uses stderr while structured result remains on stdout", () => {
   const moduleUrl = new URL("../scripts/presentation.ts", import.meta.url).href;
   const script = `

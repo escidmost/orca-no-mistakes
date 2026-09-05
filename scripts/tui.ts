@@ -122,6 +122,35 @@ function title(stage: StageName): string {
   return `${stage[0].toUpperCase()}${stage.slice(1)}`;
 }
 
+function analysisLabel(stageName: string, round: number): string {
+  return `${stageName} analysis ${round}`;
+}
+
+function fixPhaseLabel(analysis: number, fixAttempt = 0): string {
+  return `fix ${analysis}${fixAttempt > 0 ? ` retry ${fixAttempt}` : ""}`;
+}
+
+function analysisNumber(value: number | undefined, fallback: number): number {
+  return value !== undefined && value > 0 ? value : fallback;
+}
+
+function fixLabel(stageName: string, analysis: number, fixAttempt = 0): string {
+  return `${stageName} ${fixPhaseLabel(analysis, fixAttempt)}`;
+}
+
+function activityCount(value: number, label: string): string {
+  return `${value} ${label}`;
+}
+
+function activityResult(
+  prefix: string,
+  stageName: string,
+  round: number,
+  results: string[],
+): string {
+  return `${prefix.padEnd(analysisLabel(stageName, round).length)} · ${results.join(" · ")}`;
+}
+
 function printableText(text: string): string {
   let result = "";
   for (const character of text) {
@@ -231,7 +260,19 @@ export function supportsRailTui(
 }
 
 export class RailTuiRenderer implements PresentationRenderer {
-  readonly #activities: { at: string; label: string; stage?: StageName }[] = [];
+  readonly #activities: {
+    at: string;
+    fix?: {
+      analysis: number;
+      approvedFindings: number;
+      fixAttempt: number;
+      findingIds: readonly string[];
+      targetIndices?: readonly number[];
+      verified: boolean;
+    };
+    label: string;
+    stage?: StageName;
+  }[] = [];
   readonly #artifactsDir: string;
   readonly #input: Input;
   readonly #inputWasPaused: boolean;
@@ -439,6 +480,13 @@ export class RailTuiRenderer implements PresentationRenderer {
     }
   }
 
+  seed(snapshots: readonly PresentationSnapshot[]): void {
+    for (const snapshot of snapshots) {
+      const now = Date.parse(snapshot.updatedAt) || Date.now();
+      this.#logActivity(snapshot.transition, now, snapshot);
+    }
+  }
+
   #enterTerminal(): void {
     if (this.#closed || this.#terminalActive) return;
     this.#terminalActive = true;
@@ -572,14 +620,33 @@ export class RailTuiRenderer implements PresentationRenderer {
         }
         break;
 
+      case "stage-reopened":
+        this.#activities.push({
+          at: clock(now),
+          label: `${title(transition.stage)} reopened`,
+          stage,
+        });
+        break;
+
       case "round-started": {
         if (transition.stage === "intent" || transition.stage === "rebase") return;
         const stageName = title(transition.stage);
-        const roundNum = transition.round + 1;
+        const roundNum = transition.analysis ?? transition.round + 1;
 
         if (transition.role === "fixer") {
-          const fixPrefix = `${stageName} fix ${transition.round}`;
-          if (!this.#activities.some((a) => a.stage === stage && a.label.startsWith(fixPrefix))) {
+          const stageState = snapshot.stages.find((item) => item.id === transition.stage);
+          const fixAnalysis = analysisNumber(
+            transition.analysis ?? stageState?.analysis,
+            transition.round,
+          );
+          const fixAttempt = transition.fixAttempt ?? stageState?.fixAttempt ?? 0;
+          const fixPrefix = fixLabel(stageName, fixAnalysis, fixAttempt);
+          const decisionEntry = this.#activities.findLast(
+            (a) => a.stage === stage && a.label === `${stageName} fix`,
+          );
+          if (decisionEntry) {
+            decisionEntry.label = fixPrefix;
+          } else if (!this.#activities.some((a) => a.stage === stage && a.label.startsWith(fixPrefix))) {
             this.#activities.push({
               at: clock(now),
               label: fixPrefix,
@@ -589,55 +656,172 @@ export class RailTuiRenderer implements PresentationRenderer {
           break;
         }
 
-        if (roundNum > 1) {
-          const priorRoundPrefix = `${stageName} round ${roundNum - 1}`;
-          const priorFixPrefix = `${stageName} fix ${roundNum - 1}`;
-          const priorRoundHadFindings = this.#activities.some(
-            (a) => a.stage === stage && a.label.startsWith(priorRoundPrefix) && a.label.includes("found"),
-          );
-          const hasFix = this.#activities.some(
-            (a) => a.stage === stage && a.label.startsWith(priorFixPrefix),
-          );
-          if (priorRoundHadFindings && !hasFix) {
-            this.#activities.push({
-              at: clock(now),
-              label: priorFixPrefix,
-              stage,
-            });
-          }
-        }
         this.#activities.push({
           at: clock(now),
-          label: `${stageName} round ${roundNum}`,
+          label: analysisLabel(stageName, roundNum),
           stage,
         });
+        break;
+      }
+
+      case "fix-completed": {
+        const stageName = title(transition.stage);
+        const stageState = snapshot.stages.find((s) => s.id === transition.stage);
+        const fixAnalysis = analysisNumber(stageState?.analysis, transition.round);
+        const fixAttempt = stageState?.fixAttempt ?? 0;
+        const fixPrefix = fixLabel(stageName, fixAnalysis, fixAttempt);
+        const appliedLabel = transition.findingIds.length === 1 ? "fix applied" : "fixes applied";
+        const results = [activityCount(transition.findingIds.length, appliedLabel)];
+        if (transition.approvedFindings > 0) {
+          results.push(activityCount(transition.approvedFindings, "approved"));
+        }
+        const label = activityResult(
+          fixPrefix,
+          stageName,
+          fixAnalysis,
+          results,
+        );
+        const entry = this.#activities.findLast(
+          (activity) =>
+            activity.stage === stage &&
+            (activity.label === fixPrefix || activity.label === `${stageName} fix`),
+        );
+        const targetIndices: number[] = [];
+        if (stageState?.findings) {
+          const remainingIds = new Map<string, number>();
+          for (const id of transition.findingIds) {
+            remainingIds.set(id, (remainingIds.get(id) ?? 0) + 1);
+          }
+          for (let i = 0; i < stageState.findings.length; i++) {
+            const finding = stageState.findings[i];
+            const count = remainingIds.get(finding.id) ?? 0;
+            if (count > 0 && finding.disposition === "open") {
+              remainingIds.set(finding.id, count - 1);
+              targetIndices.push(i);
+            }
+          }
+        }
+        const fix = {
+          analysis: fixAnalysis,
+          approvedFindings: transition.approvedFindings,
+          fixAttempt,
+          findingIds: transition.findingIds,
+          targetIndices,
+          verified: false,
+        };
+        if (entry) {
+          entry.fix = fix;
+          entry.label = label;
+        } else {
+          this.#activities.push({ at: clock(now), fix, label, stage });
+        }
+        break;
+      }
+
+      case "fix-blocked": {
+        const stageName = title(transition.stage);
+        const stageState = snapshot.stages.find((item) => item.id === transition.stage);
+        const fixAnalysis = analysisNumber(stageState?.analysis, transition.round);
+        const fixAttempt = stageState?.fixAttempt ?? 0;
+        const fixPrefix = fixLabel(stageName, fixAnalysis, fixAttempt);
+        const entry = this.#activities.findLast(
+          (activity) =>
+            activity.stage === stage &&
+            (activity.label === fixPrefix || activity.label.startsWith(`${fixPrefix} `)),
+        );
+        if (entry) {
+          entry.label = activityResult(
+            fixPrefix,
+            stageName,
+            fixAnalysis,
+            ["blocked"],
+          );
+        }
         break;
       }
 
       case "findings-recorded": {
         if (transition.stage === "intent" || transition.stage === "rebase") return;
         const stageName = title(transition.stage);
-        const roundNum = transition.round + 1;
-        const roundPrefix = `${stageName} round ${roundNum}`;
-        const actionableCount = transition.actionable ?? transition.total;
-        const countText =
-          actionableCount > 0
-            ? `${actionableCount} found`
-            : "clean";
-
         const stageState = snapshot.stages.find((s) => s.id === transition.stage);
-        if (stageState?.fixedFindings) {
-          for (let i = this.#activities.length - 1; i >= 0; i--) {
-            const entry = this.#activities[i];
-            if (
-              entry.stage === transition.stage &&
-              entry.label.includes("fix") &&
-              !entry.label.includes("fixed")
-            ) {
-              entry.label = `${entry.label} · ${stageState.fixedFindings} fixed`;
-              break;
+        if (stageState?.phase === "fixer" && transition.analysis === undefined) {
+          return;
+        }
+        const roundNum = transition.analysis ?? stageState?.analysis ?? transition.round + 1;
+        const roundPrefix = analysisLabel(stageName, roundNum);
+        const actionableCount = stageState?.openFindings ?? transition.actionable ?? transition.total;
+        const breakdown = stageState?.analysisFindings;
+        const countText = roundNum > 1 && breakdown && actionableCount > 0
+          ? [
+              breakdown.new > 0 ? activityCount(breakdown.new, "new") : "",
+              breakdown.stillOpen > 0 ? activityCount(breakdown.stillOpen, "still open") : "",
+              breakdown.reopened > 0 ? activityCount(breakdown.reopened, "reopened") : "",
+            ].filter(Boolean).join(" · ")
+          : activityCount(actionableCount, "found");
+
+        const completedFix = this.#activities.findLast(
+          (activity) => activity.stage === transition.stage && activity.fix && !activity.fix.verified,
+        );
+        if (completedFix?.fix && stageState?.findings) {
+          let fixed = 0;
+          let open = 0;
+          if (completedFix.fix.targetIndices?.length) {
+            for (const idx of completedFix.fix.targetIndices) {
+              const finding = stageState.findings[idx];
+              if (!finding) continue;
+              if (finding.disposition === "fixed") fixed++;
+              else if (finding.disposition === "open") open++;
+            }
+          } else {
+            const remaining = new Map<string, number>();
+            for (const id of completedFix.fix.findingIds) {
+              remaining.set(id, (remaining.get(id) ?? 0) + 1);
+            }
+            for (const finding of stageState.findings) {
+              if (finding.disposition !== "fixed" && finding.disposition !== "open") continue;
+              const count = remaining.get(finding.id) ?? 0;
+              if (count === 0) continue;
+              remaining.set(finding.id, count - 1);
+              if (finding.disposition === "fixed") fixed++;
+              else if (finding.disposition === "open") open++;
             }
           }
+          const results = [];
+          if (fixed > 0) results.push(activityCount(fixed, "fixed"));
+          if (open > 0) results.push(activityCount(open, "still open"));
+          if (completedFix.fix.approvedFindings > 0) {
+            results.push(activityCount(completedFix.fix.approvedFindings, "approved"));
+          }
+          if (results.length === 0) {
+            results.push(activityCount(stageState.fixedFindings ?? 0, "fixed"));
+          }
+          completedFix.fix.verified = true;
+          completedFix.label = activityResult(
+            fixLabel(
+              stageName,
+              completedFix.fix.analysis,
+              completedFix.fix.fixAttempt,
+            ),
+            stageName,
+            completedFix.fix.analysis,
+            results,
+          );
+        } else if (completedFix?.fix && stageState?.fixedFindings) {
+          const results = [activityCount(stageState.fixedFindings, "fixed")];
+          if (completedFix.fix.approvedFindings > 0) {
+            results.push(activityCount(completedFix.fix.approvedFindings, "approved"));
+          }
+          completedFix.fix.verified = true;
+          completedFix.label = activityResult(
+            fixLabel(
+              stageName,
+              completedFix.fix.analysis,
+              completedFix.fix.fixAttempt,
+            ),
+            stageName,
+            completedFix.fix.analysis,
+            results,
+          );
         }
 
         if (
@@ -645,11 +829,11 @@ export class RailTuiRenderer implements PresentationRenderer {
           last.stage === transition.stage &&
           last.label === roundPrefix
         ) {
-          last.label = `${roundPrefix} · ${countText}`;
+          last.label = activityResult(roundPrefix, stageName, roundNum, [countText]);
         } else if (actionableCount > 0) {
           this.#activities.push({
             at: clock(now),
-            label: `${roundPrefix} · ${countText}`,
+            label: activityResult(roundPrefix, stageName, roundNum, [countText]),
             stage,
           });
         }
@@ -667,40 +851,21 @@ export class RailTuiRenderer implements PresentationRenderer {
         break;
 
       case "gate-resolved": {
-        const roundNum = (transition.round ?? 0) + 1;
         const stageName = title(transition.stage);
-        if (transition.decision === "fix") {
-          if (
-            last &&
-            last.stage === transition.stage &&
-            last.label.endsWith("decision needed")
-          ) {
-            last.label = `${stageName} fix ${roundNum}`;
-          } else {
-            this.#activities.push({
-              at: clock(now),
-              label: `${stageName} fix ${roundNum}`,
-              stage,
-            });
-          }
-        } else if (transition.decision === "approve") {
-          if (
-            last &&
-            last.stage === transition.stage &&
-            last.label.endsWith("decision needed")
-          ) {
-            last.label = `${stageName} approved`;
-          } else {
-            this.#activities.push({
-              at: clock(now),
-              label: `${stageName} approved`,
-              stage,
-            });
-          }
+        const decisionLabel =
+          transition.decision === "approve"
+            ? `${stageName} approved`
+            : `${stageName} ${transition.decision}`;
+        if (
+          last &&
+          last.stage === transition.stage &&
+          last.label.endsWith("decision needed")
+        ) {
+          last.label = decisionLabel;
         } else if (transition.decision) {
           this.#activities.push({
             at: clock(now),
-            label: `${stageName} ${transition.decision}`,
+            label: decisionLabel,
             stage,
           });
         }
@@ -711,12 +876,21 @@ export class RailTuiRenderer implements PresentationRenderer {
         if (
           last &&
           last.stage === transition.stage &&
-          last.label.includes("fix") &&
-          !last.label.includes("fixed")
+          last.fix &&
+          !last.fix.verified
         ) {
           const stageState = snapshot.stages.find((s) => s.id === transition.stage);
           if (stageState?.fixedFindings) {
-            last.label = `${last.label} · ${stageState.fixedFindings} fixed`;
+            const stageName = title(transition.stage);
+            const fixAnalysis = last.fix.analysis;
+            const fixAttempt = last.fix.fixAttempt;
+            last.label = activityResult(
+              fixLabel(stageName, fixAnalysis, fixAttempt),
+              stageName,
+              fixAnalysis,
+              [activityCount(stageState.fixedFindings, "fixed")],
+            );
+            last.fix.verified = true;
           }
         }
         const stageStatus = snapshot.stages.find((s) => s.id === transition.stage)?.status;
@@ -878,7 +1052,15 @@ export class RailTuiRenderer implements PresentationRenderer {
     const bodyRows = rows - 3;
     let body: string[];
     if (columns >= WIDE_COLUMNS) {
-      const rightWidth = columns - LEFT_WIDTH - this.#glyph.bar.length;
+      const activityWidth = Math.max(
+        0,
+        ...this.#activities.map((entry) => entry.label.length + entry.at.length + 3),
+      );
+      const leftWidth = Math.min(
+        Math.max(LEFT_WIDTH, Math.min(64, Math.floor(columns * 0.46)), activityWidth),
+        columns - this.#glyph.bar.length - LEFT_WIDTH,
+      );
+      const rightWidth = columns - leftWidth - this.#glyph.bar.length;
       const stages = this.#stages(now);
       const left = [
         ...stages,
@@ -890,7 +1072,7 @@ export class RailTuiRenderer implements PresentationRenderer {
       body = Array.from(
         { length: bodyRows },
         (_, index) =>
-          `${this.#paint(left[index] ?? {}, LEFT_WIDTH)}${bar}${this.#paint(right[index] ?? {}, rightWidth)}`,
+          `${this.#paint(left[index] ?? {}, leftWidth)}${bar}${this.#paint(right[index] ?? {}, rightWidth)}`,
       );
     } else if (this.#overlay()) {
       const all = this.#detail(bodyRows, columns, now);
@@ -999,8 +1181,8 @@ export class RailTuiRenderer implements PresentationRenderer {
         ],
         segs,
       },
-      width,
-    );
+      width - 2,
+    ) + "  ";
   }
 
   #badge(now: number): Seg {
@@ -1066,6 +1248,7 @@ export class RailTuiRenderer implements PresentationRenderer {
       const selected = index === this.#selectedStage;
       const total = state?.totalFindings ?? 0;
       const fixed = state?.fixedFindings ?? 0;
+      const approved = state?.approvedFindings ?? 0;
       const open = state?.openFindings ?? state?.actionableFindings ?? 0;
       const segs: Seg[] = [
         `${selected ? ">" : " "} `,
@@ -1074,11 +1257,16 @@ export class RailTuiRenderer implements PresentationRenderer {
         [title(stage).padEnd(8), status === "pending" ? SGR.dim : ""],
       ];
       if (state?.retainedFixer) {
-        segs.push(" ", ["retained", SGR.dim]);
+        segs.push(" ", ["fixer retained", SGR.dim]);
       }
       if (total > 0) {
+        const findings = [
+          activityCount(total, "found"),
+          activityCount(fixed, "fixed"),
+          ...(approved > 0 ? [activityCount(approved, "approved")] : []),
+        ];
         segs.push(" ", [
-          `${total} found${glyph.sep}${fixed} fixed`,
+          findings.join(glyph.sep),
           open > 0 ? SGR.amber : SGR.dim,
         ]);
       }
@@ -1157,8 +1345,8 @@ export class RailTuiRenderer implements PresentationRenderer {
     const roundLabel =
       state?.round !== undefined && status !== "pending"
         ? isFixing
-          ? `fix ${state.round}`
-          : `round ${state.round + 1}`
+          ? fixPhaseLabel(analysisNumber(state.analysis, state.round), state.fixAttempt)
+          : `analysis ${state.analysis ?? state.round + 1}`
         : "";
     const meta = [
       status === "pending" ? "" : status,
@@ -1233,7 +1421,7 @@ export class RailTuiRenderer implements PresentationRenderer {
       } else if (finding.disposition === "approved") {
         dispGlyph = glyph.approved;
         color = SGR.dim;
-      } else if (isFixing && isTargetFixing) {
+      } else if (isFixing && status === "active" && isTargetFixing) {
         dispGlyph = glyph.fixing;
         color = SGR.amber;
       } else {
@@ -1320,8 +1508,8 @@ export class RailTuiRenderer implements PresentationRenderer {
     const roundLabel =
       round !== undefined
         ? isFixing
-          ? `  fix ${round}`
-          : `  round ${round + 1}`
+          ? `  ${fixPhaseLabel(analysisNumber(state?.analysis, round), state?.fixAttempt)}`
+          : `  analysis ${state?.analysis ?? round + 1}`
         : "";
     const all = logTail(this.#artifactsDir, `${stage}_r${round}.log`, this.#stageLogs);
     const room = Math.max(0, rows - 1);
@@ -1347,13 +1535,23 @@ export class RailTuiRenderer implements PresentationRenderer {
     const options = gate.options ?? [];
     const choice = options[this.#gateChoice];
     const stage = gate.stage ?? this.#snapshot!.currentStage ?? "intent";
+    const stageState = this.#snapshot?.stages.find((item) => item.id === stage);
+    const gateLabel = this.#isFixingStage(stage, stageState)
+      ? fixPhaseLabel(
+          analysisNumber(
+            stageState?.analysis,
+            stageState?.round ?? gate.round ?? 1,
+          ),
+          stageState?.fixAttempt,
+        )
+      : `analysis ${stageState?.analysis ?? (gate.round ?? 0) + 1}`;
     const rows: Row[] = [
       { segs: ["  ", ["DECISION REQUIRED", `${SGR.amber};${SGR.bold}`]] },
       {
         segs: [
           "  ",
           [
-            `${title(stage)} round ${(gate.round ?? 0) + 1}${this.#glyph.sep}waiting ${elapsed(now - this.#gateOpenedAt)}`,
+            `${title(stage)} ${gateLabel}${this.#glyph.sep}waiting ${elapsed(now - this.#gateOpenedAt)}`,
             SGR.dim,
           ],
         ],
@@ -1824,6 +2022,14 @@ export function createRunRenderer(
         rail.render(snapshot);
       } catch (error) {
         switchToPlain(error, snapshot);
+      }
+    },
+    seed: (snapshots) => {
+      if (failed) return;
+      try {
+        rail.seed(snapshots);
+      } catch (error) {
+        switchToPlain(error);
       }
     },
   };

@@ -617,7 +617,7 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
 
   assert.match(result.runId, /^test-run-/);
   assert.deepEqual(result.steps, LEGACY_STAGE_PLAN);
-  assert.deepEqual(orca.completedStages, LEGACY_STAGE_PLAN);
+  assert.deepEqual(orca.completedStages, [...LEGACY_STAGE_PLAN, "document", "lint"]);
 
   const stageTasks = orca.tasks.slice(0, LEGACY_STAGE_PLAN.length);
   assert.equal(stageTasks.length, LEGACY_STAGE_PLAN.length);
@@ -794,9 +794,11 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
       ["document", 0],
       ["lint", 1],
       ["lint", 1],
+      ["document", 1],
+      ["lint", 2],
     ],
   );
-  for (const index of [0, 4, 5]) {
+  for (const index of [0, 4, 5, 8, 9]) {
     assert.equal(
       checkpoints[index].input_commit_oid,
       checkpoints[index].output_commit_oid,
@@ -808,7 +810,7 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
   }
   assert.ok(result.attestation);
   verifyManifest(result.attestation);
-  assert.equal(result.attestation.stageEvidence.length, 8);
+  assert.equal(result.attestation.stageEvidence.length, 10);
   assert.ok(git.calls.some((call) => call.startsWith("recover:")));
   assert.match(result.custodyNote ?? "", /carries the terminal commit/);
   assert.equal(
@@ -826,13 +828,13 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
         ? [snapshot.transition.stage]
         : [],
     ),
-    LEGACY_STAGE_PLAN,
+    [...LEGACY_STAGE_PLAN, "document", "lint"],
   );
   assert.equal(
     presentation.filter(
       (snapshot) => snapshot.transition.kind === "findings-recorded",
     ).length,
-    8,
+    10,
   );
   assert.deepEqual(presentation.at(-1)?.transition, {
     kind: "run-completed",
@@ -1637,6 +1639,7 @@ test("protected fixer commits are rejected at a resumable human gate", async () 
   allowReviewAutoFix(git);
   git.protectedTestMutation = "tests/existing.test.ts";
   const orca = new FakeOrca(git);
+  const ledger = new DomainLedger(":memory:");
   orca.gateResolution = "fix review-1";
   orca.reports.set("review", [
     {
@@ -1661,7 +1664,12 @@ test("protected fixer commits are rejected at a resumable human gate", async () 
     pass("clean rereview"),
   ]);
 
-  await runPipeline({ intent: "Protect existing assertions." }, orca, git);
+  const result = await runPipeline(
+    { intent: "Protect existing assertions." },
+    orca,
+    git,
+    ledger,
+  );
 
   assert.equal(orca.gates.length, 2);
   assert.match(orca.gates[0].question, /^\[guardrails: strict\] /);
@@ -1671,7 +1679,7 @@ test("protected fixer commits are rejected at a resumable human gate", async () 
     orca.gates[1].question,
     /fixer modified pre-existing test files: tests\/existing\.test\.ts/,
   );
-  assert.match(orca.gates[1].question, /"id":"review-2"/);
+  assert.doesNotMatch(orca.gates[1].question, /"id"\s*:\s*"review-2"/);
   assert.equal(
     orca.launches.filter((launch) => launch.role === "fixer").length,
     2,
@@ -1683,6 +1691,54 @@ test("protected fixer commits are rejected at a resumable human gate", async () 
     git.calls.filter((call) => call.startsWith("apply:/worktrees/")).length,
     1,
   );
+  const presentation = ledger.listPresentationSnapshots(result.runId);
+  assert.deepEqual(
+    presentation
+      .flatMap((snapshot) =>
+        snapshot.transition.kind === "round-started" &&
+        snapshot.transition.role === "reviewer" &&
+        snapshot.transition.stage === "review"
+          ? [snapshot.transition.analysis]
+          : [],
+      ),
+    [1, 2],
+  );
+  assert.deepEqual(
+    presentation.flatMap((snapshot) =>
+      snapshot.transition.kind === "round-started" &&
+      snapshot.transition.role === "fixer" &&
+      snapshot.transition.stage === "review"
+        ? [
+            {
+              analysis: snapshot.transition.analysis,
+              fixAttempt: snapshot.transition.fixAttempt,
+            },
+          ]
+        : [],
+    ),
+    [
+      { analysis: 1, fixAttempt: 0 },
+      { analysis: 1, fixAttempt: 1 },
+    ],
+  );
+  const blocked = presentation.find(
+    (snapshot) => snapshot.transition.kind === "fix-blocked",
+  );
+  assert.equal(blocked?.transition.kind, "fix-blocked");
+  assert.equal(blocked?.transition.total, 3);
+  assert.equal(blocked?.transition.actionable, 2);
+  const blockedStage = blocked?.stages.find((stage) => stage.id === "review");
+  assert.deepEqual(
+    [blockedStage?.totalFindings, blockedStage?.openFindings, blockedStage?.approvedFindings],
+    [3, 2, 1],
+  );
+  const completedFix = presentation.find(
+    (snapshot) => snapshot.transition.kind === "fix-completed" && snapshot.transition.round === 2,
+  );
+  assert.equal(completedFix?.transition.kind, "fix-completed");
+  assert.equal(completedFix?.transition.findingIds.length, 1);
+  assert.equal(completedFix?.transition.approvedFindings, 1);
+  ledger.close();
 });
 
 test("a policy-violation approval waives the authoritative worker evidence", async () => {
@@ -2358,6 +2414,27 @@ test("ONM-88 Auto-fix changes apply only to findings arriving after the toggle",
       .map((snapshot) => snapshot.mode.autoFix),
     [false, true],
   );
+  assert.deepEqual(
+    ledger
+      .listPresentationSnapshots(result.runId)
+      .filter(
+        (snapshot) =>
+          "stage" in snapshot.transition &&
+          snapshot.transition.stage === "review" &&
+          ["round-started", "fix-completed"].includes(snapshot.transition.kind),
+      )
+      .map((snapshot) => snapshot.transition.kind),
+    [
+      "round-started",
+      "round-started",
+      "fix-completed",
+      "round-started",
+      "round-started",
+      "fix-completed",
+      "round-started",
+    ],
+    "each applied fixer round must complete before the next analysis starts",
+  );
   assert.equal(ledger.listGateAudit(result.runId)[0]?.decision, "fix");
 });
 
@@ -2640,30 +2717,34 @@ test("reviewer context fails closed when the branch moves during collection", as
   );
 });
 
-test("malformed reviewer findings fail closed and still clean up the worker", async () => {
+test("malformed reviewer finding values get a contract-repair retry", async () => {
   const git = new FakeGit();
   const orca = new FakeOrca(git);
   orca.reports.set("review", [
     {
       findings: [
         {
-          id: "bad-severity",
-          severity: "critical",
-          action: "auto-fix",
+          id: "bad-action",
+          severity: "error",
+          action: "fix",
           description: "This report is outside the schema.",
         } as unknown as Finding,
       ],
       summary: "malformed",
     },
+    pass("review repaired"),
   ]);
 
-  await assert.rejects(
-    runPipeline({ intent: "Validate malformed reports." }, orca, git),
-    /review worker returned an invalid finding/,
-  );
+  await runPipeline({ intent: "Validate malformed reports." }, orca, git);
 
+  const reviewLaunches = orca.launches.filter(
+    (launch) => launch.role === "reviewer" && launch.stage === "review",
+  );
+  assert.equal(reviewLaunches.length, 2);
+  assert.match(reviewLaunches[1].prompt, /REPORT REPAIR/);
+  assert.match(reviewLaunches[1].prompt, /auto-fix\|ask-user\|no-op/);
   assert.ok(orca.calls.some((call) => call.startsWith("release:")));
-  assert.equal(orca.removedWorktrees.length, 1);
+  assert.ok(orca.removedWorktrees.length >= 2);
 });
 
 test("a schema-invalid reviewer report gets one contract-repair retry", async () => {
@@ -2811,23 +2892,21 @@ test("reviewer artifacts must exist under the run evidence directory", async () 
     },
   ]);
 
-  await assert.rejects(
-    runPipeline({ intent: "Confine reviewer evidence." }, orca, git),
-    /review worker returned an unsafe artifact path/,
-  );
+  await runPipeline({ intent: "Confine reviewer evidence." }, orca, git);
+  const unsafeLaunches = orca.launches.filter((launch) => launch.stage === "review");
+  assert.equal(unsafeLaunches.length, 2);
+  assert.match(unsafeLaunches[1].prompt, /REPORT REPAIR/);
   assert.ok(orca.calls.some((call) => call.startsWith("release:")));
-  assert.equal(orca.removedWorktrees.length, 1);
 
   const missingOrca = new FakeOrca(git);
   missingOrca.reports.set("review", [
     { findings: [], summary: "missing evidence", artifacts: ["missing.log"] },
   ]);
-  await assert.rejects(
-    runPipeline({ intent: "Require reviewer evidence." }, missingOrca, git),
-    /review worker returned a missing artifact/,
-  );
+  await runPipeline({ intent: "Require reviewer evidence." }, missingOrca, git);
+  const missingLaunches = missingOrca.launches.filter((launch) => launch.stage === "review");
+  assert.equal(missingLaunches.length, 2);
+  assert.match(missingLaunches[1].prompt, /REPORT REPAIR/);
   assert.ok(missingOrca.calls.some((call) => call.startsWith("release:")));
-  assert.equal(missingOrca.removedWorktrees.length, 1);
 });
 
 test("reviewer URL references are not treated as local artifacts", async () => {
@@ -3377,6 +3456,11 @@ console.log(JSON.stringify({ result }))
       "passed",
       "Run completed-run passed all 6 stages. Candidate commit: abc123.",
     );
+    await orca.notifyPullRequestReady(
+      42,
+      "ONM-42: publish complete report",
+      "https://github.com/owner/repo/pull/42",
+    );
 
     const calls = (await readFile(callsPath, "utf8"))
       .trim()
@@ -3401,6 +3485,18 @@ console.log(JSON.stringify({ result }))
     assert.ok(
       wake?.some((value) => value.includes("Report this result to the user")),
     );
+    const readySent = calls.find(
+      (args) => args.includes("orca-no-mistakes pull request #42 ready"),
+    );
+    const readyWake = calls.find(
+      (args) => args.some((value) => value.includes("Notify the user now")),
+    );
+    assert.ok(
+      readySent?.some((value) =>
+        value.includes("https://github.com/owner/repo/pull/42"),
+      ),
+    );
+    assert.ok(readyWake?.includes("--enter"));
   } finally {
     if (previousHandle === undefined) delete process.env.ORCA_TERMINAL_HANDLE;
     else process.env.ORCA_TERMINAL_HANDLE = previousHandle;
@@ -3944,6 +4040,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
       { type: 'heartbeat', body: 'malformed stale heartbeat', payload: '{not-json' },
       { type: 'heartbeat', body: 'non-object stale heartbeat', payload: 'null' },
       { type: 'heartbeat', body: 'stale fixer heartbeat', payload: JSON.stringify({ taskId: 'task-stale', dispatchId: 'dispatch-stale' }) },
+      { type: 'heartbeat', body: 'malformed active heartbeat', payload: JSON.stringify({ dispatchId: 'dispatch-review' }) },
       { type: 'heartbeat', body: 'still reviewing', payload: JSON.stringify({ taskId: 'task-review', dispatchId: 'dispatch-review' }) }
     ] })
   } else {
@@ -9125,7 +9222,7 @@ test("an unreadable worker report gets one contract-repair retry", async () => {
 
   assert.equal(outcome.worker.report.summary, "review");
   assert.equal(orca.tasks.length, 2);
-  assert.match(orca.launches[1].prompt, /Create the parent directory if needed\./);
+  assert.match(orca.launches[1].prompt, /\/bin\/orca-no-mistakes' report --stage review --role reviewer/);
 });
 
 test("report repair preserves the selected fallback launch", async () => {

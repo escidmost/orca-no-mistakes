@@ -21,12 +21,21 @@ export type PresentationFinding = {
   severity: "error" | "info" | "warning";
 };
 
+export type FixRecord = {
+  analysis: number;
+  fixAttempt?: number;
+  summary: string;
+};
+
 export type PresentationTransition =
   | { kind: "run-started" }
   | { attempt: number; kind: "attempt-started" }
   | { enabled: boolean; kind: "mode-changed"; source?: "initial" | "operator" }
   | { kind: "stage-started"; stage: StageName }
+  | { kind: "stage-reopened"; stage: StageName }
   | {
+      analysis?: number;
+      fixAttempt?: number;
       kind: "round-started";
       role?: "fixer" | "reviewer";
       round: number;
@@ -34,6 +43,25 @@ export type PresentationTransition =
       targetFindingIds?: readonly string[];
     }
   | {
+      analysis?: number;
+      approvedFindings: number;
+      findingIds: readonly string[];
+      fixAttempt?: number;
+      kind: "fix-completed";
+      round: number;
+      stage: StageName;
+      summary?: string;
+    }
+  | {
+      actionable: number;
+      findings: readonly Omit<PresentationFinding, "disposition">[];
+      kind: "fix-blocked";
+      round: number;
+      stage: StageName;
+      total: number;
+    }
+  | {
+      analysis?: number;
       actionable: number;
       findings?: readonly Omit<PresentationFinding, "disposition">[];
       kind: "findings-recorded";
@@ -88,8 +116,13 @@ export type PresentationSnapshot = {
   sequence: number;
   stages: readonly {
     actionableFindings: number;
+    analysis?: number;
+    analysisFindings?: { new: number; stillOpen: number; reopened: number };
     approvedFindings?: number;
     findings?: readonly PresentationFinding[];
+    fixRecords?: readonly FixRecord[];
+    fixSummaries?: readonly string[];
+    fixAttempt?: number;
     fixedFindings?: number;
     id: StageName;
     openFindings?: number;
@@ -117,6 +150,7 @@ export interface PresentationStore {
 
 export interface PresentationRenderer {
   render(snapshot: PresentationSnapshot): void;
+  seed?(snapshots: readonly PresentationSnapshot[]): void;
 }
 
 function initialSnapshot(
@@ -130,8 +164,11 @@ function initialSnapshot(
     sequence: 0,
     stages: stages.map((id) => ({
       actionableFindings: 0,
+      analysis: 0,
       approvedFindings: 0,
       findings: [],
+      fixRecords: [],
+      fixSummaries: [],
       fixedFindings: 0,
       id,
       openFindings: 0,
@@ -156,33 +193,129 @@ function updateStage(
   );
 }
 
+function isExactFindingMatch(
+  prev: PresentationFinding,
+  curr: Omit<PresentationFinding, "disposition">,
+): boolean {
+  return (
+    prev.id === curr.id &&
+    prev.description === curr.description &&
+    prev.severity === curr.severity &&
+    prev.file === curr.file &&
+    prev.line === curr.line
+  );
+}
+
 function updateFindings(
   previous: readonly PresentationFinding[],
   current: readonly Omit<PresentationFinding, "disposition">[],
+  options?: { inheritApproval?: boolean },
 ): PresentationFinding[] {
-  const pending = new Map<string, Omit<PresentationFinding, "disposition">[]>();
-  for (const finding of current) {
-    const queue = pending.get(finding.id);
-    if (queue) queue.push(finding);
-    else pending.set(finding.id, [finding]);
+  const inheritApproval = options?.inheritApproval ?? true;
+  const matchedInPrevious = new Map<
+    number,
+    Omit<PresentationFinding, "disposition">
+  >();
+  const usedCurrent = new Set<number>();
+
+  for (let ci = 0; ci < current.length; ci++) {
+    const curr = current[ci];
+    let matchIndex = -1;
+    for (let pi = 0; pi < previous.length; pi++) {
+      if (
+        !matchedInPrevious.has(pi) &&
+        previous[pi].disposition === "open" &&
+        isExactFindingMatch(previous[pi], curr)
+      ) {
+        matchIndex = pi;
+        break;
+      }
+    }
+    if (matchIndex === -1 && inheritApproval) {
+      for (let pi = 0; pi < previous.length; pi++) {
+        if (
+          !matchedInPrevious.has(pi) &&
+          previous[pi].disposition !== "open" &&
+          isExactFindingMatch(previous[pi], curr)
+        ) {
+          matchIndex = pi;
+          break;
+        }
+      }
+    }
+    if (matchIndex !== -1) {
+      matchedInPrevious.set(matchIndex, curr);
+      usedCurrent.add(ci);
+    }
   }
-  const next = previous.map((finding) => {
-    const reported = pending.get(finding.id)?.shift();
+
+  for (let ci = 0; ci < current.length; ci++) {
+    if (usedCurrent.has(ci)) continue;
+    const curr = current[ci];
+    let matchIndex = -1;
+    for (let pi = 0; pi < previous.length; pi++) {
+      if (
+        !matchedInPrevious.has(pi) &&
+        previous[pi].disposition === "open" &&
+        previous[pi].id === curr.id
+      ) {
+        matchIndex = pi;
+        break;
+      }
+    }
+    if (matchIndex === -1) {
+      matchIndex = previous.findIndex((prev, pi) =>
+        !matchedInPrevious.has(pi) && prev.disposition === "fixed" && prev.id === curr.id,
+      );
+    }
+    if (matchIndex !== -1) {
+      matchedInPrevious.set(matchIndex, curr);
+      usedCurrent.add(ci);
+    }
+  }
+
+  const next = previous.map((prev, pi) => {
+    const reported = matchedInPrevious.get(pi);
     if (reported) {
-      if (pending.get(finding.id)?.length === 0) pending.delete(finding.id);
+      if (prev.disposition === "approved" && inheritApproval) {
+        return { ...reported, disposition: "approved" as const };
+      }
       return { ...reported, disposition: "open" as const };
     }
-    return finding.disposition === "open"
-      ? { ...finding, disposition: "fixed" as const }
+    return prev.disposition === "open" && inheritApproval
+      ? { ...prev, disposition: "fixed" as const }
+      : prev;
+  });
+
+  const remaining: PresentationFinding[] = [];
+  for (let ci = 0; ci < current.length; ci++) {
+    if (!usedCurrent.has(ci)) {
+      remaining.push({ ...current[ci], disposition: "open" as const });
+    }
+  }
+
+  return [...next, ...remaining];
+}
+
+function updateSelectedFindings(
+  findings: readonly PresentationFinding[],
+  selectedIds: readonly string[],
+  selectedDisposition: PresentationFinding["disposition"],
+  unselectedDisposition?: PresentationFinding["disposition"],
+): PresentationFinding[] {
+  const remaining = new Map<string, number>();
+  for (const id of selectedIds) remaining.set(id, (remaining.get(id) ?? 0) + 1);
+  return findings.map((finding) => {
+    if (finding.disposition !== "open") return finding;
+    const count = remaining.get(finding.id) ?? 0;
+    if (count > 0) {
+      remaining.set(finding.id, count - 1);
+      return { ...finding, disposition: selectedDisposition };
+    }
+    return unselectedDisposition
+      ? { ...finding, disposition: unselectedDisposition }
       : finding;
   });
-  return [
-    ...next,
-    ...[...pending.values()].flat().map((finding) => ({
-      ...finding,
-      disposition: "open" as const,
-    })),
-  ];
 }
 
 function nextSnapshot(
@@ -210,8 +343,8 @@ function nextSnapshot(
         gate: undefined,
         stages: next.stages.map((stage) => ({
           ...stage,
-          phase: stage.status === "passed" ? stage.phase : undefined,
-          round: stage.status === "passed" ? stage.round : 0,
+          phase: stage.status === "passed" || stage.fixAttempt !== undefined ? stage.phase : undefined,
+          round: stage.status === "passed" || stage.fixAttempt !== undefined ? stage.round : 0,
           status: stage.status === "passed" ? "passed" : "pending",
           targetFindingIds:
             stage.status === "passed" ? stage.targetFindingIds : undefined,
@@ -231,12 +364,58 @@ function nextSnapshot(
         stages: updateStage(next, transition.stage, { status: "active" }),
       };
       break;
-    case "round-started":
+    case "stage-reopened": {
+      const stage = next.stages.find((item) => item.id === transition.stage);
+      const invalidatedFindings = stage?.findings?.map((f) =>
+        f.disposition === "approved" ? { ...f, disposition: "open" as const } : f,
+      );
+      const fixed = invalidatedFindings?.filter((f) => f.disposition === "fixed").length ?? 0;
+      const open = invalidatedFindings?.filter((f) => f.disposition === "open").length ?? 0;
+      next = {
+        ...next,
+        currentStage: transition.stage,
+        error: undefined,
+        gate: undefined,
+        stages: updateStage(next, transition.stage, {
+          actionableFindings: open,
+          analysisFindings: undefined,
+          approvedFindings: 0,
+          findings: invalidatedFindings,
+          fixAttempt: undefined,
+          fixRecords: stage?.fixRecords,
+          fixSummaries: stage?.fixSummaries,
+          fixedFindings: fixed > 0 ? fixed : (stage?.fixedFindings ?? 0),
+          openFindings: open,
+          phase: undefined,
+          status: "active",
+          targetFindingIds: undefined,
+          totalFindings: stage?.totalFindings ?? (invalidatedFindings?.length ?? 0),
+        }),
+      };
+      break;
+    }
+    case "round-started": {
+      const stage = next.stages.find((item) => item.id === transition.stage);
       next = {
         ...next,
         currentStage: transition.stage,
         stages: updateStage(next, transition.stage, {
           phase: transition.role,
+          ...(transition.role === "reviewer"
+            ? {
+                analysis: transition.analysis ?? (stage?.analysis ?? 0) + 1,
+                fixAttempt: undefined,
+              }
+            : {
+                analysis:
+                  transition.analysis ??
+                  (stage?.analysis && stage.analysis > 0
+                    ? stage.analysis
+                    : transition.round),
+                fixAttempt:
+                  transition.fixAttempt ??
+                  (stage?.fixAttempt !== undefined ? stage.fixAttempt + 1 : 0),
+              }),
           round: transition.round,
           status: "active",
           ...(transition.targetFindingIds !== undefined
@@ -247,12 +426,110 @@ function nextSnapshot(
         }),
       };
       break;
+    }
+    case "fix-completed": {
+      const stage = next.stages.find((item) => item.id === transition.stage);
+      const fixAnalysis =
+        transition.analysis ??
+        (stage?.analysis && stage.analysis > 0
+          ? stage.analysis
+          : transition.round);
+      const fixAttempt = transition.fixAttempt ?? stage?.fixAttempt ?? 0;
+      const summary = transition.summary?.trim();
+      const newRecord: FixRecord | undefined = summary
+        ? { analysis: fixAnalysis, fixAttempt, summary }
+        : undefined;
+      next = {
+        ...next,
+        currentStage: transition.stage,
+        stages: updateStage(next, transition.stage, {
+          phase: "fixer",
+          round: transition.round,
+          status: "active",
+          ...(summary
+            ? {
+                fixRecords: [
+                  ...(stage?.fixRecords ?? []),
+                  newRecord!,
+                ],
+                fixSummaries: [
+                  ...(stage?.fixSummaries ?? []),
+                  summary,
+                ],
+              }
+            : {}),
+          targetFindingIds: undefined,
+        }),
+      };
+      break;
+    }
+    case "fix-blocked": {
+      const stage = next.stages.find((item) => item.id === transition.stage);
+      const isCoordinatorBlocker = (
+        finding: PresentationFinding | Omit<PresentationFinding, "disposition">,
+      ) =>
+        (finding.id === "fixer-no-change" || finding.id === "fixer-policy-violation") &&
+        finding.file === undefined &&
+        finding.line === undefined &&
+        finding.severity === "error";
+
+      const priorFindings = (stage?.findings ?? []).filter((prev) => {
+        if (
+          prev.disposition === "open" &&
+          isCoordinatorBlocker(prev) &&
+          !transition.findings.some(
+            (curr) => isCoordinatorBlocker(curr) && curr.id === prev.id,
+          )
+        ) {
+          return false;
+        }
+        return true;
+      });
+      const findings = updateFindings(priorFindings, transition.findings, {
+        inheritApproval: false,
+      });
+      const fixed = findings.filter((finding) => finding.disposition === "fixed").length;
+      const approved = findings.filter(
+        (finding) => finding.disposition === "approved",
+      ).length;
+      const open = findings.filter((finding) => finding.disposition === "open").length;
+      next = {
+        ...next,
+        currentStage: transition.stage,
+        stages: updateStage(next, transition.stage, {
+          actionableFindings: open,
+          approvedFindings: approved,
+          findings,
+          fixedFindings: fixed,
+          openFindings: open,
+          phase: "fixer",
+          round: transition.round,
+          status: "blocked",
+          targetFindingIds: undefined,
+          totalFindings: findings.length,
+        }),
+      };
+      break;
+    }
     case "findings-recorded":
       {
         const stage = next.stages.find((item) => item.id === transition.stage);
         const findings = transition.findings
           ? updateFindings(stage?.findings ?? [], transition.findings)
           : undefined;
+        const analysisFindings = findings && stage?.findings
+          ? { new: 0, stillOpen: 0, reopened: 0 }
+          : undefined;
+        if (analysisFindings) {
+          // Reconciliation retains previous occurrence indices and appends new ones.
+          findings!.forEach((finding, index) => {
+            if (finding.disposition !== "open") return;
+            const prior = stage?.findings?.[index];
+            if (!prior) analysisFindings.new++;
+            else if (prior.disposition === "fixed") analysisFindings.reopened++;
+            else analysisFindings.stillOpen++;
+          });
+        }
         const fixed = findings?.filter((finding) => finding.disposition === "fixed").length;
         const approved = findings?.filter(
           (finding) => finding.disposition === "approved",
@@ -266,6 +543,10 @@ function nextSnapshot(
             ? {
                 ...item,
                 actionableFindings: open ?? transition.actionable,
+                analysisFindings,
+                ...(transition.analysis !== undefined
+                  ? { analysis: transition.analysis }
+                  : {}),
                 approvedFindings: approved,
                 findings,
                 fixedFindings: fixed,
@@ -313,6 +594,13 @@ function nextSnapshot(
                 ? { ...finding, disposition: "approved" as const }
                 : finding,
             )
+          : transition.decision === "fix" && transition.targetFindingIds
+            ? updateSelectedFindings(
+                stage?.findings ?? [],
+                transition.targetFindingIds,
+                "open",
+                "approved",
+              )
           : stage?.findings;
       next = {
         ...next,
@@ -424,6 +712,9 @@ export class PresentationPublisher {
     this.#current = snapshots.at(-1) ?? initialSnapshot(runId, stages);
     this.#fallbackRenderer = fallbackRenderer;
     this.#renderer = renderer;
+    if (snapshots.length > 0 && renderer?.seed) {
+      renderer.seed(snapshots);
+    }
   }
 
   get current(): PresentationSnapshot {
@@ -448,6 +739,10 @@ export class PresentationPublisher {
           try {
             this.#renderer = fallback();
             this.#rendererFailed = false;
+            const history = this.store.listPresentationSnapshots(this.runId);
+            if (history.length > 0 && this.#renderer?.seed) {
+              this.#renderer.seed(history);
+            }
           } catch (fallbackError) {
             this.onRendererError(fallbackError);
           }
@@ -537,8 +832,34 @@ export class PlainStatusRenderer implements PresentationRenderer {
       case "stage-started":
         line = `${prefix} stage ${stageNumber}/${snapshot.stages.length} ${event.stage} started`;
         break;
+      case "stage-reopened":
+        line = `${prefix} ${event.stage} reopened for a changed candidate`;
+        break;
       case "round-started":
-        line = `${prefix} ${event.stage} round ${event.round} started`;
+        {
+          const stage = snapshot.stages.find((item) => item.id === event.stage);
+          const analysis =
+            (stage?.analysis ?? event.analysis ?? 0) > 0
+              ? (stage?.analysis ?? event.analysis)!
+              : event.round;
+          line = event.role === "fixer"
+            ? `${prefix} ${event.stage} fix ${analysis}${(stage?.fixAttempt ?? event.fixAttempt ?? 0) > 0 ? ` retry ${stage?.fixAttempt ?? event.fixAttempt}` : ""} started`
+            : `${prefix} ${event.stage} analysis ${event.analysis ?? stage?.analysis ?? event.round + 1} started`;
+        }
+        break;
+      case "fix-completed":
+        {
+          const stage = snapshot.stages.find((item) => item.id === event.stage);
+          const analysis = stage?.analysis && stage.analysis > 0 ? stage.analysis : event.round;
+          line = `${prefix} ${event.stage} fix ${analysis}${(stage?.fixAttempt ?? 0) > 0 ? ` retry ${stage?.fixAttempt}` : ""} completed applied=${event.findingIds.length} approved=${event.approvedFindings}`;
+        }
+        break;
+      case "fix-blocked":
+        {
+          const stage = snapshot.stages.find((item) => item.id === event.stage);
+          const analysis = stage?.analysis && stage.analysis > 0 ? stage.analysis : event.round;
+          line = `${prefix} ${event.stage} fix ${analysis}${(stage?.fixAttempt ?? 0) > 0 ? ` retry ${stage?.fixAttempt}` : ""} blocked open=${event.actionable}`;
+        }
         break;
       case "findings-recorded":
         {

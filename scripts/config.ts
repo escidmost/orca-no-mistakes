@@ -527,7 +527,7 @@ defaults:
 # Stage-Specific Overrides
 # ------------------------------------------------------------------------------
 # Supported stages: intent, rebase, review, test, document, lint, push, pr.
-# push and pr are coordinator-owned remote stages; agent settings do not apply.
+# Only push is a coordinator-owned remote stage; agent settings do not apply. pr configures the drafting reviewer.
 # stages:
 #   intent:
 #     agent: "claude"

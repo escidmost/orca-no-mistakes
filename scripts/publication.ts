@@ -9,6 +9,7 @@ import {
   finalContiguousCheckpointByStage,
   gateAuditMatchesEvidence,
   isAuthoritativeStageEvidence,
+  isCandidateReachable,
   sha256,
   type DomainLedger
 } from './ledger.ts'
@@ -165,7 +166,7 @@ async function requireStoredRepositoryIdentity(
   }
 }
 
-function terminalCandidate(
+export function terminalCandidate(
   ledger: DomainLedger,
   runId: string,
   verifyRetainedArtifacts = true
@@ -181,17 +182,24 @@ function terminalCandidate(
   }
 
   const dispositions = new Map(ledger.stageDispositions(runId).map((row) => [row.stage_id, row]))
-  const finalCheckpoint = finalContiguousCheckpointByStage(
-    plan.slice(0, pushIndex).map((stage) => stage.stage_id),
-    ledger.listCheckpoints(runId),
-    run.submission_commit_oid
-  )
   const evidenceByDigest = new Map(
     ledger.listEvidence(runId).map((row) => [row.evidence_sha256, row])
+  )
+  const checkpoints = ledger.listCheckpoints(runId)
+  const finalCheckpoint = finalContiguousCheckpointByStage(
+    plan.slice(0, pushIndex).map((stage) => stage.stage_id),
+    checkpoints,
+    run.submission_commit_oid,
+    Array.from(dispositions.entries()).map(([stageId, disp]) => {
+      const ev = disp.evidence_sha256 ? evidenceByDigest.get(disp.evidence_sha256) : undefined
+      return ev ? { stage_id: stageId, candidate_commit_oid: ev.candidate_commit_oid, round_index: ev.round_index } : undefined
+    }).filter(Boolean) as any
   )
   const gateAudits = ledger.listGateAudit(runId)
 
   let candidate = run.submission_commit_oid
+  let currentCandidate: string | undefined = run.submission_commit_oid
+  let lastCheckpointIndex = -1
   for (const stage of plan.slice(0, pushIndex)) {
     const disposition = dispositions.get(stage.stage_id)
     if (!disposition) throw new CandidatePublicationError(`stage ${stage.stage_id} has no terminal disposition`)
@@ -208,6 +216,26 @@ function terminalCandidate(
       continue
     }
     if (!final) {
+      throw new CandidatePublicationError(
+        `stage ${stage.stage_id} does not extend the contiguous candidate chain`
+      )
+    }
+    const finalIndex = checkpoints.findIndex(
+      (cp) =>
+        cp === final ||
+        (cp.stage_id === final.stage_id &&
+          cp.round_index === final.round_index &&
+          cp.input_commit_oid === final.input_commit_oid &&
+          cp.output_commit_oid === final.output_commit_oid)
+    )
+    const connecting = checkpoints.slice(
+      lastCheckpointIndex + 1,
+      finalIndex >= 0 ? finalIndex : 0
+    )
+    if (
+      currentCandidate !== undefined &&
+      !isCandidateReachable(currentCandidate, final.input_commit_oid, connecting)
+    ) {
       throw new CandidatePublicationError(
         `stage ${stage.stage_id} does not extend the contiguous candidate chain`
       )
@@ -246,6 +274,31 @@ function terminalCandidate(
       )
     }
     candidate = final.output_commit_oid
+    currentCandidate = final.output_commit_oid
+    lastCheckpointIndex = finalIndex
+  }
+
+  for (const stage of plan.slice(0, pushIndex)) {
+    const disposition = dispositions.get(stage.stage_id)
+    if (disposition?.disposition !== 'satisfied' || !disposition.evidence_sha256) continue
+    const evidence = evidenceByDigest.get(disposition.evidence_sha256)
+    if (!evidence) continue
+    const approved = gateAudits.some(
+      (audit) =>
+        audit.resolved_at !== null &&
+        (audit.decision === 'approve' || audit.decision === 'skip') &&
+        gateAuditMatchesEvidence(
+          audit,
+          evidence.stage_id,
+          evidence.round_index,
+          evidence.evidence_sha256
+        )
+    )
+    if (approved && evidence.candidate_commit_oid !== candidate) {
+      throw new CandidatePublicationError(
+        `satisfied stage ${stage.stage_id} does not bind successful authoritative evidence`
+      )
+    }
   }
 
   if (!OID_PATTERN.test(candidate)) {

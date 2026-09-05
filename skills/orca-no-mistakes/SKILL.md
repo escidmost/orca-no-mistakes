@@ -10,7 +10,7 @@ Drive the implemented `orca-no-mistakes` CLI. It runs the eight validation and d
 
 `intent -> rebase -> review -> test -> document -> lint -> push -> pr`
 
-The default Release 2 run validates candidate changes, publishes them to GitHub, binds or creates a pull request, and records durable receipts. Success produces a v2 completion attestation manifest (`completionAttestation`) bound to the validated commit. Migrated Release 1 runs preserve their six local validation stages without remote publication.
+The default Release 2 run validates candidate changes, publishes them to GitHub, publishes the owned title/body report, notifies the origin of readiness, remains active while the pull request is open, and settles the receipt only after an authoritative matching MERGED observation. Success produces a v2 completion attestation manifest (`completionAttestation`) bound to the validated commit. Migrated Release 1 runs preserve their six local validation stages without remote publication.
 
 If your assigned task explicitly says you are already a no-mistakes stage worker, complete only that stage and return its structured report. Do not start a nested pipeline.
 
@@ -51,7 +51,8 @@ Finding-gate choices are `approve`, `fix`, `skip`, and `stop`. Durable resume-ga
 A `fix` resolution supports targeted finding selection and global guidance:
 
 - Plain text syntax: `fix: id1, id2: guidance` or `fix [id1,id2] - guidance`.
-- Resolving with `fix` without IDs targets all actionable findings. Unselected findings are evaluated in subsequent re-review passes.
+- Resolving with `fix` without IDs targets all actionable findings. When explicit IDs are selected, unselected open findings are immediately approved for the current candidate rather than deferred (see [Findings and gates](../../docs/current-architecture.md#findings-and-gates)).
+- Before sending explicit IDs, escalate every actionable `ask-user` finding, including any you intend to leave unselected. Obtain an explicit fix or approve-as-is decision for each; do not send a targeted resolution while any such decision is outstanding. Omitting an `ask-user` ID is an approval, not a way to defer its decision.
 - Copy IDs exactly from the gate question. If none of the supplied IDs match a reported finding, the run stops with `<stage> fix gate resolved with no matching findings`.
 - Single-word guidance following `fix` without brackets (e.g. `fix urgently`) is parsed as a finding ID candidate and can fail closed if no such finding exists. For global guidance across all findings, use bracket syntax (e.g. `fix [] - urgently`) or multi-word text (e.g. `fix please handle urgently`).
 

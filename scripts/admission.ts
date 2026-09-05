@@ -216,7 +216,8 @@ export function sanitizeCoordinatorEnvironment(
 
 export async function initializeLocalGate(
   repoPath: string,
-  executablePath: string
+  executablePath: string,
+  options: { allowLinkedWorktree?: boolean } = {}
 ): Promise<GateMetadata> {
   const paths = repositoryGatePaths(repoPath)
   const gateExisted = existsSync(paths.gatePath)
@@ -230,6 +231,7 @@ export async function initializeLocalGate(
     '--get-all',
     `remote.${GATE_REMOTE_NAME}.pushurl`
   ])
+  let effectiveRepoRoot = paths.repoRoot
   if (metadataExisted) {
     let recordedRoot: string | undefined
     try {
@@ -243,9 +245,16 @@ export async function initializeLocalGate(
       path.resolve(recordedRoot) !== path.resolve(paths.repoRoot) &&
       existsSync(recordedRoot)
     ) {
-      throw new Error(
-        `the local gate is routed to ${recordedRoot}; initialize it from that worktree to keep one repository-wide route`
-      )
+      const isLinkedWorktree =
+        Boolean(options.allowLinkedWorktree) &&
+        repositoryGatePaths(recordedRoot).commonDir === paths.commonDir
+      if (isLinkedWorktree) {
+        effectiveRepoRoot = path.resolve(recordedRoot)
+      } else {
+        throw new Error(
+          `the local gate is routed to ${recordedRoot}; initialize it from that worktree to keep one repository-wide route`
+        )
+      }
     }
   }
   try {
@@ -301,16 +310,41 @@ export async function initializeLocalGate(
     }
     const metadata: GateMetadata = {
       ...paths,
-      defaultBranch: detectDefaultBranch(paths.repoRoot),
+      defaultBranch: detectDefaultBranch(effectiveRepoRoot),
       gateIdentity: deriveFallbackGateIdentity(paths),
       hookVersion: 1,
       remoteName: GATE_REMOTE_NAME,
+      repoRoot: effectiveRepoRoot,
       version: 1
     }
     await writeAtomic(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, 0o600)
+    let hookExecutable = executablePath
+    if (effectiveRepoRoot !== path.resolve(paths.repoRoot)) {
+      const hookPath = path.join(paths.gatePath, 'hooks', 'pre-receive')
+      let preservedExecutable: string | undefined
+      if (existsSync(hookPath)) {
+        try {
+          const content = await readFile(hookPath, 'utf8')
+          const match = /exec\s+(?:'([^']+)'|"([^"]+)"|(\S+))\s+gate\s+admit/u.exec(content)
+          const extracted = match ? (match[1] ?? match[2] ?? match[3]) : undefined
+          if (extracted && existsSync(extracted)) {
+            preservedExecutable = extracted
+          }
+        } catch {}
+      }
+      if (preservedExecutable) {
+        hookExecutable = preservedExecutable
+      } else {
+        const relative = path.relative(paths.repoRoot, executablePath)
+        const resolved = path.resolve(effectiveRepoRoot, relative)
+        if (existsSync(resolved)) {
+          hookExecutable = resolved
+        }
+      }
+    }
     await writeAtomic(
       path.join(paths.gatePath, 'hooks', 'pre-receive'),
-      managedHook(executablePath, paths.gatePath),
+      managedHook(hookExecutable, paths.gatePath),
       0o755
     )
     return metadata
