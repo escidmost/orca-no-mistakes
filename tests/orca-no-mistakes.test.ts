@@ -3506,6 +3506,7 @@ console.log(JSON.stringify({ result }))
 
 test("runPipeline notifies Orca when stopped on a resumable error awaiting resume", async () => {
   const git = new FakeGit();
+  let requestResumeWhenReady: (() => void) | undefined;
   class CrashingReviewerOrca extends FakeOrca {
     notified: { outcome: string; summary: string }[] = [];
     attempts = 0;
@@ -3541,6 +3542,7 @@ test("runPipeline notifies Orca when stopped on a resumable error awaiting resum
       if (gateId === "gate-resume") {
         return await new Promise((resolve) => {
           this.#resolveResumeGate = resolve;
+          queueMicrotask(() => requestResumeWhenReady?.());
         });
       }
       return await super.waitForGate(gateId);
@@ -3585,12 +3587,12 @@ test("runPipeline notifies Orca when stopped on a resumable error awaiting resum
         onResumeAvailable,
       ) => {
         onResumeAvailable?.();
-        setTimeout(() => {
+        requestResumeWhenReady = () => {
           if (!resumeTriggered) {
             resumeTriggered = true;
             requestResume?.();
           }
-        }, 50);
+        };
         return {
           close() {},
           render() {},

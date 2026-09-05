@@ -391,7 +391,7 @@ if (process.env.TUI_FIXTURE === "1") {
     renderer.close();
   });
 
-  test("ONM-88 shows finding dispositions and toggles Auto-fix without settling a gate", async () => {
+  test("finding gates reserve A for approval and toggle Auto-fix from the rail", async () => {
     const input = new FakeInput();
     const output = new FakeOutput();
     output.columns = 140;
@@ -442,10 +442,10 @@ if (process.env.TUI_FIXTURE === "1") {
     assert.match(screen, /Review\s+fixer retained\s+4 found .*2 fixed/u);
     assert.match(screen, /1 approved/u);
     assert.match(screen, /Lint/u);
-    assert.match(screen, /A Auto-fix/iu);
+    assert.match(screen, /F\/A fix\/approve/iu);
     input.emit("data", "A");
     await new Promise((resolve) => setImmediate(resolve));
-    assert.deepEqual(toggles, [true]);
+    assert.deepEqual(toggles, []);
     assert.deepEqual(resolutions, []);
 
     input.emit("data", "\u001b");
@@ -455,6 +455,11 @@ if (process.env.TUI_FIXTURE === "1") {
     const summaryScreen = cleanScreen(output.writes.at(-1) ?? "");
     assert.match(summaryScreen, /1 open/u);
     assert.match(summaryScreen, /1 approved/u);
+    assert.match(summaryScreen, /A Auto-fix/iu);
+    input.emit("data", "A");
+    await nextDraw();
+    assert.deepEqual(toggles, [true]);
+    assert.deepEqual(resolutions, []);
     renderer.close();
   });
 

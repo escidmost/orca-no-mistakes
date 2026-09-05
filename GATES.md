@@ -1,28 +1,36 @@
-# Gates: ONM-80 Bind Pull Requests and Settle Remote Runs
+# Gates: ONM-93 TUI usability
 
-OWNS: scripts/**, tests/**, docs/**, templates/config.yaml, GATES.md
+OWNS: scripts/tui.ts, tests/**, docs/**, README.md, GATES.md
 
-Scope: New direct and gate runs execute and recover the complete Release 2 publication and pull-request flow with exact durable evidence.
+Scope: Independent finding decisions in the Run TUI, verified locally and delivered through Orca No-Mistakes and CodeRabbit.
 
-- [ ] G0: this ledger states outcome checks that can fail
-  CHECK: node /Users/host/.agents/skills/unlazy/scripts/gate-lint.mjs GATES.md
-  EXPECT: LINT OK
-  EVIDENCE: pending
+- [x] G1: Operators can choose Fix or Approve for individual open findings and submit one canonical decision
+  CHECK: node --test tests/tui*.test.ts > /tmp/onm-93-tui-tests.log 2>&1 && node -e "console.log('finding decision verification passed')"
+  EXPECT: finding decision verification passed
+  EVIDENCE: automatic-evidence=v1; definition-sha256=4312f84241634c6191eb4680e120162a23a3adca5b74d94837fcb36625669bd7; exit=0; EXPECT=matched; output-sha256=dc99c141b449f5c46adfd50764161065df700004f5f094eb5375350b2d7243d6; output-bytes=37; shell=/bin/sh; cwd=/Users/host/repo/orca-no-mistakes/.orca/workspaces/onm-93-tui-usability; path=22fbc48c8e9e/40 entries
 
-- [ ] G1: Release 2 pull-request publication and settlement behavior passes focused tests
-  CHECK: node --test tests/github-authority.test.ts tests/candidate-publication.test.ts tests/pull-request-binding.test.ts tests/pull-request-route-facts.test.ts tests/pipeline-release-2-integration.test.ts tests/pipeline-completion-attestation.test.ts tests/presentation-plan-stages.test.ts tests/release-2-ledger-model.test.ts tests/resume-interactive-retry-and-worker-drain.test.ts tests/pipeline-completion-base-and-diagnostic-settlement.test.ts tests/pipeline-publication-passed-outcome-journal.test.ts tests/resume-final-checkpoint-chain-and-approval.test.ts tests/ledger-fact-order-and-resume-frozen-plan.test.ts tests/pull-request-complete-report-and-body-budget.test.ts tests/pull-request-update-reconciliation-and-approved-resume.test.ts tests/pipeline-passed-settlement-marker-refresh-failure.test.ts tests/ledger-authoritative-evidence-and-pull-request-root.test.ts tests/admission-direct-run-route-prerequisite.test.ts tests/ledger-resume-pull-request-receipt-upgrade.test.ts tests/ledger-resolved-intent-migration-and-terminal-fence.test.ts tests/gate-child-lineage-and-resume-notification.test.ts tests/publication-route-snapshot-and-forge-neutral-init.test.ts tests/pull-request-binding-reconciliation-and-artifact-safety.test.ts tests/pull-request-resume-published-content.test.ts tests/pull-request-artifact-hardlinks-and-update-races.test.ts tests/pull-request-title-resume-and-checkpoint-snapshots.test.ts tests/pull-request-untrusted-html-containment.test.ts tests/pull-request-reverification-and-content-budget.test.ts && node -e "console.log('release 2 focused verification passed')"
-  EXPECT: release 2 focused verification passed
-  EVIDENCE: pending
-
-- [ ] G2: the complete TypeScript project typechecks
+- [x] G2: TypeScript project typechecks
   CHECK: npm run typecheck && node -e "console.log('typecheck verification passed')"
   EXPECT: typecheck verification passed
-  EVIDENCE: pending
+  EVIDENCE: automatic-evidence=v1; definition-sha256=3bc48c288b10f22ca8a5117c21b0ea5718b83c8f6bc62922cb9d78fa89608faf; exit=0; EXPECT=matched; output-sha256=a426ef3f522e707297d02b63c25b7b52e67838f7d7c8fe151ad013e82828b8a5; output-bytes=82; shell=/bin/sh; cwd=/Users/host/repo/orca-no-mistakes/.orca/workspaces/onm-93-tui-usability; path=22fbc48c8e9e/40 entries
 
-- [ ] G3: the complete regression suite passes
-  CHECK: npm test && node -e "console.log('full regression verification passed')"
+- [x] G3: Full regression suite passes
+  CHECK: npm test > /tmp/onm-93-full-tests.log 2>&1 && node -e "console.log('full regression verification passed')"
   EXPECT: full regression verification passed
-  EVIDENCE: pending
+  EVIDENCE: automatic-evidence=v1; definition-sha256=86326e2dc2848d8458a8f4ab0295e5c75b8a0041b56b99a24edd5868e450d2af; exit=0; EXPECT=matched; output-sha256=b3312093ec9eb7690d53672c0c92fafa73b4ce510f418d483bedf27ca5600b14; output-bytes=36; shell=/bin/sh; cwd=/Users/host/repo/orca-no-mistakes/.orca/workspaces/onm-93-tui-usability; path=22fbc48c8e9e/40 entries
 
-- [ ] G4: the pull request has the ONM-80 prefix and CodeRabbit reports no issues
-  EVIDENCE: pending
+- [x] G4: Local changes pass available whitespace and ledger lint checks
+  CHECK: git diff --check && node /Users/host/.agents/skills/unlazy/scripts/gate-lint.mjs GATES.md
+  EXPECT: LINT OK
+  EVIDENCE: automatic-evidence=v1; definition-sha256=559f4bf13c5614172139732e5975431e9d1588da6499be1cdaf4fc95f9649d53; exit=0; EXPECT=matched; output-sha256=68079f8fc1098b623ff7e741fa0e7a108cb392e737bc65ecccfeaea7c392f379; output-bytes=569; shell=/bin/sh; cwd=/Users/host/repo/orca-no-mistakes/.orca/workspaces/onm-93-tui-usability; path=22fbc48c8e9e/40 entries
+
+Complexity review: shared finding rendering replaces duplication; canonical selective-fix protocol is reused. No dependencies or configuration added. No configured code linter exists in package.json or repository configuration.
+
+- [x] G5: Exactly one local CodeRabbit review is assessed and valid findings are fixed and tested
+  EVIDENCE: coderabbit review --base main --agent completed once without a timeout on 1ecf56a; one finding at scripts/tui.ts:1850 partially confirmed and repaired by clearing stale retry errors before confirmation. Regression assertion added; local review will not be rerun.
+
+- [x] G6: Worktree-local Orca No-Mistakes gate delivers the committed changes and creates the PR
+  EVIDENCE: Worktree-local gate published 6e677cfda91265ca41f9e11cf72d5cbed78ec495 to PR https://github.com/Filamess/orca-no-mistakes/pull/65; review, test, document, lint and push stages passed, and GitHub test check passed. Pipeline later stopped with user approval after the direct review-fix push advanced the PR beyond its bound head; recovery ref refs/no-mistakes/recover/run_fc76d98e2ca0 is preserved.
+
+- [x] G7: PR title starts with ONM-93 and remote CodeRabbit review reports no issues after one request per cycle
+  EVIDENCE: PR 65 has the ONM-93 title prefix. CodeRabbit cycle two approved e4c7f83b77d0bbf60a9e176882c1e1a72a744b75 with no actionable comments, all five pre-merge checks passed, and the sole finding resolved. Exactly one request was sent per remote cycle. GitHub test passed. GATES.md is excluded from CodeRabbit review.

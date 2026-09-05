@@ -11,6 +11,7 @@ import {
 import {
   PlainStatusRenderer,
   type GateResolver,
+  type PresentationFinding,
   type PresentationRenderer,
   type PresentationSnapshot,
   type PresentationTransition,
@@ -307,6 +308,8 @@ export class RailTuiRenderer implements PresentationRenderer {
   #focus: Region = "rail";
   #gateChoice = 0;
   #gateConfirm = false;
+  #gateDecisions = new Map<string, "fix" | "approve">();
+  #gateScrollToChoice = false;
   #gateMessage?: string;
   #gateOpenedAt = 0;
   #gateReturn?: GateReturnState;
@@ -560,6 +563,9 @@ export class RailTuiRenderer implements PresentationRenderer {
       selectedStage: this.#selectedStage,
     };
     this.#gateChoice = 0;
+    this.#gateDecisions.clear();
+    this.#gateScrollToChoice = true;
+    this.#detailOffset = 0;
     this.#gateConfirm = false;
     this.#gateMessage = undefined;
     this.#gateSubmitting = false;
@@ -992,7 +998,15 @@ export class RailTuiRenderer implements PresentationRenderer {
 
   #submitGate(): void {
     const gate = this.#snapshot?.gate;
-    const resolution = gate?.options?.[this.#gateChoice];
+    const findings = this.#gateFindings();
+    const findingIds = [...new Set(findings
+      .filter((finding) => this.#gateDecisions.get(finding.id) === "fix")
+      .map((finding) => finding.id))];
+    const resolution = findings.length > 0
+      ? findingIds.length > 0
+        ? JSON.stringify({ action: "fix", findingIds })
+        : "approve"
+      : gate?.options?.[this.#gateChoice];
     if (!gate || gate.state !== "open" || !resolution) return;
     if (!this.#resolveGate) {
       this.#gateConfirm = false;
@@ -1433,66 +1447,78 @@ export class RailTuiRenderer implements PresentationRenderer {
               ? SGR.amber
               : SGR.accent;
       }
-      const head = `  ${dispGlyph} `;
-      const idWidth = 24;
-      const idLines = wrap(finding.id, idWidth);
-      const location = finding.file
-        ? safeText(
-            `${finding.file}${finding.line ? `:${finding.line}` : ""}`,
-            120,
-          )
-        : "";
+      rows.push(...this.#findingRows(finding, width, dispGlyph, color));
+    }
+    return rows;
+  }
 
-      const stack = width - (head.length + idWidth + 2) < 16;
-      if (stack) {
-        for (let i = 0; i < idLines.length; i++) {
-          if (i === 0) {
-            rows.push({
-              segs: ["  ", [dispGlyph, color], " ", [idLines[i] ?? "", SGR.bold]],
-            });
-          } else {
-            rows.push({
-              segs: [" ".repeat(head.length), [idLines[i] ?? "", SGR.bold]],
-            });
-          }
-        }
-        const descIndent = " ".repeat(head.length);
-        const descLines = wrap(finding.description, Math.max(8, width - descIndent.length));
-        for (const descLine of descLines) {
-          rows.push({ segs: [descIndent, descLine] });
-        }
-        if (location) {
-          rows.push({ segs: [descIndent, [location, SGR.dim]] });
-        }
-      } else {
-        const indent = " ".repeat(head.length + idWidth + 2);
-        const descLines = wrap(finding.description, width - indent.length);
-        const lineCount = Math.max(idLines.length, descLines.length);
+  /** Render the same wrapped description and location in summaries and decision panels. */
+  #findingRows(
+    finding: PresentationFinding,
+    width: number,
+    dispGlyph: string,
+    color: string,
+  ): Row[] {
+    const rows: Row[] = [];
+    const head = `  ${dispGlyph} `;
+    const idWidth = 24;
+    const idLines = wrap(finding.id, idWidth);
+    const location = finding.file
+      ? safeText(
+          `${finding.file}${finding.line ? `:${finding.line}` : ""}`,
+          120,
+        )
+      : "";
 
-        for (let i = 0; i < lineCount; i++) {
-          const idPart = (idLines[i] ?? "").padEnd(idWidth);
-          const descPart = descLines[i] ?? "";
-          if (i === 0) {
-            rows.push({
-              segs: ["  ", [dispGlyph, color], " ", [idPart, SGR.bold], "  ", descPart],
-            });
-          } else {
-            rows.push({
-              segs: [" ".repeat(head.length), [idPart, SGR.bold], "  ", descPart],
-            });
-          }
+    const stack = width - (head.length + idWidth + 2) < 16;
+    if (stack) {
+      for (let i = 0; i < idLines.length; i++) {
+        if (i === 0) {
+          rows.push({
+            segs: ["  ", [dispGlyph, color], " ", [idLines[i] ?? "", SGR.bold]],
+          });
+        } else {
+          rows.push({
+            segs: [" ".repeat(head.length), [idLines[i] ?? "", SGR.bold]],
+          });
         }
-        if (location) {
-          const last = rows[rows.length - 1];
-          const used = (last?.segs ?? []).reduce(
-            (sum, seg) => sum + (typeof seg === "string" ? seg : seg[0]).length,
-            0,
-          );
-          if (last && used + location.length + 2 <= width) {
-            last.right = [[location, SGR.dim]];
-          } else {
-            rows.push({ segs: [indent, [location, SGR.dim]] });
-          }
+      }
+      const descIndent = " ".repeat(head.length);
+      const descLines = wrap(finding.description, Math.max(8, width - descIndent.length));
+      for (const descLine of descLines) {
+        rows.push({ segs: [descIndent, descLine] });
+      }
+      if (location) {
+        rows.push({ segs: [descIndent, [location, SGR.dim]] });
+      }
+    } else {
+      const indent = " ".repeat(head.length + idWidth + 2);
+      const descLines = wrap(finding.description, width - indent.length);
+      const lineCount = Math.max(idLines.length, descLines.length);
+
+      for (let i = 0; i < lineCount; i++) {
+        const idPart = (idLines[i] ?? "").padEnd(idWidth);
+        const descPart = descLines[i] ?? "";
+        if (i === 0) {
+          rows.push({
+            segs: ["  ", [dispGlyph, color], " ", [idPart, SGR.bold], "  ", descPart],
+          });
+        } else {
+          rows.push({
+            segs: [" ".repeat(head.length), [idPart, SGR.bold], "  ", descPart],
+          });
+        }
+      }
+      if (location) {
+        const last = rows[rows.length - 1];
+        const used = (last?.segs ?? []).reduce(
+          (sum, seg) => sum + (typeof seg === "string" ? seg : seg[0]).length,
+          0,
+        );
+        if (last && used + location.length + 2 <= width) {
+          last.right = [[location, SGR.dim]];
+        } else {
+          rows.push({ segs: [indent, [location, SGR.dim]] });
         }
       }
     }
@@ -1529,6 +1555,14 @@ export class RailTuiRenderer implements PresentationRenderer {
     ];
   }
 
+  /** Only gates offering both choices can use the per-finding decision editor. */
+  #gateFindings(): readonly PresentationFinding[] {
+    const gate = this.#snapshot?.gate;
+    if (gate?.state !== "open" || !gate.options?.includes("fix") || !gate.options.includes("approve")) return [];
+    return this.#snapshot?.stages.find((stage) => stage.id === gate.stage)
+      ?.findings?.filter((finding) => finding.disposition === "open") ?? [];
+  }
+
   #gatePanel(width: number, now: number): Row[] {
     const gate = this.#snapshot?.gate;
     if (!gate) return [];
@@ -1545,6 +1579,39 @@ export class RailTuiRenderer implements PresentationRenderer {
           stageState?.fixAttempt,
         )
       : `analysis ${stageState?.analysis ?? (gate.round ?? 0) + 1}`;
+    const findings = this.#gateFindings();
+    if (findings.length > 0) {
+      const undecided = findings.filter((finding) => !this.#gateDecisions.has(finding.id)).length;
+      const fixes = findings.filter((finding) => this.#gateDecisions.get(finding.id) === "fix").length;
+      const status = this.#gateMessage ?? (this.#gateConfirm
+        ? `Confirm ${fixes} fix, ${findings.length - fixes} approve? Enter again.`
+        : `${undecided} undecided. Choose F or A for each finding.`);
+      const rows: Row[] = [
+        { segs: ["  ", ["DECISION REQUIRED", `${SGR.amber};${SGR.bold}`]] },
+        { segs: ["  ", [`${title(stage)} ${gateLabel}${this.#glyph.sep}waiting ${elapsed(now - this.#gateOpenedAt)}`, SGR.dim]] },
+        ...wrap(status, width - 2).map((line) => ({ segs: ["  ", [line, SGR.amber] as Seg] })),
+        {},
+      ];
+      for (const [index, finding] of findings.entries()) {
+        const selected = index === this.#gateChoice;
+        if (selected && this.#gateScrollToChoice) {
+          this.#detailOffset = index === 0 ? 0 : rows.length;
+          this.#gateScrollToChoice = false;
+        }
+        const decision = this.#gateDecisions.get(finding.id);
+        rows.push({
+          bar: selected ? SGR.reverse : undefined,
+          segs: [`${selected ? ">" : " "} ${index + 1}/${findings.length}  ${decision === "fix" ? "Fix" : decision === "approve" ? "Approve as is" : "Undecided"}`],
+        });
+        rows.push(...this.#findingRows(finding, width, this.#glyph.open,
+          finding.severity === "error" ? SGR.red : SGR.amber));
+        if (findings.filter((item) => item.id === finding.id).length > 1) {
+          rows.push({ segs: ["  Choice applies to all findings with this ID."] });
+        }
+        rows.push({});
+      }
+      return rows;
+    }
     const rows: Row[] = [
       { segs: ["  ", ["DECISION REQUIRED", `${SGR.amber};${SGR.bold}`]] },
       {
@@ -1672,14 +1739,16 @@ export class RailTuiRenderer implements PresentationRenderer {
       hints.push(["Enter", "confirm cancel"], ["Esc", "keep running"]);
     } else if (this.#gateVisible) {
       if (this.#gateSubmitting) hints.push(["", "Waiting for gate settlement"]);
-      else {
+      else if (this.#gateFindings().length > 0) {
+        hints.push([arrows, "finding"], ["F/A", "fix/approve"], ["Enter", "confirm"], ["PgUp/Dn", "scroll"], ["Esc", "back"]);
+      } else {
         hints.push(
           [arrows, "choose"],
           ["Enter", isNarrow ? "select" : "select/confirm"],
           ["Esc", isNarrow ? "back" : "return unanswered"],
         );
       }
-      if (this.#setAutoFix) hints.push(["A", "auto-fix"]);
+      if (this.#setAutoFix && this.#gateFindings().length === 0) hints.push(["A", "auto-fix"]);
       hints.push(["C", "cancel"]);
     } else if (this.#snapshot?.error) {
       if (this.#snapshot.error.resumable && this.#requestResume && this.#resumeVisible) {
@@ -1728,7 +1797,7 @@ export class RailTuiRenderer implements PresentationRenderer {
     const keys =
       complete.match(
         new RegExp(
-          "\\x1b\\[[0-?]*[ -/]*[@-~]|\\x1bO[@-~]|\\x1b\\][^\\x00-\\x1f]*(?:\\x07|\\x1b\\\\)|\\x1b\\][^\\x00-\\x1f]*|\\x1b[P_^][^\\x00-\\x1f]*\\x1b\\\\|\\x1b[P_^][^\\x00-\\x1f]*|\\x03|\\x1a|\\r|\\n|\\t|\\x1b|[aAcCgGrR]",
+          "\\x1b\\[[0-?]*[ -/]*[@-~]|\\x1bO[@-~]|\\x1b\\][^\\x00-\\x1f]*(?:\\x07|\\x1b\\\\)|\\x1b\\][^\\x00-\\x1f]*|\\x1b[P_^][^\\x00-\\x1f]*\\x1b\\\\|\\x1b[P_^][^\\x00-\\x1f]*|\\x03|\\x1a|\\r|\\n|\\t|\\x1b|[aAcCfFgGrR]",
           "g",
         ),
       ) ?? [];
@@ -1753,7 +1822,7 @@ export class RailTuiRenderer implements PresentationRenderer {
         return;
       } else if (key === "c" || key === "C") {
         this.#cancelVisible = true;
-      } else if (key === "a" || key === "A") {
+      } else if ((key === "a" || key === "A") && !(this.#gateVisible && this.#gateFindings().length > 0)) {
         this.#toggleAutoFix();
       } else if (
         (key === "r" || key === "R") &&
@@ -1764,11 +1833,24 @@ export class RailTuiRenderer implements PresentationRenderer {
         this.#activities.push({ at: clock(Date.now()), label: "Resume requested" });
         this.#requestResume();
       } else if (this.#gateVisible) {
-        if (key === "\u001b" && !this.#gateSubmitting) {
+        const findings = this.#gateFindings();
+        if (findings.length > 0 && !this.#gateSubmitting && /^[fFaA]$/u.test(key)) {
+          this.#gateDecisions.set(findings[this.#gateChoice].id, key.toLowerCase() === "f" ? "fix" : "approve");
+          this.#gateConfirm = false;
+          this.#gateMessage = undefined;
+        } else if (findings.length > 0 && (key === "\u001b[5~" || key === "\u001b[6~")) {
+          this.#detailOffset += key === "\u001b[5~" ? -5 : 5;
+        } else if (key === "\u001b" && !this.#gateSubmitting) {
           this.#leaveGate();
         } else if (!this.#gateSubmitting && (key === "\r" || key === "\n")) {
-          if (this.#gateConfirm) this.#submitGate();
+          this.#gateScrollToChoice = false;
+          if (findings.some((finding) => !this.#gateDecisions.has(finding.id))) {
+            this.#gateMessage = "Choose Fix or Approve for every finding first.";
+            this.#detailOffset = 0;
+          } else if (this.#gateConfirm) this.#submitGate();
           else {
+            this.#detailOffset = 0;
+            this.#gateMessage = undefined;
             this.#gateConfirm = true;
             break;
           }
@@ -1780,11 +1862,12 @@ export class RailTuiRenderer implements PresentationRenderer {
             key === "\u001b[C")
         ) {
           const direction = key === "\u001b[A" || key === "\u001b[D" ? -1 : 1;
-          const count = this.#snapshot?.gate?.options?.length ?? 0;
+          const count = findings.length || (this.#snapshot?.gate?.options?.length ?? 0);
           this.#gateChoice = Math.max(
             0,
             Math.min(count - 1, this.#gateChoice + direction),
           );
+          this.#gateScrollToChoice = true;
           this.#gateConfirm = false;
           this.#gateMessage = undefined;
         }
