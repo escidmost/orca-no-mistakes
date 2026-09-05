@@ -300,6 +300,15 @@ test("approved fixer-no-change stages bind worker evidence durably", async (t) =
       reviewDisposition.evidence_sha256,
       diagnosticRow.evidence_sha256,
     );
+    assert.ok(
+      ledger
+        .listGateAudit(runId)
+        .some(
+          (audit) =>
+            audit.decision === "approve" &&
+            audit.evidence_sha256 === diagnosticRow.evidence_sha256,
+        ),
+    );
 
     await installAbortReaping({ pid: process.pid });
     const resumed = new ChainOrca("orchestration-resume");

@@ -2488,6 +2488,7 @@ export async function runPipeline(
     }
     const submissionCommitOid = ledger.run(runId)!.submission_commit_oid;
     const latestEvidenceByStage = new Map<StageName, StageEvidenceRow>();
+    const latestAuthoritativeEvidenceByStage = new Map<StageName, StageEvidenceRow>();
     const priorRoundByStage = new Map<StageName, number>();
     for (const entry of priorEvidence) {
       if (
@@ -2498,6 +2499,9 @@ export async function runPipeline(
       ) {
         const stage = entry.stage_id as StageName;
         latestEvidenceByStage.set(stage, entry);
+        if (isAuthoritativeStageEvidence(entry.worker_identity)) {
+          latestAuthoritativeEvidenceByStage.set(stage, entry);
+        }
         priorRoundByStage.set(
           stage,
           Math.max(priorRoundByStage.get(stage) ?? 0, entry.round_index),
@@ -2579,9 +2583,11 @@ export async function runPipeline(
       }
       for (const stage of pipelineSteps.slice(0, resumeStageIndex)) {
         const evidence = latestEvidenceByStage.get(stage)!;
+        const settlementEvidence =
+          latestAuthoritativeEvidenceByStage.get(stage) ?? evidence;
         const approval = resolvedApprovalAudit(stage, evidence);
         const checkpointMatches = contiguousCheckpoints.has(
-          `${stage}:${evidence.round_index}:${evidence.candidate_commit_oid}`,
+          `${stage}:${settlementEvidence.round_index}:${settlementEvidence.candidate_commit_oid}`,
         );
         const dispositions = ledger.stageDispositions(runId);
         const hasDisposition = dispositions.some(
@@ -2600,21 +2606,21 @@ export async function runPipeline(
             {
               checkpoint: {
                 inputCommitOid: checkpointCandidate,
-                outputCommitOid: evidence.candidate_commit_oid,
-                roundIndex: evidence.round_index,
+                outputCommitOid: settlementEvidence.candidate_commit_oid,
+                roundIndex: settlementEvidence.round_index,
               },
-              evidenceSha256: evidence.evidence_sha256,
+              evidenceSha256: settlementEvidence.evidence_sha256,
               runId,
               stageId: stage,
             },
           );
           contiguousCheckpoints.add(
-            `${stage}:${evidence.round_index}:${evidence.candidate_commit_oid}`,
+            `${stage}:${settlementEvidence.round_index}:${settlementEvidence.candidate_commit_oid}`,
           );
           finalCheckpointByStage.set(stage, {
             input_commit_oid: checkpointCandidate,
-            output_commit_oid: evidence.candidate_commit_oid,
-            round_index: evidence.round_index,
+            output_commit_oid: settlementEvidence.candidate_commit_oid,
+            round_index: settlementEvidence.round_index,
             stage_id: stage,
           });
         }
@@ -2682,12 +2688,19 @@ export async function runPipeline(
       }
     }
     const latestEntryByStage = new Map<StageName, StageEvidenceManifestEntry>();
+    const latestControlEntryByStage = new Map<StageName, StageEvidenceManifestEntry>();
     for (const entry of stageEntries) {
+      if (!pipelineSteps.includes(entry.stage as StageName)) continue;
+      const stage = entry.stage as StageName;
+      if (isAuthoritativeStageEvidence(entry.workerIdentity)) {
+        latestEntryByStage.set(stage, entry);
+      }
       if (
-        pipelineSteps.includes(entry.stage as StageName) &&
-        isAuthoritativeStageEvidence(entry.workerIdentity)
+        isAuthoritativeStageEvidence(entry.workerIdentity) ||
+        entry.workerIdentity === "coordinator:fixer-no-change" ||
+        entry.workerIdentity === "coordinator:fixer-policy"
       ) {
-        latestEntryByStage.set(entry.stage as StageName, entry);
+        latestControlEntryByStage.set(stage, entry);
       }
     }
     const latestReportByStage = new Map<StageName, StageReport>();
@@ -2834,6 +2847,13 @@ export async function runPipeline(
         latestEntryByStage.set(stage, entry);
         latestReportByStage.set(stage, report);
         reportsByStage.set(stage, [...(reportsByStage.get(stage) ?? []), report]);
+      }
+      if (
+        isAuthoritativeStageEvidence(workerIdentity) ||
+        workerIdentity === "coordinator:fixer-no-change" ||
+        workerIdentity === "coordinator:fixer-policy"
+      ) {
+        latestControlEntryByStage.set(stage, entry);
       }
       return autoFixModeAtFindings;
     };
@@ -3260,8 +3280,8 @@ export async function runPipeline(
 
       while (actionableFindings(report).length > 0) {
         const actionable = actionableFindings(report);
-        const latestEntry = latestEntryByStage.get(stage);
-        const resumedApproval = latestEntry
+        const latestControlEntry = latestControlEntryByStage.get(stage);
+        const resumedApproval = latestControlEntry
           ? priorGateAudit.findLast(
               (audit) =>
                 audit.resolved_at !== null &&
@@ -3269,12 +3289,14 @@ export async function runPipeline(
                 gateAuditMatchesEvidence(
                   audit,
                   stage,
-                  latestEntry.round,
-                  latestEntry.evidenceSha256,
+                  latestControlEntry.round,
+                  latestControlEntry.evidenceSha256,
                 ),
             )
           : undefined;
-        if (latestEntry && resumedApproval?.resolved_at) {
+        if (latestControlEntry && resumedApproval?.resolved_at) {
+          const latestEntry = latestEntryByStage.get(stage);
+          if (!latestEntry) throw new Error(`${stage} has no authoritative evidence`);
           latestEntry.waiverOrApproval = {
             decision:
               resumedApproval.decision === "approve" ? "approve" : "skip",
@@ -3354,7 +3376,7 @@ export async function runPipeline(
             guardrailMode,
             exhausted ? stageAutoFix.max_rounds : undefined,
           );
-          const gateEvidence = latestEntryByStage.get(stage)!;
+          const gateEvidence = latestControlEntryByStage.get(stage)!;
           const gateEvidenceSha256 = gateEvidence.evidenceSha256;
           const gateEvidenceRound = gateEvidence.round;
           // Durable before the block: an interrupted run still shows why the
@@ -3394,6 +3416,28 @@ export async function runPipeline(
             decision,
             gateOptions,
           );
+          const authoritativeEntry = latestEntryByStage.get(stage);
+          let waiverGateId = gateId;
+          if (
+            (decision.action === "approve" || decision.action === "skip") &&
+            authoritativeEntry &&
+            authoritativeEntry.evidenceSha256 !== gateEvidenceSha256
+          ) {
+            waiverGateId = `${gateId}:authoritative-waiver`;
+            ledger.recordGateAudit({
+              decision: decision.action,
+              evidenceSha256: authoritativeEntry.evidenceSha256,
+              gateId: waiverGateId,
+              guidance: decision.guidance || undefined,
+              optionsJson: JSON.stringify(gateOptions),
+              question,
+              resolution,
+              roundIndex: authoritativeEntry.round,
+              runId,
+              selectedFindingIds,
+              stageId: stage,
+            });
+          }
           ledger.recordGateAudit({
             decision: decision.action,
             evidenceSha256: gateEvidenceSha256,
@@ -3426,11 +3470,11 @@ export async function runPipeline(
             );
           }
           if (decision.action === "approve" || decision.action === "skip") {
-            const waived = latestEntryByStage.get(stage);
+            const waived = authoritativeEntry;
             if (waived && !waived.waiverOrApproval) {
               waived.waiverOrApproval = {
                 decision: decision.action,
-                gateId,
+                gateId: waiverGateId,
                 resolvedAt: new Date().toISOString(),
               };
             }
