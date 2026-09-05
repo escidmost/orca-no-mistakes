@@ -239,6 +239,27 @@ export type StageCheckpointRow = {
   stage_id: string
 }
 
+export function isCandidateReachable(
+  fromCommitOid: string,
+  toCommitOid: string,
+  checkpoints: readonly StageCheckpointRow[]
+): boolean {
+  if (fromCommitOid === toCommitOid) return true
+  const visited = new Set<string>([fromCommitOid])
+  const queue = [fromCommitOid]
+  while (queue.length > 0) {
+    const curr = queue.shift()!
+    for (const cp of checkpoints) {
+      if (cp.input_commit_oid === curr && !visited.has(cp.output_commit_oid)) {
+        if (cp.output_commit_oid === toCommitOid) return true
+        visited.add(cp.output_commit_oid)
+        queue.push(cp.output_commit_oid)
+      }
+    }
+  }
+  return false
+}
+
 export function finalContiguousCheckpointByStage(
   stageIds: readonly string[],
   checkpoints: readonly StageCheckpointRow[],
@@ -289,28 +310,36 @@ export function finalContiguousCheckpointByStage(
     }
   }
 
-  let currentCandidate: string | undefined = undefined
+  let currentCandidate = initialCandidate
+  let lastCheckpointIndex = -1
   for (const stageId of stageIds) {
     if (brokenStages.has(stageId)) break
 
     const expected = expectedByStage.get(stageId)
-    const match = validCheckpoints.findLast((cp) => {
-      if (cp.stage_id !== stageId) return false
+    let match: StageCheckpointRow | undefined
+    let matchIndex = -1
+    for (let i = validCheckpoints.length - 1; i >= 0; i--) {
+      const cp = validCheckpoints[i]
+      if (cp.stage_id !== stageId) continue
+      if (i < lastCheckpointIndex) continue
       if (
         expected &&
         (cp.round_index !== expected.roundIndex ||
           cp.output_commit_oid !== expected.candidateCommitOid)
       ) {
-        return false
+        continue
       }
-      if (currentCandidate !== undefined && cp.input_commit_oid !== currentCandidate) {
-        return false
+      if (!isCandidateReachable(currentCandidate, cp.input_commit_oid, validCheckpoints)) {
+        continue
       }
-      return true
-    })
+      match = cp
+      matchIndex = i
+      break
+    }
 
     if (match) {
       currentCandidate = match.output_commit_oid
+      lastCheckpointIndex = matchIndex
       result.set(stageId, match)
     } else if (expected || validCheckpoints.some((cp) => cp.stage_id === stageId)) {
       break

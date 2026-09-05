@@ -9,6 +9,7 @@ import {
   finalContiguousCheckpointByStage,
   gateAuditMatchesEvidence,
   isAuthoritativeStageEvidence,
+  isCandidateReachable,
   sha256,
   type DomainLedger
 } from './ledger.ts'
@@ -184,9 +185,10 @@ export function terminalCandidate(
   const evidenceByDigest = new Map(
     ledger.listEvidence(runId).map((row) => [row.evidence_sha256, row])
   )
+  const checkpoints = ledger.listCheckpoints(runId)
   const finalCheckpoint = finalContiguousCheckpointByStage(
     plan.slice(0, pushIndex).map((stage) => stage.stage_id),
-    ledger.listCheckpoints(runId),
+    checkpoints,
     run.submission_commit_oid,
     Array.from(dispositions.entries()).map(([stageId, disp]) => {
       const ev = disp.evidence_sha256 ? evidenceByDigest.get(disp.evidence_sha256) : undefined
@@ -196,7 +198,7 @@ export function terminalCandidate(
   const gateAudits = ledger.listGateAudit(runId)
 
   let candidate = run.submission_commit_oid
-  let currentCandidate: string | undefined = undefined
+  let currentCandidate: string | undefined = run.submission_commit_oid
   for (const stage of plan.slice(0, pushIndex)) {
     const disposition = dispositions.get(stage.stage_id)
     if (!disposition) throw new CandidatePublicationError(`stage ${stage.stage_id} has no terminal disposition`)
@@ -217,7 +219,10 @@ export function terminalCandidate(
         `stage ${stage.stage_id} does not extend the contiguous candidate chain`
       )
     }
-    if (currentCandidate !== undefined && final.input_commit_oid !== currentCandidate) {
+    if (
+      currentCandidate !== undefined &&
+      !isCandidateReachable(currentCandidate, final.input_commit_oid, checkpoints)
+    ) {
       throw new CandidatePublicationError(
         `stage ${stage.stage_id} does not extend the contiguous candidate chain`
       )

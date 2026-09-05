@@ -651,24 +651,6 @@ export class RailTuiRenderer implements PresentationRenderer {
           break;
         }
 
-        if (roundNum > 1) {
-          const priorRoundPrefix = analysisLabel(stageName, roundNum - 1);
-          const priorFixPrefix = fixLabel(stageName, roundNum - 1);
-          const priorRoundHadFindings = this.#activities.some(
-            (a) => a.stage === stage && a.label.startsWith(priorRoundPrefix) &&
-              /· [1-9]\d* (?:found|new|still open|reopened)/u.test(a.label),
-          );
-          const hasFix = this.#activities.some(
-            (a) => a.stage === stage && a.label.startsWith(priorFixPrefix),
-          );
-          if (priorRoundHadFindings && !hasFix) {
-            this.#activities.push({
-              at: clock(now),
-              label: priorFixPrefix,
-              stage,
-            });
-          }
-        }
         this.#activities.push({
           at: clock(now),
           label: analysisLabel(stageName, roundNum),
