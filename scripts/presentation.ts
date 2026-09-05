@@ -363,28 +363,35 @@ function nextSnapshot(
         stages: updateStage(next, transition.stage, { status: "active" }),
       };
       break;
-    case "stage-reopened":
+    case "stage-reopened": {
+      const stage = next.stages.find((item) => item.id === transition.stage);
+      const invalidatedFindings = stage?.findings?.map((f) =>
+        f.disposition === "approved" ? { ...f, disposition: "open" as const } : f,
+      );
+      const fixed = invalidatedFindings?.filter((f) => f.disposition === "fixed").length ?? 0;
+      const open = invalidatedFindings?.filter((f) => f.disposition === "open").length ?? 0;
       next = {
         ...next,
         currentStage: transition.stage,
         error: undefined,
         gate: undefined,
         stages: updateStage(next, transition.stage, {
-          actionableFindings: 0,
+          actionableFindings: open,
           approvedFindings: 0,
-          findings: [],
+          findings: invalidatedFindings,
           fixAttempt: undefined,
-          fixRecords: [],
-          fixSummaries: [],
-          fixedFindings: 0,
-          openFindings: 0,
+          fixRecords: stage?.fixRecords,
+          fixSummaries: stage?.fixSummaries,
+          fixedFindings: fixed > 0 ? fixed : (stage?.fixedFindings ?? 0),
+          openFindings: open,
           phase: undefined,
           status: "active",
           targetFindingIds: undefined,
-          totalFindings: 0,
+          totalFindings: stage?.totalFindings ?? (invalidatedFindings?.length ?? 0),
         }),
       };
       break;
+    }
     case "round-started": {
       const stage = next.stages.find((item) => item.id === transition.stage);
       next = {

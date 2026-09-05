@@ -181,13 +181,17 @@ export function terminalCandidate(
   }
 
   const dispositions = new Map(ledger.stageDispositions(runId).map((row) => [row.stage_id, row]))
+  const evidenceByDigest = new Map(
+    ledger.listEvidence(runId).map((row) => [row.evidence_sha256, row])
+  )
   const finalCheckpoint = finalContiguousCheckpointByStage(
     plan.slice(0, pushIndex).map((stage) => stage.stage_id),
     ledger.listCheckpoints(runId),
-    run.submission_commit_oid
-  )
-  const evidenceByDigest = new Map(
-    ledger.listEvidence(runId).map((row) => [row.evidence_sha256, row])
+    run.submission_commit_oid,
+    Array.from(dispositions.entries()).map(([stageId, disp]) => {
+      const ev = disp.evidence_sha256 ? evidenceByDigest.get(disp.evidence_sha256) : undefined
+      return ev ? { stage_id: stageId, candidate_commit_oid: ev.candidate_commit_oid, round_index: ev.round_index } : undefined
+    }).filter(Boolean) as any
   )
   const gateAudits = ledger.listGateAudit(runId)
 

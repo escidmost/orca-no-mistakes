@@ -241,43 +241,78 @@ export type StageCheckpointRow = {
 export function finalContiguousCheckpointByStage(
   stageIds: readonly string[],
   checkpoints: readonly StageCheckpointRow[],
-  initialCandidate: string
+  initialCandidate: string,
+  evidenceByStage?:
+    | ReadonlyMap<string, { candidate_commit_oid?: string; candidateCommitOid?: string; round_index?: number; roundIndex?: number }>
+    | readonly { stage_id?: string; stage?: string; candidate_commit_oid?: string; candidateCommitOid?: string; round_index?: number; roundIndex?: number }[]
 ): Map<string, StageCheckpointRow> {
   const result = new Map<string, StageCheckpointRow>()
   const stagePosition = new Map(stageIds.map((stageId, index) => [stageId, index]))
-  let candidate = initialCandidate
-  let previousIndex = -1
-  for (const [position, stageId] of stageIds.entries()) {
-    const seenCandidates = new Set([candidate])
-    let final: { checkpoint: StageCheckpointRow; index: number } | undefined
-    for (let index = previousIndex + 1; index < checkpoints.length; index += 1) {
-      const checkpoint = checkpoints[index]!
-      if (checkpoint.stage_id !== stageId) {
-        const checkpointPosition = stagePosition.get(checkpoint.stage_id)
-        if (checkpointPosition !== undefined && checkpointPosition > position) break
-        continue
+
+  const expectedByStage = new Map<string, { candidateCommitOid: string; roundIndex: number }>()
+  if (evidenceByStage) {
+    if (evidenceByStage instanceof Map || (typeof (evidenceByStage as any).get === 'function' && typeof (evidenceByStage as any).entries === 'function')) {
+      for (const [key, val] of (evidenceByStage as Map<string, any>).entries()) {
+        if (!val) continue
+        const candidateCommitOid = val.candidate_commit_oid ?? val.candidateCommitOid
+        const roundIndex = val.round_index ?? val.roundIndex ?? val.round
+        if (candidateCommitOid !== undefined && roundIndex !== undefined) {
+          expectedByStage.set(key, { candidateCommitOid, roundIndex })
+        }
       }
-      if (checkpoint.input_commit_oid === candidate) {
-        candidate = checkpoint.output_commit_oid
-        seenCandidates.add(candidate)
-        final = { checkpoint, index }
-        continue
+    } else if (Array.isArray(evidenceByStage)) {
+      for (const item of evidenceByStage) {
+        if (!item) continue
+        const stageId = item.stage_id ?? item.stage
+        const candidateCommitOid = item.candidate_commit_oid ?? item.candidateCommitOid
+        const roundIndex = item.round_index ?? item.roundIndex ?? item.round
+        if (stageId && candidateCommitOid !== undefined && roundIndex !== undefined) {
+          expectedByStage.set(stageId, { candidateCommitOid, roundIndex })
+        }
       }
-      if (
-        checkpoint.output_commit_oid === candidate &&
-        seenCandidates.has(checkpoint.input_commit_oid)
-      ) {
-        final = { checkpoint, index }
-        continue
-      }
-      return result
     }
-    if (!final) break
-    result.set(stageId, final.checkpoint)
-    previousIndex = final.index
   }
+
+  const reachable = new Set<string>([initialCandidate])
+  const validCheckpoints: StageCheckpointRow[] = []
+  const brokenStages = new Set<string>()
+
+  for (const checkpoint of checkpoints) {
+    if (!stagePosition.has(checkpoint.stage_id)) continue
+
+    if (reachable.has(checkpoint.input_commit_oid)) {
+      reachable.add(checkpoint.output_commit_oid)
+      validCheckpoints.push(checkpoint)
+    } else {
+      brokenStages.add(checkpoint.stage_id)
+    }
+  }
+
+  for (const stageId of stageIds) {
+    if (brokenStages.has(stageId)) continue
+
+    const expected = expectedByStage.get(stageId)
+    if (expected) {
+      const match = validCheckpoints.findLast(
+        (cp) =>
+          cp.stage_id === stageId &&
+          cp.round_index === expected.roundIndex &&
+          cp.output_commit_oid === expected.candidateCommitOid
+      )
+      if (match) {
+        result.set(stageId, match)
+      }
+    } else {
+      const match = validCheckpoints.findLast((cp) => cp.stage_id === stageId)
+      if (match) {
+        result.set(stageId, match)
+      }
+    }
+  }
+
   return result
 }
+
 
 export type GateDecisionRecord = {
   decision: 'approve' | 'skip'
@@ -4035,6 +4070,7 @@ export class DomainLedger {
     }
     runId: string
     stageId: 'pr' | 'push'
+    supersedesEvidenceSha256?: string
     ownership: { branch: string; generationToken: number; repoRoot: string }
   }): { evidenceId: string; receiptSha256: string } {
     const expectedKind: RemoteReceiptKind =
@@ -4138,9 +4174,10 @@ export class DomainLedger {
          WHERE run_id = ? AND stage_id = ? AND disposition = 'satisfied'
            AND evidence_sha256 = ?`
       ).get(input.runId, input.stageId, input.evidence.evidenceSha256)
-      const priorDisposition = this.#db.prepare(
-        'SELECT 1 FROM stage_dispositions WHERE run_id = ? AND stage_id = ? LIMIT 1'
-      ).get(input.runId, input.stageId)
+      const priorDispositionRow = this.#db.prepare(
+        'SELECT disposition, evidence_sha256 FROM stage_dispositions WHERE run_id = ? AND stage_id = ? LIMIT 1'
+      ).get(input.runId, input.stageId) as { disposition: string; evidence_sha256: string } | undefined
+      const priorDisposition = priorDispositionRow !== undefined ? 1 : undefined
       const settlesDisposition = input.stageId !== 'pr' ||
         input.receipt.payload.state === 'merged' ||
         (Object.hasOwn(input.receipt.payload, 'managedCommentIntent') &&
@@ -4162,7 +4199,41 @@ export class DomainLedger {
         }
         throw new Error(`${input.stageId} round ${input.checkpoint.roundIndex} is already settled with different facts`)
       }
-      if (settlesDisposition && priorDisposition !== undefined && existingDisposition === undefined) {
+      let isHistoricalPrUpgrade = false
+      if (
+        settlesDisposition &&
+        priorDispositionRow !== undefined &&
+        existingDisposition === undefined &&
+        input.stageId === 'pr' &&
+        input.receipt.payload.state === 'merged' &&
+        priorDispositionRow.disposition === 'satisfied'
+      ) {
+        const priorPrReceipt = this.#db.prepare(
+          `SELECT receipt_json, candidate_commit_oid FROM remote_receipts
+           WHERE run_id = ? AND kind = 'pull-request-binding'
+           ORDER BY rowid DESC LIMIT 1`
+        ).get(input.runId) as { receipt_json: string; candidate_commit_oid: string } | undefined
+        if (priorPrReceipt) {
+          const parsedReceipt = JSON.parse(priorPrReceipt.receipt_json) as Record<string, unknown>
+          const priorPayload = (parsedReceipt.payload as Record<string, unknown> | undefined) ?? parsedReceipt
+          const isManagedComment = priorPayload && (
+            Object.hasOwn(priorPayload, 'managedCommentIntent') ||
+            priorPayload.managedCommentNodeId !== undefined ||
+            priorPayload.state === 'open'
+          ) && priorPayload.state !== 'merged'
+          const matchesSuperseded =
+            input.supersedesEvidenceSha256 === undefined ||
+            input.supersedesEvidenceSha256 === priorDispositionRow.evidence_sha256
+          if (
+            isManagedComment &&
+            matchesSuperseded &&
+            priorPrReceipt.candidate_commit_oid === input.receipt.candidateCommitOid
+          ) {
+            isHistoricalPrUpgrade = true
+          }
+        }
+      }
+      if (settlesDisposition && priorDisposition !== undefined && existingDisposition === undefined && !isHistoricalPrUpgrade) {
         throw new Error(`${input.stageId} is already settled with a different disposition`)
       }
 
@@ -4196,7 +4267,19 @@ export class DomainLedger {
         runId: input.runId,
         stageId: input.stageId
       })
-      if (settlesDisposition && existingDisposition === undefined) {
+      if (isHistoricalPrUpgrade) {
+        this.#db.prepare(
+          `INSERT INTO stage_disposition_supersessions
+             (run_id, stage_id, disposition, prior_evidence_sha256, evidence_sha256, recorded_at)
+           VALUES (?, ?, 'satisfied', ?, ?, ?)`
+        ).run(
+          input.runId,
+          input.stageId,
+          priorDispositionRow!.evidence_sha256,
+          input.evidence.evidenceSha256,
+          createdAt
+        )
+      } else if (settlesDisposition && existingDisposition === undefined) {
         this.recordStageDisposition({
           disposition: 'satisfied',
           evidenceSha256: input.evidence.evidenceSha256,

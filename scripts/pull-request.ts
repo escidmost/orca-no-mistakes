@@ -522,6 +522,13 @@ export async function bindPullRequest(input: {
     summary: evidenceSummary,
     workerIdentity: input.workerIdentity
   })
+  const priorPrDisp = typeof input.ledger.stageDispositions === 'function'
+    ? input.ledger.stageDispositions(input.runId).find((d) => d.stage_id === 'pr')
+    : undefined
+  const supersedesEvidenceSha256 =
+    priorPrDisp?.evidence_sha256 && priorPrDisp.evidence_sha256 !== evidenceDigest
+      ? priorPrDisp.evidence_sha256
+      : undefined
   const settlement = input.ledger.settleRemoteStage({
     checkpoint: { inputCommitOid: input.candidateCommitOid, outputCommitOid: input.candidateCommitOid, roundIndex },
     evidence: {
@@ -556,7 +563,8 @@ export async function bindPullRequest(input: {
       }
     },
     runId: input.runId,
-    stageId: 'pr'
+    stageId: 'pr',
+    ...(supersedesEvidenceSha256 ? { supersedesEvidenceSha256 } : {})
   })
   return {
     number: pullRequest.number,

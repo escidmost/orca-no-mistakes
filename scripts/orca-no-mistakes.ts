@@ -2542,6 +2542,7 @@ export async function runPipeline(
         pipelineSteps,
         priorCheckpoints,
         submissionCommitOid,
+        latestAuthoritativeEvidenceByStage,
       );
       for (const [stage, checkpoint] of finalCheckpointByStage) {
         contiguousCheckpoints.add(
@@ -2924,16 +2925,19 @@ export async function runPipeline(
 
     const getInvalidatedApprovalStage = async (): Promise<StageName | undefined> => {
       const currentHead = await git.head();
+      const hasPush = pipelineSteps.includes("push");
       const dispositions = ledger.stageDispositions(runId);
       const gateAudits = ledger.listGateAudit(runId);
       for (const candidateStage of pipelineSteps) {
         if (candidateStage === "push" || candidateStage === "pr") break;
-        const disposition = dispositions.find(
-          (entry) => entry.stage_id === candidateStage && entry.disposition === "satisfied",
-        );
-        if (!disposition?.evidence_sha256) continue;
         const evidence = latestAuthoritativeEvidenceByStage.get(candidateStage);
-        if (!evidence || evidence.evidence_sha256 !== disposition.evidence_sha256) continue;
+        if (!evidence) continue;
+        if (hasPush) {
+          const disposition = dispositions.find(
+            (entry) => entry.stage_id === candidateStage && entry.disposition === "satisfied",
+          );
+          if (!disposition?.evidence_sha256 || evidence.evidence_sha256 !== disposition.evidence_sha256) continue;
+        }
         const isApproved = gateAudits.some(
           (audit) =>
             audit.resolved_at !== null &&
@@ -3796,6 +3800,39 @@ export async function runPipeline(
 
       const stageOutputCommitOid = await git.head();
       const authoritativeEntry = latestEntryByStage.get(stage)!;
+      if (authoritativeEntry.exitCode !== 0 && !authoritativeEntry.waiverOrApproval) {
+        const priorAudit = ledger
+          .listGateAudit(runId)
+          .findLast(
+            (audit) =>
+              audit.stage_id === stage &&
+              audit.resolved_at !== null &&
+              (audit.decision === "approve" ||
+                audit.decision === "skip" ||
+                audit.decision === "fix"),
+          );
+        if (priorAudit) {
+          const preservedGateId = `${priorAudit.gate_id}:preserved-approval`;
+          ledger.recordGateAudit({
+            decision: priorAudit.decision === "fix" ? "approve" : priorAudit.decision,
+            evidenceSha256: authoritativeEntry.evidenceSha256,
+            gateId: preservedGateId,
+            guidance: priorAudit.guidance || undefined,
+            optionsJson: priorAudit.options_json || "[]",
+            question: priorAudit.question || `[preserved approval] ${stage} findings unchanged`,
+            resolution: priorAudit.resolution || "preserved approval",
+            roundIndex: authoritativeEntry.round,
+            runId,
+            selectedFindingIds: report.findings.map((f) => f.id),
+            stageId: stage,
+          });
+          authoritativeEntry.waiverOrApproval = {
+            decision: priorAudit.decision === "fix" ? "approve" : (priorAudit.decision as "approve" | "skip"),
+            gateId: preservedGateId,
+            resolvedAt: new Date().toISOString(),
+          };
+        }
+      }
       const settlementSuffix = priorDisposition?.evidence_sha256 &&
         priorDisposition.evidence_sha256 !== authoritativeEntry.evidenceSha256
           ? `:evidence:${authoritativeEntry.evidenceSha256}`
@@ -5397,63 +5434,30 @@ export function reconcileReportWithPreservedDispositions(
   const stageState = snapshot.stages.find((s) => s.id === stage);
   if (!stageState?.findings?.length) return report;
 
-  const openOccurrences = stageState.findings.filter(
-    (f) => f.disposition === "open",
+  const approvedOccurrences = stageState.findings.filter(
+    (f) => f.disposition === "approved",
   );
-  if (openOccurrences.length === 0) {
-    return {
-      ...report,
-      findings: report.findings.map((f) =>
-        f.action !== "no-op" ? { ...f, action: "no-op" as const } : f,
-      ),
-    };
-  }
+  if (approvedOccurrences.length === 0) return report;
 
-  const matchedOpen = new Set<number>();
-  const openReportIndices = new Set<number>();
-
-  for (let ri = 0; ri < report.findings.length; ri++) {
-    const rf = report.findings[ri];
-    if (rf.action === "no-op") continue;
-    for (let oi = 0; oi < openOccurrences.length; oi++) {
-      if (!matchedOpen.has(oi)) {
-        const of = openOccurrences[oi];
-        if (
-          rf.id === of.id &&
-          rf.description === of.description &&
-          rf.severity === of.severity &&
-          rf.file === of.file &&
-          rf.line === of.line
-        ) {
-          matchedOpen.add(oi);
-          openReportIndices.add(ri);
-          break;
-        }
-      }
-    }
-  }
-
-  for (let ri = 0; ri < report.findings.length; ri++) {
-    if (openReportIndices.has(ri)) continue;
-    const rf = report.findings[ri];
-    if (rf.action === "no-op") continue;
-    for (let oi = 0; oi < openOccurrences.length; oi++) {
-      if (!matchedOpen.has(oi)) {
-        const of = openOccurrences[oi];
-        if (rf.id === of.id) {
-          matchedOpen.add(oi);
-          openReportIndices.add(ri);
-          break;
-        }
-      }
-    }
-  }
-
+  const matchedApproved = new Set<number>();
   return {
     ...report,
-    findings: report.findings.map((f, ri) => {
-      if (f.action !== "no-op" && !openReportIndices.has(ri)) {
-        return { ...f, action: "no-op" as const };
+    findings: report.findings.map((f) => {
+      if (f.action === "no-op") return f;
+      for (let ai = 0; ai < approvedOccurrences.length; ai++) {
+        if (!matchedApproved.has(ai)) {
+          const of = approvedOccurrences[ai];
+          if (
+            f.id === of.id &&
+            f.description === of.description &&
+            f.severity === of.severity &&
+            f.file === of.file &&
+            f.line === of.line
+          ) {
+            matchedApproved.add(ai);
+            return { ...f, action: "no-op" as const };
+          }
+        }
       }
       return f;
     }),
