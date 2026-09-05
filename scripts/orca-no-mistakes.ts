@@ -3007,7 +3007,9 @@ export async function runPipeline(
         ? gateAudits.some(
             (audit) =>
               audit.resolved_at !== null &&
-              (audit.decision === "approve" || audit.decision === "skip") &&
+              (audit.decision === "approve" ||
+                audit.decision === "skip" ||
+                audit.decision === "fix") &&
               gateAuditMatchesEvidence(
                 audit,
                 stage,
@@ -3023,11 +3025,23 @@ export async function runPipeline(
         priorDisposition?.disposition === "satisfied" &&
         priorAuthoritativeEvidence !== undefined &&
         priorDisposition.evidence_sha256 === priorAuthoritativeEvidence.evidence_sha256;
+      const stagePresentationState = presentation.current.stages.find(
+        (item) => item.id === stage,
+      );
+      const hasCandidatePresentationApproval =
+        (stagePresentationState?.approvedFindings ?? 0) > 0 ||
+        Boolean(
+          stagePresentationState?.findings?.some(
+            (finding) => finding.disposition === "approved",
+          ),
+        );
       const shouldReopen =
         stage !== "push" &&
         stage !== "pr" &&
         isCandidateMismatched &&
-        (priorDisposition ? isSatisfiedDisposition : isApprovedByAudit);
+        (priorDisposition
+          ? isSatisfiedDisposition || hasCandidatePresentationApproval
+          : isApprovedByAudit || hasCandidatePresentationApproval);
       if (shouldReopen) {
         presentation.publish(
           `stage:${stage}:reopened:${priorAuthoritativeEvidence!.evidence_sha256}:${stageInputCommitOid}`,
