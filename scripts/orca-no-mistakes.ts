@@ -2593,19 +2593,26 @@ export async function runPipeline(
         const checkpointMatches = contiguousCheckpoints.has(
           `${stage}:${settlementEvidence.round_index}:${settlementEvidence.candidate_commit_oid}`,
         );
-        const dispositions = ledger.stageDispositions(runId);
-        const hasDisposition = dispositions.some(
-          (d) => d.stage_id === stage && d.disposition === "satisfied",
-        );
+        const currentDisposition = ledger
+          .stageDispositions(runId)
+          .find((d) => d.stage_id === stage);
+        const hasReconciledDisposition =
+          currentDisposition?.disposition === "satisfied" &&
+          currentDisposition.evidence_sha256 === settlementEvidence.evidence_sha256;
         if (
           stage !== "push" && stage !== "pr" &&
-          pipelineSteps.includes("push") && (!checkpointMatches || !hasDisposition)
+          pipelineSteps.includes("push") && (!checkpointMatches || !hasReconciledDisposition)
         ) {
           const stageIndex = pipelineSteps.indexOf(stage);
           const prevStage = stageIndex > 0 ? pipelineSteps[stageIndex - 1] : undefined;
           const checkpointCandidate = prevStage
             ? finalCheckpointByStage.get(prevStage)?.output_commit_oid ?? submissionCommitOid
             : submissionCommitOid;
+          const supersedesEvidenceSha256 =
+            currentDisposition?.evidence_sha256 &&
+            currentDisposition.evidence_sha256 !== settlementEvidence.evidence_sha256
+              ? currentDisposition.evidence_sha256
+              : undefined;
           ledger.settleLocalStage(
             {
               checkpoint: {
@@ -2614,6 +2621,7 @@ export async function runPipeline(
                 roundIndex: settlementEvidence.round_index,
               },
               evidenceSha256: settlementEvidence.evidence_sha256,
+              supersedesEvidenceSha256,
               runId,
               stageId: stage,
             },
