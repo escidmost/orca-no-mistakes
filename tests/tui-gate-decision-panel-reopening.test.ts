@@ -257,6 +257,9 @@ test("failed submission retains choices and requires a fresh confirmation", asyn
     assert.match(await frame(output), /Could not resolve gate/);
     input.emit("data", "\r\r");
     assert.equal(resolutions.length, 1);
+    const confirmation = await frame(output);
+    assert.match(confirmation, /Confirm 2 fix, 0 approve/);
+    assert.doesNotMatch(confirmation, /Could not resolve gate/);
     input.emit("data", "\r");
     assert.equal(resolutions.length, 2);
     assert.deepEqual(JSON.parse(resolutions[1]), { action: "fix", findingIds: ["finding-1", "finding-2"] });

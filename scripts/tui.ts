@@ -1848,6 +1848,7 @@ export class RailTuiRenderer implements PresentationRenderer {
           } else if (this.#gateConfirm) this.#submitGate();
           else {
             this.#detailOffset = 0;
+            this.#gateMessage = undefined;
             this.#gateConfirm = true;
             break;
           }

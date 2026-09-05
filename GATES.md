@@ -26,8 +26,8 @@ Scope: Independent finding decisions in the Run TUI, verified locally and delive
 
 Complexity review: shared finding rendering replaces duplication; canonical selective-fix protocol is reused. No dependencies or configuration added. No configured code linter exists in package.json or repository configuration.
 
-- [ ] G5: Exactly one local CodeRabbit review is assessed and valid findings are fixed and tested
-  EVIDENCE: pending
+- [x] G5: Exactly one local CodeRabbit review is assessed and valid findings are fixed and tested
+  EVIDENCE: coderabbit review --base main --agent completed once without a timeout on 1ecf56a; one finding at scripts/tui.ts:1850 partially confirmed and repaired by clearing stale retry errors before confirmation. Regression assertion added; local review will not be rerun.
 
 - [ ] G6: Worktree-local Orca No-Mistakes gate delivers the committed changes and creates the PR
   EVIDENCE: pending
