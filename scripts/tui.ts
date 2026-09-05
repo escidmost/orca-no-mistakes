@@ -2016,5 +2016,13 @@ export function createRunRenderer(
         switchToPlain(error, snapshot);
       }
     },
+    seed: (snapshots) => {
+      if (failed) return;
+      try {
+        rail.seed(snapshots);
+      } catch (error) {
+        switchToPlain(error);
+      }
+    },
   };
 }
