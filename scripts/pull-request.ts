@@ -120,6 +120,70 @@ function capEscapedText(content: string, budget: number): string {
   return capped + marker
 }
 
+export function findUnclosedFence(content: string): { char: string; length: number } | null {
+  const lines = content.split(/\r?\n/)
+  let currentFence: { char: string; length: number } | null = null
+  for (const line of lines) {
+    if (!currentFence) {
+      const match = line.match(/^[ ]{0,3}(`{3,}|~{3,})(.*)$/)
+      if (match) {
+        const fenceStr = match[1]
+        const fenceChar = fenceStr[0]
+        const rest = match[2]
+        if (fenceChar === '`' && !rest.includes('`')) {
+          currentFence = { char: fenceChar, length: fenceStr.length }
+        } else if (fenceChar === '~' && !rest.includes('~')) {
+          currentFence = { char: fenceChar, length: fenceStr.length }
+        }
+      }
+    } else {
+      const escapedChar = currentFence.char === '`' ? '`' : '~'
+      const closeRegex = new RegExp(`^[ ]{0,3}${escapedChar}{${currentFence.length},}[ \\t]*$`)
+      if (closeRegex.test(line)) {
+        currentFence = null
+      }
+    }
+  }
+  return currentFence
+}
+
+function fenceCloser(content: string, fence: { char: string; length: number }): string {
+  const prefix = content.endsWith('\n') ? '' : '\n'
+  return `${prefix}${fence.char.repeat(fence.length)}`
+}
+
+export function capEscapedMarkdown(content: string, budget: number): string {
+  if (budget <= 0) return ''
+  let capped = capEscapedText(content, budget)
+  let fence = findUnclosedFence(capped)
+  if (!fence) return capped
+
+  let closer = fenceCloser(capped, fence)
+  if (Buffer.byteLength(capped + closer) <= budget) {
+    return capped + closer
+  }
+
+  const closerBytes = Buffer.byteLength(closer)
+  const reducedBudget = Math.max(0, budget - closerBytes)
+  capped = capEscapedText(content, reducedBudget)
+  fence = findUnclosedFence(capped)
+  if (!fence) return capped
+
+  closer = fenceCloser(capped, fence)
+  let result = capped + closer
+  while (Buffer.byteLength(result) > budget && capped.length > 0) {
+    capped = capped.slice(0, -1)
+    fence = findUnclosedFence(capped)
+    closer = fence ? fenceCloser(capped, fence) : ''
+    result = capped + closer
+  }
+  return result
+}
+
+export function capMarkdownText(content: string, budget: number): string {
+  return capEscapedMarkdown(escapeUntrustedMarkdown(content), budget)
+}
+
 export function capTitle(content: string, budget = 256): string {
   const singleLine = redactKnownSecrets(content)
     .replaceAll(/[\r\n]+/gu, ' ')
@@ -149,7 +213,7 @@ function testingSection(testing: PullRequestReport['testing']): string {
     remaining -= entryBytes
     artifacts.push(entry)
   }
-  return `## Testing\n\n${capText(testing.summary, 4096)}${commands}${artifacts.length > 0 ? `\n\n${artifacts.join('\n\n')}` : ''}`
+  return `## Testing\n\n${capMarkdownText(testing.summary, 4096)}${commands}${artifacts.length > 0 ? `\n\n${artifacts.join('\n\n')}` : ''}`
 }
 
 function displayStepName(name: string): string {
@@ -257,9 +321,11 @@ function pipelineSection(candidateCommitOid: string, steps: PullRequestPipelineS
     const separatorBytes = candidates.length > 0 ? Buffer.byteLength('\n\n') : 0
     const framingBytes = Buffer.byteLength(`<details>\n<summary>${summary}</summary>\n\n\n\n</details>`) + separatorBytes
     const escaped = escapeUntrustedMarkdown(stepDetails)
+    const unclosed = findUnclosedFence(escaped)
+    const balancedEscaped = unclosed ? `${escaped}${fenceCloser(escaped, unclosed)}` : escaped
     candidates.push({
-      desiredBytes: Buffer.byteLength(escaped),
-      escaped,
+      desiredBytes: Buffer.byteLength(balancedEscaped),
+      escaped: balancedEscaped,
       framingBytes,
       summary
     })
@@ -315,7 +381,7 @@ function pipelineSection(candidateCommitOid: string, steps: PullRequestPipelineS
       for (let i = 0; i < activeCandidates.length; i++) {
         const c = activeCandidates[i]
         const budget = allocatedBudgets.get(i) ?? 0
-        const content = capEscapedText(c.escaped, budget)
+        const content = capEscapedMarkdown(c.escaped, budget)
         details.push(`<details>\n<summary>${c.summary}</summary>\n\n${content}\n\n</details>`)
       }
     }
@@ -331,7 +397,7 @@ export function pullRequestContent(intent: string, report: PullRequestReport): {
     : `chore: ${firstLine}`
   const riskEmoji = report.risk.level === 'high' ? '🚨' : report.risk.level === 'medium' ? '⚠️' : '✅'
   const otherSections = [
-    `## Risk Assessment\n\n${riskEmoji} ${report.risk.level[0].toUpperCase()}${report.risk.level.slice(1)}: ${capText(report.risk.rationale, 2048)}`,
+    `## Risk Assessment\n\n${riskEmoji} ${report.risk.level[0].toUpperCase()}${report.risk.level.slice(1)}: ${capMarkdownText(report.risk.rationale, 2048)}`,
     testingSection(report.testing),
     pipelineSection(report.candidateCommitOid, report.pipelineSteps)
   ].join('\n\n')
@@ -351,15 +417,17 @@ export function pullRequestContent(intent: string, report: PullRequestReport): {
   let finalWhatChanged: string
 
   if (whatChangedBytes + intentBytes <= totalAvailable) {
-    finalWhatChanged = sanitizedWhatChanged
-    finalIntent = sanitizedIntent
-  } else if (whatChangedBytes + 256 <= totalAvailable) {
-    finalWhatChanged = sanitizedWhatChanged
-    finalIntent = capEscapedText(sanitizedIntent, totalAvailable - whatChangedBytes)
-  } else {
-    finalIntent = capEscapedText(sanitizedIntent, Math.min(256, totalAvailable))
+    finalIntent = capEscapedMarkdown(sanitizedIntent, totalAvailable)
     const availableForWhatChanged = Math.max(0, totalAvailable - Buffer.byteLength(finalIntent))
-    finalWhatChanged = capEscapedText(sanitizedWhatChanged, availableForWhatChanged)
+    finalWhatChanged = capEscapedMarkdown(sanitizedWhatChanged, availableForWhatChanged)
+  } else if (whatChangedBytes + 256 <= totalAvailable) {
+    finalWhatChanged = capEscapedMarkdown(sanitizedWhatChanged, totalAvailable - 256)
+    const availableForIntent = Math.max(0, totalAvailable - Buffer.byteLength(finalWhatChanged))
+    finalIntent = capEscapedMarkdown(sanitizedIntent, availableForIntent)
+  } else {
+    finalIntent = capEscapedMarkdown(sanitizedIntent, Math.min(256, totalAvailable))
+    const availableForWhatChanged = Math.max(0, totalAvailable - Buffer.byteLength(finalIntent))
+    finalWhatChanged = capEscapedMarkdown(sanitizedWhatChanged, availableForWhatChanged)
   }
 
   const body = `${intentPrefix}${finalIntent}\n\n${whatChangedPrefix}${finalWhatChanged}\n\n${otherSections}\n`
