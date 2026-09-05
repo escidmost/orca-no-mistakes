@@ -641,7 +641,12 @@ export class RailTuiRenderer implements PresentationRenderer {
           );
           const fixAttempt = transition.fixAttempt ?? stageState?.fixAttempt ?? 0;
           const fixPrefix = fixLabel(stageName, fixAnalysis, fixAttempt);
-          if (!this.#activities.some((a) => a.stage === stage && a.label.startsWith(fixPrefix))) {
+          const decisionEntry = this.#activities.findLast(
+            (a) => a.stage === stage && a.label === `${stageName} fix`,
+          );
+          if (decisionEntry) {
+            decisionEntry.label = fixPrefix;
+          } else if (!this.#activities.some((a) => a.stage === stage && a.label.startsWith(fixPrefix))) {
             this.#activities.push({
               at: clock(now),
               label: fixPrefix,
@@ -677,7 +682,9 @@ export class RailTuiRenderer implements PresentationRenderer {
           results,
         );
         const entry = this.#activities.findLast(
-          (activity) => activity.stage === stage && activity.label === fixPrefix,
+          (activity) =>
+            activity.stage === stage &&
+            (activity.label === fixPrefix || activity.label === `${stageName} fix`),
         );
         const targetIndices: number[] = [];
         if (stageState?.findings) {
@@ -863,48 +870,20 @@ export class RailTuiRenderer implements PresentationRenderer {
 
       case "gate-resolved": {
         const stageName = title(transition.stage);
-        if (transition.decision === "fix") {
-          const stageState = snapshot.stages.find((item) => item.id === transition.stage);
-          const analysis = analysisNumber(
-            stageState?.analysis,
-            stageState?.phase === "fixer"
-              ? (transition.round ?? 1)
-              : (transition.round ?? 0) + 1,
-          );
-          const fixAttempt =
-            stageState?.phase === "fixer" ? (stageState.fixAttempt ?? 0) + 1 : 0;
-          const fixPrefix = fixLabel(stageName, analysis, fixAttempt);
-          if (
-            last &&
-            last.stage === transition.stage &&
-            last.label.endsWith("decision needed")
-          ) {
-            last.label = fixPrefix;
-          } else {
-            this.#activities.push({
-              at: clock(now),
-              label: fixPrefix,
-              stage,
-            });
-          }
-        } else if (transition.decision === "approve") {
-          if (
-            last &&
-            last.stage === transition.stage &&
-            last.label.endsWith("decision needed")
-          ) {
-            last.label = `${stageName} approved`;
-          } else {
-            this.#activities.push({
-              at: clock(now),
-              label: `${stageName} approved`,
-              stage,
-            });
-          }
+        const decisionLabel =
+          transition.decision === "approve"
+            ? `${stageName} approved`
+            : `${stageName} ${transition.decision}`;
+        if (
+          last &&
+          last.stage === transition.stage &&
+          last.label.endsWith("decision needed")
+        ) {
+          last.label = decisionLabel;
         } else if (transition.decision) {
           this.#activities.push({
             at: clock(now),
-            label: `${stageName} ${transition.decision}`,
+            label: decisionLabel,
             stage,
           });
         }

@@ -318,9 +318,33 @@ export async function initializeLocalGate(
       version: 1
     }
     await writeAtomic(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, 0o600)
+    let hookExecutable = executablePath
+    if (effectiveRepoRoot !== path.resolve(paths.repoRoot)) {
+      const hookPath = path.join(paths.gatePath, 'hooks', 'pre-receive')
+      let preservedExecutable: string | undefined
+      if (existsSync(hookPath)) {
+        try {
+          const content = await readFile(hookPath, 'utf8')
+          const match = /exec\s+(?:'([^']+)'|"([^"]+)"|(\S+))\s+gate\s+admit/u.exec(content)
+          const extracted = match ? (match[1] ?? match[2] ?? match[3]) : undefined
+          if (extracted && existsSync(extracted)) {
+            preservedExecutable = extracted
+          }
+        } catch {}
+      }
+      if (preservedExecutable) {
+        hookExecutable = preservedExecutable
+      } else {
+        const relative = path.relative(paths.repoRoot, executablePath)
+        const resolved = path.resolve(effectiveRepoRoot, relative)
+        if (existsSync(resolved)) {
+          hookExecutable = resolved
+        }
+      }
+    }
     await writeAtomic(
       path.join(paths.gatePath, 'hooks', 'pre-receive'),
-      managedHook(executablePath, paths.gatePath),
+      managedHook(hookExecutable, paths.gatePath),
       0o755
     )
     return metadata

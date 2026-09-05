@@ -2634,23 +2634,21 @@ export async function runPipeline(
         const openCount =
           restored?.openFindings ?? restored?.actionableFindings ?? 0;
         if (restored?.status === "passed" && openCount === 0) continue;
-        if (restored?.findings === undefined && openCount > 0) {
-          const findings = JSON.parse(
-            evidence.findings_json ?? "[]",
-          ) as Finding[];
-          const actionable = actionableFindings({ findings, summary: "" });
-          presentation.publish(
-            `findings:${evidence.evidence_sha256}:reconciled`,
-            {
-              actionable: actionable.length,
-              findings: presentationFindingDetails(actionable),
-              kind: "findings-recorded",
-              round: evidence.round_index,
-              stage,
-              total: findings.length,
-            },
-          );
-        }
+        const findings = JSON.parse(
+          evidence.findings_json ?? "[]",
+        ) as Finding[];
+        const actionable = actionableFindings({ findings, summary: "" });
+        presentation.publish(
+          `findings:${evidence.evidence_sha256}:reconciled`,
+          {
+            actionable: actionable.length,
+            findings: presentationFindingDetails(actionable),
+            kind: "findings-recorded",
+            round: evidence.round_index,
+            stage,
+            total: findings.length,
+          },
+        );
         if (approval) {
           presentation.publish(`gate:${approval.gate_id}:resolved:reconciled`, {
             decision: approval.decision,
