@@ -50,12 +50,21 @@ Use a distinct namespace such as `onm-79/<workflow-run-id>-<attempt>/` for every
 
 ## Operator sequence
 
-Install from the exact package checkout being accepted. Keep its source identity with the evidence. Initialize each fixture checkout on its clean committed feature branch:
+Install from the exact package checkout being accepted. Keep its source identity with the evidence. Before initializing, create a per-run base branch in the upstream fixture for each scenario from the recorded default-branch OID and record each base branch name and OID with the evidence. Without an explicit `--base-branch`, `init` persists the upstream default branch as the publication base, so the fixture merge below would mutate the persistent default branch:
 
 ```sh
-/path/to/package/bin/orca-no-mistakes init --repo /path/to/same-repository-checkout
-/path/to/package/bin/orca-no-mistakes init --repo /path/to/fork-checkout --upstream upstream/fixture --fork contributor/fixture --head-branch onm-79/run/fork
+git -C /path/to/same-repository-checkout push origin "$default_oid:refs/heads/onm-79/run/base-same"
+git -C /path/to/fork-checkout push upstream "$default_oid:refs/heads/onm-79/run/base-fork"
 ```
+
+Initialize each fixture checkout on its clean committed feature branch against its recorded base branch:
+
+```sh
+/path/to/package/bin/orca-no-mistakes init --repo /path/to/same-repository-checkout --base-branch onm-79/run/base-same
+/path/to/package/bin/orca-no-mistakes init --repo /path/to/fork-checkout --upstream upstream/fixture --fork contributor/fixture --base-branch onm-79/run/base-fork --head-branch onm-79/run/fork
+```
+
+Verify that the persisted route's base branch matches the recorded per-run branch before submitting.
 
 Submit the same-repository fixture through the installed local gate:
 
