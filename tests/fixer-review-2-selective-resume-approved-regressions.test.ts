@@ -52,7 +52,7 @@ class FailAfterGateAuditLedger extends DomainLedger {
   }
 }
 
-test("resume reconciles selective fix gate audits into presentation with approved findings", async () => {
+test("resume restores selective approvals before candidate revalidation invalidates them", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "onm-selective-audit-reconcile-"));
   const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
   process.env.ORCA_NO_MISTAKES_HOME = temp;
@@ -194,14 +194,27 @@ test("resume reconciles selective fix gate audits into presentation with approve
 
     assert.equal(resumed.gateCount(), 0);
     assert.ok(result.attestation);
-    const finalSnapshot = ledger
-      .listPresentationSnapshots("domain-run")
-      .at(-1)!;
+    const snapshots = ledger.listPresentationSnapshots("domain-run");
+    const restoredApproval = snapshots.find((snapshot) =>
+      snapshot.transition.kind === "gate-resolved" &&
+      snapshot.transition.decision === "fix"
+    );
+    assert.ok(restoredApproval);
+    assert.equal(stageOf(restoredApproval, "review").approvedFindings, 1);
+    assert.equal(stageOf(restoredApproval, "review").openFindings, 1);
+    const reopened = snapshots.find((snapshot) =>
+      snapshot.transition.kind === "stage-reopened" &&
+      snapshot.transition.stage === "review"
+    );
+    assert.ok(reopened);
+    assert.ok(reopened.sequence > restoredApproval.sequence);
+    assert.equal(stageOf(reopened, "review").approvedFindings, 0);
+    const finalSnapshot = snapshots.at(-1)!;
     assert.equal(finalSnapshot.status, "passed");
     const review = stageOf(finalSnapshot, "review");
     assert.equal(review.status, "passed");
-    assert.equal(review.approvedFindings, 1);
-    assert.equal(review.fixedFindings, 1);
+    assert.equal(review.approvedFindings, 0);
+    assert.equal(review.fixedFindings, 2);
     assert.equal(review.openFindings, 0);
     assert.equal(
       review.findings?.find((f) => f.id === "review-fix-1")?.disposition,
@@ -209,7 +222,7 @@ test("resume reconciles selective fix gate audits into presentation with approve
     );
     assert.equal(
       review.findings?.find((f) => f.id === "review-approve-2")?.disposition,
-      "approved",
+      "fixed",
     );
   } finally {
     await installAbortReaping({ pid: process.pid });

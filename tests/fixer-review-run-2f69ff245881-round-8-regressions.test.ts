@@ -251,9 +251,13 @@ test("recoverFixRecords reconciles mixed legacy summaries, structured records, a
   const snapshots: PresentationSnapshot[] = [
     {
       attempt: 1,
-      mode: "manual",
+      mode: { autoFix: false },
+      runId: "mixed-recovery",
+      sequence: 1,
+      status: "in-progress",
+      version: 1,
       stages: [],
-      timestamp: "2026-09-05T00:00:00.000Z",
+      updatedAt: "2026-09-05T00:00:00.000Z",
       transition: {
         analysis: 1,
         kind: "round-started",
@@ -264,9 +268,13 @@ test("recoverFixRecords reconciles mixed legacy summaries, structured records, a
     },
     {
       attempt: 1,
-      mode: "manual",
+      mode: { autoFix: false },
+      runId: "mixed-recovery",
+      sequence: 2,
+      status: "in-progress",
+      version: 1,
       stages: [],
-      timestamp: "2026-09-05T00:01:00.000Z",
+      updatedAt: "2026-09-05T00:01:00.000Z",
       transition: {
         analysis: 1,
         fixAttempt: 0,
@@ -274,13 +282,19 @@ test("recoverFixRecords reconciles mixed legacy summaries, structured records, a
         round: 1,
         stage: "review",
         summary: "legacy repair",
+        approvedFindings: 0,
+        findingIds: ["legacy-issue"],
       },
     },
     {
       attempt: 1,
-      mode: "manual",
+      mode: { autoFix: false },
+      runId: "mixed-recovery",
+      sequence: 3,
+      status: "in-progress",
+      version: 1,
       stages: [],
-      timestamp: "2026-09-05T00:02:00.000Z",
+      updatedAt: "2026-09-05T00:02:00.000Z",
       transition: {
         analysis: 2,
         kind: "round-started",
@@ -291,9 +305,13 @@ test("recoverFixRecords reconciles mixed legacy summaries, structured records, a
     },
     {
       attempt: 1,
-      mode: "manual",
+      mode: { autoFix: false },
+      runId: "mixed-recovery",
+      sequence: 4,
+      status: "in-progress",
+      version: 1,
       stages: [],
-      timestamp: "2026-09-05T00:03:00.000Z",
+      updatedAt: "2026-09-05T00:03:00.000Z",
       transition: {
         analysis: 2,
         fixAttempt: 0,
@@ -301,6 +319,8 @@ test("recoverFixRecords reconciles mixed legacy summaries, structured records, a
         round: 2,
         stage: "review",
         summary: "new repair",
+        approvedFindings: 0,
+        findingIds: ["new-issue"],
       },
     },
   ];
@@ -328,9 +348,13 @@ test("recoverFixRecords retains unknown-provenance legacy summaries alongside st
   const snapshots: PresentationSnapshot[] = [
     {
       attempt: 1,
-      mode: "manual",
+      mode: { autoFix: false },
+      runId: "unknown-provenance",
+      sequence: 1,
+      status: "in-progress",
+      version: 1,
       stages: [],
-      timestamp: "2026-09-05T00:03:00.000Z",
+      updatedAt: "2026-09-05T00:03:00.000Z",
       transition: {
         analysis: 2,
         fixAttempt: 0,
@@ -338,6 +362,8 @@ test("recoverFixRecords retains unknown-provenance legacy summaries alongside st
         round: 2,
         stage: "review",
         summary: "new structured repair",
+        approvedFindings: 0,
+        findingIds: ["d2"],
       },
     },
   ];
@@ -395,9 +421,13 @@ test("recoverFixRecords handles repeated identical summary strings preserving ex
   const snapshots: PresentationSnapshot[] = [
     {
       attempt: 1,
-      mode: "manual",
+      mode: { autoFix: false },
+      runId: "repeated-summaries",
+      sequence: 1,
+      status: "in-progress",
+      version: 1,
       stages: [],
-      timestamp: "2026-09-05T00:00:00.000Z",
+      updatedAt: "2026-09-05T00:00:00.000Z",
       transition: {
         analysis: 1,
         kind: "round-started",
@@ -408,9 +438,13 @@ test("recoverFixRecords handles repeated identical summary strings preserving ex
     },
     {
       attempt: 1,
-      mode: "manual",
+      mode: { autoFix: false },
+      runId: "repeated-summaries",
+      sequence: 2,
+      status: "in-progress",
+      version: 1,
       stages: [],
-      timestamp: "2026-09-05T00:01:00.000Z",
+      updatedAt: "2026-09-05T00:01:00.000Z",
       transition: {
         analysis: 1,
         fixAttempt: 0,
@@ -418,13 +452,19 @@ test("recoverFixRecords handles repeated identical summary strings preserving ex
         round: 1,
         stage: "review",
         summary: "fixed duplicate issue",
+        approvedFindings: 0,
+        findingIds: ["duplicate-issue"],
       },
     },
     {
       attempt: 1,
-      mode: "manual",
+      mode: { autoFix: false },
+      runId: "repeated-summaries",
+      sequence: 3,
+      status: "in-progress",
+      version: 1,
       stages: [],
-      timestamp: "2026-09-05T00:02:00.000Z",
+      updatedAt: "2026-09-05T00:02:00.000Z",
       transition: {
         analysis: 2,
         kind: "round-started",
@@ -435,9 +475,13 @@ test("recoverFixRecords handles repeated identical summary strings preserving ex
     },
     {
       attempt: 1,
-      mode: "manual",
+      mode: { autoFix: false },
+      runId: "repeated-summaries",
+      sequence: 4,
+      status: "in-progress",
+      version: 1,
       stages: [],
-      timestamp: "2026-09-05T00:03:00.000Z",
+      updatedAt: "2026-09-05T00:03:00.000Z",
       transition: {
         analysis: 2,
         fixAttempt: 0,
@@ -445,6 +489,8 @@ test("recoverFixRecords handles repeated identical summary strings preserving ex
         round: 2,
         stage: "review",
         summary: "fixed duplicate issue",
+        approvedFindings: 0,
+        findingIds: ["duplicate-issue"],
       },
     },
   ];
