@@ -30,7 +30,7 @@ Complexity review: shared finding rendering replaces duplication; canonical sele
   EVIDENCE: coderabbit review --base main --agent completed once without a timeout on 1ecf56a; one finding at scripts/tui.ts:1850 partially confirmed and repaired by clearing stale retry errors before confirmation. Regression assertion added; local review will not be rerun.
 
 - [x] G6: Worktree-local Orca No-Mistakes gate delivers the committed changes and creates the PR
-  EVIDENCE: Worktree-local gate published 6e677cfda91265ca41f9e11cf72d5cbed78ec495 to PR https://github.com/Filamess/orca-no-mistakes/pull/65; review, test, document, lint and push stages passed, and GitHub test check passed. Pipeline is waiting for merge.
+  EVIDENCE: Worktree-local gate published 6e677cfda91265ca41f9e11cf72d5cbed78ec495 to PR https://github.com/Filamess/orca-no-mistakes/pull/65; review, test, document, lint and push stages passed, and GitHub test check passed. Pipeline later stopped with user approval after the direct review-fix push advanced the PR beyond its bound head; recovery ref refs/no-mistakes/recover/run_fc76d98e2ca0 is preserved.
 
-- [ ] G7: PR title starts with ONM-93 and remote CodeRabbit review reports no issues after one request per cycle
-  EVIDENCE: pending
+- [x] G7: PR title starts with ONM-93 and remote CodeRabbit review reports no issues after one request per cycle
+  EVIDENCE: PR 65 has the ONM-93 title prefix. CodeRabbit cycle two approved e4c7f83b77d0bbf60a9e176882c1e1a72a744b75 with no actionable comments, all five pre-merge checks passed, and the sole finding resolved. Exactly one request was sent per remote cycle. GitHub test passed. GATES.md is excluded from CodeRabbit review.
