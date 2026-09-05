@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -8,18 +8,30 @@ import test from "node:test";
 const root = path.resolve(import.meta.dirname, "..");
 const executable = path.join(root, "bin", "orca-no-mistakes");
 
-async function submit(report: unknown, outsideArtifacts = false) {
+async function submit(report: unknown, outsideArtifacts = false, link?: "home" | "artifacts" | "run" | "report") {
   const temp = await mkdtemp(path.join(tmpdir(), "onm-worker-report-"));
+  const home = link === "home" ? path.join(temp, "linked-home") : temp;
+  if (link === "home") await symlink(temp, home, "dir");
   const out = outsideArtifacts
     ? path.join(temp, "review.json")
-    : path.join(temp, "artifacts", "run", "review.json");
+    : path.join(home, "artifacts", "run", "review.json");
   await mkdir(path.dirname(out), { recursive: true });
+  if (link === "artifacts" || link === "run") {
+    const parent = link === "artifacts" ? path.join(home, "artifacts") : path.dirname(out);
+    const target = path.join(temp, "relocated-evidence");
+    await rename(parent, target);
+    await symlink(target, parent, "dir");
+  } else if (link === "report") {
+    const target = path.join(temp, "outside.json");
+    await writeFile(target, "unchanged");
+    await symlink(target, out);
+  }
   const child = spawn(
     executable,
     ["report", "--stage", "review", "--role", "reviewer", "--out", out],
     {
       cwd: root,
-      env: { ...process.env, ORCA_NO_MISTAKES_HOME: temp },
+      env: { ...process.env, ORCA_NO_MISTAKES_HOME: home },
       stdio: ["pipe", "pipe", "pipe"],
     },
   );
@@ -81,3 +93,23 @@ test("worker report command rejects output outside its artifact root", async () 
     await rm(result.temp, { force: true, recursive: true });
   }
 });
+
+for (const link of ["home", "artifacts", "run", "report"] as const) {
+  test(`worker report symlink boundary: ${link}`, async () => {
+    const report = { findings: [], summary: "valid report" };
+    const result = await submit(report, false, link);
+    try {
+      if (link === "home" || link === "artifacts") {
+        assert.equal(result.code, 0, result.stderr);
+        assert.deepEqual(JSON.parse(await readFile(result.out, "utf8")), report);
+      } else {
+        assert.equal(result.code, 1);
+        assert.match(result.stderr, /symlink/u);
+        if (link === "report") assert.equal(await readFile(result.out, "utf8"), "unchanged");
+        else await assert.rejects(readFile(result.out), { code: "ENOENT" });
+      }
+    } finally {
+      await rm(result.temp, { force: true, recursive: true });
+    }
+  });
+}

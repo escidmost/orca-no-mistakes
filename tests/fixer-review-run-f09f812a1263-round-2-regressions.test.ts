@@ -64,6 +64,7 @@ test("branchIntents bounds accumulated intents to current branch incarnation aft
   const temp = await mkdtemp(path.join(tmpdir(), "onm-branch-intents-"));
   const dbPath = path.join(temp, "ledger.sqlite");
   const ledger = new DomainLedger(dbPath);
+  let db: DatabaseSync | undefined;
   try {
     const repoRoot = "/repo";
     const branch = "feature";
@@ -109,7 +110,7 @@ test("branchIntents bounds accumulated intents to current branch incarnation aft
       subject: "github.com/owner/repo#101",
     });
 
-    const db = new DatabaseSync(dbPath);
+    db = new DatabaseSync(dbPath);
     db.prepare(
       `INSERT INTO remote_receipts (
          receipt_id, run_id, kind, candidate_commit_oid,
@@ -144,6 +145,7 @@ test("branchIntents bounds accumulated intents to current branch incarnation aft
     const intentsNoRunId = ledger.branchIntents(repoRoot, branch);
     assert.deepEqual(intentsNoRunId, ["Second incarnation intent"]);
   } finally {
+    db?.close();
     ledger.close();
     await rm(temp, { force: true, recursive: true });
   }

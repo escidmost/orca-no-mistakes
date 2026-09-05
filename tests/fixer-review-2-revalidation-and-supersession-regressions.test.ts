@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import type { StageName } from "../scripts/config.ts";
 import {
   DomainLedger,
   type Finding,
@@ -113,7 +114,7 @@ test("finalContiguousCheckpointByStage handles supersessions and retains histori
     { created_at: "2026-01-01T00:00:06Z", input_commit_oid: headB, output_commit_oid: headB, round_index: 0, run_id: "run", stage_id: "lint" },
   ];
 
-  const evidence = [
+  const evidence: { candidateCommitOid: string; roundIndex: number; stage: StageName }[] = [
     { candidateCommitOid: headB, roundIndex: 1, stage: "review" },
     { candidateCommitOid: headB, roundIndex: 1, stage: "test" },
     { candidateCommitOid: headB, roundIndex: 1, stage: "document" },
@@ -129,6 +130,14 @@ test("finalContiguousCheckpointByStage handles supersessions and retains histori
   assert.equal(result.get("document")?.round_index, 1);
   assert.equal(result.get("lint")?.output_commit_oid, headB);
   assert.equal(result.get("lint")?.round_index, 0);
+
+  const evidenceByStage: ReadonlyMap<StageName, { candidate_commit_oid: string; round_index: number }> = new Map(
+    evidence.map((entry) => [entry.stage, { candidate_commit_oid: entry.candidateCommitOid, round_index: entry.roundIndex }]),
+  );
+  assert.deepEqual(
+    finalContiguousCheckpointByStage(stageIds, checkpoints, submission, evidenceByStage),
+    result,
+  );
 });
 
 test("settleRemoteStage supports explicit supersession of historical open managed-comment PR settlement", () => {

@@ -272,7 +272,7 @@ export function finalContiguousCheckpointByStage(
       for (const [key, val] of (evidenceByStage as Map<string, any>).entries()) {
         if (!val) continue
         const candidateCommitOid = val.candidate_commit_oid ?? val.candidateCommitOid
-        const roundIndex = val.round_index ?? val.roundIndex ?? val.round
+        const roundIndex = val.round_index ?? val.roundIndex
         if (candidateCommitOid !== undefined && roundIndex !== undefined) {
           expectedByStage.set(key, { candidateCommitOid, roundIndex })
         }
@@ -282,7 +282,7 @@ export function finalContiguousCheckpointByStage(
         if (!item) continue
         const stageId = item.stage_id ?? item.stage
         const candidateCommitOid = item.candidate_commit_oid ?? item.candidateCommitOid
-        const roundIndex = item.round_index ?? item.roundIndex ?? item.round
+        const roundIndex = item.round_index ?? item.roundIndex
         if (stageId && candidateCommitOid !== undefined && roundIndex !== undefined) {
           expectedByStage.set(stageId, { candidateCommitOid, roundIndex })
         }

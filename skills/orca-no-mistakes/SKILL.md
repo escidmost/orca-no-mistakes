@@ -52,6 +52,7 @@ A `fix` resolution supports targeted finding selection and global guidance:
 
 - Plain text syntax: `fix: id1, id2: guidance` or `fix [id1,id2] - guidance`.
 - Resolving with `fix` without IDs targets all actionable findings. When explicit IDs are selected, unselected open findings are immediately approved for the current candidate rather than deferred (see [Findings and gates](../../docs/current-architecture.md#findings-and-gates)).
+- Before sending explicit IDs, escalate every actionable `ask-user` finding, including any you intend to leave unselected. Obtain an explicit fix or approve-as-is decision for each; do not send a targeted resolution while any such decision is outstanding. Omitting an `ask-user` ID is an approval, not a way to defer its decision.
 - Copy IDs exactly from the gate question. If none of the supplied IDs match a reported finding, the run stops with `<stage> fix gate resolved with no matching findings`.
 - Single-word guidance following `fix` without brackets (e.g. `fix urgently`) is parsed as a finding ID candidate and can fail closed if no such finding exists. For global guidance across all findings, use bracket syntax (e.g. `fix [] - urgently`) or multi-word text (e.g. `fix please handle urgently`).
 

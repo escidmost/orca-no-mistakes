@@ -1004,7 +1004,7 @@ if (process.env.TUI_FIXTURE === "1") {
       assert.match(lines[0], /Review \d+:\d+\s+auto-fix off/u);
       if (columns === 140) assert.match(lines[0], /run \d+:\d+  $/u);
       assert.equal(lines[2].length, columns);
-      assert.equal(lines[2].search(/[│|]/u), Math.min(64, Math.floor(columns * 0.46)) + 1);
+      assert.equal(lines[2].search(/[│|]/u), columns === 100 ? 47 : 65);
       assert.match(lines[2], /REVIEW/u);
     }
   });

@@ -197,8 +197,10 @@ test('pullRequestArtifacts rejects symlinks and fifos without hanging', async ()
     await symlink(outsideFile, symlinkPath)
 
     const fifoPath = path.join(directory, 'fifo.pipe')
+    let fifoCreated = false
     try {
       execSync(`mkfifo "${fifoPath}"`)
+      fifoCreated = true
     } catch {
       // mkfifo might not be supported in some restricted environments
     }
@@ -208,12 +210,12 @@ test('pullRequestArtifacts rejects symlinks and fifos without hanging', async ()
 
     const artifactDigests = {
       'symlink.txt': createHash('sha256').update('outside-content').digest('hex'),
-      'fifo.pipe': createHash('sha256').update('').digest('hex'),
+      ...(fifoCreated ? { 'fifo.pipe': createHash('sha256').update('').digest('hex') } : {}),
       'valid.txt': createHash('sha256').update('valid-artifact-content').digest('hex')
     }
     const artifacts = await pullRequestArtifacts(directory, {
       artifactDigests,
-      artifacts: ['symlink.txt', 'fifo.pipe', 'valid.txt'],
+      artifacts: ['symlink.txt', ...(fifoCreated ? ['fifo.pipe'] : []), 'valid.txt'],
       findings: [],
       summary: 'test'
     }, { trustedPublicationApprovals: Object.values(artifactDigests) })
@@ -221,6 +223,7 @@ test('pullRequestArtifacts rejects symlinks and fifos without hanging', async ()
     assert.equal(artifacts.length, 1)
     assert.equal(artifacts[0]?.name, 'Valid')
     assert.equal(artifacts[0]?.content, 'valid-artifact-content')
+    if (fifoCreated) assert.ok(!artifacts.some((artifact) => artifact.name === 'Fifo'))
   } finally {
     await rm(directory, { force: true, recursive: true })
     await rm(outside, { force: true, recursive: true })

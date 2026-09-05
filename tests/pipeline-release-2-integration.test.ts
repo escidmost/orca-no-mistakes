@@ -164,6 +164,13 @@ async function runRelease2Pipeline(failAfter?: 'push' | 'pr'): Promise<void> {
     assert.equal(ledger.runStatus(result.runId), 'passed')
     assert.ok(ledger.remoteReceipt(result.runId, 'candidate-publication'))
     assert.ok(ledger.remoteReceipt(result.runId, 'pull-request-binding'))
+    if (failAfter === 'pr') {
+      const receipt = ledger.remoteReceipt(result.runId, 'pull-request-binding')!
+      const payload = JSON.parse(receipt.receipt_json)
+      assert.equal(payload.state, 'merged')
+      assert.notEqual(payload.pipelineEvidenceRoot, result.completionAttestation!.pipelineEvidenceRoot)
+      assert.doesNotThrow(() => ledger!.verifyRetainedCompletionAttestation(result.completionAttestation!))
+    }
     assert.equal(ledger.stageDispositions(result.runId).length, PIPELINE_STEPS.length)
     assert.equal(git(remote, 'rev-parse', 'refs/heads/feature'), candidate)
     assert.equal(pushCount, 1)

@@ -80,67 +80,70 @@ test('rebase gate-resolved fix followed by stage-completed does not fabricate Re
   const output = new FakeOutput()
   const renderer = new RailTuiRenderer(input, output, '/unused')
 
-  const base = snapshot('rebase', 1)
-  renderer.render({
-    ...base,
-    transition: {
-      gateId: 'g-rebase',
-      kind: 'gate-opened',
-      options: ['fix', 'abort'],
-      question: 'Rebase decision needed',
-      round: 0,
-      stage: 'rebase'
-    }
-  })
-  await nextDraw()
-  let screen = cleanScreen(output.writes.at(-1) ?? '')
-  assert.match(screen, /Rebase decision needed/u)
+  try {
+    const base = snapshot('rebase', 1)
+    renderer.render({
+      ...base,
+      transition: {
+        gateId: 'g-rebase',
+        kind: 'gate-opened',
+        options: ['fix', 'abort'],
+        question: 'Rebase decision needed',
+        round: 0,
+        stage: 'rebase'
+      }
+    })
+    await nextDraw()
+    let screen = cleanScreen(output.writes.at(-1) ?? '')
+    assert.match(screen, /Rebase decision needed/u)
 
-  // Gate resolved as fix (generic decision without fixer round)
-  renderer.render({
-    ...base,
-    transition: {
-      decision: 'fix',
-      gateId: 'g-rebase',
-      kind: 'gate-resolved',
-      round: 0,
-      stage: 'rebase'
-    }
-  })
-  await nextDraw()
-  screen = cleanScreen(output.writes.at(-1) ?? '')
-  assert.match(screen, /Rebase fix/u)
-  assert.doesNotMatch(screen, /Rebase fix 1/u)
+    // Gate resolved as fix (generic decision without fixer round)
+    renderer.render({
+      ...base,
+      transition: {
+        decision: 'fix',
+        gateId: 'g-rebase',
+        kind: 'gate-resolved',
+        round: 0,
+        stage: 'rebase'
+      }
+    })
+    await nextDraw()
+    screen = cleanScreen(output.writes.at(-1) ?? '')
+    assert.match(screen, /Rebase fix/u)
+    assert.doesNotMatch(screen, /Rebase fix 1/u)
 
-  // Stage completes with cleared/fixed findings on the rerun
-  const stageStateWithFixed = {
-    ...base,
-    stages: base.stages.map((s) =>
-      s.id === 'rebase'
-        ? {
-            ...s,
-            fixedFindings: 1,
-            status: 'passed' as const,
-            totalFindings: 1
-          }
-        : s
-    )
+    // Stage completes with cleared/fixed findings on the rerun
+    const stageStateWithFixed = {
+      ...base,
+      stages: base.stages.map((s) =>
+        s.id === 'rebase'
+          ? {
+              ...s,
+              fixedFindings: 1,
+              status: 'passed' as const,
+              totalFindings: 1
+            }
+          : s
+      )
+    }
+
+    renderer.render({
+      ...stageStateWithFixed,
+      transition: {
+        kind: 'stage-completed',
+        round: 0,
+        stage: 'rebase'
+      }
+    })
+    await nextDraw()
+    screen = cleanScreen(output.writes.at(-1) ?? '')
+    assert.match(screen, /Rebase fix/u)
+    assert.doesNotMatch(screen, /Rebase fix 1/u)
+    assert.doesNotMatch(screen, /Rebase fix.*fixed/u)
+  } finally {
+    renderer.close()
   }
-
-  renderer.render({
-    ...stageStateWithFixed,
-    transition: {
-      kind: 'stage-completed',
-      round: 0,
-      stage: 'rebase'
-    }
-  })
-  await nextDraw()
-  screen = cleanScreen(output.writes.at(-1) ?? '')
-  assert.match(screen, /Rebase fix/u)
-  assert.doesNotMatch(screen, /Rebase fix 1/u)
-  assert.doesNotMatch(screen, /Rebase fix.*fixed/u)
-  renderer.close()
 })
 
 test('rebase gate-resolved fix followed by findings reconciliation does not fabricate Rebase fix 1', async () => {
@@ -148,52 +151,55 @@ test('rebase gate-resolved fix followed by findings reconciliation does not fabr
   const output = new FakeOutput()
   const renderer = new RailTuiRenderer(input, output, '/unused')
 
-  const base = snapshot('rebase', 1)
-  renderer.render({
-    ...base,
-    transition: {
-      decision: 'fix',
-      gateId: 'g-rebase',
-      kind: 'gate-resolved',
-      round: 0,
-      stage: 'rebase'
-    }
-  })
-  await nextDraw()
-  let screen = cleanScreen(output.writes.at(-1) ?? '')
-  assert.match(screen, /Rebase fix/u)
-  assert.doesNotMatch(screen, /Rebase fix 1/u)
+  try {
+    const base = snapshot('rebase', 1)
+    renderer.render({
+      ...base,
+      transition: {
+        decision: 'fix',
+        gateId: 'g-rebase',
+        kind: 'gate-resolved',
+        round: 0,
+        stage: 'rebase'
+      }
+    })
+    await nextDraw()
+    let screen = cleanScreen(output.writes.at(-1) ?? '')
+    assert.match(screen, /Rebase fix/u)
+    assert.doesNotMatch(screen, /Rebase fix 1/u)
 
-  // Reconciled findings snapshot indicates fixed findings, but no fixer ever ran
-  const stageStateWithFixed = {
-    ...base,
-    stages: base.stages.map((s) =>
-      s.id === 'rebase'
-        ? {
-            ...s,
-            fixedFindings: 1,
-            totalFindings: 1
-          }
-        : s
-    )
+    // Reconciled findings snapshot indicates fixed findings, but no fixer ever ran
+    const stageStateWithFixed = {
+      ...base,
+      stages: base.stages.map((s) =>
+        s.id === 'rebase'
+          ? {
+              ...s,
+              fixedFindings: 1,
+              totalFindings: 1
+            }
+          : s
+      )
+    }
+
+    renderer.render({
+      ...stageStateWithFixed,
+      transition: {
+        actionable: 0,
+        kind: 'findings-recorded',
+        round: 0,
+        stage: 'rebase',
+        total: 1
+      }
+    })
+    await nextDraw()
+    screen = cleanScreen(output.writes.at(-1) ?? '')
+    assert.match(screen, /Rebase fix/u)
+    assert.doesNotMatch(screen, /Rebase fix 1/u)
+    assert.doesNotMatch(screen, /Rebase fix.*fixed/u)
+  } finally {
+    renderer.close()
   }
-
-  renderer.render({
-    ...stageStateWithFixed,
-    transition: {
-      actionable: 0,
-      kind: 'findings-recorded',
-      round: 0,
-      stage: 'rebase',
-      total: 1
-    }
-  })
-  await nextDraw()
-  screen = cleanScreen(output.writes.at(-1) ?? '')
-  assert.match(screen, /Rebase fix/u)
-  assert.doesNotMatch(screen, /Rebase fix 1/u)
-  assert.doesNotMatch(screen, /Rebase fix.*fixed/u)
-  renderer.close()
 })
 
 test('activity entry with explicit fix-completed metadata is correctly updated and verified', async () => {
@@ -201,86 +207,89 @@ test('activity entry with explicit fix-completed metadata is correctly updated a
   const output = new FakeOutput()
   const renderer = new RailTuiRenderer(input, output, '/unused')
 
-  const base = snapshot('review', 1)
-  renderer.render({
-    ...base,
-    transition: {
-      kind: 'round-started',
-      role: 'reviewer',
-      round: 0,
-      stage: 'review'
-    }
-  })
-  renderer.render({
-    ...base,
-    transition: {
-      actionable: 1,
-      kind: 'findings-recorded',
-      round: 0,
-      stage: 'review',
-      total: 1
-    }
-  })
-  renderer.render({
-    ...base,
-    transition: {
-      decision: 'fix',
-      gateId: 'g-review',
-      kind: 'gate-resolved',
-      round: 0,
-      stage: 'review'
-    }
-  })
-  renderer.render({
-    ...base,
-    transition: {
-      analysis: 1,
-      kind: 'round-started',
-      role: 'fixer',
-      round: 1,
-      stage: 'review'
-    }
-  })
-  renderer.render({
-    ...base,
-    transition: {
-      approvedFindings: 0,
-      findingIds: ['finding-1'],
-      kind: 'fix-completed',
-      round: 1,
-      stage: 'review'
-    }
-  })
+  try {
+    const base = snapshot('review', 1)
+    renderer.render({
+      ...base,
+      transition: {
+        kind: 'round-started',
+        role: 'reviewer',
+        round: 0,
+        stage: 'review'
+      }
+    })
+    renderer.render({
+      ...base,
+      transition: {
+        actionable: 1,
+        kind: 'findings-recorded',
+        round: 0,
+        stage: 'review',
+        total: 1
+      }
+    })
+    renderer.render({
+      ...base,
+      transition: {
+        decision: 'fix',
+        gateId: 'g-review',
+        kind: 'gate-resolved',
+        round: 0,
+        stage: 'review'
+      }
+    })
+    renderer.render({
+      ...base,
+      transition: {
+        analysis: 1,
+        kind: 'round-started',
+        role: 'fixer',
+        round: 1,
+        stage: 'review'
+      }
+    })
+    renderer.render({
+      ...base,
+      transition: {
+        approvedFindings: 0,
+        findingIds: ['finding-1'],
+        kind: 'fix-completed',
+        round: 1,
+        stage: 'review'
+      }
+    })
 
-  await nextDraw()
-  let screen = cleanScreen(output.writes.at(-1) ?? '')
-  assert.match(screen, /Review fix 1\s+· 1 fix applied/u)
+    await nextDraw()
+    let screen = cleanScreen(output.writes.at(-1) ?? '')
+    assert.match(screen, /Review fix 1\s+· 1 fix applied/u)
 
-  // Stage completed without re-analysis verifies the fix entry carrying explicit fix metadata
-  const withFixed = {
-    ...base,
-    stages: base.stages.map((s) =>
-      s.id === 'review'
-        ? {
-            ...s,
-            fixedFindings: 1,
-            status: 'passed' as const,
-            totalFindings: 1
-          }
-        : s
-    )
+    // Stage completed without re-analysis verifies the fix entry carrying explicit fix metadata
+    const withFixed = {
+      ...base,
+      stages: base.stages.map((s) =>
+        s.id === 'review'
+          ? {
+              ...s,
+              fixedFindings: 1,
+              status: 'passed' as const,
+              totalFindings: 1
+            }
+          : s
+      )
+    }
+    renderer.render({
+      ...withFixed,
+      transition: {
+        kind: 'stage-completed',
+        round: 0,
+        stage: 'review'
+      }
+    })
+
+    await nextDraw()
+    screen = cleanScreen(output.writes.at(-1) ?? '')
+    assert.match(screen, /Review fix 1\s+· 1 fixed/u)
+  } finally {
+    renderer.close()
   }
-  renderer.render({
-    ...withFixed,
-    transition: {
-      kind: 'stage-completed',
-      round: 0,
-      stage: 'review'
-    }
-  })
-
-  await nextDraw()
-  screen = cleanScreen(output.writes.at(-1) ?? '')
-  assert.match(screen, /Review fix 1\s+· 1 fixed/u)
-  renderer.close()
 })

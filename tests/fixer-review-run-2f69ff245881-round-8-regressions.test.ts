@@ -222,6 +222,49 @@ test("user findings sharing synthetic blocker ID are not retired", async () => {
     total: 1,
   });
 
+  const noChangeBlocker = {
+    action: "ask-user" as const,
+    description: "review fixer did not commit a change. Fixer summary: none. Select approve or skip if the original findings are not valid, or select them to retry.",
+    id: "fixer-no-change",
+    severity: "error" as const,
+  };
+  publisher.publish("fix-1", {
+    kind: "round-started",
+    role: "fixer",
+    round: 1,
+    stage: "review",
+    targetFindingIds: [userBlockerFinding.id],
+  });
+  publisher.publish("fix-1-blocked", {
+    actionable: 2,
+    findings: [userBlockerFinding, noChangeBlocker],
+    kind: "fix-blocked",
+    round: 1,
+    stage: "review",
+    total: 2,
+  });
+  const afterNoChange = publisher.current.stages.find((s) => s.id === "review");
+  assert.deepEqual(afterNoChange?.findings, [
+    { ...userBlockerFinding, disposition: "open" },
+    { ...noChangeBlocker, disposition: "open" },
+  ]);
+  assert.equal(afterNoChange?.openFindings, 2);
+  assert.equal(afterNoChange?.totalFindings, 2);
+
+  publisher.publish("gate-1-resolved", {
+    decision: "fix",
+    gateId: "g1",
+    kind: "gate-resolved",
+    round: 1,
+    stage: "review",
+  });
+  publisher.publish("fix-2", {
+    kind: "round-started",
+    role: "fixer",
+    round: 2,
+    stage: "review",
+  });
+
   const policyBlocker = {
     action: "ask-user" as const,
     description: "Fixer commit rejected by protected-path policy: changed guarded file. Select the original findings to retry them without protected-path changes.",
@@ -229,11 +272,12 @@ test("user findings sharing synthetic blocker ID are not retired", async () => {
     severity: "error" as const,
   };
 
-  publisher.publish("fix-1-blocked", {
+  publisher.publish("fix-2-blocked", {
     actionable: 2,
-    findings: [userBlockerFinding, policyBlocker],
+    // Omit the reviewer finding so re-adding it cannot hide ID-only retirement.
+    findings: [policyBlocker],
     kind: "fix-blocked",
-    round: 1,
+    round: 2,
     stage: "review",
     total: 2,
   });
@@ -245,6 +289,13 @@ test("user findings sharing synthetic blocker ID are not retired", async () => {
   assert.ok(preservedUserFinding);
   assert.equal(preservedUserFinding.id, "fixer-no-change");
   assert.equal(preservedUserFinding.disposition, "open");
+  assert.deepEqual(stage?.findings, [
+    { ...userBlockerFinding, disposition: "open" },
+    { ...policyBlocker, disposition: "open" },
+  ]);
+  assert.equal(stage?.actionableFindings, 2);
+  assert.equal(stage?.fixedFindings, 0);
+  assert.equal(stage?.approvedFindings, 0);
 });
 
 test("recoverFixRecords reconciles mixed legacy summaries, structured records, and durable snapshot transitions", () => {

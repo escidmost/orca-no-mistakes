@@ -137,7 +137,7 @@ test('init refuses to re-route the repository gate from a linked worktree', asyn
   }
 })
 
-test('init reuses the repository gate while configuring a linked worktree', async () => {
+test('init reuses the repository gate while configuring a linked worktree', async (t) => {
   const fixture = await gateFixture('onm-init-linked-route-', 'Configure this branch without rerouting the gate.')
   try {
     const worktree = path.join(fixture.temp, 'worktree-b')
@@ -147,7 +147,11 @@ test('init reuses the repository gate while configuring a linked worktree', asyn
       'utf8'
     )
 
+    const output = t.mock.method(console, 'log', () => {})
     await main(['init', '--repo', worktree])
+    const reported = JSON.parse(output.mock.calls.at(-1)!.arguments[0])
+    strictEqual(reported.repo, await realpath(worktree))
+    strictEqual(reported.gate, fixture.metadata.gatePath)
 
     const metadataAfter = await readFile(path.join(fixture.metadata.stateDir, 'gate.json'), 'utf8')
     strictEqual(metadataAfter, metadataBefore)

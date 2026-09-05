@@ -3177,6 +3177,7 @@ export async function runPipeline(
                   )
                 ? "medium"
                 : "low";
+            const stageSnapshots = presentation.store.listPresentationSnapshots(runId);
             const pipelineReportSteps: PullRequestPipelineStep[] = pipelineSteps
               .slice(0, pipelineSteps.indexOf("pr"))
               .map((completedStage) => {
@@ -3189,7 +3190,6 @@ export async function runPipeline(
                 const stageState = presentation.current.stages.find(
                   (candidate) => candidate.id === completedStage,
                 );
-                const stageSnapshots = presentation.store.listPresentationSnapshots(runId);
                 const stageFixes = recoverFixRecords(
                   completedStage,
                   stageState,
@@ -3240,19 +3240,6 @@ export async function runPipeline(
                 .map((value) => value.trim())
                 .filter(Boolean),
             )].join("\n\n");
-            const trustedPublicationApprovals = new Set<string>(
-              options.trustedArtifactDigests ?? [],
-            );
-            for (const audit of ledger.listGateAudit(runId)) {
-              if (
-                audit.resolved_at !== null &&
-                (audit.decision === "approve" || audit.decision === "publish-artifact") &&
-                audit.resolution === "publish-artifact" &&
-                audit.evidence_sha256
-              ) {
-                trustedPublicationApprovals.add(audit.evidence_sha256);
-              }
-            }
             content = pullRequestContent(branchIntent || intent, {
               candidateCommitOid: stageInputCommitOid,
               pipelineSteps: pipelineReportSteps,
@@ -3267,7 +3254,7 @@ export async function runPipeline(
                 artifacts: await pullRequestArtifacts(
                   artifactsDir,
                   testReport,
-                  trustedPublicationApprovals,
+                  options.trustedArtifactDigests,
                 ),
                 summary:
                   testReport?.summary ??
@@ -15368,8 +15355,8 @@ async function assertNoSymlinkParentChain(rootPath: string, targetPath: string):
     throw new Error("report --out must be inside the orca-no-mistakes artifacts directory");
   }
   let current = root;
-  for (const component of ["", ...relative.split(path.sep).filter(Boolean)]) {
-    if (component) current = path.join(current, component);
+  for (const component of relative.split(path.sep).filter(Boolean)) {
+    current = path.join(current, component);
     let entry: Awaited<ReturnType<typeof lstat>>;
     try {
       entry = await lstat(current);

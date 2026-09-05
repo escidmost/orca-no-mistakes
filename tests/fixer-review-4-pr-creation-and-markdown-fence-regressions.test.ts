@@ -12,44 +12,10 @@ import {
   pullRequestContent,
   type PullRequestReport
 } from '../scripts/pull-request.ts'
+import { assertStructurallyVisible } from './markdown-visibility.ts'
 
 const OID = 'a'.repeat(40)
 const content = { body: 'complete body', title: 'feat: complete report' }
-
-function assertStructurallyVisible(body: string, targetPrefix: string): void {
-  const lines = body.split(/\r?\n/)
-  let currentFence: { char: string; length: number } | null = null
-  let found = false
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i]
-    if (!currentFence) {
-      if (line.startsWith(targetPrefix)) {
-        found = true
-        return
-      }
-      const match = line.match(/^[ ]{0,3}(`{3,}|~{3,})(.*)$/)
-      if (match) {
-        const fenceStr = match[1]
-        const fenceChar = fenceStr[0]
-        const rest = match[2]
-        if (fenceChar === '`' && !rest.includes('`')) {
-          currentFence = { char: fenceChar, length: fenceStr.length }
-        } else if (fenceChar === '~' && !rest.includes('~')) {
-          currentFence = { char: fenceChar, length: fenceStr.length }
-        }
-      }
-    } else {
-      const escapedChar = currentFence.char === '`' ? '`' : '~'
-      const closeRegex = new RegExp(`^[ ]{0,3}${escapedChar}{${currentFence.length},}[ \\t]*$`)
-      if (closeRegex.test(line)) {
-        currentFence = null
-      }
-    }
-  }
-
-  assert.ok(found, `Expected "${targetPrefix}" to be structurally visible outside any code fences`)
-}
 
 test('bindPullRequest captures createPullRequest with draft: false and settles after merge', async () => {
   const settlements: Array<Record<string, unknown>> = []

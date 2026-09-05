@@ -1679,7 +1679,7 @@ test("protected fixer commits are rejected at a resumable human gate", async () 
     orca.gates[1].question,
     /fixer modified pre-existing test files: tests\/existing\.test\.ts/,
   );
-  assert.doesNotMatch(orca.gates[1].question, /"id":"review-2"/);
+  assert.doesNotMatch(orca.gates[1].question, /"id"\s*:\s*"review-2"/);
   assert.equal(
     orca.launches.filter((launch) => launch.role === "fixer").length,
     2,

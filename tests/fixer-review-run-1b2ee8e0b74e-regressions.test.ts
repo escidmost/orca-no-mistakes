@@ -301,8 +301,9 @@ test("invalid finding error message is structural and does not disclose payload 
   );
 });
 
-test("selective fixes distinguish targeted fixes from approved findings", async () => {
+test("selective fixes distinguish targeted fixes from approved findings", async (t) => {
   const ledger = new DomainLedger(":memory:");
+  t.after(() => ledger.close());
   const runId = "selective-fix-glyphs";
   ledger.startRun({
     baseBranch: "main",
@@ -360,16 +361,26 @@ test("selective fixes distinguish targeted fixes from approved findings", async 
     targetFindingIds: ["finding-fix"],
   });
 
-  const input = new FakeInput();
-  const output = new FakeOutput();
-  const renderer = new RailTuiRenderer(input, output, "/unused");
+  const previousLocale = process.env.LC_ALL;
+  t.after(() => {
+    if (previousLocale === undefined) delete process.env.LC_ALL;
+    else process.env.LC_ALL = previousLocale;
+  });
+  for (const [locale, fixing, approved] of [
+    ["C.UTF-8", /F\s+finding-fix/, /~\s+finding-leave/],
+    ["C", /\[F\]\s+finding-fix/, /\[approved\]\s+finding-leave/],
+  ] as const) {
+    process.env.LC_ALL = locale;
+    const input = new FakeInput();
+    const output = new FakeOutput();
+    const renderer = new RailTuiRenderer(input, output, "/unused");
+    t.after(() => renderer.close());
 
-  renderer.render(publisher.current);
-  await new Promise((resolve) => setImmediate(resolve));
+    renderer.render(publisher.current);
+    await new Promise((resolve) => setImmediate(resolve));
 
-  const screen = cleanScreen(output.writes.at(-1) ?? "");
-  assert.match(screen, /F\s+finding-fix/);
-  assert.match(screen, /~\s+finding-leave/);
-
-  renderer.close();
+    const screen = cleanScreen(output.writes.at(-1) ?? "");
+    assert.match(screen, fixing);
+    assert.match(screen, approved);
+  }
 });

@@ -154,39 +154,43 @@ test("reviewer report with unsupported severity critical receives bounded REPORT
   const runId = "run-unsupported-severity-repair";
   const orca = new FakeOrca(runId);
   const ledger = new DomainLedger(":memory:");
-  const invalidReport = {
-    findings: [
-      {
-        action: "auto-fix",
-        description: "Actionable finding with unsupported critical severity",
-        id: "unsupported-sev-1",
-        severity: "critical",
-      } as unknown as Finding,
-    ],
-    summary: "invalid reviewer report with unsupported severity",
-  };
-  orca.reports.set("review", [invalidReport, pass("review")]);
+  try {
+    const invalidReport = {
+      findings: [
+        {
+          action: "auto-fix",
+          description: "Actionable finding with unsupported critical severity",
+          id: "unsupported-sev-1",
+          severity: "critical",
+        } as unknown as Finding,
+      ],
+      summary: "invalid reviewer report with unsupported severity",
+    };
+    orca.reports.set("review", [invalidReport, pass("review")]);
 
-  await runPipeline(
-    { intent: "Handle report repair when unsupported severity is rejected" },
-    orca,
-    git,
-    ledger,
-  );
+    await runPipeline(
+      { intent: "Handle report repair when unsupported severity is rejected" },
+      orca,
+      git,
+      ledger,
+    );
 
-  const reviewTasks = orca.tasks.filter((task) =>
-    task.spec.startsWith("[review check 1]"),
-  );
-  assert.equal(reviewTasks.length, 2);
-  assert.match(reviewTasks[1].spec, /REPORT REPAIR/);
+    const reviewTasks = orca.tasks.filter((task) =>
+      task.spec.startsWith("[review check 1]"),
+    );
+    assert.equal(reviewTasks.length, 2);
+    assert.match(reviewTasks[1].spec, /REPORT REPAIR/);
 
-  const evidenceList = ledger.listEvidence(runId);
-  const reviewEvidence = evidenceList.filter((entry) => entry.stage_id === "review");
-  assert.equal(reviewEvidence.length, 1);
-  assert.equal(reviewEvidence[0].summary, "review passed");
-  assert.equal(reviewEvidence[0].findings_json, "[]");
-  assert.ok(!reviewEvidence[0].findings_json.includes("unsupported-sev-1"));
-  assert.ok(!reviewEvidence[0].findings_json.includes("critical"));
+    const evidenceList = ledger.listEvidence(runId);
+    const reviewEvidence = evidenceList.filter((entry) => entry.stage_id === "review");
+    assert.equal(reviewEvidence.length, 1);
+    assert.equal(reviewEvidence[0].summary, "review passed");
+    assert.equal(reviewEvidence[0].findings_json, "[]");
+    assert.ok(!reviewEvidence[0].findings_json.includes("unsupported-sev-1"));
+    assert.ok(!reviewEvidence[0].findings_json.includes("critical"));
+  } finally {
+    ledger.close();
+  }
 });
 
 test("repeated invalid severity exhausts bounded repair and fails closed with structural diagnostic", async () => {
@@ -194,49 +198,53 @@ test("repeated invalid severity exhausts bounded repair and fails closed with st
   const runId = "run-repeated-unsupported-severity";
   const orca = new FakeOrca(runId);
   const ledger = new DomainLedger(":memory:");
-  const invalidReport = {
-    findings: [
-      {
-        action: "auto-fix",
-        description: "Repeated finding with unsupported critical severity",
-        id: "unsupported-sev-repeated",
-        severity: "critical",
-      } as unknown as Finding,
-    ],
-    summary: "repeated invalid reviewer report with unsupported severity",
-  };
-  orca.reports.set("review", [invalidReport, invalidReport, invalidReport]);
+  try {
+    const invalidReport = {
+      findings: [
+        {
+          action: "auto-fix",
+          description: "Repeated finding with unsupported critical severity",
+          id: "unsupported-sev-repeated",
+          severity: "critical",
+        } as unknown as Finding,
+      ],
+      summary: "repeated invalid reviewer report with unsupported severity",
+    };
+    orca.reports.set("review", [invalidReport, invalidReport, invalidReport]);
 
-  await assert.rejects(
-    runPipeline(
-      { intent: "Fail closed when unsupported severity repair exhausts" },
-      orca,
-      git,
-      ledger,
-    ),
-    (error: unknown) => {
-      assert.ok(error instanceof Error);
-      assert.match(
-        error.message,
-        /review worker returned an invalid finding: index 0/u,
-      );
-      assert.match(error.message, /invalid fields: severity/u);
-      assert.match(
-        error.message,
-        /Allowed severities: error, warning, info, no-op/u,
-      );
-      return true;
-    },
-  );
+    await assert.rejects(
+      runPipeline(
+        { intent: "Fail closed when unsupported severity repair exhausts" },
+        orca,
+        git,
+        ledger,
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(
+          error.message,
+          /review worker returned an invalid finding: index 0/u,
+        );
+        assert.match(error.message, /invalid fields: severity/u);
+        assert.match(
+          error.message,
+          /Allowed severities: error, warning, info, no-op/u,
+        );
+        return true;
+      },
+    );
 
-  const reviewTasks = orca.tasks.filter((task) =>
-    task.spec.startsWith("[review check 1]"),
-  );
-  assert.equal(reviewTasks.length, 3);
-  assert.match(reviewTasks[1].spec, /REPORT REPAIR/);
-  assert.match(reviewTasks[2].spec, /REPORT REPAIR/);
+    const reviewTasks = orca.tasks.filter((task) =>
+      task.spec.startsWith("[review check 1]"),
+    );
+    assert.equal(reviewTasks.length, 3);
+    assert.match(reviewTasks[1].spec, /REPORT REPAIR/);
+    assert.match(reviewTasks[2].spec, /REPORT REPAIR/);
 
-  const evidenceList = ledger.listEvidence(runId);
-  const reviewEvidence = evidenceList.filter((entry) => entry.stage_id === "review");
-  assert.equal(reviewEvidence.length, 0);
+    const evidenceList = ledger.listEvidence(runId);
+    const reviewEvidence = evidenceList.filter((entry) => entry.stage_id === "review");
+    assert.equal(reviewEvidence.length, 0);
+  } finally {
+    ledger.close();
+  }
 });

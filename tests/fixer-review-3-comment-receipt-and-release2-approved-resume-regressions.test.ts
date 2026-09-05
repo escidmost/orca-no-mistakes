@@ -4,11 +4,13 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import {
+  GithubAuthorityError,
   type GithubAuthority,
   type GithubIssueCommentObservation,
   type GithubPullRequestObservation
 } from '../scripts/github.ts'
 import { DomainLedger, evidenceSha256, sha256 } from '../scripts/ledger.ts'
+import { bindPullRequest, PullRequestBindingError } from '../scripts/pull-request.ts'
 import {
   DomainLedger as ExportedDomainLedger,
   installAbortReaping,
@@ -231,6 +233,50 @@ async function setupLedgerWithSettledPush(home: string, runId: string, intent: s
   })
   return { ledger }
 }
+
+test('rejects an indeterminate PR update when authoritative post-read still has the old body and title', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'onm-pr-update-unproven-'))
+  const runId = 'unproven-pr-update'
+  const { ledger } = await setupLedgerWithSettledPush(home, runId, 'Reject an unproven PR update.')
+  const calls: string[] = []
+  const pullRequest = pullRequestFixture()
+  const authority = {
+    createPullRequest: async () => assert.fail('unexpected PR creation'),
+    observePullRequests: async () => {
+      calls.push('observe')
+      return { exact: pullRequest, nearMatches: [] }
+    },
+    updatePullRequest: async () => {
+      calls.push('update')
+      throw new GithubAuthorityError('mutation-indeterminate', 'update-pull-request', 'disconnected')
+    }
+  }
+  try {
+    const generationToken = startNextAttempt(ledger, runId, 'att-pr-update')
+    await assert.rejects(
+      bindPullRequest({
+        artifactPath: path.join(home, 'pr.json'),
+        attemptId: 'att-pr-update',
+        authority,
+        candidateCommitOid: OID,
+        content: { body: 'complete pipeline report', title: 'feat: complete report' },
+        generationToken,
+        ledger,
+        pipelineEvidenceRoot: sha256('pipeline'),
+        runId,
+        sleep: async () => assert.fail('unproven update must not wait for merge'),
+        workerIdentity: 'coordinator'
+      }),
+      (error: unknown) => error instanceof PullRequestBindingError &&
+        /pull-request body update was not proven by the authoritative post-read/.test(error.message)
+    )
+    assert.deepEqual(calls, ['observe', 'update', 'observe'])
+    assert.equal(ledger.remoteReceipt(runId, 'pull-request-binding'), undefined)
+  } finally {
+    ledger.close()
+    await rm(home, { force: true, recursive: true })
+  }
+})
 
 class FailAfterApprovalLedgerR2 extends ExportedDomainLedger {
   #failReviewCheckpoint = true

@@ -84,6 +84,7 @@ test('branchIntents orders by rowid preserving lifecycle sequence across clock r
   const ledger = new DomainLedger(dbPath)
   const repoRoot = path.join(temp, 'repo')
   const branch = 'feature/rollback'
+  let db: DatabaseSync | undefined
   try {
     ledger.startRun({
       baseBranch: 'main',
@@ -126,7 +127,7 @@ test('branchIntents orders by rowid preserving lifecycle sequence across clock r
       subject: 'github.com/owner/repo#101'
     })
 
-    const db = new DatabaseSync(dbPath)
+    db = new DatabaseSync(dbPath)
     db.prepare(
       `INSERT INTO remote_receipts (
          receipt_id, run_id, kind, candidate_commit_oid,
@@ -187,6 +188,7 @@ test('branchIntents orders by rowid preserving lifecycle sequence across clock r
     const unmergedIntents = ledger.branchIntents(repoRoot, branch2, 'b2-run-2')
     assert.deepEqual(unmergedIntents, ['Branch2 intent 1', 'Branch2 intent 2'])
   } finally {
+    db?.close()
     ledger.close()
     await rm(temp, { force: true, recursive: true })
   }

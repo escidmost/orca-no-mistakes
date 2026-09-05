@@ -179,47 +179,51 @@ test("malformed reviewer finding values clean up rejected worker worktree and re
   const orca = new FakeOrca("run-malformed-finding-cleanup");
   const ledger = new DomainLedger(":memory:");
 
-  const malformedReport = {
-    findings: [
-      {
-        id: "bad-action",
-        severity: "error",
-        action: "fix",
-        description: "This report is outside the schema.",
-      } as unknown as Finding,
-    ],
-    summary: "malformed",
-  };
-  orca.reports.set("review", [malformedReport, pass("review repaired")]);
+  try {
+    const malformedReport = {
+      findings: [
+        {
+          id: "bad-action",
+          severity: "error",
+          action: "fix",
+          description: "This report is outside the schema.",
+        } as unknown as Finding,
+      ],
+      summary: "malformed",
+    };
+    orca.reports.set("review", [malformedReport, pass("review repaired")]);
 
-  const result = await runPipeline(
-    { intent: "Validate malformed reviewer finding cleanup." },
-    orca,
-    git,
-    ledger,
-  );
+    const result = await runPipeline(
+      { intent: "Validate malformed reviewer finding cleanup." },
+      orca,
+      git,
+      ledger,
+    );
 
-  const reviewLaunches = orca.launches.filter(
-    (launch) => launch.role === "reviewer" && launch.stage === "review",
-  );
-  assert.equal(reviewLaunches.length, 2);
-  assert.match(reviewLaunches[1].prompt, /REPORT REPAIR/);
-  assert.match(reviewLaunches[1].prompt, /auto-fix|ask-user|no-op/);
+    const reviewLaunches = orca.launches.filter(
+      (launch) => launch.role === "reviewer" && launch.stage === "review",
+    );
+    assert.equal(reviewLaunches.length, 2);
+    assert.match(reviewLaunches[1].prompt, /REPORT REPAIR/);
+    assert.match(reviewLaunches[1].prompt, /auto-fix\|ask-user\|no-op/);
 
-  const malformedWorker = orca.startedWorkers.find(
-    (worker) => worker.report.summary === "malformed",
-  );
-  assert.ok(malformedWorker);
-  const malformedDispatchId = malformedWorker.dispatchId;
-  const malformedWorktreeId = malformedWorker.worktreeId;
-  assert.ok(malformedWorktreeId);
+    const malformedWorker = orca.startedWorkers.find(
+      (worker) => worker.report.summary === "malformed",
+    );
+    assert.ok(malformedWorker);
+    const malformedDispatchId = malformedWorker.dispatchId;
+    const malformedWorktreeId = malformedWorker.worktreeId;
+    assert.ok(malformedWorktreeId);
 
-  assert.ok(orca.removedWorktrees.includes(malformedWorktreeId));
-  assert.ok(orca.calls.includes(`release:${malformedDispatchId}`));
-  assert.equal(result.verdict, "passed");
+    assert.ok(orca.removedWorktrees.includes(malformedWorktreeId));
+    assert.ok(orca.calls.includes(`release:${malformedDispatchId}`));
+    assert.equal(result.verdict, "passed");
 
-  const laterWorktrees = orca.removedWorktrees.filter((w) => w !== malformedWorktreeId);
-  assert.ok(laterWorktrees.length >= 1);
+    const laterWorktrees = orca.removedWorktrees.filter((w) => w !== malformedWorktreeId);
+    assert.ok(laterWorktrees.length >= 1);
+  } finally {
+    ledger.close();
+  }
 });
 
 test("regression fails if rejected malformed reviewer worktree removal is suppressed despite later worker cleanup", async () => {
@@ -227,47 +231,54 @@ test("regression fails if rejected malformed reviewer worktree removal is suppre
   const orca = new FakeOrca("run-suppressed-malformed-cleanup");
   const ledger = new DomainLedger(":memory:");
 
-  let firstWorkerWorktreeId: string | undefined;
-  const originalRemoveWorktree = orca.removeWorktree.bind(orca);
-  orca.removeWorktree = async (worktreeId: string) => {
-    if (worktreeId === firstWorkerWorktreeId) {
-      return;
-    }
-    await originalRemoveWorktree(worktreeId);
-  };
+  try {
+    let firstWorkerWorktreeId: string | undefined;
+    const removalRequests: string[] = [];
+    const originalRemoveWorktree = orca.removeWorktree.bind(orca);
+    orca.removeWorktree = async (worktreeId: string) => {
+      removalRequests.push(worktreeId);
+      if (worktreeId === firstWorkerWorktreeId) {
+        return;
+      }
+      await originalRemoveWorktree(worktreeId);
+    };
 
-  const malformedReport = {
-    findings: [
-      {
-        id: "bad-action",
-        severity: "error",
-        action: "fix",
-        description: "This report is outside the schema.",
-      } as unknown as Finding,
-    ],
-    summary: "malformed",
-  };
-  orca.reports.set("review", [malformedReport, pass("review repaired")]);
+    const malformedReport = {
+      findings: [
+        {
+          id: "bad-action",
+          severity: "error",
+          action: "fix",
+          description: "This report is outside the schema.",
+        } as unknown as Finding,
+      ],
+      summary: "malformed",
+    };
+    orca.reports.set("review", [malformedReport, pass("review repaired")]);
 
-  const originalStartWorker = orca.startWorker.bind(orca);
-  orca.startWorker = async (taskId, launch) => {
-    const worker = await originalStartWorker(taskId, launch);
-    if (!firstWorkerWorktreeId && worker.worktreeId) {
-      firstWorkerWorktreeId = worker.worktreeId;
-    }
-    return worker;
-  };
+    const originalStartWorker = orca.startWorker.bind(orca);
+    orca.startWorker = async (taskId, launch) => {
+      const worker = await originalStartWorker(taskId, launch);
+      if (!firstWorkerWorktreeId && worker.worktreeId) {
+        firstWorkerWorktreeId = worker.worktreeId;
+      }
+      return worker;
+    };
 
-  await runPipeline(
-    { intent: "Demonstrate identity-specific cleanup verification." },
-    orca,
-    git,
-    ledger,
-  );
+    await runPipeline(
+      { intent: "Demonstrate identity-specific cleanup verification." },
+      orca,
+      git,
+      ledger,
+    );
 
-  assert.ok(firstWorkerWorktreeId);
-  assert.ok(orca.removedWorktrees.length >= 1);
-  assert.equal(orca.removedWorktrees.includes(firstWorkerWorktreeId), false);
+    assert.ok(firstWorkerWorktreeId);
+    assert.ok(removalRequests.includes(firstWorkerWorktreeId));
+    assert.ok(orca.removedWorktrees.length >= 1);
+    assert.equal(orca.removedWorktrees.includes(firstWorkerWorktreeId), false);
+  } finally {
+    ledger.close();
+  }
 });
 
 test("schema-invalid reviewer report with empty summary cleans up rejected worker worktree and releases worker before contract repair", async () => {
@@ -275,34 +286,38 @@ test("schema-invalid reviewer report with empty summary cleans up rejected worke
   const orca = new FakeOrca("run-schema-invalid-report-cleanup");
   const ledger = new DomainLedger(":memory:");
 
-  const schemaInvalidReport = {
-    findings: [],
-    summary: "",
-  };
-  orca.reports.set("review", [schemaInvalidReport, pass("review repaired")]);
+  try {
+    const schemaInvalidReport = {
+      findings: [],
+      summary: "",
+    };
+    orca.reports.set("review", [schemaInvalidReport, pass("review repaired")]);
 
-  const result = await runPipeline(
-    { intent: "Validate schema-invalid reviewer report cleanup." },
-    orca,
-    git,
-    ledger,
-  );
+    const result = await runPipeline(
+      { intent: "Validate schema-invalid reviewer report cleanup." },
+      orca,
+      git,
+      ledger,
+    );
 
-  const reviewLaunches = orca.launches.filter(
-    (launch) => launch.role === "reviewer" && launch.stage === "review",
-  );
-  assert.equal(reviewLaunches.length, 2);
-  assert.match(reviewLaunches[1].prompt, /REPORT REPAIR/);
+    const reviewLaunches = orca.launches.filter(
+      (launch) => launch.role === "reviewer" && launch.stage === "review",
+    );
+    assert.equal(reviewLaunches.length, 2);
+    assert.match(reviewLaunches[1].prompt, /REPORT REPAIR/);
 
-  const invalidWorker = orca.startedWorkers.find(
-    (worker) => worker.report.summary === "",
-  );
-  assert.ok(invalidWorker);
-  const invalidDispatchId = invalidWorker.dispatchId;
-  const invalidWorktreeId = invalidWorker.worktreeId;
-  assert.ok(invalidWorktreeId);
+    const invalidWorker = orca.startedWorkers.find(
+      (worker) => worker.report.summary === "",
+    );
+    assert.ok(invalidWorker);
+    const invalidDispatchId = invalidWorker.dispatchId;
+    const invalidWorktreeId = invalidWorker.worktreeId;
+    assert.ok(invalidWorktreeId);
 
-  assert.ok(orca.removedWorktrees.includes(invalidWorktreeId));
-  assert.ok(orca.calls.includes(`release:${invalidDispatchId}`));
-  assert.equal(result.verdict, "passed");
+    assert.ok(orca.removedWorktrees.includes(invalidWorktreeId));
+    assert.ok(orca.calls.includes(`release:${invalidDispatchId}`));
+    assert.equal(result.verdict, "passed");
+  } finally {
+    ledger.close();
+  }
 });

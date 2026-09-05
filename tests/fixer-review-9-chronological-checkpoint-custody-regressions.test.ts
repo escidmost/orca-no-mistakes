@@ -323,6 +323,7 @@ test('publishCandidate throws on invalid custody and causes zero publication mut
       ],
       submissionCommitOid: oidA
     })
+    const generationToken = ledger.acquireLease({ branch: 'feature', repoRoot: '/tmp/repo', runId })
 
     const evReviewSha = 'a'.repeat(64)
     ledger.recordEvidence({
@@ -396,7 +397,7 @@ test('publishCandidate throws on invalid custody and causes zero publication mut
       observedAt: '2026-09-05T00:00:00Z',
       routeFingerprint: route.route_fingerprint,
       runId,
-      transportUrl: 'https://github.com/owner/repo.git'
+      transportUrl: 'github.com/owner/repo'
     })
 
     await assert.rejects(
@@ -404,7 +405,7 @@ test('publishCandidate throws on invalid custody and causes zero publication mut
         artifactPath: '/tmp/push.json',
         attemptId: 'attempt-1',
         destination: 'https://github.com/owner/repo.git',
-        generationToken: 0,
+        generationToken,
         ledger,
         resolveRepositoryIdentity: async () => ({
           backend: 'gh',
@@ -415,13 +416,14 @@ test('publishCandidate throws on invalid custody and causes zero publication mut
           owner: 'owner',
           repo: 'repo',
           repositoryId: 'repo-1',
-          repositoryNodeId: 'node-1'
+          nodeId: 'node-1'
         }),
         runId,
         runner: fakeRunner,
         workerIdentity: 'publisher'
       }),
-      CandidatePublicationError
+      (error: unknown) => error instanceof CandidatePublicationError &&
+        /stage document does not extend the contiguous candidate chain/.test(error.message)
     )
 
     // Prove zero mutation: runner was never invoked, no push remote receipt created
