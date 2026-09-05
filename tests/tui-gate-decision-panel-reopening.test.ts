@@ -166,6 +166,7 @@ test("resolved gate options cannot reopen the decision panel", () => {
   }
 });
 
+/** Build an open review gate with independently actionable findings. */
 function findingGate(count = 2): PresentationSnapshot {
   const snapshot = gateSnapshot("open", 1);
   const stage = snapshot.stages.find((item) => item.id === "review")!;
@@ -183,6 +184,7 @@ function findingGate(count = 2): PresentationSnapshot {
   return snapshot;
 }
 
+/** Wait for the scheduled draw before reading its visible terminal text. */
 async function frame(output: FakeOutput): Promise<string> {
   await new Promise((resolve) => setImmediate(resolve));
   return stripVTControlCharacters(output.writes.at(-1) ?? "");
@@ -306,5 +308,25 @@ test("duplicate IDs share a visible decision because canonical fixes select IDs"
     input.emit("data", "f\u001b[Ba\r");
     input.emit("data", "\r");
     assert.deepEqual(resolutions, ["approve"]);
+  } finally { renderer.close(); }
+});
+
+
+test("duplicate finding IDs are submitted once when fixing", async () => {
+  const input = new FakeInput();
+  const output = new FakeOutput();
+  const resolutions: string[] = [];
+  const renderer = new RailTuiRenderer(input, output, "/unused", new Map(),
+    async (_id, resolution) => { resolutions.push(resolution); });
+  const snapshot = findingGate();
+  snapshot.stages.find((s) => s.id === "review")!.findings![1].id = "finding-1";
+  try {
+    renderer.render(snapshot);
+    input.emit("data", "f\r");
+    input.emit("data", "\r");
+    assert.equal(resolutions.length, 1);
+    assert.deepEqual(JSON.parse(resolutions[0]), {
+      action: "fix", findingIds: ["finding-1"],
+    });
   } finally { renderer.close(); }
 });

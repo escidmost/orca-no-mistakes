@@ -999,9 +999,9 @@ export class RailTuiRenderer implements PresentationRenderer {
   #submitGate(): void {
     const gate = this.#snapshot?.gate;
     const findings = this.#gateFindings();
-    const findingIds = findings
+    const findingIds = [...new Set(findings
       .filter((finding) => this.#gateDecisions.get(finding.id) === "fix")
-      .map((finding) => finding.id);
+      .map((finding) => finding.id))];
     const resolution = findings.length > 0
       ? findingIds.length > 0
         ? JSON.stringify({ action: "fix", findingIds })
@@ -1452,6 +1452,7 @@ export class RailTuiRenderer implements PresentationRenderer {
     return rows;
   }
 
+  /** Render the same wrapped description and location in summaries and decision panels. */
   #findingRows(
     finding: PresentationFinding,
     width: number,
@@ -1554,6 +1555,7 @@ export class RailTuiRenderer implements PresentationRenderer {
     ];
   }
 
+  /** Only gates offering both choices can use the per-finding decision editor. */
   #gateFindings(): readonly PresentationFinding[] {
     const gate = this.#snapshot?.gate;
     if (gate?.state !== "open" || !gate.options?.includes("fix") || !gate.options.includes("approve")) return [];

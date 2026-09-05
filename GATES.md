@@ -29,8 +29,8 @@ Complexity review: shared finding rendering replaces duplication; canonical sele
 - [x] G5: Exactly one local CodeRabbit review is assessed and valid findings are fixed and tested
   EVIDENCE: coderabbit review --base main --agent completed once without a timeout on 1ecf56a; one finding at scripts/tui.ts:1850 partially confirmed and repaired by clearing stale retry errors before confirmation. Regression assertion added; local review will not be rerun.
 
-- [ ] G6: Worktree-local Orca No-Mistakes gate delivers the committed changes and creates the PR
-  EVIDENCE: pending
+- [x] G6: Worktree-local Orca No-Mistakes gate delivers the committed changes and creates the PR
+  EVIDENCE: Worktree-local gate published 6e677cfda91265ca41f9e11cf72d5cbed78ec495 to PR https://github.com/Filamess/orca-no-mistakes/pull/65; review, test, document, lint and push stages passed, and GitHub test check passed. Pipeline is waiting for merge.
 
 - [ ] G7: PR title starts with ONM-93 and remote CodeRabbit review reports no issues after one request per cycle
   EVIDENCE: pending
