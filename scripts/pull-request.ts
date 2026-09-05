@@ -396,8 +396,9 @@ export function pullRequestContent(intent: string, report: PullRequestReport): {
     ? firstLine
     : `chore: ${firstLine}`
   const riskEmoji = report.risk.level === 'high' ? '🚨' : report.risk.level === 'medium' ? '⚠️' : '✅'
+  const riskPrefix = `${riskEmoji} ${report.risk.level[0].toUpperCase()}${report.risk.level.slice(1)}: `
   const otherSections = [
-    `## Risk Assessment\n\n${riskEmoji} ${report.risk.level[0].toUpperCase()}${report.risk.level.slice(1)}: ${capMarkdownText(report.risk.rationale, 2048)}`,
+    `## Risk Assessment\n\n${capMarkdownText(`${riskPrefix}${report.risk.rationale}`, 2048 + Buffer.byteLength(riskPrefix))}`,
     testingSection(report.testing),
     pipelineSection(report.candidateCommitOid, report.pipelineSteps)
   ].join('\n\n')

@@ -1052,7 +1052,14 @@ export class RailTuiRenderer implements PresentationRenderer {
     const bodyRows = rows - 3;
     let body: string[];
     if (columns >= WIDE_COLUMNS) {
-      const leftWidth = Math.max(LEFT_WIDTH, Math.min(64, Math.floor(columns * 0.46)));
+      const activityWidth = Math.max(
+        0,
+        ...this.#activities.map((entry) => entry.label.length + entry.at.length + 3),
+      );
+      const leftWidth = Math.min(
+        Math.max(LEFT_WIDTH, Math.min(64, Math.floor(columns * 0.46)), activityWidth),
+        columns - this.#glyph.bar.length - LEFT_WIDTH,
+      );
       const rightWidth = columns - leftWidth - this.#glyph.bar.length;
       const stages = this.#stages(now);
       const left = [

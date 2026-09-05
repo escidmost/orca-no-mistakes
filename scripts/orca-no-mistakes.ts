@@ -3320,7 +3320,6 @@ export async function runPipeline(
       ) as Finding[];
       let resumedFixDecision =
         resumedEvidence &&
-        !resumedBlocker &&
         resumedEvidence.candidate_commit_oid === stageInputCommitOid
           ? priorGateAudit.findLast(
               (audit) =>
@@ -3890,8 +3889,7 @@ export async function runPipeline(
       if (
         authoritativeEntry.exitCode !== 0 &&
         !authoritativeEntry.waiverOrApproval &&
-        !shouldReopen &&
-        !reopenedStages.has(stage)
+        !shouldReopen
       ) {
         const evidenceRows = ledger.listEvidence(runId);
         const evidenceBySha = new Map(
