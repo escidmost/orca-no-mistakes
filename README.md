@@ -103,4 +103,4 @@ npm test
 npm run typecheck
 ```
 
-GitHub Actions runs on same-repository pull requests and on pushes to `main`; fork pull requests are skipped.
+The self-hosted CI workflow runs on same-repository pull requests and on pushes to `main`; it skips fork pull requests. The hosted macOS/Linux acceptance matrix has no fork exclusion and runs on path-filtered pull requests; see [the acceptance runbook](docs/release-2-acceptance.md#local-matrix).

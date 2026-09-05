@@ -75,14 +75,15 @@ intent=$(node -e 'process.stdout.write(Buffer.from(process.argv[1]).toString("ba
 git -C /path/to/same-repository-checkout push --push-option="no-mistakes.intent=$intent" orca-no-mistakes HEAD:refs/heads/onm-79/run/same
 ```
 
-Submit the fork fixture through direct ingress with an explicit `--base`. Direct `run` resolves the base only from `origin/<base>` or a local `<base>` ref, and the fork checkout's `origin` is the fork, so first materialize the upstream base branch locally:
+Submit the fork fixture through direct ingress with an explicit `--base`. A local fetch of the upstream base is not sufficient: trusted policy reads its configuration from `origin/<base>`, and the rebase stage fetches `<base>` from `origin`, and the fork checkout's `origin` is the fork. The isolated base branch must therefore also exist on the fork at the recorded upstream OID and be fetched into the fork's remote-tracking ref:
 
 ```sh
-git -C /path/to/fork-checkout fetch upstream onm-79/run/base-fork:onm-79/run/base-fork
+git -C /path/to/fork-checkout push origin "$default_oid:refs/heads/onm-79/run/base-fork"
+git -C /path/to/fork-checkout fetch origin onm-79/run/base-fork
 /path/to/package/bin/orca-no-mistakes run --repo /path/to/fork-checkout --base onm-79/run/base-fork --intent 'ONM-79: accept fork publication'
 ```
 
-Confirm the local `onm-79/run/base-fork` OID equals the recorded upstream base OID before running. Omitting `--base` selects the default branch, which does not match the stored isolated-base route and fails closed.
+Confirm that `origin/onm-79/run/base-fork` and upstream `onm-79/run/base-fork` both equal the recorded base OID before running, and record the fork-side base branch as a fixture identity so cleanup accounts for it. Omitting `--base` selects the default branch, which does not match the stored isolated-base route and fails closed. Do not pass `--allow-local-config` to bypass trusted policy.
 
 Retain the returned admission/run identity. Detached runs return immediately; handle their notifications and decisions through Orca. Do not infer completion from command return, PR creation or readiness notification. Verify the exact base/head repositories, branches and candidate OID on the created PR. Exercise a later candidate against that same still-open PR, checking PR identity reuse and owned report replacement, then merge only the exact fixture PR as part of the test driver. Record the authoritative matching merged observation. A later run against an already merged PR is a different scenario.
 
@@ -103,7 +104,7 @@ Export and verify each completed run by exact run ID, not an ambiguous commit se
 
 Keep fixture identities, admission/run IDs, accepted and final candidate OIDs, publication and PR receipts, the v2 pipeline evidence/completion roots, all attempt outcomes, custody result, and cleanup result with the workflow artifact. Export failures and failed fixture identities must survive a failed test. An unsigned portable manifest proves internal integrity, not authorship; verification with the originating ledger also checks retained evidence.
 
-Only clean fixture branches/PRs after all scenario assertions and evidence export succeed. Before deleting any branch, compare its current OID with the exact recorded owned OID and use an exact lease; retain a moved branch. Close only PRs whose recorded repository and immutable identity match this run. Preserve all failed or uncertain identities for diagnosis, and report cleanup failure as failure, not a clean live pass.
+Only clean fixture branches/PRs, including the per-run base branches on upstream and the fork-side copy of `onm-79/run/base-fork`, after all scenario assertions and evidence export succeed. Before deleting any branch, compare its current OID with the exact recorded owned OID and use an exact lease; retain a moved branch. Close only PRs whose recorded repository and immutable identity match this run. Preserve all failed or uncertain identities for diagnosis, and report cleanup failure as failure, not a clean live pass.
 
 ## Recovery, migration and limits
 
