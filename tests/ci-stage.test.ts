@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import {
   CHECKS_PASSED_MSG,
+  CHECKS_RUNNING_MSG,
   CI_TIMEOUT_SUMMARY,
   CiMonitorError,
   NO_CHECKS_PASSED_MSG,
@@ -47,10 +48,13 @@ function harness(ticks: Array<{ pr: GithubPullRequestObservation; checks?: Githu
 
 test('ci monitor reports failing checks as ask-user findings and resumes to merge on the next run', async () => {
   const h = harness([
+    { pr: pullRequest('OPEN'), checks: checks([check('unit', 'pending'), check('lint', 'fail')], { mergeable: 'CONFLICTING' }) },
     { pr: pullRequest('OPEN'), checks: checks([check('unit', 'pass'), check('lint', 'fail')]) },
     { pr: pullRequest('MERGED') }
   ])
   const report = await h.run()
+  assert.deepEqual(h.sleeps, [30_000], 'a failure beside a pending check is not a verdict yet')
+  assert.equal(h.log[0], CHECKS_RUNNING_MSG)
   assert.equal(report.summary, 'CI failures detected on pull request #7')
   assert.deepEqual(report.findings.map((f) => [f.id, f.action, f.severity]), [['ci-lint', 'ask-user', 'error']])
   assert.equal(h.settled(), 0)

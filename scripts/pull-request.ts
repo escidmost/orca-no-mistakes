@@ -453,7 +453,17 @@ export async function observeBoundPullRequest(
   const route = ledger.publicationRoute(runId)
   const repositoryRoute = run ? ledger.repositoryPublicationRoute(run.repo_root) : undefined
   if (!route || !repositoryRoute) throw new PullRequestBindingError('run publication route is not durable')
-  return observeExact(authority, route, repositoryRoute, candidateCommitOid)
+  const pullRequest = await observeExact(authority, route, repositoryRoute, candidateCommitOid)
+  const receipt = ledger.remoteReceipt(runId, 'pull-request-binding')
+  const binding = receipt ? (JSON.parse(receipt.receipt_json) as Record<string, unknown>) : undefined
+  // The binding owns title and body; any edit or draft flip is drift, reported as null.
+  if (
+    !pullRequest || !binding || pullRequest.draft ||
+    sha256(pullRequest.title) !== binding.titleSha256 || sha256(pullRequest.body) !== binding.bodySha256
+  ) {
+    return null
+  }
+  return pullRequest
 }
 
 async function observeExact(
@@ -696,6 +706,10 @@ export async function settleMergedPullRequest(input: {
     // The pr stage already observed the merge; nothing further to settle.
     return { number: pullRequest.number, receiptSha256: openReceipt.receipt_sha256, url: pullRequest.url }
   }
+  const retainedEvidenceRoot = openPayload.pipelineEvidenceRoot
+  if (typeof retainedEvidenceRoot !== 'string' || retainedEvidenceRoot === '') {
+    throw new PullRequestBindingError('pull-request binding receipt has no pipeline evidence root')
+  }
   const priorEvidence = input.ledger.listEvidence(input.runId).filter((row) => row.stage_id === 'pr')
   const openEvidence = priorEvidence.at(-1)
   const routeFacts = {
@@ -726,7 +740,7 @@ export async function settleMergedPullRequest(input: {
     observedAt,
     outcome: 'unchanged',
     ownership,
-    pipelineEvidenceRoot: String(openPayload.pipelineEvidenceRoot ?? ''),
+    pipelineEvidenceRoot: retainedEvidenceRoot,
     pullRequest,
     roundIndex: Math.max(-1, ...priorEvidence.map((row) => row.round_index)) + 1,
     route,

@@ -77,15 +77,17 @@ export async function monitorPullRequestChecks(input: {
     }
     lastBaseOid = observed.baseRefOid ?? lastBaseOid
 
+    // Mirror the Go step: no verdict while any check is still pending.
+    const pending = observed.checks.some((check) => check.bucket === 'pending')
     const findings: Finding[] = observed.checks
-      .filter((check) => check.bucket === 'fail' || check.bucket === 'cancel')
+      .filter((check) => !pending && (check.bucket === 'fail' || check.bucket === 'cancel'))
       .map((check) => ({
         action: 'ask-user',
         description: `${check.name} ${check.bucket === 'cancel' ? 'was cancelled' : 'failed'} (${check.conclusion ?? check.status})${check.url ? `: ${check.url}` : ''}`,
         id: `ci-${check.name.replace(/[^A-Za-z0-9_-]+/g, '-')}`,
         severity: 'error'
       }))
-    if (observed.mergeable === 'CONFLICTING') {
+    if (!pending && observed.mergeable === 'CONFLICTING') {
       findings.push({
         action: 'ask-user',
         description: 'the pull request has merge conflicts with its base branch',
@@ -99,7 +101,7 @@ export async function monitorPullRequestChecks(input: {
     }
 
     if (observed.checks.length === 0) say(input.config.no_ci ? NO_CHECKS_PASSED_MSG : NO_CHECKS_YET_MSG)
-    else if (observed.checks.some((check) => check.bucket === 'pending')) say(CHECKS_RUNNING_MSG)
+    else if (pending) say(CHECKS_RUNNING_MSG)
     else say(CHECKS_PASSED_MSG)
 
     const elapsed = now() - startedAt
