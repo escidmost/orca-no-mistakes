@@ -3046,9 +3046,9 @@ export async function runPipeline(
         const isApprovedByAudit = audits.some(
           (audit) =>
             audit.resolved_at !== null &&
-            (audit.decision === "approve" ||
-              audit.decision === "skip" ||
-              audit.decision === "fix") &&
+            // A fix decision expects the head to move and approves nothing;
+            // only approve/skip bind the stage to the candidate they judged.
+            (audit.decision === "approve" || audit.decision === "skip") &&
             gateAuditMatchesEvidence(
               audit,
               stage,
