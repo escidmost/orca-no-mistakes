@@ -92,6 +92,10 @@ For a detached gate run, stranded recovery owns the gate worktree and its worker
 
 A newly admitted direct `run` starts a detached coordinator in an Orca terminal by default and returns its handle immediately; pass `--attached` to keep the pipeline running inside the invoking process. When its deterministic admission is already being handled or accepted, `run` instead returns `{"admissionId":"...","replayed":true,"runId":"..."}` immediately without launching another coordinator; `runId` can be `null` until the live launch binds its run. `--no-tui` writes one bounded semantic status line per durable transition to stderr without cursor motion, spinners, heartbeats, or raw worker output. An attached run blocks until completion or failure — including, when the TUI renders, the durable post-failure resume decision on a resumable error (an attached `--no-tui` run stops at the failure instead) — and keeps stdout reserved for JSON containing the Orca Run ID, completed stages, custody note, and the full attestation manifest. On success the coordinator anchors `refs/no-mistakes/recover/<run-id>` at the terminal commit before returning custody of the branch: a clean checkout still at the submitted commit is fast-forwarded, while a diverged or dirty checkout is left alone and the custody note tells you how to recover the validated commits from that ref. Failed and cancelled runs attach the same recovery instructions only when the checkout's HEAD differs from the anchored commit; a HEAD already carrying that commit gets no recovery instruction.
 
+## Release acceptance
+
+See [Release 2 acceptance](docs/release-2-acceptance.md) for the macOS/Linux local matrix, live fixture requirements, evidence and recovery procedures. Release 2 acceptance remains incomplete until both local platforms and a protected live same-repository/fork run pass.
+
 ## Development
 
 ```bash
@@ -99,4 +103,4 @@ npm test
 npm run typecheck
 ```
 
-GitHub Actions runs on same-repository pull requests and on pushes to `main`; fork pull requests are skipped.
+The self-hosted CI workflow runs on same-repository pull requests and on pushes to `main`; it skips fork pull requests. The hosted macOS/Linux acceptance matrix has no fork exclusion and runs on path-filtered pull requests; see [the acceptance runbook](docs/release-2-acceptance.md#local-matrix).

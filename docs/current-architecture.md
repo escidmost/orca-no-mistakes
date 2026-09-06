@@ -2,6 +2,8 @@
 
 This document describes implemented behavior through Release 2 (Candidate Publication, Pull-Request Binding, and Settlement). The ADRs under `docs/adr/` describe accepted target architecture; their `implementation` metadata states how much is current guarantee.
 
+Implementation is not release acceptance. [Release 2 acceptance](release-2-acceptance.md) records the required local/live proof and explicitly withholds completion until that evidence exists.
+
 ## Entry points
 
 `orca-no-mistakes` supports four user-facing commands (plus the internal `gate` command used by the managed receive hook and the internal `report` command used by stage workers):

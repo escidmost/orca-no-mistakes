@@ -10555,6 +10555,20 @@ test("StageLog restricts artifact directory and log permissions", async () => {
   }
 });
 
+// Exact accounting requires a distinguishable file generation. Linux can give
+// a freshly replaced file equal birth/change times within one filesystem tick;
+// establish the positive control without relaxing StageLog's conservative guard.
+async function distinguishLogGeneration(logPath: string): Promise<void> {
+  const { birthtimeNs } = await stat(logPath, { bigint: true });
+  assert.ok(birthtimeNs > 0n, "this accounting control requires filesystem birth time");
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if ((await stat(logPath, { bigint: true })).ctimeNs !== birthtimeNs) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await chmod(logPath, 0o600);
+  }
+  assert.fail("filesystem did not distinguish birth time from change time");
+}
+
 test("StageLog holds every worker of a round to one shared cap", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "onm-stage-log-share-"));
   try {
@@ -10566,6 +10580,7 @@ test("StageLog holds every worker of a round to one shared cap", async () => {
       const log = new StageLog(logPath, 2_048);
       await log.append(worker.repeat(2_000));
       await log.close();
+      await distinguishLogGeneration(logPath);
     }
 
     const written = await readFile(logPath, "utf8");
@@ -10630,6 +10645,7 @@ test("StageLog refreshes the marker when a compacted round gets more output", as
     const first = new StageLog(logPath, 2_048);
     await first.append("h".repeat(3_000));
     await first.close();
+    await distinguishLogGeneration(logPath);
     const second = new StageLog(logPath, 2_048);
     await second.append("later\n");
     await second.close();

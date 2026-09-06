@@ -11,6 +11,7 @@ import { DomainLedger } from '../scripts/ledger.ts'
 import {
   GitShell,
   runPipeline,
+  main,
   type OrcaOperations,
 } from '../scripts/orca-no-mistakes.ts'
 
@@ -18,7 +19,7 @@ function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
 }
 
-async function runRelease2Pipeline(failAfter?: 'push' | 'pr'): Promise<void> {
+async function runRelease2Pipeline(failAfter?: 'push' | 'pr', fork = false): Promise<void> {
   const temp = await mkdtemp(path.join(tmpdir(), 'onm-release-2-pipeline-'))
   const repo = path.join(temp, 'repo')
   const remote = path.join(temp, 'origin.git')
@@ -42,7 +43,10 @@ async function runRelease2Pipeline(failAfter?: 'push' | 'pr'): Promise<void> {
   const repoRoot = await realpath(repo)
   const candidate = git(repo, 'rev-parse', 'HEAD')
   const base = git(repo, 'rev-parse', 'origin/main')
-  const destination = 'https://github.com/owner/repo.git'
+  const headOwner = fork ? 'contributor' : 'owner'
+  const headRepositoryId = fork ? 'R_fork' : 'R_repo'
+  const headRepositoryNodeId = fork ? 'RN_fork' : 'RN_repo'
+  const destination = `https://github.com/${headOwner}/repo.git`
   let pushCount = 0
   const runner: CommandRunner = (executable, args, options) => {
     if (args[0] === 'config' && args[1] === '--get-regexp') {
@@ -51,7 +55,7 @@ async function runRelease2Pipeline(failAfter?: 'push' | 'pr'): Promise<void> {
     if (args[0] === 'push') pushCount += 1
     return runCommand(executable, args.map((arg) => arg === destination ? remote : arg), options)
   }
-  ledger = new DomainLedger(':memory:')
+  ledger = new DomainLedger({ repositoryPath: repoRoot })
   const completedStages: string[] = []
   let task = 0
   let dispatch = 0
@@ -99,15 +103,17 @@ async function runRelease2Pipeline(failAfter?: 'push' | 'pr'): Promise<void> {
   let commentCreateCount = 0
   let commentUpdateCount = 0
   const authority = {
-    observeRepository: async () => ({ id: 'R_repo', nodeId: 'RN_repo' }),
+    observeRepository: async (name: string) => name === 'contributor/repo'
+      ? { id: 'R_fork', nodeId: 'RN_fork' }
+      : { id: 'R_repo', nodeId: 'RN_repo' },
     observePullRequests: async () => ({ exact: pullRequest, nearMatches: [] }),
     createPullRequest: async ({ body, title }: { body: string; title: string }) => {
       pullRequestCreateCount += 1
       pullRequest = {
         baseBranch: 'main', baseOid: base, baseRepositoryId: 'R_repo',
         baseRepositoryNodeId: 'RN_repo', body, draft: false,
-        headBranch: 'feature', headOid: candidate, headRepositoryId: 'R_repo',
-        headRepositoryNodeId: 'RN_repo', id: 'PR_node', number: 80,
+        headBranch: 'feature', headOid: candidate, headRepositoryId,
+        headRepositoryNodeId, id: 'PR_node', number: 80,
         state: 'OPEN', title, url: 'https://github.com/owner/repo/pull/80',
       }
     },
@@ -134,9 +140,9 @@ async function runRelease2Pipeline(failAfter?: 'push' | 'pr'): Promise<void> {
       backend: 'gh', backendVersion: 'test', baseBranch: 'main',
       baseRepositoryId: 'R_repo', baseRepositoryName: 'owner/repo',
       baseRepositoryNodeId: 'RN_repo', credentialSource: 'GH_TOKEN',
-      forgeHost: 'github.com', headBranch: 'feature', headOwner: 'owner',
-      headRepositoryId: 'R_repo', headRepositoryName: 'owner/repo',
-      headRepositoryNodeId: 'RN_repo', networkRootRepositoryId: 'R_repo',
+      forgeHost: 'github.com', headBranch: 'feature', headOwner,
+      headRepositoryId, headRepositoryName: `${headOwner}/repo`,
+      headRepositoryNodeId, networkRootRepositoryId: 'R_repo',
       observedAt: '2026-09-02T00:00:00.000Z', repoRoot,
     })
     const pipelineOptions = {
@@ -182,6 +188,9 @@ async function runRelease2Pipeline(failAfter?: 'push' | 'pr'): Promise<void> {
     assert.match(publishedBody, /<summary>✅ \*\*Review\*\* - passed<\/summary>/)
     assert.equal(commentCreateCount, 0)
     assert.equal(commentUpdateCount, 0)
+    const exported = path.join(temp, 'completion.json')
+    await main(['attestation', 'export', result.runId, '--repo', repoRoot, '--out', exported])
+    await main(['attestation', 'verify', exported, '--repo', repoRoot])
   } finally {
     ledger?.close()
     if (priorHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME
@@ -196,4 +205,9 @@ test('runPipeline settles all eight stages before exposing Release 2 completion'
 for (const stage of ['push', 'pr'] as const) {
   test(`runPipeline resumes after ${stage} settlement bookkeeping fails without replaying creation`, () =>
     runRelease2Pipeline(stage))
+}
+
+for (const stage of [undefined, 'push', 'pr'] as const) {
+  test(`fork pipeline ${stage ? `resumes after ${stage}` : 'completes'} with canonical upstream binding and one publication`, () =>
+    runRelease2Pipeline(stage, true))
 }
