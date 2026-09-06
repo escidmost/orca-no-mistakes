@@ -50,14 +50,14 @@ Use a distinct namespace such as `onm-79/<workflow-run-id>-<attempt>/` for every
 
 ## Operator sequence
 
-Install from the exact package checkout being accepted. Keep its source identity with the evidence. Before initializing, create a per-run base branch in the upstream fixture for each scenario from the recorded default-branch OID and record each base branch name and OID with the evidence. Without an explicit `--base-branch`, `init` persists the upstream default branch as the publication base, so the fixture merge below would mutate the persistent default branch:
+Install from the exact package checkout being accepted. Keep its source identity with the evidence. Before initializing, create a per-run base branch in the upstream fixture for each scenario from the recorded default-branch OID and record each base branch name and OID with the evidence. `init` persists one repository publication route per repository (see CONTEXT.md "Repository publication route"); each run snapshots that route with its own head and base branches, so the branch a run publishes against is decided by the run, not by `init`. A run whose base is the persistent default branch would let the fixture merge below mutate it:
 
 ```sh
 git -C /path/to/same-repository-checkout push origin "$default_oid:refs/heads/onm-79/run/base-same"
 git -C /path/to/fork-checkout push upstream "$default_oid:refs/heads/onm-79/run/base-fork"
 ```
 
-Check out the exact clean committed feature branch each example submits before initializing: `onm-79/run/same` in the same-repository checkout and `onm-79/run/fork` in the fork checkout. Without `--head-branch`, `init` persists the currently checked-out branch as the head route, gate admission requires a checked-out worktree on exactly the submitted ref and candidate, and direct `run` submits the checked-out branch rather than the init override. An arbitrarily named feature branch therefore fails admission or route matching. Then initialize each checkout against its recorded base branch:
+Check out the exact clean committed feature branch each example submits before initializing: `onm-79/run/same` in the same-repository checkout and `onm-79/run/fork` in the fork checkout. Gate admission requires a checked-out worktree on exactly the submitted ref and candidate, and direct `run` submits the currently checked-out branch, so an arbitrarily named feature branch fails admission. Then initialize each checkout:
 
 ```sh
 git -C /path/to/same-repository-checkout switch -c onm-79/run/same
@@ -66,16 +66,16 @@ git -C /path/to/fork-checkout switch -c onm-79/run/fork
 /path/to/package/bin/orca-no-mistakes init --repo /path/to/fork-checkout --upstream upstream/fixture --fork contributor/fixture --base-branch onm-79/run/base-fork --head-branch onm-79/run/fork
 ```
 
-Before submitting, verify that the persisted route's base branch matches the recorded per-run base branch and that its head branch equals the branch currently checked out in that checkout (`git branch --show-current`): `onm-79/run/same` and `onm-79/run/fork` respectively.
+Before submitting, verify that the branch currently checked out in each checkout (`git branch --show-current`) is the branch the run must publish: `onm-79/run/same` and `onm-79/run/fork` respectively. The `init` branch overrides do not constrain the run.
 
-The same-repository installed-gate scenario is **blocked pending isolated-base gate support**. The gate launches the admitted pipeline without `--base`, so the run detects `origin/HEAD` (or `main`/`master`) as its base, does not match the persisted isolated-base route, and fails closed before publication. Do not work around this by initializing against the persistent default branch; that would let the fixture merge mutate it and lose fixture isolation. Once the gate can pass the persisted base through to the run, the intended submission is:
+The same-repository installed-gate scenario is **blocked pending isolated-base gate support**. The gate launches the admitted pipeline without `--base`, so the run detects `origin/HEAD` (or `main`/`master`) as its base and would publish and merge against the persistent default branch, losing fixture isolation. Do not run it. Once the gate can pass an isolated base through to the run, the intended submission is:
 
 ```sh
 intent=$(node -e 'process.stdout.write(Buffer.from(process.argv[1]).toString("base64url"))' 'ONM-79: accept same-repository publication')
 git -C /path/to/same-repository-checkout push --push-option="no-mistakes.intent=$intent" orca-no-mistakes HEAD:refs/heads/onm-79/run/same
 ```
 
-Submit the fork fixture through direct ingress with an explicit `--base`. A local fetch of the upstream base is not sufficient: trusted policy reads its configuration from `origin/<base>`, and the rebase stage fetches `<base>` from `origin`, and the fork checkout's `origin` is the fork. The isolated base branch must therefore also exist on the fork at the recorded upstream OID and be fetched into the fork's remote-tracking ref:
+Submit the fork fixture through direct ingress with an explicit isolated `--base`; nothing else keeps the run off the persistent default branch. A local fetch of the upstream base is not sufficient: trusted policy reads its configuration from `origin/<base>`, and the rebase stage fetches `<base>` from `origin`, and the fork checkout's `origin` is the fork. The isolated base branch must therefore also exist on the fork at the recorded upstream OID and be fetched into the fork's remote-tracking ref:
 
 ```sh
 git -C /path/to/fork-checkout push origin "$default_oid:refs/heads/onm-79/run/base-fork"
@@ -83,7 +83,7 @@ git -C /path/to/fork-checkout fetch origin onm-79/run/base-fork
 /path/to/package/bin/orca-no-mistakes run --repo /path/to/fork-checkout --base onm-79/run/base-fork --intent 'ONM-79: accept fork publication'
 ```
 
-Confirm that `origin/onm-79/run/base-fork` and upstream `onm-79/run/base-fork` both equal the recorded base OID before running, and record the fork-side base branch as a fixture identity so cleanup accounts for it. Omitting `--base` selects the default branch, which does not match the stored isolated-base route and fails closed. Do not pass `--allow-local-config` to bypass trusted policy.
+Confirm that `origin/onm-79/run/base-fork` and upstream `onm-79/run/base-fork` both equal the recorded base OID before running, and record the fork-side base branch as a fixture identity so cleanup accounts for it. Omitting `--base` selects the default branch and the run proceeds against it. Do not pass `--allow-local-config` to bypass trusted policy.
 
 Retain the returned admission/run identity. Detached runs return immediately; handle their notifications and decisions through Orca. Do not infer completion from command return, PR creation or readiness notification. Verify the exact base/head repositories, branches and candidate OID on the created PR. Exercise a later candidate against that same still-open PR, checking PR identity reuse and owned report replacement, then merge only the exact fixture PR as part of the test driver. Record the authoritative matching merged observation. A later run against an already merged PR is a different scenario.
 
