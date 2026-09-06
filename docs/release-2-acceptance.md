@@ -36,7 +36,7 @@ These entry points identify assertions to inspect; test names are not substitute
 
 ## Recorded local result
 
-On 2026-09-05, all 974 tests passed on macOS (Node 26.8.1) and in an unprivileged Linux container (Node 24.20.0) against matching TypeScript source/test hashes. Retained local evidence is `acceptance-results/local-1788645661523/` and `acceptance-results/linux-fixture/result-final/`; GATES.md verifies both reports against the current hashed files. These ignored evidence directories must be retained separately from a Git commit. This is local platform evidence, not an executed hosted Actions matrix or a live acceptance pass.
+On 2026-09-05, all 974 tests passed on macOS (Node 26.8.1) and in an unprivileged Linux container (Node 24.20.0) against matching TypeScript source/test hashes. Retained local evidence is `acceptance-results/local-1788645661523/` and `acceptance-results/linux-fixture/result-final/`; Those reports are historical: their hashes cover the 2026-09-05 source, not this branch, and the GATES.md ledger that recorded them is local and untracked. Produce fresh evidence for the current source with the Local matrix procedure above. These ignored evidence directories must be retained separately from a Git commit. This is local platform evidence, not an executed hosted Actions matrix or a live acceptance pass.
 
 The initial root/locale-misconfigured Linux failure remains in `acceptance-results/linux-fixture/result/`. Permission-denial tests require an unprivileged user. Exact log-accounting controls establish distinct birth/change timestamps; the zero-birthtime regression still requires unknown accounting.
 

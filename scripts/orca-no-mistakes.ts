@@ -15849,8 +15849,8 @@ Run options:
  Init options:
   --upstream <url|nwo> (override upstream repository URL or owner/repo)
   --fork <url|nwo> (override fork repository URL or owner/repo)
-  --base-branch <branch> (override target base branch)
-  --head-branch <branch> (override publication head branch)
+  --base-branch <branch> (init-time base branch for the stored route; does not select a run's base, use run --base)
+  --head-branch <branch> (init-time head branch for the stored route; a run publishes the submitted checked-out branch)
 
  Prune options:
   --stranded (reap stranded gate and direct-run resources whose coordinator died; cannot be combined with --before)
