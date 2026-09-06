@@ -5939,41 +5939,6 @@ export class DomainLedger {
       .get(runId) as RunRecord | undefined
   }
 
-  branchIntents(repoRoot: string, branch: string, runId?: string): string[] {
-    const runs = this.#db
-      .prepare(
-        `SELECT run_id, intent FROM runs
-         WHERE repo_root = ? AND branch = ?
-         ORDER BY rowid`,
-      )
-      .all(repoRoot, branch) as Array<{
-        intent: string
-        run_id: string
-      }>
-    if (runs.length === 0) return []
-
-    const targetIndex = runId ? runs.findIndex((r) => r.run_id === runId) : -1
-    const limitIndex = targetIndex !== -1 ? targetIndex : runs.length
-
-    let boundaryIndex = 0
-    for (let i = 0; i < limitIndex; i++) {
-      const receipt = this.remoteReceipt(runs[i].run_id, 'pull-request-binding')
-      if (receipt) {
-        try {
-          const payload = JSON.parse(receipt.receipt_json) as { state?: unknown }
-          if (payload?.state === 'merged') {
-            boundaryIndex = i + 1
-          }
-        } catch {}
-      }
-    }
-    const sliceEnd = targetIndex !== -1 ? targetIndex + 1 : runs.length
-    if (boundaryIndex >= sliceEnd && sliceEnd > 0) {
-      boundaryIndex = sliceEnd - 1
-    }
-    return runs.slice(boundaryIndex, sliceEnd).map((row) => row.intent)
-  }
-
   listRuns(): { intent: string; run_id: string }[] {
     return this.#db.prepare('SELECT intent, run_id FROM runs ORDER BY created_at').all() as {
       intent: string
