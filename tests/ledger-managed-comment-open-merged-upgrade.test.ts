@@ -360,11 +360,11 @@ test('historical managed-comment binding upgrades to open and then merged', asyn
         supersedesEvidenceSha256: supersedes
       }).receiptSha256
     }
-    const openReceipt = settle(3, 'open', dispositionEvidence())
+    const openReceipt = settle(3, 'open', dispositionEvidence()!)
     assert.equal(dispositionEvidence(), entries.find((entry) => entry.round === 3)!.evidenceSha256)
     const parsedOpen = JSON.parse(ledger.remoteReceipt(runId, 'pull-request-binding')!.receipt_json)
     assert.equal(parsedOpen.state, 'open')
-    const mergedReceipt = settle(4, 'merged', dispositionEvidence())
+    const mergedReceipt = settle(4, 'merged', dispositionEvidence()!)
     assert.notEqual(mergedReceipt, openReceipt)
     assert.equal(dispositionEvidence(), entries.find((entry) => entry.round === 4)!.evidenceSha256)
     assert.equal(JSON.parse(ledger.remoteReceipt(runId, 'pull-request-binding')!.receipt_json).state, 'merged')
