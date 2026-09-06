@@ -6,11 +6,11 @@ user-invocable: true
 
 # Orca No-Mistakes
 
-Drive the implemented `orca-no-mistakes` CLI. It runs the eight validation and delivery stages:
+Drive the implemented `orca-no-mistakes` CLI. It runs the nine validation and delivery stages:
 
-`intent -> rebase -> review -> test -> document -> lint -> push -> pr`
+`intent -> rebase -> review -> test -> document -> lint -> push -> pr -> ci`
 
-The default Release 2 run validates candidate changes, publishes them to GitHub, publishes the owned title/body report, notifies the origin of readiness, remains active while the pull request is open, and settles the receipt only after an authoritative matching MERGED observation. Success produces a v2 completion attestation manifest (`completionAttestation`) bound to the validated commit. Migrated Release 1 runs preserve their six local validation stages without remote publication.
+The default Release 2 run validates candidate changes, publishes them to GitHub, publishes the owned title/body report, notifies the origin of readiness, then monitors CI checks and mergeability while the pull request is open, and upgrades the receipt to merged only after an authoritative matching MERGED observation. Success produces a v2 completion attestation manifest (`completionAttestation`) bound to the validated commit. Migrated Release 1 runs preserve their six local validation stages without remote publication.
 
 If your assigned task explicitly says you are already a no-mistakes stage worker, complete only that stage and return its structured report. Do not start a nested pipeline.
 
@@ -46,7 +46,7 @@ Available direct-run controls are `--base`, `--head`, `--force-lease`, `--notify
 
 The detached run returns immediately. When an Orca gate is pending, the coordinator sends a gate notification to the originating terminal with the exact `orca orchestration send` command to resolve it. The coordinator generates an authenticated `question` message addressed with `--to`/`--run`, the exact subject `no-mistakes gate response`, and a JSON body containing `gateId` and `resolution`. Agents must run that emitted command verbatim, substituting only the chosen `<resolution>`. Do not use static or handwritten command templates.
 
-Finding-gate choices are `approve`, `fix`, `skip`, and `stop`. Durable resume-gate choices (opened when an attempt stops after a resumable failure) are `resume` and `stop`. Anything else fails closed.
+Finding-gate choices are `approve`, `fix`, `skip`, and `stop`. The `ci` stage gate (opened on failing, cancelled, or unresolved checks, a merge conflict, or an idle timeout) offers only `fix` and `stop`: nothing is auto-fixed, so relay the findings to the user, and answer `fix` once they have acted externally (reran checks, resolved the conflict, or merged) to resume monitoring. Durable resume-gate choices (opened when an attempt stops after a resumable failure) are `resume` and `stop`. Anything else fails closed.
 
 A `fix` resolution supports targeted finding selection and global guidance:
 
@@ -65,7 +65,7 @@ Approving or skipping a stage records the decision in the domain ledger's gate a
 For Release 2 runs, direct success prints JSON containing the completion attestation manifest under `completionAttestation`:
 
 ```json
-{"runId":"<orca-run-id>","steps":["intent","rebase","review","test","document","lint","push","pr"],"verdict":"passed","custodyNote":"...","completionAttestation":{"version":"2.0.0","assuranceClaims":["configured-pipeline-completed","candidate-publication-verified","pull-request-bound"],"merkleRoot":"..."}}
+{"runId":"<orca-run-id>","steps":["intent","rebase","review","test","document","lint","push","pr","ci"],"verdict":"passed","custodyNote":"...","completionAttestation":{"version":"2.0.0","assuranceClaims":["configured-pipeline-completed","candidate-publication-verified","pull-request-bound"],"merkleRoot":"..."}}
 ```
 
 For migrated Release 1 resumes, direct success prints JSON returning the frozen six-stage plan and the v1.3 manifest under `attestation`:

@@ -264,7 +264,6 @@ test('rejects an indeterminate PR update when authoritative post-read still has 
         ledger,
         pipelineEvidenceRoot: sha256('pipeline'),
         runId,
-        sleep: async () => assert.fail('unproven update must not wait for merge'),
         workerIdentity: 'coordinator'
       }),
       (error: unknown) => error instanceof PullRequestBindingError &&

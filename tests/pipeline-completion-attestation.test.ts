@@ -385,6 +385,20 @@ test('v2 completion attestations bind Release 2 facts without overstating assura
     assert.notEqual(alternateTerminalOutcome.merkleRoot, manifest.merkleRoot)
 
     verifyCompletionAttestation(manifest)
+    // Release 2 attestations (plan ending push, pr) still verify; the ci tail is optional and only after pr.
+    const withoutCi = <T extends { stage: string }>(entries: T[]) => entries.filter((entry) => entry.stage !== 'ci')
+    verifyCompletionAttestation(buildPipelineCompletionAttestation(withoutCi(stageEvidence), {
+      ...completionMetadata,
+      stageDispositions: withoutCi(completionMetadata.stageDispositions),
+      stagePlan: withoutCi(completionMetadata.stagePlan)
+    }))
+    const swapped = completionMetadata.stagePlan.map((entry) =>
+      entry.stage === 'pr' ? { ...entry, stage: 'ci' } : entry.stage === 'ci' ? { ...entry, stage: 'pr' } : entry
+    )
+    assert.throws(
+      () => verifyCompletionAttestation(buildPipelineCompletionAttestation(stageEvidence, { ...completionMetadata, stagePlan: swapped })),
+      /must end with push then pr, optionally followed by ci/
+    )
     const approvedStageEvidence = structuredClone(stageEvidence)
     const approvedReview = approvedStageEvidence.find((entry) => entry.stage === 'review')!
     approvedReview.exitCode = 1

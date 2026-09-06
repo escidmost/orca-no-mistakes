@@ -7,6 +7,7 @@ import test from 'node:test'
 import {
   assertGithubAuthenticationIdentity,
   assertGithubPublicationRouteIdentity,
+  checkBucket,
   GithubAuthority,
   GithubAuthorityError,
   parseGithubRepositoryReference,
@@ -322,6 +323,126 @@ test('issue comment observation exhausts every page', async () => {
   })
   const comments = await provider.observeIssueComments('PR_1')
   assert.deepEqual(comments.map((comment) => comment.id), ['IC_1', 'IC_2'])
+})
+
+function checksNode(input: {
+  contexts: { nodes: unknown[]; pageInfo: { endCursor: string | null; hasNextPage: boolean } } | null
+  headOid?: string
+}) {
+  return {
+    baseRef: { target: { oid: 'a'.repeat(40) } },
+    commits: {
+      nodes: [{
+        commit: {
+          oid: input.headOid ?? 'b'.repeat(40),
+          statusCheckRollup: input.contexts && { contexts: input.contexts }
+        }
+      }]
+    },
+    headRefOid: 'b'.repeat(40),
+    isDraft: false,
+    mergeable: 'MERGEABLE',
+    number: 2,
+    state: 'OPEN'
+  }
+}
+
+test('pull request checks observation exhausts every page and maps every bucket', async () => {
+  const pages = [
+    {
+      nodes: [
+        { __typename: 'CheckRun', conclusion: null, detailsUrl: 'https://ci.example/1', name: 'build', status: 'IN_PROGRESS' },
+        { __typename: 'CheckRun', conclusion: 'SUCCESS', detailsUrl: 'https://ci.example/2', name: 'unit', status: 'COMPLETED' },
+        { __typename: 'CheckRun', conclusion: 'SKIPPED', detailsUrl: null, name: 'docs', status: 'COMPLETED' },
+        { __typename: 'CheckRun', conclusion: 'CANCELLED', detailsUrl: null, name: 'e2e', status: 'COMPLETED' },
+        { __typename: 'CheckRun', conclusion: 'FAILURE', detailsUrl: 'https://ci.example/5', name: 'lint', status: 'COMPLETED' }
+      ],
+      pageInfo: { endCursor: 'page-2', hasNextPage: true }
+    },
+    {
+      nodes: [
+        { __typename: 'StatusContext', context: 'ci/legacy', state: 'SUCCESS', targetUrl: 'https://ci.example/6' },
+        { __typename: 'StatusContext', context: 'ci/deploy', state: 'PENDING', targetUrl: null },
+        { __typename: 'StatusContext', context: 'ci/scan', state: 'FAILURE', targetUrl: null }
+      ],
+      pageInfo: { endCursor: null, hasNextPage: false }
+    }
+  ]
+  const cursors: unknown[] = []
+  const provider = await GithubAuthority.connect({
+    runner: githubRunner((_executable, _args, options) => {
+      const request = JSON.parse(options.input ?? '{}') as { query: string; variables: Record<string, unknown> }
+      assert.match(request.query, /commits\(last: 1\)/)
+      assert.equal(request.variables.id, 'PR_2')
+      cursors.push(request.variables.cursor)
+      return json({ data: { node: checksNode({ contexts: pages.shift() ?? null }) } })
+    })
+  })
+  const observation = await provider.observePullRequestChecks('PR_2')
+  assert.deepEqual(cursors, [null, 'page-2'])
+  assert.equal(observation.number, 2)
+  assert.equal(observation.headOid, 'b'.repeat(40))
+  assert.deepEqual(
+    observation.checks.map((check) => [check.kind, check.name, check.bucket, check.url]),
+    [
+      ['check-run', 'build', 'pending', 'https://ci.example/1'],
+      ['check-run', 'unit', 'pass', 'https://ci.example/2'],
+      ['check-run', 'docs', 'skip', null],
+      ['check-run', 'e2e', 'cancel', null],
+      ['check-run', 'lint', 'fail', 'https://ci.example/5'],
+      ['status', 'ci/legacy', 'pass', 'https://ci.example/6'],
+      ['status', 'ci/deploy', 'pending', null],
+      ['status', 'ci/scan', 'fail', null]
+    ]
+  )
+  assert.deepEqual(observation.checks[5], {
+    bucket: 'pass',
+    conclusion: 'SUCCESS',
+    kind: 'status',
+    name: 'ci/legacy',
+    status: 'COMPLETED',
+    url: 'https://ci.example/6'
+  })
+  assert.equal(checkBucket('check-run', 'COMPLETED', 'STALE'), 'cancel')
+  assert.equal(checkBucket('check-run', 'COMPLETED', 'NEUTRAL'), 'skip')
+  assert.equal(checkBucket('check-run', 'COMPLETED', 'TIMED_OUT'), 'fail')
+  assert.equal(checkBucket('check-run', 'COMPLETED', null), 'fail')
+  assert.equal(checkBucket('status', 'COMPLETED', 'EXPECTED'), 'pending')
+  assert.equal(checkBucket('status', 'COMPLETED', 'ERROR'), 'fail')
+})
+
+test('pull request checks observation reports facts with empty checks when no rollup exists', async () => {
+  const provider = await GithubAuthority.connect({
+    runner: githubRunner(() => json({ data: { node: checksNode({ contexts: null }) } }))
+  })
+  assert.deepEqual(await provider.observePullRequestChecks('PR_2'), {
+    baseRefOid: 'a'.repeat(40),
+    checks: [],
+    draft: false,
+    headOid: 'b'.repeat(40),
+    mergeable: 'MERGEABLE',
+    number: 2,
+    state: 'OPEN'
+  })
+})
+
+test('pull request checks observation rejects absent pull requests and head drift', async () => {
+  const absent = await GithubAuthority.connect({
+    runner: githubRunner(() => json({ data: { node: null } }))
+  })
+  await assert.rejects(
+    () => absent.observePullRequestChecks('PR_2'),
+    (error: unknown) => error instanceof GithubAuthorityError &&
+      error.kind === 'ambiguous' && error.operation === 'observe-pull-request-checks'
+  )
+
+  const drifted = await GithubAuthority.connect({
+    runner: githubRunner(() => json({ data: { node: checksNode({ contexts: null, headOid: 'c'.repeat(40) }) } }))
+  })
+  await assert.rejects(
+    () => drifted.observePullRequestChecks('PR_2'),
+    (error: unknown) => error instanceof GithubAuthorityError && error.kind === 'identity-drift'
+  )
 })
 
 test('authentication and route identity checks allow redirects but reject authority drift', () => {

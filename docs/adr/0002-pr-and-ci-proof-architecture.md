@@ -2,7 +2,7 @@
 status: accepted
 date: 2026-08-20
 scope: target architecture
-implementation: partially implemented (Release 2; merge-state waiting implemented, CI, branch-protection, and delivered-tree proof pending)
+implementation: partially implemented (Release 2; merge-state waiting and CI monitoring implemented, check completeness, branch-protection, and delivered-tree proof pending)
 ---
 
 # PR and CI Proof Architecture
@@ -16,6 +16,10 @@ The target pipeline separates deterministic GitHub and Git object proof from adv
 - Check completeness is evaluated against both the effective trusted manifest and applicable forge branch rules.
 - Delivery uses a non-bypass expected-head transition that fails closed if the candidate or target base changed after reconciliation.
 - GitHub merge fields are a delivery receipt, not delivered-tree proof. After delivery, the coordinator fetches the resulting Git objects and verifies candidate ancestry for merge commits or exact tree equality for squash/rebase delivery.
+
+## Status update (2026-09-06)
+
+[ADR-0016](0016-ci-stage-monitoring-and-merge-settlement.md) implements CI monitoring as a ninth `ci` stage that polls the exact candidate's check rollup and merge state; check-set completeness, guarded merge, and delivered-tree proof remain Release 3.
 
 ## Consequences
 

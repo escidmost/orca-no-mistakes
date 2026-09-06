@@ -40,6 +40,20 @@ auto_fix:
   # guardrails: strict
 
 # ------------------------------------------------------------------------------
+# CI Monitoring (ci stage)
+# ------------------------------------------------------------------------------
+ci:
+  # Treat a pull request with no registered checks as all checks passed
+  # (default: false). Honored only from the trusted base-branch repository
+  # config; the stage still monitors until the PR is merged or closed.
+  no_ci: false
+
+  # Idle timeout in milliseconds before the ci stage opens a gate
+  # (default: 604800000 = 7 days; 0 = unlimited). Re-armed whenever the
+  # PR base branch tip advances.
+  timeout_ms: 604800000
+
+# ------------------------------------------------------------------------------
 # Agent CLI Arguments & Environment Overrides
 # ------------------------------------------------------------------------------
 # Custom flags or environment variables passed to specific agent harnesses.
@@ -104,8 +118,8 @@ defaults:
 # ------------------------------------------------------------------------------
 # Stage-Specific Overrides
 # ------------------------------------------------------------------------------
-# Supported stages: intent, rebase, review, test, document, lint, push, pr.
-# Only push is a coordinator-owned remote stage; agent settings do not apply. pr configures the drafting reviewer.
+# Supported stages: intent, rebase, review, test, document, lint, push, pr, ci.
+# push and ci are coordinator-owned remote stages; agent settings do not apply. pr configures the drafting reviewer.
 # stages:
 #   intent:
 #     agent: "claude"
@@ -137,3 +151,5 @@ defaults:
 #   push: {}
 #
 #   pr: {}
+#
+#   ci: {}

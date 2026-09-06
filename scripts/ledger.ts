@@ -865,9 +865,9 @@ export function verifyCompletionAttestation(manifest: CompletionAttestationManif
     planStages.add(entry.stage)
   }
   const pushIndex = manifest.stagePlan.findIndex((entry) => entry.stage === 'push')
-  const prIndex = manifest.stagePlan.findIndex((entry) => entry.stage === 'pr')
-  if (pushIndex < 0 || prIndex !== pushIndex + 1 || prIndex !== manifest.stagePlan.length - 1) {
-    throw new Error('attestation stage plan must end with push then pr')
+  const tail = manifest.stagePlan.slice(pushIndex).map((entry) => entry.stage).join(',')
+  if (pushIndex < 0 || !['push,pr', 'push,pr,ci'].includes(tail)) {
+    throw new Error('attestation stage plan must end with push then pr, optionally followed by ci')
   }
   if (
     !Array.isArray(manifest.stageDispositions) ||
@@ -3968,7 +3968,7 @@ export class DomainLedger {
       (hasBodyReport &&
         (typeof receipt.bodySha256 !== 'string' || !HEX_64.test(receipt.bodySha256) ||
           typeof receipt.titleSha256 !== 'string' || !HEX_64.test(receipt.titleSha256) ||
-          receipt.state !== 'merged')) ||
+          (receipt.state !== 'merged' && receipt.state !== 'open'))) ||
       typeof receipt.mutationIntent !== 'string' ||
       receipt.postRead !== input.observationSha256) return false
     const mutation = this.#db.prepare(
@@ -4047,7 +4047,7 @@ export class DomainLedger {
       ) && payload.number === receipt.number
     if (!commonMatch) return false
     if (hasBodyReport) {
-      return payload.state === 'merged' && mutationPayload.action === 'ensure-body-and-await-merge' &&
+      return payload.state === receipt.state && mutationPayload.action === 'ensure-body-and-await-merge' &&
         payload.bodySha256 === receipt.bodySha256 &&
         payload.titleSha256 === receipt.titleSha256 &&
         hasOnlyOwnProperties(payload, new Set([
@@ -4210,8 +4210,11 @@ export class DomainLedger {
         'SELECT disposition, evidence_sha256 FROM stage_dispositions WHERE run_id = ? AND stage_id = ? LIMIT 1'
       ).get(input.runId, input.stageId) as { disposition: string; evidence_sha256: string } | undefined
       const priorDisposition = priorDispositionRow !== undefined ? 1 : undefined
+      // An open binding settles pr; the ci stage later upgrades the same
+      // candidate's receipt to merged through the supersession path below.
       const settlesDisposition = input.stageId !== 'pr' ||
         input.receipt.payload.state === 'merged' ||
+        input.receipt.payload.state === 'open' ||
         (Object.hasOwn(input.receipt.payload, 'managedCommentIntent') &&
           (input.evidence.roundIndex === 0 || priorDisposition === undefined))
       const priorEvidence = this.#db.prepare(

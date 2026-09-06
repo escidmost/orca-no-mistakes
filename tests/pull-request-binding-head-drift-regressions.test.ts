@@ -61,7 +61,7 @@ function harness() {
   return { ledger, settlements, setOwnsLease: (value: boolean) => { ownsLease = value } }
 }
 
-test('rejects candidate headOid-only drift with stable PR identity and unchanged content while awaiting merge', async () => {
+test('rejects candidate headOid-only drift with stable PR identity and unchanged content after readiness notification', async () => {
   const { ledger, settlements } = harness()
   let pr = pullRequest()
   const authority = {
@@ -75,13 +75,13 @@ test('rejects candidate headOid-only drift with stable PR identity and unchanged
       bindPullRequest({
         artifactPath: path.join(directory, 'pr.json'), attemptId: 'attempt', authority,
         candidateCommitOid: OID, content, generationToken: 1, ledger: ledger as never,
-        pipelineEvidenceRoot: 'c'.repeat(64), runId: 'run',
-        sleep: async () => {
+        onReady: async () => {
           pr = pullRequest({ headOid: 'f'.repeat(40) })
         },
+        pipelineEvidenceRoot: 'c'.repeat(64), runId: 'run',
         workerIdentity: 'coordinator'
       }),
-      /facts changed while awaiting merge/
+      /facts changed after readiness notification/
     )
     assert.equal(settlements.length, 0)
   } finally {

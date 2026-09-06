@@ -61,7 +61,7 @@ function harness() {
   return { ledger, settlements, setOwnsLease: (value: boolean) => { ownsLease = value } }
 }
 
-test('updates the original PR body and settles only after merge', async () => {
+test('updates the original PR body and settles open right after readiness notification', async () => {
   const { ledger, settlements } = harness()
   let pr = pullRequest({ body: 'stale body', title: 'stale title' })
   let updates = 0
@@ -90,16 +90,13 @@ test('updates the original PR body and settles only after merge', async () => {
       },
       pipelineEvidenceRoot: 'c'.repeat(64),
       runId: 'run',
-      sleep: async () => {
-        assert.equal(settlements.length, 0)
-        pr = pullRequest({ state: 'MERGED' })
-      },
       workerIdentity: 'coordinator'
     })
     assert.equal(updates, 1)
     assert.deepEqual(ready, ['https://github.com/acme/repo/pull/7'])
     assert.equal(result.outcome, 'updated')
     assert.equal(settlements.length, 1)
+    assert.equal((settlements[0].receipt as { payload: { state: string } }).payload.state, 'open')
   } finally {
     await rm(directory, { force: true, recursive: true })
   }
@@ -137,7 +134,7 @@ test('rejects conflicting or closed pull requests before mutation', async () => 
   assert.equal(mutations, 0)
 })
 
-test('rejects lease loss and PR identity drift while awaiting merge', async () => {
+test('rejects lease loss and PR identity drift after readiness notification', async () => {
   const { ledger, setOwnsLease, settlements } = harness()
   let pr = pullRequest()
   const authority = {
@@ -151,11 +148,11 @@ test('rejects lease loss and PR identity drift while awaiting merge', async () =
       bindPullRequest({
         artifactPath: path.join(directory, 'pr.json'), attemptId: 'attempt', authority,
         candidateCommitOid: OID, content, generationToken: 1, ledger: ledger as never,
+        onReady: async () => { pr = pullRequest({ id: 'replacement', number: 8 }) },
         pipelineEvidenceRoot: 'c'.repeat(64), runId: 'run',
-        sleep: async () => { pr = pullRequest({ id: 'replacement', number: 8 }) },
         workerIdentity: 'coordinator'
       }),
-      /facts changed while awaiting merge/
+      /facts changed after readiness notification/
     )
     assert.equal(settlements.length, 0)
 

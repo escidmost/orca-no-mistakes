@@ -165,6 +165,44 @@ const CommentPageSchema = z.object({
     })
   }).nullable()
 })
+const CheckContextSchema = z.discriminatedUnion('__typename', [
+  z.object({
+    __typename: z.literal('CheckRun'),
+    conclusion: z.string().nullable(),
+    detailsUrl: z.string().nullable(),
+    name: z.string(),
+    status: z.string()
+  }),
+  z.object({
+    __typename: z.literal('StatusContext'),
+    context: z.string(),
+    state: z.string(),
+    targetUrl: z.string().nullable()
+  })
+])
+const PullRequestChecksPageSchema = z.object({
+  node: z.object({
+    baseRef: z.object({ target: z.object({ oid: OidSchema }).nullable() }).nullable(),
+    commits: z.object({
+      nodes: z.array(z.object({
+        commit: z.object({
+          oid: OidSchema,
+          statusCheckRollup: z.object({
+            contexts: z.object({
+              nodes: z.array(CheckContextSchema),
+              pageInfo: PageInfoSchema
+            })
+          }).nullable()
+        })
+      }))
+    }),
+    headRefOid: OidSchema.nullable(),
+    isDraft: z.boolean(),
+    mergeable: z.enum(['MERGEABLE', 'CONFLICTING', 'UNKNOWN']),
+    number: z.number().int().positive(),
+    state: z.enum(['OPEN', 'CLOSED', 'MERGED'])
+  }).nullable()
+})
 
 export type GithubBackend = {
   kind: 'gh' | 'gh-axi'
@@ -216,6 +254,27 @@ export type GithubIssueCommentObservation = {
   url: string
 }
 
+export type GithubCheckBucket = 'pass' | 'fail' | 'pending' | 'cancel' | 'skip'
+
+export type GithubCheckObservation = {
+  bucket: GithubCheckBucket
+  conclusion: string | null
+  kind: 'check-run' | 'status'
+  name: string
+  status: string
+  url: string | null
+}
+
+export type GithubPullRequestChecksObservation = {
+  baseRefOid: string | null
+  checks: GithubCheckObservation[]
+  draft: boolean
+  headOid: string | null
+  mergeable: 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN'
+  number: number
+  state: 'OPEN' | 'CLOSED' | 'MERGED'
+}
+
 export type GithubMutationAttempt = {
   attemptedAt: string
   backend: GithubBackend
@@ -251,6 +310,25 @@ const COMMENTS_QUERY = `query IssueComments($id: ID!, $cursor: String) {
       comments(first: 100, after: $cursor) {
         nodes { id body createdAt updatedAt url author { login ... on Node { id } } }
         pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}`
+
+const PULL_REQUEST_CHECKS_QUERY = `query PullRequestChecks($id: ID!, $cursor: String) {
+  node(id: $id) {
+    ... on PullRequest {
+      number state isDraft mergeable headRefOid
+      baseRef { target { oid } }
+      commits(last: 1) {
+        nodes { commit { oid statusCheckRollup { contexts(first: 100, after: $cursor) {
+          nodes {
+            __typename
+            ... on CheckRun { name status conclusion detailsUrl }
+            ... on StatusContext { context state targetUrl }
+          }
+          pageInfo { hasNextPage endCursor }
+        } } } }
       }
     }
   }
@@ -434,6 +512,59 @@ export class GithubAuthority {
       cursor = nextCursor(data.node.comments.pageInfo, seen, 'observe-issue-comments')
     } while (cursor)
     return comments
+  }
+
+  async observePullRequestChecks(pullRequestNodeId: string): Promise<GithubPullRequestChecksObservation> {
+    NodeIdSchema.parse(pullRequestNodeId)
+    const operation = 'observe-pull-request-checks'
+    const checks: GithubCheckObservation[] = []
+    let cursor: string | null = null
+    const seen = new Set<string>()
+    let observation: Omit<GithubPullRequestChecksObservation, 'checks'> | undefined
+    do {
+      const data = await this.#graphqlRead(
+        operation,
+        PULL_REQUEST_CHECKS_QUERY,
+        { cursor, id: pullRequestNodeId },
+        PullRequestChecksPageSchema
+      )
+      if (!data.node) {
+        throw new GithubAuthorityError('ambiguous', operation, 'pull request is absent or inaccessible')
+      }
+      const commit = data.node.commits.nodes.at(-1)?.commit
+      if (commit && data.node.headRefOid && commit.oid !== data.node.headRefOid) {
+        throw new GithubAuthorityError('identity-drift', operation, 'pull request head changed while observing checks')
+      }
+      observation ??= {
+        baseRefOid: data.node.baseRef?.target?.oid ?? null,
+        draft: data.node.isDraft,
+        headOid: data.node.headRefOid,
+        mergeable: data.node.mergeable,
+        number: data.node.number,
+        state: data.node.state
+      }
+      const contexts = commit?.statusCheckRollup?.contexts
+      if (!contexts) break
+      checks.push(...contexts.nodes.map((context) => context.__typename === 'CheckRun'
+        ? {
+          bucket: checkBucket('check-run', context.status, context.conclusion),
+          conclusion: context.conclusion,
+          kind: 'check-run' as const,
+          name: context.name,
+          status: context.status,
+          url: context.detailsUrl
+        }
+        : {
+          bucket: checkBucket('status', 'COMPLETED', context.state),
+          conclusion: context.state,
+          kind: 'status' as const,
+          name: context.context,
+          status: 'COMPLETED',
+          url: context.targetUrl
+        }))
+      cursor = nextCursor(contexts.pageInfo, seen, operation)
+    } while (cursor)
+    return { ...observation, checks }
   }
 
   async createPullRequest(input: {
@@ -764,6 +895,27 @@ export async function resolveGithubPublicationRoute(input: {
   }
   const routeFingerprint = input.ledger.setRepositoryPublicationRoute(route)
   return { ...route, routeFingerprint }
+}
+
+export function checkBucket(
+  kind: GithubCheckObservation['kind'],
+  status: string,
+  conclusion: string | null
+): GithubCheckBucket {
+  if (kind === 'status') {
+    if (conclusion === 'SUCCESS') return 'pass'
+    if (conclusion === 'PENDING' || conclusion === 'EXPECTED') return 'pending'
+    return 'fail'
+  }
+  if (status !== 'COMPLETED') return 'pending'
+  switch (conclusion) {
+    case 'SUCCESS': return 'pass'
+    case 'NEUTRAL':
+    case 'SKIPPED': return 'skip'
+    case 'CANCELLED':
+    case 'STALE': return 'cancel'
+    default: return 'fail'
+  }
 }
 
 export function parseGithubRepositoryReference(value: string): { name: string; owner: string } {

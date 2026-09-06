@@ -109,14 +109,12 @@ test('reconciles indeterminate creation through authoritative post-read', async 
       ledger: ledger as never,
       pipelineEvidenceRoot: 'c'.repeat(64),
       runId: 'run',
-      sleep: async () => {
-        pr = pullRequest({ state: 'MERGED' })
-      },
       workerIdentity: 'coordinator'
     })
     assert.equal(createAttempts, 1)
     assert.equal(result.outcome, 'created')
     assert.equal(settlements.length, 1)
+    assert.equal((settlements[0].receipt as { payload: { state: string } }).payload.state, 'open')
   } finally {
     await rm(directory, { force: true, recursive: true })
   }

@@ -17,7 +17,7 @@ import { assertStructurallyVisible } from './markdown-visibility.ts'
 const OID = 'a'.repeat(40)
 const content = { body: 'complete body', title: 'feat: complete report' }
 
-test('bindPullRequest captures createPullRequest with draft: false and settles after merge', async () => {
+test('bindPullRequest captures createPullRequest with draft: false and settles open after readiness', async () => {
   const settlements: Array<Record<string, unknown>> = []
   let ownsLease = true
   const ledger = {
@@ -107,10 +107,6 @@ test('bindPullRequest captures createPullRequest with draft: false and settles a
       },
       pipelineEvidenceRoot: 'c'.repeat(64),
       runId: 'run',
-      sleep: async () => {
-        assert.equal(settlements.length, 0)
-        pr = { ...pr!, state: 'MERGED' }
-      },
       workerIdentity: 'coordinator'
     })
 
@@ -131,6 +127,7 @@ test('bindPullRequest captures createPullRequest with draft: false and settles a
       url: 'https://github.com/acme/repo/pull/42'
     }])
     assert.equal(settlements.length, 1)
+    assert.equal((settlements[0].receipt as { payload: { state: string } }).payload.state, 'open')
   } finally {
     await rm(directory, { force: true, recursive: true })
   }

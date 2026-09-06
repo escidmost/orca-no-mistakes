@@ -442,6 +442,20 @@ export function pullRequestContent(intent: string, report: PullRequestReport): {
   }
 }
 
+/** Observes the exact pull request bound to the run's durable route and candidate. */
+export async function observeBoundPullRequest(
+  authority: PullRequestAuthority,
+  ledger: DomainLedger,
+  runId: string,
+  candidateCommitOid: string
+): Promise<GithubPullRequestObservation | null> {
+  const run = ledger.run(runId)
+  const route = ledger.publicationRoute(runId)
+  const repositoryRoute = run ? ledger.repositoryPublicationRoute(run.repo_root) : undefined
+  if (!route || !repositoryRoute) throw new PullRequestBindingError('run publication route is not durable')
+  return observeExact(authority, route, repositoryRoute, candidateCommitOid)
+}
+
 async function observeExact(
   authority: PullRequestAuthority,
   route: NonNullable<ReturnType<DomainLedger['publicationRoute']>>,
@@ -480,14 +494,11 @@ export async function bindPullRequest(input: {
     url: string
   }) => Promise<void>
   pipelineEvidenceRoot: string
-  pollIntervalMs?: number
   roundIndex?: number
   runId: string
-  sleep?: (milliseconds: number) => Promise<void>
   workerIdentity: string
 }): Promise<{ number: number; outcome: 'created' | 'unchanged' | 'updated'; receiptSha256: string; url: string }> {
   const now = input.now ?? (() => new Date().toISOString())
-  const sleep = input.sleep ?? ((milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds)))
   const content = input.content
   const run = input.ledger.run(input.runId)
   const route = input.ledger.publicationRoute(input.runId)
@@ -607,77 +618,181 @@ export async function bindPullRequest(input: {
       pullRequest = observed
     }
   }
-  while (pullRequest.state === 'OPEN') {
-    await sleep(input.pollIntervalMs ?? 15_000)
-    input.ledger.heartbeatLease(run.repo_root, run.branch, input.runId)
-    requireLease()
-    const observed = await observeExact(input.authority, route, repositoryRoute, input.candidateCommitOid)
-    if (
-      !observed ||
-      observed.id !== selectedPullRequest.id ||
-      observed.number !== selectedPullRequest.number ||
-      observed.headOid !== input.candidateCommitOid ||
-      observed.draft ||
-      observed.title !== content.title ||
-      observed.body !== content.body
-    ) {
-      throw new PullRequestBindingError('pull-request facts changed while awaiting merge')
-    }
-    pullRequest = observed
+  const state = pullRequest.state === 'MERGED' ? 'merged' : 'open'
+  const settlement = settlePullRequestBinding({
+    artifactPath: input.artifactPath,
+    attemptId: input.attemptId,
+    candidateCommitOid: input.candidateCommitOid,
+    ledger: input.ledger,
+    mutationIntent,
+    observedAt: after(mutationCreatedAt, now()),
+    outcome,
+    ownership,
+    pipelineEvidenceRoot: input.pipelineEvidenceRoot,
+    pullRequest,
+    roundIndex: input.roundIndex ?? 0,
+    route,
+    routeFacts,
+    runId: input.runId,
+    state,
+    summary: state === 'merged'
+      ? `Pull request #${pullRequest.number} merged after publishing the complete pipeline report (${outcome})`
+      : `Pull request #${pullRequest.number} published with the complete pipeline report (${outcome}); awaiting CI and merge`,
+    workerIdentity: input.workerIdentity
+  })
+  return {
+    number: pullRequest.number,
+    outcome,
+    receiptSha256: await settlement,
+    url: pullRequest.url
   }
-  if (pullRequest.state !== 'MERGED') {
-    throw new PullRequestBindingError('the exact pull request was closed without merging')
+}
+
+/**
+ * Upgrades the settled open pull-request binding to merged once the ci stage
+ * has observed the exact candidate's pull request merged with unchanged facts.
+ */
+export async function settleMergedPullRequest(input: {
+  artifactPath: string
+  attemptId: string
+  authority: PullRequestAuthority
+  candidateCommitOid: string
+  generationToken: number
+  ledger: DomainLedger
+  runId: string
+  workerIdentity: string
+}): Promise<{ number: number; receiptSha256: string; url: string }> {
+  const run = input.ledger.run(input.runId)
+  const route = input.ledger.publicationRoute(input.runId)
+  const repositoryRoute = run ? input.ledger.repositoryPublicationRoute(run.repo_root) : undefined
+  if (!run || !route || !repositoryRoute || repositoryRoute.route_fingerprint !== route.route_fingerprint) {
+    throw new PullRequestBindingError('run publication route is not durable')
   }
+  const openReceipt = input.ledger.remoteReceipt(input.runId, 'pull-request-binding')
+  if (!openReceipt || openReceipt.candidate_commit_oid !== input.candidateCommitOid) {
+    throw new PullRequestBindingError('pull-request binding must settle before merge settlement')
+  }
+  const parsedReceipt = JSON.parse(openReceipt.receipt_json) as Record<string, unknown>
+  const openPayload = (parsedReceipt.payload as Record<string, unknown> | undefined) ?? parsedReceipt
+  const ownership = { branch: run.branch, generationToken: input.generationToken, repoRoot: run.repo_root }
+  if (!input.ledger.ownsLease(input.runId, ownership)) {
+    throw new PullRequestBindingError('pull-request binding lease is no longer owned by this run generation')
+  }
+  const observedAt = new Date().toISOString()
+  const pullRequest = await observeExact(input.authority, route, repositoryRoute, input.candidateCommitOid)
   if (
+    !pullRequest ||
+    pullRequest.number !== openPayload.number ||
     pullRequest.draft ||
-    pullRequest.title !== content.title ||
-    pullRequest.body !== content.body
+    sha256(pullRequest.title) !== openPayload.titleSha256 ||
+    sha256(pullRequest.body) !== openPayload.bodySha256
   ) {
     throw new PullRequestBindingError('pull-request facts changed before merge')
   }
+  if (pullRequest.state !== 'MERGED') {
+    throw new PullRequestBindingError('the exact pull request is not merged')
+  }
+  if (openPayload.state === 'merged') {
+    // The pr stage already observed the merge; nothing further to settle.
+    return { number: pullRequest.number, receiptSha256: openReceipt.receipt_sha256, url: pullRequest.url }
+  }
+  const priorEvidence = input.ledger.listEvidence(input.runId).filter((row) => row.stage_id === 'pr')
+  const openEvidence = priorEvidence.at(-1)
+  const routeFacts = {
+    baseBranch: route.base_branch,
+    baseRepositoryId: route.base_repository_id,
+    candidateCommitOid: input.candidateCommitOid,
+    forgeHost: route.forge_host,
+    headBranch: route.head_branch,
+    headOwner: route.head_owner,
+    headRepositoryId: route.head_repository_id
+  }
+  // The merged receipt must reference an intent from the settling attempt, so a resumed
+  // run re-records the (unchanged) ensure-body intent it observed rather than the historical one.
+  const mutationIntent = input.ledger.recordMutationIntent({
+    attemptId: input.attemptId,
+    createdAt: observedAt,
+    kind: 'pull-request',
+    payload: { action: 'ensure-body-and-await-merge', ...routeFacts, body: pullRequest.body, title: pullRequest.title },
+    runId: input.runId,
+    targetFingerprint: route.route_fingerprint
+  })
+  const receiptSha256 = await settlePullRequestBinding({
+    artifactPath: input.artifactPath,
+    attemptId: input.attemptId,
+    candidateCommitOid: input.candidateCommitOid,
+    ledger: input.ledger,
+    mutationIntent,
+    observedAt,
+    outcome: 'unchanged',
+    ownership,
+    pipelineEvidenceRoot: String(openPayload.pipelineEvidenceRoot ?? ''),
+    pullRequest,
+    roundIndex: Math.max(-1, ...priorEvidence.map((row) => row.round_index)) + 1,
+    route,
+    routeFacts,
+    runId: input.runId,
+    state: 'merged',
+    summary: `Pull request #${pullRequest.number} merged after CI monitoring`,
+    supersedesEvidenceSha256: openEvidence?.evidence_sha256,
+    workerIdentity: input.workerIdentity
+  })
+  return { number: pullRequest.number, receiptSha256, url: pullRequest.url }
+}
 
-  const observedAt = after(mutationCreatedAt, now())
+async function settlePullRequestBinding(input: {
+  artifactPath: string
+  attemptId: string
+  candidateCommitOid: string
+  ledger: DomainLedger
+  mutationIntent: string
+  observedAt: string
+  supersedesEvidenceSha256?: string
+  outcome: 'created' | 'unchanged' | 'updated'
+  ownership: { branch: string; generationToken: number; repoRoot: string }
+  pipelineEvidenceRoot: string
+  pullRequest: GithubPullRequestObservation
+  roundIndex: number
+  route: NonNullable<ReturnType<DomainLedger['publicationRoute']>>
+  routeFacts: Record<string, string>
+  runId: string
+  state: 'merged' | 'open'
+  summary: string
+  workerIdentity: string
+}): Promise<string> {
+  const { pullRequest, route, state } = input
   const postRead = input.ledger.recordRemoteObservation({
     attemptId: input.attemptId,
     kind: 'pull-request',
-    observedAt,
+    observedAt: input.observedAt,
     payload: {
-      ...routeFacts,
+      ...input.routeFacts,
       bodySha256: sha256(pullRequest.body),
       number: pullRequest.number,
       pullRequestNodeId: pullRequest.id,
-      state: 'merged',
+      state,
       titleSha256: sha256(pullRequest.title)
     },
     runId: input.runId,
     subject: `${route.forge_host}/${route.base_repository_id}#${pullRequest.number}`
   })
-  const roundIndex = input.roundIndex ?? 0
-  const artifactBytes = `${canonicalJson({ findings: [], mutationIntent, number: pullRequest.number, outcome, postRead })}\n`
+  const artifactBytes = `${canonicalJson({ findings: [], mutationIntent: input.mutationIntent, number: pullRequest.number, outcome: input.outcome, postRead, state })}\n`
   await mkdir(dirname(input.artifactPath), { recursive: true })
   await writeFile(input.artifactPath, artifactBytes)
   const artifactSha256 = sha256(artifactBytes)
-  const evidenceSummary = `Pull request #${pullRequest.number} merged after publishing the complete pipeline report (${outcome})`
   const evidenceDigest = evidenceSha256({
     artifactSha256,
     baseCommitOid: input.candidateCommitOid,
     candidateCommitOid: input.candidateCommitOid,
     exitCode: 0,
-    round: roundIndex,
+    round: input.roundIndex,
     runId: input.runId,
     stage: 'pr',
-    summary: evidenceSummary,
+    summary: input.summary,
     workerIdentity: input.workerIdentity
   })
-  const priorPrDisp = typeof input.ledger.stageDispositions === 'function'
-    ? input.ledger.stageDispositions(input.runId).find((d) => d.stage_id === 'pr')
-    : undefined
-  const supersedesEvidenceSha256 =
-    priorPrDisp?.evidence_sha256 && priorPrDisp.evidence_sha256 !== evidenceDigest
-      ? priorPrDisp.evidence_sha256
-      : undefined
   const settlement = input.ledger.settleRemoteStage({
-    checkpoint: { inputCommitOid: input.candidateCommitOid, outputCommitOid: input.candidateCommitOid, roundIndex },
+    checkpoint: { inputCommitOid: input.candidateCommitOid, outputCommitOid: input.candidateCommitOid, roundIndex: input.roundIndex },
     evidence: {
       artifactPath: input.artifactPath,
       artifactSha256,
@@ -686,37 +801,32 @@ export async function bindPullRequest(input: {
       evidenceSha256: evidenceDigest,
       exitCode: 0,
       findingsJson: '[]',
-      roundIndex,
+      roundIndex: input.roundIndex,
       runId: input.runId,
       stageId: 'pr',
-      summary: evidenceSummary,
+      summary: input.summary,
       workerIdentity: input.workerIdentity
     },
-    ownership,
+    ownership: input.ownership,
     receipt: {
       authoritativePostObservationSha256: postRead,
       candidateCommitOid: input.candidateCommitOid,
       kind: 'pull-request-binding',
       payload: {
         bodySha256: sha256(pullRequest.body),
-        mutationIntent,
+        mutationIntent: input.mutationIntent,
         number: pullRequest.number,
-        outcome,
+        outcome: input.outcome,
         pipelineEvidenceRoot: input.pipelineEvidenceRoot,
         postRead,
         routeFingerprint: route.route_fingerprint,
-        state: 'merged',
+        state,
         titleSha256: sha256(pullRequest.title)
       }
     },
     runId: input.runId,
     stageId: 'pr',
-    ...(supersedesEvidenceSha256 ? { supersedesEvidenceSha256 } : {})
+    ...(input.supersedesEvidenceSha256 ? { supersedesEvidenceSha256: input.supersedesEvidenceSha256 } : {})
   })
-  return {
-    number: pullRequest.number,
-    outcome,
-    receiptSha256: settlement.receiptSha256,
-    url: pullRequest.url
-  }
+  return settlement.receiptSha256
 }

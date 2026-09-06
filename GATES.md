@@ -1,40 +1,53 @@
-# Gates: ONM-79 Release 2 acceptance
+# Gates: ONM-96 CI stage
 
-OWNS: GATES.md, .gitignore, scripts/acceptance/**, scripts/orca-no-mistakes.ts, tests/**, .github/workflows/**, README.md, docs/**, templates/config.yaml
+OWNS: scripts/**, tests/**, docs/**, templates/**, skills/**, README.md, CONTEXT.md
 
-Scope: Prove the agreed Release 2 contract through deterministic macOS/Linux acceptance and a protected live upstream/fork workflow, with retained evidence and operator documentation. Release completion requires all gates below.
+Scope: Add the `ci` pipeline stage after `pr`: pr settles on an open PR binding, ci monitors checks/mergeability/PR state on the exact candidate, gates on failures or idle timeout, and settles the merged binding; config `ci.no_ci` and `ci.timeout_ms`; docs, template, and tests updated.
 
-- [x] G1: Acceptance scenarios agree with the accepted Release 2 contract
-  EVIDENCE: User confirmed updated standards on 2026-09-05: current ADR-0010 owned title/body and matching MERGED settlement govern acceptance. Full CI/delivery proof remains withheld.
+- [x] G1: The project typechecks with the new stage, config keys, and GitHub checks query.
+  CHECK: npx tsc --noEmit && echo TYPECHECK_OK
+  EXPECT: TYPECHECK_OK
+  EVIDENCE: automatic-evidence=v1; definition-sha256=aaed0436a8a134c9687fb7ec2d8648b83af36dff37a59b0255ed6f8a5e003cf7; exit=0; EXPECT=matched; output-sha256=0d31cf08e125020004c508c562e62037cd1809c414d62a869bc1452c072c96f0; output-bytes=13; shell=/bin/sh; cwd=/Users/host/repo/orca-no-mistakes/.orca/workspaces/add-CI-stage; path=b0f69926f468/40 entries
 
-- [x] G2: The complete deterministic regression suite passes, including same-repository/fork pipeline completion, publication failure/resume and exact attestation export/verification
-  CHECK: node scripts/acceptance/local.ts
-  EXPECT: LOCAL ACCEPTANCE PASSED
-  EVIDENCE: automatic-evidence=v1; definition-sha256=a79f9a5a8942f2275da755c275892792599f3b9dc2351d087bf8e2961cbfa8ee; exit=0; EXPECT=matched; output-sha256=45c5c5bd927f062f2c81b80ef9d88b13285d78f4c99f58ebc6dcf33c96d9cbae; output-bytes=162; shell=/bin/sh; cwd=/Users/host/repo/orca-no-mistakes/.orca/workspaces/onm-79-prove-and-document-release-2-end-to-end; path=22fbc48c8e9e/40 entries
+- [x] G2: The full test suite passes.
+  CHECK: node --test tests/*.test.ts > /dev/null 2>&1 && echo TESTS_OK
+  EXPECT: TESTS_OK
+  EVIDENCE: automatic-evidence=v1; definition-sha256=bf918e317e7984e07650ae968e927badbc749bbb9842f05ba1ec1f95a2854e88; exit=0; EXPECT=matched; output-sha256=248df82524633f6943bc2136126941223c3efee4cea57b1b749c1b64f1230789; output-bytes=9; shell=/bin/sh; cwd=/Users/host/repo/orca-no-mistakes/.orca/workspaces/add-CI-stage; path=b0f69926f468/40 entries
 
-- [x] G3: The complete local acceptance matrix passes on macOS and Linux with retained logs and source identity
-  CHECK: node --input-type=module -e 'import assert from "node:assert/strict"; import {readFileSync,readdirSync} from "node:fs"; import {createHash} from "node:crypto"; const dirs=["acceptance-results/"+readdirSync("acceptance-results").filter(d=>d.startsWith("local-")).sort().at(-1),"acceptance-results/linux-fixture/result-final"]; const reports=dirs.map(d=>JSON.parse(readFileSync(d+"/result.json"))); assert.deepEqual(reports.map(r=>r.platform),["darwin","linux"]); assert.deepEqual(reports[0].source.files,reports[1].source.files); assert.equal(reports[0].source.commit,reports[1].source.commit); assert.deepEqual(reports[0].tests,reports[1].tests); for(const [file,hash] of Object.entries(reports[0].source.files)) assert.equal(createHash("sha256").update(readFileSync(file)).digest("hex"),hash,file); reports.forEach((r,i)=>{assert.equal(r.status,"passed"); assert.equal(r.exitCode,0); assert.notEqual(r.userId,0); const tap=readFileSync(dirs[i]+"/tests.tap","utf8"); assert.match(tap,/# tests 974\n/); assert.match(tap,/# pass 974\n/); assert.match(tap,/# fail 0\n/); assert.match(tap,/# cancelled 0\n/); assert.match(tap,/# skipped 0\n/)}); console.log("MACOS AND LINUX EVIDENCE VERIFIED")'
-  EXPECT: MACOS AND LINUX EVIDENCE VERIFIED
-  EVIDENCE: automatic-evidence=v1; definition-sha256=fff1a7bd20c1b58044c0755a22d603e42da5256c899550e8511d5fde9da8d8ee; exit=0; EXPECT=matched; output-sha256=be825cf4e82d9c115066962f3e9584d4c50ef62666673e467e8a5bfa8422a27c; output-bytes=34; shell=/bin/sh; cwd=/Users/host/repo/orca-no-mistakes/.orca/workspaces/onm-79-prove-and-document-release-2-end-to-end; path=22fbc48c8e9e/40 entries
+- [x] G3: The Release 2 plan ends with push, pr, ci and the legacy plan is unchanged.
+  CHECK: node --input-type=module -e "import { PIPELINE_STEPS } from './scripts/config.ts'; import { LEGACY_STAGE_PLAN } from './scripts/ledger.ts'; if (PIPELINE_STEPS.slice(-3).join(',') !== 'push,pr,ci' || PIPELINE_STEPS.length !== 9 || LEGACY_STAGE_PLAN.length !== 6) process.exit(1); console.log('PLAN_OK')"
+  EXPECT: PLAN_OK
+  EVIDENCE: automatic-evidence=v1; definition-sha256=6bed4eae7009457265a0355dc61ca8c44f116ac7fd6b477700b2cfbbe23c7cf8; exit=0; EXPECT=matched; output-sha256=36d259cae5105b07a0aca5241472d0166641bd8b682a8b69155c3993119c3ac3; output-bytes=8; shell=/bin/sh; cwd=/Users/host/repo/orca-no-mistakes/.orca/workspaces/add-CI-stage; path=b0f69926f468/40 entries
 
-- [ ] G4: A protected manual workflow uses real Orca, the installed gate, real Git and GitHub transport with dedicated upstream/fork repositories and unique per-run branches
-  EVIDENCE: pending; fixture repositories and protected runner environment requested.
+- [x] G4: A full pipeline run settles nine stages, records an open then merged pull-request binding, and its exported attestation verifies.
+  CHECK: node --test --test-reporter=tap tests/pipeline-release-2-integration.test.ts 2>&1 | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const m=/# fail (\d+)/.exec(s);if(!m||m[1]!=='0'||!/nine stages/.test(s))process.exit(1);console.log('INTEGRATION_OK')})"
+  EXPECT: INTEGRATION_OK
+  EVIDENCE: automatic-evidence=v1; definition-sha256=802ad5860a8f3bca333582ce783df09d3081f2131f7cc582ea97ba5e37b1beee; exit=0; EXPECT=matched; output-sha256=b2e443cf1574344fe8e89ee7a3b903d2d9f135c7f51a8bc53ba182814ff05abd; output-bytes=15; shell=/bin/sh; cwd=/Users/host/repo/orca-no-mistakes/.orca/workspaces/add-CI-stage; path=b0f69926f468/40 entries
 
-- [ ] G5: One live same-repository and fork acceptance run passes and exports fixture identities, run IDs, candidate OIDs, receipts, completion root, attempt outcomes, custody and cleanup results
-  EVIDENCE: pending
+- [x] G5: The ci stage gates on failing checks with fix/stop, resumes monitoring on fix, and settles when the PR merges; it errors when the PR closes unmerged; it gates on idle timeout; it treats an empty check set as passing only with trusted no_ci.
+  CHECK: node --test --test-reporter=tap tests/ci-stage.test.ts 2>&1 | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const p=/# pass (\d+)/.exec(s),f=/# fail (\d+)/.exec(s);if(!p||Number(p[1])<4||!f||f[1]!=='0')process.exit(1);console.log('CI_STAGE_OK')})"
+  EXPECT: CI_STAGE_OK
+  EVIDENCE: automatic-evidence=v1; definition-sha256=b2f1a39c2bb99d8785c3fad75457e5087bb6efdca2d918563f0f3f05619de62d; exit=0; EXPECT=matched; output-sha256=0013506281287849863456dcd5ec54e7dffe438439c249f1b5c884fc42d005b4; output-bytes=12; shell=/bin/sh; cwd=/Users/host/repo/orca-no-mistakes/.orca/workspaces/add-CI-stage; path=b0f69926f468/40 entries
 
-- [ ] G6: Successful live fixtures are cleaned and failed fixture identities are retained and reported
-  EVIDENCE: pending
+- [x] G6: The GitHub authority observes pull-request checks exhaustively with bucket mapping and rejects a missing node.
+  CHECK: node --test --test-reporter=tap tests/github-authority.test.ts 2>&1 | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const f=/# fail (\d+)/.exec(s);if(!f||f[1]!=='0'||!/checks/.test(s))process.exit(1);console.log('CHECKS_OK')})"
+  EXPECT: CHECKS_OK
+  EVIDENCE: automatic-evidence=v1; definition-sha256=7e7c122e415182f941e34ac908e555cfda9444a1378df0ef89a5ae094df8f137; exit=0; EXPECT=matched; output-sha256=37aff8c1c5c17aa0f46ff415f40d5efa6b7384ae5a3175e9de6fba40ceb60743; output-bytes=10; shell=/bin/sh; cwd=/Users/host/repo/orca-no-mistakes/.orca/workspaces/add-CI-stage; path=b0f69926f468/40 entries
 
-- [x] G7: Operator documentation covers initialization, same-repository/fork credentials, live acceptance, partial effects, explicit failed-run resume, migration, pruning and the agreed Release 2 limitations
-  EVIDENCE: Reviewed docs/release-2-acceptance.md against current README, CLI and ADR-0010. Initialization, credentials, current PR/merge contract, explicit failed resume, migration, custody/pruning and withheld later-release guarantees are covered; README/architecture link the runbook, CLI states boundaries, accepted ADR metadata records live proof pending. No configuration options added.
+- [x] G7: A v2 attestation whose plan ends with push, pr still verifies and one ending push, pr, ci verifies; any other tail is rejected.
+  CHECK: node --test --test-reporter=tap tests/ledger-completion-evidence-and-remote-provenance.test.ts tests/pipeline-completion-attestation.test.ts 2>&1 | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const f=/# fail (\d+)/.exec(s);if(!f||f[1]!=='0')process.exit(1);console.log('ATTEST_OK')})"
+  EXPECT: ATTEST_OK
+  EVIDENCE: automatic-evidence=v1; definition-sha256=52bc794031a4bab91ddad1f775c210a66d426bc522a640c1c9f167790eeb65f8; exit=0; EXPECT=matched; output-sha256=6de305b41683ea9bccbae353c89b0e604285f9bf913f549c8faed5a8f32312b5; output-bytes=10; shell=/bin/sh; cwd=/Users/host/repo/orca-no-mistakes/.orca/workspaces/add-CI-stage; path=b0f69926f468/40 entries
 
-- [x] G8: TypeScript, workflow syntax and whitespace checks pass
-  CHECK: npm run typecheck && actionlint .github/workflows/release-2-local.yml && git diff --check && node -e "console.log('STATIC CHECKS PASSED')"
-  EXPECT: STATIC CHECKS PASSED
-  EVIDENCE: automatic-evidence=v1; definition-sha256=f4f0f25c84363378f3251d6ad376677146cd29b564dd1ac668a651cc06c77eeb; exit=0; EXPECT=matched; output-sha256=224db693f1bb7876bdb46f36baa5d8a483720fafee058d58528a38e85e42b9f8; output-bytes=73; shell=/bin/sh; cwd=/Users/host/repo/orca-no-mistakes/.orca/workspaces/onm-79-prove-and-document-release-2-end-to-end; path=22fbc48c8e9e/40 entries
+- [x] G8: Config accepts `ci.no_ci` and `ci.timeout_ms`, honors no_ci only from repository config, and the shipped template documents both keys.
+  CHECK: node --input-type=module -e "import fs from 'node:fs'; import { parseConfig, resolvePipelineConfig, DEFAULT_CONFIG_TEMPLATE } from './scripts/config.ts'; const u = parseConfig({ ci: { no_ci: true, timeout_ms: 0 } }); const r = parseConfig({ ci: { no_ci: true } }); const a = resolvePipelineConfig({ userGlobalConfig: u }); const b = resolvePipelineConfig({ repoGlobalConfig: r }); const d = resolvePipelineConfig({}); const t = fs.readFileSync('templates/config.yaml','utf8'); if (a.ci.no_ci !== false || a.ci.timeout_ms !== 0 || b.ci.no_ci !== true || d.ci.timeout_ms !== 604800000 || d.ci.no_ci !== false || !t.includes('no_ci') || !t.includes('timeout_ms') || !DEFAULT_CONFIG_TEMPLATE.includes('no_ci')) process.exit(1); console.log('CONFIG_OK')"
+  EXPECT: CONFIG_OK
+  EVIDENCE: automatic-evidence=v1; definition-sha256=ef3a68d237df2b2cd9988ec48f9e9a41c8b84186a89d2e5bea0087274897bbf6; exit=0; EXPECT=matched; output-sha256=4d939306a112cc72aeb5596651d4e6a3e0af29b6c457f4ac9658fe803a472645; output-bytes=10; shell=/bin/sh; cwd=/Users/host/repo/orca-no-mistakes/.orca/workspaces/add-CI-stage; path=b0f69926f468/40 entries
 
-- [ ] G9: Scenario coverage is reconciled against every updated issue requirement and the final complexity review has no unresolved findings
-  EVIDENCE: Incomplete: the real live workflow and end-to-end live scenarios still need implementation/proof. Added a real Git receive/quarantine promotion control and simultaneous cross-process competing/replayed admission controls; these retain a controlled coordinator boundary. Reviewed changed runner, workflow, integration fixtures and timestamp positive control under ponytail-review; no production accounting guard or assertion was weakened. The Linux root-run failure is retained, and passing reruns use an unprivileged user and explicit UTF-8 locale.
+- [x] G9: Documentation no longer claims CI orchestration is future work and describes the ci stage, and an ADR records the decision.
+  CHECK: node -e "const fs=require('node:fs');const r=fs.readFileSync('README.md','utf8');const a=fs.readFileSync('docs/current-architecture.md','utf8');const c=fs.readFileSync('CONTEXT.md','utf8');const adr=fs.readdirSync('docs/adr').find(f=>/^0016-.*ci.*\.md$/i.test(f));if(/CI and delivery-proof orchestration remain future work/.test(r)||!/\x60ci\x60/.test(a)||!/CI monitoring/.test(c)||!adr)process.exit(1);console.log('DOCS_OK')"
+  EXPECT: DOCS_OK
+  EVIDENCE: automatic-evidence=v1; definition-sha256=6f1378a9c5f87aa526323c8365c2dffdecd14d9f087d3d5b07a6f12422659dec; exit=0; EXPECT=matched; output-sha256=6d36de704b81554dfb84505a4da24630d2ffb6dc40ba29dd836d0c858704f7bc; output-bytes=8; shell=/bin/sh; cwd=/Users/host/repo/orca-no-mistakes/.orca/workspaces/add-CI-stage; path=b0f69926f468/40 entries
 
-Gate authoring note: this initial outcome inventory is not execution evidence. Runnable definitions replace pending manual entries once the acceptance commands exist; no release-completion claim may rely on this inventory alone.
+- [x] G10: Ponytail review of the full diff found nothing left to cut, and the SKILL.md stage list names ci.
+  EVIDENCE: manual; ponytail-review on 2026-09-06 found 5 cuts (inlined unresolved, dropped now? seam, dropped CiConfig export, joined manifest tail check, used input.supersedesEvidenceSha256 directly), all applied and G1-G9 reverified; skills/orca-no-mistakes/SKILL.md lists ci in the stage list and gate guidance

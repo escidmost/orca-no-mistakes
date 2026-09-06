@@ -199,7 +199,7 @@ async function runRelease2Pipeline(failAfter?: 'push' | 'pr', fork = false): Pro
   }
 }
 
-test('runPipeline settles all eight stages before exposing Release 2 completion', () =>
+test('runPipeline settles all nine stages before exposing Release 2 completion', () =>
   runRelease2Pipeline())
 
 for (const stage of ['push', 'pr'] as const) {

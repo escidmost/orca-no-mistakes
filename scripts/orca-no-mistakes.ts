@@ -163,12 +163,15 @@ import {
 import { admitCandidatePublication, publishCandidate } from "./publication.ts";
 import {
   bindPullRequest,
+  observeBoundPullRequest,
   pullRequestContent,
+  settleMergedPullRequest,
   type PullRequestArtifact,
   type PullRequestPipelineFinding,
   type PullRequestPipelineRound,
   type PullRequestPipelineStep,
 } from "./pull-request.ts";
+import { monitorPullRequestChecks, type CiClock } from "./ci.ts";
 export {
   DomainLedger,
   LEGACY_STAGE_PLAN,
@@ -383,6 +386,8 @@ export type PipelineOptions = {
   publicationDestination?: string;
   release2PublicationRequired?: boolean;
   publicationRunner?: CommandRunner;
+  /** Test seam for the ci monitor's clock and sleep. */
+  ciClock?: CiClock;
   rendererFactory?: (
     artifactsDir: string,
     stageLogs: ReadonlyMap<string, StageLog>,
@@ -2577,11 +2582,18 @@ export async function runPipeline(
           const payload = prReceipt
             ? (JSON.parse(prReceipt.receipt_json) as Record<string, unknown>)
             : undefined;
-          const isMergedBodyReceipt =
+          const isBodyReceipt =
             payload !== undefined &&
             Object.hasOwn(payload, "bodySha256") &&
-            payload.state === "merged";
-          if (!isMergedBodyReceipt) break;
+            (payload.state === "merged" || payload.state === "open");
+          if (!isBodyReceipt) break;
+        }
+        if (stage === "ci") {
+          const prReceipt = ledger.remoteReceipt(runId, "pull-request-binding");
+          const payload = prReceipt
+            ? (JSON.parse(prReceipt.receipt_json) as Record<string, unknown>)
+            : undefined;
+          if (payload?.state !== "merged") break;
         }
         resumeStageIndex += 1;
       }
@@ -2883,6 +2895,10 @@ export async function runPipeline(
     let previousTask: string | undefined;
     const appendSettledRemoteEvidence = (stage: "push" | "pr") => {
       const row = ledger.listEvidence(runId).findLast((entry) => entry.stage_id === stage);
+      const existing = stageEntries.findIndex((entry) => entry.stage === stage);
+      if (existing >= 0 && stageEntries[existing]!.evidenceSha256 === row?.evidence_sha256) {
+        return stageEntries[existing]!;
+      }
       if (!row) throw new Error(`${stage} settled without durable evidence`);
       if (!row.artifact_sha256) throw new Error(`${stage} evidence is missing its artifact digest`);
       const entry: StageEvidenceManifestEntry = {
@@ -2896,6 +2912,7 @@ export async function runPipeline(
         summary: row.summary,
         workerIdentity: row.worker_identity,
       };
+      if (existing >= 0) stageEntries.splice(existing, 1);
       stageEntries.push(entry);
       latestEntryByStage.set(stage, entry);
       return entry;
@@ -2937,7 +2954,7 @@ export async function runPipeline(
       const dispositions = ledger.stageDispositions(runId);
       const gateAudits = ledger.listGateAudit(runId);
       for (const candidateStage of pipelineSteps) {
-        if (candidateStage === "push" || candidateStage === "pr") break;
+        if (candidateStage === "push" || candidateStage === "pr" || candidateStage === "ci") break;
         const evidence = latestAuthoritativeEvidenceByStage.get(candidateStage);
         if (!evidence) continue;
         if (hasPush) {
@@ -2968,7 +2985,7 @@ export async function runPipeline(
     const reopenedStages = new Set<StageName>();
     while (stageQueue.length > 0) {
       const stage = stageQueue.shift()!;
-      if (stage === "push" || stage === "pr") {
+      if (stage === "push" || stage === "pr" || stage === "ci") {
         const invalidatedStage = await getInvalidatedApprovalStage();
         if (invalidatedStage) {
           const restartIndex = pipelineSteps.indexOf(invalidatedStage);
@@ -3012,7 +3029,7 @@ export async function runPipeline(
       let shouldReopen = false;
       const invalidatedEvidenceTargets = new Set<string>();
       const invalidateCandidateBoundApprovals = (targetCommitOid: string): boolean => {
-        if (stage === "push" || stage === "pr") return false;
+        if (stage === "push" || stage === "pr" || stage === "ci") return false;
         const currentAuthoritative = latestAuthoritativeEvidenceByStage.get(stage);
         if (
           !currentAuthoritative ||
@@ -3340,6 +3357,52 @@ export async function runPipeline(
       let autoFixModeForReport = resumedBlocker
         ? false
         : (resumedFindingMode ?? autoFixMode);
+      const runCiStage = async (): Promise<StageExecution> => {
+        if (!options.githubAuthority || !attemptId) {
+          throw new Error("ci requires initialized GitHub publication");
+        }
+        const authority = options.githubAuthority;
+        const ciAttemptId = attemptId;
+        const stageLog = registeredStageLog(stageLogs, stageLogPath(artifactsDir, stage, round));
+        try {
+          const report = await monitorPullRequestChecks({
+            candidateCommitOid: stageInputCommitOid,
+            clock: options.ciClock,
+            config: pipelineConfig.ci,
+            heartbeat: () => ledger.heartbeatLease(deliveryRepo.root, deliveryRepo.branch, runId),
+            log: (line) => {
+              void stageLog.append(`${line}\n`);
+            },
+            observeChecks: (nodeId) => authority.observePullRequestChecks(nodeId),
+            observePullRequest: () =>
+              observeBoundPullRequest(authority, ledger, runId, stageInputCommitOid),
+            settleMerged: async () => {
+              const merged = await settleMergedPullRequest({
+                artifactPath: path.join(artifactsDir, "pr-merged.json"),
+                attemptId: ciAttemptId,
+                authority,
+                candidateCommitOid: stageInputCommitOid,
+                generationToken: generationToken!,
+                ledger,
+                runId,
+                workerIdentity: coordinatorIdentity,
+              });
+              appendSettledRemoteEvidence("pr");
+              return merged;
+            },
+          });
+          return {
+            exitCode: exitCodeFor(report),
+            report,
+            resolvedAgent: "coordinator",
+            workerIdentity: "coordinator",
+          };
+        } finally {
+          await stageLog.close().catch((error) => {
+            console.error(`warning: could not close ${stage} log: ${String(error)}`);
+          });
+        }
+      };
       const runStage = async () => {
         const executionHead = await git.head();
         invalidateCandidateBoundApprovals(executionHead);
@@ -3350,7 +3413,7 @@ export async function runPipeline(
         );
         let execution: StageExecution;
         try {
-          execution = await executeStage(
+          execution = stage === "ci" ? await runCiStage() : await executeStage(
             stage,
             attempt++,
             round,
@@ -3485,7 +3548,7 @@ export async function runPipeline(
         let shouldFix =
           autoFixModeForReport && !asksUser && !exhausted && !automationBlocked;
         let guidance = "";
-        const manualRebaseIssue = stage === "rebase";
+        const manualRebaseIssue = stage === "rebase" || stage === "ci";
 
         if (resumedFixDecision) {
           const recordedDecision = resumedFixDecision;
@@ -6134,14 +6197,14 @@ function stageTaskSpec(
 }
 
 function checkerBrief(stage: StageName): string {
-  const briefs: Record<Exclude<StageName, "intent" | "rebase" | "push">, string> = {
+  const briefs: Record<Exclude<StageName, "intent" | "rebase" | "push" | "ci">, string> = {
     review: "Adversarially review the committed change.",
     test: "Run the smallest relevant behavioral checks and gather evidence for user intent.",
     document: "Check whether the change made owned documentation stale.",
     lint: "Run repository linting, formatting, and static-analysis checks.",
     pr: "Draft the title and complete What Changed section for the final branch diff.",
   };
-  if (stage === "push") {
+  if (stage === "push" || stage === "ci") {
     throw new Error(`${stage} is a coordinator-owned remote stage`);
   }
   return briefs[stage as keyof typeof briefs];

@@ -228,7 +228,7 @@ test("Release 2 pipeline settles passed and commits attestation when post-custod
       pendingSummary?: string;
     };
     assert.equal(markerContent.pendingOutcome, "passed");
-    assert.ok(markerContent.pendingSummary?.includes("passed all 8 stages"));
+    assert.ok(markerContent.pendingSummary?.includes("passed all 9 stages"));
   } finally {
     await chmod(markerDir, 0o700).catch(() => {});
     await installAbortReaping({ pid: process.pid });
