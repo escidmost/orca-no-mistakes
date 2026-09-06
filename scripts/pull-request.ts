@@ -627,6 +627,7 @@ export async function bindPullRequest(input: {
       ) {
         throw new PullRequestBindingError('pull-request facts changed after readiness notification')
       }
+      if (observed.state === 'CLOSED') throw new PullRequestBindingError('the exact pull request was closed without merging')
       pullRequest = observed
     }
   }

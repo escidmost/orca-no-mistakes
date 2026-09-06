@@ -3123,181 +3123,191 @@ export async function runPipeline(
           if (!route || !publicationReceipt) {
             throw new Error("PR binding requires a settled candidate publication");
           }
-          const pipelineEvidenceRoot = buildPipelineEvidenceRoot(stageEntries, {
-            attemptOutcomeDigests: ledger
-              .listAttemptOutcomes(runId)
-              .map((entry) => entry.outcome_sha256),
-            baseCommitOid,
-            candidateCommitOid: stageInputCommitOid,
-            candidatePublicationReceiptSha256: publicationReceipt.receipt_sha256,
-            intent,
-            policySha256: policySha256Value,
-            publicationRoute: {
-              baseBranch: route.base_branch,
-              baseRepositoryId: route.base_repository_id,
-              forgeHost: route.forge_host,
-              headBranch: route.head_branch,
-              headOwner: route.head_owner,
-              headRepositoryId: route.head_repository_id,
-              routeFingerprint: route.route_fingerprint,
-            },
-            runId,
-            stageDispositions: ledger.stageDispositions(runId).map((entry) => ({
-              disposition: entry.disposition,
-              ...(entry.evidence_sha256 ? { evidenceSha256: entry.evidence_sha256 } : {}),
-              stage: entry.stage_id,
-            })),
-            stagePlan: ledger.stagePlan(runId).map((entry) => ({
-              requirement: entry.requirement,
-              stage: entry.stage_id,
-            })),
-          });
-          const retainedContent = ledger.publishedPullRequestContent(
-            runId,
-            stageInputCommitOid,
-          );
-          let content: { body: string; title: string };
-          if (retainedContent) {
-            content = retainedContent;
-          } else {
-            const draft = await executeStage(
-              "pr",
-              0,
-              remoteRound,
-              taskId,
+          const priorBinding = ledger.remoteReceipt(runId, "pull-request-binding");
+          const priorBindingReceipt = priorBinding && priorBinding.candidate_commit_oid === stageInputCommitOid
+            ? (JSON.parse(priorBinding.receipt_json) as { payload?: Record<string, unknown> } & Record<string, unknown>)
+            : undefined;
+          const priorBindingPayload = priorBindingReceipt?.payload ?? priorBindingReceipt;
+          const openBindingSettled =
+            priorBindingPayload?.state === "open" && typeof priorBindingPayload.bodySha256 === "string";
+          if (!openBindingSettled) {
+            const pipelineEvidenceRoot = buildPipelineEvidenceRoot(stageEntries, {
+              attemptOutcomeDigests: ledger
+                .listAttemptOutcomes(runId)
+                .map((entry) => entry.outcome_sha256),
+              baseCommitOid,
+              candidateCommitOid: stageInputCommitOid,
+              candidatePublicationReceiptSha256: publicationReceipt.receipt_sha256,
               intent,
-              artifactsDir,
-              repo,
-              orca,
-              git,
-              pipelineConfig.stages.pr,
-              stageLogs,
-              decisionHistory(),
+              policySha256: policySha256Value,
+              publicationRoute: {
+                baseBranch: route.base_branch,
+                baseRepositoryId: route.base_repository_id,
+                forgeHost: route.forge_host,
+                headBranch: route.head_branch,
+                headOwner: route.head_owner,
+                headRepositoryId: route.head_repository_id,
+                routeFingerprint: route.route_fingerprint,
+              },
+              runId,
+              stageDispositions: ledger.stageDispositions(runId).map((entry) => ({
+                disposition: entry.disposition,
+                ...(entry.evidence_sha256 ? { evidenceSha256: entry.evidence_sha256 } : {}),
+                stage: entry.stage_id,
+              })),
+              stagePlan: ledger.stagePlan(runId).map((entry) => ({
+                requirement: entry.requirement,
+                stage: entry.stage_id,
+              })),
+            });
+            const retainedContent = ledger.publishedPullRequestContent(
+              runId,
+              stageInputCommitOid,
             );
-            if (draft.report.findings.length > 0) {
-              throw new Error("PR drafting worker returned findings instead of PR content");
-            }
-            const reviewReport = latestReportByStage.get("review");
-            const testReport = latestReportByStage.get("test");
-            const inferredRisk = reviewReport?.findings.some(
-              (finding) => finding.severity === "error",
-            )
-              ? "high"
-              : reviewReport?.findings.some(
-                    (finding) => finding.severity === "warning",
-                  )
-                ? "medium"
-                : "low";
-            const stageSnapshots = presentation.store.listPresentationSnapshots(runId);
-            const pipelineReportSteps: PullRequestPipelineStep[] = pipelineSteps
-              .slice(0, pipelineSteps.indexOf("pr"))
-              .map((completedStage) => {
-                const decision = latestEntryByStage.get(completedStage)?.waiverOrApproval?.decision;
-                const status = decision === "approve"
-                  ? "approved"
-                  : decision === "skip"
-                    ? "skipped"
-                    : "completed";
-                const stageState = presentation.current.stages.find(
-                  (candidate) => candidate.id === completedStage,
-                );
-                const stageFixes = recoverFixRecords(
-                  completedStage,
-                  stageState,
-                  stageSnapshots,
-                );
-                const rounds = pullRequestPipelineRounds(
-                  reportsByStage.get(completedStage) ?? [{
-                    findings: [],
-                    summary: `${completedStage} passed.`,
-                  }],
-                  stageFixes,
-                  stageState?.findings ?? [],
-                );
-                const seenApproved = new Set<string>();
-                const approvedFindingDetails: PullRequestPipelineFinding[] = [];
-                for (const finding of stageState?.findings ?? []) {
-                  if (finding.disposition === "approved") {
-                    const key = pullRequestFindingKey(finding);
-                    if (!seenApproved.has(key)) {
-                      seenApproved.add(key);
-                      approvedFindingDetails.push({
-                        description: finding.description,
-                        ...(finding.file ? { file: finding.file } : {}),
-                        ...(finding.line ? { line: finding.line } : {}),
-                        severity: finding.severity,
-                      });
+            let content: { body: string; title: string };
+            if (retainedContent) {
+              content = retainedContent;
+            } else {
+              const draft = await executeStage(
+                "pr",
+                0,
+                remoteRound,
+                taskId,
+                intent,
+                artifactsDir,
+                repo,
+                orca,
+                git,
+                pipelineConfig.stages.pr,
+                stageLogs,
+                decisionHistory(),
+              );
+              if (draft.report.findings.length > 0) {
+                throw new Error("PR drafting worker returned findings instead of PR content");
+              }
+              const reviewReport = latestReportByStage.get("review");
+              const testReport = latestReportByStage.get("test");
+              const inferredRisk = reviewReport?.findings.some(
+                (finding) => finding.severity === "error",
+              )
+                ? "high"
+                : reviewReport?.findings.some(
+                      (finding) => finding.severity === "warning",
+                    )
+                  ? "medium"
+                  : "low";
+              const stageSnapshots = presentation.store.listPresentationSnapshots(runId);
+              const pipelineReportSteps: PullRequestPipelineStep[] = pipelineSteps
+                .slice(0, pipelineSteps.indexOf("pr"))
+                .map((completedStage) => {
+                  const decision = latestEntryByStage.get(completedStage)?.waiverOrApproval?.decision;
+                  const status = decision === "approve"
+                    ? "approved"
+                    : decision === "skip"
+                      ? "skipped"
+                      : "completed";
+                  const stageState = presentation.current.stages.find(
+                    (candidate) => candidate.id === completedStage,
+                  );
+                  const stageFixes = recoverFixRecords(
+                    completedStage,
+                    stageState,
+                    stageSnapshots,
+                  );
+                  const rounds = pullRequestPipelineRounds(
+                    reportsByStage.get(completedStage) ?? [{
+                      findings: [],
+                      summary: `${completedStage} passed.`,
+                    }],
+                    stageFixes,
+                    stageState?.findings ?? [],
+                  );
+                  const seenApproved = new Set<string>();
+                  const approvedFindingDetails: PullRequestPipelineFinding[] = [];
+                  for (const finding of stageState?.findings ?? []) {
+                    if (finding.disposition === "approved") {
+                      const key = pullRequestFindingKey(finding);
+                      if (!seenApproved.has(key)) {
+                        seenApproved.add(key);
+                        approvedFindingDetails.push({
+                          description: finding.description,
+                          ...(finding.file ? { file: finding.file } : {}),
+                          ...(finding.line ? { line: finding.line } : {}),
+                          severity: finding.severity,
+                        });
+                      }
                     }
                   }
-                }
-                return {
-                  ...(approvedFindingDetails.length > 0
-                    ? { approvedFindingDetails }
-                    : {}),
-                  approvedFindings: stageState?.approvedFindings ?? approvedFindingDetails.length,
-                  fixedFindings: stageState?.fixedFindings ?? 0,
-                  name: completedStage,
-                  openFindings: stageState?.openFindings ?? 0,
-                  rounds,
-                  status,
-                };
+                  return {
+                    ...(approvedFindingDetails.length > 0
+                      ? { approvedFindingDetails }
+                      : {}),
+                    approvedFindings: stageState?.approvedFindings ?? approvedFindingDetails.length,
+                    fixedFindings: stageState?.fixedFindings ?? 0,
+                    name: completedStage,
+                    openFindings: stageState?.openFindings ?? 0,
+                    rounds,
+                    status,
+                  };
+                });
+              pipelineReportSteps.push(
+                { name: "pr", status: "running" },
+                { name: "ci", status: "pending" },
+              );
+              const branchIntent = [...new Set(
+                ledger.branchIntents(deliveryRepo.root, deliveryRepo.branch, runId)
+                  .map((value) => value.trim())
+                  .filter(Boolean),
+              )].join("\n\n");
+              content = pullRequestContent(branchIntent || intent, {
+                candidateCommitOid: stageInputCommitOid,
+                pipelineSteps: pipelineReportSteps,
+                risk: {
+                  level: reviewReport?.riskLevel ?? inferredRisk,
+                  rationale:
+                    reviewReport?.riskRationale ??
+                    reviewReport?.summary ??
+                    "The validated pipeline found no material review risk.",
+                },
+                testing: {
+                  artifacts: await pullRequestArtifacts(
+                    artifactsDir,
+                    testReport,
+                    options.trustedArtifactDigests,
+                  ),
+                  summary:
+                    testReport?.summary ??
+                    "No dedicated test stage was required by the validated pipeline plan.",
+                  tested: testReport?.tested ?? [],
+                },
+                title: draft.report.title,
+                whatChanged: draft.report.summary,
               });
-            pipelineReportSteps.push(
-              { name: "pr", status: "running" },
-              { name: "ci", status: "pending" },
-            );
-            const branchIntent = [...new Set(
-              ledger.branchIntents(deliveryRepo.root, deliveryRepo.branch, runId)
-                .map((value) => value.trim())
-                .filter(Boolean),
-            )].join("\n\n");
-            content = pullRequestContent(branchIntent || intent, {
+            }
+            await bindPullRequest({
+              artifactPath: path.join(artifactsDir, `pr-r${remoteRound}.json`),
+              attemptId,
+              authority: options.githubAuthority,
               candidateCommitOid: stageInputCommitOid,
-              pipelineSteps: pipelineReportSteps,
-              risk: {
-                level: reviewReport?.riskLevel ?? inferredRisk,
-                rationale:
-                  reviewReport?.riskRationale ??
-                  reviewReport?.summary ??
-                  "The validated pipeline found no material review risk.",
+              content,
+              generationToken: generationToken!,
+              ledger,
+              onReady: async ({ number, title, url }) => {
+                await orca.notifyPullRequestReady?.(number, title, url);
               },
-              testing: {
-                artifacts: await pullRequestArtifacts(
-                  artifactsDir,
-                  testReport,
-                  options.trustedArtifactDigests,
-                ),
-                summary:
-                  testReport?.summary ??
-                  "No dedicated test stage was required by the validated pipeline plan.",
-                tested: testReport?.tested ?? [],
-              },
-              title: draft.report.title,
-              whatChanged: draft.report.summary,
+              pipelineEvidenceRoot,
+              roundIndex: remoteRound,
+              runId,
+              supersedesEvidenceSha256: ledger
+                .stageDispositions(runId)
+                .find((disposition) => disposition.stage_id === "pr")?.evidence_sha256 ?? undefined,
+              workerIdentity: coordinatorIdentity,
             });
           }
-          await bindPullRequest({
-            artifactPath: path.join(artifactsDir, `pr-r${remoteRound}.json`),
-            attemptId,
-            authority: options.githubAuthority,
-            candidateCommitOid: stageInputCommitOid,
-            content,
-            generationToken: generationToken!,
-            ledger,
-            onReady: async ({ number, title, url }) => {
-              await orca.notifyPullRequestReady?.(number, title, url);
-            },
-            pipelineEvidenceRoot,
-            roundIndex: remoteRound,
-            runId,
-            supersedesEvidenceSha256: ledger
-              .stageDispositions(runId)
-              .find((disposition) => disposition.stage_id === "pr")?.evidence_sha256 ?? undefined,
-            workerIdentity: coordinatorIdentity,
-          });
         }
         if (stage === "pr" && !pipelineSteps.includes("ci")) {
           // Frozen eight-stage plans have no ci stage, so pr itself awaits the merge.
+          appendSettledRemoteEvidence("pr");
           const sleep = options.ciClock?.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
           for (;;) {
             const observed = await observeBoundPullRequest(options.githubAuthority, ledger, runId, stageInputCommitOid);
@@ -3573,6 +3583,7 @@ export async function runPipeline(
           const recordedDecision = resumedFixDecision;
           resumedFixDecision = undefined;
           if (manualRebaseIssue) {
+            round += 1;
             report = await runStage();
             continue;
           }
@@ -3730,6 +3741,7 @@ export async function runPipeline(
               );
             }
             if (manualRebaseIssue) {
+              round += 1;
               report = await runStage();
               continue;
             }
