@@ -37,7 +37,7 @@ The target terminal outcome proving that the exact delivered tree satisfied ever
 _Avoid_: Completed, green, worker succeeded
 
 **Checks-passed**:
-An intermediate target milestone proving that required local validation and remote CI are complete on the exact candidate commit, before delivery is verified.
+An intermediate target milestone proving that required local validation and remote CI are complete on the exact candidate commit, before delivery is verified. CI monitoring logs this state when every check is pass or skip but does not settle it.
 _Avoid_: Passed, ready enough, all green
 
 **Proposed change**:
@@ -57,7 +57,7 @@ The immutable per-run identity of the forge, stable base and head repositories, 
 _Avoid_: Origin, current remotes, push URL
 
 **Repository publication route**:
-The durable, mutable publication route persisted once per repository and bound to the authenticated actor, backend, forge, stable repository identities, owner, branches, fingerprint, and canonical credential-free transport identity. It is guarded against authenticated-actor drift and against change while active runs or resumable failed runs depend on it. Release 2 runs whose head and base branches match the stored route snapshot it as their immutable per-run Publication route; legacy, provider-neutral, and unmatched runs do not.
+The durable, mutable publication route persisted once per repository, keyed by the Git common dir so every worktree shares it, and bound to the authenticated actor, backend, forge, stable repository identities, owner, identity fingerprint, and canonical credential-free transport identity. It is guarded against authenticated-actor drift and against repository-identity change while active runs or resumable failed runs depend on it. Every Release 2 run snapshots it at start, with the run's own head and base branches, as its immutable per-run Publication route; legacy and provider-neutral runs do not.
 _Avoid_: Per-run route, origin, ambient remote
 
 **Publication head ref**:
@@ -89,12 +89,24 @@ The association of a publication route and candidate commit with one exact pull 
 _Avoid_: PR URL, branch-name match, latest pull request
 
 **Managed pull-request report**:
-The Orca No-Mistakes-owned title and original pull-request body containing the bounded accumulated branch intent, final-diff change summary, risk assessment, testing evidence, and pipeline attestation under a 63,488-byte budget, truncating oversized intent or What Changed sections with an explicit marker (`_[truncated to fit GitHub PR body limits]_`) when necessary. Pipeline details present analysis findings, applied fixer summaries, approvals, and clean re-checks as a concise narrative instead of raw report dumps; the attestation includes completed stages plus the running PR and pending CI lifecycle states. The coordinator creates or refreshes this report, notifies the originating terminal that the pull request is ready, and then awaits merge; it does not move pipeline detail into a comment.
+The Orca No-Mistakes-owned title and original pull-request body containing the bounded run intent, final-diff change summary, risk assessment, testing evidence, and pipeline attestation under a 63,488-byte budget, truncating oversized intent or What Changed sections with an explicit marker (`_[truncated to fit GitHub PR body limits]_`) when necessary. Pipeline details present analysis findings, applied fixer summaries, approvals, and clean re-checks as a concise narrative instead of raw report dumps; the attestation includes completed stages plus the running PR and pending CI lifecycle states. The coordinator creates or refreshes this report and notifies the originating terminal that the pull request is ready; the `ci` stage then awaits merge. It does not move pipeline detail into a comment.
 _Avoid_: Managed comment, trust anchor, remote evidence store
 
 **Pull-request binding receipt**:
-A durable local record binding the exact merged pull request and managed report hashes to the publication route, candidate commit, forge observations, and operation outcome.
+A durable local record binding the exact pull request and managed report hashes to the publication route, candidate commit, forge observations, and operation outcome. It is settled open by the `pr` stage and upgraded to merged by the `ci` stage.
 _Avoid_: PR URL, body text, create response
+
+**Open pull-request binding**:
+The `pr` stage's settled pull-request binding receipt with `state: 'open'`, recording the published title and body hashes and the pipeline evidence root before any merge observation.
+_Avoid_: PR created, merged binding, provisional receipt
+
+**Merged pull-request binding**:
+The `ci` stage's upgrade of the open pull-request binding to `state: 'merged'` after an authoritative MERGED observation whose head, route, title hash, and body hash still match. Required for a `passed` verdict on a nine-stage plan.
+_Avoid_: PR merged, merge SHA recorded, delivered tree
+
+**CI monitoring**:
+The `ci` stage's polling of the exact candidate's pull-request state, mergeability, and check rollup until the pull request is merged or closed. It reports failures to a `fix`/`stop` gate and never repairs or re-publishes the candidate.
+_Avoid_: CI proof, check completeness, auto-fix
 
 **Required policy**:
 A validation or delivery rule that must be satisfied for Passed to be available.

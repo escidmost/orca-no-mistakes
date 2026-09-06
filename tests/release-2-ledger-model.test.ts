@@ -5,7 +5,7 @@ import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import test from 'node:test'
 
-import { DomainLedger, evidenceSha256, sha256 } from '../scripts/ledger.ts'
+import { DomainLedger, evidenceSha256, repositoryIdentityFingerprint, sha256 } from '../scripts/ledger.ts'
 
 const commit = 'a'.repeat(40)
 const policy = 'b'.repeat(64)
@@ -75,7 +75,7 @@ test('repository publication routes update safely and snapshot into runs', async
       runId: 'route-run',
       submissionCommitOid: commit
     })
-    assert.equal(ledger.publicationRoute('route-run')?.route_fingerprint, fingerprint)
+    assert.equal(repositoryIdentityFingerprint(ledger.publicationRoute('route-run')!), fingerprint)
 
     const renamed = {
       ...publicationRoute,
@@ -88,20 +88,22 @@ test('repository publication routes update safely and snapshot into runs', async
     assert.equal(ledger.repositoryPublicationRoute('/repo')?.actor_login, 'renamed-operator')
     assert.equal(ledger.repositoryPublicationRoute('/repo')?.actor_node_id, 'U_node_1')
 
+    // Branches are per-run facts, so re-initializing on another branch is not a route change.
+    assert.equal(ledger.setRepositoryPublicationRoute({ ...renamed, headBranch: 'different-feature' }), fingerprint)
     assert.throws(
       () => ledger.setRepositoryPublicationRoute({
         ...renamed,
-        headBranch: 'different-feature'
+        headOwner: 'other-owner'
       }),
       /cannot change publication route while 1 active or resumable run\(s\) depend on it/
     )
     ledger.finishRun('route-run', 'cancelled')
     const changed = ledger.setRepositoryPublicationRoute({
       ...renamed,
-      headBranch: 'different-feature'
+      headOwner: 'other-owner'
     })
     assert.notEqual(changed, fingerprint)
-    assert.equal(ledger.repositoryPublicationRoute('/repo')?.head_branch, 'different-feature')
+    assert.equal(ledger.repositoryPublicationRoute('/repo')?.head_owner, 'other-owner')
     assert.throws(
       () => ledger.recordStoredPublicationRoute('route-run', '/another-repo'),
       /does not belong to repository/
@@ -154,7 +156,7 @@ test('repository publication routes cannot strand resumable failed runs', async 
     ledger.finishRun('resumable-route-run', 'failed')
 
     assert.throws(
-      () => ledger.setRepositoryPublicationRoute({ ...publicationRoute, headBranch: 'other-feature' }),
+      () => ledger.setRepositoryPublicationRoute({ ...publicationRoute, headOwner: 'other-owner' }),
       /cannot change publication route while 1 active or resumable run\(s\) depend on it/
     )
   } finally {

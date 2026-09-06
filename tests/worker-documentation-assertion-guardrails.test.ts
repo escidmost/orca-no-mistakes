@@ -65,3 +65,43 @@ test("fixer guardrails allow prose edits but retain documentation assertions", a
     await rm(temp, { recursive: true, force: true });
   }
 });
+
+test("fixer guardrails do not mistake prose 'check (' for a Catch2 macro", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-document-guardrail-"));
+  const repo = path.join(temp, "repo");
+  const worker = path.join(temp, "worker");
+  try {
+    await mkdir(repo);
+    git(repo, "init", "-b", "feature");
+    git(repo, "config", "user.email", "test@example.com");
+    git(repo, "config", "user.name", "Test User");
+    git(repo, "config", "core.hooksPath", "/dev/null");
+    await mkdir(path.join(repo, "docs"));
+    await writeFile(
+      path.join(repo, "docs/current-architecture.md"),
+      "# Architecture\n\nOne finding per failing check (with its details URL) opens a gate.\n",
+    );
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "document ci gate");
+    const expectedHead = git(repo, "rev-parse", "HEAD");
+
+    git(repo, "worktree", "add", "--detach", worker, expectedHead);
+    await writeFile(
+      path.join(worker, "docs/current-architecture.md"),
+      "# Architecture\n\nSee ADR-0016 for the ci decision table.\n",
+    );
+    git(worker, "add", "docs/current-architecture.md");
+    git(worker, "commit", "-m", "replace duplicate prose with a pointer");
+
+    assert.deepEqual(
+      await new GitShell({ repo }).assertFixerChangesAllowed(
+        worker,
+        expectedHead,
+        git(worker, "rev-parse", "HEAD"),
+      ),
+      { changed: true, guardrailViolations: [] },
+    );
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});

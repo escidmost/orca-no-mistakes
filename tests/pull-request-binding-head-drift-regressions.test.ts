@@ -3,6 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
+import { repositoryIdentityFingerprint } from '../scripts/ledger.ts'
 
 import type { GithubPullRequestObservation } from '../scripts/github.ts'
 import { bindPullRequest } from '../scripts/pull-request.ts'
@@ -50,7 +51,7 @@ function harness() {
     repositoryPublicationRoute: () => ({
       base_repository_name: 'acme/repo', base_repository_node_id: 'R_base',
       head_repository_name: 'forker/repo', head_repository_node_id: 'R_head',
-      route_fingerprint: 'route'
+      route_fingerprint: repositoryIdentityFingerprint({ base_repository_id: '1', forge_host: 'github.com', head_owner: 'forker', head_repository_id: '2' })
     }),
     run: () => ({ branch: 'feature', repo_root: '/repo' }),
     settleRemoteStage: (input: Record<string, unknown>) => {
@@ -61,7 +62,7 @@ function harness() {
   return { ledger, settlements, setOwnsLease: (value: boolean) => { ownsLease = value } }
 }
 
-test('rejects candidate headOid-only drift with stable PR identity and unchanged content while awaiting merge', async () => {
+test('rejects candidate headOid-only drift with stable PR identity and unchanged content after readiness notification', async () => {
   const { ledger, settlements } = harness()
   let pr = pullRequest()
   const authority = {
@@ -75,13 +76,13 @@ test('rejects candidate headOid-only drift with stable PR identity and unchanged
       bindPullRequest({
         artifactPath: path.join(directory, 'pr.json'), attemptId: 'attempt', authority,
         candidateCommitOid: OID, content, generationToken: 1, ledger: ledger as never,
-        pipelineEvidenceRoot: 'c'.repeat(64), runId: 'run',
-        sleep: async () => {
+        onReady: async () => {
           pr = pullRequest({ headOid: 'f'.repeat(40) })
         },
+        pipelineEvidenceRoot: 'c'.repeat(64), runId: 'run',
         workerIdentity: 'coordinator'
       }),
-      /facts changed while awaiting merge/
+      /facts changed after readiness notification/
     )
     assert.equal(settlements.length, 0)
   } finally {

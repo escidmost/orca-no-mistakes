@@ -12,7 +12,8 @@ export const PIPELINE_STEPS = [
   'document',
   'lint',
   'push',
-  'pr'
+  'pr',
+  'ci'
 ] as const
 export type StageName = (typeof PIPELINE_STEPS)[number]
 
@@ -87,10 +88,16 @@ export const StagesConfigSchema = z.strictObject(
 )
 export type StagesConfig = z.infer<typeof StagesConfigSchema>
 
+export const CiConfigSchema = z.strictObject({
+  no_ci: z.boolean().optional(),
+  timeout_ms: z.number().int().nonnegative().optional()
+})
+
 export const OrcaNoMistakesConfigSchema = z.strictObject({
   defaults: DefaultsConfigSchema.optional(),
   stages: StagesConfigSchema.optional(),
   auto_fix: AutoFixConfigSchema.optional(),
+  ci: CiConfigSchema.optional(),
   agent_args_override: AgentArgsOverrideSchema.optional(),
   intent: z.string().optional(),
   worktree_roots: z.record(z.string(), z.string()).superRefine((roots, context) => {
@@ -128,6 +135,16 @@ export const BASELINE_AUTO_FIX = {
   allow_review_autofix: false,
   guardrails: 'strict'
 } as const
+
+/** Idle CI monitoring timeout: seven days, re-armed when the base branch advances. */
+export const DEFAULT_CI_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000
+
+export interface ResolvedCiConfig {
+  /** Trusted base-branch declaration that the repository has no CI. */
+  no_ci: boolean
+  /** Idle timeout in milliseconds; 0 means unlimited. */
+  timeout_ms: number
+}
 
 export interface ResolvedAutoFixConfig {
   enabled: boolean
@@ -262,7 +279,9 @@ export function resolveRoleConfig(
   options: ResolverOptions = {}
 ): ResolvedRoleConfig {
   const { userGlobalConfig: u, repoGlobalConfig: r, cliFlags: c } = options
-  const directCli = c ? { ...c, reviewer: undefined, fixer: undefined, max_fix_rounds: undefined } : undefined
+  const directCli = c
+    ? { ...c, reviewer: undefined, fixer: undefined, max_fix_rounds: undefined }
+    : undefined
 
   // 5-Tier precedence layers from lowest (Tier 5: User Global) to highest (Tier 1: CLI Flags)
   const layers: [RoleConfig | undefined, string?, string?][] = [
@@ -349,6 +368,7 @@ export function resolveRoleConfig(
 export interface ResolvedPipelineConfig {
   intent?: string
   auto_fix: ResolvedAutoFixConfig
+  ci: ResolvedCiConfig
   agent_args_override: AgentArgsOverride
   stages: Record<StageName, {
     reviewer: ResolvedRoleConfig
@@ -402,6 +422,12 @@ export function resolvePipelineConfig(options: ResolverOptions = {}): ResolvedPi
       guardrails: r?.auto_fix?.guardrails ?? BASELINE_AUTO_FIX.guardrails
     },
     agent_args_override: agentArgs,
+    // no_ci is a pushed-branch trust decision, so only the repository config
+    // (extracted from the trusted base ref) may declare it.
+    ci: {
+      no_ci: r?.ci?.no_ci ?? false,
+      timeout_ms: r?.ci?.timeout_ms ?? u?.ci?.timeout_ms ?? DEFAULT_CI_TIMEOUT_MS
+    },
     stages
   }
 }
@@ -460,6 +486,20 @@ auto_fix:
   # Run-wide and resolved from the trusted base policy; the key is rejected on
   # per-stage or per-role auto_fix blocks.
   # guardrails: strict
+
+# ------------------------------------------------------------------------------
+# CI Monitoring (ci stage)
+# ------------------------------------------------------------------------------
+ci:
+  # Treat a pull request with no registered checks as all checks passed
+  # (default: false). Honored only from the trusted base-branch repository
+  # config; the stage still monitors until the PR is merged or closed.
+  no_ci: false
+
+  # Idle timeout in milliseconds before the ci stage opens a gate
+  # (default: 604800000 = 7 days; 0 = unlimited). Re-armed whenever the
+  # PR base branch tip advances.
+  timeout_ms: 604800000
 
 # ------------------------------------------------------------------------------
 # Agent CLI Arguments & Environment Overrides
@@ -526,8 +566,8 @@ defaults:
 # ------------------------------------------------------------------------------
 # Stage-Specific Overrides
 # ------------------------------------------------------------------------------
-# Supported stages: intent, rebase, review, test, document, lint, push, pr.
-# Only push is a coordinator-owned remote stage; agent settings do not apply. pr configures the drafting reviewer.
+# Supported stages: intent, rebase, review, test, document, lint, push, pr, ci.
+# push and ci are coordinator-owned remote stages; agent settings do not apply. pr configures the drafting reviewer.
 # stages:
 #   intent:
 #     agent: "claude"
@@ -559,6 +599,8 @@ defaults:
 #   push: {}
 #
 #   pr: {}
+#
+#   ci: {}
 `
 
 export function defaultUserConfigDir(): string {

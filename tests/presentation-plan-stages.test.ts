@@ -20,7 +20,7 @@ function memoryStore(): PresentationStore {
   }
 }
 
-test('presentation follows the run plan instead of always eight stages', () => {
+test('presentation follows the run plan instead of always nine stages', () => {
   const lines: string[] = []
   const publisher = new PresentationPublisher(
     memoryStore(),
@@ -50,7 +50,7 @@ test('presentation follows the run plan instead of always eight stages', () => {
   assert.ok(lines.includes('no-mistakes run6 stage 3/6 review completed\n'))
 })
 
-test('plain status defaults to the eight-stage plan when none is provided', () => {
+test('plain status defaults to the nine-stage plan when none is provided', () => {
   const lines: string[] = []
   const publisher = new PresentationPublisher(
     memoryStore(),
@@ -58,5 +58,5 @@ test('plain status defaults to the eight-stage plan when none is provided', () =
     new PlainStatusRenderer({ write: (chunk: string) => lines.push(chunk) }),
   )
   publisher.publish('attempt:1:stage:review:started', { kind: 'stage-started', stage: 'review' })
-  assert.ok(lines.includes('no-mistakes run8 stage 3/8 review started\n'))
+  assert.ok(lines.includes('no-mistakes run8 stage 3/9 review started\n'))
 })

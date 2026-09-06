@@ -163,12 +163,15 @@ import {
 import { admitCandidatePublication, publishCandidate } from "./publication.ts";
 import {
   bindPullRequest,
+  observeBoundPullRequest,
   pullRequestContent,
+  settleMergedPullRequest,
   type PullRequestArtifact,
   type PullRequestPipelineFinding,
   type PullRequestPipelineRound,
   type PullRequestPipelineStep,
 } from "./pull-request.ts";
+import { CI_TIMEOUT_SUMMARY, monitorPullRequestChecks, type CiClock } from "./ci.ts";
 export {
   DomainLedger,
   LEGACY_STAGE_PLAN,
@@ -383,6 +386,8 @@ export type PipelineOptions = {
   publicationDestination?: string;
   release2PublicationRequired?: boolean;
   publicationRunner?: CommandRunner;
+  /** Test seam for the ci monitor's clock and sleep. */
+  ciClock?: CiClock;
   rendererFactory?: (
     artifactsDir: string,
     stageLogs: ReadonlyMap<string, StageLog>,
@@ -1995,11 +2000,16 @@ export async function runPipeline(
     git,
     repoRoot: repo.root,
   });
+  // no_ci is trusted only from the base ref; a local-config bypass cannot declare it.
+  const trustedRepoConfig =
+    provenance.localBypass && repoPolicyConfig.ci
+      ? { ...repoPolicyConfig, ci: { ...repoPolicyConfig.ci, no_ci: false } }
+      : repoPolicyConfig;
   const pipelineConfig = resolvePipelineConfig({
     // The explicit fix-round option rides the highest precedence tier so every
     // stage budget derives from one resolved configuration.
     cliFlags: { ...options.cliFlags, max_fix_rounds: maxFixRounds },
-    repoGlobalConfig: repoPolicyConfig,
+    repoGlobalConfig: trustedRepoConfig,
     userGlobalConfig: options.userGlobalConfig,
   });
   const remotePublication = options.githubAuthority !== undefined;
@@ -2020,6 +2030,10 @@ export async function runPipeline(
   const effectiveConfig = JSON.parse(
     JSON.stringify(pipelineConfig),
   ) as typeof pipelineConfig;
+  if (!pipelineSteps.includes("ci")) {
+    delete (effectiveConfig as Partial<typeof effectiveConfig>).ci;
+    delete (effectiveConfig.stages as Partial<typeof effectiveConfig.stages>).ci;
+  }
   // Run-wide guardrail policy: the schema accepts the key only on the
   // top-level auto_fix block, and the trusted base config outranks user-global
   // config in the resolved merge.
@@ -2087,14 +2101,7 @@ export async function runPipeline(
     pipelineSteps.includes("push") &&
     options.admission?.source === "direct"
   ) {
-    let storedRoute = ledger.repositoryPublicationRoute(deliveryRepo.root);
-    if (!storedRoute) {
-      try {
-        storedRoute = ledger.repositoryPublicationRoute(
-          path.resolve(repositoryGatePaths(deliveryRepo.root).commonDir),
-        );
-      } catch {}
-    }
+    const storedRoute = ledger.repositoryPublicationRoute(deliveryRepo.root);
     if (!storedRoute) {
       const existingLease = ledger.leaseFor(deliveryRepo.root, deliveryRepo.branch);
       if (!existingLease || options.forceLease) {
@@ -2233,10 +2240,6 @@ export async function runPipeline(
             : undefined,
         });
         domainRunStarted = true;
-        if (remotePublication && ledger.repositoryPublicationRoute(deliveryRepo.root) &&
-            !ledger.publicationRoute(runId)) {
-          throw new Error("stored publication route does not match the admitted run branches");
-        }
         if (options.admission) {
           ledger.bindSubmissionAdmission(options.admission.admissionId, runId);
         }
@@ -2577,11 +2580,19 @@ export async function runPipeline(
           const payload = prReceipt
             ? (JSON.parse(prReceipt.receipt_json) as Record<string, unknown>)
             : undefined;
-          const isMergedBodyReceipt =
+          const isBodyReceipt =
             payload !== undefined &&
             Object.hasOwn(payload, "bodySha256") &&
-            payload.state === "merged";
-          if (!isMergedBodyReceipt) break;
+            (payload.state === "merged" ||
+              (payload.state === "open" && pipelineSteps.includes("ci")));
+          if (!isBodyReceipt) break;
+        }
+        if (stage === "ci") {
+          const prReceipt = ledger.remoteReceipt(runId, "pull-request-binding");
+          const payload = prReceipt
+            ? (JSON.parse(prReceipt.receipt_json) as Record<string, unknown>)
+            : undefined;
+          if (payload?.state !== "merged") break;
         }
         resumeStageIndex += 1;
       }
@@ -2883,6 +2894,10 @@ export async function runPipeline(
     let previousTask: string | undefined;
     const appendSettledRemoteEvidence = (stage: "push" | "pr") => {
       const row = ledger.listEvidence(runId).findLast((entry) => entry.stage_id === stage);
+      // Every ledger evidence row must stay in the attestation, so a later pr
+      // round (open -> merged) is appended beside the earlier one.
+      const existing = stageEntries.find((entry) => entry.evidenceSha256 === row?.evidence_sha256);
+      if (existing) return existing;
       if (!row) throw new Error(`${stage} settled without durable evidence`);
       if (!row.artifact_sha256) throw new Error(`${stage} evidence is missing its artifact digest`);
       const entry: StageEvidenceManifestEntry = {
@@ -2937,7 +2952,7 @@ export async function runPipeline(
       const dispositions = ledger.stageDispositions(runId);
       const gateAudits = ledger.listGateAudit(runId);
       for (const candidateStage of pipelineSteps) {
-        if (candidateStage === "push" || candidateStage === "pr") break;
+        if (candidateStage === "push" || candidateStage === "pr" || candidateStage === "ci") break;
         const evidence = latestAuthoritativeEvidenceByStage.get(candidateStage);
         if (!evidence) continue;
         if (hasPush) {
@@ -2968,7 +2983,7 @@ export async function runPipeline(
     const reopenedStages = new Set<StageName>();
     while (stageQueue.length > 0) {
       const stage = stageQueue.shift()!;
-      if (stage === "push" || stage === "pr") {
+      if (stage === "push" || stage === "pr" || stage === "ci") {
         const invalidatedStage = await getInvalidatedApprovalStage();
         if (invalidatedStage) {
           const restartIndex = pipelineSteps.indexOf(invalidatedStage);
@@ -3012,7 +3027,7 @@ export async function runPipeline(
       let shouldReopen = false;
       const invalidatedEvidenceTargets = new Set<string>();
       const invalidateCandidateBoundApprovals = (targetCommitOid: string): boolean => {
-        if (stage === "push" || stage === "pr") return false;
+        if (stage === "push" || stage === "pr" || stage === "ci") return false;
         const currentAuthoritative = latestAuthoritativeEvidenceByStage.get(stage);
         if (
           !currentAuthoritative ||
@@ -3031,9 +3046,9 @@ export async function runPipeline(
         const isApprovedByAudit = audits.some(
           (audit) =>
             audit.resolved_at !== null &&
-            (audit.decision === "approve" ||
-              audit.decision === "skip" ||
-              audit.decision === "fix") &&
+            // A fix decision expects the head to move and approves nothing;
+            // only approve/skip bind the stage to the candidate they judged.
+            (audit.decision === "approve" || audit.decision === "skip") &&
             gateAuditMatchesEvidence(
               audit,
               stage,
@@ -3112,172 +3127,207 @@ export async function runPipeline(
           if (!route || !publicationReceipt) {
             throw new Error("PR binding requires a settled candidate publication");
           }
-          const pipelineEvidenceRoot = buildPipelineEvidenceRoot(stageEntries, {
-            attemptOutcomeDigests: ledger
-              .listAttemptOutcomes(runId)
-              .map((entry) => entry.outcome_sha256),
-            baseCommitOid,
-            candidateCommitOid: stageInputCommitOid,
-            candidatePublicationReceiptSha256: publicationReceipt.receipt_sha256,
-            intent,
-            policySha256: policySha256Value,
-            publicationRoute: {
-              baseBranch: route.base_branch,
-              baseRepositoryId: route.base_repository_id,
-              forgeHost: route.forge_host,
-              headBranch: route.head_branch,
-              headOwner: route.head_owner,
-              headRepositoryId: route.head_repository_id,
-              routeFingerprint: route.route_fingerprint,
-            },
-            runId,
-            stageDispositions: ledger.stageDispositions(runId).map((entry) => ({
-              disposition: entry.disposition,
-              ...(entry.evidence_sha256 ? { evidenceSha256: entry.evidence_sha256 } : {}),
-              stage: entry.stage_id,
-            })),
-            stagePlan: ledger.stagePlan(runId).map((entry) => ({
-              requirement: entry.requirement,
-              stage: entry.stage_id,
-            })),
-          });
-          const retainedContent = ledger.publishedPullRequestContent(
-            runId,
-            stageInputCommitOid,
-          );
-          let content: { body: string; title: string };
-          if (retainedContent) {
-            content = retainedContent;
-          } else {
-            const draft = await executeStage(
-              "pr",
-              0,
-              remoteRound,
-              taskId,
+          const priorBinding = ledger.remoteReceipt(runId, "pull-request-binding");
+          const priorBindingReceipt = priorBinding && priorBinding.candidate_commit_oid === stageInputCommitOid
+            ? (JSON.parse(priorBinding.receipt_json) as { payload?: Record<string, unknown> } & Record<string, unknown>)
+            : undefined;
+          const priorBindingPayload = priorBindingReceipt?.payload ?? priorBindingReceipt;
+          const openBindingSettled =
+            priorBindingPayload?.state === "open" && typeof priorBindingPayload.bodySha256 === "string";
+          if (!openBindingSettled) {
+            const pipelineEvidenceRoot = buildPipelineEvidenceRoot(stageEntries, {
+              attemptOutcomeDigests: ledger
+                .listAttemptOutcomes(runId)
+                .map((entry) => entry.outcome_sha256),
+              baseCommitOid,
+              candidateCommitOid: stageInputCommitOid,
+              candidatePublicationReceiptSha256: publicationReceipt.receipt_sha256,
               intent,
-              artifactsDir,
-              repo,
-              orca,
-              git,
-              pipelineConfig.stages.pr,
-              stageLogs,
-              decisionHistory(),
+              policySha256: policySha256Value,
+              publicationRoute: {
+                baseBranch: route.base_branch,
+                baseRepositoryId: route.base_repository_id,
+                forgeHost: route.forge_host,
+                headBranch: route.head_branch,
+                headOwner: route.head_owner,
+                headRepositoryId: route.head_repository_id,
+                routeFingerprint: route.route_fingerprint,
+              },
+              runId,
+              stageDispositions: ledger.stageDispositions(runId).map((entry) => ({
+                disposition: entry.disposition,
+                ...(entry.evidence_sha256 ? { evidenceSha256: entry.evidence_sha256 } : {}),
+                stage: entry.stage_id,
+              })),
+              stagePlan: ledger.stagePlan(runId).map((entry) => ({
+                requirement: entry.requirement,
+                stage: entry.stage_id,
+              })),
+            });
+            const retainedContent = ledger.publishedPullRequestContent(
+              runId,
+              stageInputCommitOid,
             );
-            if (draft.report.findings.length > 0) {
-              throw new Error("PR drafting worker returned findings instead of PR content");
-            }
-            const reviewReport = latestReportByStage.get("review");
-            const testReport = latestReportByStage.get("test");
-            const inferredRisk = reviewReport?.findings.some(
-              (finding) => finding.severity === "error",
-            )
-              ? "high"
-              : reviewReport?.findings.some(
-                    (finding) => finding.severity === "warning",
-                  )
-                ? "medium"
-                : "low";
-            const stageSnapshots = presentation.store.listPresentationSnapshots(runId);
-            const pipelineReportSteps: PullRequestPipelineStep[] = pipelineSteps
-              .slice(0, pipelineSteps.indexOf("pr"))
-              .map((completedStage) => {
-                const decision = latestEntryByStage.get(completedStage)?.waiverOrApproval?.decision;
-                const status = decision === "approve"
-                  ? "approved"
-                  : decision === "skip"
-                    ? "skipped"
-                    : "completed";
-                const stageState = presentation.current.stages.find(
-                  (candidate) => candidate.id === completedStage,
-                );
-                const stageFixes = recoverFixRecords(
-                  completedStage,
-                  stageState,
-                  stageSnapshots,
-                );
-                const rounds = pullRequestPipelineRounds(
-                  reportsByStage.get(completedStage) ?? [{
-                    findings: [],
-                    summary: `${completedStage} passed.`,
-                  }],
-                  stageFixes,
-                  stageState?.findings ?? [],
-                );
-                const seenApproved = new Set<string>();
-                const approvedFindingDetails: PullRequestPipelineFinding[] = [];
-                for (const finding of stageState?.findings ?? []) {
-                  if (finding.disposition === "approved") {
-                    const key = pullRequestFindingKey(finding);
-                    if (!seenApproved.has(key)) {
-                      seenApproved.add(key);
-                      approvedFindingDetails.push({
-                        description: finding.description,
-                        ...(finding.file ? { file: finding.file } : {}),
-                        ...(finding.line ? { line: finding.line } : {}),
-                        severity: finding.severity,
-                      });
+            let content: { body: string; title: string };
+            if (retainedContent) {
+              content = retainedContent;
+            } else {
+              const draft = await executeStage(
+                "pr",
+                0,
+                remoteRound,
+                taskId,
+                intent,
+                artifactsDir,
+                repo,
+                orca,
+                git,
+                pipelineConfig.stages.pr,
+                stageLogs,
+                decisionHistory(),
+              );
+              if (draft.report.findings.length > 0) {
+                throw new Error("PR drafting worker returned findings instead of PR content");
+              }
+              const reviewReport = latestReportByStage.get("review");
+              const testReport = latestReportByStage.get("test");
+              const inferredRisk = reviewReport?.findings.some(
+                (finding) => finding.severity === "error",
+              )
+                ? "high"
+                : reviewReport?.findings.some(
+                      (finding) => finding.severity === "warning",
+                    )
+                  ? "medium"
+                  : "low";
+              const stageSnapshots = presentation.store.listPresentationSnapshots(runId);
+              const pipelineReportSteps: PullRequestPipelineStep[] = pipelineSteps
+                .slice(0, pipelineSteps.indexOf("pr"))
+                .map((completedStage) => {
+                  const decision = latestEntryByStage.get(completedStage)?.waiverOrApproval?.decision;
+                  const status = decision === "approve"
+                    ? "approved"
+                    : decision === "skip"
+                      ? "skipped"
+                      : "completed";
+                  const stageState = presentation.current.stages.find(
+                    (candidate) => candidate.id === completedStage,
+                  );
+                  const stageFixes = recoverFixRecords(
+                    completedStage,
+                    stageState,
+                    stageSnapshots,
+                  );
+                  const rounds = pullRequestPipelineRounds(
+                    reportsByStage.get(completedStage) ?? [{
+                      findings: [],
+                      summary: `${completedStage} passed.`,
+                    }],
+                    stageFixes,
+                    stageState?.findings ?? [],
+                  );
+                  const seenApproved = new Set<string>();
+                  const approvedFindingDetails: PullRequestPipelineFinding[] = [];
+                  for (const finding of stageState?.findings ?? []) {
+                    if (finding.disposition === "approved") {
+                      const key = pullRequestFindingKey(finding);
+                      if (!seenApproved.has(key)) {
+                        seenApproved.add(key);
+                        approvedFindingDetails.push({
+                          description: finding.description,
+                          ...(finding.file ? { file: finding.file } : {}),
+                          ...(finding.line ? { line: finding.line } : {}),
+                          severity: finding.severity,
+                        });
+                      }
                     }
                   }
-                }
-                return {
-                  ...(approvedFindingDetails.length > 0
-                    ? { approvedFindingDetails }
-                    : {}),
-                  approvedFindings: stageState?.approvedFindings ?? approvedFindingDetails.length,
-                  fixedFindings: stageState?.fixedFindings ?? 0,
-                  name: completedStage,
-                  openFindings: stageState?.openFindings ?? 0,
-                  rounds,
-                  status,
-                };
+                  return {
+                    ...(approvedFindingDetails.length > 0
+                      ? { approvedFindingDetails }
+                      : {}),
+                    approvedFindings: stageState?.approvedFindings ?? approvedFindingDetails.length,
+                    fixedFindings: stageState?.fixedFindings ?? 0,
+                    name: completedStage,
+                    openFindings: stageState?.openFindings ?? 0,
+                    rounds,
+                    status,
+                  };
+                });
+              pipelineReportSteps.push(
+                { name: "pr", status: "running" },
+                { name: "ci", status: "pending" },
+              );
+              content = pullRequestContent(intent, {
+                candidateCommitOid: stageInputCommitOid,
+                pipelineSteps: pipelineReportSteps,
+                risk: {
+                  level: reviewReport?.riskLevel ?? inferredRisk,
+                  rationale:
+                    reviewReport?.riskRationale ??
+                    reviewReport?.summary ??
+                    "The validated pipeline found no material review risk.",
+                },
+                testing: {
+                  artifacts: await pullRequestArtifacts(
+                    artifactsDir,
+                    testReport,
+                    options.trustedArtifactDigests,
+                  ),
+                  summary:
+                    testReport?.summary ??
+                    "No dedicated test stage was required by the validated pipeline plan.",
+                  tested: testReport?.tested ?? [],
+                },
+                title: draft.report.title,
+                whatChanged: draft.report.summary,
               });
-            pipelineReportSteps.push(
-              { name: "pr", status: "running" },
-              { name: "ci", status: "pending" },
-            );
-            const branchIntent = [...new Set(
-              ledger.branchIntents(deliveryRepo.root, deliveryRepo.branch, runId)
-                .map((value) => value.trim())
-                .filter(Boolean),
-            )].join("\n\n");
-            content = pullRequestContent(branchIntent || intent, {
+            }
+            await bindPullRequest({
+              artifactPath: path.join(artifactsDir, `pr-r${remoteRound}.json`),
+              attemptId,
+              authority: options.githubAuthority,
               candidateCommitOid: stageInputCommitOid,
-              pipelineSteps: pipelineReportSteps,
-              risk: {
-                level: reviewReport?.riskLevel ?? inferredRisk,
-                rationale:
-                  reviewReport?.riskRationale ??
-                  reviewReport?.summary ??
-                  "The validated pipeline found no material review risk.",
+              content,
+              generationToken: generationToken!,
+              ledger,
+              onReady: async ({ number, title, url }) => {
+                await orca.notifyPullRequestReady?.(number, title, url);
               },
-              testing: {
-                artifacts: await pullRequestArtifacts(
-                  artifactsDir,
-                  testReport,
-                  options.trustedArtifactDigests,
-                ),
-                summary:
-                  testReport?.summary ??
-                  "No dedicated test stage was required by the validated pipeline plan.",
-                tested: testReport?.tested ?? [],
-              },
-              title: draft.report.title,
-              whatChanged: draft.report.summary,
+              pipelineEvidenceRoot,
+              roundIndex: remoteRound,
+              runId,
+              supersedesEvidenceSha256: ledger
+                .stageDispositions(runId)
+                .find((disposition) => disposition.stage_id === "pr")?.evidence_sha256 ?? undefined,
+              workerIdentity: coordinatorIdentity,
             });
           }
-          await bindPullRequest({
-            artifactPath: path.join(artifactsDir, `pr-r${remoteRound}.json`),
+        }
+        if (stage === "pr" && !pipelineSteps.includes("ci")) {
+          // Frozen eight-stage plans have no ci stage, so pr itself awaits the merge.
+          appendSettledRemoteEvidence("pr");
+          const sleep = options.ciClock?.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+          const now = options.ciClock?.now ?? Date.now;
+          const startedAt = now();
+          for (;;) {
+            const observed = await observeBoundPullRequest(options.githubAuthority, ledger, runId, stageInputCommitOid);
+            if (!observed) throw new Error("pull-request facts changed while awaiting merge");
+            if (observed.state === "CLOSED") throw new Error("the exact pull request was closed without merging");
+            if (observed.state === "MERGED") break;
+            if (pipelineConfig.ci.timeout_ms > 0 && now() - startedAt >= pipelineConfig.ci.timeout_ms) {
+              throw new Error(CI_TIMEOUT_SUMMARY);
+            }
+            await ledger.heartbeatLease(deliveryRepo.root, deliveryRepo.branch, runId);
+            await sleep(15_000);
+          }
+          await settleMergedPullRequest({
+            artifactPath: path.join(artifactsDir, "pr-merged.json"),
             attemptId,
             authority: options.githubAuthority,
             candidateCommitOid: stageInputCommitOid,
-            content,
             generationToken: generationToken!,
             ledger,
-            onReady: async ({ number, title, url }) => {
-              await orca.notifyPullRequestReady?.(number, title, url);
-            },
-            pipelineEvidenceRoot,
-            roundIndex: remoteRound,
             runId,
             workerIdentity: coordinatorIdentity,
           });
@@ -3340,6 +3390,52 @@ export async function runPipeline(
       let autoFixModeForReport = resumedBlocker
         ? false
         : (resumedFindingMode ?? autoFixMode);
+      const runCiStage = async (): Promise<StageExecution> => {
+        if (!options.githubAuthority || !attemptId) {
+          throw new Error("ci requires initialized GitHub publication");
+        }
+        const authority = options.githubAuthority;
+        const ciAttemptId = attemptId;
+        const stageLog = registeredStageLog(stageLogs, stageLogPath(artifactsDir, stage, round));
+        try {
+          const report = await monitorPullRequestChecks({
+            candidateCommitOid: stageInputCommitOid,
+            clock: options.ciClock,
+            config: pipelineConfig.ci,
+            heartbeat: () => ledger.heartbeatLease(deliveryRepo.root, deliveryRepo.branch, runId),
+            log: (line) => {
+              stageLog.append(`${line}\n`).catch(() => {});
+            },
+            observeChecks: (nodeId) => authority.observePullRequestChecks(nodeId),
+            observePullRequest: () =>
+              observeBoundPullRequest(authority, ledger, runId, stageInputCommitOid),
+            settleMerged: async () => {
+              const merged = await settleMergedPullRequest({
+                artifactPath: path.join(artifactsDir, "pr-merged.json"),
+                attemptId: ciAttemptId,
+                authority,
+                candidateCommitOid: stageInputCommitOid,
+                generationToken: generationToken!,
+                ledger,
+                runId,
+                workerIdentity: coordinatorIdentity,
+              });
+              appendSettledRemoteEvidence("pr");
+              return merged;
+            },
+          });
+          return {
+            exitCode: exitCodeFor(report),
+            report,
+            resolvedAgent: "coordinator",
+            workerIdentity: "coordinator",
+          };
+        } finally {
+          await stageLog.close().catch((error) => {
+            console.error(`warning: could not close ${stage} log: ${String(error)}`);
+          });
+        }
+      };
       const runStage = async () => {
         const executionHead = await git.head();
         invalidateCandidateBoundApprovals(executionHead);
@@ -3350,7 +3446,7 @@ export async function runPipeline(
         );
         let execution: StageExecution;
         try {
-          execution = await executeStage(
+          execution = stage === "ci" ? await runCiStage() : await executeStage(
             stage,
             attempt++,
             round,
@@ -3485,12 +3581,13 @@ export async function runPipeline(
         let shouldFix =
           autoFixModeForReport && !asksUser && !exhausted && !automationBlocked;
         let guidance = "";
-        const manualRebaseIssue = stage === "rebase";
+        const manualRebaseIssue = stage === "rebase" || stage === "ci";
 
         if (resumedFixDecision) {
           const recordedDecision = resumedFixDecision;
           resumedFixDecision = undefined;
           if (manualRebaseIssue) {
+            round += 1;
             report = await runStage();
             continue;
           }
@@ -3648,6 +3745,7 @@ export async function runPipeline(
               );
             }
             if (manualRebaseIssue) {
+              round += 1;
               report = await runStage();
               continue;
             }
@@ -6134,14 +6232,14 @@ function stageTaskSpec(
 }
 
 function checkerBrief(stage: StageName): string {
-  const briefs: Record<Exclude<StageName, "intent" | "rebase" | "push">, string> = {
+  const briefs: Record<Exclude<StageName, "intent" | "rebase" | "push" | "ci">, string> = {
     review: "Adversarially review the committed change.",
     test: "Run the smallest relevant behavioral checks and gather evidence for user intent.",
     document: "Check whether the change made owned documentation stale.",
     lint: "Run repository linting, formatting, and static-analysis checks.",
     pr: "Draft the title and complete What Changed section for the final branch diff.",
   };
-  if (stage === "push") {
+  if (stage === "push" || stage === "ci") {
     throw new Error(`${stage} is a coordinator-owned remote stage`);
   }
   return briefs[stage as keyof typeof briefs];
@@ -9878,7 +9976,10 @@ function weakensInlineTestValidation(
   // Context chains are limited to known test modifiers so same-named object
   // calls stay fixable; the character class avoids matching this regex itself.
   const testDeclaration = /(?:#\[\s*(?:cfg\s*\(\s*test\s*\)|rstest|(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test)\s*\]|@(?:[A-Za-z_][\w]*\.)*(?:ParameterizedTest|Test|TestMethod|DataTestMethod)\b|\[(?:(?:[A-Za-z_][\w]*\.)*(?:Fact|Test|Theory|TestMethod|DataTestMethod)|(?:[A-Za-z_][\w]*\.)*TestCase(?:\([^\]\n]*\))?)\]|(?<![.\w$])(?:(?:describe|it|test)(?:\.[A-Za-z_$][\w$]*)*|conte[x]t(?:\.(?:skip|only|todo|each|failing|fails|concurrent|sequential|shuffle|extend|describe|fixme|slow|if|runIf|skipIf))*)\s*\(|\b(?:SCENARIO|TEMPLATE_TEST_CASE|TEST_CASE|TEST_F|TEST_P|TYPED_TEST|TYPED_TEST_P)\s*\(|\btest\s+"(?:[^"\\]|\\.)*"\s*\{|(?:^|\n)\s*(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(|\bXCTestCase\b|class\s+\w+\s*\(\s*(?:unittest\.)?TestCase\b)/iu;
-  const inlineAssertion = /(?:(?:^|\n)\s*assert\s+\S|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\b(?:CHECK|REQUIRE)(?:_[A-Z0-9_]+)?\s*\(|\b(?:[A-Za-z_][\w]*\.)*Assert\.[A-Za-z_][\w]*\s*\(|\.should(?:\.[A-Za-z_$][\w$]*)+\s*\(|\b(?:deepStrictEqual|strictEqual|notDeepStrictEqual|notStrictEqual|doesNotReject|doesNotThrow|ifError|rejects|throws)\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|(?<![.\w$])assert[A-Z][A-Za-z0-9_$]*\s*\(|\bstd\.testing\.expect[A-Za-z0-9_]*\s*\(|\bexpect(?:\.(?:poll|soft))?\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
+  const inlineAssertion = /(?:(?:^|\n)\s*assert\s+\S|\b(?:ASSERT|EXPECT)_[A-Z0-9_]+\s*\(|\b(?:[A-Za-z_][\w]*\.)*Assert\.[A-Za-z_][\w]*\s*\(|\.should(?:\.[A-Za-z_$][\w$]*)+\s*\(|\b(?:deepStrictEqual|strictEqual|notDeepStrictEqual|notStrictEqual|doesNotReject|doesNotThrow|ifError|rejects|throws)\s*\(|\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|\bassert(?:_[a-z0-9]+)?!\s*\(|(?<![.\w$])assert[A-Z][A-Za-z0-9_$]*\s*\(|\bstd\.testing\.expect[A-Za-z0-9_]*\s*\(|\bexpect(?:\.(?:poll|soft))?\s*\(|\bshould(?:Be|Equal|Match|Throw)\b|>>>)/iu;
+  // Catch2/doctest macros are uppercase by definition; matching them
+  // case-insensitively froze prose such as "failing check (with details)".
+  const macroAssertion = /\b(?:CHECK|REQUIRE)(?:_[A-Z0-9_]+)?\s*\(/u;
   const doctestPrompt = /^\s*>>>/u;
   const nodeAssertImport = /(?:from\s+["'](?:node:)?assert(?:\/strict)?["']|require\s*\(\s*["'](?:node:)?assert(?:\/strict)?["']\s*\))/u;
   if (
@@ -9925,7 +10026,7 @@ function weakensInlineTestValidation(
     const lines = text.split("\n");
     const units: string[] = [];
     for (let index = 0; index < lines.length; index += 1) {
-      const assertion = inlineAssertion.exec(lines[index]);
+      const assertion = inlineAssertion.exec(lines[index]) ?? macroAssertion.exec(lines[index]);
       if (!assertion) continue;
       let unit = lines[index];
       const doctestUnit = doctestPrompt.test(lines[index]);
@@ -15748,8 +15849,8 @@ Run options:
  Init options:
   --upstream <url|nwo> (override upstream repository URL or owner/repo)
   --fork <url|nwo> (override fork repository URL or owner/repo)
-  --base-branch <branch> (override target base branch)
-  --head-branch <branch> (override publication head branch)
+  --base-branch <branch> (init-time base branch for the stored route; does not select a run's base, use run --base)
+  --head-branch <branch> (init-time head branch for the stored route; a run publishes the submitted checked-out branch)
 
  Prune options:
   --stranded (reap stranded gate and direct-run resources whose coordinator died; cannot be combined with --before)
@@ -16114,7 +16215,6 @@ Release boundary:
             storedRoute.head_repository_id !== storedRoute.base_repository_id
               ? storedRoute.head_repository_name
               : undefined,
-          headBranch: storedRoute?.head_branch,
           ledger,
           provider: githubAuthority,
           repoPath: routeRoot,

@@ -3,8 +3,8 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
-import { DomainLedger, evidenceSha256, sha256 } from '../scripts/ledger.ts'
-import { bindPullRequest } from '../scripts/pull-request.ts'
+import { DomainLedger, evidenceSha256, repositoryIdentityFingerprint, sha256 } from '../scripts/ledger.ts'
+import { bindPullRequest, settleMergedPullRequest } from '../scripts/pull-request.ts'
 
 const OID = 'a'.repeat(40)
 const REPO_ROOT = '/repo'
@@ -24,6 +24,11 @@ function localStageEvidence(stage: string, round: number, artifactPath: string) 
   }
   entry.evidenceSha256 = evidenceSha256({ ...entry, runId: 'run' })
   return { ...entry, artifactPath }
+}
+
+function receiptState(receiptJson: string | undefined): unknown {
+  const parsed = JSON.parse(receiptJson ?? '{}') as { payload?: { state?: unknown }; state?: unknown }
+  return (parsed.payload ?? parsed).state
 }
 
 function observedPullRequest(body = 'human body', title = 'human title', state: 'MERGED' | 'OPEN' = 'OPEN') {
@@ -46,7 +51,7 @@ function observedPullRequest(body = 'human body', title = 'human title', state: 
   }
 }
 
-test('bindPullRequest settles through a real DomainLedger with full route facts', async () => {
+test('bindPullRequest settles open through a real DomainLedger and settleMergedPullRequest upgrades it', async () => {
   const home = await mkdtemp(path.join(tmpdir(), 'onm-pr-ledger-'))
   const ledger = new DomainLedger(':memory:')
   const route = {
@@ -123,7 +128,7 @@ test('bindPullRequest settles through a real DomainLedger with full route facts'
       startedAt: '2026-09-01T00:00:01.000Z'
     })
     const routeFingerprint = ledger.recordPublicationRoute({ ...route, runId: 'run' })
-    assert.equal(routeFingerprint, fingerprint)
+    assert.equal(repositoryIdentityFingerprint({ ...route, base_repository_id: route.baseRepositoryId, forge_host: 'github.com', head_owner: route.headOwner, head_repository_id: route.headRepositoryId }), fingerprint)
     ledger.recordPublicationBaseline({
       headCommitOid: null,
       observedAt: '2026-09-01T00:00:02.000Z',
@@ -204,8 +209,9 @@ test('bindPullRequest settles through a real DomainLedger with full route facts'
     })
 
     let pullRequest: ReturnType<typeof observedPullRequest> | null = null
+    let tick = 0
+    const now = () => `2026-09-01T00:00:${String(10 + tick++).padStart(2, '0')}.000Z`
     let createdTitle: string | undefined
-    let sleepCalls = 0
     const content = { body: 'complete body', title: 'ONM-80: bind exact GitHub pull requests' }
     const authority = {
       createPullRequest: async (input: { body: string; title: string }) => {
@@ -223,28 +229,57 @@ test('bindPullRequest settles through a real DomainLedger with full route facts'
       content,
       generationToken: generation,
       ledger,
-      now: (() => { let tick = 0; return () => `2026-09-01T00:00:1${tick++}.000Z` })(),
+      now,
       pipelineEvidenceRoot: 'c'.repeat(64),
       runId: 'run',
-      sleep: async () => {
-        sleepCalls += 1
-        assert.equal(
-          ledger.stageDispositions('run').some((entry) => entry.stage_id === 'pr'),
-          false,
-          'the PR stage must remain incomplete while the PR is open'
-        )
-        pullRequest = observedPullRequest(content.body, content.title, 'MERGED')
-      },
       workerIdentity: 'coordinator'
     })
 
     assert.equal(result.outcome, 'created')
     assert.equal(result.number, 7)
-    assert.equal(sleepCalls, 1)
     assert.equal(createdTitle, 'ONM-80: bind exact GitHub pull requests')
-    const prReceipt = ledger.remoteReceipt('run', 'pull-request-binding')
-    assert.equal(prReceipt?.candidate_commit_oid, OID)
-    assert.equal(prReceipt?.receipt_sha256, result.receiptSha256)
+    const openReceipt = ledger.remoteReceipt('run', 'pull-request-binding')
+    assert.equal(openReceipt?.candidate_commit_oid, OID)
+    assert.equal(openReceipt?.receipt_sha256, result.receiptSha256)
+    assert.equal(receiptState(openReceipt?.receipt_json), 'open')
+    const openDisposition = ledger.stageDispositions('run').find((entry) => entry.stage_id === 'pr')
+    assert.equal(openDisposition?.disposition, 'satisfied')
+
+    const mergeInput = {
+      artifactPath: path.join(home, 'pr-merged.json'),
+      attemptId: 'attempt',
+      authority,
+      candidateCommitOid: OID,
+      generationToken: generation,
+      ledger,
+      now,
+      runId: 'run',
+      workerIdentity: 'coordinator'
+    }
+    await assert.rejects(settleMergedPullRequest(mergeInput), /is not merged/)
+    pullRequest = observedPullRequest(content.body, 'human-edited title')
+    await assert.rejects(settleMergedPullRequest(mergeInput), /facts changed before merge/)
+    pullRequest = observedPullRequest('human-edited body', content.title, 'MERGED')
+    await assert.rejects(settleMergedPullRequest(mergeInput), /facts changed before merge/)
+    assert.equal(ledger.remoteReceipt('run', 'pull-request-binding')?.receipt_sha256, result.receiptSha256)
+
+    pullRequest = observedPullRequest(content.body, content.title, 'MERGED')
+    const merged = await settleMergedPullRequest(mergeInput)
+    assert.equal(merged.number, 7)
+    assert.notEqual(merged.receiptSha256, result.receiptSha256)
+    const mergedReceipt = ledger.remoteReceipt('run', 'pull-request-binding')
+    assert.equal(mergedReceipt?.receipt_sha256, merged.receiptSha256)
+    assert.equal(receiptState(mergedReceipt?.receipt_json), 'merged')
+    const mergedDisposition = ledger.stageDispositions('run').find((entry) => entry.stage_id === 'pr')
+    assert.equal(mergedDisposition?.disposition, 'satisfied')
+    assert.notEqual(mergedDisposition?.evidence_sha256, openDisposition?.evidence_sha256)
+    assert.deepEqual(
+      ledger.listEvidence('run').filter((row) => row.stage_id === 'pr').map((row) => row.round_index),
+      [0, 1]
+    )
+
+    const again = await settleMergedPullRequest(mergeInput)
+    assert.equal(again.receiptSha256, merged.receiptSha256)
   } finally {
     ledger.close()
     await rm(home, { force: true, recursive: true })

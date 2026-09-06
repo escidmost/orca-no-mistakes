@@ -5,7 +5,7 @@ import path from 'node:path'
 import test from 'node:test'
 
 import type { GithubPullRequestObservation } from '../scripts/github.ts'
-import { sha256 } from '../scripts/ledger.ts'
+import { sha256, repositoryIdentityFingerprint } from '../scripts/ledger.ts'
 import {
   bindPullRequest,
   PullRequestBindingError,
@@ -67,7 +67,7 @@ function harness() {
       base_repository_node_id: 'R_base',
       head_repository_name: 'forker/repo',
       head_repository_node_id: 'R_head',
-      route_fingerprint: 'route'
+      route_fingerprint: repositoryIdentityFingerprint({ base_repository_id: '1', forge_host: 'github.com', head_owner: 'forker', head_repository_id: '2' })
     }),
     run: () => ({ branch: 'feature', repo_root: '/repo' }),
     settleRemoteStage: (input: Record<string, unknown>) => {
@@ -78,7 +78,7 @@ function harness() {
   return { ledger, recordedObservations, settlements }
 }
 
-test('bindPullRequest rejects body or title drift while awaiting merge and derives hashes from observed PR', async () => {
+test('bindPullRequest rejects body or title drift after readiness notification and derives hashes from observed PR', async () => {
   const { ledger, recordedObservations, settlements } = harness()
   let pr = pullRequest()
   const authority = {
@@ -98,14 +98,14 @@ test('bindPullRequest rejects body or title drift while awaiting merge and deriv
         content,
         generationToken: 1,
         ledger: ledger as never,
-        pipelineEvidenceRoot: 'c'.repeat(64),
-        runId: 'run',
-        sleep: async () => {
+        onReady: async () => {
           pr = pullRequest({ body: 'altered body' })
         },
+        pipelineEvidenceRoot: 'c'.repeat(64),
+        runId: 'run',
         workerIdentity: 'coordinator'
       }),
-      /pull-request facts changed while awaiting merge/
+      /pull-request facts changed after readiness notification/
     )
 
     pr = pullRequest()
@@ -118,14 +118,14 @@ test('bindPullRequest rejects body or title drift while awaiting merge and deriv
         content,
         generationToken: 1,
         ledger: ledger as never,
-        pipelineEvidenceRoot: 'c'.repeat(64),
-        runId: 'run',
-        sleep: async () => {
+        onReady: async () => {
           pr = pullRequest({ title: 'altered title' })
         },
+        pipelineEvidenceRoot: 'c'.repeat(64),
+        runId: 'run',
         workerIdentity: 'coordinator'
       }),
-      /pull-request facts changed while awaiting merge/
+      /pull-request facts changed after readiness notification/
     )
 
     pr = pullRequest()
@@ -138,14 +138,14 @@ test('bindPullRequest rejects body or title drift while awaiting merge and deriv
         content,
         generationToken: 1,
         ledger: ledger as never,
-        pipelineEvidenceRoot: 'c'.repeat(64),
-        runId: 'run',
-        sleep: async () => {
+        onReady: async () => {
           pr = pullRequest({ draft: true })
         },
+        pipelineEvidenceRoot: 'c'.repeat(64),
+        runId: 'run',
         workerIdentity: 'coordinator'
       }),
-      /pull-request facts changed while awaiting merge/
+      /pull-request facts changed after readiness notification/
     )
 
     pr = pullRequest()
@@ -159,14 +159,12 @@ test('bindPullRequest rejects body or title drift while awaiting merge and deriv
       ledger: ledger as never,
       pipelineEvidenceRoot: 'c'.repeat(64),
       runId: 'run',
-      sleep: async () => {
-        pr = pullRequest({ state: 'MERGED' })
-      },
       workerIdentity: 'coordinator'
     })
 
     assert.equal(recordedObservations.length, 1)
     const observationPayload = (recordedObservations[0].payload ?? {}) as Record<string, unknown>
+    assert.equal(observationPayload.state, 'open')
     assert.equal(observationPayload.bodySha256, sha256(content.body))
     assert.equal(observationPayload.titleSha256, sha256(content.title))
 
@@ -180,7 +178,7 @@ test('bindPullRequest rejects body or title drift while awaiting merge and deriv
 })
 
 test('bindPullRequest does not notify onReady when observed PR is already merged', async () => {
-  const { ledger } = harness()
+  const { ledger, settlements } = harness()
   const pr = pullRequest({ state: 'MERGED' })
   let readyCalled = false
   const authority = {
@@ -207,6 +205,8 @@ test('bindPullRequest does not notify onReady when observed PR is already merged
     })
     assert.equal(readyCalled, false)
     assert.equal(result.outcome, 'unchanged')
+    assert.equal(settlements.length, 1)
+    assert.equal((settlements[0].receipt as { payload: { state: string } }).payload.state, 'merged')
   } finally {
     await rm(directory, { force: true, recursive: true })
   }

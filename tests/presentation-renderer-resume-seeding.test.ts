@@ -172,7 +172,7 @@ test("createRunRenderer wrapper seed error switches to plain without re-emitting
   assert.equal(failures.length, 1);
   assert.ok(
     !output.writes.some(
-      (w) => w.includes("stage 1/8") || w.includes("stage 3/8"),
+      (w) => w.includes("stage 1/9") || w.includes("stage 3/9"),
     ),
   );
   renderer.close?.();

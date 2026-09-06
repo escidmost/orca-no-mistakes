@@ -865,9 +865,9 @@ export function verifyCompletionAttestation(manifest: CompletionAttestationManif
     planStages.add(entry.stage)
   }
   const pushIndex = manifest.stagePlan.findIndex((entry) => entry.stage === 'push')
-  const prIndex = manifest.stagePlan.findIndex((entry) => entry.stage === 'pr')
-  if (pushIndex < 0 || prIndex !== pushIndex + 1 || prIndex !== manifest.stagePlan.length - 1) {
-    throw new Error('attestation stage plan must end with push then pr')
+  const tail = manifest.stagePlan.slice(pushIndex).map((entry) => entry.stage).join(',')
+  if (pushIndex < 0 || !['push,pr', 'push,pr,ci'].includes(tail)) {
+    throw new Error('attestation stage plan must end with push then pr, optionally followed by ci')
   }
   if (
     !Array.isArray(manifest.stageDispositions) ||
@@ -1658,6 +1658,21 @@ export function cleanGitEnvironment(): NodeJS.ProcessEnv {
     }
   }
   return environment
+}
+
+/** Stable forge/repository/owner identity shared by a repository route and every per-run route it seeds. */
+export function repositoryIdentityFingerprint(route: {
+  base_repository_id: string
+  forge_host: string
+  head_owner: string
+  head_repository_id: string
+}): string {
+  return sha256(canonicalJson({
+    baseRepositoryId: route.base_repository_id,
+    forgeHost: route.forge_host,
+    headOwner: route.head_owner,
+    headRepositoryId: route.head_repository_id
+  }))
 }
 
 export function allowsLegacyLedgerFallback(error: unknown): boolean {
@@ -2887,12 +2902,8 @@ export class DomainLedger {
         insert.run(input.runId, position, entry.stageId, entry.requirement)
       }
       const route = this.repositoryPublicationRoute(input.repoRoot)
-      if (
-        route &&
-        route.head_branch === input.branch &&
-        route.base_branch === input.baseBranch
-      ) {
-        this.#recordStoredPublicationRoute(input.runId, route)
+      if (route) {
+        this.#recordStoredPublicationRoute(input.runId, route, input.branch, input.baseBranch)
       }
       this.#db.exec('COMMIT')
     } catch (error) {
@@ -3253,22 +3264,21 @@ export class DomainLedger {
   }
 
   #setRepositoryPublicationRoute(input: RepositoryPublicationRouteInput): string {
-    const route = {
-      baseBranch: input.baseBranch,
-      baseRepositoryId: input.baseRepositoryId,
-      forgeHost: input.forgeHost,
-      headBranch: input.headBranch,
-      headOwner: input.headOwner,
-      headRepositoryId: input.headRepositoryId
-    }
-    const fingerprint = sha256(canonicalJson(route))
+    // The repository route is one per repository: branches are per-run facts
+    // snapshotted at startRun, so they are not part of this fingerprint.
+    const fingerprint = repositoryIdentityFingerprint({
+      base_repository_id: input.baseRepositoryId,
+      forge_host: input.forgeHost,
+      head_owner: input.headOwner,
+      head_repository_id: input.headRepositoryId
+    })
     const existing = this.repositoryPublicationRoute(input.repoRoot)
     if (existing && existing.route_fingerprint !== fingerprint) {
       const active = this.#db.prepare(
         `SELECT COUNT(DISTINCT r.run_id) AS count
          FROM runs r
          JOIN publication_routes p ON p.run_id = r.run_id
-         WHERE r.repo_root = ? AND p.route_fingerprint = ?
+         WHERE p.forge_host = ? AND p.base_repository_id = ? AND p.head_repository_id = ? AND p.head_owner = ?
            AND (r.status = 'in-progress' OR (r.status = 'failed' AND EXISTS (
              SELECT 1
              FROM attempt_outcomes o
@@ -3278,7 +3288,12 @@ export class DomainLedger {
                  SELECT MAX(a2.generation_token) FROM run_attempts a2 WHERE a2.run_id = r.run_id
                )
            )))`
-      ).get(input.repoRoot, existing.route_fingerprint) as { count: number }
+      ).get(
+        existing.forge_host,
+        existing.base_repository_id,
+        existing.head_repository_id,
+        existing.head_owner
+      ) as { count: number }
       if (active.count > 0) {
         throw new Error(
           `cannot change publication route while ${active.count} active or resumable run(s) depend on it`
@@ -3342,15 +3357,39 @@ export class DomainLedger {
     return fingerprint
   }
 
+  #commonDirs = new Map<string, string | undefined>()
+
+  /**
+   * The route is keyed by the repository's git common dir so every worktree
+   * shares it; a worktree path is resolved to that key here.
+   */
   repositoryPublicationRoute(repoRoot: string): RepositoryPublicationRouteRow | undefined {
-    return this.#db.prepare(
+    const select = this.#db.prepare(
       `SELECT repo_root, route_fingerprint, forge_host, base_repository_id,
               base_repository_node_id, base_repository_name, head_repository_id,
               head_repository_node_id, head_repository_name, network_root_repository_id,
               head_owner, head_branch, base_branch, actor_id, actor_login, actor_node_id,
               credential_source, backend, backend_version, observed_at, updated_at
        FROM repository_publication_routes WHERE repo_root = ?`
-    ).get(repoRoot) as RepositoryPublicationRouteRow | undefined
+    )
+    if (!this.#commonDirs.has(repoRoot)) {
+      let commonDir: string | undefined
+      try {
+        commonDir = execFileSync(
+          'git',
+          ['-C', repoRoot, 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+          { encoding: 'utf8', env: cleanGitEnvironment(), stdio: ['ignore', 'pipe', 'pipe'] }
+        ).trim()
+      } catch {}
+      this.#commonDirs.set(repoRoot, commonDir)
+    }
+    // The shared row under the git common dir wins; a worktree-keyed row from an
+    // older per-worktree init only serves when no shared row exists.
+    const commonDir = this.#commonDirs.get(repoRoot)
+    const shared = commonDir && commonDir !== repoRoot
+      ? select.get(commonDir) as RepositoryPublicationRouteRow | undefined
+      : undefined
+    return shared ?? (select.get(repoRoot) as RepositoryPublicationRouteRow | undefined)
   }
 
   recordStoredPublicationRoute(runId: string, repoRoot: string): string {
@@ -3362,12 +3401,7 @@ export class DomainLedger {
       }
       const route = this.repositoryPublicationRoute(repoRoot)
       if (!route) throw new Error(`repository ${repoRoot} has no publication route`)
-      if (route.head_branch !== run.branch || route.base_branch !== run.base_branch) {
-        throw new Error(
-          `stored publication route (${route.head_branch} -> ${route.base_branch}) does not match run (${run.branch} -> ${run.base_branch})`
-        )
-      }
-      const fingerprint = this.#recordStoredPublicationRoute(runId, route)
+      const fingerprint = this.#recordStoredPublicationRoute(runId, route, run.branch, run.base_branch)
       this.#db.exec('COMMIT')
       return fingerprint
     } catch (error) {
@@ -3378,13 +3412,15 @@ export class DomainLedger {
 
   #recordStoredPublicationRoute(
     runId: string,
-    route: RepositoryPublicationRouteRow
+    route: RepositoryPublicationRouteRow,
+    headBranch: string,
+    baseBranch: string
   ): string {
     return this.recordPublicationRoute({
-      baseBranch: route.base_branch,
+      baseBranch,
       baseRepositoryId: route.base_repository_id,
       forgeHost: route.forge_host,
-      headBranch: route.head_branch,
+      headBranch,
       headOwner: route.head_owner,
       headRepositoryId: route.head_repository_id,
       runId
@@ -3968,7 +4004,7 @@ export class DomainLedger {
       (hasBodyReport &&
         (typeof receipt.bodySha256 !== 'string' || !HEX_64.test(receipt.bodySha256) ||
           typeof receipt.titleSha256 !== 'string' || !HEX_64.test(receipt.titleSha256) ||
-          receipt.state !== 'merged')) ||
+          (receipt.state !== 'merged' && receipt.state !== 'open'))) ||
       typeof receipt.mutationIntent !== 'string' ||
       receipt.postRead !== input.observationSha256) return false
     const mutation = this.#db.prepare(
@@ -4047,7 +4083,7 @@ export class DomainLedger {
       ) && payload.number === receipt.number
     if (!commonMatch) return false
     if (hasBodyReport) {
-      return payload.state === 'merged' && mutationPayload.action === 'ensure-body-and-await-merge' &&
+      return payload.state === receipt.state && mutationPayload.action === 'ensure-body-and-await-merge' &&
         payload.bodySha256 === receipt.bodySha256 &&
         payload.titleSha256 === receipt.titleSha256 &&
         hasOnlyOwnProperties(payload, new Set([
@@ -4207,11 +4243,20 @@ export class DomainLedger {
            AND evidence_sha256 = ?`
       ).get(input.runId, input.stageId, input.evidence.evidenceSha256)
       const priorDispositionRow = this.#db.prepare(
-        'SELECT disposition, evidence_sha256 FROM stage_dispositions WHERE run_id = ? AND stage_id = ? LIMIT 1'
+        `SELECT COALESCE((SELECT s.disposition FROM stage_disposition_supersessions s
+                          WHERE s.run_id = d.run_id AND s.stage_id = d.stage_id
+                          ORDER BY s.rowid DESC LIMIT 1), d.disposition) AS disposition,
+                COALESCE((SELECT s.evidence_sha256 FROM stage_disposition_supersessions s
+                          WHERE s.run_id = d.run_id AND s.stage_id = d.stage_id
+                          ORDER BY s.rowid DESC LIMIT 1), d.evidence_sha256) AS evidence_sha256
+         FROM stage_dispositions d WHERE d.run_id = ? AND d.stage_id = ? LIMIT 1`
       ).get(input.runId, input.stageId) as { disposition: string; evidence_sha256: string } | undefined
       const priorDisposition = priorDispositionRow !== undefined ? 1 : undefined
+      // An open binding settles pr; the ci stage later upgrades the same
+      // candidate's receipt to merged through the supersession path below.
       const settlesDisposition = input.stageId !== 'pr' ||
         input.receipt.payload.state === 'merged' ||
+        input.receipt.payload.state === 'open' ||
         (Object.hasOwn(input.receipt.payload, 'managedCommentIntent') &&
           (input.evidence.roundIndex === 0 || priorDisposition === undefined))
       const priorEvidence = this.#db.prepare(
@@ -4237,7 +4282,8 @@ export class DomainLedger {
         priorDispositionRow !== undefined &&
         existingDisposition === undefined &&
         input.stageId === 'pr' &&
-        input.receipt.payload.state === 'merged' &&
+        (input.receipt.payload.state === 'merged' ||
+          (input.receipt.payload.state === 'open' && typeof input.receipt.payload.bodySha256 === 'string')) &&
         priorDispositionRow.disposition === 'satisfied'
       ) {
         const priorPrReceipt = this.#db.prepare(
@@ -4248,11 +4294,13 @@ export class DomainLedger {
         if (priorPrReceipt) {
           const parsedReceipt = JSON.parse(priorPrReceipt.receipt_json) as Record<string, unknown>
           const priorPayload = (parsedReceipt.payload as Record<string, unknown> | undefined) ?? parsedReceipt
-          const isManagedComment = priorPayload && (
+          const priorManagedComment = priorPayload && (
             Object.hasOwn(priorPayload, 'managedCommentIntent') ||
-            priorPayload.managedCommentNodeId !== undefined ||
-            priorPayload.state === 'open'
-          ) && priorPayload.state !== 'merged'
+            priorPayload.managedCommentNodeId !== undefined
+          ) && priorPayload.state !== 'open' && priorPayload.state !== 'merged'
+          const isManagedComment = input.receipt.payload.state === 'merged'
+            ? priorManagedComment || (priorPayload && priorPayload.state === 'open')
+            : priorManagedComment
           const matchesSuperseded =
             typeof input.supersedesEvidenceSha256 === 'string' &&
             input.supersedesEvidenceSha256 === priorDispositionRow.evidence_sha256
@@ -5889,41 +5937,6 @@ export class DomainLedger {
                 intent, policy_sha256, status FROM runs WHERE run_id = ?`
       )
       .get(runId) as RunRecord | undefined
-  }
-
-  branchIntents(repoRoot: string, branch: string, runId?: string): string[] {
-    const runs = this.#db
-      .prepare(
-        `SELECT run_id, intent FROM runs
-         WHERE repo_root = ? AND branch = ?
-         ORDER BY rowid`,
-      )
-      .all(repoRoot, branch) as Array<{
-        intent: string
-        run_id: string
-      }>
-    if (runs.length === 0) return []
-
-    const targetIndex = runId ? runs.findIndex((r) => r.run_id === runId) : -1
-    const limitIndex = targetIndex !== -1 ? targetIndex : runs.length
-
-    let boundaryIndex = 0
-    for (let i = 0; i < limitIndex; i++) {
-      const receipt = this.remoteReceipt(runs[i].run_id, 'pull-request-binding')
-      if (receipt) {
-        try {
-          const payload = JSON.parse(receipt.receipt_json) as { state?: unknown }
-          if (payload?.state === 'merged') {
-            boundaryIndex = i + 1
-          }
-        } catch {}
-      }
-    }
-    const sliceEnd = targetIndex !== -1 ? targetIndex + 1 : runs.length
-    if (boundaryIndex >= sliceEnd && sliceEnd > 0) {
-      boundaryIndex = sliceEnd - 1
-    }
-    return runs.slice(boundaryIndex, sliceEnd).map((row) => row.intent)
   }
 
   listRuns(): { intent: string; run_id: string }[] {

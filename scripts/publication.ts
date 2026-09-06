@@ -10,6 +10,7 @@ import {
   gateAuditMatchesEvidence,
   isAuthoritativeStageEvidence,
   isCandidateReachable,
+  repositoryIdentityFingerprint,
   sha256,
   type DomainLedger
 } from './ledger.ts'
@@ -175,10 +176,9 @@ export function terminalCandidate(
   if (!run) throw new CandidatePublicationError(`run ${runId} does not exist`)
   const plan = ledger.stagePlan(runId)
   const pushIndex = plan.findIndex((stage) => stage.stage_id === 'push')
-  const validTail = pushIndex === plan.length - 1 ||
-    (pushIndex === plan.length - 2 && plan.at(-1)?.stage_id === 'pr')
-  if (pushIndex < 1 || !validTail) {
-    throw new CandidatePublicationError('publication requires push immediately before optional PR binding')
+  const tail = plan.slice(pushIndex + 1).map((stage) => stage.stage_id).join(',')
+  if (pushIndex < 1 || !['', 'pr', 'pr,ci'].includes(tail)) {
+    throw new CandidatePublicationError('publication requires push immediately before optional PR binding and CI')
   }
 
   const dispositions = new Map(ledger.stageDispositions(runId).map((row) => [row.stage_id, row]))
@@ -359,7 +359,7 @@ export async function admitCandidatePublication(input: AdmissionInput): Promise<
       `run ${input.runId} has no stored repository publication route to bind the transport`
     )
   }
-  if (route.route_fingerprint !== storedRoute.route_fingerprint) {
+  if (repositoryIdentityFingerprint(route) !== storedRoute.route_fingerprint) {
     throw new CandidatePublicationError('publication route does not match the stored repository route')
   }
   const transportUrl = transportIdentity(input.destination, storedRoute.forge_host)

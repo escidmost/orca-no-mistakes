@@ -9,7 +9,7 @@ import {
   type GithubIssueCommentObservation,
   type GithubPullRequestObservation
 } from '../scripts/github.ts'
-import { DomainLedger, evidenceSha256, sha256 } from '../scripts/ledger.ts'
+import { DomainLedger, evidenceSha256, repositoryIdentityFingerprint, sha256 } from '../scripts/ledger.ts'
 import { bindPullRequest, PullRequestBindingError } from '../scripts/pull-request.ts'
 import {
   DomainLedger as ExportedDomainLedger,
@@ -152,7 +152,7 @@ async function setupLedgerWithSettledPush(home: string, runId: string, intent: s
     startedAt: '2026-09-01T00:00:01.000Z'
   })
   const routeFingerprint = ledger.recordPublicationRoute({ ...route, runId })
-  assert.equal(routeFingerprint, fingerprint)
+  assert.equal(repositoryIdentityFingerprint({ base_repository_id: route.baseRepositoryId, forge_host: route.forgeHost, head_owner: route.headOwner, head_repository_id: route.headRepositoryId }), fingerprint)
   ledger.recordPublicationBaseline({
     headCommitOid: null,
     observedAt: '2026-09-01T00:00:02.000Z',
@@ -264,7 +264,6 @@ test('rejects an indeterminate PR update when authoritative post-read still has 
         ledger,
         pipelineEvidenceRoot: sha256('pipeline'),
         runId,
-        sleep: async () => assert.fail('unproven update must not wait for merge'),
         workerIdentity: 'coordinator'
       }),
       (error: unknown) => error instanceof PullRequestBindingError &&

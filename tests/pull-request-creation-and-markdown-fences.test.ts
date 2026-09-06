@@ -3,6 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
+import { repositoryIdentityFingerprint } from '../scripts/ledger.ts'
 
 import type { GithubPullRequestObservation } from '../scripts/github.ts'
 import {
@@ -17,7 +18,7 @@ import { assertStructurallyVisible } from './markdown-visibility.ts'
 const OID = 'a'.repeat(40)
 const content = { body: 'complete body', title: 'feat: complete report' }
 
-test('bindPullRequest captures createPullRequest with draft: false and settles after merge', async () => {
+test('bindPullRequest captures createPullRequest with draft: false and settles open after readiness', async () => {
   const settlements: Array<Record<string, unknown>> = []
   let ownsLease = true
   const ledger = {
@@ -42,7 +43,7 @@ test('bindPullRequest captures createPullRequest with draft: false and settles a
       base_repository_node_id: 'R_base',
       head_repository_name: 'forker/repo',
       head_repository_node_id: 'R_head',
-      route_fingerprint: 'route'
+      route_fingerprint: repositoryIdentityFingerprint({ base_repository_id: '1', forge_host: 'github.com', head_owner: 'forker', head_repository_id: '2' })
     }),
     run: () => ({ branch: 'feature', repo_root: '/repo' }),
     settleRemoteStage: (input: Record<string, unknown>) => {
@@ -107,10 +108,6 @@ test('bindPullRequest captures createPullRequest with draft: false and settles a
       },
       pipelineEvidenceRoot: 'c'.repeat(64),
       runId: 'run',
-      sleep: async () => {
-        assert.equal(settlements.length, 0)
-        pr = { ...pr!, state: 'MERGED' }
-      },
       workerIdentity: 'coordinator'
     })
 
@@ -131,6 +128,7 @@ test('bindPullRequest captures createPullRequest with draft: false and settles a
       url: 'https://github.com/acme/repo/pull/42'
     }])
     assert.equal(settlements.length, 1)
+    assert.equal((settlements[0].receipt as { payload: { state: string } }).payload.state, 'open')
   } finally {
     await rm(directory, { force: true, recursive: true })
   }

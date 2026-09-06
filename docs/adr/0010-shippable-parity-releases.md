@@ -42,6 +42,10 @@ Release 2 now runs `push` and `pr` after the six local validation stages for bot
 
 [Release 2 acceptance](../release-2-acceptance.md) defines the local matrix, live fixtures, evidence and operator procedure for the current title/body and matching-merge contract. The local matrix alone does not satisfy this decision: release acceptance remains pending until macOS, Linux and protected live same-repository/fork results are retained.
 
+## Status update (2026-09-06)
+
+[ADR-0016](0016-ci-stage-monitoring-and-merge-settlement.md) adds CI monitoring and merge settlement as a ninth `ci` stage after the Release 2 proof; delivery proof (delivered-tree verification, CI auto-fix re-publication) still belongs to Release 3.
+
 ## Consequences
 
 Before a release is marked complete, an automated end-to-end scenario must exercise its claimed Git, Orca, gate, failure, and recovery behavior. For what is implemented today, see [`docs/current-architecture.md`](../current-architecture.md).

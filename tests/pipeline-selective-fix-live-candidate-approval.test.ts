@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import {
@@ -243,4 +244,51 @@ test("uninterrupted selective fix invalidates candidate presentation approvals o
   assert.ok(candidateBEvidence, "must record authoritative evidence for candidate B");
   assert.equal(audits[0].evidence_sha256, candidateAEvidence.evidence_sha256);
   assert.equal(audits[1].evidence_sha256, candidateBEvidence.evidence_sha256);
+});
+
+test("a plain fix round moves the candidate without reopening the stage", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "onm-plain-fix-round-"));
+  const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
+  process.env.ORCA_NO_MISTAKES_HOME = root;
+  const ledgerPath = path.join(root, "ledger.sqlite");
+  const ledger = new DomainLedger(ledgerPath);
+  t.after(async () => {
+    ledger.close();
+    if (previousHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME;
+    else process.env.ORCA_NO_MISTAKES_HOME = previousHome;
+    await rm(root, { force: true, recursive: true });
+  });
+
+  const runId = "plain-fix-round";
+  const git = new LiveSelectiveFixGit(root, oid(1), AUTO_FIX_CONFIG, oid(2));
+  const f1: Finding = { action: "ask-user", description: "issue one", id: "f1", severity: "error" };
+  const f2: Finding = { action: "ask-user", description: "issue two", id: "f2", severity: "error" };
+  const orca = new LiveSelectiveFixOrca(runId);
+  orca.reviewReports = [
+    { findings: [f1, f2], summary: "review on A reports f1 and f2" },
+    { findings: [], summary: "review on B is clean" },
+  ];
+  orca.gateDecisions = [JSON.stringify({ action: "fix", findingIds: ["f1", "f2"] })];
+
+  await assert.rejects(
+    runPipeline(
+      {
+        githubAuthority: {} as GithubAuthority,
+        intent: "Verify a plain fix round is a new round, not a reopen.",
+        publicationDestination: "https://github.com/owner/repo.git",
+      },
+      orca,
+      git,
+      ledger,
+    ),
+    /no publication route/,
+  );
+  assert.equal(git.headOid, oid(2));
+
+  const db = new DatabaseSync(ledgerPath, { readOnly: true });
+  const keys = (db.prepare("SELECT event_key FROM presentation_snapshots WHERE run_id = ? ORDER BY sequence").all(runId) as { event_key: string }[])
+    .map((row) => row.event_key);
+  db.close();
+  assert.ok(keys.some((key) => key.includes(":stage:review:round:1:started")), "fix round must run as review round 1");
+  assert.deepEqual(keys.filter((key) => key.includes(":reopened:")), [], "a fix decision must not reopen the stage");
 });

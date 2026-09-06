@@ -75,7 +75,7 @@ test('verifyRetainedCompletionAttestation binds base commit validation to rebase
 
   try {
     const routeInput = makeRoute(temp);
-    const fingerprint = ledger.setRepositoryPublicationRoute(routeInput);
+    ledger.setRepositoryPublicationRoute(routeInput);
     const stages = ['intent', 'rebase', 'review', 'test', 'document', 'lint', 'push', 'pr'] as const;
 
     ledger.startRun({
@@ -88,6 +88,7 @@ test('verifyRetainedCompletionAttestation binds base commit validation to rebase
       stagePlan: stages.map((stageId) => ({ requirement: 'required', stageId })),
       submissionCommitOid: candidate,
     });
+    const fingerprint = ledger.publicationRoute(runId)!.route_fingerprint;
 
     const generationToken = ledger.acquireLease({ branch: 'feature', repoRoot: temp, runId });
 

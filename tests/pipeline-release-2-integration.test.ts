@@ -19,7 +19,7 @@ function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
 }
 
-async function runRelease2Pipeline(failAfter?: 'push' | 'pr', fork = false): Promise<void> {
+async function runRelease2Pipeline(failAfter?: 'push' | 'pr', fork = false, mergeOnReady = true): Promise<void> {
   const temp = await mkdtemp(path.join(tmpdir(), 'onm-release-2-pipeline-'))
   const repo = path.join(temp, 'repo')
   const remote = path.join(temp, 'origin.git')
@@ -94,7 +94,7 @@ async function runRelease2Pipeline(failAfter?: 'push' | 'pr', fork = false): Pro
     setWorktreeStatus: async () => {},
     notifyPullRequestReady: async (_number, _title, url) => {
       readyNotifications.push(url)
-      pullRequest = { ...pullRequest!, state: 'MERGED' }
+      if (mergeOnReady) pullRequest = { ...pullRequest!, state: 'MERGED' }
     },
   }
   let pullRequest: Record<string, unknown> | null = null
@@ -107,6 +107,15 @@ async function runRelease2Pipeline(failAfter?: 'push' | 'pr', fork = false): Pro
       ? { id: 'R_fork', nodeId: 'RN_fork' }
       : { id: 'R_repo', nodeId: 'RN_repo' },
     observePullRequests: async () => ({ exact: pullRequest, nearMatches: [] }),
+    // The ci stage sees passing checks once, then the PR merges on the next poll.
+    observePullRequestChecks: async () => {
+      const observation = {
+        baseRefOid: base, checks: [{ bucket: 'pass', conclusion: 'SUCCESS', kind: 'check-run', name: 'build', status: 'COMPLETED', url: null }],
+        draft: false, headOid: candidate, mergeable: 'MERGEABLE', number: 80, state: pullRequest!.state,
+      }
+      pullRequest = { ...pullRequest!, state: 'MERGED' }
+      return observation
+    },
     createPullRequest: async ({ body, title }: { body: string; title: string }) => {
       pullRequestCreateCount += 1
       pullRequest = {
@@ -146,6 +155,7 @@ async function runRelease2Pipeline(failAfter?: 'push' | 'pr', fork = false): Pro
       observedAt: '2026-09-02T00:00:00.000Z', repoRoot,
     })
     const pipelineOptions = {
+      ciClock: { sleep: async () => {} },
       githubAuthority: authority,
       intent: 'ONM-80: integration',
       publicationDestination: destination,
@@ -178,6 +188,11 @@ async function runRelease2Pipeline(failAfter?: 'push' | 'pr', fork = false): Pro
       assert.doesNotThrow(() => ledger!.verifyRetainedCompletionAttestation(result.completionAttestation!))
     }
     assert.equal(ledger.stageDispositions(result.runId).length, PIPELINE_STEPS.length)
+    if (!mergeOnReady) {
+      const prEvidence = result.completionAttestation!.stageEvidence.filter((entry) => entry.stage === 'pr')
+      assert.equal(prEvidence.length, 2, 'open and merged pr rounds both stay in the attestation')
+      assert.deepEqual(ledger.listEvidence(result.runId).filter((row) => row.stage_id === 'pr').map((row) => row.round_index), [0, 1])
+    }
     assert.equal(git(remote, 'rev-parse', 'refs/heads/feature'), candidate)
     assert.equal(pushCount, 1)
     assert.equal(pullRequestCreateCount, 1)
@@ -199,8 +214,11 @@ async function runRelease2Pipeline(failAfter?: 'push' | 'pr', fork = false): Pro
   }
 }
 
-test('runPipeline settles all eight stages before exposing Release 2 completion', () =>
+test('runPipeline settles all nine stages before exposing Release 2 completion', () =>
   runRelease2Pipeline())
+
+test('runPipeline monitors an open pull request through ci until it merges', () =>
+  runRelease2Pipeline(undefined, false, false))
 
 for (const stage of ['push', 'pr'] as const) {
   test(`runPipeline resumes after ${stage} settlement bookkeeping fails without replaying creation`, () =>

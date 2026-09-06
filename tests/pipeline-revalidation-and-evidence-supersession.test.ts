@@ -188,8 +188,8 @@ test("settleRemoteStage supports explicit supersession of historical open manage
       observedAt: new Date().toISOString(),
       repoRoot: "/repo",
     };
-    const routeFingerprint = ledger.setRepositoryPublicationRoute(route);
-    ledger.recordStoredPublicationRoute(runId, "/repo");
+    ledger.setRepositoryPublicationRoute(route);
+    const routeFingerprint = ledger.recordStoredPublicationRoute(runId, "/repo");
 
     const makeEvidence = (stageId: "push" | "pr", roundIndex: number, summary: string) => {
       const e = {

@@ -165,7 +165,7 @@ test('runPipeline in Release 2 journals passed outcome before settlement and upd
     }
     assert.equal(markerContent.pendingOutcome, 'passed')
     assert.ok(
-      markerContent.pendingSummary?.includes('passed all 8 stages'),
+      markerContent.pendingSummary?.includes('passed all 9 stages'),
       `pending summary must include stage count: ${markerContent.pendingSummary}`
     )
     assert.ok(
