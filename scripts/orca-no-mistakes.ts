@@ -2000,11 +2000,16 @@ export async function runPipeline(
     git,
     repoRoot: repo.root,
   });
+  // no_ci is trusted only from the base ref; a local-config bypass cannot declare it.
+  const trustedRepoConfig =
+    provenance.localBypass && repoPolicyConfig.ci
+      ? { ...repoPolicyConfig, ci: { ...repoPolicyConfig.ci, no_ci: false } }
+      : repoPolicyConfig;
   const pipelineConfig = resolvePipelineConfig({
     // The explicit fix-round option rides the highest precedence tier so every
     // stage budget derives from one resolved configuration.
     cliFlags: { ...options.cliFlags, max_fix_rounds: maxFixRounds },
-    repoGlobalConfig: repoPolicyConfig,
+    repoGlobalConfig: trustedRepoConfig,
     userGlobalConfig: options.userGlobalConfig,
   });
   const remotePublication = options.githubAuthority !== undefined;
@@ -2574,7 +2579,8 @@ export async function runPipeline(
           const isBodyReceipt =
             payload !== undefined &&
             Object.hasOwn(payload, "bodySha256") &&
-            (payload.state === "merged" || payload.state === "open");
+            (payload.state === "merged" ||
+              (payload.state === "open" && pipelineSteps.includes("ci")));
           if (!isBodyReceipt) break;
         }
         if (stage === "ci") {
@@ -2884,10 +2890,10 @@ export async function runPipeline(
     let previousTask: string | undefined;
     const appendSettledRemoteEvidence = (stage: "push" | "pr") => {
       const row = ledger.listEvidence(runId).findLast((entry) => entry.stage_id === stage);
-      const existing = stageEntries.findIndex((entry) => entry.stage === stage);
-      if (existing >= 0 && stageEntries[existing]!.evidenceSha256 === row?.evidence_sha256) {
-        return stageEntries[existing]!;
-      }
+      // Every ledger evidence row must stay in the attestation, so a later pr
+      // round (open -> merged) is appended beside the earlier one.
+      const existing = stageEntries.find((entry) => entry.evidenceSha256 === row?.evidence_sha256);
+      if (existing) return existing;
       if (!row) throw new Error(`${stage} settled without durable evidence`);
       if (!row.artifact_sha256) throw new Error(`${stage} evidence is missing its artifact digest`);
       const entry: StageEvidenceManifestEntry = {
@@ -2901,7 +2907,6 @@ export async function runPipeline(
         summary: row.summary,
         workerIdentity: row.worker_identity,
       };
-      if (existing >= 0) stageEntries.splice(existing, 1);
       stageEntries.push(entry);
       latestEntryByStage.set(stage, entry);
       return entry;
@@ -3284,6 +3289,31 @@ export async function runPipeline(
             },
             pipelineEvidenceRoot,
             roundIndex: remoteRound,
+            runId,
+            supersedesEvidenceSha256: ledger
+              .stageDispositions(runId)
+              .find((disposition) => disposition.stage_id === "pr")?.evidence_sha256 ?? undefined,
+            workerIdentity: coordinatorIdentity,
+          });
+        }
+        if (stage === "pr" && !pipelineSteps.includes("ci")) {
+          // Frozen eight-stage plans have no ci stage, so pr itself awaits the merge.
+          const sleep = options.ciClock?.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+          for (;;) {
+            const observed = await observeBoundPullRequest(options.githubAuthority, ledger, runId, stageInputCommitOid);
+            if (!observed) throw new Error("pull-request facts changed while awaiting merge");
+            if (observed.state === "CLOSED") throw new Error("the exact pull request was closed without merging");
+            if (observed.state === "MERGED") break;
+            await ledger.heartbeatLease(deliveryRepo.root, deliveryRepo.branch, runId);
+            await sleep(15_000);
+          }
+          await settleMergedPullRequest({
+            artifactPath: path.join(artifactsDir, "pr-merged.json"),
+            attemptId,
+            authority: options.githubAuthority,
+            candidateCommitOid: stageInputCommitOid,
+            generationToken: generationToken!,
+            ledger,
             runId,
             workerIdentity: coordinatorIdentity,
           });

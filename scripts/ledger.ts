@@ -3372,8 +3372,6 @@ export class DomainLedger {
               credential_source, backend, backend_version, observed_at, updated_at
        FROM repository_publication_routes WHERE repo_root = ?`
     )
-    const exact = select.get(repoRoot) as RepositoryPublicationRouteRow | undefined
-    if (exact) return exact
     if (!this.#commonDirs.has(repoRoot)) {
       let commonDir: string | undefined
       try {
@@ -3385,10 +3383,13 @@ export class DomainLedger {
       } catch {}
       this.#commonDirs.set(repoRoot, commonDir)
     }
+    // The shared row under the git common dir wins; a worktree-keyed row from an
+    // older per-worktree init only serves when no shared row exists.
     const commonDir = this.#commonDirs.get(repoRoot)
-    return commonDir && commonDir !== repoRoot
+    const shared = commonDir && commonDir !== repoRoot
       ? select.get(commonDir) as RepositoryPublicationRouteRow | undefined
       : undefined
+    return shared ?? (select.get(repoRoot) as RepositoryPublicationRouteRow | undefined)
   }
 
   recordStoredPublicationRoute(runId: string, repoRoot: string): string {

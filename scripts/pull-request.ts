@@ -459,7 +459,7 @@ export async function observeBoundPullRequest(
   const binding = receipt ? (JSON.parse(receipt.receipt_json) as Record<string, unknown>) : undefined
   // The binding owns title and body; any edit or draft flip is drift, reported as null.
   if (
-    !pullRequest || !binding || pullRequest.draft ||
+    !pullRequest || !binding || pullRequest.draft || pullRequest.number !== binding.number ||
     sha256(pullRequest.title) !== binding.titleSha256 || sha256(pullRequest.body) !== binding.bodySha256
   ) {
     return null
@@ -506,6 +506,7 @@ export async function bindPullRequest(input: {
   }) => Promise<void>
   pipelineEvidenceRoot: string
   roundIndex?: number
+  supersedesEvidenceSha256?: string
   runId: string
   workerIdentity: string
 }): Promise<{ number: number; outcome: 'created' | 'unchanged' | 'updated'; receiptSha256: string; url: string }> {
@@ -643,6 +644,7 @@ export async function bindPullRequest(input: {
     pullRequest,
     roundIndex: input.roundIndex ?? 0,
     route,
+    supersedesEvidenceSha256: input.supersedesEvidenceSha256,
     routeFacts,
     runId: input.runId,
     state,
@@ -841,7 +843,9 @@ async function settlePullRequestBinding(input: {
     },
     runId: input.runId,
     stageId: 'pr',
-    ...(input.supersedesEvidenceSha256 ? { supersedesEvidenceSha256: input.supersedesEvidenceSha256 } : {})
+    ...(input.supersedesEvidenceSha256 && input.supersedesEvidenceSha256 !== evidenceDigest
+      ? { supersedesEvidenceSha256: input.supersedesEvidenceSha256 }
+      : {})
   })
   return settlement.receiptSha256
 }
