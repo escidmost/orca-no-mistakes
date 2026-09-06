@@ -2030,6 +2030,10 @@ export async function runPipeline(
   const effectiveConfig = JSON.parse(
     JSON.stringify(pipelineConfig),
   ) as typeof pipelineConfig;
+  if (!pipelineSteps.includes("ci")) {
+    delete (effectiveConfig as Partial<typeof effectiveConfig>).ci;
+    delete (effectiveConfig.stages as Partial<typeof effectiveConfig.stages>).ci;
+  }
   // Run-wide guardrail policy: the schema accepts the key only on the
   // top-level auto_fix block, and the trusted base config outranks user-global
   // config in the resolved merge.

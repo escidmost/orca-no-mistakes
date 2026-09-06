@@ -837,13 +837,13 @@ export async function resolveGithubPublicationRoute(input: {
   ))
   const upstream = input.upstream ?? await gitValue(
     runner,
-    ['-C', repoRoot, 'remote', 'get-url', 'origin'],
+    ['-C', input.repoPath, 'remote', 'get-url', 'origin'],
     env,
     'read origin remote'
   )
   const headBranch = input.headBranch ?? await gitValue(
     runner,
-    ['-C', repoRoot, 'branch', '--show-current'],
+    ['-C', input.repoPath, 'branch', '--show-current'],
     env,
     'read current branch'
   )

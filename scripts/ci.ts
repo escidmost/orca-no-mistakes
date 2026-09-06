@@ -71,6 +71,10 @@ export async function monitorPullRequestChecks(input: {
     if (observed.headOid !== input.candidateCommitOid) {
       throw new CiMonitorError('pull-request facts changed while monitoring CI')
     }
+    if (observed.state !== 'OPEN' || observed.draft) {
+      input.log(`pull request #${observed.number} is ${observed.draft ? 'a draft' : observed.state.toLowerCase()}; re-reading the bound pull request`)
+      continue
+    }
     if (observed.baseRefOid && lastBaseOid && observed.baseRefOid !== lastBaseOid) {
       input.log(`base branch advanced (${lastBaseOid}..${observed.baseRefOid}), re-arming CI monitor timeout`)
       armedAt = now()

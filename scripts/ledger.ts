@@ -4243,7 +4243,13 @@ export class DomainLedger {
            AND evidence_sha256 = ?`
       ).get(input.runId, input.stageId, input.evidence.evidenceSha256)
       const priorDispositionRow = this.#db.prepare(
-        'SELECT disposition, evidence_sha256 FROM stage_dispositions WHERE run_id = ? AND stage_id = ? LIMIT 1'
+        `SELECT COALESCE((SELECT s.disposition FROM stage_disposition_supersessions s
+                          WHERE s.run_id = d.run_id AND s.stage_id = d.stage_id
+                          ORDER BY s.rowid DESC LIMIT 1), d.disposition) AS disposition,
+                COALESCE((SELECT s.evidence_sha256 FROM stage_disposition_supersessions s
+                          WHERE s.run_id = d.run_id AND s.stage_id = d.stage_id
+                          ORDER BY s.rowid DESC LIMIT 1), d.evidence_sha256) AS evidence_sha256
+         FROM stage_dispositions d WHERE d.run_id = ? AND d.stage_id = ? LIMIT 1`
       ).get(input.runId, input.stageId) as { disposition: string; evidence_sha256: string } | undefined
       const priorDisposition = priorDispositionRow !== undefined ? 1 : undefined
       // An open binding settles pr; the ci stage later upgrades the same
@@ -4276,7 +4282,8 @@ export class DomainLedger {
         priorDispositionRow !== undefined &&
         existingDisposition === undefined &&
         input.stageId === 'pr' &&
-        input.receipt.payload.state === 'merged' &&
+        (input.receipt.payload.state === 'merged' ||
+          (input.receipt.payload.state === 'open' && typeof input.receipt.payload.bodySha256 === 'string')) &&
         priorDispositionRow.disposition === 'satisfied'
       ) {
         const priorPrReceipt = this.#db.prepare(
@@ -4287,11 +4294,13 @@ export class DomainLedger {
         if (priorPrReceipt) {
           const parsedReceipt = JSON.parse(priorPrReceipt.receipt_json) as Record<string, unknown>
           const priorPayload = (parsedReceipt.payload as Record<string, unknown> | undefined) ?? parsedReceipt
-          const isManagedComment = priorPayload && (
+          const priorManagedComment = priorPayload && (
             Object.hasOwn(priorPayload, 'managedCommentIntent') ||
-            priorPayload.managedCommentNodeId !== undefined ||
-            priorPayload.state === 'open'
-          ) && priorPayload.state !== 'merged'
+            priorPayload.managedCommentNodeId !== undefined
+          ) && priorPayload.state !== 'open' && priorPayload.state !== 'merged'
+          const isManagedComment = input.receipt.payload.state === 'merged'
+            ? priorManagedComment || (priorPayload && priorPayload.state === 'open')
+            : priorManagedComment
           const matchesSuperseded =
             typeof input.supersedesEvidenceSha256 === 'string' &&
             input.supersedesEvidenceSha256 === priorDispositionRow.evidence_sha256
