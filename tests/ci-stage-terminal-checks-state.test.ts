@@ -42,7 +42,7 @@ test('a merged state on the checks observation settles the merge instead of repo
   assert.deepEqual(report.findings, [])
   assert.equal(h.settled(), 1)
   assert.deepEqual(h.sleeps, [])
-  assert.ok(h.log.some((line) => line.includes('is merged')), h.log.join('\n'))
+  assert.ok(h.log.some((line) => line.includes('has been merged')), h.log.join('\n'))
 })
 
 test('a closed or draft state on the checks observation is re-read before any verdict', async () => {
@@ -56,5 +56,5 @@ test('a closed or draft state on the checks observation is re-read before any ve
   ])
   const report = await h.run()
   assert.deepEqual(report.findings.map((f) => f.id), ['ci-lint'])
-  assert.deepEqual(h.sleeps, [])
+  assert.deepEqual(h.sleeps, [30_000], 'an inconsistent checks read is retried at the CI polling interval')
 })

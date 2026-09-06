@@ -171,7 +171,7 @@ import {
   type PullRequestPipelineRound,
   type PullRequestPipelineStep,
 } from "./pull-request.ts";
-import { monitorPullRequestChecks, type CiClock } from "./ci.ts";
+import { CI_TIMEOUT_SUMMARY, monitorPullRequestChecks, type CiClock } from "./ci.ts";
 export {
   DomainLedger,
   LEGACY_STAGE_PLAN,
@@ -3258,12 +3258,7 @@ export async function runPipeline(
                 { name: "pr", status: "running" },
                 { name: "ci", status: "pending" },
               );
-              const branchIntent = [...new Set(
-                ledger.branchIntents(deliveryRepo.root, deliveryRepo.branch, runId)
-                  .map((value) => value.trim())
-                  .filter(Boolean),
-              )].join("\n\n");
-              content = pullRequestContent(branchIntent || intent, {
+              content = pullRequestContent(intent, {
                 candidateCommitOid: stageInputCommitOid,
                 pipelineSteps: pipelineReportSteps,
                 risk: {
@@ -3313,11 +3308,16 @@ export async function runPipeline(
           // Frozen eight-stage plans have no ci stage, so pr itself awaits the merge.
           appendSettledRemoteEvidence("pr");
           const sleep = options.ciClock?.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+          const now = options.ciClock?.now ?? Date.now;
+          const startedAt = now();
           for (;;) {
             const observed = await observeBoundPullRequest(options.githubAuthority, ledger, runId, stageInputCommitOid);
             if (!observed) throw new Error("pull-request facts changed while awaiting merge");
             if (observed.state === "CLOSED") throw new Error("the exact pull request was closed without merging");
             if (observed.state === "MERGED") break;
+            if (pipelineConfig.ci.timeout_ms > 0 && now() - startedAt >= pipelineConfig.ci.timeout_ms) {
+              throw new Error(CI_TIMEOUT_SUMMARY);
+            }
             await ledger.heartbeatLease(deliveryRepo.root, deliveryRepo.branch, runId);
             await sleep(15_000);
           }
@@ -3404,7 +3404,7 @@ export async function runPipeline(
             config: pipelineConfig.ci,
             heartbeat: () => ledger.heartbeatLease(deliveryRepo.root, deliveryRepo.branch, runId),
             log: (line) => {
-              void stageLog.append(`${line}\n`);
+              stageLog.append(`${line}\n`).catch(() => {});
             },
             observeChecks: (nodeId) => authority.observePullRequestChecks(nodeId),
             observePullRequest: () =>

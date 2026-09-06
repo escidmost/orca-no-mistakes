@@ -73,6 +73,9 @@ export async function monitorPullRequestChecks(input: {
     }
     if (observed.state !== 'OPEN' || observed.draft) {
       input.log(`pull request #${observed.number} is ${observed.draft ? 'a draft' : observed.state.toLowerCase()}; re-reading the bound pull request`)
+      // A merged or closed observation terminates on the next verified read; a
+      // draft observation is re-read at the polling interval instead of spinning.
+      if (observed.draft) await sleep(ciPollIntervalMs(now() - startedAt))
       continue
     }
     if (observed.baseRefOid && lastBaseOid && observed.baseRefOid !== lastBaseOid) {

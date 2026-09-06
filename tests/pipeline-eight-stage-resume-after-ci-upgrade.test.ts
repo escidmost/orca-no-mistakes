@@ -173,6 +173,7 @@ test('a failed eight-stage run resumes after the ci upgrade with unchanged polic
     })
     assert.deepEqual(outcome.steps, plan.filter((stage) => stage !== 'ci'))
     assert.deepEqual(outcome.rounds('pr'), [0, 1])
+    assert.deepEqual(outcome.rounds('ci'), [], 'a frozen eight-stage plan records no ci evidence')
   } finally {
     ;(PIPELINE_STEPS as unknown as string[]).splice(0, PIPELINE_STEPS.length, ...plan)
   }
