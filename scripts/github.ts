@@ -538,7 +538,7 @@ export class GithubAuthority {
       if (observation && commit?.oid !== observation.headOid) {
         throw new GithubAuthorityError('identity-drift', operation, 'pull request head changed between check pages')
       }
-      observation ??= {
+      observation = {
         baseRefOid: data.node.baseRef?.target?.oid ?? null,
         draft: data.node.isDraft,
         headOid: data.node.headRefOid,
