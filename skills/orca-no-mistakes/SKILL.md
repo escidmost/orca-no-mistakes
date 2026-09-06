@@ -19,13 +19,13 @@ If your assigned task explicitly says you are already a no-mistakes stage worker
 - Work is committed on a clean, named feature branch.
 - The branch is not the detected default branch.
 - The repository has an `origin` remote.
-- For new Release 2 runs, the repository has a successful `orca-no-mistakes init` with a persisted GitHub publication route whose forge, stable base/head repository identities, owner, branches, fingerprint, and canonical transport match the run, and the GitHub CLI (`gh`) is installed with configured authentication (`GH_TOKEN`, `GITHUB_TOKEN`, or stored `gh` account). Migrated Release 1 resumes do not require GitHub publication initialization or credentials.
+- For new Release 2 runs, the repository has one successful `orca-no-mistakes init` (shared by every worktree and branch) with a persisted GitHub publication route whose forge, stable base/head repository identities, owner, identity fingerprint, and canonical transport match the run, and the GitHub CLI (`gh`) is installed with configured authentication (`GH_TOKEN`, `GITHUB_TOKEN`, or stored `gh` account). Migrated Release 1 resumes do not require GitHub publication initialization or credentials.
 - Orca is running and CLI tooling for the configured worker agents (`opencode` by default) is authenticated.
 - No other run holds the branch semantic lease. A conflicting run fails closed with `branch <name> is already leased by run <id>`; reclaim it with `--force-lease` only after confirming the other run is dead.
 
 ## Invocation
 
-New Release 2 direct runs are rejected unless this repository has a successful init and a persisted GitHub publication route matching the run's immutable forge, repository, owner, branch, fingerprint, and transport identity. Run `orca-no-mistakes init --repo /path/to/repo` before invocation to install repository-local admission and persist the matching publication route; follow the [Local gate](../../README.md#local-gate) workflow.
+New Release 2 direct runs are rejected unless this repository has a successful init and a persisted GitHub publication route matching the run's immutable forge, repository, owner, and transport identity. Run `orca-no-mistakes init --repo /path/to/repo` once per repository to install repository-local admission and persist the publication route; new worktrees and branches need no further init; follow the [Local gate](../../README.md#local-gate) workflow.
 
 For a bare `/orca-no-mistakes`, validate the user's already-committed changes. For `/orca-no-mistakes <task>`, complete and commit only that task first, preserving unrelated work, then validate it.
 

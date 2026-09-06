@@ -3,6 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
+import { repositoryIdentityFingerprint } from '../scripts/ledger.ts'
 
 import type { GithubPullRequestObservation } from '../scripts/github.ts'
 import { bindPullRequest } from '../scripts/pull-request.ts'
@@ -50,7 +51,7 @@ function harness() {
     repositoryPublicationRoute: () => ({
       base_repository_name: 'acme/repo', base_repository_node_id: 'R_base',
       head_repository_name: 'forker/repo', head_repository_node_id: 'R_head',
-      route_fingerprint: 'route'
+      route_fingerprint: repositoryIdentityFingerprint({ base_repository_id: '1', forge_host: 'github.com', head_owner: 'forker', head_repository_id: '2' })
     }),
     run: () => ({ branch: 'feature', repo_root: '/repo' }),
     settleRemoteStage: (input: Record<string, unknown>) => {

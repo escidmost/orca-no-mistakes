@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
-import { DomainLedger, evidenceSha256, sha256 } from '../scripts/ledger.ts'
+import { DomainLedger, evidenceSha256, repositoryIdentityFingerprint, sha256 } from '../scripts/ledger.ts'
 import { bindPullRequest, settleMergedPullRequest } from '../scripts/pull-request.ts'
 
 const OID = 'a'.repeat(40)
@@ -128,7 +128,7 @@ test('bindPullRequest settles open through a real DomainLedger and settleMergedP
       startedAt: '2026-09-01T00:00:01.000Z'
     })
     const routeFingerprint = ledger.recordPublicationRoute({ ...route, runId: 'run' })
-    assert.equal(routeFingerprint, fingerprint)
+    assert.equal(repositoryIdentityFingerprint({ ...route, base_repository_id: route.baseRepositoryId, forge_host: 'github.com', head_owner: route.headOwner, head_repository_id: route.headRepositoryId }), fingerprint)
     ledger.recordPublicationBaseline({
       headCommitOid: null,
       observedAt: '2026-09-01T00:00:02.000Z',

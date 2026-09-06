@@ -2092,14 +2092,7 @@ export async function runPipeline(
     pipelineSteps.includes("push") &&
     options.admission?.source === "direct"
   ) {
-    let storedRoute = ledger.repositoryPublicationRoute(deliveryRepo.root);
-    if (!storedRoute) {
-      try {
-        storedRoute = ledger.repositoryPublicationRoute(
-          path.resolve(repositoryGatePaths(deliveryRepo.root).commonDir),
-        );
-      } catch {}
-    }
+    const storedRoute = ledger.repositoryPublicationRoute(deliveryRepo.root);
     if (!storedRoute) {
       const existingLease = ledger.leaseFor(deliveryRepo.root, deliveryRepo.branch);
       if (!existingLease || options.forceLease) {
@@ -2238,10 +2231,6 @@ export async function runPipeline(
             : undefined,
         });
         domainRunStarted = true;
-        if (remotePublication && ledger.repositoryPublicationRoute(deliveryRepo.root) &&
-            !ledger.publicationRoute(runId)) {
-          throw new Error("stored publication route does not match the admitted run branches");
-        }
         if (options.admission) {
           ledger.bindSubmissionAdmission(options.admission.admissionId, runId);
         }
@@ -16177,7 +16166,6 @@ Release boundary:
             storedRoute.head_repository_id !== storedRoute.base_repository_id
               ? storedRoute.head_repository_name
               : undefined,
-          headBranch: storedRoute?.head_branch,
           ledger,
           provider: githubAuthority,
           repoPath: routeRoot,

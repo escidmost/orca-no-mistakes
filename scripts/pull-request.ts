@@ -10,6 +10,7 @@ import {
   canonicalJson,
   evidenceSha256,
   redactKnownSecrets,
+  repositoryIdentityFingerprint,
   sha256
 } from './ledger.ts'
 
@@ -513,7 +514,7 @@ export async function bindPullRequest(input: {
   const run = input.ledger.run(input.runId)
   const route = input.ledger.publicationRoute(input.runId)
   const repositoryRoute = run ? input.ledger.repositoryPublicationRoute(run.repo_root) : undefined
-  if (!run || !route || !repositoryRoute || repositoryRoute.route_fingerprint !== route.route_fingerprint) {
+  if (!run || !route || !repositoryRoute || repositoryIdentityFingerprint(route) !== repositoryRoute.route_fingerprint) {
     throw new PullRequestBindingError('run publication route is not durable')
   }
   const publicationReceipt = input.ledger.remoteReceipt(input.runId, 'candidate-publication')
@@ -675,7 +676,7 @@ export async function settleMergedPullRequest(input: {
   const run = input.ledger.run(input.runId)
   const route = input.ledger.publicationRoute(input.runId)
   const repositoryRoute = run ? input.ledger.repositoryPublicationRoute(run.repo_root) : undefined
-  if (!run || !route || !repositoryRoute || repositoryRoute.route_fingerprint !== route.route_fingerprint) {
+  if (!run || !route || !repositoryRoute || repositoryIdentityFingerprint(route) !== repositoryRoute.route_fingerprint) {
     throw new PullRequestBindingError('run publication route is not durable')
   }
   const openReceipt = input.ledger.remoteReceipt(input.runId, 'pull-request-binding')

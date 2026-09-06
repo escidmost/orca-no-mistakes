@@ -10,6 +10,7 @@ import {
   gateAuditMatchesEvidence,
   isAuthoritativeStageEvidence,
   isCandidateReachable,
+  repositoryIdentityFingerprint,
   sha256,
   type DomainLedger
 } from './ledger.ts'
@@ -358,7 +359,7 @@ export async function admitCandidatePublication(input: AdmissionInput): Promise<
       `run ${input.runId} has no stored repository publication route to bind the transport`
     )
   }
-  if (route.route_fingerprint !== storedRoute.route_fingerprint) {
+  if (repositoryIdentityFingerprint(route) !== storedRoute.route_fingerprint) {
     throw new CandidatePublicationError('publication route does not match the stored repository route')
   }
   const transportUrl = transportIdentity(input.destination, storedRoute.forge_host)

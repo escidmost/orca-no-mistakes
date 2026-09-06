@@ -21,7 +21,7 @@ During installation, a default configuration template is automatically copied to
 
 ## Run
 
-New direct runs require successful `orca-no-mistakes init` to configure GitHub publication and persist the repository route before execution. Direct invocation returns a meaningful process exit status:
+New direct runs require one successful `orca-no-mistakes init` per repository to configure GitHub publication and persist the repository route; every worktree and branch of that repository then runs without further setup. Direct invocation returns a meaningful process exit status:
 
 ```bash
 orca-no-mistakes run --repo /path/to/repo --intent "Add X without changing Y"
@@ -47,7 +47,7 @@ intent=$(node -e 'process.stdout.write(Buffer.from(process.argv[1]).toString("ba
 git -C /path/to/repo push --push-option="no-mistakes.intent=$intent" orca-no-mistakes HEAD:refs/heads/feature
 ```
 
-When the upstream remote parses as GitHub, `init` also verifies GitHub authentication and persists the stable base/head repository route; provider-neutral init installs the local gate without a publication route. New Release 2 runs require the persisted GitHub publication route before they can complete the remote push and pr stages. Use `--upstream`, `--fork`, `--base-branch`, and `--head-branch` to override the detected route. Tags, deletes, the default branch, multi-ref pushes, malformed intent, and unsafe transport state are rejected before admission. Gate and direct submissions with the same repository, ref, candidate, and intent converge on one durable submission identity and run the same remote delivery stages.
+When the upstream remote parses as GitHub, `init` also verifies GitHub authentication and persists the stable base/head repository route under the Git common dir, shared by every worktree and branch; provider-neutral init installs the local gate without a publication route. New Release 2 runs require the persisted GitHub publication route before they can complete the remote push and pr stages. Use `--upstream`, `--fork`, `--base-branch`, and `--head-branch` to override the detected route. Tags, deletes, the default branch, multi-ref pushes, malformed intent, and unsafe transport state are rejected before admission. Gate and direct submissions with the same repository, ref, candidate, and intent converge on one durable submission identity and run the same remote delivery stages.
 
 Useful direct-run options:
 

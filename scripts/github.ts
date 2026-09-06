@@ -827,11 +827,11 @@ export async function resolveGithubPublicationRoute(input: {
 }): Promise<RepositoryPublicationRouteInput & { routeFingerprint: string }> {
   const env = { ...(input.env ?? process.env) }
   const runner = input.commandRunner ?? runCommand
-  // Key the route by the same canonical repository root run admission uses
-  // (realpath of `git rev-parse --show-toplevel`), never the raw CLI argument.
+  // Key the route by the repository's git common dir (realpath), so one init
+  // serves every worktree of the repository; never the raw CLI argument.
   const repoRoot = await realpath(await gitValue(
     runner,
-    ['-C', input.repoPath, 'rev-parse', '--path-format=absolute', '--show-toplevel'],
+    ['-C', input.repoPath, 'rev-parse', '--path-format=absolute', '--git-common-dir'],
     env,
     'resolve repository root'
   ))

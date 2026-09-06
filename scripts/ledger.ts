@@ -1660,6 +1660,21 @@ export function cleanGitEnvironment(): NodeJS.ProcessEnv {
   return environment
 }
 
+/** Stable forge/repository/owner identity shared by a repository route and every per-run route it seeds. */
+export function repositoryIdentityFingerprint(route: {
+  base_repository_id: string
+  forge_host: string
+  head_owner: string
+  head_repository_id: string
+}): string {
+  return sha256(canonicalJson({
+    baseRepositoryId: route.base_repository_id,
+    forgeHost: route.forge_host,
+    headOwner: route.head_owner,
+    headRepositoryId: route.head_repository_id
+  }))
+}
+
 export function allowsLegacyLedgerFallback(error: unknown): boolean {
   if (!(error instanceof Error) || !('status' in error) || error.status !== 128) return false
   const stderr = 'stderr' in error ? String(error.stderr ?? '') : ''
@@ -2887,12 +2902,8 @@ export class DomainLedger {
         insert.run(input.runId, position, entry.stageId, entry.requirement)
       }
       const route = this.repositoryPublicationRoute(input.repoRoot)
-      if (
-        route &&
-        route.head_branch === input.branch &&
-        route.base_branch === input.baseBranch
-      ) {
-        this.#recordStoredPublicationRoute(input.runId, route)
+      if (route) {
+        this.#recordStoredPublicationRoute(input.runId, route, input.branch, input.baseBranch)
       }
       this.#db.exec('COMMIT')
     } catch (error) {
@@ -3253,22 +3264,21 @@ export class DomainLedger {
   }
 
   #setRepositoryPublicationRoute(input: RepositoryPublicationRouteInput): string {
-    const route = {
-      baseBranch: input.baseBranch,
-      baseRepositoryId: input.baseRepositoryId,
-      forgeHost: input.forgeHost,
-      headBranch: input.headBranch,
-      headOwner: input.headOwner,
-      headRepositoryId: input.headRepositoryId
-    }
-    const fingerprint = sha256(canonicalJson(route))
+    // The repository route is one per repository: branches are per-run facts
+    // snapshotted at startRun, so they are not part of this fingerprint.
+    const fingerprint = repositoryIdentityFingerprint({
+      base_repository_id: input.baseRepositoryId,
+      forge_host: input.forgeHost,
+      head_owner: input.headOwner,
+      head_repository_id: input.headRepositoryId
+    })
     const existing = this.repositoryPublicationRoute(input.repoRoot)
     if (existing && existing.route_fingerprint !== fingerprint) {
       const active = this.#db.prepare(
         `SELECT COUNT(DISTINCT r.run_id) AS count
          FROM runs r
          JOIN publication_routes p ON p.run_id = r.run_id
-         WHERE r.repo_root = ? AND p.route_fingerprint = ?
+         WHERE p.forge_host = ? AND p.base_repository_id = ? AND p.head_repository_id = ? AND p.head_owner = ?
            AND (r.status = 'in-progress' OR (r.status = 'failed' AND EXISTS (
              SELECT 1
              FROM attempt_outcomes o
@@ -3278,7 +3288,12 @@ export class DomainLedger {
                  SELECT MAX(a2.generation_token) FROM run_attempts a2 WHERE a2.run_id = r.run_id
                )
            )))`
-      ).get(input.repoRoot, existing.route_fingerprint) as { count: number }
+      ).get(
+        existing.forge_host,
+        existing.base_repository_id,
+        existing.head_repository_id,
+        existing.head_owner
+      ) as { count: number }
       if (active.count > 0) {
         throw new Error(
           `cannot change publication route while ${active.count} active or resumable run(s) depend on it`
@@ -3342,15 +3357,38 @@ export class DomainLedger {
     return fingerprint
   }
 
+  #commonDirs = new Map<string, string | undefined>()
+
+  /**
+   * The route is keyed by the repository's git common dir so every worktree
+   * shares it; a worktree path is resolved to that key here.
+   */
   repositoryPublicationRoute(repoRoot: string): RepositoryPublicationRouteRow | undefined {
-    return this.#db.prepare(
+    const select = this.#db.prepare(
       `SELECT repo_root, route_fingerprint, forge_host, base_repository_id,
               base_repository_node_id, base_repository_name, head_repository_id,
               head_repository_node_id, head_repository_name, network_root_repository_id,
               head_owner, head_branch, base_branch, actor_id, actor_login, actor_node_id,
               credential_source, backend, backend_version, observed_at, updated_at
        FROM repository_publication_routes WHERE repo_root = ?`
-    ).get(repoRoot) as RepositoryPublicationRouteRow | undefined
+    )
+    const exact = select.get(repoRoot) as RepositoryPublicationRouteRow | undefined
+    if (exact) return exact
+    if (!this.#commonDirs.has(repoRoot)) {
+      let commonDir: string | undefined
+      try {
+        commonDir = execFileSync(
+          'git',
+          ['-C', repoRoot, 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+          { encoding: 'utf8', env: cleanGitEnvironment(), stdio: ['ignore', 'pipe', 'pipe'] }
+        ).trim()
+      } catch {}
+      this.#commonDirs.set(repoRoot, commonDir)
+    }
+    const commonDir = this.#commonDirs.get(repoRoot)
+    return commonDir && commonDir !== repoRoot
+      ? select.get(commonDir) as RepositoryPublicationRouteRow | undefined
+      : undefined
   }
 
   recordStoredPublicationRoute(runId: string, repoRoot: string): string {
@@ -3362,12 +3400,7 @@ export class DomainLedger {
       }
       const route = this.repositoryPublicationRoute(repoRoot)
       if (!route) throw new Error(`repository ${repoRoot} has no publication route`)
-      if (route.head_branch !== run.branch || route.base_branch !== run.base_branch) {
-        throw new Error(
-          `stored publication route (${route.head_branch} -> ${route.base_branch}) does not match run (${run.branch} -> ${run.base_branch})`
-        )
-      }
-      const fingerprint = this.#recordStoredPublicationRoute(runId, route)
+      const fingerprint = this.#recordStoredPublicationRoute(runId, route, run.branch, run.base_branch)
       this.#db.exec('COMMIT')
       return fingerprint
     } catch (error) {
@@ -3378,13 +3411,15 @@ export class DomainLedger {
 
   #recordStoredPublicationRoute(
     runId: string,
-    route: RepositoryPublicationRouteRow
+    route: RepositoryPublicationRouteRow,
+    headBranch: string,
+    baseBranch: string
   ): string {
     return this.recordPublicationRoute({
-      baseBranch: route.base_branch,
+      baseBranch,
       baseRepositoryId: route.base_repository_id,
       forgeHost: route.forge_host,
-      headBranch: route.head_branch,
+      headBranch,
       headOwner: route.head_owner,
       headRepositoryId: route.head_repository_id,
       runId

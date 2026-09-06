@@ -178,8 +178,8 @@ test('settleRemoteStage requires explicit matching supersedesEvidenceSha256 for 
       observedAt: new Date().toISOString(),
       repoRoot: '/repo'
     }
-    const routeFingerprint = ledger.setRepositoryPublicationRoute(route)
-    ledger.recordStoredPublicationRoute(runId, '/repo')
+    ledger.setRepositoryPublicationRoute(route)
+    const routeFingerprint = ledger.recordStoredPublicationRoute(runId, '/repo')
 
     const makeEvidence = (stageId: 'push' | 'pr', roundIndex: number, summary: string) => {
       const e = {

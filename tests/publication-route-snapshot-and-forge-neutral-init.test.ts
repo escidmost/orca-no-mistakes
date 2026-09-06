@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -11,7 +11,7 @@ function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 }
 
-test("startRun does not snapshot publication route when head or base branch mismatches", async () => {
+test("startRun snapshots the repository route with the run's own branches", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "onm-branch-mismatch-"));
   const dbPath = path.join(temp, "ledger.sqlite");
   const ledger = new DomainLedger(dbPath);
@@ -48,12 +48,11 @@ test("startRun does not snapshot publication route when head or base branch mism
       submissionCommitOid: "a".repeat(40),
     });
 
-    assert.equal(ledger.publicationRoute("run-mismatched"), undefined);
-
-    assert.throws(
-      () => ledger.recordStoredPublicationRoute("run-mismatched", "/repo"),
-      /stored publication route \(main -> main\) does not match run \(feature -> main\)/,
-    );
+    const route = ledger.publicationRoute("run-mismatched");
+    assert.equal(route?.head_branch, "feature");
+    assert.equal(route?.base_branch, "main");
+    assert.equal(route?.head_repository_id, "1");
+    assert.notEqual(route?.route_fingerprint, ledger.repositoryPublicationRoute("/repo")?.route_fingerprint);
   } finally {
     ledger.close();
     await rm(temp, { force: true, recursive: true });
@@ -92,3 +91,26 @@ test("init remains provider-neutral for repositories without GitHub remotes", as
     await rm(temp, { force: true, recursive: true });
   }
 });
+
+test('a route stored under the git common dir is found from a linked worktree', async () => {
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'route-common-')))
+  const git = (...args: string[]) => execFileSync('git', ['-C', root, ...args], { stdio: 'pipe' }).toString().trim()
+  git('init', '-q', '-b', 'main')
+  git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '--allow-empty', '-m', 'init')
+  git('worktree', 'add', '-q', path.join(root, 'wt'), '-b', 'feature')
+  const ledger = new DomainLedger(':memory:')
+  try {
+    const fingerprint = ledger.setRepositoryPublicationRoute({
+      actorId: 'U_1', actorLogin: 'operator', actorNodeId: 'U_node_1', backend: 'gh' as const, backendVersion: '2.97.0',
+      baseBranch: 'main', baseRepositoryId: '1', baseRepositoryName: 'upstream/project', baseRepositoryNodeId: 'R_base',
+      credentialSource: 'stored-account' as const, forgeHost: 'github.com' as const, headBranch: 'main', headOwner: 'upstream',
+      headRepositoryId: '1', headRepositoryName: 'upstream/project', headRepositoryNodeId: 'R_base', networkRootRepositoryId: '1',
+      observedAt: new Date().toISOString(), repoRoot: path.join(root, '.git')
+    })
+    assert.equal(ledger.repositoryPublicationRoute(path.join(root, 'wt'))?.route_fingerprint, fingerprint)
+    assert.equal(ledger.repositoryPublicationRoute(path.join(root, 'nope')), undefined)
+  } finally {
+    ledger.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
