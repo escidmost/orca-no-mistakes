@@ -540,11 +540,11 @@ class DeletedGateAuditLedger extends DomainLedger {
 }
 
 // Seeds a trusted-base policy that explicitly authorizes review auto-fix,
-// opting these scenarios out of the ADR-0007 default gate.
-const allowReviewAutoFix = (git: FakeGit) => {
+// opting these scenarios out of the ADR-0007 default gate with strict guardrails.
+const allowReviewAutoFixWithStrictGuardrails = (git: FakeGit) => {
   git.baseFiles.set(
     "origin/main:.orca/no-mistakes.yaml",
-    "auto_fix:\n  allow_review_autofix: true\n",
+    "auto_fix:\n  allow_review_autofix: true\n  guardrails: strict\n",
   );
 };
 
@@ -1237,7 +1237,7 @@ test("resume replays a recorded fix decision instead of asking the gate again", 
 test("resume preserves a stage's consumed automatic-fix budget", async () => {
   const git = new FakeGit();
   git.policyDigest = "f".repeat(64);
-  allowReviewAutoFix(git);
+  allowReviewAutoFixWithStrictGuardrails(git);
   const runId = `resume-budget-${randomUUID()}`;
   const finding = (id: string): Finding => ({
     action: "auto-fix",
@@ -1309,7 +1309,7 @@ test("fix rounds reuse one durable fixer and clear its marker ownership", async 
   const temp = await mkdtemp(path.join(tmpdir(), "onm-retained-fixer-marker-"));
   const markerDir = path.join(temp, ".orca", "no-mistakes");
   const git = new FakeGit();
-  allowReviewAutoFix(git);
+  allowReviewAutoFixWithStrictGuardrails(git);
   const orca = new FakeOrca(git);
   const finding: Finding = {
     id: "review-1",
@@ -1357,7 +1357,7 @@ test("fix rounds reuse one durable fixer and clear its marker ownership", async 
 
 test("a failed retain acknowledgement discards the fixer session", async () => {
   const git = new FakeGit();
-  allowReviewAutoFix(git);
+  allowReviewAutoFixWithStrictGuardrails(git);
   class RetainFailureOrca extends FakeOrca {
     #failed = false;
 
@@ -1406,7 +1406,7 @@ test("a failed retain acknowledgement discards the fixer session", async () => {
 
 test("a failed retain acknowledgement remains fail-closed when release also fails", async () => {
   const git = new FakeGit();
-  allowReviewAutoFix(git);
+  allowReviewAutoFixWithStrictGuardrails(git);
   class RetainAndReleaseFailureOrca extends FakeOrca {
     override async finishWorker(
       worker: WorkerResult,
@@ -1614,7 +1614,7 @@ test("retained fixer release failures prevent replacement and fallback", async (
       }
     }
     const git = new ScenarioGit();
-    allowReviewAutoFix(git);
+    allowReviewAutoFixWithStrictGuardrails(git);
     const orca = new ScenarioOrca(git);
     orca.reports.set("review", [
       { findings: [finding], summary: "first failure" },
@@ -1636,7 +1636,7 @@ test("retained fixer release failures prevent replacement and fallback", async (
 
 test("protected fixer commits are rejected at a resumable human gate", async () => {
   const git = new FakeGit();
-  allowReviewAutoFix(git);
+  allowReviewAutoFixWithStrictGuardrails(git);
   git.protectedTestMutation = "tests/existing.test.ts";
   const orca = new FakeOrca(git);
   const ledger = new DomainLedger(":memory:");
@@ -1743,7 +1743,7 @@ test("protected fixer commits are rejected at a resumable human gate", async () 
 
 test("a policy-violation approval waives the authoritative worker evidence", async () => {
   const git = new FakeGit();
-  allowReviewAutoFix(git);
+  allowReviewAutoFixWithStrictGuardrails(git);
   git.protectedTestMutation = "tests/existing.test.ts";
   const runId = `policy-evidence-${randomUUID()}`;
   const orca = new FakeOrca(git, runId);
@@ -1873,7 +1873,7 @@ test("advisory guardrails accept protected fixer commits and record them in evid
 
 test("a rejected fixer fails closed when its cleanup fails", async () => {
   const git = new FakeGit();
-  allowReviewAutoFix(git);
+  allowReviewAutoFixWithStrictGuardrails(git);
   git.protectedTestMutation = "tests/existing.test.ts";
   class CleanupFailureOrca extends FakeOrca {
     override async finishWorker(
@@ -1912,7 +1912,7 @@ test("a rejected fixer fails closed when its cleanup fails", async () => {
 
 test("an invalid fixer report preserves its error when cleanup also fails", async () => {
   const git = new FakeGit();
-  allowReviewAutoFix(git);
+  allowReviewAutoFixWithStrictGuardrails(git);
   class CleanupFailureOrca extends FakeOrca {
     override async finishWorker(
       worker: WorkerResult,
@@ -1958,7 +1958,7 @@ test("an invalid fixer report preserves its error when cleanup also fails", asyn
 
 test("a passing run fails closed when retained fixer cleanup fails", async () => {
   const git = new FakeGit();
-  allowReviewAutoFix(git);
+  allowReviewAutoFixWithStrictGuardrails(git);
   class CleanupFailureOrca extends FakeOrca {
     override async finishWorker(
       worker: WorkerResult,
@@ -1998,7 +1998,7 @@ test("a passing run fails closed when retained fixer cleanup fails", async () =>
 
 test("a failed run surfaces retained fixer cleanup failure with the stage error as cause", async () => {
   const git = new FakeGit();
-  allowReviewAutoFix(git);
+  allowReviewAutoFixWithStrictGuardrails(git);
   class CleanupFailureOrca extends FakeOrca {
     override async finishWorker(
       worker: WorkerResult,
@@ -2050,7 +2050,7 @@ test("a failed run surfaces retained fixer cleanup failure with the stage error 
 test("fixer rounds without tree changes open a human gate", async () => {
   for (const createsCommit of [false, true]) {
     const git = new FakeGit();
-    allowReviewAutoFix(git);
+    allowReviewAutoFixWithStrictGuardrails(git);
     git.fixerCreatesCommit = createsCommit;
     git.fixerChangesTree = !createsCommit;
     const orca = new FakeOrca(git);
@@ -2201,7 +2201,7 @@ test("missing evidence cannot bypass passed attestation", async () => {
 
 test("opens an exhaustion gate when automatic fix limit is reached and stops on stop decision", async () => {
   const git = new FakeGit();
-  allowReviewAutoFix(git);
+  allowReviewAutoFixWithStrictGuardrails(git);
   const orca = new FakeOrca(git);
   orca.gateResolution = "stop";
   const finding: Finding = {
@@ -2327,7 +2327,7 @@ test("inline resolver settles the canonical gate audit and resumes once", async 
 
 test("ONM-88 Auto-fix changes apply only to findings arriving after the toggle", async () => {
   const git = new FakeGit();
-  allowReviewAutoFix(git);
+  allowReviewAutoFixWithStrictGuardrails(git);
   const orca = new FakeOrca(git, "onm-88-future-only");
   const ledger = new DomainLedger(":memory:");
   const finding = (id: string): Finding => ({
@@ -2451,7 +2451,7 @@ test("ONM-88 Resume applies the current audited mode to newly reported findings"
 
   const git = new FakeGit();
   git.policyDigest = "f".repeat(64);
-  allowReviewAutoFix(git);
+  allowReviewAutoFixWithStrictGuardrails(git);
   const runId = "onm-88-resume-new-finding";
   const ledger = new DomainLedger(":memory:");
   const interrupted = new InterruptedFixer(git, runId);
@@ -2854,7 +2854,7 @@ test("reviewer acknowledgement failures still remove the worker worktree", async
 
 test("reviewer title/message findings receive canonical descriptions and IDs", async () => {
   const git = new FakeGit();
-  allowReviewAutoFix(git);
+  allowReviewAutoFixWithStrictGuardrails(git);
   const orca = new FakeOrca(git);
   orca.reports.set("review", [
     {
@@ -2911,7 +2911,7 @@ test("reviewer artifacts must exist under the run evidence directory", async () 
 
 test("reviewer URL references are not treated as local artifacts", async () => {
   const git = new FakeGit();
-  allowReviewAutoFix(git);
+  allowReviewAutoFixWithStrictGuardrails(git);
   const orca = new FakeOrca(git);
   orca.reports.set("review", [
     {
@@ -6729,7 +6729,7 @@ test("GitShell binds rebase conflicts to the fetched upstream snapshot", async (
 
 test("a failed fixer leaves its worktree commits anchored for recovery", async () => {
   const git = new FakeGit();
-  allowReviewAutoFix(git);
+  allowReviewAutoFixWithStrictGuardrails(git);
   const orca = new FakeOrca(git);
   const ledger = new DomainLedger(":memory:");
   orca.reports.set("review", [
@@ -6766,7 +6766,7 @@ test("a failed fixer leaves its worktree commits anchored for recovery", async (
 
 test("a schema-invalid fixer report gets one contract-repair retry", async () => {
   const git = new FakeGit();
-  allowReviewAutoFix(git);
+  allowReviewAutoFixWithStrictGuardrails(git);
   const orca = new FakeOrca(git);
   orca.reports.set("review", [
     {
@@ -10748,7 +10748,7 @@ test("every worker launch streams its raw output to the run artifact directory",
   const temp = await mkdtemp(path.join(tmpdir(), "onm-launch-logs-"));
   const restoreHomes = isolateHomes(temp);
   const git = new FakeGit();
-  allowReviewAutoFix(git);
+  allowReviewAutoFixWithStrictGuardrails(git);
   const orca = new FakeOrca(git);
   orca.reports.set("review", [
     {
@@ -11372,7 +11372,7 @@ test("the attestation keeps the policy digest captured at run start", async () =
 
 test("rebase conflicts require manual resolution and retry", async () => {
   const git = new FakeGit();
-  allowReviewAutoFix(git);
+  allowReviewAutoFixWithStrictGuardrails(git);
   git.rebaseConflicts = ["src/a.ts", "src/b.ts"];
   const orca = new FakeOrca(git);
   orca.gateResolution = "fix";
@@ -11665,7 +11665,7 @@ test("review auto-fix findings raise a human gate under the default policy", asy
 
 test("trusted policy can authorize review auto-fix explicitly", async () => {
   const git = new FakeGit();
-  allowReviewAutoFix(git);
+  allowReviewAutoFixWithStrictGuardrails(git);
   const orca = new FakeOrca(git);
   orca.reports.set("review", [
     {
@@ -11749,7 +11749,7 @@ test("a fixer timeout during commit application leaves the branch unchanged", as
     }
   }
   const git = new SlowApplyGit();
-  allowReviewAutoFix(git);
+  allowReviewAutoFixWithStrictGuardrails(git);
   const orca = new FakeOrca(git);
   const ledger = new DomainLedger(":memory:");
   orca.reports.set("review", [
@@ -11856,7 +11856,7 @@ test("a fixer timeout waits for strict worker cleanup failures", async () => {
     }
   }
   const git = new SlowApplyGit();
-  allowReviewAutoFix(git);
+  allowReviewAutoFixWithStrictGuardrails(git);
   class SlowCleanupOrca extends FakeOrca {
     cleanupSettled = false;
 
@@ -11938,7 +11938,7 @@ test("a fixer applied within its timeout may finish coordinator verification", a
   }
 
   const git = new SlowVerificationGit();
-  allowReviewAutoFix(git);
+  allowReviewAutoFixWithStrictGuardrails(git);
   const orca = new FakeOrca(git);
   orca.reports.set("review", [
     {
@@ -11998,7 +11998,7 @@ test("a concurrent post-transfer commit fails fixer custody verification", async
   }
 
   const git = new ConcurrentPostTransferGit();
-  allowReviewAutoFix(git);
+  allowReviewAutoFixWithStrictGuardrails(git);
   const orca = new FakeOrca(git);
   orca.reports.set("review", [
     {
@@ -12104,7 +12104,7 @@ test("resolved role timeout_ms bounds reviewer execution", async () => {
 
 test("a timed-out fixer never applies commits after the run fails", async () => {
   const git = new FakeGit();
-  allowReviewAutoFix(git);
+  allowReviewAutoFixWithStrictGuardrails(git);
   class SlowFixerOrca extends FakeOrca {
     async startWorker(
       taskId: string,
@@ -12199,7 +12199,7 @@ test("the default timeout bounds a reviewer invocation with no configured timeou
 
 test("the default timeout rejects a fixer success that lands after the deadline", async () => {
   const git = new FakeGit();
-  allowReviewAutoFix(git);
+  allowReviewAutoFixWithStrictGuardrails(git);
   class SlowFixerOrca extends FakeOrca {
     async startWorker(
       taskId: string,
@@ -12291,7 +12291,7 @@ test("a stalled worker that never settles still fails its stage at the deadline"
 
 test("stage evidence binds effective policy provenance into artifacts and the ledger", async () => {
   const git = new FakeGit();
-  allowReviewAutoFix(git);
+  allowReviewAutoFixWithStrictGuardrails(git);
   const orca = new FakeOrca(git);
   const ledger = new DomainLedger(":memory:");
 
@@ -12329,7 +12329,7 @@ test("stage evidence binds effective policy provenance into artifacts and the le
 
 test("tampering with a stage log invalidates its evidence", async () => {
   const git = new FakeGit();
-  allowReviewAutoFix(git);
+  allowReviewAutoFixWithStrictGuardrails(git);
   const orca = new FakeOrca(git);
   const ledger = new DomainLedger(":memory:");
 
@@ -12352,7 +12352,7 @@ test("tampering with a stage log invalidates its evidence", async () => {
 
 test("deleting an attested evidence row invalidates verification", async () => {
   const git = new FakeGit();
-  allowReviewAutoFix(git);
+  allowReviewAutoFixWithStrictGuardrails(git);
   const orca = new FakeOrca(git);
   const home = await mkdtemp(path.join(tmpdir(), "no-mistakes-evidence-"));
   const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
@@ -12383,7 +12383,7 @@ test("deleting an attested evidence row invalidates verification", async () => {
 
 test("a ledger edit the artifact contradicts fails verification", async () => {
   const git = new FakeGit();
-  allowReviewAutoFix(git);
+  allowReviewAutoFixWithStrictGuardrails(git);
   const orca = new FakeOrca(git);
   const home = await mkdtemp(path.join(tmpdir(), "no-mistakes-findings-"));
   const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
@@ -12514,7 +12514,7 @@ test("a gate resolution outside the offered options fails closed", async () => {
 
 test("an exhaustion gate is recorded before the coordinator blocks on a human", async () => {
   const git = new FakeGit();
-  allowReviewAutoFix(git);
+  allowReviewAutoFixWithStrictGuardrails(git);
   const orca = new FakeOrca(git);
   const ledger = new DomainLedger(":memory:");
   const finding: Finding = {
@@ -12553,7 +12553,7 @@ test("an exhaustion gate is recorded before the coordinator blocks on a human", 
 
 test("exhaustion gate decisions replace the pending event without duplicating it", async () => {
   const git = new FakeGit();
-  allowReviewAutoFix(git);
+  allowReviewAutoFixWithStrictGuardrails(git);
   const orca = new FakeOrca(git);
   const ledger = new DomainLedger(":memory:");
   orca.gateResolution = "fix: persistent: try alternative fix";
@@ -12794,7 +12794,7 @@ test("legacy gate_audit ledgers are rebuilt with durable gate columns", async ()
 
 test("a stage whose findings were never addressed cannot be attested", async () => {
   const git = new FakeGit();
-  allowReviewAutoFix(git);
+  allowReviewAutoFixWithStrictGuardrails(git);
   const orca = new FakeOrca(git);
   const ledger = new DomainLedger(":memory:");
 

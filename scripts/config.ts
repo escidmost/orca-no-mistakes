@@ -133,7 +133,7 @@ export const BASELINE_AUTO_FIX = {
   enabled: true,
   max_rounds: 3,
   allow_review_autofix: false,
-  guardrails: 'strict'
+  guardrails: 'advisory'
 } as const
 
 /** Idle CI monitoring timeout: seven days, re-armed when the base branch advances. */
@@ -266,7 +266,7 @@ export interface ResolvedRoleConfig {
 /**
  * Resolves the effective configuration for a pipeline stage and role.
  *
- * Configuration layers are applied from baseline through user, repository, stage, and CLI settings, with higher-precedence values overriding lower-precedence values. Guardrail mode is taken from the repository-level auto-fix configuration or the strict baseline.
+ * Configuration layers are applied from baseline through user, repository, stage, and CLI settings, with higher-precedence values overriding lower-precedence values. Guardrail mode is taken from the repository-level auto-fix configuration or the advisory baseline.
  *
  * @param stage - The pipeline stage to resolve.
  * @param role - The role whose configuration is resolved.
@@ -380,7 +380,7 @@ export interface ResolvedPipelineConfig {
  * Resolves the complete pipeline configuration from user, repository, and CLI settings.
  *
  * CLI settings take precedence over repository and user settings where applicable. Auto-fix
- * guardrails are resolved from the repository configuration or the strict baseline.
+ * guardrails are resolved from the repository configuration or the advisory baseline.
  *
  * @param options - Configuration sources used to resolve pipeline settings
  * @returns The resolved intent, auto-fix policy, agent argument overrides, and per-stage role configurations
@@ -479,13 +479,13 @@ auto_fix:
   # Keeping this false prevents circular automated reviewer-fixer churn (ADR-0007).
   allow_review_autofix: false
 
-  # Fixer guardrail mode: strict (default) rejects fixer commits that touch
-  # protected validation policy, pre-existing tests, or test assertions;
-  # advisory keeps the fixer prompt warnings and records detected changes in
-  # the run evidence, gate audit, and attestation without blocking custody.
+  # Fixer guardrail mode: advisory (default) records content-heuristic warnings
+  # in run evidence, gate audit, and attestation, then reruns review.
+  # Strict rejects protected-content changes pending an explicit human decision.
+  # Both modes enforce branch ownership, authorized writes, history, and identity.
   # Run-wide and resolved from the trusted base policy; the key is rejected on
   # per-stage or per-role auto_fix blocks.
-  # guardrails: strict
+  # guardrails: advisory
 
 # ------------------------------------------------------------------------------
 # CI Monitoring (ci stage)
