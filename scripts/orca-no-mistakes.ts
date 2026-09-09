@@ -2184,6 +2184,7 @@ export async function runPipeline(
     if (!isWithin(canonicalArtifactsBase, canonicalArtifactsDir)) {
       throw new Error("Orca returned an unsafe Run ID");
     }
+    freezeCoordinatorProgram(artifactsDir);
 
     try {
       if (options.resumeRunId) {
@@ -6528,43 +6529,54 @@ function deliveryChannel(agent: WorkerAgent | undefined): DeliveryChannel {
 const FROZEN_PROGRAM_NONCE = randomUUID().slice(0, 8);
 const frozenProgramExecutables = new Map<string, string>();
 
+function dependencyPackageRoot(dependency: string): string {
+  const resolved = fileURLToPath(import.meta.resolve(dependency));
+  const marker = `${path.sep}node_modules${path.sep}${dependency.split("/").join(path.sep)}${path.sep}`;
+  const index = resolved.lastIndexOf(marker);
+  if (index < 0) {
+    throw new Error(`cannot locate the package root of dependency ${dependency}`);
+  }
+  return resolved.slice(0, index + marker.length - 1);
+}
+
+export function freezeCoordinatorProgram(evidenceDir: string): string {
+  const key = path.resolve(evidenceDir);
+  const cached = frozenProgramExecutables.get(key);
+  if (cached) return cached;
+  const root = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
+  const program = path.join(key, `program-${FROZEN_PROGRAM_NONCE}`);
+  const staging = `${program}.tmp`;
+  rmSync(staging, { force: true, recursive: true });
+  mkdirSync(staging, { recursive: true, mode: 0o700 });
+  for (const entry of ["bin", "scripts", "package.json"]) {
+    cpSync(path.join(root, entry), path.join(staging, entry), {
+      dereference: true,
+      recursive: true,
+    });
+  }
+  const manifest = JSON.parse(
+    readFileSync(path.join(root, "package.json"), "utf8"),
+  ) as { dependencies?: Record<string, string> };
+  for (const dependency of Object.keys(manifest.dependencies ?? {})) {
+    cpSync(
+      dependencyPackageRoot(dependency),
+      path.join(staging, "node_modules", dependency),
+      { dereference: true, recursive: true },
+    );
+  }
+  renameSync(staging, program);
+  const executable = path.join(program, "bin", "orca-no-mistakes");
+  frozenProgramExecutables.set(key, executable);
+  return executable;
+}
+
 function frozenCoordinatorExecutable(reportPath: string): string {
   const root = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
   const live = path.join(root, "bin", "orca-no-mistakes");
   const evidenceDir = path.dirname(path.resolve(reportPath));
   const artifactsBase = path.resolve(artifactsRoot());
   if (!isWithin(artifactsBase, evidenceDir)) return live;
-  const cached = frozenProgramExecutables.get(evidenceDir);
-  if (cached) return cached;
-  const program = path.join(evidenceDir, `program-${FROZEN_PROGRAM_NONCE}`);
-  const staging = `${program}.tmp`;
-  rmSync(staging, { force: true, recursive: true });
-  mkdirSync(staging, { recursive: true, mode: 0o700 });
-  for (const entry of ["bin", "scripts", "package.json"]) {
-    cpSync(path.join(root, entry), path.join(staging, entry), {
-      recursive: true,
-    });
-  }
-  const resolved = fileURLToPath(import.meta.resolve("yaml"));
-  const nodeModules = resolved.slice(
-    0,
-    resolved.lastIndexOf(`${path.sep}node_modules${path.sep}`) +
-      `${path.sep}node_modules`.length,
-  );
-  const manifest = JSON.parse(
-    readFileSync(path.join(root, "package.json"), "utf8"),
-  ) as { dependencies?: Record<string, string> };
-  for (const dependency of Object.keys(manifest.dependencies ?? {})) {
-    cpSync(
-      path.join(nodeModules, dependency),
-      path.join(staging, "node_modules", dependency),
-      { recursive: true },
-    );
-  }
-  renameSync(staging, program);
-  const executable = path.join(program, "bin", "orca-no-mistakes");
-  frozenProgramExecutables.set(evidenceDir, executable);
-  return executable;
+  return freezeCoordinatorProgram(evidenceDir);
 }
 
 function deliveryInstruction(
