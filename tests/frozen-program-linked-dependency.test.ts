@@ -1,12 +1,28 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { execFileSync } from "node:child_process";
-import { cpSync, mkdirSync, readFileSync, symlinkSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, symlinkSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
+
+function installedPackageRoot(dependency: string): string {
+  let dir = path.dirname(fileURLToPath(import.meta.resolve(dependency)));
+  while (!/^[^/]*$/.test(dir)) {
+    const manifest = path.join(dir, "package.json");
+    if (
+      existsSync(manifest) &&
+      (JSON.parse(readFileSync(manifest, "utf8")) as { name?: string }).name === dependency
+    ) {
+      return dir;
+    }
+    dir = path.dirname(dir);
+  }
+  throw new Error(`cannot locate installed dependency ${dependency}`);
+}
 
 test("freeze copies dependencies linked from outside node_modules", async () => {
   const home = await mkdtemp(path.join(tmpdir(), "onm-linked-dep-"));
@@ -21,7 +37,7 @@ test("freeze copies dependencies linked from outside node_modules", async () => 
     mkdirSync(path.join(checkout, "node_modules"));
     for (const dependency of ["yaml", "zod"]) {
       const vendored = path.join(home, "vendor", dependency);
-      cpSync(path.join(repoRoot, "node_modules", dependency), vendored, {
+      cpSync(installedPackageRoot(dependency), vendored, {
         dereference: true,
         recursive: true,
       });
