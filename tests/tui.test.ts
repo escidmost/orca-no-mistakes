@@ -1530,6 +1530,7 @@ if (process.env.TUI_FIXTURE === "1") {
     assert.match(screen(), /Confirm approve\? Press Enter again/u);
     input.emit("data", "\u001b");
     await new Promise((resolve) => setTimeout(resolve, 120));
+    await nextDraw();
     assert.deepEqual(resolutions, []);
     assert.doesNotMatch(screen(), /DECISION REQUIRED/u);
     assert.match(screen(), /pinned Review/u);

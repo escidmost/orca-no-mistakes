@@ -1834,7 +1834,14 @@ export async function installAbortReaping(
   }
 }
 
-export class FixerPolicyViolationError extends Error {}
+export class FixerPolicyViolationError extends Error {
+  readonly contentViolations?: string[];
+
+  constructor(message: string, contentViolations?: string[]) {
+    super(message);
+    this.contentViolations = contentViolations;
+  }
+}
 
 class FixerNoChangeError extends Error {
   readonly report: StageReport;
@@ -3653,6 +3660,7 @@ export async function runPipeline(
             });
             presentation.publish(`gate:${gateId}:opened`, {
               gateId,
+              gateKind: exhausted ? "exhaustion" : "finding",
               kind: "gate-opened",
               options: gateOptions,
               question,
@@ -3826,6 +3834,44 @@ export async function runPipeline(
                 fixerSession,
                 fixerLog,
                 fence,
+                async (candidate, worktree, violations) => {
+                  const recoveryOptions = ["approve", "fix", "stop"];
+                  const question = `[guardrails: strict] Fixer candidate ${candidate} is retained at ${worktree}. Content warnings: ${JSON.stringify(violations)}. Approve applies this exact candidate and reruns review; fix rejects it and returns to the findings gate for retry; stop ends the run. Approval does not waive reviewer findings.`;
+                  const opened = (gateId: string) => {
+                    ledger.openGateAudit({
+                      evidenceSha256: latestControlEntryByStage.get(stage)!.evidenceSha256,
+                      gateId, gateKind: "guardrail", optionsJson: JSON.stringify(recoveryOptions),
+                      question, roundIndex: round, runId, stageId: stage,
+                    });
+                    presentation.publish(`gate:${gateId}:opened`, {
+                      gateId, gateKind: "guardrail", kind: "gate-opened", options: recoveryOptions, question, round, stage,
+                    });
+                  };
+                  let audited = false;
+                  const gateId = await orca.createGate(taskId, question, recoveryOptions, (id) => {
+                    opened(id);
+                    audited = true;
+                  });
+                  if (!audited) opened(gateId);
+                  const resolution = await orca.waitForGate(gateId);
+                  const action = gateDecision(resolution);
+                  if (!recoveryOptions.includes(action)) {
+                    throw new Error(`Invalid fixer recovery resolution: ${resolution}`);
+                  }
+                  ledger.recordGateAudit({
+                    // Content acceptance is not a waiver of the preceding review.
+                    decision: action === "approve" ? "advisory" : action,
+                    gateId, gateKind: "guardrail",
+                    optionsJson: JSON.stringify(recoveryOptions), question, resolution,
+                    roundIndex: round, runId, stageId: stage,
+                  });
+                  presentation.publish(`gate:${gateId}:resolved`, {
+                    decision: action === "approve" ? "advisory" : action,
+                    gateId, kind: "gate-resolved", round, stage,
+                  });
+                  if (action === "stop") throw new GateStopError("Fixer recovery stopped");
+                  return action === "approve";
+                },
               ),
           );
           handoffFixerLog = true;
@@ -5347,6 +5393,7 @@ async function runFixer(
   retainedSession: FixerSession | undefined,
   stageLog: StageLog,
   fence: TimeoutFence,
+  recoverContent: (candidate: string, worktree: string, violations: string[]) => Promise<boolean>,
 ): Promise<{
   after: string;
   before: string;
@@ -5495,12 +5542,24 @@ async function runFixer(
       if (before === workerHead) {
         throw new FixerNoChangeError(validatedReport, stage);
       }
-      const verdict = await git.assertFixerChangesAllowed(
-        worktreePath,
-        before,
-        workerHead,
-        guardrails,
-      );
+      let verdict: FixerChangesVerdict | void;
+      let recovered = false;
+      try {
+        verdict = await git.assertFixerChangesAllowed(worktreePath, before, workerHead, guardrails);
+      } catch (error) {
+        if (!(error instanceof FixerPolicyViolationError) || !error.contentViolations?.length) {
+          throw error;
+        }
+        if (fence.aborted) throw error;
+        await git.anchorRecoveryRef(`${runId}-fixer-${stage}-${round}`, workerHead);
+        if (fence.aborted) throw error;
+        // Worker execution has finished. Human decisions have no deadline;
+        // custody receives a fresh bounded attempt after approval.
+        fence.deadlineSatisfied = true;
+        if (!(await recoverContent(workerHead, worktreePath, error.contentViolations))) throw error;
+        verdict = { changed: true, guardrailViolations: error.contentViolations };
+        recovered = true;
+      }
       if (verdict !== undefined && !verdict.changed) {
         throw new FixerNoChangeError(validatedReport, stage);
       }
@@ -5510,18 +5569,18 @@ async function runFixer(
         throw new Error(`${stage} fixer timed out; commits were not applied`);
       }
       const expectedWorkerHead = workerHead;
-      const after = await withGateMutation(async () => {
+      const transfer = (custodyFence: TimeoutFence) => withGateMutation(async () => {
         if (
           !(await git.applyWorktreeCommits(
             worktreePath,
             before,
             expectedWorkerHead,
-            fence,
+            custodyFence,
           ))
         ) {
           throw new Error(`${stage} fixer could not apply its committed change`);
         }
-        fence.deadlineSatisfied = true;
+        custodyFence.deadlineSatisfied = true;
         const after = await git.head();
         if (after !== expectedWorkerHead) {
           throw new PostMutationCustodyError(
@@ -5530,6 +5589,9 @@ async function runFixer(
         }
         return after;
       });
+      const after = recovered
+        ? await withTimeout(role.timeout_ms ?? defaultWorkerTimeoutMs(), `${stage} fixer recovery`, transfer)
+        : await transfer(fence);
       const terminalHandle =
         worker.terminalHandle ?? retainedSession?.worker.terminalHandle;
       if (terminalHandle && worktreeId) {
@@ -10875,15 +10937,10 @@ export class GitShell implements GitOperations {
         validationEntrypoints,
       )),
     );
-    // Advisory mode reports every detected category instead of throwing at the
-    // first one, so the run evidence shows the full guardrail picture.
+    // Collect every content warning for review, including strict-mode recovery.
     const violations: string[] = [];
-    const enforce = (message: string): void => {
-      if (guardrails === "advisory") violations.push(message);
-      else throw new FixerPolicyViolationError(message);
-    };
     if (protectedTests.length > 0) {
-      enforce(
+      violations.push(
         `fixer modified pre-existing test files: ${protectedTests.sort().join(", ")}`,
       );
     }
@@ -10891,14 +10948,17 @@ export class GitShell implements GitOperations {
       (filePath) => !protectedPolicy.includes(filePath),
     );
     if (inlineOnly.length > 0) {
-      enforce(
+      violations.push(
         `fixer modified co-located test assertions or skip markers: ${inlineOnly.sort().join(", ")}`,
       );
     }
     if (protectedPolicy.length > 0) {
-      enforce(
+      violations.push(
         `unexplained-policy-relaxation: fixer modified protected validation policy files: ${protectedPolicy.sort().join(", ")}`,
       );
+    }
+    if (guardrails === "strict" && violations.length > 0) {
+      throw new FixerPolicyViolationError(violations.join("; "), violations);
     }
     return { changed: changedPaths.length > 0, guardrailViolations: violations };
   }

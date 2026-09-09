@@ -31,13 +31,13 @@ auto_fix:
   # Keeping this false prevents circular automated reviewer-fixer churn (ADR-0007).
   allow_review_autofix: false
 
-  # Fixer guardrail mode: strict (default) rejects fixer commits that touch
-  # protected validation policy, pre-existing tests, or test assertions;
-  # advisory keeps the fixer prompt warnings and records detected changes in
-  # the run evidence, gate audit, and attestation without blocking custody.
+  # Fixer guardrail mode: advisory (default) records content-heuristic warnings
+  # in run evidence, gate audit, and attestation, then reruns review.
+  # Strict rejects protected-content changes pending an explicit human decision.
+  # Both modes enforce branch ownership, authorized writes, history, and identity.
   # Run-wide and resolved from the trusted base policy; the key is rejected on
   # per-stage or per-role auto_fix blocks.
-  # guardrails: strict
+  # guardrails: advisory
 
 # ------------------------------------------------------------------------------
 # CI Monitoring (ci stage)

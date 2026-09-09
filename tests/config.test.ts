@@ -176,27 +176,27 @@ test('fails closed on unknown keys in auto_fix configuration', () => {
 })
 
 test('guardrails resolves only from trusted-base top-level auto_fix', () => {
-  // Existing projects without the key stay on fail-closed enforcement.
-  assert.equal(resolveRoleConfig('test', 'fixer').auto_fix.guardrails, 'strict')
-  assert.equal(resolvePipelineConfig({}).auto_fix.guardrails, 'strict')
+  // Content heuristics are advisory unless trusted repository policy opts in.
+  assert.equal(resolveRoleConfig('test', 'fixer').auto_fix.guardrails, 'advisory')
+  assert.equal(resolvePipelineConfig({}).auto_fix.guardrails, 'advisory')
 
-  const userGlobalConfig: OrcaNoMistakesConfig = { auto_fix: { guardrails: 'advisory' } }
-  assert.equal(resolveRoleConfig('test', 'fixer', { userGlobalConfig }).auto_fix.guardrails, 'strict')
-  assert.equal(resolvePipelineConfig({ userGlobalConfig }).auto_fix.guardrails, 'strict')
+  const userGlobalConfig: OrcaNoMistakesConfig = { auto_fix: { guardrails: 'strict' } }
+  assert.equal(resolveRoleConfig('test', 'fixer', { userGlobalConfig }).auto_fix.guardrails, 'advisory')
+  assert.equal(resolvePipelineConfig({ userGlobalConfig }).auto_fix.guardrails, 'advisory')
 
   const repoWithoutGuardrails: OrcaNoMistakesConfig = { auto_fix: { enabled: false } }
   assert.equal(
     resolveRoleConfig('test', 'fixer', { userGlobalConfig, repoGlobalConfig: repoWithoutGuardrails }).auto_fix.guardrails,
-    'strict'
+    'advisory'
   )
   assert.equal(
     resolvePipelineConfig({ userGlobalConfig, repoGlobalConfig: repoWithoutGuardrails }).auto_fix.guardrails,
-    'strict'
+    'advisory'
   )
 
-  const repoGlobalConfig: OrcaNoMistakesConfig = { auto_fix: { guardrails: 'advisory' } }
-  assert.equal(resolveRoleConfig('test', 'fixer', { repoGlobalConfig }).auto_fix.guardrails, 'advisory')
-  assert.equal(resolvePipelineConfig({ repoGlobalConfig }).auto_fix.guardrails, 'advisory')
+  const repoGlobalConfig: OrcaNoMistakesConfig = { auto_fix: { guardrails: 'strict' } }
+  assert.equal(resolveRoleConfig('test', 'fixer', { repoGlobalConfig }).auto_fix.guardrails, 'strict')
+  assert.equal(resolvePipelineConfig({ repoGlobalConfig }).auto_fix.guardrails, 'strict')
 })
 
 test('fails closed on invalid guardrails modes and on role-level guardrails keys', () => {
