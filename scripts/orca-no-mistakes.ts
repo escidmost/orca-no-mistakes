@@ -6577,6 +6577,7 @@ export function freezeCoordinatorProgram(evidenceDir: string): string {
     rmSync(staging, { force: true, recursive: true });
     throw error;
   }
+  rmSync(program, { force: true, recursive: true });
   renameSync(staging, program);
   const executable = path.join(program, "bin", "orca-no-mistakes");
   frozenProgramExecutables.set(key, executable);

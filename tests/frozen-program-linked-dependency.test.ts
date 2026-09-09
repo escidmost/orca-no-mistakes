@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { execFileSync } from "node:child_process";
-import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, symlinkSync } from "node:fs";
+import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, rmSync, symlinkSync } from "node:fs";
+import { freezeCoordinatorProgram } from "../scripts/orca-no-mistakes.ts";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -64,6 +65,20 @@ process.stdout.write(m.freezeCoordinatorProgram(${JSON.stringify(evidenceDir)}))
       ) as { name: string };
       assert.equal(manifest.name, dependency);
     }
+  } finally {
+    await rm(home, { force: true, recursive: true });
+  }
+});
+
+test("freeze rebuilds a snapshot whose executable was removed", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "onm-stale-frozen-"));
+  try {
+    const evidenceDir = path.join(home, "run_stale");
+    mkdirSync(evidenceDir, { recursive: true });
+    const executable = freezeCoordinatorProgram(evidenceDir);
+    rmSync(executable);
+    assert.equal(freezeCoordinatorProgram(evidenceDir), executable);
+    assert.ok(existsSync(executable));
   } finally {
     await rm(home, { force: true, recursive: true });
   }
