@@ -3853,23 +3853,24 @@ export async function runPipeline(
                     audited = true;
                   });
                   if (!audited) opened(gateId);
-                  const resolution = (await orca.waitForGate(gateId)).trim();
-                  if (!recoveryOptions.includes(resolution)) {
+                  const resolution = await orca.waitForGate(gateId);
+                  const action = gateDecision(resolution);
+                  if (!recoveryOptions.includes(action)) {
                     throw new Error(`Invalid fixer recovery resolution: ${resolution}`);
                   }
                   ledger.recordGateAudit({
                     // Content acceptance is not a waiver of the preceding review.
-                    decision: resolution === "approve" ? "advisory" : resolution,
+                    decision: action === "approve" ? "advisory" : action,
                     gateId, gateKind: "guardrail",
                     optionsJson: JSON.stringify(recoveryOptions), question, resolution,
                     roundIndex: round, runId, stageId: stage,
                   });
                   presentation.publish(`gate:${gateId}:resolved`, {
-                    decision: resolution === "approve" ? "advisory" : resolution,
+                    decision: action === "approve" ? "advisory" : action,
                     gateId, kind: "gate-resolved", round, stage,
                   });
-                  if (resolution === "stop") throw new GateStopError("Fixer recovery stopped");
-                  return resolution === "approve";
+                  if (action === "stop") throw new GateStopError("Fixer recovery stopped");
+                  return action === "approve";
                 },
               ),
           );

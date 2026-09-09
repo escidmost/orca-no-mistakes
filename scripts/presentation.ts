@@ -593,7 +593,9 @@ function nextSnapshot(
     case "gate-resolved":
       {
         const stage = next.stages.find((item) => item.id === transition.stage);
-        const approved = ["approve", "skip"].includes(transition.decision)
+        const approved = next.gate?.gateKind === "guardrail"
+          ? stage?.findings
+          : ["approve", "skip"].includes(transition.decision)
           ? stage?.findings?.map((finding) =>
               finding.disposition === "open"
                 ? { ...finding, disposition: "approved" as const }

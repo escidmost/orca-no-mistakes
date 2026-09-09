@@ -13,15 +13,19 @@ import {
   type StageReport,
 } from "../scripts/orca-no-mistakes.ts";
 
-for (const [mode, weakened, recovery] of [
+for (const [mode, weakened, recovery, rawResolution] of [
   ["advisory", false, "approve"],
   ["advisory", true, "approve"],
   ["strict", false, "approve"],
   ["strict", true, "approve"],
   ["strict", false, "fix"],
   ["strict", false, "stop"],
+  ["strict", false, "approve", "  ApPrOvE: inspect candidate  "],
+  ["strict", false, "fix", "FiX: retry without touching tests"],
+  ["strict", false, "stop", "STOP: end the run"],
+  ["strict", false, "invalid", "skip: unsupported"],
 ] as const) {
-  test(`${mode} content recovery=${recovery} (weakened=${weakened})`, async () => {
+  test(`${mode} content recovery=${rawResolution ?? recovery} (weakened=${weakened})`, async () => {
     const temp = await mkdtemp(path.join(tmpdir(), "orca-advisory-audit-"));
     const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
     process.env.ORCA_NO_MISTAKES_HOME = temp;
@@ -96,7 +100,7 @@ for (const [mode, weakened, recovery] of [
       async waitForGate() {
         // Human recovery waits must outlive the configured worker deadline.
         if (mode === "strict" && gates === 1) await new Promise((resolve) => setTimeout(resolve, 1100));
-        return gates === 1 ? recovery : recovery === "fix" ? "stop" : "approve";
+        return gates === 1 ? (rawResolution ?? recovery) : recovery === "fix" ? "stop" : "approve";
       },
       async setWorktreeStatus() {},
     };
@@ -150,7 +154,10 @@ for (const [mode, weakened, recovery] of [
     try {
       const run = runPipeline({ intent: "Record advisory guardrail changes." }, orca, git, ledger);
       if (recovery !== "approve") {
-        await assert.rejects(run, /stopped/i);
+        await assert.rejects(run, recovery === "invalid" ? /Invalid fixer recovery resolution/ : /stopped/i);
+        if (recovery !== "invalid") {
+          assert.equal(ledger.listGateAudit(runId).find((audit) => audit.gate_kind === "guardrail")?.resolution, rawResolution ?? recovery);
+        }
         assert.equal(head, "a".repeat(40));
         assert.equal(gates, recovery === "fix" ? 2 : 1);
         return;
@@ -164,6 +171,7 @@ for (const [mode, weakened, recovery] of [
       if (mode === "strict") {
         const recoveryAudit = allAudits.find((audit) => audit.gate_kind === "guardrail" && audit.decision === "advisory" && audit.question.includes("Fixer candidate"));
         assert.ok(recoveryAudit);
+        assert.equal(recoveryAudit.resolution, rawResolution ?? recovery);
         assert.match(recoveryAudit.question, new RegExp(workerHead));
         const accepted = ledger.listPresentationSnapshots(runId).find((snapshot) =>
           snapshot.transition.kind === "gate-resolved" && snapshot.transition.decision === "advisory",

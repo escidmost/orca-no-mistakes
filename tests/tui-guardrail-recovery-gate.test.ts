@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import test from "node:test";
 
 import { PIPELINE_STEPS } from "../scripts/config.ts";
-import type { PresentationSnapshot } from "../scripts/presentation.ts";
+import { PresentationPublisher, type PresentationSnapshot } from "../scripts/presentation.ts";
 import { RailTuiRenderer } from "../scripts/tui.ts";
 
 class FakeInput extends EventEmitter {
@@ -98,4 +98,26 @@ test("auto-fix never resolves a guardrail recovery gate", async () => {
   await nextDraw();
   assert.deepEqual(resolutions, []);
   renderer.close();
+});
+
+test("guardrail resolutions preserve findings while ordinary gates retain approval behavior", () => {
+  for (const gateKind of ["guardrail", undefined] as const) {
+    for (const decision of ["approve", "skip", "fix"]) {
+      const snapshot = guardrailGateSnapshot(false);
+      snapshot.gate!.gateKind = gateKind;
+      const publisher = new PresentationPublisher({
+        listPresentationSnapshots: () => [snapshot],
+        recordPresentationSnapshot: () => true,
+      }, snapshot.runId);
+      publisher.publish("resolve", {
+        kind: "gate-resolved", gateId: "gate-guardrail", decision,
+        round: 1, stage: "review", targetFindingIds: [],
+      });
+      const review = publisher.current.stages.find((stage) => stage.id === "review")!;
+      assert.equal(review.approvedFindings, gateKind === "guardrail" ? 0 : 1);
+      if (gateKind === "guardrail") {
+        assert.deepEqual(review.findings, snapshot.stages.find((stage) => stage.id === "review")!.findings);
+      }
+    }
+  }
 });
