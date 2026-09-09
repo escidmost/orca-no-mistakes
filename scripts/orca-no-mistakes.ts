@@ -7,6 +7,7 @@ import {
   appendFileSync,
   closeSync,
   constants,
+  cpSync,
   existsSync,
   fstatSync,
   fsyncSync,
@@ -2190,6 +2191,7 @@ export async function runPipeline(
     if (!isWithin(canonicalArtifactsBase, canonicalArtifactsDir)) {
       throw new Error("Orca returned an unsafe Run ID");
     }
+    freezeCoordinatorProgram(artifactsDir);
 
     try {
       if (options.resumeRunId) {
@@ -6582,10 +6584,75 @@ function deliveryChannel(agent: WorkerAgent | undefined): DeliveryChannel {
   return agent && classifyHarness(agent.harness) === "acp" ? "acp" : "orca";
 }
 
-function trustedCoordinatorExecutable(): string {
-  return path.resolve(
-    fileURLToPath(new URL("../bin/orca-no-mistakes", import.meta.url)),
-  );
+// Workers must run the report command from a copy frozen inside the run's
+// evidence directory. The live checkout this coordinator loaded from can be
+// edited, rebased, or left mid-merge while a run is in flight, which would make
+// the command fail to load before it can validate anything.
+const FROZEN_PROGRAM_NONCE = randomUUID().slice(0, 8);
+const frozenProgramExecutables = new Map<string, string>();
+
+function dependencyPackageRoot(dependency: string): string {
+  let dir = path.dirname(fileURLToPath(import.meta.resolve(dependency)));
+  while (true) {
+    const manifest = path.join(dir, "package.json");
+    if (existsSync(manifest)) {
+      const { name } = JSON.parse(readFileSync(manifest, "utf8")) as {
+        name?: string;
+      };
+      if (name === dependency) return dir;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) {
+      throw new Error(`cannot locate the package root of dependency ${dependency}`);
+    }
+    dir = parent;
+  }
+}
+
+export function freezeCoordinatorProgram(evidenceDir: string): string {
+  const key = path.resolve(evidenceDir);
+  const cached = frozenProgramExecutables.get(key);
+  if (cached && existsSync(cached)) return cached;
+  const root = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
+  const program = path.join(key, `program-${FROZEN_PROGRAM_NONCE}`);
+  const staging = `${program}.tmp`;
+  rmSync(staging, { force: true, recursive: true });
+  try {
+    mkdirSync(staging, { recursive: true, mode: 0o700 });
+    for (const entry of ["bin", "scripts", "package.json"]) {
+      cpSync(path.join(root, entry), path.join(staging, entry), {
+        dereference: true,
+        recursive: true,
+      });
+    }
+    const manifest = JSON.parse(
+      readFileSync(path.join(root, "package.json"), "utf8"),
+    ) as { dependencies?: Record<string, string> };
+    for (const dependency of Object.keys(manifest.dependencies ?? {})) {
+      cpSync(
+        dependencyPackageRoot(dependency),
+        path.join(staging, "node_modules", dependency),
+        { dereference: true, recursive: true },
+      );
+    }
+  } catch (error) {
+    rmSync(staging, { force: true, recursive: true });
+    throw error;
+  }
+  rmSync(program, { force: true, recursive: true });
+  renameSync(staging, program);
+  const executable = path.join(program, "bin", "orca-no-mistakes");
+  frozenProgramExecutables.set(key, executable);
+  return executable;
+}
+
+function frozenCoordinatorExecutable(reportPath: string): string {
+  const root = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
+  const live = path.join(root, "bin", "orca-no-mistakes");
+  const evidenceDir = path.dirname(path.resolve(reportPath));
+  const artifactsBase = path.resolve(artifactsRoot());
+  if (!isWithin(artifactsBase, evidenceDir)) return live;
+  return freezeCoordinatorProgram(evidenceDir);
 }
 
 function deliveryInstruction(
@@ -6605,7 +6672,7 @@ Do not write a report file and do not call worker_done: your final message is th
 ${shape}
 
 Pipe that object to this command instead of writing the report directly:
-${shellQuote(trustedCoordinatorExecutable())} report --stage ${stage} --role ${role} --out ${shellQuote(reportPath)}
+${shellQuote(frozenCoordinatorExecutable(reportPath))} report --stage ${stage} --role ${role} --out ${shellQuote(reportPath)}
 
 The command rejects invalid values and writes the report only after validation. Correct any reported error before continuing. Then report exactly once with worker_done: keep --body to the required three-sentence executive summary and pass --report-path ${reportPath}.`;
 }
