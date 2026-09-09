@@ -193,3 +193,36 @@ test("package module exports are fixable while scripts and bin remain protected"
     await rm(temp, { recursive: true, force: true });
   }
 });
+
+
+test("runtime describe calls and prose are not inline test declarations", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-runtime-test-names-"));
+  const repo = path.join(temp, "repo");
+  try {
+    await initialize(repo);
+    const cases = [
+      ["prose.ts", "// The adapter injects no rules over it (ORC-233).\nexport const value = 1;\n", false],
+      ["description.ts", "export const message = describe(replyFailure);\n", false],
+      ["named.ts", 'describe("suite", () => { expect(value).toBe(1); });\n', true],
+      ["callback.ts", 'test(async () => { expect(value).toBe(1); });\n', true],
+    ] as const;
+    for (const [name, source] of cases) await writeFile(path.join(repo, name), source);
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "inline declarations");
+    const expectedHead = git(repo, "rev-parse", "HEAD");
+    const worker = path.join(temp, "worker");
+    git(repo, "worktree", "add", "--detach", worker, expectedHead);
+    const shell = new GitShell({ repo });
+    for (const [name, source, protectedFile] of cases) {
+      git(worker, "reset", "--hard", expectedHead);
+      await writeFile(path.join(worker, name), source + "export const added = 2;\n");
+      git(worker, "add", ".");
+      git(worker, "commit", "-m", "extend implementation");
+      const result = shell.assertFixerChangesAllowed(worker, expectedHead, git(worker, "rev-parse", "HEAD"));
+      if (protectedFile) await assert.rejects(result, /co-located test assertions/);
+      else assert.deepEqual(await result, { changed: true, guardrailViolations: [] });
+    }
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
