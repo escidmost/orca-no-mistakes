@@ -154,3 +154,42 @@ exit "$status"
     await rm(temp, { recursive: true, force: true });
   }
 });
+
+
+test("package module exports are fixable while scripts and bin remain protected", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "orca-package-exports-"));
+  const repo = path.join(temp, "repo");
+  try {
+    await initialize(repo);
+    await mkdir(path.join(repo, "apps/gateway/src"), { recursive: true });
+    await writeFile(path.join(repo, "apps/gateway/package.json"), JSON.stringify({
+      exports: { "./gateway": { import: "./src/gateway.ts", types: "./src/gateway.d.ts" } },
+      main: "./src/gateway.ts",
+      scripts: { test: "node ./src/check.ts" },
+      bin: { gate: "./src/cli.ts" },
+    }));
+    for (const name of ["gateway.ts", "gateway.d.ts", "check.ts", "cli.ts"]) {
+      await writeFile(path.join(repo, "apps/gateway/src", name), "export const value = 1;\n");
+    }
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "package entrypoints");
+    const expectedHead = git(repo, "rev-parse", "HEAD");
+    const worker = path.join(temp, "worker");
+    git(repo, "worktree", "add", "--detach", worker, expectedHead);
+    const shell = new GitShell({ repo });
+    for (const name of ["gateway.ts", "gateway.d.ts", "check.ts", "cli.ts"]) {
+      git(worker, "reset", "--hard", expectedHead);
+      await writeFile(path.join(worker, "apps/gateway/src", name), "export const value = 2;\n");
+      git(worker, "add", ".");
+      git(worker, "commit", "-m", "change entrypoint");
+      const result = shell.assertFixerChangesAllowed(worker, expectedHead, git(worker, "rev-parse", "HEAD"));
+      if (name.startsWith("gateway")) {
+        assert.deepEqual(await result, { changed: true, guardrailViolations: [] });
+      } else {
+        await assert.rejects(result, /protected validation policy files/);
+      }
+    }
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});

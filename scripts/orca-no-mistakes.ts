@@ -10526,7 +10526,20 @@ type ValidationPolicyIndex = {
   yamlRuns?: ValidationPolicyRun[];
 };
 
-function indexValidationPolicySource(source: string): ValidationPolicyIndex {
+function indexValidationPolicySource(source: string, policyPath: string): ValidationPolicyIndex {
+  if (path.posix.basename(policyPath).toLowerCase() === "package.json") {
+    try {
+      const manifest = JSON.parse(source);
+      // Module entrypoints describe library consumption, not validation commands.
+      // Keep scripts, bin, and tool configuration subject to the existing checks.
+      for (const field of ["exports", "main", "module", "types", "typings", "browser", "typesVersions"]) {
+        delete manifest[field];
+      }
+      source = JSON.stringify(manifest);
+    } catch {
+      // Malformed manifests retain conservative path matching.
+    }
+  }
   try {
     const yamlRuns: ValidationPolicyRun[] = [];
     const collect = (value: unknown, inheritedDirectory?: string): void => {
@@ -10908,7 +10921,7 @@ export class GitShell implements GitOperations {
     const pendingPolicyPaths: string[] = [];
     const addPolicySource = (policyPath: string, source: string): void => {
       if (policySources.has(policyPath)) return;
-      policySources.set(policyPath, indexValidationPolicySource(source));
+      policySources.set(policyPath, indexValidationPolicySource(source, policyPath));
       pendingPolicyPaths.push(policyPath);
     };
     for (const policyPath of trackedPaths.filter(isProtectedValidationPolicyPath)) {
