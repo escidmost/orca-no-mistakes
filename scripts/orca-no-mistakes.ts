@@ -3660,6 +3660,7 @@ export async function runPipeline(
             });
             presentation.publish(`gate:${gateId}:opened`, {
               gateId,
+              gateKind: exhausted ? "exhaustion" : "finding",
               kind: "gate-opened",
               options: gateOptions,
               question,
@@ -3843,7 +3844,7 @@ export async function runPipeline(
                       question, roundIndex: round, runId, stageId: stage,
                     });
                     presentation.publish(`gate:${gateId}:opened`, {
-                      gateId, kind: "gate-opened", options: recoveryOptions, question, round, stage,
+                      gateId, gateKind: "guardrail", kind: "gate-opened", options: recoveryOptions, question, round, stage,
                     });
                   };
                   let audited = false;

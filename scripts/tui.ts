@@ -198,7 +198,17 @@ function logTail(
   }
 }
 
-function gateConsequence(option: string, stage?: StageName): string {
+function gateConsequence(option: string, stage?: StageName, gateKind?: string): string {
+  if (gateKind === "guardrail") {
+    switch (option) {
+      case "approve":
+        return "Apply this exact candidate and rerun review; findings are not waived.";
+      case "fix":
+        return "Reject the candidate and return to the findings gate.";
+      case "stop":
+        return "Stop and cancel this run.";
+    }
+  }
   switch (option) {
     case "approve":
       return "Continue with an audited approval.";
@@ -942,6 +952,7 @@ export class RailTuiRenderer implements PresentationRenderer {
     if (
       !gate ||
       gate.state !== "open" ||
+      gate.gateKind === "guardrail" ||
       !gate.options?.length ||
       !this.#autoFix ||
       !this.#resolveGate ||
@@ -1555,10 +1566,10 @@ export class RailTuiRenderer implements PresentationRenderer {
     ];
   }
 
-  /** Only gates offering both choices can use the per-finding decision editor. */
+  /** Only finding gates offering both choices can use the per-finding decision editor. */
   #gateFindings(): readonly PresentationFinding[] {
     const gate = this.#snapshot?.gate;
-    if (gate?.state !== "open" || !gate.options?.includes("fix") || !gate.options.includes("approve")) return [];
+    if (gate?.state !== "open" || gate.gateKind === "guardrail" || !gate.options?.includes("fix") || !gate.options.includes("approve")) return [];
     return this.#snapshot?.stages.find((stage) => stage.id === gate.stage)
       ?.findings?.filter((finding) => finding.disposition === "open") ?? [];
   }
@@ -1636,7 +1647,7 @@ export class RailTuiRenderer implements PresentationRenderer {
         segs: [
           `${selected ? ">" : " "} `,
           [safeText(option, 16).padEnd(8), selected ? SGR.bold : ""],
-          ["  " + gateConsequence(option, gate.stage), SGR.dim],
+          ["  " + gateConsequence(option, gate.stage, gate.gateKind), SGR.dim],
         ],
       });
     }
@@ -1748,7 +1759,7 @@ export class RailTuiRenderer implements PresentationRenderer {
           ["Esc", isNarrow ? "back" : "return unanswered"],
         );
       }
-      if (this.#setAutoFix && this.#gateFindings().length === 0) hints.push(["A", "auto-fix"]);
+      if (this.#setAutoFix && this.#gateFindings().length === 0 && this.#snapshot?.gate?.gateKind !== "guardrail") hints.push(["A", "auto-fix"]);
       hints.push(["C", "cancel"]);
     } else if (this.#snapshot?.error) {
       if (this.#snapshot.error.resumable && this.#requestResume && this.#resumeVisible) {

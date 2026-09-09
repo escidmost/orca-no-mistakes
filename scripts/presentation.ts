@@ -72,6 +72,7 @@ export type PresentationTransition =
     }
   | {
       gateId: string;
+      gateKind?: PresentationGateKind;
       kind: "gate-opened";
       options: string[];
       question: string;
@@ -97,6 +98,8 @@ export type PresentationTransition =
       status: "passed" | "failed" | "cancelled";
     };
 
+export type PresentationGateKind = "exhaustion" | "finding" | "guardrail";
+
 export type PresentationSnapshot = {
   attempt: number;
   cancellation?: { action: CancellationAction };
@@ -104,6 +107,7 @@ export type PresentationSnapshot = {
   error?: { resumable: boolean };
   gate?: {
     decision?: string;
+    gateKind?: PresentationGateKind;
     id: string;
     options?: readonly string[];
     question?: string;
@@ -566,6 +570,7 @@ function nextSnapshot(
       next = {
         ...next,
         gate: {
+          gateKind: transition.gateKind,
           id: transition.gateId,
           options: transition.options,
           question: transition.question,
