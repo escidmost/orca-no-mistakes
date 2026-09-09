@@ -7,6 +7,7 @@ import {
   appendFileSync,
   closeSync,
   constants,
+  cpSync,
   existsSync,
   fstatSync,
   fsyncSync,
@@ -6520,10 +6521,50 @@ function deliveryChannel(agent: WorkerAgent | undefined): DeliveryChannel {
   return agent && classifyHarness(agent.harness) === "acp" ? "acp" : "orca";
 }
 
-function trustedCoordinatorExecutable(): string {
-  return path.resolve(
-    fileURLToPath(new URL("../bin/orca-no-mistakes", import.meta.url)),
+// Workers must run the report command from a copy frozen inside the run's
+// evidence directory. The live checkout this coordinator loaded from can be
+// edited, rebased, or left mid-merge while a run is in flight, which would make
+// the command fail to load before it can validate anything.
+const FROZEN_PROGRAM_NONCE = randomUUID().slice(0, 8);
+const frozenProgramExecutables = new Map<string, string>();
+
+function frozenCoordinatorExecutable(reportPath: string): string {
+  const root = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
+  const live = path.join(root, "bin", "orca-no-mistakes");
+  const evidenceDir = path.dirname(path.resolve(reportPath));
+  const artifactsBase = path.resolve(artifactsRoot());
+  if (!isWithin(artifactsBase, evidenceDir)) return live;
+  const cached = frozenProgramExecutables.get(evidenceDir);
+  if (cached) return cached;
+  const program = path.join(evidenceDir, `program-${FROZEN_PROGRAM_NONCE}`);
+  const staging = `${program}.tmp`;
+  rmSync(staging, { force: true, recursive: true });
+  mkdirSync(staging, { recursive: true, mode: 0o700 });
+  for (const entry of ["bin", "scripts", "package.json"]) {
+    cpSync(path.join(root, entry), path.join(staging, entry), {
+      recursive: true,
+    });
+  }
+  const resolved = fileURLToPath(import.meta.resolve("yaml"));
+  const nodeModules = resolved.slice(
+    0,
+    resolved.lastIndexOf(`${path.sep}node_modules${path.sep}`) +
+      `${path.sep}node_modules`.length,
   );
+  const manifest = JSON.parse(
+    readFileSync(path.join(root, "package.json"), "utf8"),
+  ) as { dependencies?: Record<string, string> };
+  for (const dependency of Object.keys(manifest.dependencies ?? {})) {
+    cpSync(
+      path.join(nodeModules, dependency),
+      path.join(staging, "node_modules", dependency),
+      { recursive: true },
+    );
+  }
+  renameSync(staging, program);
+  const executable = path.join(program, "bin", "orca-no-mistakes");
+  frozenProgramExecutables.set(evidenceDir, executable);
+  return executable;
 }
 
 function deliveryInstruction(
@@ -6543,7 +6584,7 @@ Do not write a report file and do not call worker_done: your final message is th
 ${shape}
 
 Pipe that object to this command instead of writing the report directly:
-${shellQuote(trustedCoordinatorExecutable())} report --stage ${stage} --role ${role} --out ${shellQuote(reportPath)}
+${shellQuote(frozenCoordinatorExecutable(reportPath))} report --stage ${stage} --role ${role} --out ${shellQuote(reportPath)}
 
 The command rejects invalid values and writes the report only after validation. Correct any reported error before continuing. Then report exactly once with worker_done: keep --body to the required three-sentence executive summary and pass --report-path ${reportPath}.`;
 }

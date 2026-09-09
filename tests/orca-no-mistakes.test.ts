@@ -9198,6 +9198,57 @@ test("an invalid worker report gets one contract-repair retry", async () => {
   assert.match(orca.launches[1].prompt, /REPORT REPAIR/);
 });
 
+test("workers are handed a frozen copy of the report command inside the run evidence", async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), "frozen-program-"));
+  const noMistakesHome = path.join(temp, "home");
+  const evidence = path.join(noMistakesHome, "artifacts", "run_frozen");
+  const reportPath = path.join(evidence, "review-1.json");
+  const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
+  try {
+    process.env.ORCA_NO_MISTAKES_HOME = noMistakesHome;
+    const git = new FakeGit();
+    const orca = new FakeOrca(git);
+    orca.launchFailures.push(
+      new Error("worker dispatch-invalid returned an invalid report"),
+    );
+    await startWorkerWithFallback(
+      orca,
+      (launch) => orca.createTask(launch.prompt),
+      [
+        {
+          name: "frozen",
+          prompt: "Review the change.",
+          reportPath,
+          role: "reviewer",
+          stage: "review",
+          worktree: "current",
+        },
+      ],
+    );
+    const match = orca.launches[1].prompt.match(
+      /'([^']*\/program-[0-9a-f]{8}\/bin\/orca-no-mistakes)' report --stage review/,
+    );
+    assert.ok(match, orca.launches[1].prompt);
+    const executable = match[1];
+    assert.ok(executable.startsWith(`${evidence}${path.sep}`));
+    const stdout = execFileSync(
+      executable,
+      ["report", "--stage", "review", "--role", "reviewer", "--out", reportPath],
+      {
+        encoding: "utf8",
+        env: { ...process.env, ORCA_NO_MISTAKES_HOME: noMistakesHome },
+        input: JSON.stringify({ findings: [], summary: "review passed" }),
+      },
+    );
+    assert.match(stdout, /"ok":true/);
+    assert.equal(JSON.parse(await readFile(reportPath, "utf8")).summary, "review passed");
+  } finally {
+    if (previousHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME;
+    else process.env.ORCA_NO_MISTAKES_HOME = previousHome;
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test("an unreadable worker report gets one contract-repair retry", async () => {
   const git = new FakeGit();
   const orca = new FakeOrca(git);
