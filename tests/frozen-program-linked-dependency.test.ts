@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { execFileSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, readFileSync, symlinkSync } from "node:fs";
+import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, symlinkSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -11,7 +11,7 @@ const repoRoot = path.resolve(import.meta.dirname, "..");
 
 function installedPackageRoot(dependency: string): string {
   let dir = path.dirname(fileURLToPath(import.meta.resolve(dependency)));
-  while (!/^[^/]*$/.test(dir)) {
+  while (true) {
     const manifest = path.join(dir, "package.json");
     if (
       existsSync(manifest) &&
@@ -19,9 +19,10 @@ function installedPackageRoot(dependency: string): string {
     ) {
       return dir;
     }
-    dir = path.dirname(dir);
+    const parent = path.dirname(dir);
+    if (parent === dir) throw new Error(`cannot locate installed dependency ${dependency}`);
+    dir = parent;
   }
-  throw new Error(`cannot locate installed dependency ${dependency}`);
 }
 
 test("freeze copies dependencies linked from outside node_modules", async () => {
@@ -56,8 +57,10 @@ process.stdout.write(m.freezeCoordinatorProgram(${JSON.stringify(evidenceDir)}))
     );
     const program = path.dirname(path.dirname(executable));
     for (const dependency of ["yaml", "zod"]) {
+      const staged = path.join(program, "node_modules", dependency);
+      assert.ok(lstatSync(staged).isDirectory(), `${dependency} should be copied, not linked`);
       const manifest = JSON.parse(
-        readFileSync(path.join(program, "node_modules", dependency, "package.json"), "utf8"),
+        readFileSync(path.join(staged, "package.json"), "utf8"),
       ) as { name: string };
       assert.equal(manifest.name, dependency);
     }

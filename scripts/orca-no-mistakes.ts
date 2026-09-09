@@ -6550,27 +6550,32 @@ function dependencyPackageRoot(dependency: string): string {
 export function freezeCoordinatorProgram(evidenceDir: string): string {
   const key = path.resolve(evidenceDir);
   const cached = frozenProgramExecutables.get(key);
-  if (cached) return cached;
+  if (cached && existsSync(cached)) return cached;
   const root = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
   const program = path.join(key, `program-${FROZEN_PROGRAM_NONCE}`);
   const staging = `${program}.tmp`;
   rmSync(staging, { force: true, recursive: true });
-  mkdirSync(staging, { recursive: true, mode: 0o700 });
-  for (const entry of ["bin", "scripts", "package.json"]) {
-    cpSync(path.join(root, entry), path.join(staging, entry), {
-      dereference: true,
-      recursive: true,
-    });
-  }
-  const manifest = JSON.parse(
-    readFileSync(path.join(root, "package.json"), "utf8"),
-  ) as { dependencies?: Record<string, string> };
-  for (const dependency of Object.keys(manifest.dependencies ?? {})) {
-    cpSync(
-      dependencyPackageRoot(dependency),
-      path.join(staging, "node_modules", dependency),
-      { dereference: true, recursive: true },
-    );
+  try {
+    mkdirSync(staging, { recursive: true, mode: 0o700 });
+    for (const entry of ["bin", "scripts", "package.json"]) {
+      cpSync(path.join(root, entry), path.join(staging, entry), {
+        dereference: true,
+        recursive: true,
+      });
+    }
+    const manifest = JSON.parse(
+      readFileSync(path.join(root, "package.json"), "utf8"),
+    ) as { dependencies?: Record<string, string> };
+    for (const dependency of Object.keys(manifest.dependencies ?? {})) {
+      cpSync(
+        dependencyPackageRoot(dependency),
+        path.join(staging, "node_modules", dependency),
+        { dereference: true, recursive: true },
+      );
+    }
+  } catch (error) {
+    rmSync(staging, { force: true, recursive: true });
+    throw error;
   }
   renameSync(staging, program);
   const executable = path.join(program, "bin", "orca-no-mistakes");
