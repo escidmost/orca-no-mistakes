@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { existsSync, readdirSync } from "node:fs";
-import { rm } from "node:fs/promises";
-import { homedir } from "node:os";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   runPipeline,
@@ -14,6 +14,7 @@ import {
   type WorkerLaunch,
   type WorkerResult,
 } from "../scripts/orca-no-mistakes.ts";
+import { artifactsRoot } from "../scripts/ledger.ts";
 
 function pass(stage: string): StageReport {
   return {
@@ -198,7 +199,10 @@ class FakeOrca implements OrcaOperations {
 
 test("the frozen report command exists before the first worker launches", async () => {
   const runId = `frozen-at-init-${Date.now()}`;
-  const artifactsDir = path.join(homedir(), ".orca-no-mistakes", "artifacts", runId);
+  const home = await mkdtemp(path.join(tmpdir(), "frozen-at-init-"));
+  const previousHome = process.env.ORCA_NO_MISTAKES_HOME;
+  process.env.ORCA_NO_MISTAKES_HOME = home;
+  const artifactsDir = path.join(artifactsRoot(), runId);
   const git = new FakeGit();
   const orca = new FakeOrca(runId);
   const frozenAtLaunch: string[] = [];
@@ -221,6 +225,8 @@ test("the frozen report command exists before the first worker launches", async 
       assert.ok(existsSync(path.join(program, entry)), entry);
     }
   } finally {
-    await rm(artifactsDir, { recursive: true, force: true });
+    if (previousHome === undefined) delete process.env.ORCA_NO_MISTAKES_HOME;
+    else process.env.ORCA_NO_MISTAKES_HOME = previousHome;
+    await rm(home, { recursive: true, force: true });
   }
 });
