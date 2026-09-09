@@ -6530,13 +6530,21 @@ const FROZEN_PROGRAM_NONCE = randomUUID().slice(0, 8);
 const frozenProgramExecutables = new Map<string, string>();
 
 function dependencyPackageRoot(dependency: string): string {
-  const resolved = fileURLToPath(import.meta.resolve(dependency));
-  const marker = `${path.sep}node_modules${path.sep}${dependency.split("/").join(path.sep)}${path.sep}`;
-  const index = resolved.lastIndexOf(marker);
-  if (index < 0) {
-    throw new Error(`cannot locate the package root of dependency ${dependency}`);
+  let dir = path.dirname(fileURLToPath(import.meta.resolve(dependency)));
+  while (true) {
+    const manifest = path.join(dir, "package.json");
+    if (existsSync(manifest)) {
+      const { name } = JSON.parse(readFileSync(manifest, "utf8")) as {
+        name?: string;
+      };
+      if (name === dependency) return dir;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) {
+      throw new Error(`cannot locate the package root of dependency ${dependency}`);
+    }
+    dir = parent;
   }
-  return resolved.slice(0, index + marker.length - 1);
 }
 
 export function freezeCoordinatorProgram(evidenceDir: string): string {
