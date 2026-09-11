@@ -7766,7 +7766,7 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
     const startupCommand = sent.args[sent.args.indexOf("--text") + 1];
     assert.ok(
       startupCommand.startsWith(
-        "'claude' '--model' 'opus[1m]' '--effort' 'high' '--dangerously-skip-permissions' 'Read and follow the complete authenticated task in ",
+        "'claude' '--model' 'opus[1m]' '--effort' 'high' '--dangerously-skip-permissions' '--settings' '{\"attribution\":{\"commit\":\"\",\"pr\":\"\",\"sessionUrl\":false}}' 'Read and follow the complete authenticated task in ",
       ),
     );
     assert.match(startupCommand, /prompt-[^']+\.txt'$/);
