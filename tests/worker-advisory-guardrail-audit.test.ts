@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { withLivePass } from './live-validation-fixture.ts';
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -73,7 +74,7 @@ for (const [mode, weakened, recovery, rawResolution] of [
             : pass(launch.stage);
         return {
           dispatchId: id,
-          report,
+          report: withLivePass(launch, report),
           taskId,
           worktreePath:
             launch.worktree === "new-child" ? path.join(temp, id) : undefined,

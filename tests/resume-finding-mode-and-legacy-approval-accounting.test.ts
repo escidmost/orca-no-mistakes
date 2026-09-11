@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { withLivePass } from './live-validation-fixture.ts';
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -132,7 +133,7 @@ const makeOrca = (
       if (report instanceof Error) throw report;
       return {
         dispatchId: `dispatch-${launches.length}`,
-        report: structuredClone(report ?? { findings: [], summary: "passed" }),
+        report: withLivePass(launch, structuredClone(report ?? { findings: [], summary: "passed" })),
         taskId,
         terminalHandle: `term-${launches.length}`,
       };

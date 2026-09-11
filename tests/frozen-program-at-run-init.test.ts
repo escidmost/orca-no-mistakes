@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { withLivePass } from './live-validation-fixture.ts';
 import test from "node:test";
 import { existsSync, readdirSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -167,7 +168,7 @@ class FakeOrca implements OrcaOperations {
     const dispatchId = `dispatch-${++this.#dispatchNumber}`;
     const stage = launch.stage;
     const reports = this.reports.get(stage) ?? [pass(stage)];
-    const report = reports.shift() ?? pass(stage);
+    const report = withLivePass(launch, reports.shift() ?? pass(stage));
     this.reports.set(stage, reports);
     return {
       deliveryId: `delivery-${dispatchId}`,

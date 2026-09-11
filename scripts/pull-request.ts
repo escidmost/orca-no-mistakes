@@ -1,5 +1,6 @@
 import { mkdir, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
+import { liveValidationText, type LiveValidation } from './live-validation.ts'
 
 import {
   GithubAuthorityError,
@@ -29,6 +30,8 @@ export type PullRequestPipelineFinding = {
   severity: 'error' | 'info' | 'warning'
 }
 export type PullRequestPipelineRound = {
+  liveValidation?: LiveValidation
+  evidenceCommitOid?: string
   findings: PullRequestPipelineFinding[]
   fixSummary?: string
   historicalFixSummaries?: string[]
@@ -51,6 +54,8 @@ export type PullRequestReport = {
   pipelineSteps: PullRequestPipelineStep[]
   risk: { level: 'high' | 'low' | 'medium'; rationale: string }
   testing: {
+    liveValidation?: LiveValidation
+    evidenceCommitOid?: string
     artifacts: PullRequestArtifact[]
     summary: string
     tested: string[]
@@ -215,7 +220,10 @@ function testingSection(testing: PullRequestReport['testing']): string {
     remaining -= entryBytes
     artifacts.push(entry)
   }
-  return `## Testing\n\n${capMarkdownText(testing.summary, 4096)}${commands}${artifacts.length > 0 ? `\n\n${artifacts.join('\n\n')}` : ''}`
+  const live = testing.liveValidation
+    ? `\n\n${capText(liveValidationText(testing.liveValidation, testing.evidenceCommitOid), 4096)}`
+    : '\n\nStructured live-validation evidence was not recorded (pre-contract or absent Test evidence).'
+  return `## Testing\n\n${capMarkdownText(testing.summary, 4096)}${live}${commands}${artifacts.length > 0 ? `\n\n${artifacts.join('\n\n')}` : ''}`
 }
 
 function displayStepName(name: string): string {
@@ -283,6 +291,7 @@ function pipelineStepDetails(step: PullRequestPipelineStep): string | undefined 
     if (round.tested?.length) {
       sections.push(round.tested.map((command) => `- ${command}`).join('\n'))
     }
+    if (round.liveValidation) sections.push(liveValidationText(round.liveValidation, round.evidenceCommitOid))
     if (round.historicalFixSummaries && round.historicalFixSummaries.length > 0) {
       for (const summary of round.historicalFixSummaries) {
         sections.push(`🔧 Historical fix: ${summary}`)

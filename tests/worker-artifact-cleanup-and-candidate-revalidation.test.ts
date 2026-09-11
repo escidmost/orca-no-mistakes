@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { withLivePass } from './live-validation-fixture.ts';
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -155,7 +156,7 @@ class RegOrca implements OrcaOperations {
     const dispatchId = `dispatch-${++this.#dispatch}`;
     return {
       dispatchId,
-      report: queued ?? pass(`${launch.stage} ${launch.role} passed`),
+      report: withLivePass(launch, queued ?? pass(`${launch.stage} ${launch.role} passed`)),
       taskId,
       terminalHandle: `term-${dispatchId}`,
       worktreeId:

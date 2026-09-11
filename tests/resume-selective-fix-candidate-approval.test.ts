@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { withLivePass } from './live-validation-fixture.ts';
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -158,7 +159,7 @@ class SelectiveFixOrca implements OrcaOperations {
     const dispatchId = `dispatch-${++this.#dispatch}`;
     return {
       dispatchId,
-      report: queued ?? pass(`${launch.stage} ${launch.role} passed`),
+      report: withLivePass(launch, queued ?? pass(`${launch.stage} ${launch.role} passed`)),
       taskId,
       terminalHandle: `term-${dispatchId}`,
       worktreeId: launch.worktree === "new-child" ? dispatchId : undefined,

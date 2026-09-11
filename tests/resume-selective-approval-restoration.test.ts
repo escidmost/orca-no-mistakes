@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { withLivePass } from './live-validation-fixture.ts';
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -85,7 +86,7 @@ test("resume restores selective approvals before candidate revalidation invalida
         }
         return {
           dispatchId,
-          report,
+          report: withLivePass(launch, report),
           taskId,
           terminalHandle: `term-${dispatchId}`,
           worktreeId: `wt-${dispatchId}`,

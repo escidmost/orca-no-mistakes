@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { withLivePass } from './live-validation-fixture.ts';
 import { execFileSync } from "node:child_process";
 import {
   mkdir,
@@ -163,7 +164,7 @@ test("each rebase attempt records its reported upstream", async () => {
       const id = `dispatch-${++dispatch}`;
       return {
         dispatchId: id,
-        report: pass(launch.stage),
+        report: withLivePass(launch, pass(launch.stage)),
         taskId,
         worktreeId: launch.worktree === "new-child" ? id : undefined,
         worktreePath:

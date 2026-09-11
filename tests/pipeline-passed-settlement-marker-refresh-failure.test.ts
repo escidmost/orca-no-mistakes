@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { withLivePass } from './live-validation-fixture.ts';
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
@@ -76,7 +77,7 @@ test("Release 2 pipeline settles passed and commits attestation when post-custod
     createTask: async () => `task-${++task}`,
     startWorker: async (taskId, launch) => ({
       dispatchId: `dispatch-${++dispatch}`,
-      report: { findings: [], summary: `${launch.stage} passed` },
+      report: withLivePass(launch, { findings: [], summary: `${launch.stage} passed` }),
       shutdownConfirmed: false,
       taskId,
       terminalHandle: `term-${dispatch}`,
@@ -277,7 +278,7 @@ test("local pipeline settles passed and commits attestation when post-custody ma
     createTask: async () => `task-${++task}`,
     startWorker: async (taskId, launch) => ({
       dispatchId: `dispatch-${++dispatch}`,
-      report: { findings: [], summary: `${launch.stage} passed` },
+      report: withLivePass(launch, { findings: [], summary: `${launch.stage} passed` }),
       shutdownConfirmed: false,
       taskId,
       terminalHandle: `term-${dispatch}`,
