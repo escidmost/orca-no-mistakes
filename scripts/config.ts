@@ -523,10 +523,16 @@ defaults:
   # Default agent harness. Can be:
   # 1. Shorthand string: "claude", "opencode", "gemini"
   # 2. Structured object: { harness: "claude", model: "claude-3-7-sonnet", effort: "high" }
-  # 3. Fallback chain array: ["claude", { harness: "opencode", model: "sonnet" }]
+  # 3. Fallback chain array: ["claude", { harness: "opencode", model: "anthropic/claude-sonnet-5" }]
   agent: "claude"
 
   # Optional model override
+  # opencode: the effective explicit model (a raw --model/-m pin in
+  # agent_args_override takes precedence over this setting) must be
+  # provider/model, e.g. "openai/gpt-6-astra"; nested paths such as
+  # "openrouter/openai/gpt-6-astra" are valid. A bare identifier like
+  # "sonnet" fails the launch before the startup command is sent; no
+  # provider is inferred. Omitting the model keeps the harness default.
   # model: "claude-3-7-sonnet"
 
   # Reasoning effort (e.g. "low", "medium", "high"). Mapped per harness:
@@ -554,7 +560,7 @@ defaults:
 
   # Role-specific default overrides across all stages
   # reviewer:
-  #   agent: { harness: "opencode", model: "claude-3-7-sonnet" }
+  #   agent: { harness: "opencode", model: "anthropic/claude-sonnet-5" }
   #   effort: "high"
   #   timeout_ms: 180000
 
