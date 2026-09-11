@@ -6415,21 +6415,10 @@ Rules:
 }
 
 function fenceUntrusted(content: string): string {
-  return content
-    .replaceAll("<untrusted_branch_diff>", "<\\untrusted_branch_diff>")
-    .replaceAll("</untrusted_branch_diff>", "<\\/untrusted_branch_diff>")
-    .replaceAll("<untrusted_instruction>", "<\\untrusted_instruction>")
-    .replaceAll("</untrusted_instruction>", "<\\/untrusted_instruction>")
-    .replaceAll(
-      "<untrusted_finding_decisions>",
-      "<\\untrusted_finding_decisions>",
-    )
-    .replaceAll(
-      "</untrusted_finding_decisions>",
-      "<\\/untrusted_finding_decisions>",
-    )
-    .replaceAll("<untrusted_review_rounds>", "<\\untrusted_review_rounds>")
-    .replaceAll("</untrusted_review_rounds>", "<\\/untrusted_review_rounds>");
+  return content.replace(
+    /<(?=\/?untrusted_(?:branch_diff|instruction|finding_decisions|review_rounds)>)/g,
+    "\\u003c",
+  );
 }
 
 const UNTRUSTED_DIFF_LIMIT_CHARS = 200_000;
