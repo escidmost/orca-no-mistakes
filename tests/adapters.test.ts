@@ -17,6 +17,21 @@ import {
   workerAgentReadyTimeoutMs
 } from '../scripts/adapters.ts'
 
+// Command expectations below assume no inherited OpenCode config; the dispatched
+// environment may carry one, so clear it for the duration of the assertions.
+function withoutInheritedOpencodeConfig(fn: () => void): () => void {
+  return () => {
+    const saved = process.env.OPENCODE_CONFIG_CONTENT
+    delete process.env.OPENCODE_CONFIG_CONTENT
+    try {
+      fn()
+    } finally {
+      if (saved === undefined) delete process.env.OPENCODE_CONFIG_CONTENT
+      else process.env.OPENCODE_CONFIG_CONTENT = saved
+    }
+  }
+}
+
 test('classifyHarness routes native, CLI, and ACP harnesses', () => {
   assert.equal(classifyHarness('claude'), 'cli')
   assert.equal(classifyHarness('codex'), 'cli')
@@ -103,15 +118,15 @@ test('nativeWorkerStartArgs maps model, effort, timeout, and worktree placement'
   )
 })
 
-test('buildCliCommand formats startup lines with model, variant, env, and override args', () => {
+test('buildCliCommand formats startup lines with model, variant, env, and override args', withoutInheritedOpencodeConfig(() => {
   assert.equal(buildCliCommand('opencode'), `'opencode'`)
   assert.equal(
-    buildCliCommand('opencode', { model: 'gpt-5.6', variant: 'high' }),
-    `OPENCODE_CONFIG_CONTENT='{"agent":{"build":{"model":"gpt-5.6","variant":"high"}}}' 'opencode' '--model' 'gpt-5.6' '--agent' 'build'`
+    buildCliCommand('opencode', { model: 'openai/gpt-5.6', variant: 'high' }),
+    `OPENCODE_CONFIG_CONTENT='{"agent":{"build":{"model":"openai/gpt-5.6","variant":"high"}}}' 'opencode' '--model' 'openai/gpt-5.6' '--agent' 'build'`
   )
   assert.equal(
-    buildCliCommand('opencode', { effort: 'high', model: 'gpt-5.6' }),
-    `OPENCODE_CONFIG_CONTENT='{"agent":{"build":{"model":"gpt-5.6","variant":"high"}}}' 'opencode' '--model' 'gpt-5.6' '--agent' 'build'`
+    buildCliCommand('opencode', { effort: 'high', model: 'openai/gpt-5.6' }),
+    `OPENCODE_CONFIG_CONTENT='{"agent":{"build":{"model":"openai/gpt-5.6","variant":"high"}}}' 'opencode' '--model' 'openai/gpt-5.6' '--agent' 'build'`
   )
   // Variant is opencode-specific.
   assert.equal(buildCliCommand('grok', { model: 'grok-4', variant: 'high' }), `'grok' '--model' 'grok-4'`)
@@ -252,17 +267,18 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
   )
   // Accepted raw model-pin forms for opencode effort validation:
   for (const rawArgs of [
-    ['--model', 'custom-model'],
-    ['--model=custom-model'],
-    ['-m', 'custom-model'],
-    ['-m=custom-model']
+    ['--model', 'custom/model'],
+    ['--model=custom/model'],
+    ['-m', 'custom/model'],
+    ['-m=custom/model'],
+    ['-mcustom/model']
   ]) {
     assert.equal(
       buildCliCommand('opencode', {
         agentArgsOverride: { opencode: rawArgs } as never,
         effort: 'high'
       }),
-      `OPENCODE_CONFIG_CONTENT='{"agent":{"build":{"model":"custom-model","variant":"high"}}}' 'opencode' '--agent' 'build' ${rawArgs.map((a) => `'${a}'`).join(' ')}`
+      `OPENCODE_CONFIG_CONTENT='{"agent":{"build":{"model":"custom/model","variant":"high"}}}' 'opencode' '--agent' 'build' ${rawArgs.map((a) => `'${a}'`).join(' ')}`
     )
   }
   // Empty raw model pins are malformed rather than silently treated as absent.
@@ -290,19 +306,19 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
   const pinnedVariant = buildCliCommand('opencode', {
     agentArgsOverride: { opencode: ['--variant=low'] } as never,
     effort: 'high',
-    model: 'gpt-5.6'
+    model: 'openai/gpt-5.6'
   })
   assert.equal(
     pinnedVariant,
-    `OPENCODE_CONFIG_CONTENT='{"agent":{"build":{"model":"gpt-5.6","variant":"low"}}}' 'opencode' '--model' 'gpt-5.6' '--agent' 'build'`,
+    `OPENCODE_CONFIG_CONTENT='{"agent":{"build":{"model":"openai/gpt-5.6","variant":"low"}}}' 'opencode' '--model' 'openai/gpt-5.6' '--agent' 'build'`,
   )
   assert.equal(
     buildCliCommand('opencode', {
-      agentArgsOverride: { opencode: ['--model', 'custom-model'] } as never,
+      agentArgsOverride: { opencode: ['--model', 'custom/model'] } as never,
       model: 'profile-model',
       variant: 'high',
     }),
-    `OPENCODE_CONFIG_CONTENT='{"agent":{"build":{"model":"custom-model","variant":"high"}}}' 'opencode' '--agent' 'build' '--model' 'custom-model'`,
+    `OPENCODE_CONFIG_CONTENT='{"agent":{"build":{"model":"custom/model","variant":"high"}}}' 'opencode' '--agent' 'build' '--model' 'custom/model'`,
   )
   assert.equal(
     buildCliCommand('opencode', {
@@ -317,7 +333,7 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
     () =>
       buildCliCommand('opencode', {
         agentArgsOverride: { opencode: ['--variant', '--print-logs'] } as never,
-        model: 'gpt-5.6',
+        model: 'openai/gpt-5.6',
       }),
     /argument --variant requires a value/,
   )
@@ -361,7 +377,7 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
 
   const overridden = buildCliCommand('opencode', {
     agentArgsOverride: { opencode: { OPENCODE_MODEL: 'custom' }, grok: ['--verbose'] } as never,
-    model: 'm'
+    model: 'custom/m'
   })
   assert.match(overridden, /^OPENCODE_MODEL='custom' 'opencode'/)
   assert.ok(!overridden.includes('--verbose'), 'override entries apply per harness')
@@ -370,7 +386,29 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
     agentArgsOverride: { grok: ['--dangerously-auto', '-q'] } as never
   })
   assert.equal(extra, `'grok' '--dangerously-auto' '-q'`)
-})
+}))
+
+test('OpenCode validates the effective explicit model without selecting a provider', withoutInheritedOpencodeConfig(() => {
+  for (const model of ['', 'gpt-6-astra', '/gpt-6-astra', 'openai/', 'openai/gpt 6', ' openai/gpt-6', 'openai//gpt-6-astra', 'openai/gpt-6-astra/']) {
+    assert.throws(() => buildCliCommand('OpenCode', { model }), /agent opencode: invalid model.*provider\/model/)
+  }
+  for (const raw of [
+    ['--model', 'gpt-6-astra'], ['--model=gpt-6-astra'],
+    ['-m', 'gpt-6-astra'], ['-m=gpt-6-astra'], ['-mgpt-6-astra'],
+  ]) {
+    assert.throws(() => buildCliCommand('opencode', {
+      model: 'openai/gpt-6-astra', agentArgsOverride: { opencode: raw },
+    }), /provider\/model/)
+  }
+  for (const model of ['openai/gpt-6-astra', 'opencode/gpt-6-astra', 'openrouter/openai/gpt-6-astra']) {
+    assert.equal(buildCliCommand('opencode', { model, effort: 'medium' }),
+      `OPENCODE_CONFIG_CONTENT='{"agent":{"build":{"model":"${model}","variant":"medium"}}}' 'opencode' '--model' '${model}' '--agent' 'build'`)
+    assert.equal(buildCliCommand('opencode', { model }), `'opencode' '--model' '${model}'`)
+  }
+  assert.throws(() => buildCliCommand('opencode', {
+    model: 'bare', agentArgsOverride: { opencode: ['--', '--model', 'openai/gpt-6-astra'] },
+  }), /provider\/model/)
+}))
 
 test('buildCliCommand rejects environment names that would break out of the assignment prefix', () => {
   assert.throws(
