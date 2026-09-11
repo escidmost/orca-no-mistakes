@@ -137,17 +137,17 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
   )
   assert.equal(
     buildCliCommand('claude', { effort: 'high', model: 'opus[1m]' }),
-    `'claude' '--model' 'opus[1m]' '--effort' 'high' '--dangerously-skip-permissions'`
+    `'claude' '--model' 'opus[1m]' '--effort' 'high' '--dangerously-skip-permissions' '--settings' '{"attribution":{"commit":"","pr":"","sessionUrl":false}}'`
   )
   assert.equal(
     buildCliCommand('Claude', { effort: 'high', model: 'opus[1m]' }),
-    `'claude' '--model' 'opus[1m]' '--effort' 'high' '--dangerously-skip-permissions'`
+    `'claude' '--model' 'opus[1m]' '--effort' 'high' '--dangerously-skip-permissions' '--settings' '{"attribution":{"commit":"","pr":"","sessionUrl":false}}'`
   )
   assert.equal(
     buildCliCommand('claude', {
       agentArgsOverride: { Claude: ['--verbose'] } as never,
     }),
-    `'claude' '--dangerously-skip-permissions' '--verbose'`
+    `'claude' '--dangerously-skip-permissions' '--settings' '{"attribution":{"commit":"","pr":"","sessionUrl":false}}' '--verbose'`
   )
   assert.throws(
     () =>
@@ -409,6 +409,18 @@ test('OpenCode validates the effective explicit model without selecting a provid
     model: 'bare', agentArgsOverride: { opencode: ['--', '--model', 'openai/gpt-6-astra'] },
   }), /provider\/model/)
 }))
+
+test('Claude attribution is disabled before raw arguments and conflicting settings are rejected', () => {
+  const settings = `'--settings' '{"attribution":{"commit":"","pr":"","sessionUrl":false}}'`
+  for (const agentArgsOverride of [undefined, { claude: { CUSTOM: 'value' } }, { claude: ['--', 'prompt'] }]) {
+    const command = buildCliCommand('claude', { agentArgsOverride })
+    assert.ok(command.includes(settings))
+    if (command.includes("'--'")) assert.ok(command.indexOf(settings) < command.indexOf("'--'"))
+  }
+  for (const args of [['--settings', '{"attribution":{"commit":"Claude"}}'], ['--settings=custom.json']]) {
+    assert.throws(() => buildCliCommand('claude', { agentArgsOverride: { claude: args } }), /reserved argument/)
+  }
+})
 
 test('buildCliCommand rejects environment names that would break out of the assignment prefix', () => {
   assert.throws(

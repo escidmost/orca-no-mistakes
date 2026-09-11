@@ -241,6 +241,7 @@ const RESERVED_HARNESS_ARGS: Record<string, ReadonlySet<string>> = {
     '--allow-dangerously-skip-permissions',
     '--dangerously-skip-permissions',
     '--permission-mode',
+    '--settings',
   ]),
   codex: new Set([
     '--ask-for-approval',
@@ -274,7 +275,7 @@ const RESERVED_CONFIG_KEYS: Record<string, ReadonlySet<string>> = {
 }
 const REQUIRED_HARNESS_ARGS: Record<string, readonly string[]> = {
   agy: ['--dangerously-skip-permissions'],
-  claude: ['--dangerously-skip-permissions'],
+  claude: ['--dangerously-skip-permissions', '--settings', '{"attribution":{"commit":"","pr":"","sessionUrl":false}}'],
   codex: ['--dangerously-bypass-approvals-and-sandbox'],
   kimi: ['--auto'],
 }
