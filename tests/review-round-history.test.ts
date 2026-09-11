@@ -38,6 +38,38 @@ test("review repair history fails open on ledger reads, JSON parsing, and malfor
   }
 });
 
+test("exact-fit review history reserves notice only after an omission", (t) => {
+  const ledger = new DomainLedger(":memory:");
+  t.after(() => ledger.close());
+  const limit = 16 * 1024;
+  let rows = [repair(2, "")];
+  t.mock.method(ledger, "listPresentationSnapshots", () => [...rows]);
+  const padding = "x".repeat(limit - Buffer.byteLength(reviewRoundHistoryPrompt(ledger, "history-test")));
+  rows = [repair(2, padding)];
+  const exact = reviewRoundHistoryPrompt(ledger, "history-test");
+  assert.equal(Buffer.byteLength(exact), limit);
+  assert.ok(exact.includes(padding));
+  assert.ok(!exact.includes("Some repair rounds were omitted"));
+
+  // An oversized older round requires a notice, so the sole retained round must go.
+  rows.unshift(repair(1, "x".repeat(limit)));
+  const empty = reviewRoundHistoryPrompt(ledger, "history-test");
+  assert.match(empty, /\n\[\]\n/);
+  assert.match(empty, /Some repair rounds were omitted/);
+  assert.ok(Buffer.byteLength(empty) <= limit);
+
+  // When two rounds fit exactly, make room for the notice by removing the older one.
+  rows = [repair(2, ""), repair(3, "newest")];
+  rows[0] = repair(2, "x".repeat(limit - Buffer.byteLength(reviewRoundHistoryPrompt(ledger, "history-test"))));
+  assert.equal(Buffer.byteLength(reviewRoundHistoryPrompt(ledger, "history-test")), limit);
+  rows.unshift(repair(1, "x".repeat(limit)));
+  const trimmed = reviewRoundHistoryPrompt(ledger, "history-test");
+  assert.ok(Buffer.byteLength(trimmed) <= limit);
+  assert.ok(trimmed.includes('"round":3'));
+  assert.ok(!trimmed.includes('"round":2'));
+  assert.match(trimmed, /Some repair rounds were omitted/);
+});
+
 test("complete review repair history fits the byte cap with and without a truncation notice", (t) => {
   const ledger = new DomainLedger(":memory:");
   t.after(() => ledger.close());

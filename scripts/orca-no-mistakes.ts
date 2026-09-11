@@ -6726,8 +6726,7 @@ Prior review repair rounds (oldest to newest):
 `;
     const checkpoints = ledger.listCheckpoints(runId).filter((entry) => entry.stage_id === "review");
     const rounds: string[] = [];
-    // Reserve the notice up front: an older round may be omitted after newer ones fit.
-    let bytes = Buffer.byteLength(header + footer + notice + guidance);
+    let bytes = Buffer.byteLength(header + footer + guidance);
     let truncated = false;
     const snapshots = ledger.listPresentationSnapshots(runId);
     const repairIndex = new Map<PresentationSnapshot, number>();
@@ -6763,6 +6762,12 @@ Prior review repair rounds (oldest to newest):
       bytes += size;
     }
     if (rounds.length === 0 && !truncated) return "";
+    if (truncated) {
+      bytes += Buffer.byteLength(notice);
+      while (bytes > FINDING_DECISION_HISTORY_LIMIT_BYTES && rounds.length > 0) {
+        bytes -= Buffer.byteLength(rounds.pop()!) + (rounds.length > 0 ? 1 : 0);
+      }
+    }
     return header + rounds.reverse().join(",") + footer + (truncated ? notice : "") + guidance;
   } catch (error) {
     console.error(`warning: could not load prior review repair rounds: ${String(error)}`);
