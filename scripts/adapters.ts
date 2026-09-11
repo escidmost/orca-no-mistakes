@@ -361,7 +361,7 @@ export function buildCliCommand(harness: string, options: CliAgentCommandOptions
   if (options.model && !modelPinned) parts.push('--model', options.model)
   if (normalizedHarness === 'opencode') {
     const model = flagValue(raw, MODEL_PIN_FLAGS) ?? options.model
-    if (model !== undefined && !/^[^/\s]+\/[^\s]+$/.test(model)) {
+    if (model !== undefined && !/^[^/\s]+(?:\/[^/\s]+)+$/.test(model)) {
       throw new Error(
         `agent opencode: invalid model '${model}'; expected provider/model (for example openai/gpt-6-astra). Specify the provider explicitly; no provider is selected automatically`,
       )

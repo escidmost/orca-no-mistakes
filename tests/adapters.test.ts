@@ -389,7 +389,7 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
 }))
 
 test('OpenCode validates the effective explicit model without selecting a provider', withoutInheritedOpencodeConfig(() => {
-  for (const model of ['', 'gpt-6-astra', '/gpt-6-astra', 'openai/', 'openai/gpt 6', ' openai/gpt-6']) {
+  for (const model of ['', 'gpt-6-astra', '/gpt-6-astra', 'openai/', 'openai/gpt 6', ' openai/gpt-6', 'openai//gpt-6-astra', 'openai/gpt-6-astra/']) {
     assert.throws(() => buildCliCommand('OpenCode', { model }), /agent opencode: invalid model.*provider\/model/)
   }
   for (const raw of [
