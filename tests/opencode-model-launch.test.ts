@@ -63,6 +63,9 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
             (args[0] === 'terminal' && args[1] === 'send') ||
             (args[0] === 'orchestration' && args[1] === 'dispatch'),
           ).length, 0, 'invalid model must never execute or receive a task')
+          assert.ok((await calls()).some(args =>
+            args[0] === 'terminal' && args[1] === 'close' && args.includes('worker-shell'),
+          ), 'validation failure must clean up the prepared terminal')
         } else {
           assert.equal((await run).worker.report.summary, 'reviewed')
           const sends = (await calls()).filter(args => args[0] === 'terminal' && args[1] === 'send')
