@@ -9705,11 +9705,11 @@ test("launchAgent carries role settings even when no agent harness is configured
       "opencode",
       launchAgent({
         auto_fix: autoFix,
-        model: "gpt-5.6",
+        model: "openai/gpt-5.6",
         effort: "high",
       })?.[0] ?? {},
     ),
-    `OPENCODE_CONFIG_CONTENT='{"agent":{"build":{"model":"gpt-5.6","variant":"high"}}}' 'opencode' '--model' 'gpt-5.6' '--agent' 'build'`,
+    `OPENCODE_CONFIG_CONTENT='{"agent":{"build":{"model":"openai/gpt-5.6","variant":"high"}}}' 'opencode' '--model' 'openai/gpt-5.6' '--agent' 'build'`,
   );
   assert.deepEqual(
     launchAgent({
