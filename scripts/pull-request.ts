@@ -221,7 +221,7 @@ function testingSection(testing: PullRequestReport['testing']): string {
     artifacts.push(entry)
   }
   const live = testing.liveValidation
-    ? `\n\n${capText(liveValidationText(testing.liveValidation, testing.evidenceCommitOid), 4096)}`
+    ? `\n\n${capMarkdownText(liveValidationText(testing.liveValidation, testing.evidenceCommitOid), 4096)}`
     : '\n\nStructured live-validation evidence was not recorded (pre-contract or absent Test evidence).'
   return `## Testing\n\n${capMarkdownText(testing.summary, 4096)}${live}${commands}${artifacts.length > 0 ? `\n\n${artifacts.join('\n\n')}` : ''}`
 }
