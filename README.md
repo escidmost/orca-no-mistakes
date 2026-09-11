@@ -72,7 +72,7 @@ Workers launch with the `opencode` agent on the agent's own default model by def
 ## Live Test evidence
 
 New Test checker reports require `liveValidation`: an overall `verdict`, a nonempty
-`reason`, and named `scenarios`. Each scenario records `result` (`pass`, `fail`, or
+`reason`, and named `scenarios` whose trimmed names are nonempty and unique. Each scenario records `result` (`pass`, `fail`, or
 `untested`), a boolean `live`, an `evidence` string array, and a `limitation` string.
 Pass/fail requires live execution and nonempty evidence. Untested requires
 `live: false` and a nonempty limitation. Live means driving the real product during
@@ -81,8 +81,9 @@ checks, not live execution.
 
 `go` requires a live pass and no failed scenario. `no-go` creates an actionable
 failure; every failed scenario requires that verdict. `inconclusive` and
-`no-surface` require an explicit human decision. Only `no-surface` permits an empty
-scenario list, with its reason explaining why no runtime surface applies.
+`no-surface` require an explicit human decision. `no-surface` requires
+`scenarios: []`, with its reason explaining why no runtime surface applies; every
+other verdict requires at least one scenario.
 An individually untested scenario need not block a justified overall `go`.
 
 Put startup and focused end-user test instructions in the inline `test_runbook`
