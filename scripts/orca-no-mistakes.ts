@@ -6717,14 +6717,21 @@ function reviewRoundHistoryPrompt(ledger: DomainLedger, runId: string): string {
   const rounds: string[] = [];
   let bytes = 2;
   let truncated = false;
-  for (const snapshot of ledger.listPresentationSnapshots(runId).reverse()) {
+  const snapshots = ledger.listPresentationSnapshots(runId);
+  const repairIndex = new Map<PresentationSnapshot, number>();
+  const repairsByRound = new Map<number, number>();
+  for (const snapshot of snapshots) {
     const fix = snapshot.transition;
     if (fix.kind !== "fix-completed" || fix.stage !== "review") continue;
-    const candidates = checkpoints.filter((entry) => entry.round_index === fix.round);
-    const prior = checkpoints.findLast((entry) => entry.round_index < fix.round);
-    const checkpoint = candidates.find(
-      (entry) => entry.input_commit_oid === prior?.output_commit_oid,
-    ) ?? candidates.at(-1);
+    const index = repairsByRound.get(fix.round) ?? 0;
+    repairIndex.set(snapshot, index);
+    repairsByRound.set(fix.round, index + 1);
+  }
+  for (const snapshot of snapshots.reverse()) {
+    const fix = snapshot.transition;
+    if (fix.kind !== "fix-completed" || fix.stage !== "review") continue;
+    const checkpoint = checkpoints
+      .filter((entry) => entry.round_index === fix.round)[repairIndex.get(snapshot)!];
     const rendered = fenceUntrusted(JSON.stringify({
       round: fix.round,
       analysis: fix.analysis,

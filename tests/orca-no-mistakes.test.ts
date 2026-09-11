@@ -2904,6 +2904,57 @@ test("rereview after reopening attributes the repair checkpoint, not the settlem
   }
 });
 
+test("rereview after resume and reopening attributes the repair checkpoint without a prior round", async () => {
+  class InterruptedRereview extends FakeOrca {
+    reviews = 0;
+    override async startWorker(taskId: string, launch: WorkerLaunch): Promise<WorkerResult> {
+      if (launch.stage === "review" && launch.role === "reviewer" && ++this.reviews === 2) {
+        throw new Error("interrupted before rereview");
+      }
+      return super.startWorker(taskId, launch);
+    }
+  }
+  const git = new FakeGit();
+  allowReviewAutoFixWithStrictGuardrails(git);
+  git.policyDigest = "f".repeat(64);
+  const runId = `rereview-resume-reopen-${randomUUID()}`;
+  const orca = new InterruptedRereview(git, runId);
+  const ledger = new DomainLedger(":memory:");
+  const intent = "Reject blank names";
+  orca.reports.set("review", [
+    { findings: [{ id: "first", action: "auto-fix", severity: "error", description: "Fix first" }], summary: "First finding" },
+    pass("First repair"),
+  ]);
+  try {
+    await assert.rejects(runPipeline({ intent }, orca, git, ledger), /interrupted before rereview/);
+    const repair = ledger.listCheckpoints(runId).findLast((row) => row.stage_id === "review")!;
+    assert.notEqual(repair.input_commit_oid, repair.output_commit_oid);
+    const resumed = new FakeOrca(git, runId);
+    resumed.reports.set("review", [
+      { findings: [{ id: "approved", action: "ask-user", severity: "error", description: "Needs approval" }], summary: "Needs approval" },
+      pass("Clean after reopen"),
+    ]);
+    resumed.reports.set("test", [
+      { findings: [{ id: "test-gap", action: "auto-fix", severity: "error", description: "Fix test gap" }], summary: "Test gap" },
+      pass("Test repair"),
+      pass("Tests pass"),
+      pass("Tests pass"),
+    ]);
+    await runPipeline({ intent, resumeRunId: runId }, resumed, git, ledger);
+    const review = ledger.listCheckpoints(runId).filter((row) => row.stage_id === "review");
+    const settlement = review[1];
+    assert.equal(settlement.round_index, repair.round_index);
+    assert.equal(settlement.input_commit_oid, settlement.output_commit_oid);
+    const prompts = resumed.launches.filter((launch) => launch.stage === "review" && launch.role === "reviewer").map((launch) => launch.prompt);
+    assert.equal(prompts.length, 2);
+    const history = prompts[1].split("<untrusted_review_rounds>\n")[1].split("\n</untrusted_review_rounds>")[0];
+    assert.ok(history.includes(`"inputCommit":"${repair.input_commit_oid}","outputCommit":"${repair.output_commit_oid}"`));
+    assert.equal(history.includes(`"inputCommit":"${settlement.input_commit_oid}","outputCommit":"${settlement.output_commit_oid}"`), false);
+  } finally {
+    ledger.close();
+  }
+});
+
 test("reviewer prompts fall back to placeholders when the branch has no diff or AGENTS.md", async () => {
   const git = new FakeGit();
   const orca = new FakeOrca(git);
