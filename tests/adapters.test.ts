@@ -17,6 +17,21 @@ import {
   workerAgentReadyTimeoutMs
 } from '../scripts/adapters.ts'
 
+// Command expectations below assume no inherited OpenCode config; the dispatched
+// environment may carry one, so clear it for the duration of the assertions.
+function withoutInheritedOpencodeConfig(fn: () => void): () => void {
+  return () => {
+    const saved = process.env.OPENCODE_CONFIG_CONTENT
+    delete process.env.OPENCODE_CONFIG_CONTENT
+    try {
+      fn()
+    } finally {
+      if (saved === undefined) delete process.env.OPENCODE_CONFIG_CONTENT
+      else process.env.OPENCODE_CONFIG_CONTENT = saved
+    }
+  }
+}
+
 test('classifyHarness routes native, CLI, and ACP harnesses', () => {
   assert.equal(classifyHarness('claude'), 'cli')
   assert.equal(classifyHarness('codex'), 'cli')
@@ -103,7 +118,7 @@ test('nativeWorkerStartArgs maps model, effort, timeout, and worktree placement'
   )
 })
 
-test('buildCliCommand formats startup lines with model, variant, env, and override args', () => {
+test('buildCliCommand formats startup lines with model, variant, env, and override args', withoutInheritedOpencodeConfig(() => {
   assert.equal(buildCliCommand('opencode'), `'opencode'`)
   assert.equal(
     buildCliCommand('opencode', { model: 'openai/gpt-5.6', variant: 'high' }),
@@ -371,9 +386,9 @@ test('buildCliCommand formats startup lines with model, variant, env, and overri
     agentArgsOverride: { grok: ['--dangerously-auto', '-q'] } as never
   })
   assert.equal(extra, `'grok' '--dangerously-auto' '-q'`)
-})
+}))
 
-test('OpenCode validates the effective explicit model without selecting a provider', () => {
+test('OpenCode validates the effective explicit model without selecting a provider', withoutInheritedOpencodeConfig(() => {
   for (const model of ['', 'gpt-6-astra', '/gpt-6-astra', 'openai/', 'openai/gpt 6', ' openai/gpt-6']) {
     assert.throws(() => buildCliCommand('OpenCode', { model }), /agent opencode: invalid model.*provider\/model/)
   }
@@ -393,7 +408,7 @@ test('OpenCode validates the effective explicit model without selecting a provid
   assert.throws(() => buildCliCommand('opencode', {
     model: 'bare', agentArgsOverride: { opencode: ['--', '--model', 'openai/gpt-6-astra'] },
   }), /provider\/model/)
-})
+}))
 
 test('buildCliCommand rejects environment names that would break out of the assignment prefix', () => {
   assert.throws(
