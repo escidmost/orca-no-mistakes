@@ -2862,6 +2862,48 @@ test("rereview provenance bounds oversized rounds while retaining newer useful e
   }
 });
 
+test("rereview after reopening attributes the repair checkpoint, not the settlement checkpoint", async () => {
+  const git = new FakeGit();
+  allowReviewAutoFixWithStrictGuardrails(git);
+  const runId = `rereview-reopen-${randomUUID()}`;
+  const orca = new FakeOrca(git, runId);
+  const ledger = new DomainLedger(":memory:");
+  const finding = (id: string): Finding => ({
+    id, action: "auto-fix", severity: "error", description: `Fix ${id}`,
+  });
+  orca.reports.set("review", [
+    { findings: [finding("first")], summary: "First finding" },
+    pass("First repair"),
+    { findings: [finding("second")], summary: "Second finding" },
+    pass("Second repair"),
+    { findings: [{ ...finding("approved"), action: "ask-user" }], summary: "Needs approval" },
+    pass("Clean after reopen"),
+  ]);
+  orca.reports.set("test", [
+    { findings: [finding("test-gap")], summary: "Test gap" },
+    pass("Test repair"),
+    pass("Tests pass"),
+    pass("Tests pass"),
+  ]);
+  try {
+    await runPipeline({ intent: "Reject blank names" }, orca, git, ledger);
+    const review = ledger.listCheckpoints(runId).filter((row) => row.stage_id === "review");
+    const [first, second, settlement] = review;
+    assert.equal(review.length, 4);
+    assert.equal(second.round_index, settlement.round_index);
+    assert.equal(first.input_commit_oid, settlement.input_commit_oid);
+    assert.equal(second.output_commit_oid, settlement.output_commit_oid);
+    const prompts = orca.launches.filter((launch) => launch.stage === "review" && launch.role === "reviewer").map((launch) => launch.prompt);
+    assert.equal(prompts.length, 4);
+    const history = prompts[3].split("<untrusted_review_rounds>\n")[1].split("\n</untrusted_review_rounds>")[0];
+    assert.ok(history.includes(`"round":${second.round_index},`));
+    assert.ok(history.includes(`"inputCommit":"${second.input_commit_oid}","outputCommit":"${second.output_commit_oid}"`));
+    assert.equal(history.includes(`"inputCommit":"${settlement.input_commit_oid}","outputCommit":"${settlement.output_commit_oid}"`), false);
+  } finally {
+    ledger.close();
+  }
+});
+
 test("reviewer prompts fall back to placeholders when the branch has no diff or AGENTS.md", async () => {
   const git = new FakeGit();
   const orca = new FakeOrca(git);

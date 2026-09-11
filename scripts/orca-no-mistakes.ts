@@ -6713,16 +6713,18 @@ ${deliveryInstruction(delivery, reportPath, `{"findings":[],"summary":"what was 
 const FINDING_DECISION_HISTORY_LIMIT_BYTES = 16 * 1024;
 
 function reviewRoundHistoryPrompt(ledger: DomainLedger, runId: string): string {
-  const checkpoints = ledger.listCheckpoints(runId);
+  const checkpoints = ledger.listCheckpoints(runId).filter((entry) => entry.stage_id === "review");
   const rounds: string[] = [];
   let bytes = 2;
   let truncated = false;
   for (const snapshot of ledger.listPresentationSnapshots(runId).reverse()) {
     const fix = snapshot.transition;
     if (fix.kind !== "fix-completed" || fix.stage !== "review") continue;
-    const checkpoint = checkpoints.findLast(
-      (entry) => entry.stage_id === "review" && entry.round_index === fix.round,
-    );
+    const candidates = checkpoints.filter((entry) => entry.round_index === fix.round);
+    const prior = checkpoints.findLast((entry) => entry.round_index < fix.round);
+    const checkpoint = candidates.find(
+      (entry) => entry.input_commit_oid === prior?.output_commit_oid,
+    ) ?? candidates.at(-1);
     const rendered = fenceUntrusted(JSON.stringify({
       round: fix.round,
       analysis: fix.analysis,
