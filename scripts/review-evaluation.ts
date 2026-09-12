@@ -87,17 +87,22 @@ export function coordinatorIdentity(): string {
 export function loadCase(corpus: string, id: string): ReviewCase {
   const dir = caseDir(corpus, id)
   let value: ReviewCase
-  try { value = Case.parse(json(path.join(dir, 'case.json'))) }
+  let bundleHash: string
+  try {
+    value = Case.parse(json(path.join(dir, 'case.json')))
+    bundleHash = bytesHash(path.join(dir, 'repository.bundle'))
+  }
   catch (cause) {
     throw new Error('Incomplete historical review inputs: need a captured case.json, frozen prompt and repository.bundle; current policy will not be substituted', { cause })
   }
   if (value.id !== id || identity(value.inputs) !== id) throw new Error('Review case input identity mismatch')
-  if (bytesHash(path.join(dir, 'repository.bundle')) !== value.bundleHash) throw new Error('Review case bundle identity mismatch')
+  if (bundleHash !== value.bundleHash) throw new Error('Review case bundle identity mismatch')
   return value
 }
 
 export function selectCases(corpus: string, requested?: string[]): string[] {
-  const ids = requested ?? readdirSync(path.join(corpus, 'cases')).filter(name => Hash.safeParse(name).success)
+  const dir = path.join(corpus, 'cases')
+  const ids = requested ?? (existsSync(dir) ? readdirSync(dir).filter(name => Hash.safeParse(name).success) : [])
   if (ids.length === 0 || new Set(ids).size !== ids.length) throw new Error('Select at least one case, with no duplicate IDs')
   for (const id of ids) loadCase(corpus, id)
   return [...ids].sort()
@@ -196,9 +201,10 @@ export function importCase(sourceCorpus: string, corpus: string, id: string): Re
 
 export function pruneCase(corpus: string, id: string): void {
   locked(corpus, () => {
-    loadCase(corpus, id)
+    const dir = caseDir(corpus, id)
+    if (!existsSync(dir)) throw new Error('No such review case in this corpus')
     // Every case owns a self-contained bundle; no shared object or source ref is deleted.
-    rmSync(caseDir(corpus, id), { recursive: true })
+    rmSync(dir, { recursive: true })
   })
 }
 
@@ -208,8 +214,10 @@ export function bestEffortCapture(work: () => unknown, warn: (message: string) =
 
 export function completeAutomaticCapture(sourceCorpus: string, corpus: string): void {
   bestEffortCapture(() => {
-    if (!existsSync(path.join(sourceCorpus, 'cases'))) return
-    for (const id of selectCases(sourceCorpus)) bestEffortCapture(() => importCase(sourceCorpus, corpus, id))
+    const dir = path.join(sourceCorpus, 'cases')
+    if (!existsSync(dir)) return
+    const ids = readdirSync(dir).filter(name => Hash.safeParse(name).success).sort()
+    for (const id of ids) bestEffortCapture(() => importCase(sourceCorpus, corpus, id))
   })
 }
 
@@ -236,8 +244,9 @@ export async function replayCase(corpus: string, id: string, configInput: unknow
       commitOid: value.inputs.candidate, prompt: value.inputs.prompt,
       agent: { harness: config.harness, model: config.model, timeoutMs: config.timeout_ms },
     })
+    if (worker.failedOutcome) throw new Error('Review replay failed: the reviewer reported a failed outcome')
     const report = await validateReport(worker.report, 'review', temp)
-    if (worker.failedOutcome || commit(repo, 'HEAD') !== value.inputs.candidate || git(repo, 'status', '--porcelain') || git(repo, 'remote')) {
+    if (commit(repo, 'HEAD') !== value.inputs.candidate || git(repo, 'status', '--porcelain') || git(repo, 'remote')) {
       throw new Error('Review-only isolation violated: reviewer changed checkout or remotes')
     }
     const body = ResultBody.parse({

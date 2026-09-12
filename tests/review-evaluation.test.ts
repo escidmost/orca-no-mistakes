@@ -9,7 +9,8 @@ import {
   importCase, loadCase, loadGold, loadResult, pruneCase, replayCase, score, seedCorpus, selectCases,
 } from '../scripts/review-evaluation.ts'
 import { parseConfig } from '../scripts/config.ts'
-import { main } from '../scripts/orca-no-mistakes.ts'
+import { CliOrca, main } from '../scripts/orca-no-mistakes.ts'
+import { cleanGitEnvironment } from '../scripts/ledger.ts'
 
 test('replay CLI help succeeds without corpus access while missing commands still fail', async t => {
   const output: string[] = []
@@ -28,7 +29,7 @@ function fixture(t: test.TestContext) {
   mkdirSync(repo)
   const git = (...args: string[]) => execFileSync('git', args, {
     cwd: repo, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null',
+    env: { ...cleanGitEnvironment(), GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_TERMINAL_PROMPT: '0',
       GIT_AUTHOR_NAME: 'Corpus fixture', GIT_AUTHOR_EMAIL: 'fixture@example.test',
       GIT_COMMITTER_NAME: 'Corpus fixture', GIT_COMMITTER_EMAIL: 'fixture@example.test' },
   }).trim()
@@ -70,6 +71,7 @@ console.log(JSON.stringify({findings, summary:'Offline fixture review complete',
 
 test('capture validates immutable inputs, deduplicates, deterministically selects fixed corpus and retains provenance', t => {
   const f = fixture(t)
+  assert.throws(() => selectCases(f.corpus), /Select at least one case, with no duplicate IDs/)
   const defect = captureCase(f.options)
   assert.equal(captureCase(f.options).id, defect.id)
   const clean = captureCase({ ...f.options, candidate: f.base })
@@ -104,6 +106,8 @@ test('historical capture rejects missing prompt and bundle instead of substituti
   assert.deepEqual(loadGold(path.join(f.root, 'imported'), value.id).issues, [])
   writeFileSync(path.join(f.corpus, 'cases', value.id, 'repository.bundle'), 'corrupt')
   assert.throws(() => loadCase(f.corpus, value.id), /bundle identity/)
+  rmSync(path.join(f.corpus, 'cases', value.id, 'repository.bundle'))
+  assert.throws(() => loadCase(f.corpus, value.id), /Incomplete historical review inputs/)
 })
 
 test('retention survives source ref deletion and garbage collection; pruning never damages another case', async t => {
@@ -246,6 +250,12 @@ test('capture refuses external LFS and submodule inputs instead of certifying in
 })
 
 test('capture and replay retain the source SHA-256 object format', async t => {
+  const version = execFileSync('git', ['--version'], { encoding: 'utf8' }).match(/git version (\d+)\.(\d+)/)
+  assert.ok(version, 'Git version must be identifiable')
+  if (Number(version[1]) < 2 || (Number(version[1]) === 2 && Number(version[2]) < 29)) {
+    t.skip('SHA-256 bundles require Git >=2.29')
+    return
+  }
   const f = fixture(t)
   rmSync(path.join(f.repo, '.git'), { recursive: true })
   f.git('init', '--object-format=sha256', '-b', 'main')
@@ -253,4 +263,43 @@ test('capture and replay retain the source SHA-256 object format', async t => {
   const value = captureCase({ ...f.options, base: 'HEAD', candidate: 'HEAD' })
   assert.equal(value.inputs.candidate.length, 64)
   assert.equal((await replayCase(f.corpus, value.id, f.config(), f.acpx)).caseId, value.id)
+})
+
+test('automatic import isolates corrupt cases and pruning keeps validated path boundaries', t => {
+  const f = fixture(t)
+  const valid = captureCase(f.options)
+  const malformed = captureCase({ ...f.options, intent: 'malformed' })
+  const corrupt = captureCase({ ...f.options, intent: 'corrupt' })
+  writeFileSync(path.join(f.corpus, 'cases', malformed.id, 'case.json'), '{}')
+  writeFileSync(path.join(f.corpus, 'cases', corrupt.id, 'repository.bundle'), 'corrupt')
+  const warnings: string[] = []
+  t.mock.method(console, 'error', (message: string) => warnings.push(message))
+  const destination = path.join(f.root, 'imported')
+  completeAutomaticCapture(f.corpus, destination)
+  assert.deepEqual(selectCases(destination), [valid.id])
+  assert.equal(warnings.length, 2)
+  for (const id of [malformed.id, corrupt.id]) pruneCase(f.corpus, id)
+  assert.throws(() => pruneCase(f.corpus, '../source'), /Invalid/)
+  assert.throws(() => pruneCase(f.corpus, corrupt.id), /No such review case/)
+  assert.deepEqual(selectCases(f.corpus), [valid.id])
+})
+
+test('replay failed outcomes are not reported as isolation violations', async t => {
+  const f = fixture(t)
+  const value = captureCase(f.options)
+  t.mock.method(CliOrca.prototype, 'startWorker', async () => ({ failedOutcome: true }))
+  t.mock.method(CliOrca.prototype, 'finishWorker', async () => {})
+  await assert.rejects(replayCase(f.corpus, value.id, f.config(), f.acpx), /Review replay failed/)
+})
+
+test('capture fixture excludes inherited repository-scoping environment', t => {
+  const keys = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE']
+  const prior = keys.map(key => process.env[key])
+  try {
+    for (const key of keys) process.env[key] = '/nonexistent/onm-fixture-sentinel'
+    const f = fixture(t)
+    assert.equal(f.git('rev-parse', 'HEAD'), f.candidate)
+  } finally {
+    keys.forEach((key, index) => { if (prior[index] === undefined) delete process.env[key]; else process.env[key] = prior[index] })
+  }
 })
