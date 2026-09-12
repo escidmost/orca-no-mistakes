@@ -3480,6 +3480,7 @@ export async function runPipeline(
             stageLogs,
             decisionHistory() + (stage === "review" ? reviewRoundHistoryPrompt(ledger, runId) : ""),
             pipelineConfig.test_runbook,
+            options.userGlobalConfig?.evaluation?.capture_on_completion === true,
           );
         } catch (stageError) {
           if (
@@ -4317,6 +4318,14 @@ export async function runPipeline(
         "completed",
       )
       .catch(() => {});
+    if (options.userGlobalConfig?.evaluation?.capture_on_completion === true) {
+      try {
+        const { completeAutomaticCapture } = await import('./review-evaluation.ts');
+        completeAutomaticCapture(path.join(artifactsDir, 'review-cases'), path.join(noMistakesHome(), 'evaluation'));
+      } catch (error) {
+        console.error(`Review corpus capture failed (pipeline outcome unchanged): ${String(error)}`);
+      }
+    }
     return {
       ...(attestation.version === "2.0.0"
         ? { completionAttestation: attestation }
@@ -5078,6 +5087,7 @@ async function executeStage(
   stageLogs: Map<string, StageLog> | undefined,
   decisionHistory: string,
   testRunbook = "",
+  captureReview = false,
 ): Promise<StageExecution> {
   const stageLog = registeredStageLog(
     stageLogs,
@@ -5106,6 +5116,22 @@ async function executeStage(
         workerIdentity: "coordinator",
         resolvedAgent: "coordinator",
       };
+    }
+    if (stage === 'review' && captureReview) {
+      try {
+        const { captureCase } = await import('./review-evaluation.ts');
+        captureCase({
+          repo: repo.root, corpus: path.join(evidenceDir, 'review-cases'),
+          base: repo.base, candidate: await git.head(), branch: repo.branch,
+          intent, decisionHistory,
+          source: {
+            reference: `run-artifacts:${path.basename(evidenceDir)}:review:${round}`,
+            note: 'New evaluation snapshot captured before review, using the shared coordinator policy and ACP delivery envelope. Candidate, base and decision history frozen; no original worker-session or retry reconstruction and no gold inferred from run decisions.',
+          },
+        });
+      } catch (error) {
+        console.error(`Review corpus capture failed (pipeline outcome unchanged): ${String(error)}`);
+      }
     }
     return await withTimeout(
       roles.reviewer.timeout_ms ?? defaultWorkerTimeoutMs(),
@@ -6503,7 +6529,7 @@ async function untrustedBranchContext(
   };
 }
 
-function checkerPrompt(
+export function checkerPrompt(
   stage: StageName,
   intent: string,
   repo: RepoState,
@@ -7110,6 +7136,7 @@ async function command(
   options: {
     abortSignal?: AbortSignal;
     allowFailure?: boolean;
+    env?: NodeJS.ProcessEnv;
     onOutput?: CommandOutput;
     stdin?: string;
     timeoutMs?: number | null;
@@ -7120,7 +7147,7 @@ async function command(
     const gated = allocation !== undefined;
     const spawnOptions = {
       cwd,
-      env: process.env,
+      env: options.env ?? process.env,
       killSignal: "SIGKILL" as const,
       signal: options.abortSignal,
     };
@@ -7388,6 +7415,7 @@ type PreparedWorker = {
 
 type CliOrcaOptions = {
   acpxCommand?: string;
+  acpxEnvironment?: NodeJS.ProcessEnv;
   command?: string;
   cwd: string;
   notifyHandle?: string;
@@ -7405,6 +7433,7 @@ function resolveOrcaCommand(override?: string): string {
 
 export class CliOrca implements OrcaOperations {
   readonly #acpxCommand: string;
+  readonly #acpxEnvironment?: NodeJS.ProcessEnv;
   readonly #command: string;
   readonly #cwd: string;
   readonly #notifyHandle?: string;
@@ -7438,6 +7467,7 @@ export class CliOrca implements OrcaOperations {
     this.#notifyHandle = options.notifyHandle;
     this.#parentWorktree = options.parentWorktree ?? options.cwd;
     this.#acpxCommand = options.acpxCommand ?? "acpx";
+    this.#acpxEnvironment = options.acpxEnvironment;
     this.#runId = options.runId;
   }
 
@@ -8904,6 +8934,7 @@ export class CliOrca implements OrcaOperations {
         const fenceSignal = fence?.signal;
         processDone = command(this.#acpxCommand, invocation.args, cwd, {
           allowFailure: true,
+          env: this.#acpxEnvironment,
           abortSignal: fenceSignal
             ? AbortSignal.any([fenceSignal, processAbort.signal])
             : processAbort.signal,
@@ -16058,6 +16089,11 @@ async function runGateCoordinatorCommand(flags: RawCliFlags): Promise<void> {
 }
 
 export async function main(argv: string[]): Promise<void> {
+  if (argv[0] === 'evaluation') {
+    const { evaluationMain } = await import('./review-evaluation.ts');
+    await evaluationMain(argv.slice(1));
+    return;
+  }
   if (
     argv.length === 0 ||
     argv[0] === "--help" ||
@@ -16074,6 +16110,7 @@ export async function main(argv: string[]): Promise<void> {
   orca-no-mistakes attestation verify <manifest-file|run-id|commit-sha> [--repo <path>]
   orca-no-mistakes prune [--before <date>] [--repo <path>]
   orca-no-mistakes prune --stranded [--repo <path>]
+  orca-no-mistakes evaluation <seed|capture|list|replay|adjudicate|compare|prune> (docs/review-evaluation.md)
 
 Run options:
   --reviewer-model <model>

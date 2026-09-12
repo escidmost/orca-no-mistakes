@@ -549,6 +549,22 @@ const allowReviewAutoFixWithStrictGuardrails = (git: FakeGit) => {
   );
 };
 
+test('automatic review capture failure does not change a successful pipeline outcome', async (t) => {
+  const git = new FakeGit();
+  const orca = new FakeOrca(git);
+  const ledger = new DomainLedger(':memory:');
+  t.after(() => ledger.close());
+  const warnings: string[] = [];
+  t.mock.method(console, 'error', (message: unknown) => warnings.push(String(message)));
+  const result = await runPipeline({
+    intent: 'Verify optional capture isolation',
+    userGlobalConfig: { evaluation: { capture_on_completion: true } },
+  }, orca, git, ledger);
+  assert.equal(result.verdict, 'passed');
+  assert.ok(warnings.some(message => message.includes('Review corpus capture failed (pipeline outcome unchanged)')));
+  assert.equal(orca.launches.filter(launch => launch.role === 'fixer').length, 0);
+});
+
 test("runs the six-stage local adversarial pipeline with fixes, gates, and isolation", async () => {
   const git = new FakeGit();
   git.baseFiles.set(
