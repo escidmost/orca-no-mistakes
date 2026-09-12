@@ -78,7 +78,7 @@ export async function approvedMediaBytes(root: string, file: string, digest: str
       : type.mime === 'video/webm' ? magic.subarray(0, 4).equals(Buffer.from('1a45dfa3', 'hex'))
       : magic.toString('ascii', 4, 8) === 'ftyp'
     if (!matches) throw new Error('Media bytes do not match the supported file type.')
-    return { bytes, ...type, name: path.basename(file) }
+    return { bytes, ...type, name: `${digest}${path.extname(file).toLowerCase()}` }
   } finally { await handle.close() }
 }
 

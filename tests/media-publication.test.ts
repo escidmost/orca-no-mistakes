@@ -20,7 +20,7 @@ test('approved snapshot is exactly the uploaded image/video bytes, with bounded 
     const result = await uploadGithubMedia({ ...media, host: 'github.com', repositoryId: '42', token: 'gho_test' }, async (endpoint, init) => {
       assert.equal(new URL(String(endpoint)).origin, 'https://uploads.github.com')
       assert.equal(new URL(String(endpoint)).searchParams.get('repository_id'), '42')
-      assert.equal(new URL(String(endpoint)).searchParams.get('name'), name)
+      assert.equal(new URL(String(endpoint)).searchParams.get('name'), `${digest(bytes)}${path.extname(name)}`)
       assert.equal(init?.method, 'POST')
       assert.equal(init?.redirect, 'error')
       assert.equal((init?.headers as Record<string, string>).Authorization, 'Bearer gho_test')
