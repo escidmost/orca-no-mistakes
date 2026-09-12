@@ -58,6 +58,7 @@ function json(file: string): unknown { return JSON.parse(readFileSync(file, 'utf
 function writeJson(file: string, value: unknown): void {
   writeFileSync(file, `${canonicalJson(value)}\n`, { flag: 'wx', mode: 0o600 })
 }
+// ponytail: serial local Git blocks during capture; use async operations if large corpora need responsive progress/cancellation.
 function git(repo: string, ...args: string[]): string {
   return execFileSync('git', ['-c', 'core.hooksPath=/dev/null', ...args], {
     cwd: repo, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
@@ -382,7 +383,9 @@ export function seedCorpus(repo: string, corpus: string, manifest: unknown): { n
 }
 
 export async function evaluationMain(argv: string[]): Promise<void> {
+  const usage = 'Usage: orca-no-mistakes evaluation <seed|capture|list|replay|adjudicate|compare|prune> [--corpus PATH]; see docs/review-evaluation.md'
   const { values, positionals } = parseArgs({ args: argv, allowPositionals: true, options: {
+    help: { type: 'boolean', short: 'h' },
     corpus: { type: 'string', default: path.join(noMistakesHome(), 'evaluation') }, repo: { type: 'string', default: process.cwd() },
     base: { type: 'string' }, candidate: { type: 'string' }, intent: { type: 'string' },
     source: { type: 'string' }, note: { type: 'string' }, from: { type: 'string' },
@@ -391,6 +394,7 @@ export async function evaluationMain(argv: string[]): Promise<void> {
     reject: { type: 'boolean' }, complete: { type: 'boolean' }, selections: { type: 'string' },
     manifest: { type: 'string' },
   } })
+  if (values.help) { console.log(usage); return }
   const corpus = path.resolve(values.corpus!)
   const required = (key: keyof typeof values): string => {
     const value = values[key]
@@ -428,6 +432,6 @@ export async function evaluationMain(argv: string[]): Promise<void> {
     }
     case 'compare': console.log(compare(corpus, z.array(z.strictObject({ caseId: Hash, resultId: Hash })).parse(json(required('selections'))))); break
     case 'prune': pruneCase(corpus, oneCase()); console.log('Case pruned; other case bundles retained.'); break
-    default: throw new Error('Usage: orca-no-mistakes evaluation <seed|capture|list|replay|adjudicate|compare|prune> [--corpus PATH]; see docs/review-evaluation.md')
+    default: throw new Error(usage)
   }
 }

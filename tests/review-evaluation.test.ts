@@ -9,6 +9,17 @@ import {
   importCase, loadCase, loadGold, loadResult, pruneCase, replayCase, score, seedCorpus, selectCases,
 } from '../scripts/review-evaluation.ts'
 import { parseConfig } from '../scripts/config.ts'
+import { main } from '../scripts/orca-no-mistakes.ts'
+
+test('replay CLI help succeeds without corpus access while missing commands still fail', async t => {
+  const output: string[] = []
+  t.mock.method(console, 'log', (message: unknown) => output.push(String(message)))
+  for (const flag of ['--help', '-h']) await main(['evaluation', flag])
+  assert.equal(output.length, 2)
+  assert.ok(output.every(line => line.startsWith('Usage: orca-no-mistakes evaluation ')))
+  await assert.rejects(main(['evaluation']), /Usage:/)
+  await assert.rejects(main(['evaluation', 'list', '--unknown-option']), /Unknown option/)
+})
 
 function fixture(t: test.TestContext) {
   const root = mkdtempSync(path.join(tmpdir(), 'onm-evaluation-test-'))

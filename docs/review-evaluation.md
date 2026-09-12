@@ -51,7 +51,9 @@ The existing ACP quiet transport exposes no token/usage receipt, so results reco
 ## Capture and seed
 
 Use a private corpus outside the source checkout. By default it is
-`~/.orca-no-mistakes/evaluation` (under `NO_MISTAKES_HOME` when overridden).
+`~/.orca-no-mistakes/evaluation` (under `ORCA_NO_MISTAKES_HOME` when overridden).
+Capture uses synchronous Git operations; large bundles block the coordinator
+until Git returns. Optional automatic capture runs outside the reviewer timeout.
 
 ```bash
 ./bin/orca-no-mistakes evaluation capture --corpus /private/reviews \
