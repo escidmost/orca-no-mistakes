@@ -8,7 +8,7 @@ permissions:
   contents: read
 jobs:
   exact-total:
-    if: github.head_ref == 'evs/onm100-live-acceptance'
+    if: github.head_ref == 'evs/onm100-live-acceptance' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
