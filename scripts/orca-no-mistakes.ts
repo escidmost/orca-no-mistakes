@@ -76,6 +76,7 @@ import {
 import {
   effectivePolicyHash,
   resolveRunPolicy,
+  trustedRepoPolicyConfig,
   type PolicyProvenance,
 } from "./policy.ts";
 import {
@@ -2012,11 +2013,9 @@ export async function runPipeline(
     git,
     repoRoot: repo.root,
   });
-  // no_ci is trusted only from the base ref; a local-config bypass cannot declare it.
-  const trustedRepoConfig =
-    provenance.localBypass && repoPolicyConfig.ci
-      ? { ...repoPolicyConfig, ci: { ...repoPolicyConfig.ci, no_ci: false } }
-      : repoPolicyConfig;
+  // no_ci and media publication approvals are trusted only from the base ref;
+  // a local-config bypass cannot declare them.
+  const trustedRepoConfig = trustedRepoPolicyConfig(repoPolicyConfig, provenance);
   const pipelineConfig = resolvePipelineConfig({
     // The explicit fix-round option rides the highest precedence tier so every
     // stage budget derives from one resolved configuration.
