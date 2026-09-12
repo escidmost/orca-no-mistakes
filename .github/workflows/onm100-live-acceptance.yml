@@ -1,0 +1,22 @@
+name: ONM-100 live CI repair acceptance
+on:
+  pull_request:
+    paths:
+      - 'acceptance/onm100-live/**'
+      - '.github/workflows/onm100-live-acceptance.yml'
+permissions:
+  contents: read
+jobs:
+  exact-total:
+    if: github.head_ref == 'evs/onm100-live-acceptance' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24
+      - name: Require correct total from the exact PR candidate
+        run: node --input-type=module -e "import assert from 'node:assert/strict'; import { total } from './acceptance/onm100-live/total.mjs'; assert.equal(total(2, 3), 6, 'unit price times quantity must equal 6');"

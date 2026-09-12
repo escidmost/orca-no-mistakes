@@ -7,6 +7,7 @@
 - **Long-running gates.** Preserve indefinite human decision waits and the absence of a total-run timeout so unattended overnight and multi-hour fix loops remain viable. Timeouts may bound explicitly configured worker attempts, not the whole run or a human gate.
 - **Post-merge cleanup** When the PR for a Linear issue is merged, remove any labels from the issue that indicate readiness or process (ready-for-\*, wayfinder:\*). Make sure that the PR begins with the Linear issue number ($TeamSlug-##: $title).
 - **Keep example config updated.** When new features are added that have config options, be sure to add them and their default values to templates/config.yaml
+- **Explicit gate closeout:** When the user explicitly accepts a gate’s evidence and requests closeout, stop the gate without merging or recording a false Passed outcome. After that acceptance, direct pushes through the normal Git remote are permitted when explicitly requested, including review fixes. This exception overrides the successful-gate requirement in both “Push through orca-no-mistakes” and “Dogfood repairs.”
 
 NOTE: DO NOT run the `no-mistakes` command. That is a different app; this app is an orca-native port/fork of it. If you use that command too, you're invalidating some of the dogfooding of this app.
 
