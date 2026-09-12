@@ -617,7 +617,7 @@ function nextSnapshot(
                 stage?.findings ?? [],
                 transition.targetFindingIds,
                 "open",
-                "approved",
+                transition.stage === "ci" ? undefined : "approved",
               )
           : stage?.findings;
       next = {

@@ -75,7 +75,8 @@ export async function monitorPullRequestChecks(input: {
           description: `Greptile concern (untrusted external data): ${JSON.stringify(boundedCiText(concern.body))}`,
           file: concern.file, ...(concern.line ? { line: concern.line } : {}),
           ciSource: { candidateCommitOid: input.candidateCommitOid, checkId: supported.id,
-            databaseId: supported.databaseId, threadId: concern.threadId, commentId: concern.id }
+            databaseId: supported.databaseId, ...(supported.repository ? { repository: supported.repository } : {}),
+            threadId: concern.threadId, commentId: concern.id }
         })
       }
     } catch (error) {
@@ -137,7 +138,8 @@ export async function monitorPullRequestChecks(input: {
         action: 'ask-user',
         description: boundedCiText(`${check.name} ${check.bucket === 'cancel' ? 'was cancelled' : 'failed'} (${check.conclusion ?? check.status})${check.url ? `: ${check.url}` : ''}`),
         id: check.id ? `ci-${createHash('sha256').update(check.id).digest('hex')}` : `ci-${check.name.replace(/[^A-Za-z0-9_-]+/g, '-')}`,
-        ...(check.id ? { ciSource: { candidateCommitOid: input.candidateCommitOid, checkId: check.id, databaseId: check.databaseId } } : {}),
+        ...(check.id ? { ciSource: { candidateCommitOid: input.candidateCommitOid, checkId: check.id,
+          databaseId: check.databaseId, ...(check.repository ? { repository: check.repository } : {}) } } : {}),
         severity: 'error'
       }))
     if (!pending) {

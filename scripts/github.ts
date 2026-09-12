@@ -182,7 +182,8 @@ const CheckContextSchema = z.discriminatedUnion('__typename', [
     __typename: z.literal('CheckRun'),
     id: NodeIdSchema,
     databaseId: NumericIdSchema.nullable(),
-    checkSuite: z.object({ app: z.object({ id: NodeIdSchema, databaseId: NumericIdSchema.nullable(), slug: z.string() }).nullable() }),
+    checkSuite: z.object({ app: z.object({ id: NodeIdSchema, databaseId: NumericIdSchema.nullable(), slug: z.string() }).nullable(),
+      repository: z.object({ nameWithOwner: z.string().min(1) }).nullish() }),
     conclusion: z.string().nullable(),
     detailsUrl: z.string().nullable(),
     name: z.string(),
@@ -327,6 +328,7 @@ export type GithubCheckBucket = 'pass' | 'fail' | 'pending' | 'cancel' | 'skip'
 export type GithubCheckObservation = {
   id?: string
   databaseId?: string
+  repository?: string
   app?: { id: string; databaseId: string | null; slug: string } | null
   bucket: GithubCheckBucket
   conclusion: string | null
@@ -395,7 +397,7 @@ const PULL_REQUEST_CHECKS_QUERY = `query PullRequestChecks($id: ID!, $cursor: St
         nodes { commit { oid statusCheckRollup { contexts(first: 100, after: $cursor) {
           nodes {
             __typename
-            ... on CheckRun { id databaseId name status conclusion detailsUrl checkSuite { app { id databaseId slug } } }
+            ... on CheckRun { id databaseId name status conclusion detailsUrl checkSuite { app { id databaseId slug } repository { nameWithOwner } } }
             ... on StatusContext { id context state targetUrl }
           }
           pageInfo { hasNextPage endCursor }
@@ -623,6 +625,7 @@ export class GithubAuthority {
         ? {
           id: context.id,
           ...(context.databaseId === null ? {} : { databaseId: context.databaseId }),
+          ...(context.checkSuite.repository ? { repository: context.checkSuite.repository.nameWithOwner } : {}),
           app: context.checkSuite.app,
           bucket: checkBucket('check-run', context.status, context.conclusion),
           conclusion: context.conclusion,

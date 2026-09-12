@@ -197,7 +197,7 @@ const { O_APPEND, O_CREAT, O_EXCL, O_NOFOLLOW, O_NONBLOCK = 0, O_RDONLY = 0, O_W
 const FINDING_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
 
 export type Finding = {
-  ciSource?: { candidateCommitOid: string; checkId: string; databaseId?: string; threadId?: string; commentId?: string };
+  ciSource?: { candidateCommitOid: string; checkId: string; databaseId?: string; repository?: string; threadId?: string; commentId?: string };
   action: FindingAction;
   description: string;
   file?: string;
@@ -3836,7 +3836,7 @@ export async function runPipeline(
             if (source.databaseId) {
               try {
                 logs.push({ checkId: source.checkId, text: await options.githubAuthority!.observeCheckLog({
-                  repository: route.head_repository_name, candidateCommitOid: stageInputCommitOid,
+                  repository: source.repository ?? route.head_repository_name, candidateCommitOid: stageInputCommitOid,
                   checkId: source.checkId, databaseId: source.databaseId,
                 }) });
               } catch (error) {
