@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { withLivePass } from './live-validation-fixture.ts'
 import { execFileSync } from 'node:child_process'
 import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -71,7 +72,7 @@ async function runRelease2Pipeline(failAfter?: 'push' | 'pr', fork = false, merg
     },
     startWorker: async (taskId, launch) => ({
       dispatchId: `dispatch-${++dispatch}`,
-      report: { findings: [], summary: `${launch.stage} passed` },
+      report: withLivePass(launch, { findings: [], summary: `${launch.stage} passed` }),
       shutdownConfirmed: false,
       taskId,
       terminalHandle: `term-${dispatch}`,

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { withLivePass } from './live-validation-fixture.ts';
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -73,7 +74,7 @@ test("resume skips approved evidence when its checkpoint write failed", async ()
           report:
             launch.stage === "review"
               ? structuredClone(finding)
-              : { findings: [], summary: "passed" },
+              : withLivePass(launch, { findings: [], summary: "passed" }),
           taskId,
           terminalHandle: `term-${dispatchId}`,
         };

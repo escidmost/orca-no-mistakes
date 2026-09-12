@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { withLivePass } from './live-validation-fixture.ts'
 import { execFileSync } from 'node:child_process'
 import { mkdtemp, mkdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -244,7 +245,7 @@ test('runPipeline reuses published PR content on stage resume without redrafting
         }
         return {
           dispatchId: 'dispatch-default',
-          report: { findings: [], summary: `${launch.stage} passed` },
+          report: withLivePass(launch, { findings: [], summary: `${launch.stage} passed` }),
           shutdownConfirmed: false,
           taskId,
           terminalHandle: 'term-default'

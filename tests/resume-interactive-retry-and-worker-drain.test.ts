@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { withLivePass } from './live-validation-fixture.ts';
 import { randomUUID } from "node:crypto";
 import test from "node:test";
 
@@ -286,7 +287,7 @@ class FakeOrca implements OrcaOperations {
     return {
       deliveryId: `delivery-${dispatchId}`,
       dispatchId,
-      report: pass(launch.stage),
+      report: withLivePass(launch, pass(launch.stage)),
       taskId,
       terminalHandle: `term-${dispatchId}`,
       worktreeId:

@@ -100,6 +100,7 @@ export const OrcaNoMistakesConfigSchema = z.strictObject({
   ci: CiConfigSchema.optional(),
   agent_args_override: AgentArgsOverrideSchema.optional(),
   intent: z.string().optional(),
+  test_runbook: z.string().optional(),
   worktree_roots: z.record(z.string(), z.string()).superRefine((roots, context) => {
     for (const [checkout, root] of Object.entries(roots)) {
       if (!path.isAbsolute(checkout)) {
@@ -367,6 +368,7 @@ export function resolveRoleConfig(
 
 export interface ResolvedPipelineConfig {
   intent?: string
+  test_runbook?: string
   auto_fix: ResolvedAutoFixConfig
   ci: ResolvedCiConfig
   agent_args_override: AgentArgsOverride
@@ -417,6 +419,7 @@ export function resolvePipelineConfig(options: ResolverOptions = {}): ResolvedPi
 
   return {
     intent: c?.intent ?? r?.intent ?? u?.intent,
+    ...(r?.test_runbook ? { test_runbook: r.test_runbook } : {}),
     auto_fix: {
       ...withAutoFixDefaults(autoFix),
       guardrails: r?.auto_fix?.guardrails ?? BASELINE_AUTO_FIX.guardrails
@@ -458,6 +461,10 @@ export const DEFAULT_CONFIG_TEMPLATE = `# ======================================
 
 # Optional default task intent or objective statement
 # intent: "Ensure zero regressions and complete test coverage"
+
+# Trusted-base startup and focused end-user testing instructions (default: empty).
+# Inline the runbook here; proposed-branch instructions cannot redefine validation.
+test_runbook: ""
 
 # Optional user-global placement for coordinator run worktrees. Keys are
 # absolute registered checkout paths and values are absolute operator-owned

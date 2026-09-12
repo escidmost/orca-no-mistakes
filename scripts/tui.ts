@@ -1,5 +1,6 @@
 import path from "node:path";
 import { stripVTControlCharacters } from "node:util";
+import { liveValidationText } from "./live-validation.ts";
 
 import { PIPELINE_STEPS, type StageName } from "./config.ts";
 import {
@@ -966,6 +967,8 @@ export class RailTuiRenderer implements PresentationRenderer {
     const stageState = stage
       ? snapshot.stages.find((s) => s.id === stage)
       : undefined;
+    if (stageState?.liveValidation?.verdict === "inconclusive" ||
+        stageState?.liveValidation?.verdict === "no-surface") return;
     const actionable =
       (stageState?.openFindings ?? stageState?.actionableFindings ?? 0) > 0;
 
@@ -1414,6 +1417,12 @@ export class RailTuiRenderer implements PresentationRenderer {
     }
     rows.push({});
     const findings = state?.findings ?? [];
+    if (state?.liveValidation) {
+      for (const line of liveValidationText(state.liveValidation, state.evidenceCommitOid).split("\n")) {
+        for (const part of wrap(line, Math.max(8, width - 2))) rows.push({ segs: ["  ", part] });
+      }
+      rows.push({});
+    }
     if (findings.length === 0) {
       rows.push({
         segs: [

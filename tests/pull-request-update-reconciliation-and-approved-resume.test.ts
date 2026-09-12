@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { withLivePass } from './live-validation-fixture.ts'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -330,7 +331,7 @@ test('Release 2 resume reconciles approved stage settlement and contiguous check
           report:
             launch.stage === 'review'
               ? structuredClone(finding)
-              : { findings: [], summary: 'passed' },
+              : withLivePass(launch, { findings: [], summary: 'passed' }),
           taskId,
           terminalHandle: `term-${dispatchId}`
         }

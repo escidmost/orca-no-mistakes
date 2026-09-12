@@ -69,6 +69,36 @@ Validation policy comes from `.orca/no-mistakes.yaml` on the trusted base ref, n
 
 Workers launch with the `opencode` agent on the agent's own default model by default; the default maximum is three fix rounds. `ORCA_CLI_COMMAND` overrides the Orca executable and `WORKER_AGENT_READY_TIMEOUT_MS` overrides the 60-second agent-startup deadline. Fresh terminal workers wait 20 seconds when `$SHELL` is fish so hidden panes can finish fish's terminal query and settle before command delivery; `WORKER_SHELL_STARTUP_DELAY_MS` overrides that grace period.
 
+## Live Test evidence
+
+New Test checker reports require `liveValidation`: an overall `verdict`, a nonempty
+`reason`, and named `scenarios` whose trimmed names are nonempty and unique. Each scenario records `result` (`pass`, `fail`, or
+`untested`), a boolean `live`, an `evidence` string array, and a `limitation` string.
+Pass/fail requires live execution and nonempty evidence. Untested requires
+`live: false` and a nonempty limitation. Live means driving the real product during
+this run; unit tests, mocks, recordings, and source inspection are supporting
+checks, not live execution.
+
+`go` requires a live pass and no failed scenario. `no-go` creates an actionable
+failure; every failed scenario requires that verdict. `inconclusive` and
+`no-surface` require an explicit human decision. `no-surface` requires
+`scenarios: []`, with its reason explaining why no runtime surface applies; every
+other verdict requires at least one scenario.
+An individually untested scenario need not block a justified overall `go`.
+
+Put startup and focused end-user test instructions in the inline `test_runbook`
+string in trusted-base `.orca/no-mistakes.yaml` (default: empty). The runbook is
+validated and included in the effective policy hash; proposed-branch and user
+global runbooks do not override it. Explicit local-policy bypasses remain
+uncertified. Checkers stay read-only; fixers submit their separate repair report
+without live-validation requirements.
+
+Scenarios and verdicts are retained in commit-bound evidence, Test stage details,
+and the managed PR report. Changing the candidate reruns Test rather than claiming
+an earlier live result for the new commit. Pre-contract evidence remains readable
+and verifiable without inventing missing live results. Worker-attempt deadlines
+remain independent of human decisions; there is no total-run deadline.
+
 ## Attestations and retention
 
 ```bash

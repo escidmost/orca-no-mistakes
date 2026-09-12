@@ -2,6 +2,7 @@ import { stripVTControlCharacters } from "node:util";
 
 import { PIPELINE_STEPS, type StageName } from "./config.ts";
 import { redactKnownSecrets } from "./ledger.ts";
+import type { LiveValidation } from "./live-validation.ts";
 
 export type PresentationStatus =
   | "in-progress"
@@ -65,6 +66,8 @@ export type PresentationTransition =
       actionable: number;
       findings?: readonly Omit<PresentationFinding, "disposition">[];
       kind: "findings-recorded";
+      liveValidation?: LiveValidation;
+      evidenceCommitOid?: string;
       retainedFixer?: boolean;
       round: number;
       stage: StageName;
@@ -129,6 +132,8 @@ export type PresentationSnapshot = {
     fixAttempt?: number;
     fixedFindings?: number;
     id: StageName;
+    liveValidation?: LiveValidation;
+    evidenceCommitOid?: string;
     openFindings?: number;
     phase?: "fixer" | "reviewer";
     retainedFixer?: boolean;
@@ -383,6 +388,8 @@ function nextSnapshot(
         stages: updateStage(next, transition.stage, {
           actionableFindings: open,
           analysisFindings: undefined,
+          liveValidation: undefined,
+          evidenceCommitOid: undefined,
           approvedFindings: 0,
           findings: invalidatedFindings,
           fixAttempt: undefined,
@@ -556,6 +563,10 @@ function nextSnapshot(
                 fixedFindings: fixed,
                 openFindings: open,
                 retainedFixer: transition.retainedFixer,
+                ...(transition.liveValidation ? {
+                  liveValidation: transition.liveValidation,
+                  evidenceCommitOid: transition.evidenceCommitOid,
+                } : {}),
                 round: transition.round,
                 status: (open ?? transition.actionable) > 0 ? "blocked" : "active",
                 targetFindingIds: undefined,

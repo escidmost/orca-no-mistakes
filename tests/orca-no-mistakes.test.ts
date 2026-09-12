@@ -1,5 +1,6 @@
 import { fullStageEvidence } from './attestation-fixture.ts'
 import assert from "node:assert/strict";
+import { withLivePass } from './live-validation-fixture.ts';
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -365,7 +366,7 @@ class FakeOrca implements OrcaOperations {
     const dispatchId = `dispatch-${++this.#dispatchNumber}`;
     const stage = launch.stage;
     const reports = this.reports.get(stage) ?? [pass(stage)];
-    const report = reports.shift() ?? pass(stage);
+    const report = withLivePass(launch, reports.shift() ?? pass(stage));
     this.reports.set(stage, reports);
     if (launch.role === "fixer") this.fixerDispatches.push(dispatchId);
     return {
@@ -617,7 +618,7 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
 
   assert.match(result.runId, /^test-run-/);
   assert.deepEqual(result.steps, LEGACY_STAGE_PLAN);
-  assert.deepEqual(orca.completedStages, [...LEGACY_STAGE_PLAN, "document", "lint"]);
+  assert.deepEqual(orca.completedStages, [...LEGACY_STAGE_PLAN, "test", "document", "lint"]);
 
   const stageTasks = orca.tasks.slice(0, LEGACY_STAGE_PLAN.length);
   assert.equal(stageTasks.length, LEGACY_STAGE_PLAN.length);
@@ -794,11 +795,12 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
       ["document", 0],
       ["lint", 1],
       ["lint", 1],
+      ["test", 1],
       ["document", 1],
       ["lint", 2],
     ],
   );
-  for (const index of [0, 4, 5, 8, 9]) {
+  for (const index of [0, 4, 5, 8, 9, 10]) {
     assert.equal(
       checkpoints[index].input_commit_oid,
       checkpoints[index].output_commit_oid,
@@ -810,7 +812,7 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
   }
   assert.ok(result.attestation);
   verifyManifest(result.attestation);
-  assert.equal(result.attestation.stageEvidence.length, 10);
+  assert.equal(result.attestation.stageEvidence.length, 11);
   assert.ok(git.calls.some((call) => call.startsWith("recover:")));
   assert.match(result.custodyNote ?? "", /carries the terminal commit/);
   assert.equal(
@@ -828,13 +830,13 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
         ? [snapshot.transition.stage]
         : [],
     ),
-    [...LEGACY_STAGE_PLAN, "document", "lint"],
+    [...LEGACY_STAGE_PLAN, "test", "document", "lint"],
   );
   assert.equal(
     presentation.filter(
       (snapshot) => snapshot.transition.kind === "findings-recorded",
     ).length,
-    10,
+    11,
   );
   assert.deepEqual(presentation.at(-1)?.transition, {
     kind: "run-completed",

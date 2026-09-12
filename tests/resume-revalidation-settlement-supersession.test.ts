@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { withLivePass } from './live-validation-fixture.ts';
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -149,7 +150,7 @@ class TestOrca implements OrcaOperations {
         : pass(`${launch.stage} ${launch.role} passed`);
     return {
       dispatchId,
-      report,
+      report: withLivePass(launch, report),
       taskId,
       terminalHandle: `term-${dispatchId}`,
       worktreeId: launch.worktree === "new-child" ? dispatchId : undefined,

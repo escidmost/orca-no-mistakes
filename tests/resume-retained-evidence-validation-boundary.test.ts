@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { withLivePass } from './live-validation-fixture.ts';
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -129,7 +130,7 @@ class ResumeOrca implements OrcaOperations {
     }
     return {
       dispatchId: `dispatch-${taskId}`,
-      report: pass(`${launch.stage} passed`),
+      report: withLivePass(launch, pass(`${launch.stage} passed`)),
       taskId,
       terminalHandle: `term-${taskId}`,
     };

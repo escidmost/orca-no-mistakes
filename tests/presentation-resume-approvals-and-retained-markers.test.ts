@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { withLivePass } from './live-validation-fixture.ts';
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -77,7 +78,7 @@ test("resume reconciles approved gate audits into presentation", async () => {
           report:
             launch.stage === "review"
               ? structuredClone(approvalFinding)
-              : { findings: [], summary: "passed" },
+              : withLivePass(launch, { findings: [], summary: "passed" }),
           taskId,
           terminalHandle: `term-${dispatchId}`,
         };

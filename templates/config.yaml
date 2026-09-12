@@ -11,6 +11,10 @@
 # Optional default task intent or objective statement
 # intent: "Ensure zero regressions and complete test coverage"
 
+# Trusted-base startup and focused end-user testing instructions (default: empty).
+# Inline the runbook here; proposed-branch instructions cannot redefine validation.
+test_runbook: ""
+
 # Optional user-global placement for coordinator run worktrees. Keys are
 # absolute registered checkout paths and values are absolute operator-owned
 # directories. Repository-local config cannot choose operator placement.

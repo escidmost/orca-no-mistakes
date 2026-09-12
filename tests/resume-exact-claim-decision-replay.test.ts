@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { withLivePass } from './live-validation-fixture.ts';
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
@@ -99,7 +100,7 @@ class ResumeOrca implements OrcaOperations {
       report:
         launch.stage === "review"
           ? structuredClone(finding)
-          : { findings: [], summary: "passed" },
+          : withLivePass(launch, { findings: [], summary: "passed" }),
       taskId,
       terminalHandle: `term-${dispatchId}`,
     };
