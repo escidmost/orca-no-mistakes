@@ -2063,6 +2063,20 @@ CREATE TABLE IF NOT EXISTS passed_attestations (
 CREATE INDEX IF NOT EXISTS idx_passed_attestations_candidate
   ON passed_attestations(candidate_commit_oid, created_at);
 
+CREATE TABLE IF NOT EXISTS media_publications (
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  candidate_commit_oid TEXT NOT NULL,
+  artifact_sha256 TEXT NOT NULL,
+  artifact_path TEXT NOT NULL,
+  repository_id TEXT NOT NULL,
+  host TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('pending', 'published', 'failed', 'uncertain')),
+  url TEXT,
+  detail TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (run_id, candidate_commit_oid, artifact_sha256, repository_id, host)
+);
+
 CREATE TRIGGER IF NOT EXISTS immutable_stage_plan_entries
 BEFORE UPDATE ON stage_plan_entries
 BEGIN SELECT RAISE(ABORT, 'stage_plan_entries rows are immutable'); END;
@@ -2776,6 +2790,7 @@ export class DomainLedger {
         'stage_evidence',
         'gate_audit',
         'auto_fix_mode_events',
+        'media_publications',
         'presentation_snapshots',
         'passed_attestations'
       ]) {
@@ -6006,5 +6021,27 @@ export class DomainLedger {
 
   close(): void {
     this.#db.close()
+  }
+
+  mediaPublication(key: { runId: string; candidate: string; digest: string; repositoryId: string; host: string }):
+    { status: 'pending' | 'published' | 'failed' | 'uncertain'; url: string | null; detail: string } | undefined {
+    return this.#db.prepare(`SELECT status, url, detail FROM media_publications
+      WHERE run_id = ? AND candidate_commit_oid = ? AND artifact_sha256 = ? AND repository_id = ? AND host = ?`)
+      .get(key.runId, key.candidate, key.digest, key.repositoryId, key.host) as ReturnType<DomainLedger['mediaPublication']>
+  }
+
+  beginMediaPublication(key: { runId: string; candidate: string; digest: string; repositoryId: string; host: string }, artifactPath: string): boolean {
+    return this.#db.prepare(`INSERT OR IGNORE INTO media_publications
+      (run_id, candidate_commit_oid, artifact_sha256, repository_id, host, artifact_path, status, detail, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'pending', 'Upload outcome unknown; automatic retry withheld.', ?)`)
+      .run(key.runId, key.candidate, key.digest, key.repositoryId, key.host, artifactPath, new Date().toISOString()).changes === 1
+  }
+
+  finishMediaPublication(key: { runId: string; candidate: string; digest: string; repositoryId: string; host: string },
+    result: { status: 'published' | 'failed' | 'uncertain'; url?: string; detail: string }): void {
+    const changed = this.#db.prepare(`UPDATE media_publications SET status = ?, url = ?, detail = ?
+      WHERE run_id = ? AND candidate_commit_oid = ? AND artifact_sha256 = ? AND repository_id = ? AND host = ? AND status = 'pending'`)
+      .run(result.status, result.url ?? null, result.detail, key.runId, key.candidate, key.digest, key.repositoryId, key.host).changes
+    if (changed !== 1) throw new Error('media publication attempt is not pending')
   }
 }

@@ -22,7 +22,11 @@ const ARTIFACT_BUDGET = 16 * 1024
 const TOTAL_ARTIFACT_BUDGET = 24 * 1024
 const PIPELINE_DETAILS_BUDGET = 16 * 1024
 
-export type PullRequestArtifact = { content: string; name: string }
+export type PullRequestArtifact = {
+  content: string
+  name: string
+  media?: { kind: 'image' | 'video'; url: string }
+}
 export type PullRequestPipelineFinding = {
   description: string
   file?: string
@@ -210,11 +214,15 @@ function testingSection(testing: PullRequestReport['testing']): string {
   for (const artifact of testing.artifacts) {
     const separatorBytes = artifacts.length > 0 ? Buffer.byteLength('\n\n') : 0
     const name = capText(artifact.name, 512)
-    const framingBytes = Buffer.byteLength(`<details>\n<summary>${name}</summary>\n\n<pre></pre>\n\n</details>`) + separatorBytes
+    const url = artifact.media?.url
+    const media = url && /^https:\/\/github\.com\/user-attachments\/assets\/[a-f0-9-]{36}$/i.test(url)
+      ? artifact.media?.kind === 'image' ? `\n\n![Evidence image](${url})` : `\n\n[View recording](${url})`
+      : ''
+    const framingBytes = Buffer.byteLength(`<details>\n<summary>${name}</summary>\n\n<pre></pre>${media}\n\n</details>`) + separatorBytes
     if (remaining <= framingBytes) break
     const contentBudget = Math.min(ARTIFACT_BUDGET, remaining - framingBytes)
     const content = capText(artifact.content, contentBudget)
-    const entry = `<details>\n<summary>${name}</summary>\n\n<pre>${content}</pre>\n\n</details>`
+    const entry = `<details>\n<summary>${name}</summary>\n\n<pre>${content}</pre>${media}\n\n</details>`
     const entryBytes = Buffer.byteLength(entry) + separatorBytes
     if (entryBytes > remaining) break
     remaining -= entryBytes

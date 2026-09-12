@@ -40,6 +40,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import YAML from "yaml";
+import { isMediaArtifact, publishMediaArtifact, type MediaPublicationContext } from "./media-publication.ts";
 
 import {
   PreflightError,
@@ -3290,7 +3291,27 @@ export async function runPipeline(
                   artifacts: await pullRequestArtifacts(
                     artifactsDir,
                     testReport,
-                    options.trustedArtifactDigests,
+                    {
+                      trustedPublicationApprovals: new Set([
+                        ...(options.trustedArtifactDigests ?? []),
+                        ...pipelineConfig.media_publication.approved_sha256,
+                      ]),
+                      ...(pipelineConfig.media_publication.enabled ? {
+                        media: {
+                          ledger,
+                          runId,
+                          candidate: stageInputCommitOid,
+                          evidenceCandidate: latestEntryByStage.get("test")?.candidateCommitOid ?? "",
+                          repositoryId: route.base_repository_id,
+                          host: route.forge_host,
+                          upload: (media) => options.githubAuthority!.uploadMedia({
+                            ...media,
+                            host: route.forge_host,
+                            repositoryId: route.base_repository_id,
+                          }),
+                        },
+                      } : {}),
+                    },
                   ),
                   summary:
                     testReport?.summary ??
@@ -6257,6 +6278,7 @@ function pullRequestArtifactLabel(fileName: string): string {
 
 export type PullRequestArtifactTrustOptions = {
   trustedPublicationApprovals?: ReadonlySet<string> | readonly string[];
+  media?: MediaPublicationContext;
 };
 
 export async function pullRequestArtifacts(
@@ -6278,6 +6300,10 @@ export async function pullRequestArtifacts(
   );
 
   for (const artifact of report?.artifacts ?? []) {
+    if (options && !(Symbol.iterator in options) && options.media && isMediaArtifact(artifact)) {
+      artifacts.push(await publishMediaArtifact(artifactsDir, artifact, report?.artifactDigests?.[artifact] ?? "", trustedApprovals, options.media));
+      continue;
+    }
     const resolved = path.resolve(artifactsDir, artifact);
     if (!isWithin(artifactsDir, resolved)) continue;
     try {

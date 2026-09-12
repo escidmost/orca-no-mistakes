@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process'
 import { realpath } from 'node:fs/promises'
 import { z } from 'zod'
+import { MediaUploadError, uploadGithubMedia, type MediaBytes } from './media-publication.ts'
 
 import type {
   DomainLedger,
@@ -386,6 +387,17 @@ export class GithubAuthority {
 
   backend(): GithubBackend {
     return { ...this.#backend }
+  }
+
+  async uploadMedia(input: MediaBytes & { host: string; repositoryId: string }): Promise<string> {
+    if (input.host !== GITHUB_HOST) throw new MediaUploadError('Media attachments currently support github.com only.')
+    let token = this.#env.GH_TOKEN || this.#env.GITHUB_TOKEN
+    if (!token) {
+      const result = await this.#runner('gh', ['auth', 'token', '--hostname', GITHUB_HOST], { env: this.#env })
+      if (result.code !== 0) throw new MediaUploadError('GitHub media credentials unavailable; local evidence retained.')
+      token = result.stdout.trim()
+    }
+    return uploadGithubMedia({ ...input, token })
   }
 
   async observeAuthentication(): Promise<GithubAuthenticationObservation> {

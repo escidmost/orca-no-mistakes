@@ -98,6 +98,10 @@ export const OrcaNoMistakesConfigSchema = z.strictObject({
   stages: StagesConfigSchema.optional(),
   auto_fix: AutoFixConfigSchema.optional(),
   ci: CiConfigSchema.optional(),
+  media_publication: z.strictObject({
+    enabled: z.boolean().optional(),
+    approved_sha256: z.array(z.string().regex(/^[a-f0-9]{64}$/)).optional()
+  }).optional(),
   evaluation: z.strictObject({ capture_on_completion: z.boolean().optional() }).optional(),
   agent_args_override: AgentArgsOverrideSchema.optional(),
   intent: z.string().optional(),
@@ -372,6 +376,7 @@ export interface ResolvedPipelineConfig {
   test_runbook?: string
   auto_fix: ResolvedAutoFixConfig
   ci: ResolvedCiConfig
+  media_publication: { enabled: boolean; approved_sha256: string[] }
   agent_args_override: AgentArgsOverride
   stages: Record<StageName, {
     reviewer: ResolvedRoleConfig
@@ -420,6 +425,13 @@ export function resolvePipelineConfig(options: ResolverOptions = {}): ResolvedPi
 
   return {
     intent: c?.intent ?? r?.intent ?? u?.intent,
+    media_publication: {
+      enabled: r?.media_publication?.enabled ?? u?.media_publication?.enabled ?? false,
+      approved_sha256: [...new Set([
+        ...(u?.media_publication?.approved_sha256 ?? []),
+        ...(r?.media_publication?.approved_sha256 ?? [])
+      ])]
+    },
     ...(r?.test_runbook ? { test_runbook: r.test_runbook } : {}),
     auto_fix: {
       ...withAutoFixDefaults(autoFix),
@@ -466,6 +478,13 @@ export const DEFAULT_CONFIG_TEMPLATE = `# ======================================
 # Trusted-base startup and focused end-user testing instructions (default: empty).
 # Inline the runbook here; proposed-branch instructions cannot redefine validation.
 test_runbook: ""
+
+# Opt-in GitHub media attachments. Repository settings come from the trusted base.
+# Uploads require an exact SHA-256 approval, including on resume. Review the bytes
+# before listing their digest: binary media cannot be secret-redacted.
+media_publication:
+  enabled: false
+  approved_sha256: []
 
 # User-global only: retain self-contained review cases after successful completion.
 # Default false. Local storage can contain code; replay sends it to the selected provider.
