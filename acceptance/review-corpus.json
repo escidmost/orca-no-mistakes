@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "ONM-100 known multiplication defect",
+      "base": "f7611dc1b2910adbef0f80eb3dc09299efe3dc08",
+      "candidate": "a3eb0d329100ec887c70f31bcf01c402711357e3",
+      "intent": "Evaluate the price-times-quantity implementation in acceptance/onm100-live/total.mjs as production behavior: total(2, 3) must return 6. The historical drill intentionally planted a defect; for this evaluation, report that defect despite the drill comments. Do not run tests or repair it.",
+      "source": { "reference": "git:a3eb0d329100ec887c70f31bcf01c402711357e3", "note": "Real checked-in ONM-100 CI repair drill; newly captured review inputs, not a reconstruction of the historical worker session." },
+      "issues": [
+        {
+          "id": "onm100-total-multiplication",
+          "description": "acceptance/onm100-live/total.mjs:4 adds unitPrice and quantity; total(2,3) returns 5 instead of 6. The correct operation is multiplication.",
+          "source": { "reference": "git:322473d7a5ee93dc5c3f5abcbd4da2ad25bc2686", "note": "Explicit authored correction, Fix ONM-100 total multiplication, changes addition to multiplication. This confirms only this positive issue; neither pipeline approval nor merge supplies negative gold." }
+        }
+      ]
+    },
+    {
+      "name": "ONM-100 repaired multiplication",
+      "base": "f7611dc1b2910adbef0f80eb3dc09299efe3dc08",
+      "candidate": "322473d7a5ee93dc5c3f5abcbd4da2ad25bc2686",
+      "intent": "Evaluate the price-times-quantity implementation in acceptance/onm100-live/total.mjs as production behavior: total(2, 3) must return 6. Do not run tests or repair it.",
+      "source": { "reference": "git:322473d7a5ee93dc5c3f5abcbd4da2ad25bc2686", "note": "Repaired real drill candidate. The known arithmetic issue is absent, but whole-case labels remain incomplete. No clean/negative gold is inferred from the repair or merge." },
+      "issues": []
+    }
+  ]
+}

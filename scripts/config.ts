@@ -98,6 +98,7 @@ export const OrcaNoMistakesConfigSchema = z.strictObject({
   stages: StagesConfigSchema.optional(),
   auto_fix: AutoFixConfigSchema.optional(),
   ci: CiConfigSchema.optional(),
+  evaluation: z.strictObject({ capture_on_completion: z.boolean().optional() }).optional(),
   agent_args_override: AgentArgsOverrideSchema.optional(),
   intent: z.string().optional(),
   test_runbook: z.string().optional(),
@@ -465,6 +466,12 @@ export const DEFAULT_CONFIG_TEMPLATE = `# ======================================
 # Trusted-base startup and focused end-user testing instructions (default: empty).
 # Inline the runbook here; proposed-branch instructions cannot redefine validation.
 test_runbook: ""
+
+# User-global only: retain self-contained review cases after successful completion.
+# Default false. Local storage can contain code; replay sends it to the selected provider.
+# Manual pruning and explicit capture/replay: docs/review-evaluation.md.
+evaluation:
+  capture_on_completion: false
 
 # Optional user-global placement for coordinator run worktrees. Keys are
 # absolute registered checkout paths and values are absolute operator-owned

@@ -71,6 +71,10 @@ Workers launch with the `opencode` agent on the agent's own default model by def
 
 ## Live Test evidence
 
+For local review-only model comparisons with immutable Git cases and human finding
+labels, see [Review evaluation](docs/review-evaluation.md). The `evaluation`
+commands reuse the ACP reviewer transport and do not start a publication pipeline.
+
 New Test checker reports require `liveValidation`: an overall `verdict`, a nonempty
 `reason`, and named `scenarios` whose trimmed names are nonempty and unique. Each scenario records `result` (`pass`, `fail`, or
 `untested`), a boolean `live`, an `evidence` string array, and a `limitation` string.
