@@ -672,7 +672,11 @@ export class GithubAuthority {
           }
           // Discard the whole thread if it resolved or became outdated between pages.
           if (thread.isResolved || thread.isOutdated) {
-            for (const [id, concern] of concerns) if (concern.threadId === thread.id) concerns.delete(id)
+            for (const [id, concern] of concerns) {
+              if (concern.threadId !== thread.id) continue
+              remaining += Buffer.byteLength(JSON.stringify(concern))
+              concerns.delete(id)
+            }
             break
           }
           for (const comment of thread.comments.nodes) {

@@ -4089,6 +4089,10 @@ export async function runPipeline(
           invalidateCandidateBoundApprovals(nextFixer.after);
         }
         if (stage === "ci") {
+          await orca.completeTask(taskId, {
+            findings: [],
+            summary: `CI repair applied at ${nextFixer.after}; handed off to revalidation before CI is re-run`,
+          });
           const revalidate = pipelineSteps.slice(pipelineSteps.indexOf("review"));
           for (const next of revalidate) {
             reopenedStages.add(next);
