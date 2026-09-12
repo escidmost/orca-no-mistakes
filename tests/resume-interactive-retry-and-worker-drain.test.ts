@@ -324,6 +324,34 @@ class FakeOrca implements OrcaOperations {
   async setWorktreeStatus(): Promise<void> {}
 }
 
+test("human question waits pause the execution deadline, which resumes afterward", async () => {
+  for (const overrun of [false, true]) {
+    const ledger = new DomainLedger(":memory:");
+    class QuestionOrca extends FakeOrca {
+      override async startWorker(taskId: string, launch: WorkerLaunch,
+        fence?: Parameters<OrcaOperations["startWorker"]>[2]): Promise<WorkerResult> {
+        if (launch.stage === "review") {
+          assert.ok(fence?.pauseDeadline);
+          assert.ok(fence.resumeDeadline);
+          fence.pauseDeadline();
+          await new Promise(resolve => setTimeout(resolve, 250));
+          assert.equal(fence.aborted, false);
+          fence.resumeDeadline();
+          if (overrun) await new Promise(resolve => setTimeout(resolve, 250));
+        }
+        return super.startWorker(taskId, launch);
+      }
+    }
+    try {
+      const run = runPipeline({ intent: "Check human wait deadlines", userGlobalConfig: {
+        stages: { review: { reviewer: { timeout_ms: 100 } } },
+      } }, new QuestionOrca(`question-timeout-${randomUUID()}`), new FakeGit(), ledger);
+      if (overrun) await assert.rejects(run, /execution timeout/);
+      else assert.equal((await run).verdict, "passed");
+    } finally { ledger.close(); }
+  }
+});
+
 class OrphanAllocationOrca extends FakeOrca {
   readonly orphanDispatchIds: string[] = [];
 

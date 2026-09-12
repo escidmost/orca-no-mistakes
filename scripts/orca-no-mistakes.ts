@@ -4837,6 +4837,8 @@ type TimeoutFence = {
   aborted: boolean;
   deadlineSatisfied: boolean;
   signal?: AbortSignal;
+  pauseDeadline?: () => void;
+  resumeDeadline?: () => void;
 };
 
 async function withTimeout<T>(
@@ -4853,19 +4855,38 @@ async function withTimeout<T>(
     signal: abortController.signal,
   };
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let remaining = timeoutMs;
+  let startedAt = Date.now();
+  let paused = false;
+  let armDeadline: (() => void) | undefined;
+  fence.pauseDeadline = () => {
+    if (paused) return;
+    paused = true;
+    remaining = Math.max(0, remaining - (Date.now() - startedAt));
+    clearTimeout(timer);
+  };
+  fence.resumeDeadline = () => {
+    if (!paused) return;
+    paused = false;
+    startedAt = Date.now();
+    armDeadline?.();
+  };
   const operation = run(fence);
   try {
     return await Promise.race([
       operation,
       new Promise<never>((_, reject) => {
-        timer = setTimeout(() => {
-          if (fence.deadlineSatisfied) return;
-          fence.aborted = true;
-          abortController.abort();
-          reject(
-            new Error(`${label} exceeded its ${timeoutMs}ms execution timeout`),
-          );
-        }, timeoutMs);
+        armDeadline = () => {
+          timer = setTimeout(() => {
+            if (fence.deadlineSatisfied) return;
+            fence.aborted = true;
+            abortController.abort();
+            reject(
+              new Error(`${label} exceeded its ${timeoutMs}ms execution timeout`),
+            );
+          }, remaining);
+        };
+        if (!paused) armDeadline();
       }),
     ]);
   } catch (error) {
@@ -9499,6 +9520,7 @@ export class CliOrca implements OrcaOperations {
     const activity = {
       lastActivityAt: Date.now(),
       lastOutputAt: await this.#workerOutputAt(terminalHandle),
+      waitingForHuman: false,
     };
     const abortController = new AbortController();
     // The caller's fence still owns cancellation state: a copy that hardcodes
@@ -9519,6 +9541,8 @@ export class CliOrca implements OrcaOperations {
       signal: fence?.signal
         ? AbortSignal.any([fence.signal, abortController.signal])
         : abortController.signal,
+      pauseDeadline: () => fence?.pauseDeadline?.(),
+      resumeDeadline: () => fence?.resumeDeadline?.(),
     };
     const workerReport = this.#awaitWorkerReport(
       taskId,
@@ -9542,8 +9566,10 @@ export class CliOrca implements OrcaOperations {
         // silence is the worker's or the channel's.
         new Promise<{ error?: string }>((resolve) => {
           watchdog = setInterval(() => {
+            if (activity.waitingForHuman) return;
             void this.#workerOutputAt(terminalHandle)
               .then((outputAt) => {
+                if (activity.waitingForHuman) return;
                 if (outputAt === undefined) {
                   resolve({
                     error: `worker ${dispatchId} terminal disconnected`,
@@ -9837,7 +9863,7 @@ export class CliOrca implements OrcaOperations {
     launch: WorkerLaunch,
     log: StageLog | undefined,
     source: symbol | undefined,
-    activity: { lastActivityAt: number; lastOutputAt: number | undefined },
+    activity: { lastActivityAt: number; lastOutputAt: number | undefined; waitingForHuman: boolean },
     fence?: TimeoutFence,
   ): Promise<{
     deliveryId?: string;
@@ -9853,6 +9879,7 @@ export class CliOrca implements OrcaOperations {
         connectionLost?: boolean;
         deliveryId?: string;
         messages?: {
+          id?: string;
           body?: string;
           payload?: Record<string, unknown> | string | null;
           subject?: string;
@@ -9956,6 +9983,28 @@ export class CliOrca implements OrcaOperations {
           continue;
         }
         heartbeatOnly = false;
+        if (message.type === "question" && payload.taskId === taskId && message.id) {
+          activity.waitingForHuman = true;
+          fence?.pauseDeadline?.();
+          try {
+            const gateId = await this.createGate(taskId,
+              `Worker ${dispatchId} asks: ${message.body ?? message.subject ?? ""}\n\nReply to this worker without restarting it. Resolve with "reply: <your answer>" or "stop". The answer must contain the actual guidance; separate status messages are not forwarded.`,
+              ["reply", "stop"]);
+            const resolution = await this.waitForGate(gateId);
+            const answer = /^reply:\s*(\S[\s\S]*)$/i.exec(resolution)?.[1];
+            if (!answer && resolution !== "stop") throw new Error("Worker question requires reply: <answer> or stop");
+            await this.#json(["orchestration", "reply", "--id", message.id,
+              "--body", answer ?? "Stop: the human declined to continue this worker.",
+              ...(this.#runId ? ["--run", this.#runId] : []), "--json"]);
+            if (resolution === "stop") throw new GateStopError("Human stopped the worker at its question");
+          } finally {
+            activity.lastActivityAt = Date.now();
+            activity.waitingForHuman = false;
+            fence?.resumeDeadline?.();
+          }
+          heartbeatOnly = true;
+          continue;
+        }
         if (message.type !== "worker_done") {
           return {
             deliveryId: result.deliveryId,
