@@ -8,6 +8,22 @@ import { pullRequestPipelineRounds } from '../scripts/orca-no-mistakes.ts'
 import { PresentationPublisher } from '../scripts/presentation.ts'
 import { RailTuiRenderer } from '../scripts/tui.ts'
 import { livePass } from './live-validation-fixture.ts'
+import { liveValidationFinding } from '../scripts/live-validation.ts'
+
+test('rounds omit only duplicate synthetic findings when structured live evidence is present', () => {
+  for (const verdict of ['no-go', 'inconclusive', 'no-surface'] as const) {
+    const liveValidation = { verdict, reason: 'Needs attention', scenarios: verdict === 'no-surface' ? [] : [{ name: 'Unavailable host', result: 'untested' as const, live: false, evidence: [], limitation: 'Host unavailable' }] }
+    const other = { id: 'other', action: 'ask-user' as const, severity: 'warning' as const, description: 'Separate finding' }
+    const findings = [...liveValidationFinding(liveValidation), other]
+    const report = { summary: 'Needs attention', findings, liveValidation, evidenceCommitOid: 'a'.repeat(40) }
+    const [round] = pullRequestPipelineRounds([report], [], [])
+    assert.deepEqual(round.findings, [{ description: other.description, severity: other.severity }])
+    assert.deepEqual(round.liveValidation, liveValidation)
+    assert.equal(round.evidenceCommitOid, report.evidenceCommitOid)
+    assert.equal(pullRequestPipelineRounds([{ summary: report.summary, findings }], [], [])[0].findings.length, 2)
+    assert.equal(report.findings.length, 2)
+  }
+})
 
 test('managed report includes candidate-bound live scenarios in testing and stage details', () => {
   const candidate = 'a'.repeat(40)

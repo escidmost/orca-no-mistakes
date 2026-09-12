@@ -6192,6 +6192,7 @@ export function pullRequestPipelineRounds(
     const isLastRound = index === reports.length - 1;
     return {
       findings: actionableFindings(report)
+        .filter((finding) => !report.liveValidation || finding.id !== LIVE_VALIDATION_FINDING_ID)
         .filter((finding) => !approvedOnly.has(pullRequestFindingKey(finding)))
         .map((finding): PullRequestPipelineFinding => ({
           description: finding.description,
