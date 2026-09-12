@@ -1,5 +1,4 @@
-// Deliberately incorrect initial candidate for the disposable ONM-100 CI drill.
-// The CI-selected fixer must repair this implementation, not the workflow oracle.
+// Disposable ONM-100 CI drill fixture; see acceptance/onm100-live/README.md.
 export function total(unitPrice, quantity) {
   return unitPrice * quantity;
 }
