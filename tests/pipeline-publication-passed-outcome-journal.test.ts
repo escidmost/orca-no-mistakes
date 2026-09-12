@@ -93,6 +93,7 @@ test('runPipeline in Release 2 journals passed outcome before settlement and upd
   const authority = {
     observeRepository: async () => ({ id: 'R_repo', nodeId: 'RN_repo' }),
     observePullRequests: async () => ({ exact: pullRequest, nearMatches: [] }),
+    observePullRequestChecks: async () => ({ headOid: pullRequest!.headOid, checks: [] }),
     createPullRequest: async ({ body, title }: { body: string; title: string }) => {
       pullRequest = {
         baseBranch: 'main', baseOid: 'base', baseRepositoryId: 'R_repo',

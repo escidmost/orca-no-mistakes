@@ -495,7 +495,10 @@ auto_fix:
   # guardrails: advisory
 
 # ------------------------------------------------------------------------------
-# CI Monitoring (ci stage)
+# CI Monitoring and Selected Repair (ci stage)
+# Greptile feedback is supported. Repairs reuse auto_fix.max_rounds (default 3)
+# and the resolved stages.ci.fixer timeout (default 1800000 ms).
+# Timeout findings retry monitoring; selected check findings launch a fixer.
 # ------------------------------------------------------------------------------
 ci:
   # Treat a pull request with no registered checks as all checks passed
@@ -580,7 +583,8 @@ defaults:
 # Stage-Specific Overrides
 # ------------------------------------------------------------------------------
 # Supported stages: intent, rebase, review, test, document, lint, push, pr, ci.
-# push and ci are coordinator-owned remote stages; agent settings do not apply. pr configures the drafting reviewer.
+# push and CI polling are coordinator-owned. stages.ci.fixer configures selected
+# CI repairs; pr configures the drafting reviewer.
 # stages:
 #   intent:
 #     agent: "claude"

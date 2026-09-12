@@ -265,6 +265,9 @@ export function terminalCandidate(
         `satisfied stage ${stage.stage_id} does not bind successful authoritative evidence`
       )
     }
+    if (ledger.ciRepairNeedsValidation(runId, stage.stage_id, evidence.evidence_sha256)) {
+      throw new CandidatePublicationError(`stage ${stage.stage_id} requires revalidation after CI repair`)
+    }
     const evidenceProblems = verifyRetainedArtifacts
       ? inputEvidenceProblems(ledger, runId, evidence)
       : []
@@ -431,8 +434,11 @@ export async function publishCandidate(input: PublicationInput): Promise<{
   }
 
   const candidate = terminalCandidate(input.ledger, input.runId, false)
+  const repair = input.ledger.ciRepairs(input.runId).findLast((entry) => entry.status === 'repaired')
+  const round = repair?.round_index ?? 0
+  const superseded = repair ? input.ledger.remoteReceipt(input.runId, 'candidate-publication', repair.publication_receipt_sha256) : undefined
   const settled = input.ledger.listEvidence(input.runId).find(
-    (row) => row.stage_id === 'push' && row.round_index === 0
+    (row) => row.stage_id === 'push' && row.round_index === round
   )
   if (settled) {
     terminalCandidate(input.ledger, input.runId)
@@ -459,6 +465,9 @@ export async function publishCandidate(input: PublicationInput): Promise<{
     }
     return { candidateCommitOid: candidate, outcome, receiptSha256: receipt.receipt_sha256 }
   }
+  if (repair && (!superseded || input.ledger.remoteReceipt(input.runId, 'candidate-publication')?.receipt_sha256 !== superseded.receipt_sha256)) {
+    throw new CandidatePublicationError('CI republication requires the immediately preceding publication receipt')
+  }
   terminalCandidate(input.ledger, input.runId)
   const ref = headRef(route.head_branch)
   const subject = `${route.forge_host}/${route.head_repository_id}:${ref}`
@@ -473,7 +482,7 @@ export async function publishCandidate(input: PublicationInput): Promise<{
     observedAt: preObservedAt
   })
 
-  const baselineExpected = baseline.authoritative_absence === 1 ? null : baseline.head_commit_oid
+  const baselineExpected = superseded?.candidate_commit_oid ?? (baseline.authoritative_absence === 1 ? null : baseline.head_commit_oid)
   const reconciled = pre.oid === candidate && pre.oid !== baselineExpected && input.reconcileExactCandidate === true
   if (pre.oid !== baselineExpected && !reconciled) {
     throw new CandidatePublicationError('publication head changed after admission; no mutation attempted')
@@ -586,7 +595,7 @@ export async function publishCandidate(input: PublicationInput): Promise<{
     baseCommitOid: candidate,
     candidateCommitOid: candidate,
     exitCode: 0,
-    round: 0,
+    round,
     runId: input.runId,
     stage: 'push',
     summary,
@@ -595,6 +604,7 @@ export async function publishCandidate(input: PublicationInput): Promise<{
   const settlement = input.ledger.settleRemoteStage({
     runId: input.runId,
     stageId: 'push',
+    supersedesEvidenceSha256: repair ? input.ledger.stageDispositions(input.runId).find((entry) => entry.stage_id === 'push')?.evidence_sha256 ?? undefined : undefined,
     ownership: {
       repoRoot: run.repo_root,
       branch: run.branch,
@@ -603,12 +613,12 @@ export async function publishCandidate(input: PublicationInput): Promise<{
     checkpoint: {
       inputCommitOid: candidate,
       outputCommitOid: candidate,
-      roundIndex: 0
+      roundIndex: round
     },
     evidence: {
       runId: input.runId,
       stageId: 'push',
-      roundIndex: 0,
+      roundIndex: round,
       candidateCommitOid: candidate,
       baseCommitOid: candidate,
       workerIdentity: input.workerIdentity,
@@ -624,6 +634,7 @@ export async function publishCandidate(input: PublicationInput): Promise<{
       candidateCommitOid: candidate,
       kind: 'candidate-publication',
       payload: {
+        ...(superseded ? { supersedes: superseded.receipt_sha256 } : {}),
         mutationIntent: mutation,
         outcome,
         postRead,

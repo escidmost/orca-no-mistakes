@@ -100,6 +100,7 @@ test("Release 2 pipeline settles passed and commits attestation when post-custod
   const authority = {
     observeRepository: async () => ({ id: "R_repo", nodeId: "RN_repo" }),
     observePullRequests: async () => ({ exact: pullRequest, nearMatches: [] }),
+    observePullRequestChecks: async () => ({ headOid: pullRequest!.headOid, checks: [] }),
     createPullRequest: async ({ body, title }: { body: string; title: string }) => {
       pullRequest = {
         baseBranch: "main",

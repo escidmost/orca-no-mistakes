@@ -245,6 +245,7 @@ test('Release 2 resume reconciles clean stage settlement without approval before
     },
     observeIssueComments: async () => comments,
     observePullRequests: async () => ({ exact: pullRequest, nearMatches: [] }),
+    observePullRequestChecks: async () => ({ headOid: pullRequest!.headOid, checks: [] }),
     observeRepository: async () => ({ id: 'R_repo', nodeId: 'RN_repo' }),
     updateIssueComment: async () => {},
     updatePullRequest: async ({ body, title }: { body: string; title: string }) => {

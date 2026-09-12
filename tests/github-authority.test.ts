@@ -351,19 +351,19 @@ test('pull request checks observation exhausts every page and maps every bucket'
   const pages = [
     {
       nodes: [
-        { __typename: 'CheckRun', conclusion: null, detailsUrl: 'https://ci.example/1', name: 'build', status: 'IN_PROGRESS' },
-        { __typename: 'CheckRun', conclusion: 'SUCCESS', detailsUrl: 'https://ci.example/2', name: 'unit', status: 'COMPLETED' },
-        { __typename: 'CheckRun', conclusion: 'SKIPPED', detailsUrl: null, name: 'docs', status: 'COMPLETED' },
-        { __typename: 'CheckRun', conclusion: 'CANCELLED', detailsUrl: null, name: 'e2e', status: 'COMPLETED' },
-        { __typename: 'CheckRun', conclusion: 'FAILURE', detailsUrl: 'https://ci.example/5', name: 'lint', status: 'COMPLETED' }
+         { __typename: 'CheckRun', id: 'CR_1', databaseId: 1, checkSuite: { app: null }, conclusion: null, detailsUrl: 'https://ci.example/1', name: 'build', status: 'IN_PROGRESS' },
+         { __typename: 'CheckRun', id: 'CR_2', databaseId: 2, checkSuite: { app: null }, conclusion: 'SUCCESS', detailsUrl: 'https://ci.example/2', name: 'unit', status: 'COMPLETED' },
+         { __typename: 'CheckRun', id: 'CR_3', databaseId: 3, checkSuite: { app: null }, conclusion: 'SKIPPED', detailsUrl: null, name: 'docs', status: 'COMPLETED' },
+         { __typename: 'CheckRun', id: 'CR_4', databaseId: 4, checkSuite: { app: null }, conclusion: 'CANCELLED', detailsUrl: null, name: 'e2e', status: 'COMPLETED' },
+         { __typename: 'CheckRun', id: 'CR_5', databaseId: 5, checkSuite: { app: null }, conclusion: 'FAILURE', detailsUrl: 'https://ci.example/5', name: 'lint', status: 'COMPLETED' }
       ],
       pageInfo: { endCursor: 'page-2', hasNextPage: true }
     },
     {
       nodes: [
-        { __typename: 'StatusContext', context: 'ci/legacy', state: 'SUCCESS', targetUrl: 'https://ci.example/6' },
-        { __typename: 'StatusContext', context: 'ci/deploy', state: 'PENDING', targetUrl: null },
-        { __typename: 'StatusContext', context: 'ci/scan', state: 'FAILURE', targetUrl: null }
+         { __typename: 'StatusContext', id: 'SC_6', context: 'ci/legacy', state: 'SUCCESS', targetUrl: 'https://ci.example/6' },
+         { __typename: 'StatusContext', id: 'SC_7', context: 'ci/deploy', state: 'PENDING', targetUrl: null },
+         { __typename: 'StatusContext', id: 'SC_8', context: 'ci/scan', state: 'FAILURE', targetUrl: null }
       ],
       pageInfo: { endCursor: null, hasNextPage: false }
     }
@@ -396,6 +396,7 @@ test('pull request checks observation exhausts every page and maps every bucket'
     ]
   )
   assert.deepEqual(observation.checks[5], {
+    id: 'SC_6',
     bucket: 'pass',
     conclusion: 'SUCCESS',
     kind: 'status',

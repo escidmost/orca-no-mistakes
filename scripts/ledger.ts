@@ -295,12 +295,10 @@ export function finalContiguousCheckpointByStage(
   const brokenStages = new Set<string>()
 
   for (const checkpoint of checkpoints) {
-    if (!stagePosition.has(checkpoint.stage_id)) continue
-
     if (reachable.has(checkpoint.input_commit_oid)) {
       reachable.add(checkpoint.output_commit_oid)
       validCheckpoints.push(checkpoint)
-    } else {
+    } else if (stagePosition.has(checkpoint.stage_id)) {
       brokenStages.add(checkpoint.stage_id)
     }
   }
@@ -1940,6 +1938,17 @@ CREATE TABLE IF NOT EXISTS remote_receipts (
   created_at TEXT NOT NULL,
   FOREIGN KEY (run_id, authoritative_post_observation_sha256)
     REFERENCES remote_observations(run_id, observation_sha256) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS ci_repairs (
+  run_id TEXT NOT NULL REFERENCES runs(run_id),
+  round_index INTEGER NOT NULL,
+  input_commit_oid TEXT NOT NULL,
+  output_commit_oid TEXT,
+  publication_receipt_sha256 TEXT NOT NULL REFERENCES remote_receipts(receipt_sha256),
+  evidence_floor INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('running', 'failed', 'repaired')),
+  PRIMARY KEY (run_id, round_index)
 );
 
 CREATE TABLE IF NOT EXISTS branch_leases (
@@ -3875,7 +3884,7 @@ export class DomainLedger {
       if (latest.generation_token === null ||
           Number(observation.generation_token) !== Number(latest.generation_token)) return false
     }
-    const baseline = this.publicationBaseline(input.runId)
+    let baseline = this.publicationBaseline(input.runId)
     if (!baseline || baseline.route_fingerprint !== route.route_fingerprint) return false
     let payload: Record<string, unknown>
     try {
@@ -3893,8 +3902,16 @@ export class DomainLedger {
     })) !== input.observationSha256) return false
     if (input.kind === 'candidate-publication') {
       const receipt = input.receiptPayload
+      if (Object.hasOwn(receipt, 'supersedes')) {
+        if (typeof receipt.supersedes !== 'string') return false
+        const prior = this.remoteReceipt(input.runId, 'candidate-publication', receipt.supersedes)
+        if (!prior || !this.ciRepairs(input.runId).some((repair) => repair.status === 'repaired' &&
+            repair.publication_receipt_sha256 === prior.receipt_sha256 && repair.input_commit_oid === prior.candidate_commit_oid)) return false
+        baseline = { ...baseline, authoritative_absence: 0, head_commit_oid: prior.candidate_commit_oid }
+      }
       if (!hasOnlyOwnProperties(receipt, new Set([
-        'mutationIntent', 'outcome', 'postRead', 'preRead', 'routeFingerprint'
+        'mutationIntent', 'outcome', 'postRead', 'preRead', 'routeFingerprint',
+        ...(Object.hasOwn(receipt, 'supersedes') ? ['supersedes'] : [])
       ])) ||
           !['created', 'updated', 'unchanged'].includes(String(receipt.outcome)) ||
           typeof receipt.preRead !== 'string' || typeof receipt.mutationIntent !== 'string' ||
@@ -4313,7 +4330,15 @@ export class DomainLedger {
           }
         }
       }
-      if (settlesDisposition && priorDisposition !== undefined && existingDisposition === undefined && !isHistoricalPrUpgrade) {
+      const priorReceipt = this.remoteReceipt(input.runId, expectedKind)
+      const repairSupersession = priorDispositionRow?.disposition === 'satisfied' &&
+        input.supersedesEvidenceSha256 === priorDispositionRow.evidence_sha256 &&
+        priorReceipt && priorReceipt.candidate_commit_oid !== input.receipt.candidateCommitOid &&
+        this.ciRepairs(input.runId).some((repair) => repair.status === 'repaired' &&
+          (input.stageId === 'push'
+            ? repair.publication_receipt_sha256 === priorReceipt.receipt_sha256 && input.receipt.payload.supersedes === priorReceipt.receipt_sha256
+            : repair.input_commit_oid === priorReceipt.candidate_commit_oid))
+      if (settlesDisposition && priorDisposition !== undefined && existingDisposition === undefined && !isHistoricalPrUpgrade && !repairSupersession) {
         throw new Error(`${input.stageId} is already settled with a different disposition`)
       }
 
@@ -4347,7 +4372,7 @@ export class DomainLedger {
         runId: input.runId,
         stageId: input.stageId
       })
-      if (isHistoricalPrUpgrade) {
+      if (isHistoricalPrUpgrade || repairSupersession) {
         this.#db.prepare(
           `INSERT INTO stage_disposition_supersessions
              (run_id, stage_id, disposition, prior_evidence_sha256, evidence_sha256, recorded_at)
@@ -4390,6 +4415,63 @@ export class DomainLedger {
     ).get(runId, kind, receiptSha256 ?? null, receiptSha256 ?? null) as
       | RemoteReceiptRow
       | undefined
+  }
+
+  ciRepairs(runId: string): Array<{
+    round_index: number; input_commit_oid: string; output_commit_oid: string | null;
+    publication_receipt_sha256: string; evidence_floor: number; status: 'running' | 'failed' | 'repaired'
+  }> {
+    return this.#db.prepare('SELECT * FROM ci_repairs WHERE run_id = ? ORDER BY round_index').all(runId) as ReturnType<DomainLedger['ciRepairs']>
+  }
+
+  beginCiRepair(runId: string, candidate: string, round: number): void {
+    const publication = this.remoteReceipt(runId, 'candidate-publication')
+    const binding = this.remoteReceipt(runId, 'pull-request-binding')
+    if (!publication || publication.candidate_commit_oid !== candidate || binding?.candidate_commit_oid !== candidate) {
+      throw new Error('CI repair requires the current published and PR-bound candidate')
+    }
+    const floor = this.#db.prepare('SELECT COALESCE(MAX(rowid), 0) AS floor FROM stage_evidence WHERE run_id = ?')
+      .get(runId) as { floor: number }
+    this.#db.prepare(`INSERT INTO ci_repairs
+      (run_id, round_index, input_commit_oid, publication_receipt_sha256, evidence_floor, status)
+      VALUES (?, ?, ?, ?, ?, 'running')`).run(runId, round, candidate, publication.receipt_sha256, floor.floor)
+  }
+
+  recordCiRepairCandidate(runId: string, round: number, candidate: string): void {
+    const changed = this.#db.prepare(`UPDATE ci_repairs SET output_commit_oid = ?
+      WHERE run_id = ? AND round_index = ? AND status = 'running' AND output_commit_oid IS NULL`)
+      .run(candidate, runId, round)
+    if (changed.changes !== 1) throw new Error('CI repair candidate has already been recorded')
+  }
+
+  finishCiRepair(runId: string, round: number, candidate?: string, presentation?: { eventKey: string; snapshot: PresentationSnapshot }): void {
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      const repair = this.ciRepairs(runId).find((entry) => entry.round_index === round)
+      if (!repair || repair.status !== 'running') throw new Error('CI repair is not running')
+      if (candidate) {
+        if (repair.output_commit_oid && candidate !== repair.output_commit_oid) throw new Error('CI repair candidate changed before custody')
+        if (candidate === repair.input_commit_oid) throw new Error('CI repair must produce a new candidate')
+        this.#recordCheckpoint({ runId, stageId: 'ci', roundIndex: round,
+          inputCommitOid: repair.input_commit_oid, outputCommitOid: candidate })
+      }
+      this.#db.prepare('UPDATE ci_repairs SET status = ?, output_commit_oid = ? WHERE run_id = ? AND round_index = ?')
+        .run(candidate ? 'repaired' : 'failed', candidate ?? null, runId, round)
+      if (presentation) this.#recordPresentationMilestone(runId, presentation)
+      this.#db.exec('COMMIT')
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  ciRepairNeedsValidation(runId: string, stage: string, evidenceSha256: string): boolean {
+    const repair = this.ciRepairs(runId).findLast((entry) => entry.status === 'repaired')
+    if (!repair) return false
+    const stages = this.stagePlan(runId).map((entry) => entry.stage_id)
+    if (stages.indexOf(stage) < stages.indexOf('review')) return false
+    return !this.#db.prepare('SELECT 1 FROM stage_evidence WHERE run_id = ? AND evidence_sha256 = ? AND rowid > ?')
+      .get(runId, evidenceSha256, repair.evidence_floor)
   }
 
   prepareResume(input: {
@@ -4568,7 +4650,9 @@ export class DomainLedger {
       )
       .get(input.runId) as StageCheckpointRow | undefined
     if (!checkpoint) throw new Error(`run ${input.runId} has no durable checkpoint to resume`)
-    if (checkpoint.output_commit_oid !== input.head) {
+    const pendingRepair = this.ciRepairs(input.runId).at(-1)
+    if (checkpoint.output_commit_oid !== input.head &&
+        !(pendingRepair?.status === 'running' && pendingRepair.output_commit_oid === input.head)) {
       throw new Error(
         `HEAD ${input.head} does not match checkpoint ${checkpoint.output_commit_oid} for run ${input.runId}`
       )

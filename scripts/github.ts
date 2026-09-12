@@ -63,16 +63,23 @@ export const runCommand: CommandRunner = (executable, args, options) => new Prom
   })
   let stdout = ''
   let stderr = ''
-  child.stdout.on('data', (chunk) => { stdout += chunk.toString() })
-  child.stderr.on('data', (chunk) => { stderr += chunk.toString() })
+  let bytes = 0
+  const accept = (chunk: Buffer): boolean => {
+    bytes += chunk.length
+    if (bytes <= 16 * 1024 * 1024) return true
+    child.kill('SIGKILL')
+    return false
+  }
+  child.stdout.on('data', (chunk: Buffer) => { if (accept(chunk)) stdout += chunk.toString() })
+  child.stderr.on('data', (chunk: Buffer) => { if (accept(chunk)) stderr += chunk.toString() })
   child.on('error', (error) => {
     const timedOut = (error as NodeJS.ErrnoException).code === 'ETIMEDOUT'
     // Timeout and signal kills surface as the retryable `unavailable` class.
     resolve({ code: timedOut ? 124 : 127, stderr: timedOut ? 'command timed out' : 'command unavailable', stdout: '' })
   })
   child.on('close', (code, signal) => resolve({
-    code: code ?? (signal ? 124 : 1),
-    stderr: code === null && signal ? `terminated by ${signal}` : stderr,
+    code: bytes > 16 * 1024 * 1024 ? 1 : code ?? (signal ? 124 : 1),
+    stderr: bytes > 16 * 1024 * 1024 ? 'command output exceeded 16 MiB' : code === null && signal ? `terminated by ${signal}` : stderr,
     stdout
   }))
   // ponytail: a child that closes stdin early must not crash the coordinator
@@ -168,6 +175,9 @@ const CommentPageSchema = z.object({
 const CheckContextSchema = z.discriminatedUnion('__typename', [
   z.object({
     __typename: z.literal('CheckRun'),
+    id: NodeIdSchema,
+    databaseId: NumericIdSchema,
+    checkSuite: z.object({ app: z.object({ id: NodeIdSchema, databaseId: NumericIdSchema, slug: z.string() }).nullable() }),
     conclusion: z.string().nullable(),
     detailsUrl: z.string().nullable(),
     name: z.string(),
@@ -175,6 +185,7 @@ const CheckContextSchema = z.discriminatedUnion('__typename', [
   }),
   z.object({
     __typename: z.literal('StatusContext'),
+    id: NodeIdSchema,
     context: z.string(),
     state: z.string(),
     targetUrl: z.string().nullable()
@@ -203,6 +214,58 @@ const PullRequestChecksPageSchema = z.object({
     state: z.enum(['OPEN', 'CLOSED', 'MERGED'])
   }).nullable()
 })
+
+const ReviewCommentSchema = z.object({
+  id: NodeIdSchema,
+  body: z.string(),
+  author: z.object({ __typename: z.string(), login: z.string() }).nullable(),
+  commit: z.object({ oid: OidSchema }).nullable(),
+  url: z.string().url()
+})
+const ReviewThreadSchema = z.object({
+  id: NodeIdSchema,
+  isResolved: z.boolean(),
+  isOutdated: z.boolean(),
+  path: z.string(),
+  line: z.number().int().positive().nullable(),
+  pullRequest: z.object({ id: NodeIdSchema, headRefOid: OidSchema.nullable() }),
+  comments: z.object({ nodes: z.array(ReviewCommentSchema), pageInfo: PageInfoSchema })
+})
+const REVIEW_THREAD_FIELDS = `id isResolved isOutdated path line pullRequest { id headRefOid }
+  comments(first: 100, after: $commentCursor) {
+    nodes { id body url author { __typename login } commit { oid } }
+    pageInfo { hasNextPage endCursor }
+  }`
+const REVIEW_THREADS_QUERY = `query ReviewThreads($id: ID!, $cursor: String, $commentCursor: String) {
+  node(id: $id) { ... on PullRequest { id headRefOid
+    reviewThreads(first: 100, after: $cursor) {
+      nodes { ${REVIEW_THREAD_FIELDS} } pageInfo { hasNextPage endCursor }
+    }
+  } }
+}`
+const REVIEW_THREAD_QUERY = `query ReviewThreadComments($id: ID!, $commentCursor: String) {
+  node(id: $id) { ... on PullRequestReviewThread { ${REVIEW_THREAD_FIELDS} } }
+}`
+
+export type GithubReviewConcern = {
+  id: string
+  threadId: string
+  body: string
+  file: string
+  line?: number
+  url: string
+}
+
+export function boundedCiText(value: string, bytes = 8192): string {
+  const text = value.replace(/\p{Cc}/gu, (character) => character === '\n' || character === '\t' ? character : '')
+  if (Buffer.byteLength(text) <= bytes) return text
+  return Buffer.from(text).subarray(0, bytes - 32).toString('utf8').replace(/\uFFFD$/u, '') + '\n[truncated external data]'
+}
+
+// Stable public GitHub App identity, not a check-name heuristic.
+export function isGreptileCheck(check: GithubCheckObservation): boolean {
+  return check.kind === 'check-run' && check.app?.databaseId === '867647' && check.app.slug === 'greptile-apps'
+}
 
 export type GithubBackend = {
   kind: 'gh' | 'gh-axi'
@@ -257,6 +320,9 @@ export type GithubIssueCommentObservation = {
 export type GithubCheckBucket = 'pass' | 'fail' | 'pending' | 'cancel' | 'skip'
 
 export type GithubCheckObservation = {
+  id?: string
+  databaseId?: string
+  app?: { id: string; databaseId: string; slug: string } | null
   bucket: GithubCheckBucket
   conclusion: string | null
   kind: 'check-run' | 'status'
@@ -324,8 +390,8 @@ const PULL_REQUEST_CHECKS_QUERY = `query PullRequestChecks($id: ID!, $cursor: St
         nodes { commit { oid statusCheckRollup { contexts(first: 100, after: $cursor) {
           nodes {
             __typename
-            ... on CheckRun { name status conclusion detailsUrl }
-            ... on StatusContext { context state targetUrl }
+            ... on CheckRun { id databaseId name status conclusion detailsUrl checkSuite { app { id databaseId slug } } }
+            ... on StatusContext { id context state targetUrl }
           }
           pageInfo { hasNextPage endCursor }
         } } } }
@@ -550,6 +616,9 @@ export class GithubAuthority {
       if (!contexts) break
       checks.push(...contexts.nodes.map((context) => context.__typename === 'CheckRun'
         ? {
+          id: context.id,
+          databaseId: context.databaseId,
+          app: context.checkSuite.app,
           bucket: checkBucket('check-run', context.status, context.conclusion),
           conclusion: context.conclusion,
           kind: 'check-run' as const,
@@ -558,6 +627,7 @@ export class GithubAuthority {
           url: context.detailsUrl
         }
         : {
+          id: context.id,
           bucket: checkBucket('status', 'COMPLETED', context.state),
           conclusion: context.state,
           kind: 'status' as const,
@@ -568,6 +638,101 @@ export class GithubAuthority {
       cursor = nextCursor(contexts.pageInfo, seen, operation)
     } while (cursor)
     return { ...observation, checks }
+  }
+
+  async observeGreptileConcerns(pullRequestNodeId: string, candidateCommitOid: string): Promise<GithubReviewConcern[]> {
+    NodeIdSchema.parse(pullRequestNodeId)
+    OidSchema.parse(candidateCommitOid)
+    const operation = 'observe-review-threads'
+    const concerns = new Map<string, GithubReviewConcern>()
+    const cursors = new Set<string>()
+    let cursor: string | null = null
+    let remaining = 32 * 1024
+    do {
+      const page = await this.#graphqlRead(operation, REVIEW_THREADS_QUERY,
+        { id: pullRequestNodeId, cursor, commentCursor: null },
+        z.object({ node: z.object({ id: NodeIdSchema, headRefOid: OidSchema.nullable(),
+          reviewThreads: z.object({ nodes: z.array(ReviewThreadSchema), pageInfo: PageInfoSchema })
+        }).nullable() }))
+      if (page.node?.id !== pullRequestNodeId || page.node.headRefOid !== candidateCommitOid) {
+        throw new GithubAuthorityError('identity-drift', operation, 'review thread pull-request head changed')
+      }
+      for (const initial of page.node.reviewThreads.nodes) {
+        let thread = initial
+        const commentCursors = new Set<string>()
+        for (;;) {
+          if (thread.id !== initial.id || thread.pullRequest.id !== pullRequestNodeId ||
+              thread.pullRequest.headRefOid !== candidateCommitOid) {
+            throw new GithubAuthorityError('identity-drift', operation, 'review thread identity changed')
+          }
+          // Discard the whole thread if it resolved or became outdated between pages.
+          if (thread.isResolved || thread.isOutdated) {
+            for (const [id, concern] of concerns) if (concern.threadId === thread.id) concerns.delete(id)
+            break
+          }
+          for (const comment of thread.comments.nodes) {
+            if (comment.author?.__typename !== 'Bot' ||
+                !['greptile-apps', 'greptile-apps[bot]'].includes(comment.author.login) ||
+                comment.commit?.oid !== candidateCommitOid || !comment.body.trim() || concerns.has(comment.id)) continue
+            const concern: GithubReviewConcern = {
+              id: comment.id, threadId: thread.id, body: boundedCiText(comment.body),
+              file: boundedCiText(thread.path, 1024), ...(thread.line === null ? {} : { line: thread.line }), url: comment.url
+            }
+            const size = Buffer.byteLength(JSON.stringify(concern))
+            if (size > remaining) continue
+            remaining -= size
+            concerns.set(comment.id, concern)
+          }
+          const commentCursor = nextCursor(thread.comments.pageInfo, commentCursors, operation)
+          if (!commentCursor) break
+          const next = await this.#graphqlRead(operation, REVIEW_THREAD_QUERY,
+            { id: thread.id, commentCursor }, z.object({ node: ReviewThreadSchema.nullable() }))
+          if (!next.node) throw new GithubAuthorityError('ambiguous', operation, 'review thread disappeared')
+          thread = next.node
+        }
+      }
+      cursor = nextCursor(page.node.reviewThreads.pageInfo, cursors, operation)
+    } while (cursor)
+    return [...concerns.values()]
+  }
+
+  async observeCheckLog(input: { repository: string; candidateCommitOid: string; checkId: string; databaseId: string }): Promise<string> {
+    const { owner, name } = parseGithubRepositoryReference(input.repository)
+    OidSchema.parse(input.candidateCommitOid)
+    if (!/^\d+$/.test(input.databaseId)) throw new Error('invalid check database identity')
+    const prefix = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}`
+    const check = await this.#restRead('observe-check-log', `${prefix}/check-runs/${input.databaseId}`, z.object({
+      id: NumericIdSchema, node_id: NodeIdSchema, head_sha: OidSchema,
+      app: z.object({ id: NumericIdSchema }), check_suite: z.object({ id: NumericIdSchema }),
+      output: z.object({ title: z.string().nullable(), summary: z.string().nullable(), text: z.string().nullable() })
+    }))
+    if (check.id !== input.databaseId || check.node_id !== input.checkId || check.head_sha !== input.candidateCommitOid) {
+      throw new GithubAuthorityError('identity-drift', 'observe-check-log', 'selected check does not bind the candidate')
+    }
+    const output = [check.output.title, check.output.summary, check.output.text].filter(Boolean).join('\n')
+    if (check.app.id !== '15368') return boundedCiText(output || 'The exact check returned no textual output.', 32 * 1024)
+    // Actions job names are not identities. Join the check suite and check_run_url.
+    for (let page = 1; ; page++) {
+      const runs = await this.#restRead('observe-check-log', `${prefix}/actions/runs?head_sha=${input.candidateCommitOid}&per_page=100&page=${page}`,
+        z.object({ workflow_runs: z.array(z.object({ id: NumericIdSchema, head_sha: OidSchema, check_suite_id: NumericIdSchema })) }))
+      for (const run of runs.workflow_runs) {
+        if (run.head_sha !== input.candidateCommitOid || run.check_suite_id !== check.check_suite.id) continue
+        for (let jobPage = 1; ; jobPage++) {
+          const jobs = await this.#restRead('observe-check-log', `${prefix}/actions/runs/${run.id}/jobs?filter=all&per_page=100&page=${jobPage}`,
+            z.object({ jobs: z.array(z.object({ id: NumericIdSchema, head_sha: OidSchema, check_run_url: z.string().url() })) }))
+          for (const job of jobs.jobs) {
+            if (job.check_run_url !== `https://api.github.com${prefix}/check-runs/${input.databaseId}`) continue
+            if (job.head_sha !== input.candidateCommitOid) throw new GithubAuthorityError('identity-drift', 'observe-check-log', 'selected job head changed')
+            const log = await this.#runner('gh', ['api', `${prefix}/actions/jobs/${job.id}/logs`, '--hostname', GITHUB_HOST], { env: this.#env })
+            if (log.code !== 0) throw new GithubAuthorityError('unavailable', 'observe-check-log', 'exact job logs unavailable')
+            return boundedCiText(log.stdout, 32 * 1024)
+          }
+          if (jobs.jobs.length < 100) break
+        }
+      }
+      if (runs.workflow_runs.length < 100) break
+    }
+    throw new GithubAuthorityError('unavailable', 'observe-check-log', 'no exact Actions job matched the selected check')
   }
 
   async createPullRequest(input: {

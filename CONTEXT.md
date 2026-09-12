@@ -65,11 +65,11 @@ The fully qualified feature-branch ref in the publication route's head repositor
 _Avoid_: Remote HEAD, default branch, base branch
 
 **Publication baseline**:
-The exact remote pull-request head commit, or authoritative absence, recorded when a run starts. Candidate publication may replace only this recorded state.
+The exact remote pull-request head commit, or authoritative absence, recorded when a run starts. Initial candidate publication may replace only this recorded state; a repair publication may replace only the candidate in its immediately preceding publication receipt.
 _Avoid_: Remote-tracking branch, latest fetched head, inferred lease
 
 **Candidate publication receipt**:
-A durable record that binds a publication route, publication baseline, candidate commit, immediate remote observations, and publication outcome. It proves only the observed pull-request head state, not final delivery.
+A durable record that binds a publication route, publication baseline or superseded publication receipt, candidate commit, immediate remote observations, and publication outcome. It proves only the observed pull-request head state, not final delivery.
 _Avoid_: Push log, delivery proof, PR URL
 
 **Forge repository identity**:
@@ -105,8 +105,12 @@ The `ci` stage's upgrade of the open pull-request binding to `state: 'merged'` a
 _Avoid_: PR merged, merge SHA recorded, delivered tree
 
 **CI monitoring**:
-The `ci` stage's polling of the exact candidate's pull-request state, mergeability, and check rollup until the pull request is merged or closed. It reports failures to a `fix`/`stop` gate and never repairs or re-publishes the candidate.
+The observation of an exact candidate's pull-request state, mergeability, checks, and supported review-bot concerns until merge or closure. Actionable failures require a repair or stop decision; monitoring alone does not change the candidate.
 _Avoid_: CI proof, check completeness, auto-fix
+
+**CI repair attempt**:
+A selected response to CI findings that may produce a new candidate. Its consumed worker budget, original publication receipt, and candidate transition remain part of the run's history. A repaired candidate requires fresh validation and guarded publication before monitoring resumes.
+_Avoid_: Check rerun, review waiver, new run
 
 **Required policy**:
 A validation or delivery rule that must be satisfied for Passed to be available.

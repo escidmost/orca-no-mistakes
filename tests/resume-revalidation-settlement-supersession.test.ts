@@ -271,6 +271,7 @@ test("resume reconciles review settlement with supersedesEvidenceSha256 across c
     },
     observeIssueComments: async () => comments,
     observePullRequests: async () => ({ exact: pullRequest, nearMatches: [] }),
+    observePullRequestChecks: async () => ({ headOid: pullRequest!.headOid, checks: [] }),
     observeRepository: async () => ({ id: "R_repo", nodeId: "RN_repo" }),
     updateIssueComment: async () => {},
     updatePullRequest: async ({

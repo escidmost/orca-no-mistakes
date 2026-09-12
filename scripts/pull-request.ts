@@ -468,7 +468,7 @@ export async function observeBoundPullRequest(
   const binding = receipt ? (JSON.parse(receipt.receipt_json) as Record<string, unknown>) : undefined
   // The binding owns title and body; any edit or draft flip is drift, reported as null.
   if (
-    !pullRequest || !binding || pullRequest.draft || pullRequest.number !== binding.number ||
+    !pullRequest || !binding || receipt?.candidate_commit_oid !== candidateCommitOid || pullRequest.draft || pullRequest.number !== binding.number ||
     sha256(pullRequest.title) !== binding.titleSha256 || sha256(pullRequest.body) !== binding.bodySha256
   ) {
     return null

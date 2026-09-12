@@ -20,8 +20,8 @@ function node(extra: Record<string, unknown>, contexts: ReturnType<typeof page>)
   }
 }
 
-const failing = { __typename: 'CheckRun', conclusion: 'FAILURE', detailsUrl: null, name: 'lint', status: 'COMPLETED' }
-const passing = { __typename: 'StatusContext', context: 'ci/legacy', state: 'SUCCESS', targetUrl: null }
+const failing = { __typename: 'CheckRun', id: 'CR_1', databaseId: 1, checkSuite: { app: null }, conclusion: 'FAILURE', detailsUrl: null, name: 'lint', status: 'COMPLETED' }
+const passing = { __typename: 'StatusContext', id: 'SC_2', context: 'ci/legacy', state: 'SUCCESS', targetUrl: null }
 
 function runner(pages: unknown[]): CommandRunner {
   return async (executable, args): Promise<CommandResult> => {

@@ -188,6 +188,7 @@ test('runPipeline reuses published PR content on stage resume without redrafting
     const authority = {
       observeRepository: async () => ({ id: 'R_repo', nodeId: 'RN_repo' }),
       observePullRequests: async () => ({ exact: pullRequest, nearMatches: [] }),
+      observePullRequestChecks: async () => ({ headOid: pullRequest!.headOid, checks: [] }),
       createPullRequest: async ({ body, title }: { body: string; title: string }) => {
         pullRequest = {
           baseBranch: 'main',

@@ -21,6 +21,8 @@ The target pipeline separates deterministic GitHub and Git object proof from adv
 
 [ADR-0016](0016-ci-stage-monitoring-and-merge-settlement.md) implements CI monitoring as a ninth `ci` stage that polls the exact candidate's check rollup and merge state; check-set completeness, guarded merge, and delivered-tree proof remain Release 3.
 
+ONM-100 (2026-09-12) adds selected CI repair, full relevant revalidation, and guarded candidate republication with superseding receipts. This does not add check-set completeness or delivery proof.
+
 ## Consequences
 
 The coordinator needs scoped non-bypass GitHub credentials and records full check lifecycle identifiers and timestamps. Agent summaries and PR state alone cannot produce `checks-passed` or `Passed`.

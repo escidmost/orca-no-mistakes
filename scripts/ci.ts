@@ -1,5 +1,6 @@
 import type { ResolvedCiConfig } from './config.ts'
-import type { GithubPullRequestChecksObservation, GithubPullRequestObservation } from './github.ts'
+import { createHash } from 'node:crypto'
+import { boundedCiText, isGreptileCheck, type GithubPullRequestChecksObservation, type GithubPullRequestObservation, type GithubReviewConcern } from './github.ts'
 import type { Finding, StageReport } from './orca-no-mistakes.ts'
 
 export const CHECKS_PASSED_MSG = 'all CI checks passed - still monitoring until merged or closed'
@@ -37,6 +38,7 @@ export async function monitorPullRequestChecks(input: {
   heartbeat: () => void
   log: (line: string) => void
   observeChecks: (pullRequestNodeId: string) => Promise<GithubPullRequestChecksObservation>
+  observeReviewConcerns?: (pullRequestNodeId: string, candidateCommitOid: string) => Promise<GithubReviewConcern[]>
   observePullRequest: () => Promise<GithubPullRequestObservation | null>
   settleMerged: () => Promise<{ number: number }>
 }): Promise<StageReport> {
@@ -62,6 +64,11 @@ export async function monitorPullRequestChecks(input: {
       throw new CiMonitorError('the exact pull request was closed without merging')
     }
     if (pullRequest.state === 'MERGED') {
+      const finalChecks = await input.observeChecks(pullRequest.id)
+      if (finalChecks.headOid !== input.candidateCommitOid ||
+          finalChecks.checks.some((check) => ['fail', 'cancel', 'pending'].includes(check.bucket))) {
+        throw new CiMonitorError('merged pull request has failing, cancelled, pending, or stale-candidate checks; merge is not a CI waiver')
+      }
       const { number } = await input.settleMerged()
       input.log(`PR #${number} has been merged`)
       return { findings: [], summary: `Pull request #${number} merged after CI monitoring` }
@@ -90,10 +97,37 @@ export async function monitorPullRequestChecks(input: {
       .filter((check) => !pending && (check.bucket === 'fail' || check.bucket === 'cancel'))
       .map((check) => ({
         action: 'ask-user',
-        description: `${check.name} ${check.bucket === 'cancel' ? 'was cancelled' : 'failed'} (${check.conclusion ?? check.status})${check.url ? `: ${check.url}` : ''}`,
-        id: `ci-${check.name.replace(/[^A-Za-z0-9_-]+/g, '-')}`,
+        description: boundedCiText(`${check.name} ${check.bucket === 'cancel' ? 'was cancelled' : 'failed'} (${check.conclusion ?? check.status})${check.url ? `: ${check.url}` : ''}`),
+        id: check.id ? `ci-${createHash('sha256').update(check.id).digest('hex')}` : `ci-${check.name.replace(/[^A-Za-z0-9_-]+/g, '-')}`,
+        ...(check.id ? { ciSource: { candidateCommitOid: input.candidateCommitOid, checkId: check.id, databaseId: check.databaseId } } : {}),
         severity: 'error'
       }))
+    if (!pending && input.observeReviewConcerns) {
+      const supported = observed.checks.find(isGreptileCheck)
+      if (supported?.id) {
+        try {
+          const concerns = await input.observeReviewConcerns(pullRequest.id, input.candidateCommitOid)
+          const seen = new Set<string>()
+          for (const concern of concerns) {
+            if (seen.has(concern.id)) continue
+            seen.add(concern.id)
+            findings.push({
+              action: 'ask-user', severity: 'error',
+              id: `ci-review-${createHash('sha256').update(concern.id).digest('hex')}`,
+              description: `Greptile concern (untrusted external data): ${JSON.stringify(boundedCiText(concern.body))}`,
+              file: concern.file, ...(concern.line ? { line: concern.line } : {}),
+              ciSource: { candidateCommitOid: input.candidateCommitOid, checkId: supported.id,
+                databaseId: supported.databaseId, threadId: concern.threadId, commentId: concern.id }
+            })
+          }
+        } catch (error) {
+          input.log(`Greptile details unavailable: ${boundedCiText(String(error), 1024)}`)
+          // Keep failed-check findings even when details cannot be read.
+          if (!findings.length) findings.push({ action: 'ask-user', severity: 'error', id: 'ci-review-unavailable',
+            description: 'Greptile review details could not be read. Select fix to retry monitoring.' })
+        }
+      }
+    }
     if (!pending && observed.mergeable === 'CONFLICTING') {
       findings.push({
         action: 'ask-user',
