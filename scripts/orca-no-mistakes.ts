@@ -7474,6 +7474,7 @@ type PreparedWorker = {
 
 type CliOrcaOptions = {
   acpxCommand?: string;
+  artifactRunId?: string;
   command?: string;
   cwd: string;
   notifyHandle?: string;
@@ -7491,6 +7492,7 @@ function resolveOrcaCommand(override?: string): string {
 
 export class CliOrca implements OrcaOperations {
   readonly #acpxCommand: string;
+  readonly #artifactRunId?: string;
   readonly #command: string;
   readonly #cwd: string;
   readonly #notifyHandle?: string;
@@ -7524,6 +7526,7 @@ export class CliOrca implements OrcaOperations {
     this.#notifyHandle = options.notifyHandle;
     this.#parentWorktree = options.parentWorktree ?? options.cwd;
     this.#acpxCommand = options.acpxCommand ?? "acpx";
+    this.#artifactRunId = options.artifactRunId;
     this.#runId = options.runId;
   }
 
@@ -10006,8 +10009,10 @@ export class CliOrca implements OrcaOperations {
           };
         }
         const artifactsBase = artifactsRoot();
-        const artifactsRunRoot = this.#runId
-          ? path.resolve(artifactsBase, this.#runId)
+        // Resumes use a new orchestration run but retain the durable run's artifacts.
+        const artifactRunId = this.#artifactRunId ?? this.#runId;
+        const artifactsRunRoot = artifactRunId
+          ? path.resolve(artifactsBase, artifactRunId)
           : undefined;
         if (
           !artifactsRunRoot ||
@@ -16447,6 +16452,7 @@ Release boundary:
       : admissionRow?.run_id ?? stringFlag(parsed.flags, "run-id");
   const orca = new CliOrca({
     cwd: gatePath,
+    artifactRunId: resumeRunId,
     notifyHandle,
     parentWorktree: gate?.kind === "configured" ? originWorktree : undefined,
     runId: attachedRunId,
