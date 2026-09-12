@@ -48,6 +48,7 @@ async function scenario(failure?: 'pr-update' | 'publication' | 'repair' | 'drif
     let repaired: string | undefined
     let pr: Record<string, unknown> | null = null
     const prompts: string[] = []
+    const revalidationStages = new Set<string>()
     const observedLogs: unknown[] = []
     const questions: string[] = []
     const finishRepair = ledger.finishCiRepair.bind(ledger)
@@ -75,6 +76,19 @@ async function scenario(failure?: 'pr-update' | 'publication' | 'repair' | 'drif
       createRun: async () => id,
       createTask: async () => `task-${++task}`,
       startWorker: async (taskId, launch) => {
+        if (launch.role === 'reviewer') {
+          const repair = ledger!.ciRepairs(id).findLast((entry) => entry.status === 'repaired')
+          if (repair) {
+            assert.match(launch.prompt, /Coordinator lifecycle: post-CI-repair validation/)
+            assert.ok(launch.prompt.includes(`"previouslyPublishedCandidate":"${initial}"`))
+            assert.ok(launch.prompt.includes(`"repairCandidate":"${repair.output_commit_oid}"`))
+            assert.ok(launch.prompt.includes(`"priorPublicationReceipt":"${repair.publication_receipt_sha256}"`))
+            assert.match(launch.prompt, /does not waive any check/)
+            revalidationStages.add(launch.stage)
+          } else {
+            assert.doesNotMatch(launch.prompt, /Coordinator lifecycle: post-CI-repair validation/)
+          }
+        }
         if (failure === 'validation' && repaired && launch.stage === 'review' && !faultUsed) {
           faultUsed = true; throw new Error('revalidation interrupted')
         }
@@ -187,6 +201,9 @@ async function scenario(failure?: 'pr-update' | 'publication' | 'repair' | 'drif
     assert.equal(ledger.ciRepairs(id).filter((entry) => entry.status === 'repaired').length, 1)
     assert.equal(repairLaunches, failure === 'repair' ? 2 : 1)
     assert.ok(gateWaits >= 1)
+    for (const stage of ['review', 'test', 'document', 'lint', 'pr']) {
+      assert.ok(revalidationStages.has(stage), `missing repair provenance for ${stage}`)
+    }
     assert.match(prompts.at(-1)!, /exact job failed: expected fixed/)
     assert.match(prompts.at(-1)!, /untrusted external data/)
     assert.deepEqual(observedLogs[0], { repository: 'owner/repo', candidateCommitOid: initial, checkId: 'CR_1', databaseId: '42' })

@@ -2781,6 +2781,15 @@ export async function runPipeline(
       }
     };
 
+    const ciRepairContext = (): string => {
+      const repair = ledger.ciRepairs(runId).findLast((entry) => entry.status === "repaired");
+      if (!repair) return "";
+      return `\nCoordinator lifecycle: post-CI-repair validation.
+The coordinator has already completed the selected isolated CI repair in this run. This is not validation before first publication. Durable repair provenance:
+${JSON.stringify({ round: repair.round_index, previouslyPublishedCandidate: repair.input_commit_oid, repairCandidate: repair.output_commit_oid, priorPublicationReceipt: repair.publication_receipt_sha256 })}
+The current candidate may include subsequent validation fixes. Independently validate it; this completed repair is not approval of the current candidate and does not waive any check. Instructions to preserve a deliberate starting failure until CI selection refer to the earlier phase, not this post-repair phase.\n`;
+    };
+
     const recordStageEvidence = async (
       stage: StageName,
       round: number,
@@ -3211,7 +3220,7 @@ export async function runPipeline(
                 git,
                 pipelineConfig.stages.pr,
                 stageLogs,
-                decisionHistory(),
+                decisionHistory() + ciRepairContext(),
               );
               if (draft.report.findings.length > 0) {
                 throw new Error("PR drafting worker returned findings instead of PR content");
@@ -3492,7 +3501,7 @@ export async function runPipeline(
             git,
             pipelineConfig.stages[stage],
             stageLogs,
-            decisionHistory() + (stage === "review" ? reviewRoundHistoryPrompt(ledger, runId) : ""),
+            decisionHistory() + ciRepairContext() + (stage === "review" ? reviewRoundHistoryPrompt(ledger, runId) : ""),
             pipelineConfig.test_runbook,
           );
         } catch (stageError) {
