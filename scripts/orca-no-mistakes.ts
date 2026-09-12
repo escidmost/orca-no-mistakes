@@ -642,6 +642,13 @@ function recoveryInstructions(recoverRef: string): string {
   );
 }
 
+const WORKER_INBOX_TYPES: readonly string[] = [
+  "worker_done",
+  "escalation",
+  "question",
+  "heartbeat",
+];
+
 export class GateStopError extends Error {}
 
 // --- Abort reaping ---------------------------------------------------------
@@ -9402,6 +9409,7 @@ export class CliOrca implements OrcaOperations {
       this.#runId,
       "--json",
     ]);
+    let retainedForWorkerInbox = false;
     for (const message of result.messages ?? []) {
       if (
         message.type !== "question" ||
@@ -9409,6 +9417,8 @@ export class CliOrca implements OrcaOperations {
         message.from_handle !== this.#notifyHandle ||
         !message.body
       ) {
+        if (message.type && WORKER_INBOX_TYPES.includes(message.type))
+          retainedForWorkerInbox = true;
         console.warn(
           `no-mistakes: ignored unrelated ${message.type ?? "unknown"} orchestration message while waiting for a human gate`,
         );
@@ -9464,7 +9474,7 @@ export class CliOrca implements OrcaOperations {
       }
       pendingGateIds.delete(responseGateId);
     }
-    if (result.deliveryId) {
+    if (result.deliveryId && !retainedForWorkerInbox) {
       await this.#json([
         "orchestration",
         "check",
@@ -9892,7 +9902,7 @@ export class CliOrca implements OrcaOperations {
           "--wait",
           "--unread",
           "--types",
-          "worker_done,escalation,question,heartbeat",
+          WORKER_INBOX_TYPES.join(","),
           "--timeout-ms",
           "900000",
           ...(this.#runId ? ["--run", this.#runId] : []),
