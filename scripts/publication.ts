@@ -455,12 +455,12 @@ export async function publishCandidate(input: PublicationInput): Promise<{
         receipt.candidate_commit_oid !== candidate ||
         settled.exit_code !== 0 ||
         !isAuthoritativeStageEvidence(settled.worker_identity)) {
-      throw new CandidatePublicationError('push round 0 is already settled with different facts')
+      throw new CandidatePublicationError(`push round ${round} is already settled with different facts`)
     }
     const settledProblems = inputEvidenceProblems(input.ledger, input.runId, settled)
     if (settledProblems.length > 0) {
       throw new CandidatePublicationError(
-        `settled push round 0 retained evidence is invalid: ${settledProblems.join('; ')}`
+        `settled push round ${round} retained evidence is invalid: ${settledProblems.join('; ')}`
       )
     }
     return { candidateCommitOid: candidate, outcome, receiptSha256: receipt.receipt_sha256 }

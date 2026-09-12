@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { GithubAuthority, boundedCiText, type GithubCheckObservation, type CommandRunner } from '../scripts/github.ts'
+import { GithubAuthority, boundedCiText, runCommand, type GithubCheckObservation, type CommandRunner } from '../scripts/github.ts'
 import { monitorPullRequestChecks } from '../scripts/ci.ts'
 
 const head = 'a'.repeat(40)
@@ -66,6 +66,27 @@ test('resolved-between-pages concerns are removed and external text is byte boun
 
 const supported: GithubCheckObservation = { id: 'CR_1', databaseId: '1', app: { id: 'APP', databaseId: '867647', slug: 'greptile-apps' },
   bucket: 'fail', conclusion: 'FAILURE', kind: 'check-run', name: 'arbitrary display name', status: 'COMPLETED', url: null }
+
+test('check observations tolerate nullable database identities without losing stable node identity', async () => {
+  const api = await authority([{ baseRef: { target: { oid: other } }, headRefOid: head, isDraft: false,
+    mergeable: 'MERGEABLE', number: 1, state: 'OPEN', commits: { nodes: [{ commit: { oid: head,
+      statusCheckRollup: { contexts: page([{ __typename: 'CheckRun', id: 'CR_null', databaseId: null,
+        checkSuite: { app: { id: 'APP', databaseId: null, slug: 'unknown' } }, conclusion: 'FAILURE',
+        detailsUrl: null, name: 'build', status: 'COMPLETED' }]) } } }] } }])
+  const observed = await api.observePullRequestChecks('PR_1')
+  assert.equal(observed.checks[0].id, 'CR_null')
+  assert.equal(observed.checks[0].databaseId, undefined)
+  assert.equal(observed.checks[0].bucket, 'fail')
+})
+
+test('command output preserves UTF-8 split across stdout and stderr chunks', async () => {
+  const result = await runCommand(process.execPath, ['-e', `
+    const bytes = Buffer.from('💡');
+    process.stdout.write(bytes.subarray(0, 2)); process.stderr.write(bytes.subarray(0, 1));
+    setTimeout(() => { process.stdout.write(bytes.subarray(2)); process.stderr.write(bytes.subarray(1)); }, 50);
+  `], { env: process.env })
+  assert.deepEqual(result, { code: 0, stdout: '💡', stderr: '💡' })
+})
 
 test('monitor preserves failed-check blockers, gates actual concerns, and waits through pending checks', async () => {
   let reads = 0

@@ -1941,11 +1941,12 @@ CREATE TABLE IF NOT EXISTS remote_receipts (
 );
 
 CREATE TABLE IF NOT EXISTS ci_repairs (
-  run_id TEXT NOT NULL REFERENCES runs(run_id),
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
   round_index INTEGER NOT NULL,
   input_commit_oid TEXT NOT NULL,
   output_commit_oid TEXT,
-  publication_receipt_sha256 TEXT NOT NULL REFERENCES remote_receipts(receipt_sha256),
+  publication_receipt_sha256 TEXT NOT NULL REFERENCES remote_receipts(receipt_sha256) ON DELETE CASCADE,
+  -- Internal stage_evidence SQLite rowid, not a digest or an evidence count.
   evidence_floor INTEGER NOT NULL,
   status TEXT NOT NULL CHECK(status IN ('running', 'failed', 'repaired')),
   PRIMARY KEY (run_id, round_index)
@@ -2411,6 +2412,20 @@ export class DomainLedger {
       }
     }
     this.#db.exec(SCHEMA)
+    const repairForeignKeys = this.#db.prepare('PRAGMA foreign_key_list(ci_repairs)').all() as Array<{ on_delete: string }>
+    if (repairForeignKeys.some((key) => key.on_delete !== 'CASCADE')) {
+      this.#db.exec('BEGIN IMMEDIATE')
+      try {
+        this.#db.exec('ALTER TABLE ci_repairs RENAME TO ci_repairs_legacy')
+        this.#db.exec(SCHEMA)
+        this.#db.exec('INSERT INTO ci_repairs SELECT * FROM ci_repairs_legacy')
+        this.#db.exec('DROP TABLE ci_repairs_legacy')
+        this.#db.exec('COMMIT')
+      } catch (error) {
+        this.#db.exec('ROLLBACK')
+        throw error
+      }
+    }
     this.#db.exec('DROP TRIGGER IF EXISTS fence_run_attempt_generation')
     this.#db.exec(`CREATE TRIGGER IF NOT EXISTS fence_run_attempt_generation
       BEFORE INSERT ON run_attempts
@@ -4425,16 +4440,23 @@ export class DomainLedger {
   }
 
   beginCiRepair(runId: string, candidate: string, round: number): void {
-    const publication = this.remoteReceipt(runId, 'candidate-publication')
-    const binding = this.remoteReceipt(runId, 'pull-request-binding')
-    if (!publication || publication.candidate_commit_oid !== candidate || binding?.candidate_commit_oid !== candidate) {
-      throw new Error('CI repair requires the current published and PR-bound candidate')
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      const publication = this.remoteReceipt(runId, 'candidate-publication')
+      const binding = this.remoteReceipt(runId, 'pull-request-binding')
+      if (!publication || publication.candidate_commit_oid !== candidate || binding?.candidate_commit_oid !== candidate) {
+        throw new Error('CI repair requires the current published and PR-bound candidate')
+      }
+      const floor = this.#db.prepare('SELECT COALESCE(MAX(rowid), 0) AS floor FROM stage_evidence WHERE run_id = ?')
+        .get(runId) as { floor: number }
+      this.#db.prepare(`INSERT INTO ci_repairs
+        (run_id, round_index, input_commit_oid, publication_receipt_sha256, evidence_floor, status)
+        VALUES (?, ?, ?, ?, ?, 'running')`).run(runId, round, candidate, publication.receipt_sha256, floor.floor)
+      this.#db.exec('COMMIT')
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
     }
-    const floor = this.#db.prepare('SELECT COALESCE(MAX(rowid), 0) AS floor FROM stage_evidence WHERE run_id = ?')
-      .get(runId) as { floor: number }
-    this.#db.prepare(`INSERT INTO ci_repairs
-      (run_id, round_index, input_commit_oid, publication_receipt_sha256, evidence_floor, status)
-      VALUES (?, ?, ?, ?, ?, 'running')`).run(runId, round, candidate, publication.receipt_sha256, floor.floor)
   }
 
   recordCiRepairCandidate(runId: string, round: number, candidate: string): void {
@@ -4455,7 +4477,7 @@ export class DomainLedger {
         this.#recordCheckpoint({ runId, stageId: 'ci', roundIndex: round,
           inputCommitOid: repair.input_commit_oid, outputCommitOid: candidate })
       }
-      this.#db.prepare('UPDATE ci_repairs SET status = ?, output_commit_oid = ? WHERE run_id = ? AND round_index = ?')
+      this.#db.prepare('UPDATE ci_repairs SET status = ?, output_commit_oid = COALESCE(?, output_commit_oid) WHERE run_id = ? AND round_index = ?')
         .run(candidate ? 'repaired' : 'failed', candidate ?? null, runId, round)
       if (presentation) this.#recordPresentationMilestone(runId, presentation)
       this.#db.exec('COMMIT')

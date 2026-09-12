@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process'
 import { realpath } from 'node:fs/promises'
+import { StringDecoder } from 'node:string_decoder'
 import { z } from 'zod'
 
 import type {
@@ -9,6 +10,8 @@ import type {
 } from './ledger.ts'
 
 export const GITHUB_HOST = 'github.com' as const
+const GREPTILE_APP_DATABASE_ID = '867647'
+const GITHUB_ACTIONS_APP_DATABASE_ID = '15368'
 
 export const GithubAuthorityFailureSchema = z.enum([
   'prerequisite',
@@ -63,6 +66,8 @@ export const runCommand: CommandRunner = (executable, args, options) => new Prom
   })
   let stdout = ''
   let stderr = ''
+  const stdoutDecoder = new StringDecoder('utf8')
+  const stderrDecoder = new StringDecoder('utf8')
   let bytes = 0
   const accept = (chunk: Buffer): boolean => {
     bytes += chunk.length
@@ -70,8 +75,8 @@ export const runCommand: CommandRunner = (executable, args, options) => new Prom
     child.kill('SIGKILL')
     return false
   }
-  child.stdout.on('data', (chunk: Buffer) => { if (accept(chunk)) stdout += chunk.toString() })
-  child.stderr.on('data', (chunk: Buffer) => { if (accept(chunk)) stderr += chunk.toString() })
+  child.stdout.on('data', (chunk: Buffer) => { if (accept(chunk)) stdout += stdoutDecoder.write(chunk) })
+  child.stderr.on('data', (chunk: Buffer) => { if (accept(chunk)) stderr += stderrDecoder.write(chunk) })
   child.on('error', (error) => {
     const timedOut = (error as NodeJS.ErrnoException).code === 'ETIMEDOUT'
     // Timeout and signal kills surface as the retryable `unavailable` class.
@@ -79,8 +84,8 @@ export const runCommand: CommandRunner = (executable, args, options) => new Prom
   })
   child.on('close', (code, signal) => resolve({
     code: bytes > 16 * 1024 * 1024 ? 1 : code ?? (signal ? 124 : 1),
-    stderr: bytes > 16 * 1024 * 1024 ? 'command output exceeded 16 MiB' : code === null && signal ? `terminated by ${signal}` : stderr,
-    stdout
+    stderr: bytes > 16 * 1024 * 1024 ? 'command output exceeded 16 MiB' : code === null && signal ? `terminated by ${signal}` : stderr + stderrDecoder.end(),
+    stdout: stdout + stdoutDecoder.end()
   }))
   // ponytail: a child that closes stdin early must not crash the coordinator
   // with an uncaught EPIPE; the classified close result carries the failure.
@@ -176,8 +181,8 @@ const CheckContextSchema = z.discriminatedUnion('__typename', [
   z.object({
     __typename: z.literal('CheckRun'),
     id: NodeIdSchema,
-    databaseId: NumericIdSchema,
-    checkSuite: z.object({ app: z.object({ id: NodeIdSchema, databaseId: NumericIdSchema, slug: z.string() }).nullable() }),
+    databaseId: NumericIdSchema.nullable(),
+    checkSuite: z.object({ app: z.object({ id: NodeIdSchema, databaseId: NumericIdSchema.nullable(), slug: z.string() }).nullable() }),
     conclusion: z.string().nullable(),
     detailsUrl: z.string().nullable(),
     name: z.string(),
@@ -264,7 +269,7 @@ export function boundedCiText(value: string, bytes = 8192): string {
 
 // Stable public GitHub App identity, not a check-name heuristic.
 export function isGreptileCheck(check: GithubCheckObservation): boolean {
-  return check.kind === 'check-run' && check.app?.databaseId === '867647' && check.app.slug === 'greptile-apps'
+  return check.kind === 'check-run' && check.app?.databaseId === GREPTILE_APP_DATABASE_ID && check.app.slug === 'greptile-apps'
 }
 
 export type GithubBackend = {
@@ -322,7 +327,7 @@ export type GithubCheckBucket = 'pass' | 'fail' | 'pending' | 'cancel' | 'skip'
 export type GithubCheckObservation = {
   id?: string
   databaseId?: string
-  app?: { id: string; databaseId: string; slug: string } | null
+  app?: { id: string; databaseId: string | null; slug: string } | null
   bucket: GithubCheckBucket
   conclusion: string | null
   kind: 'check-run' | 'status'
@@ -617,7 +622,7 @@ export class GithubAuthority {
       checks.push(...contexts.nodes.map((context) => context.__typename === 'CheckRun'
         ? {
           id: context.id,
-          databaseId: context.databaseId,
+          ...(context.databaseId === null ? {} : { databaseId: context.databaseId }),
           app: context.checkSuite.app,
           bucket: checkBucket('check-run', context.status, context.conclusion),
           conclusion: context.conclusion,
@@ -699,7 +704,7 @@ export class GithubAuthority {
   async observeCheckLog(input: { repository: string; candidateCommitOid: string; checkId: string; databaseId: string }): Promise<string> {
     const { owner, name } = parseGithubRepositoryReference(input.repository)
     OidSchema.parse(input.candidateCommitOid)
-    if (!/^\d+$/.test(input.databaseId)) throw new Error('invalid check database identity')
+    if (!/^\d+$/.test(input.databaseId)) throw new GithubAuthorityError('prerequisite', 'observe-check-log', 'invalid check database identity')
     const prefix = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}`
     const check = await this.#restRead('observe-check-log', `${prefix}/check-runs/${input.databaseId}`, z.object({
       id: NumericIdSchema, node_id: NodeIdSchema, head_sha: OidSchema,
@@ -710,7 +715,7 @@ export class GithubAuthority {
       throw new GithubAuthorityError('identity-drift', 'observe-check-log', 'selected check does not bind the candidate')
     }
     const output = [check.output.title, check.output.summary, check.output.text].filter(Boolean).join('\n')
-    if (check.app.id !== '15368') return boundedCiText(output || 'The exact check returned no textual output.', 32 * 1024)
+    if (check.app.id !== GITHUB_ACTIONS_APP_DATABASE_ID) return boundedCiText(output || 'The exact check returned no textual output.', 32 * 1024)
     // Actions job names are not identities. Join the check suite and check_run_url.
     for (let page = 1; ; page++) {
       const runs = await this.#restRead('observe-check-log', `${prefix}/actions/runs?head_sha=${input.candidateCommitOid}&per_page=100&page=${page}`,

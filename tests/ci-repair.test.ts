@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process'
 import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import test from 'node:test'
 import { runCommand, type CommandRunner, type GithubAuthority } from '../scripts/github.ts'
 import { DomainLedger } from '../scripts/ledger.ts'
@@ -196,6 +197,28 @@ async function scenario(failure?: 'pr-update' | 'publication' | 'repair' | 'drif
       assert.ok(rows.some((entry) => entry.candidate_commit_oid === initial), `missing original ${stage}`)
     }
     assert.doesNotThrow(() => ledger!.verifyRetainedCompletionAttestation(result.completionAttestation!))
+    if (!failure) {
+      const retained = ledger.ciRepairs(id)
+      const dbPath = ledger.path
+      ledger.close()
+      const db = new DatabaseSync(dbPath)
+      const schema = (db.prepare("SELECT sql FROM sqlite_master WHERE name = 'ci_repairs'").get() as { sql: string }).sql
+      db.exec('ALTER TABLE ci_repairs RENAME TO old_repairs')
+      db.exec(schema.replaceAll(' ON DELETE CASCADE', ''))
+      db.exec('INSERT INTO ci_repairs SELECT * FROM old_repairs; DROP TABLE old_repairs')
+      db.exec(`INSERT INTO ci_repairs SELECT run_id, 99, input_commit_oid, output_commit_oid,
+        publication_receipt_sha256, evidence_floor, 'running' FROM ci_repairs LIMIT 1`)
+      db.close()
+      ledger = new DomainLedger(dbPath)
+      assert.deepEqual(ledger.ciRepairs(id).filter((entry) => entry.round_index !== 99), retained, 'schema repair must preserve durable attempts')
+      ledger.finishCiRepair(id, 99)
+      assert.equal(ledger.ciRepairs(id).at(-1)!.output_commit_oid, repaired, 'failed custody retains its recorded candidate')
+      assert.equal(ledger.ciRepairs(id).at(-1)!.status, 'failed')
+      assert.throws(() => ledger!.beginCiRepair(id, initial, 99), /current published/)
+      assert.throws(() => ledger!.beginCiRepair(id, initial, 99), /current published/, 'failed admission must roll back')
+      assert.equal(ledger.prune([id]), 1, 'repaired runs must retain cascading prune behavior')
+      assert.deepEqual(ledger.ciRepairs(id), [])
+    }
   } finally {
     ledger?.close()
     if (home === undefined) delete process.env.ORCA_NO_MISTAKES_HOME

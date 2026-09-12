@@ -380,6 +380,8 @@ test('pull request checks observation exhausts every page and maps every bucket'
   })
   const observation = await provider.observePullRequestChecks('PR_2')
   assert.deepEqual(cursors, [null, 'page-2'])
+  assert.deepEqual(observation.checks.filter((check) => check.kind === 'check-run').map((check) => [check.id, check.databaseId]),
+    [['CR_1', '1'], ['CR_2', '2'], ['CR_3', '3'], ['CR_4', '4'], ['CR_5', '5']])
   assert.equal(observation.number, 2)
   assert.equal(observation.headOid, 'b'.repeat(40))
   assert.deepEqual(
