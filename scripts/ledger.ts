@@ -6030,6 +6030,12 @@ export class DomainLedger {
       .get(key.runId, key.candidate, key.digest, key.repositoryId, key.host) as ReturnType<DomainLedger['mediaPublication']>
   }
 
+  publishedMediaDigests(runId: string, candidate: string, repositoryId: string, host: string): string[] {
+    return (this.#db.prepare(`SELECT artifact_sha256 FROM media_publications
+      WHERE run_id = ? AND candidate_commit_oid = ? AND repository_id = ? AND host = ? AND status = 'published'`)
+      .all(runId, candidate, repositoryId, host) as Array<{ artifact_sha256: string }>).map(row => row.artifact_sha256)
+  }
+
   beginMediaPublication(key: { runId: string; candidate: string; digest: string; repositoryId: string; host: string }, artifactPath: string,
     ownership: { repoRoot: string; branch: string; generationToken: number }): boolean {
     this.#db.exec('BEGIN IMMEDIATE')

@@ -3183,12 +3183,33 @@ export async function runPipeline(
                 stage: entry.stage_id,
               })),
             });
+            const trustedPublicationApprovals = new Set([
+              ...(options.trustedArtifactDigests ?? []),
+              ...pipelineConfig.media_publication.approved_sha256,
+            ]);
             const retainedContent = ledger.publishedPullRequestContent(
               runId,
               stageInputCommitOid,
             );
             let content: { body: string; title: string };
             if (retainedContent) {
+              const unauthorized = ledger
+                .publishedMediaDigests(
+                  runId,
+                  stageInputCommitOid,
+                  route.base_repository_id,
+                  route.forge_host,
+                )
+                .filter(
+                  (digest) =>
+                    !pipelineConfig.media_publication.enabled ||
+                    !trustedPublicationApprovals.has(digest),
+                );
+              if (unauthorized.length > 0) {
+                throw new Error(
+                  "retained pull request content carries published media whose publication approval is no longer authorized",
+                );
+              }
               content = retainedContent;
             } else {
               const draft = await executeStage(
@@ -3292,10 +3313,7 @@ export async function runPipeline(
                     artifactsDir,
                     testReport,
                     {
-                      trustedPublicationApprovals: new Set([
-                        ...(options.trustedArtifactDigests ?? []),
-                        ...pipelineConfig.media_publication.approved_sha256,
-                      ]),
+                      trustedPublicationApprovals,
                       ...(pipelineConfig.media_publication.enabled ? {
                         media: {
                           ledger,
