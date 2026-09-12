@@ -126,6 +126,7 @@ export type MediaPublicationContext = {
   runId: string
   candidate: string
   evidenceCandidate: string
+  ownership: { repoRoot: string; branch: string; generationToken: number }
   repositoryId: string
   host: string
   upload: (media: MediaBytes) => Promise<string>
@@ -142,7 +143,7 @@ export async function publishMediaArtifact(root: string, file: string, digest: s
     return artifact
   }
   const key = { runId: context.runId, candidate: context.candidate, digest, repositoryId: context.repositoryId, host: context.host }
-  if (context.ledger.beginMediaPublication(key, file)) {
+  if (context.ledger.beginMediaPublication(key, file, context.ownership)) {
     try {
       const url = attachmentUrl(await context.upload(media), context.host)
       context.ledger.finishMediaPublication(key, { status: 'published', url, detail: 'GitHub attachment published.' })
@@ -153,7 +154,11 @@ export async function publishMediaArtifact(root: string, file: string, digest: s
       })
     }
   }
-  const recorded = context.ledger.mediaPublication(key)!
+  const recorded = context.ledger.mediaPublication(key)
+  if (!recorded) {
+    artifact.content += '\nMedia not published: coordinator no longer owns the branch lease. Local evidence retained.'
+    return artifact
+  }
   artifact.content += `\nSize: ${media.bytes.length} bytes\n${recorded.detail}`
   if (recorded.status === 'published' && recorded.url) artifact.media = { kind: media.kind, url: attachmentUrl(recorded.url, context.host) }
   else artifact.content += '\nNot confirmed viewable remotely; no automatic re-upload. A new run is required to retry after investigating the previous attempt.'

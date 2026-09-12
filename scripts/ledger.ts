@@ -6030,11 +6030,20 @@ export class DomainLedger {
       .get(key.runId, key.candidate, key.digest, key.repositoryId, key.host) as ReturnType<DomainLedger['mediaPublication']>
   }
 
-  beginMediaPublication(key: { runId: string; candidate: string; digest: string; repositoryId: string; host: string }, artifactPath: string): boolean {
-    return this.#db.prepare(`INSERT OR IGNORE INTO media_publications
-      (run_id, candidate_commit_oid, artifact_sha256, repository_id, host, artifact_path, status, detail, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, 'pending', 'Upload outcome unknown; automatic retry withheld.', ?)`)
-      .run(key.runId, key.candidate, key.digest, key.repositoryId, key.host, artifactPath, new Date().toISOString()).changes === 1
+  beginMediaPublication(key: { runId: string; candidate: string; digest: string; repositoryId: string; host: string }, artifactPath: string,
+    ownership: { repoRoot: string; branch: string; generationToken: number }): boolean {
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      const reserved = this.ownsLease(key.runId, ownership) && this.#db.prepare(`INSERT OR IGNORE INTO media_publications
+        (run_id, candidate_commit_oid, artifact_sha256, repository_id, host, artifact_path, status, detail, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'pending', 'Upload outcome unknown; automatic retry withheld.', ?)`)
+        .run(key.runId, key.candidate, key.digest, key.repositoryId, key.host, artifactPath, new Date().toISOString()).changes === 1
+      this.#db.exec('COMMIT')
+      return reserved
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
   }
 
   finishMediaPublication(key: { runId: string; candidate: string; digest: string; repositoryId: string; host: string },

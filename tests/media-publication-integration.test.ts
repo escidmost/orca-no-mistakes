@@ -17,9 +17,10 @@ test('PR artifact integration persists success across reopen, rechecks authoriza
   let ledger = new DomainLedger(path.join(root, 'ledger.sqlite'))
   t.after(() => ledger.close())
   ledger.startRun({ runId: 'media-run', repoRoot: root, branch: 'feature', baseBranch: 'main', intent: 'test', policySha256: 'a'.repeat(64), submissionCommitOid: 'b'.repeat(40) })
+  const ownership = { repoRoot: root, branch: 'feature', generationToken: ledger.acquireLease({ runId: 'media-run', repoRoot: root, branch: 'feature' }) }
   let uploads = 0
   const url = 'https://github.com/user-attachments/assets/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
-  const context: MediaPublicationContext = { ledger, runId: 'media-run', candidate: 'b'.repeat(40), evidenceCandidate: 'b'.repeat(40), repositoryId: '42', host: 'github.com', upload: async media => { assert.deepEqual(media.bytes, bytes); uploads++; return url } }
+  const context: MediaPublicationContext = { ledger, ownership, runId: 'media-run', candidate: 'b'.repeat(40), evidenceCandidate: 'b'.repeat(40), repositoryId: '42', host: 'github.com', upload: async media => { assert.deepEqual(media.bytes, bytes); uploads++; return url } }
   const report = { findings: [], summary: 'test', artifacts: ['screen.png'], artifactDigests: { 'screen.png': digest } }
   const render = (media = context, approvals = [digest]) => pullRequestArtifacts(root, report, { media, trustedPublicationApprovals: approvals })
   assert.equal((await render())[0].media?.url, url)
@@ -50,9 +51,10 @@ test('durable failed, uncertain, and interrupted uploads preserve evidence and n
   for (const mode of ['failed', 'uncertain', 'pending']) {
     ledger.startRun({ runId: mode, repoRoot: root, branch: mode, baseBranch: 'main', intent: 'test', policySha256: 'a'.repeat(64), submissionCommitOid: 'b'.repeat(40) })
     const key = { runId: mode, candidate: 'b'.repeat(40), digest, repositoryId: '42', host: 'github.com' }
-    if (mode === 'pending') ledger.beginMediaPublication(key, 'clip.mp4')
+    const ownership = { repoRoot: root, branch: mode, generationToken: ledger.acquireLease({ runId: mode, repoRoot: root, branch: mode }) }
+    if (mode === 'pending') ledger.beginMediaPublication(key, 'clip.mp4', ownership)
     let uploads = 0
-    const media: MediaPublicationContext = { ...key, ledger, evidenceCandidate: key.candidate, upload: async () => { uploads++; throw new MediaUploadError('Upload failed; local evidence retained.', mode === 'uncertain') } }
+    const media: MediaPublicationContext = { ...key, ledger, ownership, evidenceCandidate: key.candidate, upload: async () => { uploads++; throw new MediaUploadError('Upload failed; local evidence retained.', mode === 'uncertain') } }
     for (let i = 0; i < 2; i++) {
       const artifacts = await pullRequestArtifacts(root, { findings: [], summary: 'test', artifacts: ['clip.mp4'], artifactDigests: { 'clip.mp4': digest } }, { media, trustedPublicationApprovals: [digest] })
       assert.equal(artifacts[0].media, undefined)
@@ -62,4 +64,30 @@ test('durable failed, uncertain, and interrupted uploads preserve evidence and n
     assert.equal(uploads, mode === 'pending' ? 0 : 1)
     assert.equal(ledger.mediaPublication(key)?.status, mode)
   }
+})
+
+test('a revoked or stale lease cannot reserve or upload media, while its current owner can', async t => {
+  const root = await mkdtemp(path.join(tmpdir(), 'onm-media-lease-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const bytes = Buffer.from('89504e470d0a1a0a0000000049454e44', 'hex')
+  const digest = createHash('sha256').update(bytes).digest('hex')
+  await writeFile(path.join(root, 'screen.png'), bytes)
+  const ledger = new DomainLedger(':memory:')
+  t.after(() => ledger.close())
+  ledger.startRun({ runId: 'lease-run', repoRoot: root, branch: 'feature', baseBranch: 'main', intent: 'test', policySha256: 'a'.repeat(64), submissionCommitOid: 'b'.repeat(40) })
+  const ownership = { repoRoot: root, branch: 'feature', generationToken: ledger.acquireLease({ runId: 'lease-run', repoRoot: root, branch: 'feature' }) }
+  const key = { runId: 'lease-run', candidate: 'b'.repeat(40), digest, repositoryId: '42', host: 'github.com' }
+  let uploads = 0
+  const media: MediaPublicationContext = { ...key, ledger, ownership, evidenceCandidate: key.candidate, upload: async () => { uploads++; return 'https://github.com/user-attachments/assets/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' } }
+  const render = () => pullRequestArtifacts(root, { findings: [], summary: 'test', artifacts: ['screen.png'], artifactDigests: { 'screen.png': digest } }, { media, trustedPublicationApprovals: [digest] })
+  ledger.releaseLease(key.runId)
+  assert.match((await render())[0].content, /no longer owns the branch lease/)
+  const currentGeneration = ledger.acquireLease({ runId: key.runId, repoRoot: root, branch: 'feature' })
+  assert.notEqual(currentGeneration, ownership.generationToken)
+  assert.match((await render())[0].content, /no longer owns the branch lease/)
+  assert.equal(uploads, 0)
+  assert.equal(ledger.mediaPublication(key), undefined)
+  ownership.generationToken = currentGeneration
+  assert.ok((await render())[0].media)
+  assert.equal(uploads, 1)
 })

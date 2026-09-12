@@ -3302,6 +3302,7 @@ export async function runPipeline(
                           runId,
                           candidate: stageInputCommitOid,
                           evidenceCandidate: latestEntryByStage.get("test")?.candidateCommitOid ?? "",
+                          ownership: { repoRoot: deliveryRepo.root, branch: deliveryRepo.branch, generationToken: generationToken! },
                           repositoryId: route.base_repository_id,
                           host: route.forge_host,
                           upload: (media) => options.githubAuthority!.uploadMedia({
