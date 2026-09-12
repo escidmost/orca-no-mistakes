@@ -7,6 +7,12 @@ The initial `total.mjs` deliberately adds a unit price and quantity. Running
 Actions oracle requires multiplication and therefore fails with expected `6`.
 The initial failure is the intended starting state, not a production change.
 
+That oracle only runs when the pull request's head branch is exactly
+`evs/onm100-live-acceptance` (`.github/workflows/onm100-live-acceptance.yml`).
+Publishing the fixture from any other head branch skips the `exact-total` job,
+so the intended failure and repair gate never appear. Publish from that exact
+branch name; do not relax the workflow restriction to work around it.
+
 This checkout is only the disposable fixture; it supplies no repair capability.
 Its own `ci` gate `fix` resolution merely resumes monitoring after external
 action (see the repository-root `README.md` and `docs/current-architecture.md`),
