@@ -644,6 +644,19 @@ function recoveryInstructions(recoverRef: string): string {
 
 export class GateStopError extends Error {}
 
+class GateAbandonedError extends Error {}
+
+function messagePayload(value: unknown): Record<string, unknown> {
+  try {
+    const parsed = typeof value === "string" ? (JSON.parse(value) as unknown) : value;
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed))
+      return {};
+    return parsed as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
 // --- Abort reaping ---------------------------------------------------------
 // A coordinator owns its worker terminals, its gate worktree/branch, and the
 // branch lease. Closing or signalling its terminal kills only the coordinator
@@ -9349,7 +9362,10 @@ export class CliOrca implements OrcaOperations {
 
   async waitForGate(
     gateId: string,
-    options?: { readOnlyInbox?: boolean },
+    options?: {
+      abandonWhen?: () => Promise<boolean>;
+      readOnlyInbox?: boolean;
+    },
   ): Promise<string> {
     for (;;) {
       const result = await this.#json<{
@@ -9364,6 +9380,8 @@ export class CliOrca implements OrcaOperations {
       if (gate?.status === "resolved") return gate.resolution ?? "";
       if (gate?.status === "timeout")
         throw new Error(`gate ${gateId} timed out`);
+      if (await options?.abandonWhen?.())
+        throw new GateAbandonedError(`gate ${gateId} abandoned`);
       await this.#applyGateResponses(
         options?.readOnlyInbox === true,
         new Set(
@@ -9386,6 +9404,24 @@ export class CliOrca implements OrcaOperations {
       resolution,
       "--json",
     ]);
+  }
+
+  async #dispatchSettled(taskId: string, dispatchId: string): Promise<boolean> {
+    const result = await this.#json<{
+      messages?: { payload?: Record<string, unknown> | string | null }[];
+    }>([
+      "orchestration",
+      "check",
+      "--peek",
+      "--types",
+      "worker_done,escalation",
+      ...(this.#runId ? ["--run", this.#runId] : []),
+      "--json",
+    ]);
+    return (result.messages ?? []).some((message) => {
+      const payload = messagePayload(message.payload);
+      return payload.taskId === taskId && payload.dispatchId === dispatchId;
+    });
   }
 
   async #applyGateResponses(
@@ -9996,9 +10032,17 @@ export class CliOrca implements OrcaOperations {
             const gateId = await this.createGate(taskId,
               `Worker ${dispatchId} asks: ${message.body ?? message.subject ?? ""}\n\nReply to this worker without restarting it. Resolve with "reply: <your answer>" or "stop". The answer must contain the actual guidance; separate status messages are not forwarded.`,
               ["reply", "stop"]);
-            const resolution = await this.waitForGate(gateId, {
-              readOnlyInbox: true,
-            });
+            let resolution: string;
+            try {
+              resolution = await this.waitForGate(gateId, {
+                abandonWhen: () => this.#dispatchSettled(taskId, dispatchId),
+                readOnlyInbox: true,
+              });
+            } catch (error) {
+              if (!(error instanceof GateAbandonedError)) throw error;
+              heartbeatOnly = true;
+              continue;
+            }
             const answer = /^reply:\s*(\S[\s\S]*)$/i.exec(resolution)?.[1];
             if (!answer && resolution !== "stop") throw new Error("Worker question requires reply: <answer> or stop");
             await this.#json(["orchestration", "reply", "--id", message.id,
