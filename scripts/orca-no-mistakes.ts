@@ -642,13 +642,6 @@ function recoveryInstructions(recoverRef: string): string {
   );
 }
 
-const WORKER_INBOX_TYPES: readonly string[] = [
-  "worker_done",
-  "escalation",
-  "question",
-  "heartbeat",
-];
-
 export class GateStopError extends Error {}
 
 // --- Abort reaping ---------------------------------------------------------
@@ -9354,7 +9347,10 @@ export class CliOrca implements OrcaOperations {
     return result.gate.id;
   }
 
-  async waitForGate(gateId: string): Promise<string> {
+  async waitForGate(
+    gateId: string,
+    options?: { readOnlyInbox?: boolean },
+  ): Promise<string> {
     for (;;) {
       const result = await this.#json<{
         gates: { id: string; resolution?: string; status: string }[];
@@ -9369,6 +9365,7 @@ export class CliOrca implements OrcaOperations {
       if (gate?.status === "timeout")
         throw new Error(`gate ${gateId} timed out`);
       await this.#applyGateResponses(
+        options?.readOnlyInbox === true,
         new Set(
           result.gates
             .filter((candidate) => candidate.status === "pending")
@@ -9391,7 +9388,10 @@ export class CliOrca implements OrcaOperations {
     ]);
   }
 
-  async #applyGateResponses(pendingGateIds: Set<string>): Promise<void> {
+  async #applyGateResponses(
+    readOnlyInbox: boolean,
+    pendingGateIds: Set<string>,
+  ): Promise<void> {
     if (!this.#runId) return;
     const result = await this.#json<{
       deliveryId?: string;
@@ -9404,12 +9404,11 @@ export class CliOrca implements OrcaOperations {
     }>([
       "orchestration",
       "check",
-      "--unread",
+      ...(readOnlyInbox ? ["--peek", "--types", "question"] : ["--unread"]),
       "--run",
       this.#runId,
       "--json",
     ]);
-    let retainedForWorkerInbox = false;
     for (const message of result.messages ?? []) {
       if (
         message.type !== "question" ||
@@ -9417,8 +9416,6 @@ export class CliOrca implements OrcaOperations {
         message.from_handle !== this.#notifyHandle ||
         !message.body
       ) {
-        if (message.type && WORKER_INBOX_TYPES.includes(message.type))
-          retainedForWorkerInbox = true;
         console.warn(
           `no-mistakes: ignored unrelated ${message.type ?? "unknown"} orchestration message while waiting for a human gate`,
         );
@@ -9474,7 +9471,7 @@ export class CliOrca implements OrcaOperations {
       }
       pendingGateIds.delete(responseGateId);
     }
-    if (result.deliveryId && !retainedForWorkerInbox) {
+    if (result.deliveryId && !readOnlyInbox) {
       await this.#json([
         "orchestration",
         "check",
@@ -9902,7 +9899,7 @@ export class CliOrca implements OrcaOperations {
           "--wait",
           "--unread",
           "--types",
-          WORKER_INBOX_TYPES.join(","),
+          "worker_done,escalation,question,heartbeat",
           "--timeout-ms",
           "900000",
           ...(this.#runId ? ["--run", this.#runId] : []),
@@ -9999,7 +9996,9 @@ export class CliOrca implements OrcaOperations {
             const gateId = await this.createGate(taskId,
               `Worker ${dispatchId} asks: ${message.body ?? message.subject ?? ""}\n\nReply to this worker without restarting it. Resolve with "reply: <your answer>" or "stop". The answer must contain the actual guidance; separate status messages are not forwarded.`,
               ["reply", "stop"]);
-            const resolution = await this.waitForGate(gateId);
+            const resolution = await this.waitForGate(gateId, {
+              readOnlyInbox: true,
+            });
             const answer = /^reply:\s*(\S[\s\S]*)$/i.exec(resolution)?.[1];
             if (!answer && resolution !== "stop") throw new Error("Worker question requires reply: <answer> or stop");
             await this.#json(["orchestration", "reply", "--id", message.id,
