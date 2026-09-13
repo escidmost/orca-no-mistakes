@@ -15,7 +15,31 @@ export const PIPELINE_STEPS = [
   'pr',
   'ci'
 ] as const
-export type StageName = (typeof PIPELINE_STEPS)[number]
+export type CoreStageName = (typeof PIPELINE_STEPS)[number]
+export type StageName = CoreStageName | `command-${string}`
+
+export const CommandGateSchema = z.strictObject({
+  name: z.string().max(40).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/)
+    .refine((name) => !PIPELINE_STEPS.includes(name as CoreStageName), 'name must not be a core stage'),
+  after: z.enum(['rebase', 'review', 'test', 'document', 'lint']),
+  command: z.string().trim().min(1)
+})
+export const CommandGatesSchema = z.array(CommandGateSchema).max(16).superRefine((gates, context) => {
+  const names = new Set<string>()
+  for (const [index, gate] of gates.entries()) {
+    if (names.has(gate.name)) context.addIssue({ code: 'custom', path: [index, 'name'], message: 'duplicate gate name' })
+    names.add(gate.name)
+  }
+})
+export type CommandGate = z.infer<typeof CommandGateSchema>
+
+export function commandGateStage(name: string): `command-${string}` {
+  return `command-${name}`
+}
+
+export function withCommandGates(stages: readonly CoreStageName[], gates: readonly CommandGate[]): StageName[] {
+  return stages.flatMap((stage) => [stage, ...gates.filter((gate) => gate.after === stage).map((gate) => commandGateStage(gate.name))])
+}
 
 export const ROLES = ['reviewer', 'fixer'] as const
 export type RoleName = (typeof ROLES)[number]
@@ -82,7 +106,7 @@ export type DefaultsConfig = z.infer<typeof DefaultsConfigSchema>
 
 export const StagesConfigSchema = z.strictObject(
   Object.fromEntries(PIPELINE_STEPS.map((s) => [s, StageConfigSchema.optional()])) as Record<
-    StageName,
+    CoreStageName,
     ReturnType<typeof StageConfigSchema.optional>
   >
 )
@@ -94,6 +118,7 @@ export const CiConfigSchema = z.strictObject({
 })
 
 export const OrcaNoMistakesConfigSchema = z.strictObject({
+  command_gates: CommandGatesSchema.optional(),
   defaults: DefaultsConfigSchema.optional(),
   stages: StagesConfigSchema.optional(),
   auto_fix: AutoFixConfigSchema.optional(),
@@ -280,7 +305,7 @@ export interface ResolvedRoleConfig {
  * @returns The resolved agent, execution, argument override, and auto-fix settings.
  */
 export function resolveRoleConfig(
-  stage: StageName,
+  stage: CoreStageName,
   role: RoleName,
   options: ResolverOptions = {}
 ): ResolvedRoleConfig {
@@ -372,13 +397,14 @@ export function resolveRoleConfig(
 }
 
 export interface ResolvedPipelineConfig {
+  command_gates: CommandGate[]
   intent?: string
   test_runbook?: string
   auto_fix: ResolvedAutoFixConfig
   ci: ResolvedCiConfig
   media_publication: { enabled: boolean; approved_sha256: string[] }
   agent_args_override: AgentArgsOverride
-  stages: Record<StageName, {
+  stages: Record<CoreStageName, {
     reviewer: ResolvedRoleConfig
     fixer: ResolvedRoleConfig
   }>
@@ -421,9 +447,10 @@ export function resolvePipelineConfig(options: ResolverOptions = {}): ResolvedPi
         fixer: resolveRoleConfig(stage, 'fixer', options)
       }
     ])
-  ) as Record<StageName, { reviewer: ResolvedRoleConfig; fixer: ResolvedRoleConfig }>
+  ) as Record<CoreStageName, { reviewer: ResolvedRoleConfig; fixer: ResolvedRoleConfig }>
 
   return {
+    command_gates: structuredClone(r?.command_gates ?? []),
     intent: c?.intent ?? r?.intent ?? u?.intent,
     media_publication: {
       enabled: r?.media_publication?.enabled ?? u?.media_publication?.enabled ?? false,
@@ -478,6 +505,18 @@ export const DEFAULT_CONFIG_TEMPLATE = `# ======================================
 # Trusted-base startup and focused end-user testing instructions (default: empty).
 # Inline the runbook here; proposed-branch instructions cannot redefine validation.
 test_runbook: ""
+
+# Required commands from the trusted base only; frozen for each run. Default: none.
+# Up to 16 unique names: lowercase letters/digits with inner hyphens, max 40
+# characters, excluding core-stage names. Anchors: rebase, review, test, document, lint.
+# Commands run under /bin/sh in a disposable candidate worktree. Install any
+# dependencies in the command. Branch-owned scripts remain code under review.
+# Failure requires an explicit fix or stop; optional/agent gates are unsupported.
+command_gates: []
+# command_gates:
+#   - name: architecture
+#     after: test
+#     command: "npm ci && npm run check:architecture"
 
 # Opt-in GitHub media attachments. Repository settings come from the trusted base.
 # Uploads require an exact SHA-256 approval, including on resume. Review the bytes

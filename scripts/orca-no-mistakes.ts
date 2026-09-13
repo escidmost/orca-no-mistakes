@@ -40,6 +40,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import YAML from "yaml";
+import { cancelCommandGates, runCommandGate } from "./command-gates.ts";
 import { isMediaArtifact, publishMediaArtifact, type MediaPublicationContext } from "./media-publication.ts";
 
 import {
@@ -63,11 +64,15 @@ import {
 } from "./adapters.ts";
 import {
   PIPELINE_STEPS,
+  CommandGateSchema,
+  commandGateStage,
+  withCommandGates,
   loadUserConfig,
   normalizeAgentSpec,
   resolvePipelineConfig,
   type AgentArgsOverride,
   type CliFlags,
+  type CoreStageName,
   type GuardrailMode,
   type OrcaNoMistakesConfig,
   type ResolvedRoleConfig,
@@ -1459,6 +1464,7 @@ function persistedStageIds(ledger: DomainLedger, runId: string): StageName[] {
 
 function forceStopAbortedRun(signal: "SIGHUP" | "SIGINT" | "SIGTERM"): void {
   abortRequested = true;
+  void cancelCommandGates();
   runAbortPresentationCleanup();
   const { artifactsDir, ledger, runId } = abortReap;
   try {
@@ -1501,6 +1507,7 @@ function forceStopAbortedRun(signal: "SIGHUP" | "SIGINT" | "SIGTERM"): void {
 
 export async function reapAbortedRun(reason: string): Promise<void> {
   abortRequested = true;
+  await cancelCommandGates();
   abortLog(`no-mistakes: ${reason}; reaping this run's resources`);
   await Promise.all([...abortAllocations]);
   let workers: WorkerResult[] = [];
@@ -2024,6 +2031,8 @@ export async function runPipeline(
     userGlobalConfig: options.userGlobalConfig,
   });
   const remotePublication = options.githubAuthority !== undefined;
+  if (options.resumeRunId) pipelineConfig.command_gates = ledger.commandGates(options.resumeRunId);
+  const commandGates = new Map(pipelineConfig.command_gates.map((gate) => [commandGateStage(gate.name), gate]));
   if (remotePublication !== (options.publicationDestination !== undefined)) {
     throw new Error("GitHub authority and publication destination must be configured together");
   }
@@ -2033,8 +2042,8 @@ export async function runPipeline(
   const pipelineSteps: readonly StageName[] = resumedPlan.length > 0
     ? resumedPlan
     : remotePublication || options.release2PublicationRequired
-      ? PIPELINE_STEPS
-      : LEGACY_STAGE_PLAN;
+      ? withCommandGates(PIPELINE_STEPS, pipelineConfig.command_gates)
+      : withCommandGates(LEGACY_STAGE_PLAN, pipelineConfig.command_gates);
   if (resumedPlan.length > 0 && pipelineSteps.includes("push") && !remotePublication) {
     throw new Error("Release 2 resume requires initialized GitHub publication");
   }
@@ -2237,6 +2246,7 @@ export async function runPipeline(
         domainRunStarted = true;
       } else {
         ledger.startRun({
+          commandGates: pipelineConfig.command_gates,
           baseBranch: deliveryRepo.base,
           branch: deliveryRepo.branch,
           intent,
@@ -2244,12 +2254,10 @@ export async function runPipeline(
           repoRoot: deliveryRepo.root,
           runId,
           submissionCommitOid: options.admission?.newOid ?? deliveryRepo.head,
-          stagePlan: pipelineSteps.includes("push")
-            ? RELEASE_2_STAGE_PLAN.map((stageId) => ({
+          stagePlan: pipelineSteps.map((stageId) => ({
                 requirement: "required" as const,
                 stageId,
-              }))
-            : undefined,
+              })),
         });
         domainRunStarted = true;
         if (options.admission) {
@@ -2990,7 +2998,7 @@ export async function runPipeline(
               evidence.evidence_sha256,
             ),
         );
-        if ((isApproved || latestReportByStage.get(candidateStage)?.liveValidation) && evidence.candidate_commit_oid !== currentHead) {
+        if ((isApproved || commandGates.has(candidateStage as `command-${string}`) || latestReportByStage.get(candidateStage)?.liveValidation) && evidence.candidate_commit_oid !== currentHead) {
           return candidateStage;
         }
       }
@@ -3001,6 +3009,8 @@ export async function runPipeline(
     const reopenedStages = new Set<StageName>();
     while (stageQueue.length > 0) {
       const stage = stageQueue.shift()!;
+      const commandGate = commandGates.get(stage as `command-${string}`);
+      const stageRoles = pipelineConfig.stages[commandGate?.after ?? stage as CoreStageName];
       if (stage === "push" || stage === "pr" || stage === "ci") {
         const invalidatedStage = await getInvalidatedApprovalStage();
         if (invalidatedStage) {
@@ -3505,7 +3515,27 @@ export async function runPipeline(
         );
         let execution: StageExecution;
         try {
-          execution = stage === "ci" ? await runCiStage() : await executeStage(
+          if (commandGate) {
+            if (abortRequested) throw new GateStopError("the run was aborted");
+            const log = registeredStageLog(stageLogs, stageLogPath(artifactsDir, stage, round));
+            try {
+              const result = await runCommandGate({ gate: commandGate, repoRoot: repo.root, candidate: executionHead, artifactsDir });
+              await log.append(result.output + (result.truncated ? "\n[command output truncated]\n" : ""), Symbol());
+              execution = {
+                exitCode: result.exitCode,
+                evidenceCommitOid: executionHead,
+                workerIdentity: "coordinator",
+                resolvedAgent: "coordinator",
+                report: {
+                  summary: `${commandGate.name} exited ${result.exitCode}${result.truncated ? " (output truncated)" : ""}\n${result.output}`,
+                  findings: result.exitCode === 0 ? [] : [{
+                    id: "command-failed", action: "ask-user", severity: "error",
+                    description: `Required command gate ${commandGate.name} failed (exit ${result.exitCode}). Command: ${commandGate.command}\n${result.output}`,
+                  }],
+                },
+              };
+            } finally { await log.close(); }
+          } else execution = stage === "ci" ? await runCiStage() : await executeStage(
             stage,
             attempt++,
             round,
@@ -3515,7 +3545,7 @@ export async function runPipeline(
             repo,
             orca,
             git,
-            pipelineConfig.stages[stage],
+            stageRoles,
             stageLogs,
             decisionHistory() + (stage === "review" ? reviewRoundHistoryPrompt(ledger, runId) : ""),
             pipelineConfig.test_runbook,
@@ -3630,7 +3660,7 @@ export async function runPipeline(
         const asksUser = actionable.some(
           (finding) => finding.action === "ask-user",
         );
-        const stageAutoFix = pipelineConfig.stages[stage].fixer.auto_fix;
+        const stageAutoFix = stageRoles.fixer.auto_fix;
         // ADR-0007: review findings are never repaired without explicit
         // trusted-policy authorization, and a disabled auto_fix blocks every
         // stage's automatic repairs.
@@ -3686,7 +3716,7 @@ export async function runPipeline(
             fixerSession = undefined;
             await releaseFixerSession(pausedSession, orca);
           }
-          const gateOptions = manualRebaseIssue
+          const gateOptions = manualRebaseIssue || commandGate
             ? ["fix", "stop"]
             : ["approve", "fix", "skip", "stop"];
           const question = gateQuestion(
@@ -3855,7 +3885,7 @@ export async function runPipeline(
           },
         );
         ledger.heartbeatLease(deliveryRepo.root, deliveryRepo.branch, runId);
-        const fixerRoles = pipelineConfig.stages[stage].fixer;
+        const fixerRoles = stageRoles.fixer;
         if (fixerSession && !fixerSessionMatchesRole(fixerSession, fixerRoles)) {
           const staleSession = fixerSession;
           fixerSession = undefined;
@@ -4072,6 +4102,9 @@ export async function runPipeline(
 
       const stageOutputCommitOid = await git.head();
       const authoritativeEntry = latestEntryByStage.get(stage)!;
+      if (commandGate && authoritativeEntry.exitCode !== 0) {
+        throw new Error(`required command gate ${commandGate.name} has not passed`);
+      }
       if (
         authoritativeEntry.exitCode !== 0 &&
         !authoritativeEntry.waiverOrApproval &&
@@ -6421,7 +6454,7 @@ function stageTaskSpec(
 }
 
 function checkerBrief(stage: StageName): string {
-  const briefs: Record<Exclude<StageName, "intent" | "rebase" | "push" | "ci">, string> = {
+  const briefs: Record<Exclude<CoreStageName, "intent" | "rebase" | "push" | "ci">, string> = {
     review: "Adversarially review the committed change.",
     test: "Run the smallest relevant behavioral checks and gather evidence for user intent.",
     document: "Check whether the change made owned documentation stale.",
@@ -15929,7 +15962,8 @@ async function runWorkerReportCommand(flags: RawCliFlags): Promise<void> {
   const stageValue = stringFlag(flags, "stage");
   const role = stringFlag(flags, "role");
   const outputValue = stringFlag(flags, "out");
-  if (!stageValue || !PIPELINE_STEPS.includes(stageValue as StageName)) {
+  if (!stageValue || (!PIPELINE_STEPS.includes(stageValue as CoreStageName) &&
+    !(stageValue.startsWith("command-") && CommandGateSchema.shape.name.safeParse(stageValue.slice(8)).success))) {
     throw new Error(`report requires --stage <${PIPELINE_STEPS.join("|")}>`);
   }
   if (role !== "reviewer" && role !== "fixer") {

@@ -6,7 +6,7 @@ import { homedir } from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
-import { PIPELINE_STEPS, type GuardrailMode } from './config.ts'
+import { PIPELINE_STEPS, CommandGatesSchema, commandGateStage, type CommandGate, type GuardrailMode } from './config.ts'
 import type { PresentationSnapshot } from './presentation.ts'
 
 const { O_APPEND, O_CREAT, O_EXCL, O_NOFOLLOW, O_RDONLY, O_RDWR, O_WRONLY } = constants
@@ -2491,6 +2491,7 @@ export class DomainLedger {
     // ponytail: nullable columns added post-release use the idempotent ALTER
     // path. Only the expected duplicate-column failure is tolerated.
     for (const [table, column] of [
+      ['runs', "command_gates_json TEXT NOT NULL DEFAULT '[]'"],
       ['stage_evidence', 'effective_policy_hash TEXT'],
       ['stage_evidence', 'base_ref_sha TEXT'],
       ['stage_evidence', 'artifact_sha256 TEXT'],
@@ -2512,6 +2513,9 @@ export class DomainLedger {
         }
       }
     }
+    this.#db.exec(`CREATE TRIGGER IF NOT EXISTS freeze_command_gates
+      BEFORE UPDATE OF command_gates_json ON runs
+      BEGIN SELECT RAISE(ABORT, 'command gates are frozen at run creation'); END;`)
     const schemaVersion = this.#db.prepare('PRAGMA user_version').get() as {
       user_version: number
     }
@@ -2889,6 +2893,7 @@ export class DomainLedger {
   }
 
   startRun(input: {
+    commandGates?: readonly CommandGate[]
     baseBranch: string
     branch: string
     intent: string
@@ -2902,14 +2907,21 @@ export class DomainLedger {
       requirement: 'required' as const,
       stageId
     }))
+    const commandGates = CommandGatesSchema.parse(input.commandGates ?? [])
+    const declared = commandGates.map((gate) => commandGateStage(gate.name))
+    if (plan.filter((entry) => entry.stageId.startsWith('command-')).some((entry) =>
+      !declared.includes(entry.stageId as `command-${string}`) || entry.requirement !== 'required') ||
+      declared.some((id) => !plan.some((entry) => entry.stageId === id))) {
+      throw new Error('command gates must match required frozen plan entries')
+    }
     this.#db.exec('BEGIN IMMEDIATE')
     try {
       this.#db
         .prepare(
           `INSERT INTO runs (
              run_id, repo_root, branch, base_branch, submission_commit_oid, terminal_commit_oid,
-             intent, intent_hash, policy_sha256, status, created_at, completed_at
-           ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, 'in-progress', ?, NULL)`
+             intent, intent_hash, policy_sha256, status, created_at, completed_at, command_gates_json
+           ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, 'in-progress', ?, NULL, ?)`
         )
         .run(
           input.runId,
@@ -2920,7 +2932,8 @@ export class DomainLedger {
           input.intent,
           intentHash(input.intent),
           input.policySha256,
-          new Date().toISOString()
+          new Date().toISOString(),
+          JSON.stringify(commandGates)
         )
       const insert = this.#db.prepare(
         `INSERT INTO stage_plan_entries (run_id, position, stage_id, requirement)
@@ -2938,6 +2951,12 @@ export class DomainLedger {
       this.#db.exec('ROLLBACK')
       throw error
     }
+  }
+
+  commandGates(runId: string): CommandGate[] {
+    const row = this.#db.prepare('SELECT command_gates_json FROM runs WHERE run_id = ?').get(runId) as { command_gates_json: string } | undefined
+    if (!row) throw new Error(`run ${runId} does not exist`)
+    return CommandGatesSchema.parse(JSON.parse(row.command_gates_json))
   }
 
   submissionAdmission(admissionId: string): SubmissionAdmissionRow | undefined {
@@ -5322,6 +5341,10 @@ export class DomainLedger {
     const blockers: string[] = []
     for (const row of latest.values()) {
       const label = `${row.stage_id} round ${row.round_index}`
+      if (row.stage_id.startsWith('command-') && row.exit_code !== 0) {
+        blockers.push(`${label}: required command gate failed`)
+        continue
+      }
       if (row.findings_json === null) {
         blockers.push(`${label}: recorded findings are unreadable`)
         continue

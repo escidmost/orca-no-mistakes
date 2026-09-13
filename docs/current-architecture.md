@@ -155,6 +155,38 @@ Media-publication settings are the documented exception to the scalar array repl
 
 ## Findings and gates
 
+### Repository command gates
+
+Trusted-base `.orca/no-mistakes.yaml` may declare `command_gates` (default `[]`),
+each with a unique `name`, an `after` anchor, and a nonempty `command`. Names use
+lowercase letters/digits separated by inner hyphens, have at most 40 characters,
+and cannot equal a core stage. At most 16 gates are allowed. Anchors are `rebase`,
+`review`, `test`, `document`, and `lint`; declaration order is preserved within
+each anchor. Gates appear as `command-<name>` in the existing stage plan, logs,
+evidence, and reports, before publication. User-global and local-bypass
+configuration cannot declare them. All command gates are required; optional,
+skip, and agent configuration fields are rejected.
+
+The run stores its declarations atomically with its frozen stage plan. Resume
+uses that list rather than adding, removing, or retargeting gates from later
+configuration; existing compatibility checks on other policy and base evidence
+still apply. Commands execute under `/bin/sh` in fresh detached Git worktrees at
+the exact candidate, with no implicit dependency installation. Combined output
+is retained up to 64 KiB with an explicit truncation marker, together with the
+exit status and commit-bound evidence. POSIX process groups are killed when the
+shell exits or the attempt is cancelled, then the worktree is removed. There is
+no command or whole-run deadline. Deliberately detached processes are outside
+this process-group cleanup contract; it is not a sandbox.
+
+A nonzero exit opens `fix`/`stop`, even with auto-fix enabled. `fix` authorizes the
+existing fixer and guardrail path using the anchor's fixer configuration, then
+reruns the command on the repaired candidate. Approval cannot certify a failed
+command. Candidate changes require fresh command evidence before publication.
+Trusting the declaration does **not** freeze a branch-owned script it invokes:
+the script executes from the candidate. Review changes to such scripts through
+the existing unexplained-policy-relaxation review and fixer guardrails rather
+than treating the declaration as immutable validation code.
+
 Fixer labels are bound to the reviewer analysis that produced their findings, not to the internal evidence round. The first attempt after `Review analysis 3` is `Review fix 3`; a blocked retry is `Review fix 3 retry 1`. This identity is stored in presentation snapshots and reused by activity, detail, log, gate, and resumed TUI displays. Plain-status output uses it only for fixer start, completion, and blocker lines; its findings-recorded, gate-opened, and gate-resolved lines still print the internal evidence round.
 
 When a settled local stage reruns on a changed candidate, a durable `stage-reopened` transition clears candidate-bound finding dispositions before analysis. New local settlements explicitly name the prior evidence they replace and append to `stage_disposition_supersessions`; the original settlement and evidence remain immutable. Effective disposition reads use the latest supersession, and settlement events distinguish newly reviewed evidence even when the internal round and candidate are unchanged.
