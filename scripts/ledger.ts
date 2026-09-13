@@ -6,7 +6,7 @@ import { homedir } from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
-import { PIPELINE_STEPS, CommandGatesSchema, commandGateStage, type CommandGate, type GuardrailMode } from './config.ts'
+import { PIPELINE_STEPS, CommandGatesSchema, commandGateStage, withCommandGates, type CoreStageName, type CommandGate, type GuardrailMode } from './config.ts'
 import type { PresentationSnapshot } from './presentation.ts'
 
 const { O_APPEND, O_CREAT, O_EXCL, O_NOFOLLOW, O_RDONLY, O_RDWR, O_WRONLY } = constants
@@ -2913,6 +2913,10 @@ export class DomainLedger {
       !declared.includes(entry.stageId as `command-${string}`) || entry.requirement !== 'required') ||
       declared.some((id) => !plan.some((entry) => entry.stageId === id))) {
       throw new Error('command gates must match required frozen plan entries')
+    }
+    const expected = withCommandGates(plan.filter((entry) => !entry.stageId.startsWith('command-')).map((entry) => entry.stageId as CoreStageName), commandGates)
+    if (expected.length !== plan.length || expected.some((stage, index) => stage !== plan[index].stageId)) {
+      throw new Error('command gate order must match frozen anchors and declaration order')
     }
     this.#db.exec('BEGIN IMMEDIATE')
     try {

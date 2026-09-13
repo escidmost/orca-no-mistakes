@@ -139,6 +139,15 @@ test('ledger freezes declarations and refuses optional command plan entries', ()
   const input = { baseBranch: 'main', branch: 'feature', intent: 'test', policySha256: 'f'.repeat(64), repoRoot: '/repo', runId: 'frozen', submissionCommitOid: 'a'.repeat(40), commandGates: [declaration] }
   try {
     assert.throws(() => ledger.startRun({ ...input, stagePlan: [{ stageId: commandGateStage(declaration.name), requirement: 'optional' }] }), /required frozen plan/)
+    for (const stages of [
+      ['command-value-check', ...LEGACY_STAGE_PLAN],
+      [...LEGACY_STAGE_PLAN, 'command-value-check'],
+      ['intent', 'rebase', 'review', 'command-value-check', 'document', 'lint'],
+    ]) {
+      assert.throws(() => ledger.startRun({ ...input, stagePlan: stages.map((stageId) => ({ stageId, requirement: 'required' })) }), /order must match/)
+    }
+    const second = { ...declaration, name: 'second' }
+    assert.throws(() => ledger.startRun({ ...input, commandGates: [declaration, second], stagePlan: withCommandGates(LEGACY_STAGE_PLAN, [second, declaration]).map((stageId) => ({ stageId, requirement: 'required' })) }), /order must match/)
     ledger.startRun({ ...input, stagePlan: withCommandGates(LEGACY_STAGE_PLAN, [declaration]).map((stageId) => ({ stageId, requirement: 'required' })) })
     const copy = ledger.commandGates(input.runId)
     copy[0].command = 'exit 99'
