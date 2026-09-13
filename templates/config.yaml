@@ -15,6 +15,13 @@
 # Inline the runbook here; proposed-branch instructions cannot redefine validation.
 test_runbook: ""
 
+# Opt-in GitHub media attachments. Repository settings come from the trusted base.
+# Uploads require an exact SHA-256 approval, including on resume. Review the bytes
+# before listing their digest: binary media cannot be secret-redacted.
+media_publication:
+  enabled: false
+  approved_sha256: []
+
 # User-global only: retain self-contained review cases after successful completion.
 # Default false. Local storage can contain code; replay sends it to the selected provider.
 # Manual pruning and explicit capture/replay: docs/review-evaluation.md.

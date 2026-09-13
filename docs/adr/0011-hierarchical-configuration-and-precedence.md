@@ -20,7 +20,7 @@ The runner requires a deterministic, hierarchical configuration system allowing 
 
 - **Merge Semantics**:
   - Dictionaries/objects are deep-merged across precedence tiers.
-  - Primitives, booleans, and arrays (including agent fallback lists) use scalar replacement.
+  - Primitives, booleans, and arrays (including agent fallback lists) use scalar replacement. The one implemented exception is `media_publication.approved_sha256`, which unions user-global and trusted-repository approvals; see [Validation policy](../current-architecture.md#validation-policy).
 
 - **Strict Validation & Failure Mode**:
   - Configuration files are strictly validated using Zod (`z.strictObject()`).

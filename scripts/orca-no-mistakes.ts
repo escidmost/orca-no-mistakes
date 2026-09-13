@@ -40,6 +40,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import YAML from "yaml";
+import { isMediaArtifact, publishMediaArtifact, type MediaPublicationContext } from "./media-publication.ts";
 
 import {
   PreflightError,
@@ -75,6 +76,7 @@ import {
 import {
   effectivePolicyHash,
   resolveRunPolicy,
+  trustedRepoPolicyConfig,
   type PolicyProvenance,
 } from "./policy.ts";
 import {
@@ -2011,11 +2013,9 @@ export async function runPipeline(
     git,
     repoRoot: repo.root,
   });
-  // no_ci is trusted only from the base ref; a local-config bypass cannot declare it.
-  const trustedRepoConfig =
-    provenance.localBypass && repoPolicyConfig.ci
-      ? { ...repoPolicyConfig, ci: { ...repoPolicyConfig.ci, no_ci: false } }
-      : repoPolicyConfig;
+  // no_ci and media publication approvals are trusted only from the base ref;
+  // a local-config bypass cannot declare them.
+  const trustedRepoConfig = trustedRepoPolicyConfig(repoPolicyConfig, provenance);
   const pipelineConfig = resolvePipelineConfig({
     // The explicit fix-round option rides the highest precedence tier so every
     // stage budget derives from one resolved configuration.
@@ -3182,12 +3182,33 @@ export async function runPipeline(
                 stage: entry.stage_id,
               })),
             });
+            const trustedPublicationApprovals = new Set([
+              ...(options.trustedArtifactDigests ?? []),
+              ...pipelineConfig.media_publication.approved_sha256,
+            ]);
             const retainedContent = ledger.publishedPullRequestContent(
               runId,
               stageInputCommitOid,
             );
             let content: { body: string; title: string };
             if (retainedContent) {
+              const unauthorized = ledger
+                .publishedMediaDigests(
+                  runId,
+                  stageInputCommitOid,
+                  route.base_repository_id,
+                  route.forge_host,
+                )
+                .filter(
+                  (digest) =>
+                    !pipelineConfig.media_publication.enabled ||
+                    !trustedPublicationApprovals.has(digest),
+                );
+              if (unauthorized.length > 0) {
+                throw new Error(
+                  "retained pull request content carries published media whose publication approval is no longer authorized",
+                );
+              }
               content = retainedContent;
             } else {
               const draft = await executeStage(
@@ -3290,7 +3311,25 @@ export async function runPipeline(
                   artifacts: await pullRequestArtifacts(
                     artifactsDir,
                     testReport,
-                    options.trustedArtifactDigests,
+                    {
+                      trustedPublicationApprovals,
+                      ...(pipelineConfig.media_publication.enabled ? {
+                        media: {
+                          ledger,
+                          runId,
+                          candidate: stageInputCommitOid,
+                          evidenceCandidate: latestEntryByStage.get("test")?.candidateCommitOid ?? "",
+                          ownership: { repoRoot: deliveryRepo.root, branch: deliveryRepo.branch, generationToken: generationToken! },
+                          repositoryId: route.base_repository_id,
+                          host: route.forge_host,
+                          upload: (media) => options.githubAuthority!.uploadMedia({
+                            ...media,
+                            host: route.forge_host,
+                            repositoryId: route.base_repository_id,
+                          }),
+                        },
+                      } : {}),
+                    },
                   ),
                   summary:
                     testReport?.summary ??
@@ -4797,6 +4836,8 @@ type TimeoutFence = {
   aborted: boolean;
   deadlineSatisfied: boolean;
   signal?: AbortSignal;
+  pauseDeadline?: () => void;
+  resumeDeadline?: () => void;
 };
 
 async function withTimeout<T>(
@@ -4813,19 +4854,38 @@ async function withTimeout<T>(
     signal: abortController.signal,
   };
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let remaining = timeoutMs;
+  let startedAt = Date.now();
+  let paused = false;
+  let armDeadline: (() => void) | undefined;
+  fence.pauseDeadline = () => {
+    if (paused) return;
+    paused = true;
+    remaining = Math.max(0, remaining - (Date.now() - startedAt));
+    clearTimeout(timer);
+  };
+  fence.resumeDeadline = () => {
+    if (!paused) return;
+    paused = false;
+    startedAt = Date.now();
+    armDeadline?.();
+  };
   const operation = run(fence);
   try {
     return await Promise.race([
       operation,
       new Promise<never>((_, reject) => {
-        timer = setTimeout(() => {
-          if (fence.deadlineSatisfied) return;
-          fence.aborted = true;
-          abortController.abort();
-          reject(
-            new Error(`${label} exceeded its ${timeoutMs}ms execution timeout`),
-          );
-        }, timeoutMs);
+        armDeadline = () => {
+          timer = setTimeout(() => {
+            if (fence.deadlineSatisfied) return;
+            fence.aborted = true;
+            abortController.abort();
+            reject(
+              new Error(`${label} exceeded its ${timeoutMs}ms execution timeout`),
+            );
+          }, remaining);
+        };
+        if (!paused) armDeadline();
       }),
     ]);
   } catch (error) {
@@ -6257,6 +6317,7 @@ function pullRequestArtifactLabel(fileName: string): string {
 
 export type PullRequestArtifactTrustOptions = {
   trustedPublicationApprovals?: ReadonlySet<string> | readonly string[];
+  media?: MediaPublicationContext;
 };
 
 export async function pullRequestArtifacts(
@@ -6278,6 +6339,10 @@ export async function pullRequestArtifacts(
   );
 
   for (const artifact of report?.artifacts ?? []) {
+    if (options && !(Symbol.iterator in options) && options.media && isMediaArtifact(artifact)) {
+      artifacts.push(await publishMediaArtifact(artifactsDir, artifact, report?.artifactDigests?.[artifact] ?? "", trustedApprovals, options.media));
+      continue;
+    }
     const resolved = path.resolve(artifactsDir, artifact);
     if (!isWithin(artifactsDir, resolved)) continue;
     try {
@@ -9282,23 +9347,54 @@ export class CliOrca implements OrcaOperations {
     return result.gate.id;
   }
 
+  async #gates(): Promise<
+    { id: string; resolution?: string; status: string }[]
+  > {
+    const result = await this.#json<{
+      gates: { id: string; resolution?: string; status: string }[];
+    }>([
+      "orchestration",
+      "gate-list",
+      ...(this.#runId ? ["--run", this.#runId] : []),
+      "--json",
+    ]);
+    return result.gates;
+  }
+
+  async #gateOutcome(gateId: string): Promise<string | undefined> {
+    const gate = (await this.#gates()).find(
+      (candidate) => candidate.id === gateId,
+    );
+    if (gate?.status === "timeout") throw new Error(`gate ${gateId} timed out`);
+    return gate?.status === "resolved" ? (gate.resolution ?? "") : undefined;
+  }
+
+  // A human can answer the worker's durable question directly with
+  // `orchestration reply`, which never touches the relay gate. Orca marks the
+  // question answered, so its dispatch stops reporting the `input` attention
+  // category; an unreadable projection stays a wait rather than settling one
+  // that is still open.
+  async #workerAwaitsInput(dispatchId: string): Promise<boolean> {
+    const result = await this.#json<{
+      projection?: { attention?: { categories?: string[] } };
+    }>(
+      ["orchestration", "worker-show", "--dispatch", dispatchId, "--json"],
+      true,
+    ).catch(() => undefined);
+    const categories = result?.projection?.attention?.categories;
+    return categories === undefined ? true : categories.includes("input");
+  }
+
   async waitForGate(gateId: string): Promise<string> {
     for (;;) {
-      const result = await this.#json<{
-        gates: { id: string; resolution?: string; status: string }[];
-      }>([
-        "orchestration",
-        "gate-list",
-        ...(this.#runId ? ["--run", this.#runId] : []),
-        "--json",
-      ]);
-      const gate = result.gates.find((candidate) => candidate.id === gateId);
+      const gates = await this.#gates();
+      const gate = gates.find((candidate) => candidate.id === gateId);
       if (gate?.status === "resolved") return gate.resolution ?? "";
       if (gate?.status === "timeout")
         throw new Error(`gate ${gateId} timed out`);
       await this.#applyGateResponses(
         new Set(
-          result.gates
+          gates
             .filter((candidate) => candidate.status === "pending")
             .map((candidate) => candidate.id),
         ),
@@ -9337,7 +9433,30 @@ export class CliOrca implements OrcaOperations {
       this.#runId,
       "--json",
     ]);
-    for (const message of result.messages ?? []) {
+    await this.#resolveGateResponses(result.messages ?? [], pendingGateIds);
+    if (result.deliveryId) {
+      await this.#json([
+        "orchestration",
+        "check",
+        "--ack",
+        result.deliveryId,
+        "--run",
+        this.#runId,
+        "--json",
+      ]);
+    }
+  }
+
+  async #resolveGateResponses(
+    messages: {
+      body?: string;
+      from_handle?: string;
+      subject?: string;
+      type?: string;
+    }[],
+    pendingGateIds: Set<string>,
+  ): Promise<void> {
+    for (const message of messages) {
       if (
         message.type !== "question" ||
         message.subject !== "no-mistakes gate response" ||
@@ -9399,17 +9518,6 @@ export class CliOrca implements OrcaOperations {
       }
       pendingGateIds.delete(responseGateId);
     }
-    if (result.deliveryId) {
-      await this.#json([
-        "orchestration",
-        "check",
-        "--ack",
-        result.deliveryId,
-        "--run",
-        this.#runId,
-        "--json",
-      ]);
-    }
   }
 
   async setWorktreeStatus(comment: string, status?: string): Promise<void> {
@@ -9454,6 +9562,7 @@ export class CliOrca implements OrcaOperations {
     const activity = {
       lastActivityAt: Date.now(),
       lastOutputAt: await this.#workerOutputAt(terminalHandle),
+      waitingForHuman: false,
     };
     const abortController = new AbortController();
     // The caller's fence still owns cancellation state: a copy that hardcodes
@@ -9474,6 +9583,8 @@ export class CliOrca implements OrcaOperations {
       signal: fence?.signal
         ? AbortSignal.any([fence.signal, abortController.signal])
         : abortController.signal,
+      pauseDeadline: () => fence?.pauseDeadline?.(),
+      resumeDeadline: () => fence?.resumeDeadline?.(),
     };
     const workerReport = this.#awaitWorkerReport(
       taskId,
@@ -9497,8 +9608,10 @@ export class CliOrca implements OrcaOperations {
         // silence is the worker's or the channel's.
         new Promise<{ error?: string }>((resolve) => {
           watchdog = setInterval(() => {
+            if (activity.waitingForHuman) return;
             void this.#workerOutputAt(terminalHandle)
               .then((outputAt) => {
+                if (activity.waitingForHuman) return;
                 if (outputAt === undefined) {
                   resolve({
                     error: `worker ${dispatchId} terminal disconnected`,
@@ -9792,7 +9905,7 @@ export class CliOrca implements OrcaOperations {
     launch: WorkerLaunch,
     log: StageLog | undefined,
     source: symbol | undefined,
-    activity: { lastActivityAt: number; lastOutputAt: number | undefined },
+    activity: { lastActivityAt: number; lastOutputAt: number | undefined; waitingForHuman: boolean },
     fence?: TimeoutFence,
   ): Promise<{
     deliveryId?: string;
@@ -9800,7 +9913,43 @@ export class CliOrca implements OrcaOperations {
     failedOutcome?: boolean;
     report?: StageReport;
   }> {
+    let question: { gateId: string; messageId: string } | undefined;
+    const settleQuestion = (): void => {
+      if (!question) return;
+      question = undefined;
+      activity.lastActivityAt = Date.now();
+      activity.waitingForHuman = false;
+      fence?.resumeDeadline?.();
+    };
     for (;;) {
+      if (question) {
+        const resolution = await this.#gateOutcome(question.gateId);
+        if (resolution === undefined) {
+          if (!(await this.#workerAwaitsInput(dispatchId))) settleQuestion();
+        } else {
+          const messageId = question.messageId;
+          settleQuestion();
+          const answer = /^reply:\s*(\S[\s\S]*)$/i.exec(resolution)?.[1];
+          if (!answer && resolution !== "stop")
+            throw new Error("Worker question requires reply: <answer> or stop");
+          const reply = await this.#json<{ error?: { code?: string; message?: string } }>([
+            "orchestration",
+            "reply",
+            "--id",
+            messageId,
+            "--body",
+            answer ?? "Stop: the human declined to continue this worker.",
+            ...(this.#runId ? ["--run", this.#runId] : []),
+            "--json",
+          ], true);
+          // Completion can close the dispatch before this answer reaches Orca.
+          // Reconcile its lifecycle delivery below; a stale reply is not success.
+          if (reply.error && reply.error.code !== "dispatch_inactive")
+            throw new Error(`Worker question reply failed: ${reply.error.code}: ${reply.error.message}`);
+          if (resolution === "stop")
+            throw new GateStopError("Human stopped the worker at its question");
+        }
+      }
       const result = await this.#json<{
         _heartbeat?: boolean;
         _keepalive?: boolean;
@@ -9808,7 +9957,9 @@ export class CliOrca implements OrcaOperations {
         connectionLost?: boolean;
         deliveryId?: string;
         messages?: {
+          id?: string;
           body?: string;
+          from_handle?: string;
           payload?: Record<string, unknown> | string | null;
           subject?: string;
           type?: string;
@@ -9823,7 +9974,7 @@ export class CliOrca implements OrcaOperations {
           "--types",
           "worker_done,escalation,question,heartbeat",
           "--timeout-ms",
-          "900000",
+          question ? "5000" : "900000",
           ...(this.#runId ? ["--run", this.#runId] : []),
           "--json",
         ],
@@ -9848,8 +9999,8 @@ export class CliOrca implements OrcaOperations {
             await this.#drainWorkerLog(terminalHandle, log, source);
         }
         if (
-          Date.now() - activity.lastActivityAt >=
-          workerIdleTimeoutMs()
+          !question &&
+          Date.now() - activity.lastActivityAt >= workerIdleTimeoutMs()
         ) {
           return {
             deliveryId: result.deliveryId,
@@ -9872,6 +10023,16 @@ export class CliOrca implements OrcaOperations {
           deliveryId: result.deliveryId,
           error: "orchestration check returned no messages",
         };
+      }
+      if (question) {
+        await this.#resolveGateResponses(
+          result.messages.filter(
+            (message) =>
+              message.type === "question" &&
+              message.subject === "no-mistakes gate response",
+          ),
+          new Set([question.gateId]),
+        );
       }
       let heartbeatOnly = true;
       for (const message of result.messages) {
@@ -9911,6 +10072,20 @@ export class CliOrca implements OrcaOperations {
           continue;
         }
         heartbeatOnly = false;
+        if (message.type === "question" && payload.taskId === taskId && message.id) {
+          settleQuestion();
+          activity.waitingForHuman = true;
+          fence?.pauseDeadline?.();
+          question = {
+            gateId: await this.createGate(taskId,
+              `Worker ${dispatchId} asks: ${message.body ?? message.subject ?? ""}\n\nReply to this worker without restarting it. Resolve with "reply: <your answer>" or "stop". The answer must contain the actual guidance; separate status messages are not forwarded.`,
+              ["reply", "stop"]),
+            messageId: message.id,
+          };
+          heartbeatOnly = true;
+          continue;
+        }
+        settleQuestion();
         if (message.type !== "worker_done") {
           return {
             deliveryId: result.deliveryId,

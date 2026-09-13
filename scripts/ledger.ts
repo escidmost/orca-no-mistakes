@@ -2063,6 +2063,32 @@ CREATE TABLE IF NOT EXISTS passed_attestations (
 CREATE INDEX IF NOT EXISTS idx_passed_attestations_candidate
   ON passed_attestations(candidate_commit_oid, created_at);
 
+CREATE TABLE IF NOT EXISTS media_publications (
+  run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  candidate_commit_oid TEXT NOT NULL,
+  artifact_sha256 TEXT NOT NULL,
+  artifact_path TEXT NOT NULL,
+  repository_id TEXT NOT NULL,
+  host TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('pending', 'published', 'failed', 'uncertain')),
+  url TEXT,
+  detail TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (run_id, candidate_commit_oid, artifact_sha256, repository_id, host)
+);
+
+CREATE TABLE IF NOT EXISTS media_publication_artifacts (
+  run_id TEXT NOT NULL,
+  candidate_commit_oid TEXT NOT NULL,
+  artifact_sha256 TEXT NOT NULL,
+  repository_id TEXT NOT NULL,
+  host TEXT NOT NULL,
+  artifact_path TEXT NOT NULL,
+  PRIMARY KEY (run_id, candidate_commit_oid, artifact_sha256, repository_id, host, artifact_path),
+  FOREIGN KEY (run_id, candidate_commit_oid, artifact_sha256, repository_id, host)
+    REFERENCES media_publications(run_id, candidate_commit_oid, artifact_sha256, repository_id, host) ON DELETE CASCADE
+);
+
 CREATE TRIGGER IF NOT EXISTS immutable_stage_plan_entries
 BEFORE UPDATE ON stage_plan_entries
 BEGIN SELECT RAISE(ABORT, 'stage_plan_entries rows are immutable'); END;
@@ -2776,6 +2802,8 @@ export class DomainLedger {
         'stage_evidence',
         'gate_audit',
         'auto_fix_mode_events',
+        'media_publications',
+        'media_publication_artifacts',
         'presentation_snapshots',
         'passed_attestations'
       ]) {
@@ -6006,5 +6034,53 @@ export class DomainLedger {
 
   close(): void {
     this.#db.close()
+  }
+
+  mediaPublication(key: { runId: string; candidate: string; digest: string; repositoryId: string; host: string }, artifactPath: string):
+    { status: 'pending' | 'published' | 'failed' | 'uncertain'; url: string | null; detail: string; artifactPath: string } | undefined {
+    return this.#db.prepare(`SELECT status, url, detail, artifacts.artifact_path AS artifactPath FROM media_publications
+      JOIN media_publication_artifacts AS artifacts USING (run_id, candidate_commit_oid, artifact_sha256, repository_id, host)
+      WHERE run_id = ? AND candidate_commit_oid = ? AND artifact_sha256 = ? AND repository_id = ? AND host = ? AND artifacts.artifact_path = ?`)
+      .get(key.runId, key.candidate, key.digest, key.repositoryId, key.host, artifactPath) as ReturnType<DomainLedger['mediaPublication']>
+  }
+
+  publishedMediaDigests(runId: string, candidate: string, repositoryId: string, host: string): string[] {
+    return (this.#db.prepare(`SELECT artifact_sha256 FROM media_publications
+      WHERE run_id = ? AND candidate_commit_oid = ? AND repository_id = ? AND host = ? AND status = 'published'`)
+      .all(runId, candidate, repositoryId, host) as Array<{ artifact_sha256: string }>).map(row => row.artifact_sha256)
+  }
+
+  beginMediaPublication(key: { runId: string; candidate: string; digest: string; repositoryId: string; host: string }, artifactPath: string,
+    ownership: { repoRoot: string; branch: string; generationToken: number }): boolean {
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      const owned = this.ownsLease(key.runId, ownership)
+      const reserved = owned && this.#db.prepare(`INSERT OR IGNORE INTO media_publications
+        (run_id, candidate_commit_oid, artifact_sha256, repository_id, host, artifact_path, status, detail, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'pending', 'Upload outcome unknown; automatic retry withheld.', ?)`)
+        .run(key.runId, key.candidate, key.digest, key.repositoryId, key.host, artifactPath, new Date().toISOString()).changes === 1
+      if (owned) this.#db.prepare(`INSERT OR IGNORE INTO media_publication_artifacts
+        (run_id, candidate_commit_oid, artifact_sha256, repository_id, host, artifact_path) VALUES (?, ?, ?, ?, ?, ?)`)
+        .run(key.runId, key.candidate, key.digest, key.repositoryId, key.host, artifactPath)
+      this.#db.exec('COMMIT')
+      return reserved
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  finishMediaPublication(key: { runId: string; candidate: string; digest: string; repositoryId: string; host: string },
+    result: { status: 'published' | 'failed' | 'uncertain'; url?: string; detail: string },
+    ownership: { repoRoot: string; branch: string; generationToken: number }): boolean {
+    const changed = this.#db.prepare(`UPDATE media_publications SET status = ?, url = ?, detail = ?
+      WHERE run_id = ? AND candidate_commit_oid = ? AND artifact_sha256 = ? AND repository_id = ? AND host = ? AND status = 'pending'
+      AND EXISTS (SELECT 1 FROM runs r JOIN branch_leases l
+        ON l.run_id = r.run_id AND l.repo_root = r.repo_root AND l.branch = r.branch
+        WHERE r.run_id = media_publications.run_id AND r.status = 'in-progress'
+          AND r.repo_root = ? AND r.branch = ? AND l.generation_token = ?)`)
+      .run(result.status, result.url ?? null, result.detail, key.runId, key.candidate, key.digest, key.repositoryId, key.host,
+        ownership.repoRoot, ownership.branch, ownership.generationToken).changes
+    return changed === 1
   }
 }

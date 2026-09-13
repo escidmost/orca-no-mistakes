@@ -114,3 +114,12 @@ export async function resolveRunPolicy(options: {
     },
   };
 }
+
+export function trustedRepoPolicyConfig(
+  config: OrcaNoMistakesConfig,
+  provenance: PolicyProvenance,
+): OrcaNoMistakesConfig {
+  if (!provenance.localBypass) return config;
+  const { media_publication: _untrustedMedia, ...rest } = config;
+  return rest.ci ? { ...rest, ci: { ...rest.ci, no_ci: false } } : rest;
+}
