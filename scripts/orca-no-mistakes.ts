@@ -3519,8 +3519,16 @@ export async function runPipeline(
             if (abortRequested) throw new GateStopError("the run was aborted");
             const log = registeredStageLog(stageLogs, stageLogPath(artifactsDir, stage, round));
             try {
-              const result = await runCommandGate({ gate: commandGate, repoRoot: repo.root, candidate: executionHead, artifactsDir });
-              await log.append(result.output + (result.truncated ? "\n[command output truncated]\n" : ""), Symbol());
+              const commandOutput = Symbol();
+              const result = await runCommandGate({
+                gate: commandGate,
+                repoRoot: repo.root,
+                candidate: executionHead,
+                artifactsDir,
+                onOutput: (text) => {
+                  log.append(text, commandOutput).catch(() => {});
+                },
+              });
               execution = {
                 exitCode: result.exitCode,
                 evidenceCommitOid: executionHead,
