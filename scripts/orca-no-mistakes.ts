@@ -9369,6 +9369,22 @@ export class CliOrca implements OrcaOperations {
     return gate?.status === "resolved" ? (gate.resolution ?? "") : undefined;
   }
 
+  // A human can answer the worker's durable question directly with
+  // `orchestration reply`, which never touches the relay gate. Orca marks the
+  // question answered, so its dispatch stops reporting the `input` attention
+  // category; an unreadable projection stays a wait rather than settling one
+  // that is still open.
+  async #workerAwaitsInput(dispatchId: string): Promise<boolean> {
+    const result = await this.#json<{
+      projection?: { attention?: { categories?: string[] } };
+    }>(
+      ["orchestration", "worker-show", "--dispatch", dispatchId, "--json"],
+      true,
+    ).catch(() => undefined);
+    const categories = result?.projection?.attention?.categories;
+    return categories === undefined ? true : categories.includes("input");
+  }
+
   async waitForGate(gateId: string): Promise<string> {
     for (;;) {
       const gates = await this.#gates();
@@ -9908,7 +9924,9 @@ export class CliOrca implements OrcaOperations {
     for (;;) {
       if (question) {
         const resolution = await this.#gateOutcome(question.gateId);
-        if (resolution !== undefined) {
+        if (resolution === undefined) {
+          if (!(await this.#workerAwaitsInput(dispatchId))) settleQuestion();
+        } else {
           const messageId = question.messageId;
           settleQuestion();
           const answer = /^reply:\s*(\S[\s\S]*)$/i.exec(resolution)?.[1];
