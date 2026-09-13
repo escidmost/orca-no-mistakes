@@ -6071,10 +6071,16 @@ export class DomainLedger {
   }
 
   finishMediaPublication(key: { runId: string; candidate: string; digest: string; repositoryId: string; host: string },
-    result: { status: 'published' | 'failed' | 'uncertain'; url?: string; detail: string }): void {
+    result: { status: 'published' | 'failed' | 'uncertain'; url?: string; detail: string },
+    ownership: { repoRoot: string; branch: string; generationToken: number }): boolean {
     const changed = this.#db.prepare(`UPDATE media_publications SET status = ?, url = ?, detail = ?
-      WHERE run_id = ? AND candidate_commit_oid = ? AND artifact_sha256 = ? AND repository_id = ? AND host = ? AND status = 'pending'`)
-      .run(result.status, result.url ?? null, result.detail, key.runId, key.candidate, key.digest, key.repositoryId, key.host).changes
-    if (changed !== 1) throw new Error('media publication attempt is not pending')
+      WHERE run_id = ? AND candidate_commit_oid = ? AND artifact_sha256 = ? AND repository_id = ? AND host = ? AND status = 'pending'
+      AND EXISTS (SELECT 1 FROM runs r JOIN branch_leases l
+        ON l.run_id = r.run_id AND l.repo_root = r.repo_root AND l.branch = r.branch
+        WHERE r.run_id = media_publications.run_id AND r.status = 'in-progress'
+          AND r.repo_root = ? AND r.branch = ? AND l.generation_token = ?)`)
+      .run(result.status, result.url ?? null, result.detail, key.runId, key.candidate, key.digest, key.repositoryId, key.host,
+        ownership.repoRoot, ownership.branch, ownership.generationToken).changes
+    return changed === 1
   }
 }

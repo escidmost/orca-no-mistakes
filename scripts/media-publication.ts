@@ -147,12 +147,12 @@ export async function publishMediaArtifact(root: string, file: string, digest: s
   if (context.ledger.beginMediaPublication(key, media.artifactPath, context.ownership)) {
     try {
       const url = attachmentUrl(await context.upload(media), context.host)
-      context.ledger.finishMediaPublication(key, { status: 'published', url, detail: 'GitHub attachment published.' })
+      context.ledger.finishMediaPublication(key, { status: 'published', url, detail: 'GitHub attachment published.' }, context.ownership)
     } catch (error) {
       context.ledger.finishMediaPublication(key, {
         status: error instanceof MediaUploadError && !error.uncertain ? 'failed' : 'uncertain',
         detail: error instanceof MediaUploadError ? error.message : 'Upload outcome uncertain; automatic retry withheld and local evidence retained.'
-      })
+      }, context.ownership)
     }
   }
   const recorded = context.ledger.mediaPublication(key, media.artifactPath)

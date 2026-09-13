@@ -95,6 +95,44 @@ test('durable failed, uncertain, and interrupted uploads preserve evidence and n
   }
 })
 
+test('upload completion cannot change a pending record after lease replacement', async t => {
+  const root = await mkdtemp(path.join(tmpdir(), 'onm-media-completion-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const bytes = Buffer.from('89504e470d0a1a0a0000000049454e44', 'hex')
+  const digest = createHash('sha256').update(bytes).digest('hex')
+  await writeFile(path.join(root, 'screen.png'), bytes)
+  const artifactPath = await realpath(path.join(root, 'screen.png'))
+  const ledger = new DomainLedger(':memory:')
+  t.after(() => ledger.close())
+  for (const replacement of ['same-run', 'other-run']) for (const outcome of ['success', 'failed', 'uncertain']) {
+    const runId = `${replacement}-${outcome}`
+    const start = (id: string) => ledger.startRun({ runId: id, repoRoot: root, branch: runId, baseBranch: 'main', intent: 'test', policySha256: 'a'.repeat(64), submissionCommitOid: 'b'.repeat(40) })
+    start(runId)
+    const ownership = { repoRoot: root, branch: runId, generationToken: ledger.acquireLease({ runId, repoRoot: root, branch: runId }) }
+    const key = { runId, candidate: 'b'.repeat(40), digest, repositoryId: '42', host: 'github.com' }
+    let pending: ReturnType<DomainLedger['mediaPublication']>
+    let uploads = 0
+    const media: MediaPublicationContext = { ...key, ledger, ownership, evidenceCandidate: key.candidate, upload: async () => {
+      uploads++
+      pending = ledger.mediaPublication(key, artifactPath)
+      assert.equal(pending?.status, 'pending')
+      ledger.releaseLease(runId)
+      const nextRun = replacement === 'same-run' ? runId : `${runId}-replacement`
+      if (nextRun !== runId) start(nextRun)
+      assert.notEqual(ledger.acquireLease({ runId: nextRun, repoRoot: root, branch: runId }), ownership.generationToken)
+      if (outcome !== 'success') throw new MediaUploadError('upload failed', outcome === 'uncertain')
+      return 'https://github.com/user-attachments/assets/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    } }
+    for (let i = 0; i < 2; i++) {
+      const artifacts = await pullRequestArtifacts(root, { findings: [], summary: 'test', artifacts: ['screen.png'], artifactDigests: { 'screen.png': digest } }, { media, trustedPublicationApprovals: [digest] })
+      assert.equal(artifacts[0].media, undefined)
+      assert.match(artifacts[0].content, /Not confirmed viewable remotely/)
+      assert.deepEqual(ledger.mediaPublication(key, artifactPath), pending)
+    }
+    assert.equal(uploads, 1)
+  }
+})
+
 test('a revoked or stale lease cannot reserve or upload media, while its current owner can', async t => {
   const root = await mkdtemp(path.join(tmpdir(), 'onm-media-lease-'))
   t.after(() => rm(root, { recursive: true, force: true }))
