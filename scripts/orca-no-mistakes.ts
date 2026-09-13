@@ -644,19 +644,6 @@ function recoveryInstructions(recoverRef: string): string {
 
 export class GateStopError extends Error {}
 
-class GateAbandonedError extends Error {}
-
-function messagePayload(value: unknown): Record<string, unknown> {
-  try {
-    const parsed = typeof value === "string" ? (JSON.parse(value) as unknown) : value;
-    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed))
-      return {};
-    return parsed as Record<string, unknown>;
-  } catch {
-    return {};
-  }
-}
-
 // --- Abort reaping ---------------------------------------------------------
 // A coordinator owns its worker terminals, its gate worktree/branch, and the
 // branch lease. Closing or signalling its terminal kills only the coordinator
@@ -9360,32 +9347,38 @@ export class CliOrca implements OrcaOperations {
     return result.gate.id;
   }
 
-  async waitForGate(
-    gateId: string,
-    options?: {
-      abandonWhen?: () => Promise<boolean>;
-      readOnlyInbox?: boolean;
-    },
-  ): Promise<string> {
+  async #gates(): Promise<
+    { id: string; resolution?: string; status: string }[]
+  > {
+    const result = await this.#json<{
+      gates: { id: string; resolution?: string; status: string }[];
+    }>([
+      "orchestration",
+      "gate-list",
+      ...(this.#runId ? ["--run", this.#runId] : []),
+      "--json",
+    ]);
+    return result.gates;
+  }
+
+  async #gateOutcome(gateId: string): Promise<string | undefined> {
+    const gate = (await this.#gates()).find(
+      (candidate) => candidate.id === gateId,
+    );
+    if (gate?.status === "timeout") throw new Error(`gate ${gateId} timed out`);
+    return gate?.status === "resolved" ? (gate.resolution ?? "") : undefined;
+  }
+
+  async waitForGate(gateId: string): Promise<string> {
     for (;;) {
-      const result = await this.#json<{
-        gates: { id: string; resolution?: string; status: string }[];
-      }>([
-        "orchestration",
-        "gate-list",
-        ...(this.#runId ? ["--run", this.#runId] : []),
-        "--json",
-      ]);
-      const gate = result.gates.find((candidate) => candidate.id === gateId);
+      const gates = await this.#gates();
+      const gate = gates.find((candidate) => candidate.id === gateId);
       if (gate?.status === "resolved") return gate.resolution ?? "";
       if (gate?.status === "timeout")
         throw new Error(`gate ${gateId} timed out`);
-      if (await options?.abandonWhen?.())
-        throw new GateAbandonedError(`gate ${gateId} abandoned`);
       await this.#applyGateResponses(
-        options?.readOnlyInbox === true,
         new Set(
-          result.gates
+          gates
             .filter((candidate) => candidate.status === "pending")
             .map((candidate) => candidate.id),
         ),
@@ -9406,28 +9399,7 @@ export class CliOrca implements OrcaOperations {
     ]);
   }
 
-  async #dispatchSettled(taskId: string, dispatchId: string): Promise<boolean> {
-    const result = await this.#json<{
-      messages?: { payload?: Record<string, unknown> | string | null }[];
-    }>([
-      "orchestration",
-      "check",
-      "--peek",
-      "--types",
-      "worker_done,escalation",
-      ...(this.#runId ? ["--run", this.#runId] : []),
-      "--json",
-    ]);
-    return (result.messages ?? []).some((message) => {
-      const payload = messagePayload(message.payload);
-      return payload.taskId === taskId && payload.dispatchId === dispatchId;
-    });
-  }
-
-  async #applyGateResponses(
-    readOnlyInbox: boolean,
-    pendingGateIds: Set<string>,
-  ): Promise<void> {
+  async #applyGateResponses(pendingGateIds: Set<string>): Promise<void> {
     if (!this.#runId) return;
     const result = await this.#json<{
       deliveryId?: string;
@@ -9440,12 +9412,35 @@ export class CliOrca implements OrcaOperations {
     }>([
       "orchestration",
       "check",
-      ...(readOnlyInbox ? ["--peek", "--types", "question"] : ["--unread"]),
+      "--unread",
       "--run",
       this.#runId,
       "--json",
     ]);
-    for (const message of result.messages ?? []) {
+    await this.#resolveGateResponses(result.messages ?? [], pendingGateIds);
+    if (result.deliveryId) {
+      await this.#json([
+        "orchestration",
+        "check",
+        "--ack",
+        result.deliveryId,
+        "--run",
+        this.#runId,
+        "--json",
+      ]);
+    }
+  }
+
+  async #resolveGateResponses(
+    messages: {
+      body?: string;
+      from_handle?: string;
+      subject?: string;
+      type?: string;
+    }[],
+    pendingGateIds: Set<string>,
+  ): Promise<void> {
+    for (const message of messages) {
       if (
         message.type !== "question" ||
         message.subject !== "no-mistakes gate response" ||
@@ -9506,17 +9501,6 @@ export class CliOrca implements OrcaOperations {
         }
       }
       pendingGateIds.delete(responseGateId);
-    }
-    if (result.deliveryId && !readOnlyInbox) {
-      await this.#json([
-        "orchestration",
-        "check",
-        "--ack",
-        result.deliveryId,
-        "--run",
-        this.#runId,
-        "--json",
-      ]);
     }
   }
 
@@ -9913,7 +9897,37 @@ export class CliOrca implements OrcaOperations {
     failedOutcome?: boolean;
     report?: StageReport;
   }> {
+    let question: { gateId: string; messageId: string } | undefined;
+    const settleQuestion = (): void => {
+      if (!question) return;
+      question = undefined;
+      activity.lastActivityAt = Date.now();
+      activity.waitingForHuman = false;
+      fence?.resumeDeadline?.();
+    };
     for (;;) {
+      if (question) {
+        const resolution = await this.#gateOutcome(question.gateId);
+        if (resolution !== undefined) {
+          const messageId = question.messageId;
+          settleQuestion();
+          const answer = /^reply:\s*(\S[\s\S]*)$/i.exec(resolution)?.[1];
+          if (!answer && resolution !== "stop")
+            throw new Error("Worker question requires reply: <answer> or stop");
+          await this.#json([
+            "orchestration",
+            "reply",
+            "--id",
+            messageId,
+            "--body",
+            answer ?? "Stop: the human declined to continue this worker.",
+            ...(this.#runId ? ["--run", this.#runId] : []),
+            "--json",
+          ]);
+          if (resolution === "stop")
+            throw new GateStopError("Human stopped the worker at its question");
+        }
+      }
       const result = await this.#json<{
         _heartbeat?: boolean;
         _keepalive?: boolean;
@@ -9923,6 +9937,7 @@ export class CliOrca implements OrcaOperations {
         messages?: {
           id?: string;
           body?: string;
+          from_handle?: string;
           payload?: Record<string, unknown> | string | null;
           subject?: string;
           type?: string;
@@ -9937,7 +9952,7 @@ export class CliOrca implements OrcaOperations {
           "--types",
           "worker_done,escalation,question,heartbeat",
           "--timeout-ms",
-          "900000",
+          question ? "5000" : "900000",
           ...(this.#runId ? ["--run", this.#runId] : []),
           "--json",
         ],
@@ -9962,8 +9977,8 @@ export class CliOrca implements OrcaOperations {
             await this.#drainWorkerLog(terminalHandle, log, source);
         }
         if (
-          Date.now() - activity.lastActivityAt >=
-          workerIdleTimeoutMs()
+          !question &&
+          Date.now() - activity.lastActivityAt >= workerIdleTimeoutMs()
         ) {
           return {
             deliveryId: result.deliveryId,
@@ -9986,6 +10001,16 @@ export class CliOrca implements OrcaOperations {
           deliveryId: result.deliveryId,
           error: "orchestration check returned no messages",
         };
+      }
+      if (question) {
+        await this.#resolveGateResponses(
+          result.messages.filter(
+            (message) =>
+              message.type === "question" &&
+              message.subject === "no-mistakes gate response",
+          ),
+          new Set([question.gateId]),
+        );
       }
       let heartbeatOnly = true;
       for (const message of result.messages) {
@@ -10026,37 +10051,19 @@ export class CliOrca implements OrcaOperations {
         }
         heartbeatOnly = false;
         if (message.type === "question" && payload.taskId === taskId && message.id) {
+          settleQuestion();
           activity.waitingForHuman = true;
           fence?.pauseDeadline?.();
-          try {
-            const gateId = await this.createGate(taskId,
+          question = {
+            gateId: await this.createGate(taskId,
               `Worker ${dispatchId} asks: ${message.body ?? message.subject ?? ""}\n\nReply to this worker without restarting it. Resolve with "reply: <your answer>" or "stop". The answer must contain the actual guidance; separate status messages are not forwarded.`,
-              ["reply", "stop"]);
-            let resolution: string;
-            try {
-              resolution = await this.waitForGate(gateId, {
-                abandonWhen: () => this.#dispatchSettled(taskId, dispatchId),
-                readOnlyInbox: true,
-              });
-            } catch (error) {
-              if (!(error instanceof GateAbandonedError)) throw error;
-              heartbeatOnly = true;
-              continue;
-            }
-            const answer = /^reply:\s*(\S[\s\S]*)$/i.exec(resolution)?.[1];
-            if (!answer && resolution !== "stop") throw new Error("Worker question requires reply: <answer> or stop");
-            await this.#json(["orchestration", "reply", "--id", message.id,
-              "--body", answer ?? "Stop: the human declined to continue this worker.",
-              ...(this.#runId ? ["--run", this.#runId] : []), "--json"]);
-            if (resolution === "stop") throw new GateStopError("Human stopped the worker at its question");
-          } finally {
-            activity.lastActivityAt = Date.now();
-            activity.waitingForHuman = false;
-            fence?.resumeDeadline?.();
-          }
+              ["reply", "stop"]),
+            messageId: message.id,
+          };
           heartbeatOnly = true;
           continue;
         }
+        settleQuestion();
         if (message.type !== "worker_done") {
           return {
             deliveryId: result.deliveryId,
