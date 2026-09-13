@@ -18,6 +18,7 @@ async function fixture() {
   let declarations = [declaration]
   const launches: WorkerLaunch[] = []
   const gates: string[][] = []
+  const questions: string[] = []
   const resolutions: string[] = []
   let index = 0
   let failLint = false
@@ -53,7 +54,7 @@ async function fixture() {
     },
     finishWorker: async () => {},
     removeWorktree: async () => {},
-    createGate: async (_task, _question, options) => { gates.push(options ?? []); return `gate-${++index}` },
+    createGate: async (_task, question, options) => { gates.push(options ?? []); questions.push(question); return `gate-${++index}` },
     waitForGate: async () => resolutions.shift() ?? 'stop',
     completeTask: async () => {},
     setWorktreeStatus: async () => {},
@@ -61,7 +62,7 @@ async function fixture() {
   const previousHome = process.env.ORCA_NO_MISTAKES_HOME
   process.env.ORCA_NO_MISTAKES_HOME = path.join(repo.directory, 'home')
   return {
-    ...repo, ledger, git, orca, runId, launches, gates, resolutions,
+    ...repo, ledger, git, orca, runId, launches, gates, questions, resolutions,
     setDeclarations: (value: CommandGate[]) => { declarations = value },
     setFailLint: (value: boolean) => { failLint = value },
     setFixLint: () => { fixLint = true },
@@ -116,6 +117,32 @@ test('later candidate changes invalidate a passed command and leave fresh eviden
     assert.deepEqual(evidence.map((row) => row.candidate_commit_oid), [f.initial, f.repaired])
     assert.match(evidence[1].summary, /good/)
   } finally { await f.cleanup() }
+})
+
+for (const exitCode of [0, 7]) test(`command output secrets are redacted from persisted reports and decisions (exit ${exitCode})`, async () => {
+  const f = await fixture()
+  const previousSecret = process.env.ONM_TEST_SECRET
+  const secret = 'command-output-test-secret-9876'
+  process.env.ONM_TEST_SECRET = secret
+  f.setDeclarations([{ ...declaration, command: `node -e 'console.log(process.env.ONM_TEST_SECRET); process.exit(${exitCode})'` }])
+  try {
+    if (exitCode === 0) await f.run()
+    else await assert.rejects(f.run(), /stopped/)
+    const [evidence] = f.ledger.listEvidence(f.runId).filter((row) => row.stage_id === 'command-value-check')
+    assert.equal(evidence.exit_code, exitCode)
+    const artifact = await readFile(evidence.artifact_path, 'utf8')
+    for (const text of [evidence.summary, artifact, ...f.questions]) {
+      assert.equal(text.includes(secret), false)
+      assert.match(text, /\[REDACTED\]/)
+    }
+    const report = JSON.parse(artifact)
+    assert.equal(report.findings.length, exitCode === 0 ? 0 : 1)
+    if (exitCode !== 0) assert.match(report.findings[0].description, /\[REDACTED\]/)
+  } finally {
+    if (previousSecret === undefined) delete process.env.ONM_TEST_SECRET
+    else process.env.ONM_TEST_SECRET = previousSecret
+    await f.cleanup()
+  }
 })
 
 test('resume retains the frozen declarations despite removal or retargeting in later policy', async () => {

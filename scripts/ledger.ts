@@ -905,7 +905,7 @@ export function verifyCompletionAttestation(manifest: CompletionAttestationManif
     if (
       disposition.disposition === 'satisfied' &&
       (evidence?.stage !== plan.stage ||
-        (evidence.exitCode !== 0 && evidence.waiverOrApproval === undefined) ||
+        (evidence.exitCode !== 0 && (plan.stage.startsWith('command-') || evidence.waiverOrApproval === undefined)) ||
         !isAuthoritativeStageEvidence(evidence.workerIdentity))
     ) {
       throw new Error(

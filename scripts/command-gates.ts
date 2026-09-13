@@ -1,4 +1,6 @@
 import { execFile, spawn } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import { addAbortListener } from 'node:events'
 import { mkdtemp, rm } from 'node:fs/promises'
 import path from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
@@ -10,6 +12,19 @@ const exec = promisify(execFile)
 export const COMMAND_OUTPUT_LIMIT = 64 * 1024
 export const COMMAND_TRUNCATION_MARKER = '\n[command output truncated]\n'
 const active = new Map<AbortController, Promise<unknown>>()
+
+async function worktreeGit(args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; signal: AbortSignal }): Promise<void> {
+  options.signal.throwIfAborted()
+  const pending = exec('git', ['worktree', ...args], { ...options, killSignal: 'SIGKILL' })
+  const closed = new Promise<void>((resolve) => pending.child.once('close', () => resolve()))
+  // execFile does not forward killSignal to its AbortSignal handler, and its
+  // abort rejection can precede exit. Kill explicitly and wait before cleanup.
+  const abort = addAbortListener(options.signal, () => { pending.child.kill('SIGKILL') })
+  try { await pending } finally {
+    abort[Symbol.dispose]()
+    await closed
+  }
+}
 // Keep the group leader live until the owner kills the group: signalling an
 // already-exited leader's numeric PGID can target a reused process identity.
 const supervisor = `
@@ -46,7 +61,7 @@ export async function runCommandGate(options: {
     const env = cleanGitEnvironment()
     let added = false
     try {
-      await exec('git', ['worktree', 'add', '--detach', worktree, options.candidate], { cwd: options.repoRoot, env })
+      await worktreeGit(['add', '--detach', worktree, options.candidate], { cwd: options.repoRoot, env, signal })
       added = true
       signal.throwIfAborted()
       return await new Promise<{ exitCode: number; output: string; truncated: boolean }>((resolve, reject) => {
@@ -106,7 +121,11 @@ export async function runCommandGate(options: {
         if (signal.aborted) stop()
       })
     } finally {
-      if (added) await exec('git', ['worktree', 'remove', '--force', worktree], { cwd: options.repoRoot, env })
+      // Interrupted setup can leave a registered, still-initializing worktree.
+      // Cleanup must run even after cancellation, but Git itself may stall.
+      if (added || existsSync(path.join(worktree, '.git'))) await worktreeGit(['remove', '--force', '--force', worktree], {
+        cwd: options.repoRoot, env, signal: AbortSignal.timeout(120_000)
+      })
       await rm(directory, { recursive: true, force: true })
     }
   })()

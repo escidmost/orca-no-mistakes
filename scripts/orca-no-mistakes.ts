@@ -3529,16 +3529,17 @@ export async function runPipeline(
                   log.append(text, commandOutput).catch(() => {});
                 },
               });
+              const output = redactKnownSecrets(result.output);
               execution = {
                 exitCode: result.exitCode,
                 evidenceCommitOid: executionHead,
                 workerIdentity: "coordinator",
                 resolvedAgent: "coordinator",
                 report: {
-                  summary: `${commandGate.name} exited ${result.exitCode}${result.truncated ? " (output truncated)" : ""}\n${result.output}`,
+                  summary: `${commandGate.name} exited ${result.exitCode}${result.truncated ? " (output truncated)" : ""}\n${output}`,
                   findings: result.exitCode === 0 ? [] : [{
                     id: "command-failed", action: "ask-user", severity: "error",
-                    description: `Required command gate ${commandGate.name} failed (exit ${result.exitCode}). Command: ${commandGate.command}\n${result.output}`,
+                    description: `Required command gate ${commandGate.name} failed (exit ${result.exitCode}). Command: ${commandGate.command}\n${output}`,
                   }],
                 },
               };
