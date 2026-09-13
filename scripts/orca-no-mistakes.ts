@@ -9932,7 +9932,7 @@ export class CliOrca implements OrcaOperations {
           const answer = /^reply:\s*(\S[\s\S]*)$/i.exec(resolution)?.[1];
           if (!answer && resolution !== "stop")
             throw new Error("Worker question requires reply: <answer> or stop");
-          await this.#json([
+          const reply = await this.#json<{ error?: { code?: string; message?: string } }>([
             "orchestration",
             "reply",
             "--id",
@@ -9941,7 +9941,11 @@ export class CliOrca implements OrcaOperations {
             answer ?? "Stop: the human declined to continue this worker.",
             ...(this.#runId ? ["--run", this.#runId] : []),
             "--json",
-          ]);
+          ], true);
+          // Completion can close the dispatch before this answer reaches Orca.
+          // Reconcile its lifecycle delivery below; a stale reply is not success.
+          if (reply.error && reply.error.code !== "dispatch_inactive")
+            throw new Error(`Worker question reply failed: ${reply.error.code}: ${reply.error.message}`);
           if (resolution === "stop")
             throw new GateStopError("Human stopped the worker at its question");
         }

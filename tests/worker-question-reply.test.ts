@@ -5,7 +5,8 @@ import path from 'node:path';
 import test from 'node:test';
 import { CliOrca } from '../scripts/orca-no-mistakes.ts';
 
-test('a resolved relay gate replies the exact human answer and continues the same dispatch', async () => {
+for (const replyError of [undefined, 'dispatch_inactive', 'permission_denied']) {
+test(`relay answer reconciles the same dispatch: ${replyError ?? 'success'}`, async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'worker-question-'));
   const runId = path.basename(root);
   const evidence = path.join(homedir(), '.orca-no-mistakes', 'artifacts', runId);
@@ -30,7 +31,12 @@ else if (args[1] === 'gate-list') out({ gates: [{ id: 'question-gate', status: '
 else if (args[1] === 'worker-show') out({ projection: { attention: { categories: ['input'] } } });
 else if (args[1] === 'reply') {
   if (args[args.indexOf('--id') + 1] !== 'question-1') throw Error('wrong question');
-  fs.writeFileSync(replied, args[args.indexOf('--body') + 1]); out({ ok: true });
+  fs.writeFileSync(replied, args[args.indexOf('--body') + 1]);
+  if (${JSON.stringify(replyError)}) {
+    console.log(JSON.stringify({ ok: false, error: { code: ${JSON.stringify(replyError)}, message: 'reply rejected' } }));
+    process.exit(1);
+  }
+  out({ ok: true });
 } else if (args[1] === 'check' && args.includes('--wait')) {
   out(fs.existsSync(replied)
     ? { deliveryId: 'done-delivery', messages: [{ type: 'worker_done', payload: { taskId: 'task', dispatchId: 'dispatch', outcome: 'succeeded', reportPath: ${JSON.stringify(reportPath)} } }] }
@@ -42,7 +48,7 @@ else if (args[1] === 'reply') {
 `);
     await chmod(command, 0o755);
     const orca = new CliOrca({ command, cwd: root, runId });
-    const worker = await orca.startWorker('task', {
+    const pendingWorker = orca.startWorker('task', {
       agent: { harness: 'cursor' }, name: 'question-test', prompt: 'Review',
       role: 'reviewer', stage: 'review', worktree: 'current',
     }, {
@@ -50,6 +56,11 @@ else if (args[1] === 'reply') {
       pauseDeadline() { transitions.push('pause'); },
       resumeDeadline() { transitions.push('resume'); },
     });
+    if (replyError === 'permission_denied') {
+      await assert.rejects(pendingWorker, /Worker question reply failed: permission_denied/);
+      return;
+    }
+    const worker = await pendingWorker;
 
     assert.equal(worker.report.summary, 'Answered and completed');
     assert.equal(await readFile(repliedPath, 'utf8'), 'Inspect the existing authorized attachment; retain its digest.');
@@ -65,3 +76,4 @@ else if (args[1] === 'reply') {
     await rm(evidence, { recursive: true, force: true });
   }
 });
+}
