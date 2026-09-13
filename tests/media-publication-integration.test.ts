@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import test from 'node:test'
 import { DomainLedger } from '../scripts/ledger.ts'
 import { MediaUploadError, type MediaPublicationContext } from '../scripts/media-publication.ts'
@@ -24,10 +25,37 @@ test('PR artifact integration persists success across reopen, rechecks authoriza
   const report = { findings: [], summary: 'test', artifacts: ['screen.png'], artifactDigests: { 'screen.png': digest } }
   const render = (media = context, approvals = [digest]) => pullRequestArtifacts(root, report, { media, trustedPublicationApprovals: approvals })
   assert.equal((await render())[0].media?.url, url)
+  const key = { runId: context.runId, candidate: context.candidate, digest, repositoryId: context.repositoryId, host: context.host }
+  const firstPath = await realpath(path.join(root, 'screen.png'))
+  const secondPath = path.join(path.dirname(firstPath), 'copy.png')
+  await writeFile(secondPath, bytes)
+  assert.equal(ledger.mediaPublication(key, secondPath), undefined)
+  report.artifacts.push('copy.png')
+  Object.assign(report.artifactDigests, { 'copy.png': digest })
+  assert.equal((await render(context, []))[1].media, undefined)
+  assert.equal(ledger.mediaPublication(key, secondPath), undefined)
+  const copies = await render()
+  assert.deepEqual(copies.map(artifact => artifact.media?.url), [url, url])
+  assert.equal(ledger.mediaPublication(key, firstPath)?.artifactPath, firstPath)
+  assert.equal(ledger.mediaPublication(key, secondPath)?.artifactPath, secondPath)
+  assert.equal(uploads, 1)
   ledger.close()
   ledger = new DomainLedger(path.join(root, 'ledger.sqlite'))
   context.ledger = ledger
-  assert.equal((await render())[0].media?.url, url)
+  assert.equal(ledger.mediaPublication(key, firstPath)?.artifactPath, firstPath)
+  assert.equal(ledger.mediaPublication(key, secondPath)?.artifactPath, secondPath)
+  assert.deepEqual((await render()).map(artifact => artifact.media?.url), [url, url])
+  assert.equal(uploads, 1)
+  // An older ledger has the upload outcome but no artifact associations yet.
+  ledger.close()
+  const legacy = new DatabaseSync(path.join(root, 'ledger.sqlite'))
+  legacy.exec('DROP TABLE media_publication_artifacts')
+  legacy.close()
+  ledger = new DomainLedger(path.join(root, 'ledger.sqlite'))
+  context.ledger = ledger
+  assert.deepEqual((await render()).map(artifact => artifact.media?.url), [url, url])
+  assert.equal(ledger.mediaPublication(key, firstPath)?.artifactPath, firstPath)
+  assert.equal(ledger.mediaPublication(key, secondPath)?.artifactPath, secondPath)
   assert.equal(uploads, 1)
   assert.equal((await render(context, []))[0].media, undefined)
   assert.equal((await render({ ...context, candidate: 'c'.repeat(40) }))[0].media, undefined)
@@ -52,7 +80,8 @@ test('durable failed, uncertain, and interrupted uploads preserve evidence and n
     ledger.startRun({ runId: mode, repoRoot: root, branch: mode, baseBranch: 'main', intent: 'test', policySha256: 'a'.repeat(64), submissionCommitOid: 'b'.repeat(40) })
     const key = { runId: mode, candidate: 'b'.repeat(40), digest, repositoryId: '42', host: 'github.com' }
     const ownership = { repoRoot: root, branch: mode, generationToken: ledger.acquireLease({ runId: mode, repoRoot: root, branch: mode }) }
-    if (mode === 'pending') ledger.beginMediaPublication(key, 'clip.mp4', ownership)
+    const artifactPath = await realpath(path.join(root, 'clip.mp4'))
+    if (mode === 'pending') ledger.beginMediaPublication(key, artifactPath, ownership)
     let uploads = 0
     const media: MediaPublicationContext = { ...key, ledger, ownership, evidenceCandidate: key.candidate, upload: async () => { uploads++; throw new MediaUploadError('Upload failed; local evidence retained.', mode === 'uncertain') } }
     for (let i = 0; i < 2; i++) {
@@ -62,7 +91,7 @@ test('durable failed, uncertain, and interrupted uploads preserve evidence and n
       assert.deepEqual(await readFile(path.join(root, 'clip.mp4')), bytes)
     }
     assert.equal(uploads, mode === 'pending' ? 0 : 1)
-    assert.equal(ledger.mediaPublication(key)?.status, mode)
+    assert.equal(ledger.mediaPublication(key, artifactPath)?.status, mode)
   }
 })
 
@@ -86,7 +115,7 @@ test('a revoked or stale lease cannot reserve or upload media, while its current
   assert.notEqual(currentGeneration, ownership.generationToken)
   assert.match((await render())[0].content, /no longer owns the branch lease/)
   assert.equal(uploads, 0)
-  assert.equal(ledger.mediaPublication(key), undefined)
+  assert.equal(ledger.mediaPublication(key, await realpath(path.join(root, 'screen.png'))), undefined)
   ownership.generationToken = currentGeneration
   assert.ok((await render())[0].media)
   assert.equal(uploads, 1)

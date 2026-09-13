@@ -34,7 +34,7 @@ export function attachmentUrl(value: unknown, host: string): string {
 export type MediaBytes = { bytes: Buffer; mime: string; kind: 'image' | 'video'; name: string }
 
 /** Snapshot once, hash that snapshot, then upload that same buffer rather than reopening a path. */
-export async function approvedMediaBytes(root: string, file: string, digest: string, approvals: ReadonlySet<string>): Promise<MediaBytes> {
+export async function approvedMediaBytes(root: string, file: string, digest: string, approvals: ReadonlySet<string>): Promise<MediaBytes & { artifactPath: string }> {
   if (!/^[a-f0-9]{64}$/.test(digest) || !approvals.has(digest)) throw new Error('Exact-content publication approval required.')
   const type = types[path.extname(file).toLowerCase()]
   if (!type) throw new Error('Unsupported media type.')
@@ -51,6 +51,7 @@ export async function approvedMediaBytes(root: string, file: string, digest: str
     const canonicalBase = await realpath(base)
     const canonicalTarget = await realpath(target)
     if (canonicalTarget !== path.join(canonicalBase, relative)) throw new Error('Artifact path changed during validation.')
+    return canonicalTarget
   }
   await checkPath()
   const handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
@@ -67,7 +68,7 @@ export async function approvedMediaBytes(root: string, file: string, digest: str
     }
     const after = await handle.stat()
     const named = await lstat(target)
-    await checkPath()
+    const artifactPath = await checkPath()
     const bytes = buffer.subarray(0, length)
     if (length !== before.size || after.nlink !== 1 || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs || named.dev !== before.dev || named.ino !== before.ino || createHash('sha256').update(bytes).digest('hex') !== digest) throw new Error('Artifact changed after approval.')
     const magic = bytes.subarray(0, 16)
@@ -78,7 +79,7 @@ export async function approvedMediaBytes(root: string, file: string, digest: str
       : type.mime === 'video/webm' ? magic.subarray(0, 4).equals(Buffer.from('1a45dfa3', 'hex'))
       : magic.toString('ascii', 4, 8) === 'ftyp'
     if (!matches) throw new Error('Media bytes do not match the supported file type.')
-    return { bytes, ...type, name: `${digest}${path.extname(file).toLowerCase()}` }
+    return { bytes, ...type, name: `${digest}${path.extname(file).toLowerCase()}`, artifactPath }
   } finally { await handle.close() }
 }
 
@@ -134,7 +135,7 @@ export type MediaPublicationContext = {
 
 export async function publishMediaArtifact(root: string, file: string, digest: string, approvals: ReadonlySet<string>, context: MediaPublicationContext): Promise<PullRequestArtifact> {
   const artifact: PullRequestArtifact = { name: path.basename(file), content: `Artifact: ${path.basename(file)}\nSHA-256: ${digest}\nCandidate: ${context.evidenceCandidate}` }
-  let media: MediaBytes
+  let media: Awaited<ReturnType<typeof approvedMediaBytes>>
   try {
     if (context.candidate !== context.evidenceCandidate) throw new Error('Artifact evidence belongs to a different candidate.')
     media = await approvedMediaBytes(root, file, digest, approvals)
@@ -143,7 +144,7 @@ export async function publishMediaArtifact(root: string, file: string, digest: s
     return artifact
   }
   const key = { runId: context.runId, candidate: context.candidate, digest, repositoryId: context.repositoryId, host: context.host }
-  if (context.ledger.beginMediaPublication(key, file, context.ownership)) {
+  if (context.ledger.beginMediaPublication(key, media.artifactPath, context.ownership)) {
     try {
       const url = attachmentUrl(await context.upload(media), context.host)
       context.ledger.finishMediaPublication(key, { status: 'published', url, detail: 'GitHub attachment published.' })
@@ -154,7 +155,7 @@ export async function publishMediaArtifact(root: string, file: string, digest: s
       })
     }
   }
-  const recorded = context.ledger.mediaPublication(key)
+  const recorded = context.ledger.mediaPublication(key, media.artifactPath)
   if (!recorded) {
     artifact.content += '\nMedia not published: coordinator no longer owns the branch lease. Local evidence retained.'
     return artifact

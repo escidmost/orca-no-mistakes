@@ -2077,6 +2077,18 @@ CREATE TABLE IF NOT EXISTS media_publications (
   PRIMARY KEY (run_id, candidate_commit_oid, artifact_sha256, repository_id, host)
 );
 
+CREATE TABLE IF NOT EXISTS media_publication_artifacts (
+  run_id TEXT NOT NULL,
+  candidate_commit_oid TEXT NOT NULL,
+  artifact_sha256 TEXT NOT NULL,
+  repository_id TEXT NOT NULL,
+  host TEXT NOT NULL,
+  artifact_path TEXT NOT NULL,
+  PRIMARY KEY (run_id, candidate_commit_oid, artifact_sha256, repository_id, host, artifact_path),
+  FOREIGN KEY (run_id, candidate_commit_oid, artifact_sha256, repository_id, host)
+    REFERENCES media_publications(run_id, candidate_commit_oid, artifact_sha256, repository_id, host) ON DELETE CASCADE
+);
+
 CREATE TRIGGER IF NOT EXISTS immutable_stage_plan_entries
 BEFORE UPDATE ON stage_plan_entries
 BEGIN SELECT RAISE(ABORT, 'stage_plan_entries rows are immutable'); END;
@@ -2791,6 +2803,7 @@ export class DomainLedger {
         'gate_audit',
         'auto_fix_mode_events',
         'media_publications',
+        'media_publication_artifacts',
         'presentation_snapshots',
         'passed_attestations'
       ]) {
@@ -6023,11 +6036,12 @@ export class DomainLedger {
     this.#db.close()
   }
 
-  mediaPublication(key: { runId: string; candidate: string; digest: string; repositoryId: string; host: string }):
-    { status: 'pending' | 'published' | 'failed' | 'uncertain'; url: string | null; detail: string } | undefined {
-    return this.#db.prepare(`SELECT status, url, detail FROM media_publications
-      WHERE run_id = ? AND candidate_commit_oid = ? AND artifact_sha256 = ? AND repository_id = ? AND host = ?`)
-      .get(key.runId, key.candidate, key.digest, key.repositoryId, key.host) as ReturnType<DomainLedger['mediaPublication']>
+  mediaPublication(key: { runId: string; candidate: string; digest: string; repositoryId: string; host: string }, artifactPath: string):
+    { status: 'pending' | 'published' | 'failed' | 'uncertain'; url: string | null; detail: string; artifactPath: string } | undefined {
+    return this.#db.prepare(`SELECT status, url, detail, artifacts.artifact_path AS artifactPath FROM media_publications
+      JOIN media_publication_artifacts AS artifacts USING (run_id, candidate_commit_oid, artifact_sha256, repository_id, host)
+      WHERE run_id = ? AND candidate_commit_oid = ? AND artifact_sha256 = ? AND repository_id = ? AND host = ? AND artifacts.artifact_path = ?`)
+      .get(key.runId, key.candidate, key.digest, key.repositoryId, key.host, artifactPath) as ReturnType<DomainLedger['mediaPublication']>
   }
 
   publishedMediaDigests(runId: string, candidate: string, repositoryId: string, host: string): string[] {
@@ -6040,10 +6054,14 @@ export class DomainLedger {
     ownership: { repoRoot: string; branch: string; generationToken: number }): boolean {
     this.#db.exec('BEGIN IMMEDIATE')
     try {
-      const reserved = this.ownsLease(key.runId, ownership) && this.#db.prepare(`INSERT OR IGNORE INTO media_publications
+      const owned = this.ownsLease(key.runId, ownership)
+      const reserved = owned && this.#db.prepare(`INSERT OR IGNORE INTO media_publications
         (run_id, candidate_commit_oid, artifact_sha256, repository_id, host, artifact_path, status, detail, created_at)
         VALUES (?, ?, ?, ?, ?, ?, 'pending', 'Upload outcome unknown; automatic retry withheld.', ?)`)
         .run(key.runId, key.candidate, key.digest, key.repositoryId, key.host, artifactPath, new Date().toISOString()).changes === 1
+      if (owned) this.#db.prepare(`INSERT OR IGNORE INTO media_publication_artifacts
+        (run_id, candidate_commit_oid, artifact_sha256, repository_id, host, artifact_path) VALUES (?, ?, ?, ?, ?, ?)`)
+        .run(key.runId, key.candidate, key.digest, key.repositoryId, key.host, artifactPath)
       this.#db.exec('COMMIT')
       return reserved
     } catch (error) {
