@@ -6,7 +6,7 @@ These maps describe the current implementation. Download the HTML files or open 
 
 [Open the pipeline diagram](run-to-merge.html) · [Editable specification](run-to-merge.workflow.json)
 
-Follow the nine numbered stages from left to right. The lanes distinguish coordinator operations from worker evaluations. The `pr` stage combines a worker-drafted title and summary with coordinator-owned publication and receipt settlement.
+Follow the nine numbered stages from left to right. The lanes distinguish coordinator operations from worker evaluations. The coordinator records `intent`; it appears in the worker lane only for layout. The `pr` stage combines a worker-drafted title and summary with coordinator-owned publication and receipt settlement.
 
 Before this flow, initialize the repository's publication route and submit a clean feature-branch commit with intent. Both direct `run` and local-gate admission launch the same isolated pipeline. Trusted-base command gates can extend the local stages before publication.
 
@@ -51,7 +51,7 @@ The upper path starts with a durably failed run that has a checkpoint. `run --re
 
 After successful execution, anchor the terminal commit at `refs/no-mistakes/recover/<run-id>` before custody transfer. A clean initiating checkout still at the submitted commit can advance. A dirty or diverged checkout remains intact, with recovery instructions returned to the operator.
 
-The disconnected crash-cleanup path is deliberate: `prune --stranded` proves coordinator death and resource ownership before preserving work, reaping owned resources, and releasing the lease. It does not automatically adopt or resume an abandoned `in-progress` run. Uncertain ownership retains resources; direct-run cleanup leaves the operator's checkout intact.
+The disconnected crash-cleanup path is deliberate: `prune --stranded` proves coordinator death and resource ownership before preserving work, reaping owned resources, and releasing the lease. It does not automatically adopt or resume an abandoned `in-progress` run. Use `abandon --run-id <id> --reason <text>` to close a dead local `in-progress` or resumable-failed run that still blocks publication-route changes. Uncertain ownership retains resources; direct-run cleanup leaves the operator's checkout intact.
 
 Sources: [resume behavior](../current-architecture.md#orchestration), [custody return](../current-architecture.md#custody-return), and [stranded cleanup](../../README.md#attestations-and-retention).
 

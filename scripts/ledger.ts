@@ -1741,7 +1741,7 @@ CREATE TABLE IF NOT EXISTS runs (
   repo_root TEXT NOT NULL,
   branch TEXT NOT NULL,
   base_branch TEXT NOT NULL,
-  initial_coordinator_identity TEXT NOT NULL,
+  initial_coordinator_identity TEXT NOT NULL DEFAULT '',
   submission_commit_oid TEXT NOT NULL,
   terminal_commit_oid TEXT,
   intent TEXT NOT NULL,
