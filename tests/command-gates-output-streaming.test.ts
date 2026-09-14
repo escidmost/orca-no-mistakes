@@ -48,6 +48,22 @@ test('output streams while the command runs and survives cancellation', async ()
   } finally { await cancelCommandGates(); await repo.cleanup() }
 })
 
+for (const truncated of [false, true]) test(`incomplete UTF-8 is flushed once before settlement or truncation (truncated ${truncated})`, async () => {
+  const repo = await repository()
+  let streamed = ''
+  try {
+    const result = await runCommandGate({
+      ...repo, repoRoot: repo.root, candidate: repo.initial,
+      gate: { name: 'utf8', after: 'test', command: `node -e "process.stdout.write(Buffer.concat([Buffer.alloc(${COMMAND_OUTPUT_LIMIT - 1},120),Buffer.from([${truncated ? '0xe2,0x82,0xac' : '0xe2'}])]))"` },
+      onOutput: (text) => { streamed += text },
+    })
+    assert.equal(result.exitCode, 0)
+    assert.equal(result.truncated, truncated)
+    assert.equal(result.output, 'x'.repeat(COMMAND_OUTPUT_LIMIT - 1) + '\ufffd')
+    assert.equal(streamed, result.output + (truncated ? COMMAND_TRUNCATION_MARKER : ''))
+  } finally { await repo.cleanup() }
+})
+
 test('streamed output carries the same bound and truncation marker as the captured result', async () => {
   const repo = await repository()
   let streamed = ''

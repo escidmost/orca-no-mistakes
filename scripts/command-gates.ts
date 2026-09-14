@@ -76,6 +76,13 @@ export async function runCommandGate(options: {
         let exitCode: number | undefined
         let exited = false
         let settled = false
+        let decoderEnded = false
+        const endDecoder = () => {
+          if (decoderEnded) return
+          decoderEnded = true
+          const text = decoder.end()
+          if (text) options.onOutput?.(text)
+        }
         const stop = () => {
           if (child.pid === undefined || exited) return
           try { process.kill(-child.pid, 'SIGKILL') } catch (error) {
@@ -94,6 +101,7 @@ export async function runCommandGate(options: {
           }
           if (chunk.length > remaining && !truncated) {
             truncated = true
+            endDecoder()
             options.onOutput?.(COMMAND_TRUNCATION_MARKER)
           }
         }
@@ -105,6 +113,7 @@ export async function runCommandGate(options: {
           signal.removeEventListener('abort', stop)
           child.stdout!.destroy()
           child.stderr!.destroy()
+          endDecoder()
           if (signal.aborted) reject(signal.reason)
           else if (failure) reject(failure)
           else resolve({ exitCode: exitCode ?? 1, output: Buffer.concat(chunks).toString('utf8'), truncated })
