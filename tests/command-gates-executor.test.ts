@@ -54,7 +54,7 @@ for (const cancelled of [false, true]) test(`owned background children are kille
 
 for (const phase of ['before-add', 'after-add', 'remove']) test(`cancellation handles Git stalled at ${phase}`, { timeout: 10_000 }, async (t) => {
   const repo = await repository()
-  const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim()
+  const realGit = execFileSync('/bin/sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim()
   const bin = path.join(repo.directory, 'bin')
   const pidFile = path.join(repo.directory, 'git-pid')
   const previousPath = process.env.PATH
