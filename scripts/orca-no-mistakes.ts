@@ -16396,6 +16396,9 @@ Completion and recovery:
           try {
             parsedMarker = JSON.parse(await readFile(path.join(markersDir, name), "utf8"));
           } catch {
+            console.error(
+              `no-mistakes: skipped ${name} during abandon precheck; its marker is unreadable`,
+            );
             continue;
           }
           if (typeof parsedMarker !== "object" || parsedMarker === null) continue;

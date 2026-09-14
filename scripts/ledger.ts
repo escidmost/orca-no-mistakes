@@ -2522,7 +2522,7 @@ export class DomainLedger {
     // path. Only the expected duplicate-column failure is tolerated.
     for (const [table, column] of [
       ['runs', "command_gates_json TEXT NOT NULL DEFAULT '[]'"],
-      ['runs', 'initial_coordinator_identity TEXT'],
+      ['runs', "initial_coordinator_identity TEXT NOT NULL DEFAULT ''"],
       ['stage_evidence', 'effective_policy_hash TEXT'],
       ['stage_evidence', 'base_ref_sha TEXT'],
       ['stage_evidence', 'artifact_sha256 TEXT'],
