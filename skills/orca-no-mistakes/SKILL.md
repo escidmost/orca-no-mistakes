@@ -75,7 +75,10 @@ orca-no-mistakes attestation export <run-id-or-commit-sha> [--out manifest.json]
 orca-no-mistakes attestation verify <manifest-file|run-id|commit-sha> [--repo <path>]
 orca-no-mistakes prune [--before <date>] [--repo <path>]
 orca-no-mistakes prune --stranded [--repo <path>]
+orca-no-mistakes abandon --run-id <id> --reason <text> [--repo <path>]
 ```
+
+Run `abandon` only on the coordinator's machine after coordinator death is proven. It refuses while a direct-run or gate marker remains and retains all evidence.
 
 `prune --stranded` reaps gate or direct-run resources only when their owning coordinator is proven gone. It first anchors the recorded HEAD at `refs/no-mistakes/recover/<run-id>` and retains the marker if ownership or preservation cannot be verified; direct recovery never removes the operator checkout or branch.
 

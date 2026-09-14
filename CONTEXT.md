@@ -157,8 +157,12 @@ A durable run-level mode that automatically starts fix rounds for findings eligi
 _Avoid_: YOLO mode, unattended approval, policy bypass
 
 **Run cancellation**:
-The terminal outcome when an operator stops a run before it passes or fails. Cancel requests an orderly stop; Force stop escalates immediately. Both produce the same outcome, while retaining which action occurred as evidence.
+The terminal outcome when an operator stops or abandons a run before it passes or fails. Cancel requests an orderly stop; Force stop escalates immediately; abandonment closes an already-dead run. All retain which action occurred as evidence.
 _Avoid_: Abort status, failed run
+
+**Run abandonment**:
+Operator closeout of a provably dead run after its owned resources are cleared. It ends resumability while retaining evidence, attempt outcomes, artifacts, and Git refs.
+_Avoid_: Crash adoption, evidence deletion
 
 **Resumable error**:
 An error the pipeline explicitly identifies as safe to continue from a durable checkpoint. Operators may resume only when the pipeline declares this condition.
