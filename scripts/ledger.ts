@@ -4877,6 +4877,16 @@ export class DomainLedger {
       this.#db.prepare(
         "UPDATE runs SET status = 'cancelled', completed_at = ? WHERE run_id = ?"
       ).run(abandonedAt, input.runId)
+      this.#db.prepare(
+        `DELETE FROM pending_admission_leases
+         WHERE admission_id IN (SELECT admission_id FROM submission_admissions WHERE run_id = ?)`
+      ).run(input.runId)
+      this.#db.prepare(
+        `UPDATE submission_admissions
+         SET status = 'failed', run_id = NULL, launched_at = NULL, launcher_pid = NULL,
+             accepted_oid = NULL, accepted_at = NULL
+         WHERE run_id = ?`
+      ).run(input.runId)
       this.releaseLease(input.runId)
       this.#db.exec('COMMIT')
     } catch (error) {

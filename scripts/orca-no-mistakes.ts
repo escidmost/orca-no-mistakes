@@ -16369,7 +16369,8 @@ Completion and recovery:
     const runId = stringFlag(parsed.flags, "run-id");
     const reason = stringFlag(parsed.flags, "reason");
     if (!runId || !reason?.trim()) throw new Error("abandon requires --run-id and --reason");
-    const ledger = openRepositoryLedger(stringFlag(parsed.flags, "repo") ?? process.cwd());
+    const repo = stringFlag(parsed.flags, "repo");
+    const ledger = openRepositoryLedger(repo ?? process.cwd(), repo === undefined);
     try {
       ledger.abandonRun({ runId, reason, actorIdentity: `local-operator:${process.pid}` });
       console.log(JSON.stringify({ runId, status: "cancelled", evidenceRetained: true }));
