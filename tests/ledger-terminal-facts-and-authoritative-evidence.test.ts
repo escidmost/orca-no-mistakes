@@ -9,8 +9,10 @@ import test from 'node:test'
 import {
   DomainLedger,
   buildPipelineCompletionAttestation,
+  buildPipelineEvidenceRoot,
   canonicalJson,
   evidenceSha256,
+  merkleRoot,
   repositoryLedgerPath,
   sha256,
   verifyCompletionAttestation,
@@ -21,8 +23,8 @@ const candidate = 'a'.repeat(40)
 const base = 'b'.repeat(40)
 const policy = 'c'.repeat(64)
 
-function manifestFor(runId: string) {
-  const stageEvidence = ['push', 'pr'].map((stage, round) => {
+function manifestFor(runId: string, stages = ['push', 'pr']) {
+  const stageEvidence = stages.map((stage, round) => {
     const entry: StageEvidenceManifestEntry = {
       artifactSha256: sha256(`${stage}-artifact`),
       baseCommitOid: base,
@@ -92,6 +94,65 @@ test('v2 satisfied dispositions require successful authoritative evidence', () =
   } finally {
     ledger.close()
   }
+})
+
+test('waived command failures are rejected by offline, retained, and record attestation entry points', () => {
+  const ledger = new DomainLedger(':memory:')
+  try {
+    for (const stage of ['review', 'command-check']) for (const decision of ['approve', 'skip'] as const) {
+      const manifest = manifestFor('command-waiver', [stage, 'push', 'pr'])
+      verifyCompletionAttestation(manifest) // Positive control: successful commands remain valid.
+      const failed = manifest.stageEvidence[0]
+      failed.exitCode = 7
+      failed.waiverOrApproval = { decision, gateId: 'gate', resolvedAt: '2026-01-02T03:04:05.000Z' }
+      failed.evidenceSha256 = evidenceSha256({ ...failed, runId: manifest.runId })
+      manifest.stageDispositions[0].evidenceSha256 = failed.evidenceSha256
+      manifest.pipelineEvidenceRoot = buildPipelineEvidenceRoot(manifest.stageEvidence, {
+        ...manifest, attemptOutcomeDigests: manifest.attemptOutcomeDigests.slice(0, -1)
+      })
+      const { merkleRoot: _root, ...payload } = manifest
+      manifest.merkleRoot = merkleRoot([sha256(canonicalJson(payload))])
+      if (stage === 'review') {
+        verifyCompletionAttestation(manifest) // Existing non-command approval semantics.
+      } else {
+        for (const verify of [
+          () => verifyCompletionAttestation(manifest),
+          () => ledger.verifyRetainedCompletionAttestation(manifest),
+          () => ledger.recordAttestation(manifest),
+        ]) assert.throws(verify, /command-check disposition does not bind successful authoritative evidence/)
+      }
+    }
+  } finally { ledger.close() }
+})
+
+test('command stages cannot use optional or disabled completion semantics', () => {
+  const ledger = new DomainLedger(':memory:')
+  try {
+    for (const stage of ['review', 'command-check']) {
+      for (const [requirement, disposition] of [
+        ['optional', 'satisfied'], ['optional', 'skipped'], ['optional', 'waived'], ['disabled', 'disabled'],
+      ] as const) {
+        const manifest = manifestFor('command-requirement', [stage, 'push', 'pr'])
+        manifest.stagePlan[0].requirement = requirement
+        manifest.stageDispositions[0].disposition = disposition
+        if (disposition !== 'satisfied') {
+          delete manifest.stageDispositions[0].evidenceSha256
+          manifest.stageEvidence.shift()
+        }
+        manifest.pipelineEvidenceRoot = buildPipelineEvidenceRoot(manifest.stageEvidence, {
+          ...manifest, attemptOutcomeDigests: manifest.attemptOutcomeDigests.slice(0, -1)
+        })
+        const { merkleRoot: _root, ...payload } = manifest
+        manifest.merkleRoot = merkleRoot([sha256(canonicalJson(payload))])
+        if (stage === 'review') verifyCompletionAttestation(manifest)
+        else for (const verify of [
+          () => verifyCompletionAttestation(manifest),
+          () => ledger.verifyRetainedCompletionAttestation(manifest),
+          () => ledger.recordAttestation(manifest),
+        ]) assert.throws(verify, /command stage command-check must be required/)
+      }
+    }
+  } finally { ledger.close() }
 })
 
 test('terminal runs reject new Release 2 facts after migration', async () => {

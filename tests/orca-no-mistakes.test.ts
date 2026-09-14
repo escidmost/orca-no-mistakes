@@ -12860,7 +12860,8 @@ test("a gate resolution outside the offered options fails closed", async () => {
   const runId = ledger.listRuns()[0].run_id;
   const audits = ledger.listGateAudit(runId);
   assert.equal(audits.length, 1);
-  assert.equal(audits[0].decision, "approve");
+  assert.equal(audits[0].decision, "pending");
+  assert.equal(audits[0].resolved_at, null);
   assert.equal(ledger.runStatus(runId), "failed");
 });
 

@@ -85,7 +85,7 @@ test("guardrail recovery gate uses candidate-level options, not the findings edi
   renderer.close();
 });
 
-test("auto-fix never resolves a guardrail recovery gate", async () => {
+for (const command of [false, true]) test(`auto-fix never resolves a ${command ? "command" : "guardrail recovery"} gate`, async () => {
   const input = new FakeInput();
   const output = new FakeOutput();
   const resolutions: string[] = [];
@@ -94,7 +94,15 @@ test("auto-fix never resolves a guardrail recovery gate", async () => {
     async (_id, resolution) => { resolutions.push(resolution); },
     undefined, undefined, undefined, undefined, true,
   );
-  renderer.render(guardrailGateSnapshot(true));
+  const snapshot = guardrailGateSnapshot(true);
+  if (command) {
+    snapshot.currentStage = "command-check";
+    snapshot.gate!.gateKind = undefined;
+    snapshot.gate!.stage = "command-check";
+    snapshot.gate!.options = ["fix", "stop"];
+    snapshot.stages.find((stage) => stage.id === "review")!.id = "command-check";
+  }
+  renderer.render(snapshot);
   await nextDraw();
   assert.deepEqual(resolutions, []);
   renderer.close();

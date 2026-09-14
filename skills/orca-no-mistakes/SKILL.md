@@ -6,7 +6,7 @@ user-invocable: true
 
 # Orca No-Mistakes
 
-Drive the implemented `orca-no-mistakes` CLI. It runs the nine validation and delivery stages:
+Drive the implemented `orca-no-mistakes` CLI. It runs the nine core validation and delivery stages, plus any command gates the trusted base declares ([Repository command gates](../../docs/current-architecture.md#repository-command-gates)):
 
 `intent -> rebase -> review -> test -> document -> lint -> push -> pr -> ci`
 

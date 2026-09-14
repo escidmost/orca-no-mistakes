@@ -258,7 +258,7 @@ export function terminalCandidate(
       evidence?.stage_id !== stage.stage_id ||
       evidence.candidate_commit_oid !== final.output_commit_oid ||
       evidence.round_index !== final.round_index ||
-      (evidence.exit_code !== 0 && !approved) ||
+      (evidence.exit_code !== 0 && (!approved || stage.stage_id.startsWith('command-'))) ||
       !isAuthoritativeStageEvidence(evidence.worker_identity)
     ) {
       throw new CandidatePublicationError(
@@ -294,7 +294,7 @@ export function terminalCandidate(
           evidence.evidence_sha256
         )
     )
-    if (approved && evidence.candidate_commit_oid !== candidate) {
+    if ((approved || stage.stage_id.startsWith('command-')) && evidence.candidate_commit_oid !== candidate) {
       throw new CandidatePublicationError(
         `satisfied stage ${stage.stage_id} does not bind successful authoritative evidence`
       )

@@ -954,6 +954,7 @@ export class RailTuiRenderer implements PresentationRenderer {
       !gate ||
       gate.state !== "open" ||
       gate.gateKind === "guardrail" ||
+      gate.stage?.startsWith("command-") ||
       !gate.options?.length ||
       !this.#autoFix ||
       !this.#resolveGate ||

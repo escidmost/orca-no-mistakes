@@ -120,6 +120,6 @@ export function trustedRepoPolicyConfig(
   provenance: PolicyProvenance,
 ): OrcaNoMistakesConfig {
   if (!provenance.localBypass) return config;
-  const { media_publication: _untrustedMedia, ...rest } = config;
+  const { media_publication: _untrustedMedia, command_gates: _untrustedGates, ...rest } = config;
   return rest.ci ? { ...rest, ci: { ...rest.ci, no_ci: false } } : rest;
 }
