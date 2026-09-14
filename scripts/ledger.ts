@@ -1986,6 +1986,13 @@ CREATE TABLE IF NOT EXISTS resume_claims (
   generation_token INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS resume_claim_owners (
+  run_id TEXT PRIMARY KEY REFERENCES resume_claims(run_id) ON DELETE CASCADE,
+  claim_id TEXT NOT NULL UNIQUE,
+  generation_token INTEGER NOT NULL,
+  coordinator_identity TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS stage_checkpoints (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
@@ -2819,6 +2826,7 @@ export class DomainLedger {
       copy('lease_generations', 'WHERE repo_root = ?')
       for (const table of [
         'resume_claims',
+        'resume_claim_owners',
         'stage_dispositions',
         'stage_disposition_supersessions',
         'publication_routes',
@@ -4483,6 +4491,7 @@ export class DomainLedger {
     baseBranch: string
     baseRefSha?: string
     branch: string
+    coordinatorIdentity?: string
     effectivePolicyHash: string
     force?: boolean
     head: string
@@ -4491,6 +4500,11 @@ export class DomainLedger {
     repoRoot: string
     runId: string
   }): { claimId: string; checkpoint: StageCheckpointRow; generationToken: number } {
+    const coordinatorIdentity = input.coordinatorIdentity ?? `no-mistakes:${process.pid}`
+    const coordinatorPid = Number(/^no-mistakes:([1-9]\d*)$/.exec(coordinatorIdentity)?.[1])
+    if (!Number.isSafeInteger(coordinatorPid) || coordinatorPid > 2_147_483_647) {
+      throw new Error('resume coordinator identity must contain a verifiable local PID')
+    }
     this.#db.exec('BEGIN IMMEDIATE')
     try {
       const checkpoint = this.#validateResume(input)
@@ -4513,10 +4527,19 @@ export class DomainLedger {
           `INSERT INTO resume_claims (run_id, claim_id, generation_token)
            VALUES (?, ?, ?)
            ON CONFLICT(run_id) DO UPDATE SET
-             claim_id = excluded.claim_id,
-             generation_token = excluded.generation_token`
+              claim_id = excluded.claim_id,
+              generation_token = excluded.generation_token`
         )
         .run(input.runId, claimId, generationToken)
+      this.#db.prepare(
+        `INSERT INTO resume_claim_owners
+           (run_id, claim_id, generation_token, coordinator_identity)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(run_id) DO UPDATE SET
+           claim_id = excluded.claim_id,
+           generation_token = excluded.generation_token,
+           coordinator_identity = excluded.coordinator_identity`
+      ).run(input.runId, claimId, generationToken, coordinatorIdentity)
       this.#db.exec('COMMIT')
       return { claimId, checkpoint, generationToken }
     } catch (error) {
@@ -4530,6 +4553,7 @@ export class DomainLedger {
     baseRefSha?: string
     branch: string
     claimId: string
+    coordinatorIdentity?: string
     effectivePolicyHash: string
     force?: boolean
     head: string
@@ -4538,18 +4562,26 @@ export class DomainLedger {
     repoRoot: string
     runId: string
   }): { checkpoint: StageCheckpointRow; generationToken: number } {
+    const coordinatorIdentity = input.coordinatorIdentity ?? `no-mistakes:${process.pid}`
     this.#db.exec('BEGIN IMMEDIATE')
     try {
       const checkpoint = this.#validateResume(input)
       const claim = this.#db
         .prepare(
-          `SELECT generation_token FROM resume_claims
-           WHERE run_id = ? AND claim_id = ?`
+          `SELECT c.generation_token, o.coordinator_identity
+           FROM resume_claims c
+           LEFT JOIN resume_claim_owners o
+             ON o.run_id = c.run_id AND o.claim_id = c.claim_id
+               AND o.generation_token = c.generation_token
+           WHERE c.run_id = ? AND c.claim_id = ?`
         )
         .get(input.runId, input.claimId) as
-        | { generation_token: number | bigint }
+        | { coordinator_identity: string | null; generation_token: number | bigint }
         | undefined
       if (!claim) throw new Error(`run ${input.runId} has no matching resume claim`)
+      if (claim.coordinator_identity !== coordinatorIdentity) {
+        throw new Error(`run ${input.runId} resume claim belongs to another coordinator`)
+      }
       const generationToken = Number(claim.generation_token)
       this.#acquireClaimedLeaseLocked(input, generationToken)
       this.#db
@@ -4855,7 +4887,19 @@ export class DomainLedger {
       if (run.status !== 'in-progress' && run.status !== 'failed') {
         throw new Error(`cannot abandon a ${run.status} run`)
       }
-      if (this.#db.prepare('SELECT 1 FROM resume_claims WHERE run_id = ?').get(input.runId)) {
+      const claim = this.#db.prepare(
+        `SELECT c.claim_id, c.generation_token, o.coordinator_identity
+         FROM resume_claims c
+         LEFT JOIN resume_claim_owners o
+           ON o.run_id = c.run_id AND o.claim_id = c.claim_id
+             AND o.generation_token = c.generation_token
+         WHERE c.run_id = ?`
+      ).get(input.runId) as {
+        claim_id: string
+        coordinator_identity: string | null
+        generation_token: number
+      } | undefined
+      if (claim && !claim.coordinator_identity) {
         throw new Error(`run ${input.runId} has a pending resume claim; recover its launcher first`)
       }
       const attempt = this.#db.prepare(
@@ -4865,14 +4909,30 @@ export class DomainLedger {
       const lease = this.#db.prepare(
         'SELECT generation_token FROM branch_leases WHERE run_id = ?'
       ).get(input.runId) as { generation_token: number } | undefined
-      if (lease && (!attempt || lease.generation_token !== attempt.generation_token)) {
-        throw new Error(`run ${input.runId} has an unrecorded lease owner; recover its launcher first`)
-      }
       const initial = this.#db.prepare(
         'SELECT initial_coordinator_identity FROM runs WHERE run_id = ?'
       ).get(input.runId) as { initial_coordinator_identity: string | null }
-      const coordinatorIdentity = attempt?.coordinator_identity ?? initial.initial_coordinator_identity ?? ''
-      const generationToken = attempt?.generation_token ?? 0
+      let coordinatorIdentity: string
+      let generationToken: number
+      if (claim) {
+        coordinatorIdentity = claim.coordinator_identity!
+        generationToken = claim.generation_token
+        if (
+          (run.status === 'in-progress' && lease?.generation_token !== generationToken) ||
+          (lease && lease.generation_token !== generationToken) ||
+          (attempt && attempt.generation_token > generationToken) ||
+          (attempt?.generation_token === generationToken &&
+            attempt.coordinator_identity !== coordinatorIdentity)
+        ) {
+          throw new Error(`run ${input.runId} resume ownership is stale or mismatched`)
+        }
+      } else {
+        if (lease && (!attempt || lease.generation_token !== attempt.generation_token)) {
+          throw new Error(`run ${input.runId} has an unrecorded lease owner; recover its launcher first`)
+        }
+        coordinatorIdentity = attempt?.coordinator_identity ?? initial.initial_coordinator_identity ?? ''
+        generationToken = attempt?.generation_token ?? 0
+      }
       const pid = Number(/^no-mistakes:([1-9]\d*)$/.exec(coordinatorIdentity)?.[1])
       if (!Number.isSafeInteger(pid) || pid > 2_147_483_647) {
         throw new Error(`run ${input.runId} has no verifiable local coordinator PID`)
@@ -4905,7 +4965,14 @@ export class DomainLedger {
              accepted_oid = NULL, accepted_at = NULL
          WHERE run_id = ?`
       ).run(input.runId)
-      this.releaseLease(input.runId)
+      if (claim) {
+        this.#db.prepare(
+          'DELETE FROM resume_claims WHERE run_id = ? AND claim_id = ? AND generation_token = ?'
+        ).run(input.runId, claim.claim_id, generationToken)
+      }
+      this.#db.prepare(
+        'DELETE FROM branch_leases WHERE run_id = ? AND generation_token = ?'
+      ).run(input.runId, generationToken)
       this.#db.exec('COMMIT')
     } catch (error) {
       this.#db.exec('ROLLBACK')
