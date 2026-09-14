@@ -57,7 +57,7 @@ The immutable per-run identity of the forge, stable base and head repositories, 
 _Avoid_: Origin, current remotes, push URL
 
 **Repository publication route**:
-The durable, mutable publication route persisted once per repository, keyed by the Git common dir so every worktree shares it, and bound to the authenticated actor, backend, forge, stable repository identities, owner, identity fingerprint, and canonical credential-free transport identity. It is guarded against authenticated-actor drift and against repository-identity change while active runs or resumable failed runs depend on it. Every Release 2 run snapshots it at start, with the run's own head and base branches, as its immutable per-run Publication route; legacy and provider-neutral runs do not.
+The shared, mutable publication route configured for a repository and bound to its authenticated actor, forge, stable repository identities, and credential-free transport. A publication run snapshots it with its own head and base branches as an immutable per-run Publication route.
 _Avoid_: Per-run route, origin, ambient remote
 
 **Publication head ref**:
@@ -197,11 +197,11 @@ A deterministic root binding the frozen stage plan and evidence through candidat
 _Avoid_: Completion-attestation root, remote trust anchor, raw evidence link
 
 **Pipeline completion attestation**:
-A portable, tamper-evident manifest using the version 2 completion schema for a run with a `passed` verdict. It binds the frozen stage plan, recorded stage dispositions and evidence, candidate-publication and pull-request-binding receipt digests, all attempt-outcome digests (explicitly including the terminal passed attempt; only pipelineEvidenceRoot excludes that final digest), custody facts, and explicit assurance claims to the candidate commit. It proves historical observations, not current remote state or independent authenticity.
+A portable, tamper-evident record for a run with a `passed` verdict, binding its frozen stage plan, dispositions, evidence, publication receipts, attempt history, custody facts, and explicit assurance claims to the candidate commit. It proves historical observations, not current remote state or independent authenticity.
 _Avoid_: Passed, signature, live-status certificate
 
 **Passed attestation**:
-A pipeline completion attestation carrying the target `Passed` assurance claim and binding its required evidence to the candidate and delivered commits. Release 2 cannot produce one.
+A pipeline completion attestation carrying the target `Passed` assurance claim and binding its required evidence to the candidate and delivered commits.
 _Avoid_: Any passed-verdict attestation, signature, badge
 
 **Reconciliation snapshot**:

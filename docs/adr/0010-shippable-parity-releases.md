@@ -3,12 +3,14 @@ status: accepted
 date: 2026-08-20
 scope: target roadmap
 implementation: partially implemented
-acceptance: Release 2 live proof pending
+acceptance: protected live proof pending
 ---
 
 # Four Shippable Parity Releases
 
-The target architecture is delivered in four independently useful releases. Each release states its limitations; only Release 4 may emit the full Passed outcome defined by ADR-0005.
+This ADR preserves the historical four-milestone delivery plan and its dated amendments. Its release numbers are roadmap labels, not supported product versions or selectable operating modes. See [Current architecture](../current-architecture.md) for implemented behavior and [Acceptance](../acceptance.md) for the evidence requirements.
+
+The plan divides the target architecture into four independently useful milestones. Only the final milestone may emit the full Passed outcome defined by ADR-0005.
 
 ## Decision
 
@@ -26,7 +28,7 @@ Release 1 pulled forward two capabilities the list above assigns to later releas
 
 Release 2 still owns `--force-with-lease` candidate publication, pull-request report publication, and merge settlement; Release 4 still owns coordinator restart recovery, parked-gate reattachment, and three-way custody reconciliation. Every other item stands as decided.
 
-The local v1.3 evidence manifest emitted at the end of Release 1, historically called a "Passed Attestation" by the current implementation, predates and does not satisfy the version 2 pipeline completion-attestation schema. It binds the recorded stage history and terminal candidate after every required *local* validation stage reaches an accepted terminal disposition; it does not prove that every stage ran against one unchanged candidate or prove delivery. Full "Passed" — including remote delivery, PR, and CI proof — remains reserved for Release 4.
+The local v1.3 evidence manifest emitted at the end of Release 1, historically called a "Passed Attestation" by that implementation, predates and does not satisfy the version 2 pipeline completion-attestation schema. It binds the recorded stage history and terminal candidate after every required *local* validation stage reaches an accepted terminal disposition; it does not prove that every stage ran against one unchanged candidate or prove delivery. Full "Passed" — including remote delivery, PR, and CI proof — remains reserved for Release 4.
 
 ## Amendment 2026-09-01
 
@@ -40,11 +42,11 @@ Release 2 now runs `push` and `pr` after the six local validation stages for bot
 
 ## Acceptance status 2026-09-05
 
-[Release 2 acceptance](../release-2-acceptance.md) defines the local matrix, live fixtures, evidence and operator procedure for the current title/body and matching-merge contract. The local matrix alone does not satisfy this decision: release acceptance remains pending until macOS, Linux and protected live same-repository/fork results are retained.
+The [acceptance runbook](../acceptance.md) defines the local matrix, live fixtures, evidence and operator procedure for the title/body and matching-merge contract. The local matrix alone does not satisfy this decision: acceptance remains pending until macOS, Linux and protected live same-repository/fork results are retained.
 
 ## Status update (2026-09-06)
 
-[ADR-0016](0016-ci-stage-monitoring-and-merge-settlement.md) adds CI monitoring and merge settlement as a ninth `ci` stage after the Release 2 proof; delivery proof (delivered-tree verification, CI auto-fix re-publication) still belongs to Release 3.
+[ADR-0016](0016-ci-stage-monitoring-and-merge-settlement.md) adds CI monitoring and merge settlement as a ninth `ci` stage, moving the merge wait out of `pr`; delivery proof (delivered-tree verification, CI auto-fix re-publication) still belongs to the third roadmap milestone.
 
 ## Consequences
 

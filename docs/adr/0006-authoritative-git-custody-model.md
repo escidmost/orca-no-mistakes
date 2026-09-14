@@ -2,7 +2,7 @@
 status: accepted
 date: 2026-08-20
 scope: target architecture
-implementation: partially implemented (Release 1)
+implementation: partially implemented
 ---
 
 # Authoritative Git Custody Model
@@ -19,4 +19,4 @@ The target pipeline owns an exact proposed-change head while it creates rebases 
 
 ## Consequences
 
-Release 1 implements preserved recovery refs for terminal runs and uncontended fast-forward custody return on successful runs. Release 4 implements adoption and three-way custody recovery for interrupted or divergent runs under ADR-0010. Earlier remote releases explicitly accept that a crash may strand pipeline-created commits and therefore cannot emit the full target Passed outcome.
+The current pipeline preserves recovery refs for terminal runs and returns custody by uncontended fast-forward on successful runs. Adoption and three-way custody recovery for interrupted or divergent runs remain planned under ADR-0010. A crash may strand pipeline-created commits, so the full target Passed outcome remains unavailable.

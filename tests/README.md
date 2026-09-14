@@ -18,7 +18,7 @@ npm run typecheck
 node --test tests/publication-worker-identity.test.ts
 ```
 
-`npm test` runs `node --test tests/*.test.ts`; `npm run typecheck` runs
+`npm test` runs `node --test --test-concurrency=4 tests/*.test.ts`; `npm run typecheck` runs
 `tsc --noEmit`. The last command is a focused-file example.
 
 Organization-only changes must preserve coverage: do not delete tests, change

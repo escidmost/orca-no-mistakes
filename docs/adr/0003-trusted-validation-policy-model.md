@@ -2,7 +2,7 @@
 status: accepted
 date: 2026-08-20
 scope: target architecture
-implementation: partially implemented (Release 1)
+implementation: partially implemented
 ---
 
 # Trusted Validation Policy Model

@@ -1,8 +1,8 @@
-# Release 2 acceptance
+# Acceptance
 
-Release 2 acceptance is **not complete**. A local test run is not proof of real Orca or GitHub behavior. Completion requires passing macOS and Linux local results plus a clean protected live run against dedicated persistent GitHub.com upstream and fork repositories.
+Full acceptance is **not complete**. Completion requires passing macOS and Linux local results plus a clean protected live run against dedicated persistent GitHub.com upstream and fork repositories. Local tests exercise controlled Orca/provider implementations; live evidence must exercise the real services.
 
-The current contract is ADR-0010: the pipeline owns the PR title and body, not a managed comment, and remains active until an authoritative matching `MERGED` observation. That wording described Release 2 as proven on 2026-09-05; ONM-96 afterwards split the merge wait into a ninth `ci` stage that settles `pr` on an open binding and monitors CI checks and mergeability until merge (ADR-0016). Human comments, labels, reviewers and other fields are outside that report ownership. ONM-79's original managed-comment/no-merge wording has been superseded. Observing a merged PR does not prove CI completeness, non-bypass merge, or delivered-tree integrity.
+The pipeline owns the PR title and body. The `pr` stage settles an open binding, and the `ci` stage monitors checks and mergeability until an authoritative matching `MERGED` observation ([ADR-0016](adr/0016-ci-stage-monitoring-and-merge-settlement.md)). Human comments, labels, reviewers and other fields are outside that report ownership. Observing a merged PR does not prove CI completeness, non-bypass merge, or delivered-tree integrity.
 
 ## Local matrix
 
@@ -16,7 +16,7 @@ node scripts/acceptance/local.ts
 
 The runner sets an explicit UTF-8 locale for terminal rendering tests and records it with the user ID. The runner executes every `tests/*.test.ts` file with Node's test runner and four concurrent test processes. It creates a fresh directory under `acceptance-results/` containing `tests.tap` and `result.json`. An existing output directory is refused. A failure returns a nonzero exit code and retains the log. An interrupted runner can leave `status: running`; that is not successful evidence. The result records OS, architecture, Node/Git versions, commit, tracked diff digest and TypeScript source/test hashes, including untracked TypeScript files. Retain both files together.
 
-The `Release 2 local acceptance` workflow runs this same command on macOS and Linux with Node 24 and retains each platform's artifact even after test failure. A workflow definition alone does not prove either platform passed. The local runner uses controlled Orca/provider implementations and local bare Git repositories; it does not use real GitHub credentials or certify a live Orca installation.
+The [Local acceptance workflow](../.github/workflows/local-acceptance.yml) runs this same command on macOS and Linux with Node 24 and retains each platform's artifact even after test failure. A workflow definition alone does not prove either platform passed. The local runner uses controlled Orca/provider implementations and local bare Git repositories; it does not use real GitHub credentials or certify a live Orca installation.
 
 Coverage entry points (the runner includes all regression files, not just this list):
 
@@ -29,14 +29,14 @@ Coverage entry points (the runner includes all regression files, not just this l
 | PR ambiguity, owned report and matching merge settlement | `tests/pull-request-binding.test.ts`, `tests/pull-request-binding-reconciliation-and-artifact-safety.test.ts` |
 | Publication failure, explicit resume and no duplicate push/PR | `tests/pipeline-release-2-integration.test.ts` runs same-repository and fork routes, counts mutations and exports/verifies completion evidence |
 | Migration interruption and retry | `tests/ledger-migration-cleanup-and-repository-resolution.test.ts` injects failure between destination commit and source cleanup; `tests/ledger-concurrent-migration-and-completion-retry.test.ts` opens concurrently |
-| v1.3 and v2 evidence, offline and retained verification | `tests/pipeline-completion-attestation.test.ts`, `tests/repository-ledger-migration.test.ts` |
+| Completion evidence and historical manifests, offline and retained verification | `tests/pipeline-completion-attestation.test.ts`, `tests/repository-ledger-migration.test.ts` |
 | Custody divergence, cancellation and stranded cleanup | `tests/orca-no-mistakes.test.ts`, `tests/abort-reap.test.ts`, `tests/resume-generation-custody-pruning.test.ts` |
 
 These entry points identify assertions to inspect; test names are not substitutes for results. The real receive test controls the coordinator entrypoint and invokes production admission primitives; it does not certify real Orca launch. Concurrent admission tests synchronize four processes against the same SQLite ledger; they do not simulate simultaneous full pipelines. The live acceptance record must state precisely which boundary it exercised.
 
 ## Recorded local result
 
-On 2026-09-05, all 974 tests passed on macOS (Node 26.8.1) and in an unprivileged Linux container (Node 24.20.0) against matching TypeScript source/test hashes. Retained local evidence is `acceptance-results/local-1788645661523/` and `acceptance-results/linux-fixture/result-final/`; Those reports are historical: their hashes cover the 2026-09-05 source, not this branch, and the GATES.md ledger that recorded them is local and untracked. Produce fresh evidence for the current source with the Local matrix procedure above. These ignored evidence directories must be retained separately from a Git commit. This is local platform evidence, not an executed hosted Actions matrix or a live acceptance pass.
+The historical record reports 974 passing tests on 2026-09-05 on macOS (Node 26.8.1) and in an unprivileged Linux container (Node 24.20.0), with matching TypeScript source/test hashes. Its evidence locations are `acceptance-results/local-1788645661523/` and `acceptance-results/linux-fixture/result-final/`. Those ignored directories and the local, untracked `GATES.md` are not distributed with this checkout; the claim requires those retained artifacts to verify. Produce fresh evidence for the current source with the Local matrix procedure above. This record does not establish an executed hosted Actions matrix or a live acceptance pass.
 
 The initial root/locale-misconfigured Linux failure remains in `acceptance-results/linux-fixture/result/`. Permission-denial tests require an unprivileged user. Exact log-accounting controls establish distinct birth/change timestamps; the zero-birthtime regression still requires unknown accounting.
 
@@ -102,14 +102,16 @@ Export and verify each completed run by exact run ID, not an ambiguous commit se
 /path/to/package/bin/orca-no-mistakes attestation verify completion.json --repo /path/to/checkout
 ```
 
-Keep fixture identities, admission/run IDs, accepted and final candidate OIDs, publication and PR receipts, the v2 pipeline evidence/completion roots, all attempt outcomes, custody result, and cleanup result with the workflow artifact. Export failures and failed fixture identities must survive a failed test. An unsigned portable manifest proves internal integrity, not authorship; verification with the originating ledger also checks retained evidence.
+Keep fixture identities, admission/run IDs, accepted and final candidate OIDs, publication and PR receipts, pipeline evidence/completion roots, all attempt outcomes, custody result, and cleanup result with the workflow artifact. Export failures and failed fixture identities must survive a failed test. An unsigned portable manifest proves internal integrity, not authorship; verification with the originating ledger also checks retained evidence.
 
 Only clean fixture branches/PRs, including the per-run base branches on upstream and the fork-side copy of `onm-79/run/base-fork`, after all scenario assertions and evidence export succeed. Before deleting any branch, compare its current OID with the exact recorded owned OID and use an exact lease; retain a moved branch. Close only PRs whose recorded repository and immutable identity match this run. Preserve all failed or uncertain identities for diagnosis, and report cleanup failure as failure, not a clean live pass.
 
-## Recovery, migration and limits
+## Recovery and limits
 
-Migration opens the repository-local ledger under the Git common directory and copies eligible historical state before cleaning the legacy source. Active historical runs or live semantic leases block migration. Retrying after interrupted source cleanup must preserve the committed destination. Migrated Release 1 failures retain their frozen six-stage plan and emit v1.3 local manifests; they do not silently acquire Release 2 publication requirements.
+Historical ledger imports, frozen plans, and manifest formats follow the [retained-run compatibility contract](current-architecture.md#retained-run-compatibility).
 
-Use `prune --stranded --repo <checkout>` to reconcile provably dead owned resources. It retains custody on liveness, identity or ownership uncertainty. Ordinary `prune` removes eligible terminal ledger/artifact history but preserves Git recovery refs and refuses to discard undelivered recovery commits. Export evidence before pruning. See [the retention guide](../README.md#attestations-and-retention) for the exact retention rules.
+Use `prune --stranded --repo <checkout>` to reconcile provably dead owned resources. It retains custody on liveness, identity or ownership uncertainty. Ordinary `prune` removes eligible terminal ledger/artifact history but preserves Git recovery refs and refuses to discard undelivered recovery commits. Export evidence before pruning. See [the architecture reference](current-architecture.md#entry-points) for the exact retention rules.
 
-As proven on 2026-09-05, Release 2 withheld CI reconciliation; ONM-96 afterwards added the `ci` stage's CI monitoring (ADR-0016), which reports check failures but still does not prove completeness. Release 2 continues to withhold trusted check-set completeness, non-bypass merge/delivery proof, delivered-tree integrity, `checks-passed`, target `Passed`, GitHub Enterprise Server and Windows support. It observes matching merge state but does not claim to implement the later delivery proof. Release 4 crash adoption, parked-gate reattachment and three-way custody recovery remain unavailable: a hard crash can strand pipeline-created commits, and automatic adoption of an abandoned `in-progress` run is not supported. Recovery refs and conservative stranded cleanup do not remove that limitation.
+The pipeline reports CI failures and observes matching merge state. It does not establish trusted check-set completeness, non-bypass delivery, delivered-tree integrity, `checks-passed` proof, or target `Passed`. GitHub Enterprise Server and Windows are outside this acceptance contract.
+
+Crash adoption, parked-gate reattachment, and three-way custody recovery remain unavailable: a hard crash can strand pipeline-created commits, and automatic adoption of an abandoned `in-progress` run is not supported. Recovery refs and conservative stranded cleanup do not remove that limitation.

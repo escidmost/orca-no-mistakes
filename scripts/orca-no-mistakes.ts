@@ -16354,11 +16354,11 @@ Run options:
   init installs or refreshes the repository-local bare gate and managed remote
   admit accepts one feature ref update with one encoded intent push option
 
-Release boundary:
-  New runs own the PR title/body and wait for an exact matching merged PR.
+Completion and recovery:
+  The coordinator owns the PR title/body, monitors CI, and waits for an exact matching merged PR.
   Completion does not prove CI completeness, delivered-tree integrity, or target Passed.
   Resume requires a durably failed run; abandoned in-progress crash adoption is unavailable.
-  Acceptance procedure: docs/release-2-acceptance.md`);
+  Acceptance procedure: docs/acceptance.md`);
     return;
   }
   const parsed = parseCli(argv);

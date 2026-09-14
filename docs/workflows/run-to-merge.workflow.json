@@ -1,0 +1,36 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": { "title": "From committed change to merged PR", "locale": "en", "quality_profile": "showcase" },
+  "lanes": [
+    { "id": "validate-candidate", "label": "Coordinator operations" },
+    { "id": "settle-run", "label": "Worker evaluations" }
+  ],
+  "mainPath": ["record-intent", "rebase-candidate", "review-change", "test-product", "update-docs", "lint-candidate", "publish-candidate", "bind-pr", "monitor-ci"],
+  "nodes": [
+    { "id": "record-intent", "lane": "settle-run", "col": 0, "type": "backend", "label": "1 · intent", "sublabel": "Record the objective" },
+    { "id": "rebase-candidate", "lane": "validate-candidate", "col": 1, "type": "backend", "label": "2 · rebase", "sublabel": "Onto the selected base" },
+    { "id": "review-change", "lane": "settle-run", "col": 1, "type": "security", "label": "3 · review", "sublabel": "Findings + repairs" },
+    { "id": "test-product", "lane": "settle-run", "col": 2, "type": "backend", "label": "4 · test", "sublabel": "Live product evidence" },
+    { "id": "update-docs", "lane": "settle-run", "col": 3, "type": "backend", "label": "5 · document", "sublabel": "Check documentation" },
+    { "id": "lint-candidate", "lane": "settle-run", "col": 4, "type": "backend", "label": "6 · lint", "sublabel": "Check code conventions" },
+    { "id": "publish-candidate", "lane": "validate-candidate", "col": 4, "type": "cloud", "label": "7 · push", "sublabel": "Exact candidate + lease" },
+    { "id": "bind-pr", "lane": "settle-run", "col": 5, "type": "cloud", "label": "8 · pr", "sublabel": "Draft, bind, notify" },
+    { "id": "monitor-ci", "lane": "validate-candidate", "col": 5, "type": "cloud", "label": "9 · ci", "sublabel": "Wait for matching merge" }
+  ],
+  "edges": [
+    { "id": "intent-to-base", "from": "record-intent", "to": "rebase-candidate", "role": "main", "toSide": "left" },
+    { "id": "base-to-review", "from": "rebase-candidate", "to": "review-change", "role": "main", "route": "drop" },
+    { "id": "review-to-test", "from": "review-change", "to": "test-product", "role": "main" },
+    { "id": "test-to-docs", "from": "test-product", "to": "update-docs", "role": "main" },
+    { "id": "docs-to-lint", "from": "update-docs", "to": "lint-candidate", "role": "main" },
+    { "id": "lint-to-push", "from": "lint-candidate", "to": "publish-candidate", "role": "main" },
+    { "id": "push-to-pr", "from": "publish-candidate", "to": "bind-pr", "role": "main" },
+    { "id": "pr-to-monitor", "from": "bind-pr", "to": "monitor-ci", "role": "main", "label": "PR ready" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "Start", "items": ["Initialize once; submit a clean feature commit and intent.", "run and local-gate admission use the same isolated pipeline."] },
+    { "dot": "amber", "title": "Validate", "items": ["Trusted-base command gates can extend the local stages.", "Candidate changes require fresh commit-bound evidence."] },
+    { "dot": "emerald", "title": "Complete", "items": ["The operator handles CI repairs and merge externally.", "Matching merge leads to custody return and attestation."] }
+  ]
+}

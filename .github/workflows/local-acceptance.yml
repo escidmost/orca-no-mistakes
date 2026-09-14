@@ -1,4 +1,4 @@
-name: Release 2 local acceptance
+name: Local acceptance
 on:
   workflow_dispatch:
   pull_request:
@@ -6,7 +6,7 @@ on:
       - 'scripts/**'
       - 'tests/**'
       - 'package*.json'
-      - '.github/workflows/release-2-local.yml'
+      - '.github/workflows/local-acceptance.yml'
 permissions:
   contents: read
 jobs:
@@ -32,6 +32,6 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: release-2-local-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: local-acceptance-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: acceptance-local/
           if-no-files-found: error
