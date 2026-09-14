@@ -1741,6 +1741,7 @@ CREATE TABLE IF NOT EXISTS runs (
   repo_root TEXT NOT NULL,
   branch TEXT NOT NULL,
   base_branch TEXT NOT NULL,
+  initial_coordinator_identity TEXT NOT NULL,
   submission_commit_oid TEXT NOT NULL,
   terminal_commit_oid TEXT,
   intent TEXT NOT NULL,
@@ -2514,6 +2515,7 @@ export class DomainLedger {
     // path. Only the expected duplicate-column failure is tolerated.
     for (const [table, column] of [
       ['runs', "command_gates_json TEXT NOT NULL DEFAULT '[]'"],
+      ['runs', 'initial_coordinator_identity TEXT'],
       ['stage_evidence', 'effective_policy_hash TEXT'],
       ['stage_evidence', 'base_ref_sha TEXT'],
       ['stage_evidence', 'artifact_sha256 TEXT'],
@@ -2538,6 +2540,9 @@ export class DomainLedger {
     this.#db.exec(`CREATE TRIGGER IF NOT EXISTS freeze_command_gates
       BEFORE UPDATE OF command_gates_json ON runs
       BEGIN SELECT RAISE(ABORT, 'command gates are frozen at run creation'); END;`)
+    this.#db.exec(`CREATE TRIGGER IF NOT EXISTS freeze_initial_coordinator_identity
+      BEFORE UPDATE OF initial_coordinator_identity ON runs
+      BEGIN SELECT RAISE(ABORT, 'initial coordinator identity is frozen at run creation'); END;`)
     const schemaVersion = this.#db.prepare('PRAGMA user_version').get() as {
       user_version: number
     }
@@ -2919,6 +2924,7 @@ export class DomainLedger {
     commandGates?: readonly CommandGate[]
     baseBranch: string
     branch: string
+    coordinatorIdentity?: string
     intent: string
     policySha256: string
     repoRoot: string
@@ -2926,6 +2932,11 @@ export class DomainLedger {
     stagePlan?: readonly { requirement: StageRequirement; stageId: string }[]
     submissionCommitOid: string
   }): void {
+    const coordinatorIdentity = input.coordinatorIdentity ?? `no-mistakes:${process.pid}`
+    const coordinatorPid = Number(/^no-mistakes:([1-9]\d*)$/.exec(coordinatorIdentity)?.[1])
+    if (!Number.isSafeInteger(coordinatorPid) || coordinatorPid > 2_147_483_647) {
+      throw new Error('run coordinator identity must contain a verifiable local PID')
+    }
     const plan = input.stagePlan ?? LEGACY_STAGE_PLAN.map((stageId) => ({
       requirement: 'required' as const,
       stageId
@@ -2946,15 +2957,17 @@ export class DomainLedger {
       this.#db
         .prepare(
           `INSERT INTO runs (
-             run_id, repo_root, branch, base_branch, submission_commit_oid, terminal_commit_oid,
+             run_id, repo_root, branch, base_branch, initial_coordinator_identity,
+             submission_commit_oid, terminal_commit_oid,
              intent, intent_hash, policy_sha256, status, created_at, completed_at, command_gates_json
-           ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, 'in-progress', ?, NULL, ?)`
+           ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, 'in-progress', ?, NULL, ?)`
         )
         .run(
           input.runId,
           input.repoRoot,
           input.branch,
           input.baseBranch,
+          coordinatorIdentity,
           input.submissionCommitOid,
           input.intent,
           intentHash(input.intent),
@@ -4849,15 +4862,20 @@ export class DomainLedger {
         `SELECT coordinator_identity, generation_token FROM run_attempts
          WHERE run_id = ? ORDER BY generation_token DESC LIMIT 1`
       ).get(input.runId) as { coordinator_identity: string; generation_token: number } | undefined
-      const pid = Number(/^no-mistakes:([1-9]\d*)$/.exec(attempt?.coordinator_identity ?? '')?.[1])
-      if (!attempt || !Number.isSafeInteger(pid) || pid > 2_147_483_647) {
-        throw new Error(`run ${input.runId} has no verifiable local coordinator PID`)
-      }
       const lease = this.#db.prepare(
         'SELECT generation_token FROM branch_leases WHERE run_id = ?'
       ).get(input.runId) as { generation_token: number } | undefined
-      if (lease && lease.generation_token !== attempt.generation_token) {
+      if (lease && (!attempt || lease.generation_token !== attempt.generation_token)) {
         throw new Error(`run ${input.runId} has an unrecorded lease owner; recover its launcher first`)
+      }
+      const initial = this.#db.prepare(
+        'SELECT initial_coordinator_identity FROM runs WHERE run_id = ?'
+      ).get(input.runId) as { initial_coordinator_identity: string | null }
+      const coordinatorIdentity = attempt?.coordinator_identity ?? initial.initial_coordinator_identity ?? ''
+      const generationToken = attempt?.generation_token ?? 0
+      const pid = Number(/^no-mistakes:([1-9]\d*)$/.exec(coordinatorIdentity)?.[1])
+      if (!Number.isSafeInteger(pid) || pid > 2_147_483_647) {
+        throw new Error(`run ${input.runId} has no verifiable local coordinator PID`)
       }
       // PID absence proves death; permission errors and PID reuse remain uncertain.
       // The write lock prevents resume from racing this check and cancellation.
@@ -4872,7 +4890,7 @@ export class DomainLedger {
         `INSERT INTO run_abandonments
          (run_id, prior_status, coordinator_identity, generation_token, actor_identity, reason, abandoned_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)`
-      ).run(input.runId, run.status, attempt.coordinator_identity, attempt.generation_token,
+      ).run(input.runId, run.status, coordinatorIdentity, generationToken,
         input.actorIdentity, input.reason.trim(), abandonedAt)
       this.#db.prepare(
         "UPDATE runs SET status = 'cancelled', completed_at = ? WHERE run_id = ?"

@@ -2249,6 +2249,7 @@ export async function runPipeline(
           commandGates: pipelineConfig.command_gates,
           baseBranch: deliveryRepo.base,
           branch: deliveryRepo.branch,
+          coordinatorIdentity,
           intent,
           policySha256: policySha256Value,
           repoRoot: deliveryRepo.root,
