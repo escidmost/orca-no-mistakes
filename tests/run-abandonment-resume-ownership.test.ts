@@ -97,6 +97,28 @@ test('stale resume ownership cannot release a newer lease generation', (t) => {
     claim.generationToken + 1)
 })
 
+test('abandoning a dead resumed run preserves its replacement lease after force takeover', (t) => {
+  const { abandon, db, ledger, prepare, resume, root } = fixture(t)
+  const claim = prepare(deadCoordinator)
+  resume(claim, deadCoordinator)
+  ledger.startRun({ repoRoot: root, runId: 'replacement', branch: 'feature', baseBranch: 'main',
+    intent: 'Continue after the old coordinator died', policySha256: policy, submissionCommitOid: commit })
+  const generation = ledger.acquireLease({ repoRoot: root, branch: 'feature', runId: 'replacement', force: true })
+  const replacementLease = db.prepare('SELECT * FROM branch_leases').get()
+  const priorAttempt = db.prepare('SELECT * FROM run_attempts').get()
+
+  abandon()
+
+  assert.equal(ledger.runStatus('run'), 'cancelled')
+  assert.equal(ledger.runStatus('replacement'), 'in-progress')
+  assert.ok(generation > claim.generationToken)
+  assert.deepEqual(db.prepare('SELECT * FROM branch_leases').get(), replacementLease)
+  assert.deepEqual(db.prepare('SELECT * FROM run_attempts').get(), priorAttempt)
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM resume_claims').get()?.count, 0)
+  assert.equal(db.prepare('SELECT generation_token FROM run_abandonments').get()?.generation_token,
+    claim.generationToken)
+})
+
 test('resume activation rejects a different coordinator identity', (t) => {
   const { ledger, prepare, resume } = fixture(t)
   const claim = prepare(deadCoordinator)

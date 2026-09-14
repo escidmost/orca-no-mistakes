@@ -4918,7 +4918,6 @@ export class DomainLedger {
         coordinatorIdentity = claim.coordinator_identity!
         generationToken = claim.generation_token
         if (
-          (run.status === 'in-progress' && lease?.generation_token !== generationToken) ||
           (lease && lease.generation_token !== generationToken) ||
           (attempt && attempt.generation_token > generationToken) ||
           (attempt?.generation_token === generationToken &&
