@@ -1771,6 +1771,25 @@ CREATE TABLE IF NOT EXISTS submission_admissions (
   UNIQUE (gate_identity, repo_root, ref_name, new_oid, intent_hash)
 );
 
+CREATE TABLE IF NOT EXISTS run_abandonments (
+  run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE CASCADE,
+  prior_status TEXT NOT NULL CHECK(prior_status IN ('in-progress', 'failed')),
+  coordinator_identity TEXT NOT NULL,
+  generation_token INTEGER NOT NULL,
+  actor_identity TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  abandoned_at TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS immutable_run_abandonments
+BEFORE UPDATE ON run_abandonments
+BEGIN SELECT RAISE(ABORT, 'run abandonment is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_run_abandonments_delete
+BEFORE DELETE ON run_abandonments
+WHEN EXISTS (SELECT 1 FROM runs WHERE run_id = OLD.run_id)
+BEGIN SELECT RAISE(ABORT, 'run abandonment is immutable'); END;
+
 CREATE TABLE IF NOT EXISTS pending_admission_leases (
   repo_root TEXT NOT NULL,
   ref_name TEXT NOT NULL,
@@ -2801,6 +2820,7 @@ export class DomainLedger {
         'publication_baselines',
         'run_attempts',
         'attempt_outcomes',
+        'run_abandonments',
         'remote_observations',
         'mutation_intents',
         'resolved_mutation_intents',
@@ -3350,7 +3370,7 @@ export class DomainLedger {
       ) as { count: number }
       if (active.count > 0) {
         throw new Error(
-          `cannot change publication route while ${active.count} active or resumable run(s) depend on it`
+          `cannot change publication route while ${active.count} active or resumable run(s) depend on it; this counts retained ledger state, not live processes. Use abandon --run-id <id> --reason <text> to close out a dead local run without deleting evidence`
         )
       }
     }
@@ -4805,6 +4825,64 @@ export class DomainLedger {
 
   releaseLease(runId: string): void {
     this.#db.prepare('DELETE FROM branch_leases WHERE run_id = ?').run(runId)
+  }
+
+  abandonRun(input: { runId: string; reason: string; actorIdentity: string }): void {
+    if (!input.reason.trim() || !input.actorIdentity.trim()) {
+      throw new Error('abandon requires a reason and actor identity')
+    }
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      const run = this.run(input.runId)
+      if (!run) throw new Error(`run ${input.runId} does not exist`)
+      if (this.#db.prepare('SELECT 1 FROM run_abandonments WHERE run_id = ?').get(input.runId)) {
+        this.#db.exec('COMMIT')
+        return
+      }
+      if (run.status !== 'in-progress' && run.status !== 'failed') {
+        throw new Error(`cannot abandon a ${run.status} run`)
+      }
+      if (this.#db.prepare('SELECT 1 FROM resume_claims WHERE run_id = ?').get(input.runId)) {
+        throw new Error(`run ${input.runId} has a pending resume claim; recover its launcher first`)
+      }
+      const attempt = this.#db.prepare(
+        `SELECT coordinator_identity, generation_token FROM run_attempts
+         WHERE run_id = ? ORDER BY generation_token DESC LIMIT 1`
+      ).get(input.runId) as { coordinator_identity: string; generation_token: number } | undefined
+      const pid = Number(/^no-mistakes:([1-9]\d*)$/.exec(attempt?.coordinator_identity ?? '')?.[1])
+      if (!attempt || !Number.isSafeInteger(pid) || pid > 2_147_483_647) {
+        throw new Error(`run ${input.runId} has no verifiable local coordinator PID`)
+      }
+      const lease = this.#db.prepare(
+        'SELECT generation_token FROM branch_leases WHERE run_id = ?'
+      ).get(input.runId) as { generation_token: number } | undefined
+      if (lease && lease.generation_token !== attempt.generation_token) {
+        throw new Error(`run ${input.runId} has an unrecorded lease owner; recover its launcher first`)
+      }
+      // PID absence proves death; permission errors and PID reuse remain uncertain.
+      // The write lock prevents resume from racing this check and cancellation.
+      try {
+        process.kill(pid, 0)
+        throw new Error(`run ${input.runId} coordinator PID ${pid} is still present`)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+      }
+      const abandonedAt = new Date().toISOString()
+      this.#db.prepare(
+        `INSERT INTO run_abandonments
+         (run_id, prior_status, coordinator_identity, generation_token, actor_identity, reason, abandoned_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      ).run(input.runId, run.status, attempt.coordinator_identity, attempt.generation_token,
+        input.actorIdentity, input.reason.trim(), abandonedAt)
+      this.#db.prepare(
+        "UPDATE runs SET status = 'cancelled', completed_at = ? WHERE run_id = ?"
+      ).run(abandonedAt, input.runId)
+      this.releaseLease(input.runId)
+      this.#db.exec('COMMIT')
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
   }
 
   settleRun(

@@ -11921,12 +11921,14 @@ const VALUE_FLAGS = new Set([
   "reviewer-model",
   "role",
   "readiness",
+  "reason",
   "run-id",
   "gate",
   "stage",
   "upstream",
 ]);
 const COMMAND_FLAGS: Record<string, Set<string>> = {
+  abandon: new Set(["repo", "run-id", "reason"]),
   attestation: new Set(["out", "repo"]),
   gate: new Set(["admission-id", "gate", "launch-nonce", "readiness", "run-id"]),
   init: new Set(["base-branch", "fork", "head-branch", "repo", "upstream"]),
@@ -16328,6 +16330,7 @@ export async function main(argv: string[]): Promise<void> {
   orca-no-mistakes attestation verify <manifest-file|run-id|commit-sha> [--repo <path>]
   orca-no-mistakes prune [--before <date>] [--repo <path>]
   orca-no-mistakes prune --stranded [--repo <path>]
+  orca-no-mistakes abandon --run-id <id> --reason <text> [--repo <path>]
   orca-no-mistakes evaluation <seed|capture|list|replay|adjudicate|compare|prune> (docs/review-evaluation.md)
 
 Run options:
@@ -16362,6 +16365,19 @@ Completion and recovery:
     return;
   }
   const parsed = parseCli(argv);
+  if (parsed.command === "abandon") {
+    const runId = stringFlag(parsed.flags, "run-id");
+    const reason = stringFlag(parsed.flags, "reason");
+    if (!runId || !reason?.trim()) throw new Error("abandon requires --run-id and --reason");
+    const ledger = openRepositoryLedger(stringFlag(parsed.flags, "repo") ?? process.cwd());
+    try {
+      ledger.abandonRun({ runId, reason, actorIdentity: `local-operator:${process.pid}` });
+      console.log(JSON.stringify({ runId, status: "cancelled", evidenceRetained: true }));
+    } finally {
+      ledger.close();
+    }
+    return;
+  }
   if (parsed.command === "init") {
     await runInitCommand(parsed.flags);
     return;

@@ -142,6 +142,7 @@ orca-no-mistakes attestation export <run-id-or-commit-sha> [--out manifest.json]
 orca-no-mistakes attestation verify <manifest-file|run-id|commit-sha> [--repo <path>]
 orca-no-mistakes prune [--before <date>] [--repo <path>]
 orca-no-mistakes prune --stranded [--repo <path>]
+orca-no-mistakes abandon --run-id <id> --reason <text> [--repo <path>]
 ```
 
 Run metadata lives in `<git-common-dir>/orca-no-mistakes/ledger.sqlite`; stage and remote artifacts live in `<artifact-home>/artifacts/<run-id>/`, where `<artifact-home>` is `ORCA_NO_MISTAKES_HOME` or, by default, `~/.orca-no-mistakes`. `--repo` selects the repository ledger explicitly.
@@ -153,6 +154,8 @@ Evidence remains until explicitly pruned. Ordinary `prune` deletes eligible term
 Prune locates artifacts under the current artifact home. Use the same `ORCA_NO_MISTAKES_HOME` setting that created them; changing it does not relocate existing evidence or rewrite recorded artifact paths.
 
 `prune --stranded` recovers resources whose coordinator is proven dead; it cannot be combined with `--before`. It preserves the recorded HEAD, reaps owned workers, and releases the lease. Gate recovery removes owned gate resources; direct-run recovery leaves the operator's checkout and branch intact. Uncertain liveness or ownership keeps resources for diagnosis.
+
+`abandon` explicitly ends a failed or orphaned run's resumability while retaining its evidence, attempt outcomes, artifacts, and Git refs. Run it on the machine that ran the coordinator: it requires the latest recorded coordinator PID to be absent, rejects pending resume claims and unrecorded lease generations, records the reason, marks the run cancelled, and releases only its lease. It does not remove worktrees or stop workers; use stranded recovery for those resources. This also removes that run's publication-route dependency. The route blocker counts retained in-progress and resumable failed records, not live processes.
 
 ## Development
 
