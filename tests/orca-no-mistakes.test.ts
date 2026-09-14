@@ -789,7 +789,7 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
   assert.match(
     orca.tasks.find((task) => task.spec.startsWith("[review fix 1]"))?.spec ??
       "",
-    /implementation source code and new regression test files only/,
+    /implementation source code, documentation files and comments, and new regression test files only/,
   );
   assert.match(
     orca.tasks.find((task) => task.spec.startsWith("[lint fix 1]"))?.spec ?? "",
