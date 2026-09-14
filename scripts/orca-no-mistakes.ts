@@ -16380,6 +16380,44 @@ Completion and recovery:
     const repo = stringFlag(parsed.flags, "repo");
     const ledger = openRepositoryLedger(repo ?? process.cwd(), repo === undefined);
     try {
+      const run = ledger.runIdentity(runId);
+      if (run) {
+        const markersDir = path.join(run.repo_root, ".orca", "no-mistakes");
+        let names: string[];
+        try {
+          names = await readdir(markersDir);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          names = [];
+        }
+        for (const name of names) {
+          if (!name.startsWith("gate-") || !name.endsWith(".json")) continue;
+          let parsedMarker: unknown;
+          try {
+            parsedMarker = JSON.parse(await readFile(path.join(markersDir, name), "utf8"));
+          } catch {
+            continue;
+          }
+          if (typeof parsedMarker !== "object" || parsedMarker === null) continue;
+          const marker = parsedMarker as {
+            domainRunId?: unknown;
+            gate?: { kind?: unknown; runId?: unknown };
+            runId?: unknown;
+          };
+          const markerRunId = typeof marker.domainRunId === "string"
+            ? marker.domainRunId
+            : typeof marker.runId === "string"
+              ? marker.runId
+              : marker.gate?.kind === "configured" && typeof marker.gate.runId === "string"
+                ? marker.gate.runId
+                : undefined;
+          if (markerRunId === runId) {
+            throw new Error(
+              `run ${runId} still has marker-owned resources; run prune --stranded before abandon`,
+            );
+          }
+        }
+      }
       ledger.abandonRun({ runId, reason, actorIdentity: `local-operator:${process.pid}` });
       console.log(JSON.stringify({ runId, status: "cancelled", evidenceRetained: true }));
     } finally {

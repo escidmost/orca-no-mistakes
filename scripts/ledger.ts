@@ -3391,7 +3391,7 @@ export class DomainLedger {
       ) as { count: number }
       if (active.count > 0) {
         throw new Error(
-          `cannot change publication route while ${active.count} active or resumable run(s) depend on it; this counts retained ledger state, not live processes. Use abandon --run-id <id> --reason <text> to close out a dead local run without deleting evidence`
+          `cannot change publication route while ${active.count} active or resumable run(s) depend on it; this counts retained ledger state, not live processes. Run prune --stranded first to clean marker-owned resources, then use abandon --run-id <id> --reason <text> to close out any remaining dead local run without deleting evidence`
         )
       }
     }
