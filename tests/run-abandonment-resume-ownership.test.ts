@@ -126,3 +126,44 @@ test('resume activation rejects a different coordinator identity', (t) => {
   assert.throws(() => resume(claim, `no-mistakes:${process.pid}`), /belongs to another coordinator/)
   assert.equal(ledger.runStatus('run'), 'failed')
 })
+
+test('resume preparation preserves live and uncertain claims and permits same-owner re-preparation', (t) => {
+  const { db, prepare, resume } = fixture(t)
+  const live = `no-mistakes:${process.pid}`
+  prepare(live)
+  const claim = prepare(live)
+  const before = db.prepare('SELECT * FROM resume_claims').get()
+  const owner = db.prepare('SELECT * FROM resume_claim_owners').get()
+  assert.throws(() => prepare(deadCoordinator), /still present/)
+  const probe = t.mock.method(process, 'kill', () => {
+    throw Object.assign(new Error('permission denied'), { code: 'EPERM' })
+  })
+  assert.throws(() => prepare(deadCoordinator), /permission denied/)
+  probe.mock.restore()
+  assert.deepEqual(db.prepare('SELECT * FROM resume_claims').get(), before)
+  assert.deepEqual(db.prepare('SELECT * FROM resume_claim_owners').get(), owner)
+  resume(claim, live)
+})
+
+test('resume preparation replaces only a provably dead owner and fences the old claim', (t) => {
+  const { ledger, prepare, resume } = fixture(t)
+  const old = prepare(deadCoordinator)
+  const live = `no-mistakes:${process.pid}`
+  const replacement = prepare(live)
+  assert.ok(replacement.generationToken > old.generationToken)
+  assert.throws(() => resume(old, deadCoordinator), /no matching resume claim/)
+  resume(replacement, live)
+  assert.equal(ledger.runStatus('run'), 'in-progress')
+})
+
+test('resume preparation refuses missing or mismatched pending ownership', (t) => {
+  const { db, prepare } = fixture(t)
+  prepare(deadCoordinator)
+  db.exec('UPDATE resume_claim_owners SET generation_token = generation_token + 1')
+  const before = db.prepare('SELECT * FROM resume_claims').get()
+  assert.throws(() => prepare(`no-mistakes:${process.pid}`), /no verifiable local coordinator PID/)
+  assert.deepEqual(db.prepare('SELECT * FROM resume_claims').get(), before)
+  db.exec('DELETE FROM resume_claim_owners')
+  assert.throws(() => prepare(`no-mistakes:${process.pid}`), /no verifiable local coordinator PID/)
+  assert.deepEqual(db.prepare('SELECT * FROM resume_claims').get(), before)
+})

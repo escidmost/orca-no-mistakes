@@ -12,7 +12,7 @@ import { main } from '../scripts/orca-no-mistakes.ts'
 const commit = 'a'.repeat(40)
 const policy = 'b'.repeat(64)
 
-test('abandon reports unreadable markers skipped by its precheck', async (t) => {
+test('abandon fails closed on marker inspection errors but permits parsed nonmatching markers', async (t) => {
   const root = realpathSync(mkdtempSync(path.join(tmpdir(), 'onm-abandon-unreadable-')))
   t.after(() => rmSync(root, { recursive: true, force: true }))
   execFileSync('git', ['init', '--quiet', root])
@@ -29,19 +29,24 @@ test('abandon reports unreadable markers skipped by its precheck', async (t) => 
 
   const markersDir = path.join(root, '.orca', 'no-mistakes')
   mkdirSync(markersDir, { recursive: true })
-  writeFileSync(path.join(markersDir, 'gate-broken.json'), '{')
-  const warnings: string[] = []
-  const originalConsoleError = console.error
-  console.error = (...args: unknown[]) => warnings.push(args.map(String).join(' '))
-  try {
-    await main(['abandon', '--repo', root, '--run-id', 'run', '--reason', 'Close dead run'])
-  } finally {
-    console.error = originalConsoleError
+  const markerPath = path.join(markersDir, 'gate-broken.json')
+  const abandon = () => main(['abandon', '--repo', root, '--run-id', 'run', '--reason', 'Close dead run'])
+  const db = new DatabaseSync(path.join(root, '.git', 'orca-no-mistakes', 'ledger.sqlite'))
+  t.after(() => db.close())
+  const beforeRun = db.prepare('SELECT * FROM runs').get()
+  const beforeLease = db.prepare('SELECT * FROM branch_leases').get()
+  for (const failure of ['parse', 'read']) {
+    if (failure === 'parse') writeFileSync(markerPath, '{')
+    else mkdirSync(markerPath)
+    await assert.rejects(abandon, /marker gate-broken.json could not be read or parsed/)
+    assert.deepEqual(db.prepare('SELECT * FROM runs').get(), beforeRun)
+    assert.deepEqual(db.prepare('SELECT * FROM branch_leases').get(), beforeLease)
+    assert.equal(db.prepare('SELECT COUNT(*) AS count FROM run_abandonments').get()?.count, 0)
+    rmSync(markerPath, { recursive: true })
   }
-
-  assert.deepEqual(warnings, [
-    'no-mistakes: skipped gate-broken.json during abandon precheck; its marker is unreadable',
-  ])
+  writeFileSync(markerPath, 'null')
+  writeFileSync(path.join(markersDir, 'gate-other.json'), JSON.stringify({ runId: 'another-run' }))
+  await abandon()
   const reopened = new DomainLedger({ repositoryPath: root })
   assert.equal(reopened.runStatus('run'), 'cancelled')
   reopened.close()

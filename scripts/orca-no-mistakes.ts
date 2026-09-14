@@ -16394,11 +16394,11 @@ Completion and recovery:
           let parsedMarker: unknown;
           try {
             parsedMarker = JSON.parse(await readFile(path.join(markersDir, name), "utf8"));
-          } catch {
-            console.error(
-              `no-mistakes: skipped ${name} during abandon precheck; its marker is unreadable`,
+          } catch (error) {
+            throw new Error(
+              `cannot abandon run ${runId}: marker ${name} could not be read or parsed`,
+              { cause: error },
             );
-            continue;
           }
           if (typeof parsedMarker !== "object" || parsedMarker === null) continue;
           const marker = parsedMarker as {

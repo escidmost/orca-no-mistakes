@@ -4489,6 +4489,20 @@ export class DomainLedger {
       | undefined
   }
 
+  #assertCoordinatorDead(runId: string, coordinatorIdentity: string): void {
+    const pid = Number(/^no-mistakes:([1-9]\d*)$/.exec(coordinatorIdentity)?.[1])
+    if (!Number.isSafeInteger(pid) || pid > 2_147_483_647) {
+      throw new Error(`run ${runId} has no verifiable local coordinator PID`)
+    }
+    // PID absence proves death; permission errors and PID reuse remain uncertain.
+    try {
+      process.kill(pid, 0)
+      throw new Error(`run ${runId} coordinator PID ${pid} is still present`)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+    }
+  }
+
   prepareResume(input: {
     baseBranch: string
     baseRefSha?: string
@@ -4510,6 +4524,16 @@ export class DomainLedger {
     this.#db.exec('BEGIN IMMEDIATE')
     try {
       const checkpoint = this.#validateResume(input)
+      const pending = this.#db.prepare(
+        `SELECT o.coordinator_identity FROM resume_claims c
+         LEFT JOIN resume_claim_owners o
+           ON o.run_id = c.run_id AND o.claim_id = c.claim_id
+             AND o.generation_token = c.generation_token
+         WHERE c.run_id = ?`
+      ).get(input.runId) as { coordinator_identity: string | null } | undefined
+      if (pending && pending.coordinator_identity !== coordinatorIdentity) {
+        this.#assertCoordinatorDead(input.runId, pending.coordinator_identity ?? '')
+      }
       const existing = this.leaseFor(input.repoRoot, input.branch)
       if (existing && existing.run_id !== input.runId && !input.force) {
         throw new Error(
@@ -4934,18 +4958,8 @@ export class DomainLedger {
         coordinatorIdentity = attempt?.coordinator_identity ?? initial.initial_coordinator_identity ?? ''
         generationToken = attempt?.generation_token ?? 0
       }
-      const pid = Number(/^no-mistakes:([1-9]\d*)$/.exec(coordinatorIdentity)?.[1])
-      if (!Number.isSafeInteger(pid) || pid > 2_147_483_647) {
-        throw new Error(`run ${input.runId} has no verifiable local coordinator PID`)
-      }
-      // PID absence proves death; permission errors and PID reuse remain uncertain.
       // The write lock prevents resume from racing this check and cancellation.
-      try {
-        process.kill(pid, 0)
-        throw new Error(`run ${input.runId} coordinator PID ${pid} is still present`)
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
-      }
+      this.#assertCoordinatorDead(input.runId, coordinatorIdentity)
       const abandonedAt = new Date().toISOString()
       this.#db.prepare(
         `INSERT INTO run_abandonments
