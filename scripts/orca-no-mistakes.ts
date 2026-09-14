@@ -9767,13 +9767,12 @@ export class CliOrca implements OrcaOperations {
     source: symbol,
     exhaustive = false,
   ): Promise<void> {
-    // Timer-driven and wait-driven drains overlap. A periodic drain skips when
-    // one is already running -- it would only repeat work, and queueing every
-    // tick behind a slow read builds an unbounded backlog. Finalization must
-    // not skip, so it waits its turn instead.
+    // Overlapping live drains share the current work, so heartbeat callers
+    // wait for durable output without queueing another read. Finalization
+    // waits and then drains the remaining tail.
     const inflight = this.#draining.get(terminalHandle);
     if (inflight) {
-      if (!exhaustive) return;
+      if (!exhaustive) return inflight;
       await inflight.catch(() => {});
     }
     const run = this.#drainNow(terminalHandle, log, source, exhaustive);

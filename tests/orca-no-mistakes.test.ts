@@ -9127,7 +9127,16 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
   // last line may still be being written. Capture has to page from
   // oldestCursor instead of persisting it.
   if (cursor === undefined) out({ terminal: { tail: ['done'], oldestCursor: 0, nextCursor: 3, latestCursor: 3 } })
-  else if (cursor === '0') out({ terminal: { tail: ['npm test', 'ok 12 passed'], nextCursor: 2, latestCursor: 3 } })
+  else if (cursor === '0') {
+    // Hold the timer-driven read until the heartbeat overlaps it.
+    const deadline = Date.now() + 10000
+    while (!fs.existsSync(${JSON.stringify(heartbeatCountPath)})) {
+      if (Date.now() >= deadline) throw new Error('heartbeat never arrived')
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    await new Promise(resolve => setTimeout(resolve, 200))
+    out({ terminal: { tail: ['npm test', 'ok 12 passed'], nextCursor: 2, latestCursor: 3 } })
+  }
   else if (cursor === '2') out({ terminal: { tail: ['done'], nextCursor: 3, latestCursor: 3 } })
   else out({ terminal: { tail: [], nextCursor: Number(cursor), latestCursor: Number(cursor) } })
 } else if (args[0] === 'terminal' && args[1] === 'show') {

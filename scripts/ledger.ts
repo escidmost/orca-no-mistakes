@@ -2310,8 +2310,9 @@ export class DomainLedger {
       mkdirSync(path.dirname(dbPath), { recursive: true })
     }
     this.#path = dbPath
-    this.#db = new DatabaseSync(dbPath, { timeout: 5_000 })
-    const walDeadline = Date.now() + 5_000
+    // Concurrent first opens may wait behind a full legacy import.
+    this.#db = new DatabaseSync(dbPath, { timeout: 30_000 })
+    const walDeadline = Date.now() + 30_000
     const walWait = new Int32Array(new SharedArrayBuffer(4))
     for (;;) {
       try {
@@ -2582,6 +2583,7 @@ export class DomainLedger {
     if (resolved.repoRoot && resolved.legacyPath && path.resolve(resolved.legacyPath) !== path.resolve(dbPath)) {
       this.#migrateLegacyRepository(resolved.repoRoot, resolved.legacyPath)
     }
+    this.#db.exec('PRAGMA busy_timeout = 5000')
   }
 
   #migrateLegacyRepository(repoRoot: string, sourcePath: string): void {
