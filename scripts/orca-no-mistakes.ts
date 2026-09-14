@@ -6741,6 +6741,9 @@ function fixerScope(stage: StageName): string {
   if (stage === "document") {
     return "Limit changes to documentation files and documentation comments only.";
   }
+  if (stage === "review") {
+    return "Limit changes to implementation source code, documentation files and comments, and new regression test files only.";
+  }
   return "Limit changes to implementation source code and new regression test files only.";
 }
 

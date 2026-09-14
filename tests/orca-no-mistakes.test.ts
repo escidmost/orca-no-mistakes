@@ -12939,6 +12939,32 @@ test("exhaustion gate decisions replace the pending event without duplicating it
   assert.ok(audits[0].resolved_at);
 });
 
+test("review fixers may repair documentation without broadening document-stage scope", async () => {
+  for (const stage of ["review", "document"] as const) {
+    const git = new FakeGit();
+    const orca = new FakeOrca(git);
+    const ledger = new DomainLedger(":memory:");
+    orca.gateResolution = "fix";
+    orca.reports.set(stage, [
+      { findings: [{ id: "stale-doc", severity: "warning", action: "ask-user",
+        description: "Correct the documented behavior in README.md." }], summary: "stale documentation" },
+      pass("documentation corrected"),
+    ]);
+    try {
+      await runPipeline({ intent: "Keep documentation accurate." }, orca, git, ledger);
+      const prompt = orca.launches.find(launch => launch.role === "fixer" && launch.stage === stage)?.prompt;
+      assert.ok(prompt, `expected a ${stage} fixer dispatch`);
+      assert.match(prompt, stage === "review"
+        ? /Limit changes to implementation source code, documentation files and comments, and new regression test files only\./
+        : /Limit changes to documentation files and documentation comments only\./);
+      assert.match(prompt, /Do NOT modify or delete pre-existing test files/);
+      assert.match(prompt, /or coordinator prompt templates\./);
+    } finally {
+      ledger.close();
+    }
+  }
+});
+
 test("declined findings reach later steps in the same run", async () => {
   const git = new FakeGit();
   const orca = new FakeOrca(git);

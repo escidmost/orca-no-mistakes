@@ -57,7 +57,7 @@ The immutable per-run identity of the forge, stable base and head repositories, 
 _Avoid_: Origin, current remotes, push URL
 
 **Repository publication route**:
-The shared, mutable publication route configured for a repository and bound to its authenticated actor, forge, stable repository identities, and credential-free transport. A publication run snapshots it with its own head and base branches as an immutable per-run Publication route.
+The mutable publication route keyed by the repository's Git common directory, shared by every worktree, and bound to its authenticated actor, forge, stable repository identities, and credential-free transport. A publication run snapshots it with its own head and base branches as an immutable per-run Publication route; repository identity changes are blocked while active or resumable runs depend on the existing route.
 _Avoid_: Per-run route, origin, ambient remote
 
 **Publication head ref**:
@@ -202,6 +202,7 @@ _Avoid_: Passed, signature, live-status certificate
 
 **Passed attestation**:
 A pipeline completion attestation carrying the target `Passed` assurance claim and binding its required evidence to the candidate and delivered commits.
+The current pipeline does not produce one.
 _Avoid_: Any passed-verdict attestation, signature, badge
 
 **Reconciliation snapshot**:
