@@ -10,7 +10,7 @@ Drive the implemented `orca-no-mistakes` CLI. It runs the nine core validation a
 
 `intent -> rebase -> review -> test -> document -> lint -> push -> pr -> ci`
 
-The default Release 2 run validates candidate changes, publishes them to GitHub, publishes the owned title/body report, notifies the origin of readiness, then monitors CI checks and mergeability while the pull request is open, and upgrades the receipt to merged only after an authoritative matching MERGED observation. Success produces a v2 completion attestation manifest (`completionAttestation`) bound to the validated commit. Migrated Release 1 runs preserve their six local validation stages without remote publication.
+The run validates candidate changes, publishes them to GitHub, publishes the owned title/body report, and notifies the originating session of readiness. It then monitors CI checks and mergeability until an authoritative matching MERGED observation upgrades the receipt. Success produces a completion attestation manifest (`completionAttestation`) bound to the validated commit.
 
 If your assigned task explicitly says you are already a no-mistakes stage worker, complete only that stage and return its structured report. Do not start a nested pipeline.
 
@@ -19,13 +19,13 @@ If your assigned task explicitly says you are already a no-mistakes stage worker
 - Work is committed on a clean, named feature branch.
 - The branch is not the detected default branch.
 - The repository has an `origin` remote.
-- For new Release 2 runs, the repository has one successful `orca-no-mistakes init` (shared by every worktree and branch) with a persisted GitHub publication route whose forge, stable base/head repository identities, owner, identity fingerprint, and canonical transport match the run, and the GitHub CLI (`gh`) is installed with configured authentication (`GH_TOKEN`, `GITHUB_TOKEN`, or stored `gh` account). Migrated Release 1 resumes do not require GitHub publication initialization or credentials.
-- Orca is running and CLI tooling for the configured worker agents (`opencode` by default) is authenticated.
+- The repository has one successful `orca-no-mistakes init` (shared by every worktree and branch) with a persisted GitHub publication route whose forge, stable base/head repository identities, owner, identity fingerprint, and canonical transport match the run. The GitHub CLI (`gh`) is installed with configured authentication (`GH_TOKEN`, `GITHUB_TOKEN`, or stored `gh` account), and Git push authentication works.
+- Orca is running and CLI tooling for the configured worker agents is authenticated. The installed template selects `claude`; the runner falls back to `opencode` if no agent is configured.
 - No other run holds the branch semantic lease. A conflicting run fails closed with `branch <name> is already leased by run <id>`; reclaim it with `--force-lease` only after confirming the other run is dead.
 
 ## Invocation
 
-New Release 2 direct runs are rejected unless this repository has a successful init and a persisted GitHub publication route matching the run's immutable forge, repository, owner, and transport identity. Run `orca-no-mistakes init --repo /path/to/repo` once per repository to install repository-local admission and persist the publication route; new worktrees and branches need no further init; follow the [Local gate](../../README.md#local-gate) workflow.
+Run `orca-no-mistakes init --repo /path/to/repo` once per repository to install repository-local admission and persist the publication route. New worktrees and branches need no further init; follow the [Local gate](../../README.md#local-gate) workflow.
 
 For a bare `/orca-no-mistakes`, validate the user's already-committed changes. For `/orca-no-mistakes <task>`, complete and commit only that task first, preserving unrelated work, then validate it.
 
@@ -40,7 +40,7 @@ A newly admitted direct run launches detached in a dedicated Orca terminal and r
 
 Use `--resume` only for a failed run whose clean initiating checkout is still at its original submission commit. Detached resume reconstructs the isolated gate worktree at the last durable checkpoint, retains the original evidence and resolved gate decisions, and runs only the stages that still need validation. Keeping the initiating checkout at the submission commit lets successful custody transfer advance it automatically.
 
-Available direct-run controls are `--base`, `--head`, `--force-lease`, `--notify`, `--resume`, `--tui`, `--no-tui`, `--reviewer-model`, `--fixer-model`, `--fixer-effort`, and `--max-fix-rounds`. `--no-tui` emits bounded semantic progress on stderr while attached stdout remains reserved for the final JSON result. Workers launch with the `opencode` agent without a model or effort override by default; the model and effort flags set explicit overrides. The default maximum is 3 automated fix rounds, after which an exhaustion gate opens.
+Available direct-run controls are `--base`, `--head`, `--force-lease`, `--notify`, `--resume`, `--tui`, `--no-tui`, `--reviewer-model`, `--fixer-model`, `--fixer-effort`, and `--max-fix-rounds`. `--no-tui` emits bounded semantic progress on stderr while attached stdout remains reserved for the final JSON result. Workers use their configured agent's model and effort defaults unless explicitly overridden. The default maximum is 3 automated fix rounds, after which an exhaustion gate opens.
 
 ## Gates
 
@@ -62,16 +62,10 @@ Approving or skipping a stage records the decision in the domain ledger's gate a
 
 ## Result
 
-For Release 2 runs, direct success prints JSON containing the completion attestation manifest under `completionAttestation`:
+The attached coordinator prints JSON on success, including the completion attestation under `completionAttestation`. Detached callers receive the outcome through Orca notifications. This abbreviated example shows a run without additional command gates; `version` identifies the manifest schema:
 
 ```json
 {"runId":"<orca-run-id>","steps":["intent","rebase","review","test","document","lint","push","pr","ci"],"verdict":"passed","custodyNote":"...","completionAttestation":{"version":"2.0.0","assuranceClaims":["configured-pipeline-completed","candidate-publication-verified","pull-request-bound"],"merkleRoot":"..."}}
-```
-
-For migrated Release 1 resumes, direct success prints JSON returning the frozen six-stage plan and the v1.3 manifest under `attestation`:
-
-```json
-{"runId":"<orca-run-id>","steps":["intent","rebase","review","test","document","lint"],"verdict":"passed","custodyNote":"...","attestation":{"version":"1.3.0","merkleRoot":"..."}}
 ```
 
 Export and verify attestations, and prune retained evidence:
@@ -81,7 +75,10 @@ orca-no-mistakes attestation export <run-id-or-commit-sha> [--out manifest.json]
 orca-no-mistakes attestation verify <manifest-file|run-id|commit-sha> [--repo <path>]
 orca-no-mistakes prune [--before <date>] [--repo <path>]
 orca-no-mistakes prune --stranded [--repo <path>]
+orca-no-mistakes abandon --run-id <id> --reason <text> [--repo <path>]
 ```
+
+Run `abandon` only on the coordinator's machine after coordinator death is proven. It refuses while a direct-run or gate marker remains and retains all evidence.
 
 `prune --stranded` reaps gate or direct-run resources only when their owning coordinator is proven gone. It first anchors the recorded HEAD at `refs/no-mistakes/recover/<run-id>` and retains the marker if ownership or preservation cannot be verified; direct recovery never removes the operator checkout or branch.
 

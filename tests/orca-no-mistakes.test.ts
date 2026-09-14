@@ -789,7 +789,7 @@ test("runs the six-stage local adversarial pipeline with fixes, gates, and isola
   assert.match(
     orca.tasks.find((task) => task.spec.startsWith("[review fix 1]"))?.spec ??
       "",
-    /implementation source code and new regression test files only/,
+    /implementation source code, documentation files and comments, and new regression test files only/,
   );
   assert.match(
     orca.tasks.find((task) => task.spec.startsWith("[lint fix 1]"))?.spec ?? "",
@@ -9127,7 +9127,16 @@ if (args[0] === 'orchestration' && args[1] === 'run-create') {
   // last line may still be being written. Capture has to page from
   // oldestCursor instead of persisting it.
   if (cursor === undefined) out({ terminal: { tail: ['done'], oldestCursor: 0, nextCursor: 3, latestCursor: 3 } })
-  else if (cursor === '0') out({ terminal: { tail: ['npm test', 'ok 12 passed'], nextCursor: 2, latestCursor: 3 } })
+  else if (cursor === '0') {
+    // Hold the timer-driven read until the heartbeat overlaps it.
+    const deadline = Date.now() + 10000
+    while (!fs.existsSync(${JSON.stringify(heartbeatCountPath)})) {
+      if (Date.now() >= deadline) throw new Error('heartbeat never arrived')
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    await new Promise(resolve => setTimeout(resolve, 200))
+    out({ terminal: { tail: ['npm test', 'ok 12 passed'], nextCursor: 2, latestCursor: 3 } })
+  }
   else if (cursor === '2') out({ terminal: { tail: ['done'], nextCursor: 3, latestCursor: 3 } })
   else out({ terminal: { tail: [], nextCursor: Number(cursor), latestCursor: Number(cursor) } })
 } else if (args[0] === 'terminal' && args[1] === 'show') {
@@ -12937,6 +12946,32 @@ test("exhaustion gate decisions replace the pending event without duplicating it
   assert.equal(audits[0].guidance, "try alternative fix");
   assert.equal(audits[0].selected_finding_ids, '["persistent"]');
   assert.ok(audits[0].resolved_at);
+});
+
+test("review fixers may repair documentation without broadening document-stage scope", async () => {
+  for (const stage of ["review", "document"] as const) {
+    const git = new FakeGit();
+    const orca = new FakeOrca(git);
+    const ledger = new DomainLedger(":memory:");
+    orca.gateResolution = "fix";
+    orca.reports.set(stage, [
+      { findings: [{ id: "stale-doc", severity: "warning", action: "ask-user",
+        description: "Correct the documented behavior in README.md." }], summary: "stale documentation" },
+      pass("documentation corrected"),
+    ]);
+    try {
+      await runPipeline({ intent: "Keep documentation accurate." }, orca, git, ledger);
+      const prompt = orca.launches.find(launch => launch.role === "fixer" && launch.stage === stage)?.prompt;
+      assert.ok(prompt, `expected a ${stage} fixer dispatch`);
+      assert.match(prompt, stage === "review"
+        ? /Limit changes to implementation source code, documentation files and comments, and new regression test files only\./
+        : /Limit changes to documentation files and documentation comments only\./);
+      assert.match(prompt, /Do NOT modify or delete pre-existing test files/);
+      assert.match(prompt, /or coordinator prompt templates\./);
+    } finally {
+      ledger.close();
+    }
+  }
 });
 
 test("declined findings reach later steps in the same run", async () => {

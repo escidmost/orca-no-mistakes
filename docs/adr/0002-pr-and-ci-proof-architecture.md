@@ -2,7 +2,7 @@
 status: accepted
 date: 2026-08-20
 scope: target architecture
-implementation: partially implemented (Release 2; merge-state waiting and CI monitoring implemented, check completeness, branch-protection, and delivered-tree proof pending)
+implementation: partially implemented (merge-state waiting and CI monitoring implemented; check completeness, branch-protection, and delivered-tree proof pending)
 ---
 
 # PR and CI Proof Architecture
@@ -19,7 +19,7 @@ The target pipeline separates deterministic GitHub and Git object proof from adv
 
 ## Status update (2026-09-06)
 
-[ADR-0016](0016-ci-stage-monitoring-and-merge-settlement.md) implements CI monitoring as a ninth `ci` stage that polls the exact candidate's check rollup and merge state; check-set completeness, guarded merge, and delivered-tree proof remain Release 3.
+[ADR-0016](0016-ci-stage-monitoring-and-merge-settlement.md) implements CI monitoring as a ninth `ci` stage that polls the exact candidate's check rollup and merge state; check-set completeness, guarded merge, and delivered-tree proof remain planned.
 
 ## Consequences
 

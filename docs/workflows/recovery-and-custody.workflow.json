@@ -1,0 +1,41 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": { "title": "Resume a failed run and recover its work", "locale": "en", "quality_profile": "showcase" },
+  "lanes": [
+    { "id": "resume-attempt", "label": "Explicit failed-run resume" },
+    { "id": "return-custody", "label": "Successful custody return" },
+    { "id": "stranded-resources", "label": "Crash cleanup / manual recovery", "variant": "exception" }
+  ],
+  "mainPath": ["failed-checkpoint", "request-resume", "restore-attempt", "continue-plan", "anchor-result", "inspect-checkout", "advance-checkout"],
+  "nodes": [
+    { "id": "failed-checkpoint", "lane": "resume-attempt", "col": 0, "type": "database", "label": "Failed run", "sublabel": "Durable checkpoint" },
+    { "id": "request-resume", "lane": "resume-attempt", "col": 1, "type": "frontend", "label": "Request resume", "sublabel": "run --resume <run-id>", "width": 124 },
+    { "id": "restore-attempt", "lane": "resume-attempt", "col": 2, "type": "backend", "label": "Restore attempt", "sublabel": "Checkpoint + new lease", "width": 124 },
+    { "id": "continue-plan", "lane": "resume-attempt", "col": 3, "type": "backend", "label": "Continue plan", "sublabel": "Reuse only valid evidence", "width": 124 },
+    { "id": "anchor-result", "lane": "return-custody", "col": 3, "type": "database", "label": "Anchor terminal HEAD", "sublabel": "Preserve recovery ref", "width": 160 },
+    { "id": "inspect-checkout", "lane": "return-custody", "col": 4, "type": "security", "label": "Check initiating tree", "sublabel": "Clean at submitted HEAD?", "width": 164 },
+    { "id": "advance-checkout", "lane": "return-custody", "col": 5, "type": "frontend", "label": "Fast-forward", "sublabel": "Return validated commits", "width": 124 },
+    { "id": "preserve-checkout", "lane": "stranded-resources", "col": 4, "type": "frontend", "label": "Leave checkout intact", "sublabel": "Return recovery instructions", "width": 164 },
+    { "id": "abandoned-coordinator", "lane": "stranded-resources", "col": 0, "type": "security", "label": "Coordinator died", "sublabel": "May remain in-progress", "width": 128 },
+    { "id": "prune-stranded", "lane": "stranded-resources", "col": 1, "type": "backend", "label": "prune --stranded", "sublabel": "Prove death + ownership", "width": 128 },
+    { "id": "recover-resources", "lane": "stranded-resources", "col": 2, "type": "database", "label": "Preserve and reap", "sublabel": "Anchor, clean, release lease", "width": 136 }
+  ],
+  "edges": [
+    { "id": "operator-resumes", "from": "failed-checkpoint", "to": "request-resume", "role": "main" },
+    { "id": "resume-reconstructs", "from": "request-resume", "to": "restore-attempt", "role": "main" },
+    { "id": "restore-continues", "from": "restore-attempt", "to": "continue-plan", "role": "main" },
+    { "id": "success-anchors", "from": "continue-plan", "to": "anchor-result", "role": "main", "label": "pipeline succeeds", "toSide": "top" },
+    { "id": "anchor-before-transfer", "from": "anchor-result", "to": "inspect-checkout", "role": "main" },
+    { "id": "clean-transfer", "from": "inspect-checkout", "to": "advance-checkout", "role": "main", "label": "yes" },
+    { "id": "changed-checkout", "from": "inspect-checkout", "to": "preserve-checkout", "role": "branch", "label": "dirty or diverged" },
+    { "id": "cleanup-request", "from": "abandoned-coordinator", "to": "prune-stranded", "role": "branch", "label": "operator invokes" },
+    { "id": "owned-cleanup", "from": "prune-stranded", "to": "recover-resources", "role": "branch", "label": "proven safe" }
+  ],
+  "semanticChecks": { "allowedRoots": ["failed-checkpoint", "abandoned-coordinator"], "allowedTerminals": ["advance-checkout", "preserve-checkout", "recover-resources"] },
+  "cards": [
+    { "dot": "cyan", "title": "Same run, new attempt", "items": ["Keep the clean initiating checkout at the submission commit.", "Retain the run ID, frozen plan, and evidence history.", "The TUI also offers Resume after an eligible attempt settles."] },
+    { "dot": "emerald", "title": "Preserve before transfer", "items": ["Recovery ref: refs/no-mistakes/recover/<run-id>.", "Success records custody alongside the completion attestation.", "Changed checkouts remain under the operator's control."] },
+    { "dot": "rose", "title": "Cleanup is not crash adoption", "items": ["Abandoned in-progress runs are not automatically resumed.", "Uncertain liveness or ownership retains resources.", "Direct-run cleanup never removes the operator's checkout."] }
+  ]
+}

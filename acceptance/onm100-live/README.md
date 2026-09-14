@@ -1,6 +1,6 @@
-# ONM-100 disposable live acceptance
+# ONM-100 historical live acceptance fixture
 
-This branch is a controlled CI-repair fixture. **Never merge it.**
+This directory retains the controlled CI-repair fixture used for ONM-100. The procedure below applies to its dedicated disposable branch and pinned external runner, not an ordinary run from this checkout. Fixture PRs must be closed after evidence collection rather than merged.
 
 The initial `total.mjs` deliberately adds a unit price and quantity. Running
 `node acceptance/onm100-live/total.mjs` initially prints `5`. The real GitHub
@@ -13,8 +13,8 @@ Publishing the fixture from any other head branch skips the `exact-total` job,
 so the intended failure and repair gate never appear. Publish from that exact
 branch name; do not relax the workflow restriction to work around it.
 
-This checkout is only the disposable fixture; it supplies no repair capability.
-Its own `ci` gate `fix` resolution merely resumes monitoring after external
+The fixture supplies no repair capability. This package's `ci` gate `fix`
+resolution merely resumes monitoring after external
 action (see the repository-root `README.md` and `docs/current-architecture.md`),
 so the drill requires an external runner: `.orca/workspaces/onm-100-integrate-ci-review-feedback-and-guarded/bin/orca-no-mistakes`
 at revision `0f280639e5135265c8f436f5759e4a613af35aa9`, launched with `--repo`

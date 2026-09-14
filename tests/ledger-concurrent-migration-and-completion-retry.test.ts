@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
-import { execFile, execFileSync } from 'node:child_process'
+import { execFile, execFileSync, spawn } from 'node:child_process'
+import { once } from 'node:events'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -82,6 +83,33 @@ test('concurrent first opens converge on one repository migration', async () => 
     )
     repository.close()
   } finally {
+    await rm(temp, { recursive: true, force: true })
+  }
+})
+
+test('ledger initialization waits beyond the normal operation lock budget', async () => {
+  const temp = await mkdtemp(path.join(tmpdir(), 'onm-initialization-lock-'))
+  const dbPath = path.join(temp, 'ledger.sqlite')
+  new DomainLedger(dbPath).close()
+  const holder = spawn(process.execPath, ['--input-type=module', '-e', `
+    import { DatabaseSync } from 'node:sqlite';
+    const db = new DatabaseSync(${JSON.stringify(dbPath)});
+    db.exec('BEGIN IMMEDIATE');
+    process.stdout.write('locked');
+    setTimeout(() => { db.exec('COMMIT'); db.close(); }, 6000);
+  `], { stdio: ['ignore', 'pipe', 'inherit'] })
+  const exited = once(holder, 'exit')
+  try {
+    await once(holder.stdout, 'data')
+    const moduleUrl = pathToFileURL(path.resolve('scripts/ledger.ts')).href
+    await execFileAsync(process.execPath, ['--input-type=module', '-e', `
+      import { DomainLedger } from ${JSON.stringify(moduleUrl)};
+      new DomainLedger(${JSON.stringify(dbPath)}).close();
+    `])
+    assert.equal((await exited)[0], 0)
+  } finally {
+    holder.kill()
+    await exited
     await rm(temp, { recursive: true, force: true })
   }
 })

@@ -25,4 +25,4 @@ Passed requires all of the following:
 
 ## Consequences
 
-A required stage cannot offer a waiver that still leads to Passed. Releases lacking an invariant may report narrower completion or delivery facts, but the full Passed outcome remains unavailable until Release 4 under ADR-0010.
+A required stage cannot offer a waiver that still leads to Passed. The pipeline may report narrower completion or delivery facts while any invariant remains unimplemented; the full Passed outcome requires every invariant and the recovery guarantees in ADR-0010.

@@ -2211,6 +2211,7 @@ export async function runPipeline(
           baseBranch: deliveryRepo.base,
           baseRefSha: effectiveProvenance.baseRefSha,
           branch: deliveryRepo.branch,
+          coordinatorIdentity,
           effectivePolicyHash: effectiveProvenance.effectivePolicyHash,
           force: options.forceLease === true,
           head: repo.head,
@@ -2233,6 +2234,7 @@ export async function runPipeline(
           baseRefSha: effectiveProvenance.baseRefSha,
           branch: deliveryRepo.branch,
           claimId: resumeClaimId,
+          coordinatorIdentity,
           effectivePolicyHash: effectiveProvenance.effectivePolicyHash,
           force: options.forceLease === true,
           head: repo.head,
@@ -2249,6 +2251,7 @@ export async function runPipeline(
           commandGates: pipelineConfig.command_gates,
           baseBranch: deliveryRepo.base,
           branch: deliveryRepo.branch,
+          coordinatorIdentity,
           intent,
           policySha256: policySha256Value,
           repoRoot: deliveryRepo.root,
@@ -4694,6 +4697,7 @@ export async function runPipeline(
               baseBranch: deliveryRepo.base,
               baseRefSha: effectiveProvenance.baseRefSha,
               branch: deliveryRepo.branch,
+              coordinatorIdentity,
               effectivePolicyHash: effectiveProvenance.effectivePolicyHash,
               force: options.forceLease === true,
               head: currentHead,
@@ -4716,6 +4720,7 @@ export async function runPipeline(
             baseRefSha: effectiveProvenance.baseRefSha,
             branch: deliveryRepo.branch,
             claimId: resumeClaimId,
+            coordinatorIdentity,
             effectivePolicyHash: effectiveProvenance.effectivePolicyHash,
             force: options.forceLease === true,
             head: currentHead,
@@ -6740,6 +6745,9 @@ function fixerInstructions(stage: StageName): string {
 function fixerScope(stage: StageName): string {
   if (stage === "document") {
     return "Limit changes to documentation files and documentation comments only.";
+  }
+  if (stage === "review") {
+    return "Limit changes to implementation source code, documentation files and comments, and new regression test files only.";
   }
   return "Limit changes to implementation source code and new regression test files only.";
 }
@@ -9759,13 +9767,12 @@ export class CliOrca implements OrcaOperations {
     source: symbol,
     exhaustive = false,
   ): Promise<void> {
-    // Timer-driven and wait-driven drains overlap. A periodic drain skips when
-    // one is already running -- it would only repeat work, and queueing every
-    // tick behind a slow read builds an unbounded backlog. Finalization must
-    // not skip, so it waits its turn instead.
+    // Overlapping live drains share the current work, so heartbeat callers
+    // wait for durable output without queueing another read. Finalization
+    // waits and then drains the remaining tail.
     const inflight = this.#draining.get(terminalHandle);
     if (inflight) {
-      if (!exhaustive) return;
+      if (!exhaustive) return inflight;
       await inflight.catch(() => {});
     }
     const run = this.#drainNow(terminalHandle, log, source, exhaustive);
@@ -11921,12 +11928,14 @@ const VALUE_FLAGS = new Set([
   "reviewer-model",
   "role",
   "readiness",
+  "reason",
   "run-id",
   "gate",
   "stage",
   "upstream",
 ]);
 const COMMAND_FLAGS: Record<string, Set<string>> = {
+  abandon: new Set(["repo", "run-id", "reason"]),
   attestation: new Set(["out", "repo"]),
   gate: new Set(["admission-id", "gate", "launch-nonce", "readiness", "run-id"]),
   init: new Set(["base-branch", "fork", "head-branch", "repo", "upstream"]),
@@ -16328,6 +16337,7 @@ export async function main(argv: string[]): Promise<void> {
   orca-no-mistakes attestation verify <manifest-file|run-id|commit-sha> [--repo <path>]
   orca-no-mistakes prune [--before <date>] [--repo <path>]
   orca-no-mistakes prune --stranded [--repo <path>]
+  orca-no-mistakes abandon --run-id <id> --reason <text> [--repo <path>]
   orca-no-mistakes evaluation <seed|capture|list|replay|adjudicate|compare|prune> (docs/review-evaluation.md)
 
 Run options:
@@ -16354,14 +16364,69 @@ Run options:
   init installs or refreshes the repository-local bare gate and managed remote
   admit accepts one feature ref update with one encoded intent push option
 
-Release boundary:
-  New runs own the PR title/body and wait for an exact matching merged PR.
+Completion and recovery:
+  The coordinator owns the PR title/body, monitors CI, and waits for an exact matching merged PR.
   Completion does not prove CI completeness, delivered-tree integrity, or target Passed.
   Resume requires a durably failed run; abandoned in-progress crash adoption is unavailable.
-  Acceptance procedure: docs/release-2-acceptance.md`);
+  Acceptance procedure: docs/acceptance.md`);
     return;
   }
   const parsed = parseCli(argv);
+  if (parsed.command === "abandon") {
+    const runId = stringFlag(parsed.flags, "run-id");
+    const reason = stringFlag(parsed.flags, "reason");
+    if (!runId || !reason?.trim()) throw new Error("abandon requires --run-id and --reason");
+    const repo = stringFlag(parsed.flags, "repo");
+    const ledger = openRepositoryLedger(repo ?? process.cwd(), repo === undefined);
+    try {
+      const run = ledger.runIdentity(runId);
+      if (run) {
+        const markersDir = path.join(run.repo_root, ".orca", "no-mistakes");
+        let names: string[];
+        try {
+          names = await readdir(markersDir);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          names = [];
+        }
+        for (const name of names) {
+          if (!name.startsWith("gate-") || !name.endsWith(".json")) continue;
+          let parsedMarker: unknown;
+          try {
+            parsedMarker = JSON.parse(await readFile(path.join(markersDir, name), "utf8"));
+          } catch (error) {
+            throw new Error(
+              `cannot abandon run ${runId}: marker ${name} could not be read or parsed`,
+              { cause: error },
+            );
+          }
+          if (typeof parsedMarker !== "object" || parsedMarker === null) continue;
+          const marker = parsedMarker as {
+            domainRunId?: unknown;
+            gate?: { kind?: unknown; runId?: unknown };
+            runId?: unknown;
+          };
+          const markerRunId = typeof marker.domainRunId === "string"
+            ? marker.domainRunId
+            : typeof marker.runId === "string"
+              ? marker.runId
+              : marker.gate?.kind === "configured" && typeof marker.gate.runId === "string"
+                ? marker.gate.runId
+                : undefined;
+          if (markerRunId === runId) {
+            throw new Error(
+              `run ${runId} still has marker-owned resources; run prune --stranded before abandon`,
+            );
+          }
+        }
+      }
+      ledger.abandonRun({ runId, reason, actorIdentity: `local-operator:${process.pid}` });
+      console.log(JSON.stringify({ runId, status: "cancelled", evidenceRetained: true }));
+    } finally {
+      ledger.close();
+    }
+    return;
+  }
   if (parsed.command === "init") {
     await runInitCommand(parsed.flags);
     return;

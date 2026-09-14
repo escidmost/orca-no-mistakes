@@ -1,0 +1,32 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": { "title": "How findings become repairs or decisions", "locale": "en", "quality_profile": "showcase" },
+  "lanes": [
+    { "id": "inspect-candidate", "label": "Evaluate, decide, recheck" }
+  ],
+  "mainPath": ["check-candidate", "classify-report", "finding-decision", "repair-candidate", "accept-repair"],
+  "nodes": [
+    { "id": "check-candidate", "lane": "inspect-candidate", "col": 0, "type": "backend", "label": "Check candidate", "sublabel": "Read-only worker", "width": 140, "height": 80 },
+    { "id": "classify-report", "lane": "inspect-candidate", "col": 1, "type": "security", "label": "Classify findings", "sublabel": "Commit-bound report", "width": 140, "height": 80 },
+    { "id": "finding-decision", "lane": "inspect-candidate", "col": 2, "type": "frontend", "label": "Finding gate", "sublabel": "Human decision", "width": 140, "height": 80 },
+    { "id": "repair-candidate", "lane": "inspect-candidate", "col": 3, "type": "backend", "label": "Fixer commits", "sublabel": "Commit the repair", "width": 140, "height": 80 },
+    { "id": "accept-repair", "lane": "inspect-candidate", "col": 4, "type": "security", "label": "Check custody", "sublabel": "Policy + exact OID", "width": 140, "height": 80 },
+    { "id": "settle-stage", "lane": "inspect-candidate", "col": 5, "type": "database", "label": "Settle stage", "sublabel": "Evidence + audit", "width": 140, "height": 80 }
+  ],
+  "edges": [
+    { "id": "checker-report", "from": "check-candidate", "to": "classify-report", "role": "main" },
+    { "id": "report-needs-choice", "from": "classify-report", "to": "finding-decision", "role": "main", "label": "decision needed" },
+    { "id": "choice-authorizes-fix", "from": "finding-decision", "to": "repair-candidate", "role": "main", "label": "fix" },
+    { "id": "repair-custody-check", "from": "repair-candidate", "to": "accept-repair", "role": "main", "label": "new commit" },
+    { "id": "repair-recheck", "from": "accept-repair", "to": "check-candidate", "role": "return", "variant": "dashed", "label": "accepted repair: recheck" },
+    { "id": "clean-report-settles", "from": "classify-report", "to": "settle-stage", "role": "branch", "label": "no actionable findings", "fromSide": "bottom" },
+    { "id": "automatic-fix", "from": "classify-report", "to": "repair-candidate", "role": "branch", "label": "eligible auto-fix" },
+    { "id": "human-waiver", "from": "finding-decision", "to": "settle-stage", "role": "branch", "label": "approve / skip: audited" }
+  ],
+  "cards": [
+    { "dot": "amber", "title": "Automatic repair eligibility", "items": ["Only auto-fix findings, enabled mode, and rounds remaining.", "Stage policy must allow it; Review requires explicit opt-in.", "Otherwise the finding gate waits without a deadline."] },
+    { "dot": "cyan", "title": "Human choices", "items": ["fix repairs; approve / skip retain audited dispositions.", "Targeting IDs approves other findings for this candidate.", "stop cancels the run and preserves recovery work."] },
+    { "dot": "rose", "title": "Repair boundaries", "items": ["A changed candidate invalidates candidate-bound approvals.", "No-change repairs and strict-policy rejections need decisions.", "CI fix only resumes monitoring after external action."] }
+  ]
+}

@@ -2,7 +2,7 @@
 status: accepted
 date: 2026-08-20
 scope: target architecture
-implementation: partially implemented (Release 1)
+implementation: partially implemented
 ---
 
 # Coordinator Recovery Model
@@ -19,4 +19,4 @@ The target coordinator persists domain state separately from Orca's orchestratio
 
 ## Consequences
 
-Recovery is a Release 4 capability under ADR-0010. Earlier releases may run and deliver changes, but they are not crash-safe and cannot claim the full target Passed guarantee.
+Coordinator restart recovery and adoption of interrupted workers remain planned. The current pipeline can resume durably failed runs and preserve recovery refs, but cannot automatically adopt an abandoned `in-progress` run or claim the full target Passed guarantee.

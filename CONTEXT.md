@@ -57,7 +57,7 @@ The immutable per-run identity of the forge, stable base and head repositories, 
 _Avoid_: Origin, current remotes, push URL
 
 **Repository publication route**:
-The durable, mutable publication route persisted once per repository, keyed by the Git common dir so every worktree shares it, and bound to the authenticated actor, backend, forge, stable repository identities, owner, identity fingerprint, and canonical credential-free transport identity. It is guarded against authenticated-actor drift and against repository-identity change while active runs or resumable failed runs depend on it. Every Release 2 run snapshots it at start, with the run's own head and base branches, as its immutable per-run Publication route; legacy and provider-neutral runs do not.
+The mutable publication route keyed by the repository's Git common directory, shared by every worktree, and bound to its authenticated actor, forge, stable repository identities, and credential-free transport. A publication run snapshots it with its own head and base branches as an immutable per-run Publication route; repository identity changes are blocked while active or resumable runs depend on the existing route.
 _Avoid_: Per-run route, origin, ambient remote
 
 **Publication head ref**:
@@ -157,8 +157,12 @@ A durable run-level mode that automatically starts fix rounds for findings eligi
 _Avoid_: YOLO mode, unattended approval, policy bypass
 
 **Run cancellation**:
-The terminal outcome when an operator stops a run before it passes or fails. Cancel requests an orderly stop; Force stop escalates immediately. Both produce the same outcome, while retaining which action occurred as evidence.
+The terminal outcome when an operator stops or abandons a run before it passes or fails. Cancel requests an orderly stop; Force stop escalates immediately; abandonment closes an already-dead run. All retain which action occurred as evidence.
 _Avoid_: Abort status, failed run
+
+**Run abandonment**:
+Operator closeout of a provably dead run after its owned resources are cleared. It ends resumability while retaining evidence, attempt outcomes, artifacts, and Git refs.
+_Avoid_: Crash adoption, evidence deletion
 
 **Resumable error**:
 An error the pipeline explicitly identifies as safe to continue from a durable checkpoint. Operators may resume only when the pipeline declares this condition.
@@ -197,11 +201,12 @@ A deterministic root binding the frozen stage plan and evidence through candidat
 _Avoid_: Completion-attestation root, remote trust anchor, raw evidence link
 
 **Pipeline completion attestation**:
-A portable, tamper-evident manifest using the version 2 completion schema for a run with a `passed` verdict. It binds the frozen stage plan, recorded stage dispositions and evidence, candidate-publication and pull-request-binding receipt digests, all attempt-outcome digests (explicitly including the terminal passed attempt; only pipelineEvidenceRoot excludes that final digest), custody facts, and explicit assurance claims to the candidate commit. It proves historical observations, not current remote state or independent authenticity.
+A portable, tamper-evident record for a run with a `passed` verdict, binding its frozen stage plan, dispositions, evidence, publication receipts, attempt history, custody facts, and explicit assurance claims to the candidate commit. It proves historical observations, not current remote state or independent authenticity.
 _Avoid_: Passed, signature, live-status certificate
 
 **Passed attestation**:
-A pipeline completion attestation carrying the target `Passed` assurance claim and binding its required evidence to the candidate and delivered commits. Release 2 cannot produce one.
+A pipeline completion attestation carrying the target `Passed` assurance claim and binding its required evidence to the candidate and delivered commits.
+The current pipeline does not produce one.
 _Avoid_: Any passed-verdict attestation, signature, badge
 
 **Reconciliation snapshot**:

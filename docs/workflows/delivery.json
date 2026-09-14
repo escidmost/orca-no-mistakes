@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "generator": "Archify",
+  "diagram_type": "workflow",
+  "browser_coverage": {
+    "mode": "READ",
+    "motion": "Still",
+    "containment_viewports": [[1440, 900], [1600, 1000], [1920, 1080], [2048, 1320]],
+    "screenshot_viewports": [[1440, 900], [2048, 1320]],
+    "screenshot_themes": ["light", "dark"]
+  },
+  "visual_review_method": "Image-capable assistant inspected all four final screenshots per delivered diagram for readable labels, unambiguous arrows, containment, and desktop balance. This is separate from automated browser evidence and does not certify every viewer interaction.",
+  "correction_scope": "Counts below cover the additional bounded layout pass explicitly authorized after the initial repair limit.",
+  "deliveries": [
+    {
+      "specification": {
+        "path": "run-to-merge.workflow.json",
+        "sha256": "9919c29ce1495a7841647c8b24c80e88a3d248f1d3b5d1af8bde0b2ebad48e7d",
+        "bytes": 3148
+      },
+      "artifact": {
+        "path": "run-to-merge.html",
+        "sha256": "61fa44e65aaf7ba9aa091c8afe6c6e9631636506b7656855ae28e61141a286c3",
+        "bytes": 804315
+      },
+      "validation": {
+        "checks_passed": 9,
+        "check_count": 9,
+        "composition_profile": "showcase",
+        "errors": 0,
+        "warnings": 0
+      },
+      "browser_evidence": "passed",
+      "browser_receipt": "run-to-merge.visual-check.json",
+      "visual_review": "passed",
+      "correction_rounds": 1
+    },
+    {
+      "specification": {
+        "path": "recovery-and-custody.workflow.json",
+        "sha256": "dabb1d4ef44918ccd3325dfd82a18a7e4bdfb31f83b6ae1ff605ad067dc45246",
+        "bytes": 4525
+      },
+      "artifact": {
+        "path": "recovery-and-custody.html",
+        "sha256": "5a633c32dce80b047883f0037e38b81710adc0d797226b6de8014b9a5fd4aa73",
+        "bytes": 811638
+      },
+      "validation": {
+        "checks_passed": 9,
+        "check_count": 9,
+        "composition_profile": "showcase",
+        "errors": 0,
+        "warnings": 0
+      },
+      "browser_evidence": "passed",
+      "browser_receipt": "recovery-and-custody.visual-check.json",
+      "visual_review": "passed",
+      "correction_rounds": 1
+    }
+  ],
+  "unpublished_drafts": [
+    {
+      "specification": "findings-and-fixes.workflow.json",
+      "validation": "failed",
+      "diagnostic": "workflow/explicit-pin-conflict",
+      "subject": "clean-report-settles",
+      "conflicting_relationship": "choice-authorizes-fix",
+      "reason": "Explicit fromSide=bottom routing shares a corridor with the fix branch; no accepted HTML was produced.",
+      "correction_rounds": 2
+    }
+  ]
+}

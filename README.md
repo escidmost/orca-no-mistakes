@@ -1,107 +1,139 @@
 # orca-no-mistakes
 
-An Orca-native adversarial validation and publication pipeline over nine core stages:
+An Orca-native pipeline that reviews committed changes, runs validation in isolated worktrees, and publishes the validated candidate to GitHub.
 
-`intent -> rebase -> review -> test -> document -> lint -> push -> pr -> ci`
+```text
+intent -> rebase -> review -> test -> document -> lint -> push -> pr -> ci
+```
 
-The runner creates an Orca Run, acquires an exclusive semantic lease on the branch in a repository-local SQLite domain ledger (`<git-common-dir>/orca-no-mistakes/ledger.sqlite`), validates through disposable child worktrees, publishes the exact candidate, publishes the owned title/body pull-request report, notifies the origin of readiness, then monitors the pull request's CI checks and mergeability while it is open, and cannot succeed until an authoritative matching MERGED observation upgrades the receipt. Stage and remote evidence lands under `~/.orca-no-mistakes/artifacts/<run-id>/`, outside the branch. A migrated Release 1 failure resumes under its frozen six-stage local plan and produces a v1.3 manifest only if it later passes; new initialized runs use the nine-stage Release 2 plan, extended by any command gates the trusted base declares ([Repository command gates](docs/current-architecture.md#repository-command-gates)), and v2 completion attestation; earlier eight-stage v2 attestations still verify.
+The pipeline owns the pull request's title and body, notifies the originating session when it is ready, and monitors CI and mergeability until the exact matching pull request is merged. Successful completion records the stage evidence, publication receipts, and custody result in a portable completion attestation. Trusted repositories can add [command gates](docs/current-architecture.md#repository-command-gates) before publication.
 
-For Release 2 runs, successful completion means all nine required core stages, every configured command gate, and both remote receipts settled durably in a v2 completion attestation; migrated Release 1 resumes complete successfully when their six local stages pass and produce a v1.3 manifest under `attestation`. CI monitoring and merge settlement are implemented (see [ADR-0016](docs/adr/0016-ci-stage-monitoring-and-merge-settlement.md)); delivery proof — Release 3 delivered-tree verification and CI auto-fix re-publication — remains future work. See [Current Architecture](docs/current-architecture.md) for implemented behavior and [the ADRs](docs/adr/) for accepted target decisions.
+The [workflow guide](docs/workflows/README.md) includes interactive pipeline and recovery diagrams, plus a walkthrough of finding decisions and repairs.
+
+CI monitoring reports failures for human action; it does not repair or merge the pull request. Completion records the observed merge, but does not prove required-check completeness or delivered-tree integrity. The stronger target `Passed` guarantee is defined in the [ADRs](docs/adr/).
 
 ## Install
 
-Requires Node.js 24+, Git, a running Orca app, and authenticated CLI tooling for the configured worker agents (`opencode` by default). New Release 2 runs additionally require the GitHub CLI (`gh`) with existing authentication (`GH_TOKEN`, `GITHUB_TOKEN`, or stored `gh` auth); migrated Release 1 resumes do not require GitHub publication initialization or credentials.
+Requires Node.js 24+, Git, a running Orca app, authenticated worker-agent tooling, and the GitHub CLI (`gh`) with existing authentication (`GH_TOKEN`, `GITHUB_TOKEN`, or stored `gh` auth). Git push authentication must also work.
+
+From this package checkout:
 
 ```bash
 npm install
 npm link
 ```
 
-During installation, a default configuration template is automatically copied to `~/.config/orca-no-mistakes/config.yaml` (from [`templates/config.yaml`](templates/config.yaml)) if no configuration exists.
+Installation creates `~/.config/orca-no-mistakes/config.yaml` from the [configuration template](templates/config.yaml) if no configuration exists. The template selects `claude`; without an agent setting, the runner falls back to `opencode`. Configure and authenticate the agents you intend to use.
 
 ## Run
 
-New direct runs require one successful `orca-no-mistakes init` per repository to configure GitHub publication and persist the repository route; every worktree and branch of that repository then runs without further setup. Direct invocation returns a meaningful process exit status:
-
-```bash
-orca-no-mistakes run --repo /path/to/repo --intent "Add X without changing Y"
-orca-no-mistakes run --repo /path/to/repo --resume <failed-run-id>
-```
-
-New runs require an explicit single-line `--intent` and prior `orca-no-mistakes init`; failed runs can instead use `--resume` without repeating the intent. The runner requires a clean committed named feature branch, refuses the default base branch, and requires a configured `origin`. It rebases onto the detected default branch unless `--base` is supplied, publishes the validated candidate with an exact force-with-lease, publishes the owned title/body report, notifies the origin of readiness, then monitors CI checks and mergeability while the pull request is open until an authoritative matching MERGED observation upgrades the receipt. Detached resume reuses the failed run's ledger and evidence, reconstructs the isolated gate worktree at its last durable checkpoint, and skips completed stages whose commit-bound evidence is still valid. Leave the clean initiating checkout at the failed run's original submission commit so successful custody transfer can advance it automatically.
-
-## Local gate
-
-Install or repair the repository-local bare gate and its managed remote:
+Initialize each repository once, then submit a clean, committed feature branch with a single-line intent:
 
 ```bash
 orca-no-mistakes init --repo /path/to/repo
-# Fork publication:
-orca-no-mistakes init --repo /path/to/repo --fork owner/repo --head-branch feature
+orca-no-mistakes run --repo /path/to/repo --intent "Add X without changing Y"
 ```
 
-Submit one feature-branch update with one encoded intent option. The gate admits the update before Git mutates its permanent ref, then launches the same detached pipeline used by direct `run`:
+Initialization persists the GitHub publication route for every worktree and branch in that repository. The checkout must have an `origin` remote and be on a named branch other than the detected default branch. The runner rebases onto the default branch unless you pass `--base <branch>`.
+
+A newly admitted run starts a detached coordinator in an Orca terminal and returns its handle immediately. Handle its notifications and decisions in the originating session; command return and PR readiness do not mean the pipeline has completed. An identical submission already being handled returns its admission identity instead of starting another coordinator.
+
+To continue a failed run:
+
+```bash
+orca-no-mistakes run --repo /path/to/repo --resume <failed-run-id>
+```
+
+Resume reconstructs the isolated worktree at the last durable checkpoint and reuses evidence that is still valid for that commit. Leave the clean initiating checkout at the original submission commit so successful custody transfer can advance it automatically. Automatic adoption of an abandoned `in-progress` run is unavailable; see [recovery](#attestations-and-retention).
+
+Useful options:
+
+```text
+--base <branch>          select the run's base branch
+--head <sha>             refuse to run unless HEAD matches
+--notify <handle>        send decisions and outcomes to an Orca terminal
+--reviewer-model <model>
+--fixer-model <model> --fixer-effort <level>
+--max-fix-rounds <count>
+--tui                    interactive run view; default for detached runs
+--no-tui                 line-oriented progress on stderr
+--attached               run in the invoking process and wait for the result
+--force-lease            reclaim a branch lease after confirming its owner is dead
+--allow-local-config     read working-tree policy; marks the run uncertified
+--config <path>          read an explicit policy file; marks the run uncertified
+```
+
+## Local gate
+
+`init` also installs a repository-local bare gate and the managed `orca-no-mistakes` Git remote. To configure fork publication:
+
+```bash
+orca-no-mistakes init --repo /path/to/repo --upstream owner/repo --fork contributor/repo
+```
+
+Submit the checked-out feature branch with one encoded intent option:
 
 ```bash
 intent=$(node -e 'process.stdout.write(Buffer.from(process.argv[1]).toString("base64url"))' 'Add X without changing Y')
 git -C /path/to/repo push --push-option="no-mistakes.intent=$intent" orca-no-mistakes HEAD:refs/heads/feature
 ```
 
-When the upstream remote parses as GitHub, `init` also verifies GitHub authentication and persists the stable base/head repository route under the Git common dir, shared by every worktree and branch; provider-neutral init installs the local gate without a publication route. New Release 2 runs require the persisted GitHub publication route before they can complete the remote push and pr stages. Use `--upstream`, `--fork`, `--base-branch`, and `--head-branch` to override the detected route. Tags, deletes, the default branch, multi-ref pushes, malformed intent, and unsafe transport state are rejected before admission. Gate and direct submissions with the same repository, ref, candidate, and intent converge on one durable submission identity and run the same remote delivery stages.
+The gate admits the update before Git changes its permanent ref, then launches the same detached pipeline as `run`. Tags, deletes, the default branch, multi-ref pushes, malformed intent, and unsafe transport state are rejected before admission.
 
-Useful direct-run options:
+Use `init --upstream` and `--fork` to select repositories. Its `--base-branch` and `--head-branch` options set initial route coordinates; each run uses its own selected base and checked-out feature branch. To select a non-default base, use direct `run --base`.
 
-```text
---base <branch>
---head <sha>            refuse to run unless HEAD matches
---force-lease           reclaim a branch lease held by another run
---reviewer-model <model>
---fixer-model <model> --fixer-effort <level>
---max-fix-rounds <count>
---tui                   render an interactive Rail with inline decision-gate resolution; default for detached runs
---no-tui                emit line-oriented semantic progress on stderr
---resume <failed-run-id>
---allow-local-config
---config <path>
-```
+Initialization with a non-GitHub upstream installs the local gate only. The publication pipeline requires a persisted GitHub route. See [Entry points](docs/current-architecture.md#entry-points) for admission and replay behavior.
 
-Validation policy comes from `.orca/no-mistakes.yaml` on the trusted base ref, not from the proposed branch; an absent file means built-in defaults. It selects the worker agent per stage and role across native (`cursor`), terminal (`claude`, `codex`, `opencode`, `grok`, `gemini`, `kimi`, `agy`, `pi`), and `acp:<target>` harnesses. `--allow-local-config` and `--config <path>` read policy locally instead and mark the run uncertified. Compatible fixers retain their terminal and child worktree across rounds; `agy` and `pi` therefore continue the same interactive process instead of selecting a saved session through user-supplied CLI flags.
+## Configuration
 
-Workers launch with the `opencode` agent on the agent's own default model by default; the default maximum is three fix rounds. `ORCA_CLI_COMMAND` overrides the Orca executable and `WORKER_AGENT_READY_TIMEOUT_MS` overrides the 60-second agent-startup deadline. Fresh terminal workers wait 20 seconds when `$SHELL` is fish so hidden panes can finish fish's terminal query and settle before command delivery; `WORKER_SHELL_STARTUP_DELAY_MS` overrides that grace period.
+Repository validation policy comes from `.orca/no-mistakes.yaml` on the trusted base ref. An absent file uses built-in defaults. CLI overrides take precedence over repository and user-global agent settings; `--allow-local-config` and `--config` bypass trusted-base loading and mark the run uncertified.
+
+Each stage and role can select a native (`cursor`), terminal (`claude`, `codex`, `opencode`, `grok`, `gemini`, `kimi`, `agy`, `pi`), or `acp:<target>` agent. Workers use the agent's own model unless configured otherwise. The default fix-round limit is three. Compatible fixers retain their terminal and child worktree across rounds.
+
+The [configuration template](templates/config.yaml) lists settings and defaults; [configuration precedence](docs/adr/0011-hierarchical-configuration-and-precedence.md) and [validation policy](docs/current-architecture.md#validation-policy) explain how they resolve.
+
+Environment overrides:
+
+- `ORCA_CLI_COMMAND`: Orca executable; defaults to `orca` on macOS and `orca-ide` on Linux.
+- `WORKER_AGENT_READY_TIMEOUT_MS`: agent-startup deadline, default 60 seconds.
+- `WORKER_SHELL_STARTUP_DELAY_MS`: shell-startup grace period, default 20 seconds for fish and zero otherwise.
+- `ORCA_NO_MISTAKES_HOME`: artifact home, default `~/.orca-no-mistakes`; repository ledgers remain under the Git common directory.
+
+## Gates and outcomes
+
+Worker finding gates offer `approve`, `fix`, `skip`, or `stop`. A targeted `fix [id1,id2] - guidance` repairs the selected findings and approves unselected open findings for that candidate. Approvals and skips are recorded in evidence. See [Findings and gates](docs/current-architecture.md#findings-and-gates) for selection, auto-fix, and guardrail rules.
+
+Other gates have narrower choices:
+
+- CI: `fix` resumes monitoring after external action; `stop` ends the run.
+- Required command failure or rebase conflict: `fix` or `stop`.
+- Resumable failure: `resume` or `stop`.
+- Worker question: `reply: <your answer>` or `stop`.
+
+Agents must use the exact `orca orchestration send` command supplied in the notification, substituting only the chosen resolution. Do not inject terminal input into a detached coordinator. The bundled [agent skill](skills/orca-no-mistakes/SKILL.md) describes this workflow.
+
+In the TUI, use Up/Down to select findings, `F` to fix, `A` to approve, and Enter to review and submit choices. `G` reopens a gate. Outside the finding editor, `A` toggles the local gate auto-responder and durable Auto-fix mode. A resumable error offers `R` to resume; `C` opens Cancel confirmation. The first Ctrl-C requests orderly cancellation; a second forces a stop for later stranded recovery. See [Run TUI](docs/adr/0015-run-tui-presentation-and-control-boundary.md) for the control contract.
+
+Human decision waits and the pipeline have no total deadline. Worker-attempt deadlines are independent. CI's idle timeout opens a decision gate rather than terminating the run.
+
+An attached run waits for completion and returns a nonzero status on failure or cancellation. Its stdout is reserved for JSON containing the run ID, completed stages, verdict, custody note, and `completionAttestation`. Detached runs deliver their outcome through Orca notifications.
+
+On success, the coordinator preserves the terminal commit under `refs/no-mistakes/recover/<run-id>` and advances a clean initiating checkout still at the submitted commit. If the checkout has changed, it leaves it alone and returns recovery instructions. See [Custody return](docs/current-architecture.md#custody-return).
 
 ## Live Test evidence
 
-For local review-only model comparisons with immutable Git cases and human finding
-labels, see [Review evaluation](docs/review-evaluation.md). The `evaluation`
-commands reuse the ACP reviewer transport and do not start a publication pipeline.
+Test checker reports require `liveValidation`: an overall `verdict`, a nonempty `reason`, and named `scenarios` whose trimmed names are nonempty and unique. Each scenario records `result` (`pass`, `fail`, or `untested`), a boolean `live`, an `evidence` string array, and a `limitation` string.
 
-New Test checker reports require `liveValidation`: an overall `verdict`, a nonempty
-`reason`, and named `scenarios` whose trimmed names are nonempty and unique. Each scenario records `result` (`pass`, `fail`, or
-`untested`), a boolean `live`, an `evidence` string array, and a `limitation` string.
-Pass/fail requires live execution and nonempty evidence. Untested requires
-`live: false` and a nonempty limitation. Live means driving the real product during
-this run; unit tests, mocks, recordings, and source inspection are supporting
-checks, not live execution.
+Pass/fail requires live execution and nonempty evidence. Untested requires `live: false` and a nonempty limitation. Live means driving the real product during this run; unit tests, mocks, recordings, and source inspection are supporting checks.
 
-`go` requires a live pass and no failed scenario. `no-go` creates an actionable
-failure; every failed scenario requires that verdict. `inconclusive` and
-`no-surface` require an explicit human decision. `no-surface` requires
-`scenarios: []`, with its reason explaining why no runtime surface applies; every
-other verdict requires at least one scenario.
-An individually untested scenario need not block a justified overall `go`.
+- `go` requires a live pass and no failed scenario. An individually untested scenario need not block a justified overall `go`.
+- `no-go` creates an actionable failure; every failed scenario requires that verdict.
+- `inconclusive` and `no-surface` require an explicit human decision.
+- `no-surface` requires `scenarios: []` and a reason explaining why no runtime surface applies. Every other verdict requires at least one scenario.
 
-Put startup and focused end-user test instructions in the inline `test_runbook`
-string in trusted-base `.orca/no-mistakes.yaml` (default: empty). The runbook is
-validated and included in the effective policy hash; proposed-branch and user
-global runbooks do not override it. Explicit local-policy bypasses remain
-uncertified. Checkers stay read-only; fixers submit their separate repair report
-without live-validation requirements.
+Put startup and focused end-user test instructions in the inline `test_runbook` string in trusted-base `.orca/no-mistakes.yaml` (default: empty). It is included in the effective policy hash; proposed-branch and user-global runbooks do not override it. Checkers stay read-only; fixers submit separate repair reports.
 
-Scenarios and verdicts are retained in commit-bound evidence, Test stage details,
-and the managed PR report. Screenshot and recording evidence reaches the managed PR only through the opt-in media-attachment contract in [Orchestration](docs/current-architecture.md#orchestration), which owns its approvals, supported formats, and publication outcomes. Changing the candidate reruns Test rather than claiming
-an earlier live result for the new commit. Pre-contract evidence remains readable
-and verifiable without inventing missing live results. Worker-attempt deadlines
-remain independent of human decisions; there is no total-run deadline.
+Scenarios and verdicts are retained in commit-bound evidence, Test stage details, and the managed PR report. Candidate changes require fresh Test evidence. Screenshots and recordings reach the PR only through the opt-in [media-attachment contract](docs/current-architecture.md#orchestration).
 
 ## Attestations and retention
 
@@ -110,25 +142,20 @@ orca-no-mistakes attestation export <run-id-or-commit-sha> [--out manifest.json]
 orca-no-mistakes attestation verify <manifest-file|run-id|commit-sha> [--repo <path>]
 orca-no-mistakes prune [--before <date>] [--repo <path>]
 orca-no-mistakes prune --stranded [--repo <path>]
+orca-no-mistakes abandon --run-id <id> --reason <text> [--repo <path>]
 ```
 
-Both attestation commands accept `--repo <path>` to name the repository ledger; passing `--repo` fails closed rather than falling back to the legacy archive.
+Run metadata lives in `<git-common-dir>/orca-no-mistakes/ledger.sqlite`; stage and remote artifacts live in `<artifact-home>/artifacts/<run-id>/`, where `<artifact-home>` is `ORCA_NO_MISTAKES_HOME` or, by default, `~/.orca-no-mistakes`. `--repo` selects the repository ledger explicitly.
 
-For migrated Release 1 v1.3 manifests, `verify` recomputes every stage-evidence hash, rebuilds the Merkle root over the manifest header and every stage digest, and cross-checks the intent hash; for Release 2 v2 manifests, `verify` recomputes the canonical full-manifest Merkle root after omitting `merkleRoot` (while checking pipeline evidence roots and stage evidence) — rewriting a stage hash, a commit SHA, the policy hash, or the run ID fails loudly and exits non-zero. An exported manifest is self-verifying, so it can be carried to a machine that never ran the pipeline and checked there — it is tamper-evident, not signed, so that check proves internal integrity rather than authorship; where the local ledger does hold the run, `verify` additionally requires the stored record to match and re-reads each retained stage artifact to recompute its artifact digest. Evidence is retained indefinitely — nothing is evicted by age or count — until you explicitly `prune` it. `prune` deletes completed runs matching the filters (`--repo` names a checkout, matching that root and anything nested under it) together with their artifact directories. It never touches Git history: preserved commits under `refs/no-mistakes/recover/` outlive the runs that produced them. It keeps any run that still holds a branch lease, any run whose repository root is unavailable unless `--repo` names that exact root, and any run with a recovery ref — including a fixer round's `-fixer-<stage>-<round>` child — whose commits are not yet contained in its branch or base — those are the runs whose ledger row is the operator's only record of preserved work. `prune --stranded` cannot be combined with `--before`; it instead scans the repository's recovery markers (`.orca/no-mistakes/gate-*.json`) and reaps gate or direct-run resources whose coordinator terminal or process is dead — a gate reaping anchors the run's last committed HEAD to its recovery ref, releases the branch lease, and removes the worktree, gate branch, terminal, and marker; a direct-run Force-stop marker is settled and removed without touching the checkout (below). Anything it cannot prove safe to reap (live pid, live terminal, unreadable marker, or an in-progress run whose gate ownership is absent or unverifiable) is retained, so it cannot tear down a live run. For terminal runs, including passed, failed, and cancelled runs, prune preserves the ledger outcome while finishing any stranded resource cleanup that a prior attempt left incomplete; it removes without `--force`, so Orca refuses a workspace that became live mid-reap instead of tearing it down.
+Exported manifests can be verified offline. Verification checks internal hashes; when the local ledger holds the run, it also checks the stored record and retained stage artifacts at their recorded paths. Manifests are tamper-evident and unsigned: they prove internal integrity, not authorship. See [Evidence](docs/current-architecture.md#evidence) for the schema and verification contract.
 
-Pruning also removes every submission admission bound to the deleted run, so an identical later submission is admitted again instead of replaying evidence that no longer exists.
+Evidence remains until explicitly pruned. Ordinary `prune` deletes eligible terminal run records and artifacts, including their submission admissions. It preserves Git recovery refs and retains runs with active leases, unavailable repositories, or recovery commits not yet contained in the branch or base. `--repo` matches the named checkout and nested roots; the exact-root override for an unavailable repository is described in [retention rules](docs/current-architecture.md#entry-points).
 
-## Gates and outcomes
+Prune locates artifacts under the current artifact home. Use the same `ORCA_NO_MISTAKES_HOME` setting that created them; changing it does not relocate existing evidence or rewrite recorded artifact paths.
 
-Worker-stage finding gates offer `approve`, `fix [ids][: guidance]`, `skip`, or `stop` (the `ci` gate offers only `fix` and `stop`; see [ADR-0016](docs/adr/0016-ci-stage-monitoring-and-merge-settlement.md)), while durable resume-decision gates offer `resume` or `stop` and an in-flight worker-question relay gate offers `reply: <your answer>` or `stop` (see [Findings and gates](docs/current-architecture.md#findings-and-gates)); unknown resolutions fail closed. With `--tui`, finding gates show each open finding: use Up/Down to select a finding, `F` for Fix, `A` for Approve as is, and Page Up/Down to scroll long descriptions. Choose for every finding, then press Enter to review the fix/approval counts and Enter again to submit. Findings sharing an ID share a choice. Other gates retain their offered choices. Esc returns unanswered and `G` reopens the gate; outside the finding editor, `A` toggles the local gate auto-responder and synchronizes durable Auto-fix mode to the resulting state (see [Findings and gates](docs/current-architecture.md#findings-and-gates)); when the error panel reports a resumable stage failure, `R` starts the next attempt of the same run from its durable checkpoint (offered only after the failed attempt is durably settled and its workers cleaned), while confirming Cancel from the error panel leaves the already-settled run stopped for a later detached `--resume`; `C` opens the Cancel confirmation (Enter confirms Cancel, Esc dismisses it), raw Ctrl-Z suspends the TUI and restores the terminal (continuing the process re-enters it with a redraw), the first Ctrl-C requests an orderly Cancel, and a second Ctrl-C Force stops, leaving marker-based recovery that `prune --stranded` later settles as cancelled. TUI `R`/`C` choices resolve the same durable resume gate used by remote agents. Agents must answer detached decisions with the supplied `orca orchestration send` command rather than injecting terminal input. The bundled [`/orca-no-mistakes` skill](skills/orca-no-mistakes/SKILL.md) contains the commands.
+`prune --stranded` recovers resources whose coordinator is proven dead; it cannot be combined with `--before`. It preserves the recorded HEAD, reaps owned workers, and releases the lease. Gate recovery removes owned gate resources; direct-run recovery leaves the operator's checkout and branch intact. Uncertain liveness or ownership keeps resources for diagnosis.
 
-For a detached gate run, stranded recovery owns the gate worktree and its workers. For a direct-attached run, Force stop writes a direct-run marker containing the exact HEAD and worker state; recovery preserves that HEAD, reaps owned workers, settles the run cancelled, releases its lease, and removes only the marker, never the operator's checkout or branch.
-
-A newly admitted direct `run` starts a detached coordinator in an Orca terminal by default and returns its handle immediately; pass `--attached` to keep the pipeline running inside the invoking process. When its deterministic admission is already being handled or accepted, `run` instead returns `{"admissionId":"...","replayed":true,"runId":"..."}` immediately without launching another coordinator; `runId` can be `null` until the live launch binds its run. `--no-tui` writes one bounded semantic status line per durable transition to stderr without cursor motion, spinners, heartbeats, or raw worker output. An attached run blocks until completion or failure — including, when the TUI renders, the durable post-failure resume decision on a resumable error (an attached `--no-tui` run stops at the failure instead) — and keeps stdout reserved for JSON containing the Orca Run ID, completed stages, custody note, and the full attestation manifest. On success the coordinator anchors `refs/no-mistakes/recover/<run-id>` at the terminal commit before returning custody of the branch: a clean checkout still at the submitted commit is fast-forwarded, while a diverged or dirty checkout is left alone and the custody note tells you how to recover the validated commits from that ref. Failed and cancelled runs attach the same recovery instructions only when the checkout's HEAD differs from the anchored commit; a HEAD already carrying that commit gets no recovery instruction.
-
-## Release acceptance
-
-See [Release 2 acceptance](docs/release-2-acceptance.md) for the macOS/Linux local matrix, live fixture requirements, evidence and recovery procedures. Release 2 acceptance remains incomplete until both local platforms and a protected live same-repository/fork run pass.
+`abandon` explicitly ends a failed or orphaned run's resumability while retaining its evidence, attempt outcomes, artifacts, and Git refs. Run it on the machine that ran the coordinator: it requires the latest attempt coordinator PID to be absent, the initial coordinator PID for a run interrupted before its first attempt, or the successor coordinator PID recorded in an interrupted resume claim. Resume ownership is recorded before activation and remains authoritative until the new attempt is registered; abandonment requires its claim, lease, and any same-generation attempt to agree, and releases only that proven generation. Older records without verifiable coordinator ownership and stale or mismatched resume generations remain fail-closed. If marker-owned worktrees or workers remain, run `prune --stranded` first so it can preserve the owned tip before cleanup; `abandon` refuses a matching direct-run or gate marker. It also releases the run's bound submission admission, allowing the identical branch, candidate, and intent to start a fresh run. This removes that run's publication-route dependency. The route blocker counts retained in-progress and resumable failed records, not live processes.
 
 ## Development
 
@@ -137,4 +164,13 @@ npm test
 npm run typecheck
 ```
 
-The self-hosted CI workflow runs on same-repository pull requests and on pushes to `main`; it skips fork pull requests. The hosted macOS/Linux acceptance matrix has no fork exclusion and runs on path-filtered pull requests; see [the acceptance runbook](docs/release-2-acceptance.md#local-matrix).
+The package executes its TypeScript directly; use `./bin/orca-no-mistakes` to run this checkout. [Test organization](tests/README.md) covers focused test commands.
+
+The self-hosted CI workflow runs on same-repository pull requests and pushes to `main`; fork pull requests are skipped. The hosted macOS/Linux [local acceptance matrix](docs/acceptance.md#local-matrix) runs on path-filtered pull requests, including forks. Full acceptance still requires current local results and protected live same-repository/fork evidence; see the [acceptance runbook](docs/acceptance.md).
+
+## Reference
+
+- [Current architecture](docs/current-architecture.md): implementation, evidence, orchestration, and recovery.
+- [Domain glossary](CONTEXT.md): pipeline terminology and assurance claims.
+- [Architecture decisions](docs/adr/): accepted design decisions and historical roadmap.
+- [Review evaluation](docs/review-evaluation.md): local model comparisons using fixed Git cases and human finding labels.
