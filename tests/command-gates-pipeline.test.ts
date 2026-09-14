@@ -104,6 +104,13 @@ for (const resolution of ['approve', 'skip', 'stop']) test(`required command fai
     assert.deepEqual(f.gates, [['fix', 'stop']])
     assert.equal(f.launches.some((launch) => launch.role === 'fixer'), false)
     assert.notEqual(f.ledger.runStatus(f.runId), 'passed')
+    if (resolution !== 'stop') {
+      assert.equal(f.ledger.listGateAudit(f.runId).some((audit) => audit.decision === resolution), false)
+      f.resolutions.push('fix')
+      await f.run(true)
+      assert.deepEqual(f.gates, [['fix', 'stop'], ['fix', 'stop']])
+      assert.equal(f.ledger.runStatus(f.runId), 'passed')
+    }
   } finally { await f.cleanup() }
 })
 

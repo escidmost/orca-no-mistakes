@@ -123,10 +123,15 @@ export async function runCommandGate(options: {
     } finally {
       // Interrupted setup can leave a registered, still-initializing worktree.
       // Cleanup must run even after cancellation, but Git itself may stall.
-      if (added || existsSync(path.join(worktree, '.git'))) await worktreeGit(['remove', '--force', '--force', worktree], {
-        cwd: options.repoRoot, env, signal: AbortSignal.timeout(120_000)
-      })
-      await rm(directory, { recursive: true, force: true })
+      try {
+        if (added || existsSync(path.join(worktree, '.git'))) await worktreeGit(['remove', '--force', '--force', worktree], {
+          cwd: options.repoRoot, env, signal: AbortSignal.timeout(120_000)
+        })
+      } finally {
+        // A failed Git removal remains an error and may leave prunable metadata,
+        // but must not retain the owned candidate files.
+        await rm(directory, { recursive: true, force: true })
+      }
     }
   })()
   active.set(controller, run)

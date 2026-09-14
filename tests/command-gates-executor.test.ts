@@ -111,8 +111,8 @@ if (stalled) {
     await delay(20)
   }
   assert.equal(pid, 0, 'the stalled Git subprocess was killed')
+  assert.deepEqual(await readdir(repo.artifactsDir), [])
   if (phase !== 'remove') {
-    assert.deepEqual(await readdir(repo.artifactsDir), [])
     assert.equal(git(repo.root, 'worktree', 'list', '--porcelain').split('worktree ').length - 1, 1)
   }
 })

@@ -893,6 +893,9 @@ export function verifyCompletionAttestation(manifest: CompletionAttestationManif
     ) {
       throw new Error('attestation stage dispositions do not match the stage plan')
     }
+    if (plan.stage.startsWith('command-') && plan.requirement !== 'required') {
+      throw new Error(`attestation command stage ${plan.stage} must be required`)
+    }
     const completed =
       (plan.requirement === 'required' && disposition.disposition === 'satisfied') ||
       (plan.requirement === 'optional' &&

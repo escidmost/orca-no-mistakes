@@ -3772,6 +3772,14 @@ export async function runPipeline(
           if (!gateAudited) openGateAudit(gateId);
           const resolution = (await orca.waitForGate(gateId)).trim();
           const decision = parseGateResolution(resolution, actionable);
+          if (
+            decision.action !== "unknown" &&
+            !gateOptions.includes(decision.action)
+          ) {
+            throw new Error(
+              `${stage} gate resolution selected "${decision.action}", which was not offered (${gateOptions.join(", ")}): ${resolution}`,
+            );
+          }
           const selectedFindingIds = selectedFindingIdsForGate(
             decision,
             gateOptions,
@@ -3821,14 +3829,6 @@ export async function runPipeline(
               ? { targetFindingIds: selectedFindingIds }
               : {}),
           });
-          if (
-            decision.action !== "unknown" &&
-            !gateOptions.includes(decision.action)
-          ) {
-            throw new Error(
-              `${stage} gate resolution selected "${decision.action}", which was not offered (${gateOptions.join(", ")}): ${resolution}`,
-            );
-          }
           if (decision.action === "approve" || decision.action === "skip") {
             const waived = authoritativeEntry;
             if (waived && !waived.waiverOrApproval) {
@@ -15973,7 +15973,7 @@ async function runWorkerReportCommand(flags: RawCliFlags): Promise<void> {
   const outputValue = stringFlag(flags, "out");
   if (!stageValue || (!PIPELINE_STEPS.includes(stageValue as CoreStageName) &&
     !(stageValue.startsWith("command-") && CommandGateSchema.shape.name.safeParse(stageValue.slice(8)).success))) {
-    throw new Error(`report requires --stage <${PIPELINE_STEPS.join("|")}>`);
+    throw new Error(`report requires --stage <${PIPELINE_STEPS.join("|")}|command-<name>>`);
   }
   if (role !== "reviewer" && role !== "fixer") {
     throw new Error("report requires --role <reviewer|fixer>");

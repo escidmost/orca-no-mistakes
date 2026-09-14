@@ -125,6 +125,36 @@ test('waived command failures are rejected by offline, retained, and record atte
   } finally { ledger.close() }
 })
 
+test('command stages cannot use optional or disabled completion semantics', () => {
+  const ledger = new DomainLedger(':memory:')
+  try {
+    for (const stage of ['review', 'command-check']) {
+      for (const [requirement, disposition] of [
+        ['optional', 'satisfied'], ['optional', 'skipped'], ['optional', 'waived'], ['disabled', 'disabled'],
+      ] as const) {
+        const manifest = manifestFor('command-requirement', [stage, 'push', 'pr'])
+        manifest.stagePlan[0].requirement = requirement
+        manifest.stageDispositions[0].disposition = disposition
+        if (disposition !== 'satisfied') {
+          delete manifest.stageDispositions[0].evidenceSha256
+          manifest.stageEvidence.shift()
+        }
+        manifest.pipelineEvidenceRoot = buildPipelineEvidenceRoot(manifest.stageEvidence, {
+          ...manifest, attemptOutcomeDigests: manifest.attemptOutcomeDigests.slice(0, -1)
+        })
+        const { merkleRoot: _root, ...payload } = manifest
+        manifest.merkleRoot = merkleRoot([sha256(canonicalJson(payload))])
+        if (stage === 'review') verifyCompletionAttestation(manifest)
+        else for (const verify of [
+          () => verifyCompletionAttestation(manifest),
+          () => ledger.verifyRetainedCompletionAttestation(manifest),
+          () => ledger.recordAttestation(manifest),
+        ]) assert.throws(verify, /command stage command-check must be required/)
+      }
+    }
+  } finally { ledger.close() }
+})
+
 test('terminal runs reject new Release 2 facts after migration', async () => {
   const temp = await mkdtemp(path.join(tmpdir(), 'onm-terminal-facts-'))
   const repo = path.join(temp, 'repo')
