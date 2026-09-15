@@ -1076,6 +1076,39 @@ async function stopAbortWorkers(
   return failures;
 }
 
+// The gate marker lives inside the origin worktree, which the run also
+// requires to be clean, so the marker directory (and Orca's gate workspaces)
+// must be git-excluded before the first write. The repository's private
+// exclude file keeps this out of tracked .gitignore files.
+const RUN_STATE_GIT_EXCLUDES = [".orca/no-mistakes/", ".orca/workspaces/"];
+
+async function ensureRunStateGitExcluded(worktree: string): Promise<void> {
+  const gitCheck = (args: string[]): string | null => {
+    try {
+      return execFileSync("git", ["-C", worktree, ...args], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim();
+    } catch {
+      return null;
+    }
+  };
+  const commonDir = gitCheck(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+  if (!commonDir) return; // not a git checkout; the marker must still land
+  const missing = RUN_STATE_GIT_EXCLUDES.filter(
+    (pattern) => gitCheck(["check-ignore", "-q", `${pattern}probe`]) === null,
+  );
+  if (missing.length === 0) return;
+  const excludePath = path.join(commonDir, "info", "exclude");
+  await mkdir(path.dirname(excludePath), { recursive: true });
+  let existing = "";
+  try {
+    existing = await readFile(excludePath, "utf8");
+  } catch {}
+  const separator = existing && !existing.endsWith("\n") ? "\n" : "";
+  await writeFile(excludePath, `${existing}${separator}${missing.join("\n")}\n`);
+}
+
 function gateMarkerPath(originWorktree: string, gateId: string): string {
   return path.join(
     originWorktree,
@@ -1214,6 +1247,7 @@ async function refreshGateMarker(): Promise<void> {
   const { gate, originWorktree } = abortReap;
   if (!gate || !originWorktree) return;
   const markerPath = gateMarkerPath(originWorktree, gateMarkerId(gate));
+  await ensureRunStateGitExcluded(originWorktree);
   let createdAt = new Date().toISOString();
   let terminalHandle = abortReap.terminalHandle;
   try {
