@@ -1028,8 +1028,6 @@ test("prune --stranded retains a gate whose commits cannot be anchored", async (
   }
 });
 
-test.after(() => console.log("ABORT REAP CANCELLATION PASSED"));
-}
 
 test("recording the gate marker git-excludes run state in the origin worktree", async () => {
   const seeded = await seedRun("onm-marker-exclude-", { work: false });
@@ -1069,3 +1067,6 @@ test("recording the gate marker git-excludes run state in the origin worktree", 
     await rm(seeded.temp, { force: true, recursive: true });
   }
 });
+
+test.after(() => console.log("ABORT REAP CANCELLATION PASSED"));
+}

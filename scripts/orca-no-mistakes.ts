@@ -6867,6 +6867,9 @@ function frozenCoordinatorExecutable(reportPath: string): string {
   return freezeCoordinatorProgram(evidenceDir);
 }
 
+const REPORT_CONTRACT_RULES =
+  "Validation rules beyond that shape: id matches [A-Za-z0-9_-]+, description is non-empty, file when present is non-empty, line when present is an integer of at least 1. This prompt is the complete report contract: do not read the coordinator program, the run log, the manifest, or other run workspaces to work out the schema.";
+
 function deliveryInstruction(
   delivery: DeliveryChannel,
   reportPath: string,
@@ -6878,7 +6881,7 @@ function deliveryInstruction(
     return `Reply with exactly one JSON object as your final message, with nothing before or after it, in this shape:
 ${shape}
 
-Do not write a report file and do not call worker_done: your final message is the report.`;
+Do not write a report file and do not call worker_done: your final message is the report. ${REPORT_CONTRACT_RULES}`;
   }
   return `Evidence belongs outside the repository at ${reportPath}. Produce one JSON object with this shape:
 ${shape}
@@ -6886,7 +6889,7 @@ ${shape}
 Pipe that object to this command instead of writing the report directly:
 ${shellQuote(frozenCoordinatorExecutable(reportPath))} report --stage ${stage} --role ${role} --out ${shellQuote(reportPath)}
 
-The command rejects invalid values and writes the report only after validation. Correct any reported error before continuing. Validation rules beyond that shape: id matches [A-Za-z0-9_-]+, description is non-empty, file when present is non-empty, line when present is an integer of at least 1. This prompt is the complete report contract: do not read the coordinator program, the run log, the manifest, or other run workspaces to work out the schema. Then report exactly once with worker_done: keep --body to the required three-sentence executive summary and pass --report-path ${reportPath}.`;
+The command rejects invalid values and writes the report only after validation. Correct any reported error before continuing. ${REPORT_CONTRACT_RULES} Then report exactly once with worker_done: keep --body to the required three-sentence executive summary and pass --report-path ${reportPath}.`;
 }
 
 function fixerPrompt(
