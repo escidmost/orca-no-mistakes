@@ -6886,7 +6886,7 @@ function frozenCoordinatorExecutable(reportPath: string): string {
 }
 
 const WORKER_SCOPE_RULES =
-  "Scope: your worktree is your current working directory, pinned at the commit under review; work only there. Do not open other worktrees under .orca/workspaces, the origin checkout, the coordinator gate copy, or the artifacts directory. The orca commands in the dispatch preamble are complete as written: do not run --help on them or invent verbs.";
+  "Scope: your worktree is your current working directory, pinned at the commit under review; work only there. Do not open other worktrees under .orca/workspaces, the origin checkout, the coordinator gate copy, or the artifacts directory beyond the report path, evidence root, and report command named in this prompt. The orca commands in the dispatch preamble are complete as written: do not run --help on them or invent verbs.";
 
 const REPORT_CONTRACT_RULES =
   "Validation rules beyond that shape: id matches [A-Za-z0-9_-]+, description is non-empty, file when present is non-empty, line when present is an integer of at least 1, and each artifacts entry must resolve inside the evidence root and name an existing regular file. This prompt is the complete report contract: do not read the coordinator program, the run log, the manifest, or other run workspaces to work out the schema.";
