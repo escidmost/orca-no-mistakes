@@ -1105,8 +1105,12 @@ function ensureRunStateGitExcluded(worktree: string): void {
     return;
   }
   const excludePath = path.join(commonDir, "info", "exclude");
-  mkdirSync(path.dirname(excludePath), { recursive: true });
-  appendFileSync(excludePath, `\n${missing.join("\n")}\n`);
+  try {
+    mkdirSync(path.dirname(excludePath), { recursive: true });
+    appendFileSync(excludePath, `\n${missing.join("\n")}\n`);
+  } catch {
+    return;
+  }
   runStateGitExcludedWorktrees.add(worktree);
 }
 
