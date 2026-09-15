@@ -1076,6 +1076,44 @@ async function stopAbortWorkers(
   return failures;
 }
 
+// The gate marker lives inside the origin worktree, which the run also
+// requires to be clean, so the marker directory (and Orca's gate workspaces)
+// must be git-excluded before the first write. The repository's private
+// exclude file keeps this out of tracked .gitignore files.
+const RUN_STATE_GIT_EXCLUDES = [".orca/no-mistakes/", ".orca/workspaces/"];
+const runStateGitExcludedWorktrees = new Set<string>();
+
+function ensureRunStateGitExcluded(worktree: string): void {
+  if (runStateGitExcludedWorktrees.has(worktree)) return;
+  const gitCheck = (args: string[]): string | null => {
+    try {
+      return execFileSync("git", ["-C", worktree, ...args], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim();
+    } catch {
+      return null;
+    }
+  };
+  const commonDir = gitCheck(["rev-parse", "--git-common-dir"]);
+  if (!commonDir) return; // not a git checkout; the marker must still land
+  const missing = RUN_STATE_GIT_EXCLUDES.filter(
+    (pattern) => gitCheck(["check-ignore", "-q", `${pattern}probe`]) === null,
+  );
+  if (missing.length === 0) {
+    runStateGitExcludedWorktrees.add(worktree);
+    return;
+  }
+  const excludePath = path.join(path.resolve(worktree, commonDir), "info", "exclude");
+  try {
+    mkdirSync(path.dirname(excludePath), { recursive: true });
+    appendFileSync(excludePath, `\n${missing.join("\n")}\n`);
+  } catch {
+    return;
+  }
+  runStateGitExcludedWorktrees.add(worktree);
+}
+
 function gateMarkerPath(originWorktree: string, gateId: string): string {
   return path.join(
     originWorktree,
@@ -1263,6 +1301,7 @@ async function writeMarker(
     | ConfiguredLauncherMarker
     | OrcaLauncherMarker,
 ): Promise<void> {
+  ensureRunStateGitExcluded(marker.originWorktree);
   const temporaryPath = `${markerPath}.${randomUUID()}.tmp`;
   await mkdir(path.dirname(markerPath), { recursive: true });
   try {
@@ -1360,6 +1399,7 @@ function writeMarkerSync(
   markerPath: string,
   marker: DirectRunMarker | GateRunMarker,
 ): void {
+  ensureRunStateGitExcluded(marker.originWorktree);
   const directory = path.dirname(markerPath);
   const temporaryPath = `${markerPath}.${randomUUID()}.tmp`;
   mkdirSync(directory, { recursive: true });
@@ -4981,6 +5021,7 @@ export type WorkerLaunchOutcome = {
 
 // ponytail: two repair retries; repeated invalid or unreadable output remains a hard failure.
 const WORKER_REPORT_RETRY_LIMIT = 2;
+const WORKER_REPORT_ERROR_LIMIT_CHARS = 2_000;
 
 class WorkerReportValidationError extends Error {}
 
@@ -4994,17 +5035,27 @@ function isRepairableWorkerReportError(error: unknown): boolean {
   );
 }
 
-function repairWorkerReportLaunch(launch: WorkerLaunch): WorkerLaunch {
+function repairWorkerReportLaunch(
+  launch: WorkerLaunch,
+  error: unknown,
+): WorkerLaunch {
   const shape = `{"findings":[...],"summary":"...","tested":[...],"artifacts":[...]${launch.stage === "test" && launch.role === "reviewer" ? ',"liveValidation":{"verdict":"go|no-go|inconclusive|no-surface","reason":"justification","scenarios":[{"name":"scenario","result":"pass|fail|untested","live":true,"evidence":["observed output"],"limitation":""}]}' : ''}}`;
   const delivery = deliveryChannel(launch.agent);
   if (delivery === "orca" && !launch.reportPath?.trim()) {
     throw new Error(`${launch.stage} worker report repair requires a report path`);
   }
+  const reportError = fenceUntrusted(
+    error instanceof Error ? error.message : String(error),
+  ).slice(0, WORKER_REPORT_ERROR_LIMIT_CHARS);
   return {
     ...launch,
     prompt: `${launch.prompt}
 
-REPORT REPAIR: the previous response did not produce a valid report. Retry the task and follow the delivery contract exactly.
+REPORT REPAIR: The previous report was rejected:
+<untrusted_report_error>
+${reportError}
+</untrusted_report_error>
+Retry the task and follow the delivery contract exactly.
 ${deliveryInstruction(delivery, launch.reportPath ?? "", shape, launch.stage, launch.role)}`,
     ...(launch.retainedWorktreeId || launch.terminal
       ? {
@@ -5117,7 +5168,7 @@ export async function startWorkerWithFallback(
         const retryOutcome = await startWorkerWithFallback(
           orca,
           createTask,
-          [repairWorkerReportLaunch(launch)],
+          [repairWorkerReportLaunch(launch, error)],
           undefined,
           fence,
           onReportRetry,
@@ -5373,7 +5424,7 @@ async function runReviewer(
           throw error;
         }
         reportRetry += 1;
-        retryLaunches = [repairWorkerReportLaunch(outcome.launch)];
+        retryLaunches = [repairWorkerReportLaunch(outcome.launch, error)];
         continue;
       }
       if (worker.failedOutcome === true) {
@@ -5684,7 +5735,7 @@ async function runFixer(
         reportRetry += 1;
         sessionToReuse = undefined;
         retainedSession = undefined;
-        retryLaunches = [repairWorkerReportLaunch(outcome.launch)];
+        retryLaunches = [repairWorkerReportLaunch(outcome.launch, error)];
         continue;
       }
       if (!worktreePath) {
@@ -6592,7 +6643,7 @@ Rules:
 
 function fenceUntrusted(content: string): string {
   return content.replace(
-    /<(?=\/?untrusted_(?:branch_diff|instruction|finding_decisions|review_rounds)>)/g,
+    /<(?=\/?untrusted_(?:branch_diff|instruction|finding_decisions|report_error|review_rounds)>)/g,
     "\\u003c",
   );
 }
@@ -6833,6 +6884,9 @@ function frozenCoordinatorExecutable(reportPath: string): string {
   return freezeCoordinatorProgram(evidenceDir);
 }
 
+const REPORT_CONTRACT_RULES =
+  "Validation rules beyond that shape: id matches [A-Za-z0-9_-]+, description is non-empty, file when present is non-empty, line when present is an integer of at least 1, and each artifacts entry must resolve inside the evidence root and name an existing regular file. This prompt is the complete report contract: do not read the coordinator program, the run log, the manifest, or other run workspaces to work out the schema.";
+
 function deliveryInstruction(
   delivery: DeliveryChannel,
   reportPath: string,
@@ -6840,11 +6894,12 @@ function deliveryInstruction(
   stage: StageName,
   role: WorkerLaunch["role"],
 ): string {
+  const artifactEvidenceRoot = `Artifact evidence root: ${path.dirname(path.resolve(reportPath))}.`;
   if (delivery === "acp") {
     return `Reply with exactly one JSON object as your final message, with nothing before or after it, in this shape:
 ${shape}
 
-Do not write a report file and do not call worker_done: your final message is the report.`;
+Do not write a report file and do not call worker_done: your final message is the report. ${artifactEvidenceRoot} ${REPORT_CONTRACT_RULES}`;
   }
   return `Evidence belongs outside the repository at ${reportPath}. Produce one JSON object with this shape:
 ${shape}
@@ -6852,7 +6907,7 @@ ${shape}
 Pipe that object to this command instead of writing the report directly:
 ${shellQuote(frozenCoordinatorExecutable(reportPath))} report --stage ${stage} --role ${role} --out ${shellQuote(reportPath)}
 
-The command rejects invalid values and writes the report only after validation. Correct any reported error before continuing. Then report exactly once with worker_done: keep --body to the required three-sentence executive summary and pass --report-path ${reportPath}.`;
+The command rejects invalid values and writes the report only after validation. Correct any reported error before continuing. ${artifactEvidenceRoot} ${REPORT_CONTRACT_RULES} Then report exactly once with worker_done: keep --body to the required three-sentence executive summary and pass --report-path ${reportPath}.`;
 }
 
 function fixerPrompt(
@@ -11235,6 +11290,7 @@ export class GitShell implements GitOperations {
     const root = await canonicalPath(
       (await this.#git(["rev-parse", "--show-toplevel"])).stdout.trim(),
     );
+    ensureRunStateGitExcluded(root);
     await this.assertClean();
     const branch = (
       await this.#git(["branch", "--show-current"])

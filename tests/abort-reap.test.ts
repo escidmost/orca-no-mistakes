@@ -1028,5 +1028,45 @@ test("prune --stranded retains a gate whose commits cannot be anchored", async (
   }
 });
 
+
+test("recording the gate marker git-excludes run state in the origin worktree", async () => {
+  const seeded = await seedRun("onm-marker-exclude-", { work: false });
+  const restore = withEnv({
+    ORCA_NO_MISTAKES_HOME: path.join(seeded.temp, "home"),
+  });
+  const ledger = new DomainLedger(legacyLedgerPath());
+  const excludePath = path.join(seeded.origin, ".git", "info", "exclude");
+  try {
+    for (let round = 0; round < 2; round += 1) {
+      await installAbortReaping({
+        gate: seeded.gate,
+        ledger,
+        orca: new ReapOrca(),
+        orcaCommand: seeded.fakeOrca,
+        originWorktree: seeded.origin,
+        pid: process.pid,
+        terminalHandle: "term-coordinator",
+      });
+    }
+    assert.ok(existsSync(markerPath(seeded.origin, seeded.gate.id)));
+    assert.equal(
+      git(seeded.origin, "status", "--porcelain"),
+      "",
+      "the run's own marker must not dirty the origin worktree",
+    );
+    const exclude = await readFile(excludePath, "utf8");
+    assert.deepEqual(
+      exclude.split("\n").filter((line) => line.startsWith(".orca/")),
+      [".orca/no-mistakes/", ".orca/workspaces/"],
+      "exclude entries are added once, not per marker refresh",
+    );
+  } finally {
+    await installAbortReaping({ pid: process.pid });
+    ledger.close();
+    restore();
+    await rm(seeded.temp, { force: true, recursive: true });
+  }
+});
+
 test.after(() => console.log("ABORT REAP CANCELLATION PASSED"));
 }
