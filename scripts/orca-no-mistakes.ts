@@ -1095,7 +1095,7 @@ function ensureRunStateGitExcluded(worktree: string): void {
       return null;
     }
   };
-  const commonDir = gitCheck(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+  const commonDir = gitCheck(["rev-parse", "--git-common-dir"]);
   if (!commonDir) return; // not a git checkout; the marker must still land
   const missing = RUN_STATE_GIT_EXCLUDES.filter(
     (pattern) => gitCheck(["check-ignore", "-q", `${pattern}probe`]) === null,
@@ -1104,7 +1104,7 @@ function ensureRunStateGitExcluded(worktree: string): void {
     runStateGitExcludedWorktrees.add(worktree);
     return;
   }
-  const excludePath = path.join(commonDir, "info", "exclude");
+  const excludePath = path.join(path.resolve(worktree, commonDir), "info", "exclude");
   try {
     mkdirSync(path.dirname(excludePath), { recursive: true });
     appendFileSync(excludePath, `\n${missing.join("\n")}\n`);
@@ -5021,6 +5021,7 @@ export type WorkerLaunchOutcome = {
 
 // ponytail: two repair retries; repeated invalid or unreadable output remains a hard failure.
 const WORKER_REPORT_RETRY_LIMIT = 2;
+const WORKER_REPORT_ERROR_LIMIT_CHARS = 2_000;
 
 class WorkerReportValidationError extends Error {}
 
@@ -5043,11 +5044,18 @@ function repairWorkerReportLaunch(
   if (delivery === "orca" && !launch.reportPath?.trim()) {
     throw new Error(`${launch.stage} worker report repair requires a report path`);
   }
+  const reportError = fenceUntrusted(
+    error instanceof Error ? error.message : String(error),
+  ).slice(0, WORKER_REPORT_ERROR_LIMIT_CHARS);
   return {
     ...launch,
     prompt: `${launch.prompt}
 
-REPORT REPAIR: ${error instanceof Error ? error.message : String(error)}. Retry the task and follow the delivery contract exactly.
+REPORT REPAIR: The previous report was rejected:
+<untrusted_report_error>
+${reportError}
+</untrusted_report_error>
+Retry the task and follow the delivery contract exactly.
 ${deliveryInstruction(delivery, launch.reportPath ?? "", shape, launch.stage, launch.role)}`,
     ...(launch.retainedWorktreeId || launch.terminal
       ? {
@@ -6635,7 +6643,7 @@ Rules:
 
 function fenceUntrusted(content: string): string {
   return content.replace(
-    /<(?=\/?untrusted_(?:branch_diff|instruction|finding_decisions|review_rounds)>)/g,
+    /<(?=\/?untrusted_(?:branch_diff|instruction|finding_decisions|report_error|review_rounds)>)/g,
     "\\u003c",
   );
 }
