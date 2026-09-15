@@ -1081,8 +1081,10 @@ async function stopAbortWorkers(
 // must be git-excluded before the first write. The repository's private
 // exclude file keeps this out of tracked .gitignore files.
 const RUN_STATE_GIT_EXCLUDES = [".orca/no-mistakes/", ".orca/workspaces/"];
+const runStateGitExcludedWorktrees = new Set<string>();
 
 async function ensureRunStateGitExcluded(worktree: string): Promise<void> {
+  if (runStateGitExcludedWorktrees.has(worktree)) return;
   const gitCheck = (args: string[]): string | null => {
     try {
       return execFileSync("git", ["-C", worktree, ...args], {
@@ -1098,7 +1100,10 @@ async function ensureRunStateGitExcluded(worktree: string): Promise<void> {
   const missing = RUN_STATE_GIT_EXCLUDES.filter(
     (pattern) => gitCheck(["check-ignore", "-q", `${pattern}probe`]) === null,
   );
-  if (missing.length === 0) return;
+  if (missing.length === 0) {
+    runStateGitExcludedWorktrees.add(worktree);
+    return;
+  }
   const excludePath = path.join(commonDir, "info", "exclude");
   await mkdir(path.dirname(excludePath), { recursive: true });
   let existing = "";
@@ -1107,6 +1112,7 @@ async function ensureRunStateGitExcluded(worktree: string): Promise<void> {
   } catch {}
   const separator = existing && !existing.endsWith("\n") ? "\n" : "";
   await writeFile(excludePath, `${existing}${separator}${missing.join("\n")}\n`);
+  runStateGitExcludedWorktrees.add(worktree);
 }
 
 function gateMarkerPath(originWorktree: string, gateId: string): string {
