@@ -34,7 +34,7 @@ orca-no-mistakes init --repo /path/to/repo
 orca-no-mistakes run --repo /path/to/repo --intent "Add X without changing Y"
 ```
 
-Initialization persists the GitHub publication route for every worktree and branch in that repository. The checkout must have an `origin` remote and be on a named branch other than the detected default branch. The runner rebases onto the default branch unless you pass `--base <branch>`.
+Initialization persists the GitHub publication route for every worktree and branch in that repository. Before checking cleanliness or writing run markers, the runner appends unignored `.orca/no-mistakes/` and `.orca/workspaces/` patterns to the repository's private `.git/info/exclude` when possible; tracked `.gitignore` files remain unchanged. The checkout must have an `origin` remote and be on a named branch other than the detected default branch. The runner rebases onto the default branch unless you pass `--base <branch>`.
 
 A newly admitted run starts a detached coordinator in an Orca terminal and returns its handle immediately. Handle its notifications and decisions in the originating session; command return and PR readiness do not mean the pipeline has completed. An identical submission already being handled returns its admission identity instead of starting another coordinator.
 

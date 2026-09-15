@@ -21,7 +21,7 @@ Before deleting a completed run, `prune` deletes every `submission_admissions` r
 
 Stranded recovery also handles direct attached Force stops. Their marker records the exact HEAD and owned worker state; recovery preserves that commit, reaps those workers, atomically settles an in-progress run cancelled and releases its lease, then removes only the marker, never the operator checkout or branch. If the run already reached `passed` or `failed`, recovery verifies the recorded commit is already preserved and leaves that terminal status unchanged.
 
-New runs require an explicit single-line `--intent`; `--resume <run-id>` instead reopens a failed run with its stored intent. The runner requires a clean, committed, named feature branch, rejects the detected default branch, verifies an `origin` remote, and optionally checks an expected `--head` SHA. It fetches and rebases onto the selected base before validation continues.
+New runs require an explicit single-line `--intent`; `--resume <run-id>` instead reopens a failed run with its stored intent. The runner requires a clean, committed, named feature branch, rejects the detected default branch, verifies an `origin` remote, and optionally checks an expected `--head` SHA. The [Run guide](../README.md#run) documents the private Git-exclusion update for marker state. It fetches and rebases onto the selected base before validation continues.
 
 ## Domain ledger
 
