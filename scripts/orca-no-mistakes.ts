@@ -6886,7 +6886,7 @@ ${shape}
 Pipe that object to this command instead of writing the report directly:
 ${shellQuote(frozenCoordinatorExecutable(reportPath))} report --stage ${stage} --role ${role} --out ${shellQuote(reportPath)}
 
-The command rejects invalid values and writes the report only after validation. Correct any reported error before continuing. Then report exactly once with worker_done: keep --body to the required three-sentence executive summary and pass --report-path ${reportPath}.`;
+The command rejects invalid values and writes the report only after validation. Correct any reported error before continuing. This prompt is the complete report contract: do not read the coordinator program, the run log, the manifest, or other run workspaces to work out the schema. Then report exactly once with worker_done: keep --body to the required three-sentence executive summary and pass --report-path ${reportPath}.`;
 }
 
 function fixerPrompt(
