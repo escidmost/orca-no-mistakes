@@ -1083,7 +1083,7 @@ async function stopAbortWorkers(
 const RUN_STATE_GIT_EXCLUDES = [".orca/no-mistakes/", ".orca/workspaces/"];
 const runStateGitExcludedWorktrees = new Set<string>();
 
-async function ensureRunStateGitExcluded(worktree: string): Promise<void> {
+function ensureRunStateGitExcluded(worktree: string): void {
   if (runStateGitExcludedWorktrees.has(worktree)) return;
   const gitCheck = (args: string[]): string | null => {
     try {
@@ -1105,13 +1105,8 @@ async function ensureRunStateGitExcluded(worktree: string): Promise<void> {
     return;
   }
   const excludePath = path.join(commonDir, "info", "exclude");
-  await mkdir(path.dirname(excludePath), { recursive: true });
-  let existing = "";
-  try {
-    existing = await readFile(excludePath, "utf8");
-  } catch {}
-  const separator = existing && !existing.endsWith("\n") ? "\n" : "";
-  await writeFile(excludePath, `${existing}${separator}${missing.join("\n")}\n`);
+  mkdirSync(path.dirname(excludePath), { recursive: true });
+  appendFileSync(excludePath, `\n${missing.join("\n")}\n`);
   runStateGitExcludedWorktrees.add(worktree);
 }
 
@@ -1253,7 +1248,6 @@ async function refreshGateMarker(): Promise<void> {
   const { gate, originWorktree } = abortReap;
   if (!gate || !originWorktree) return;
   const markerPath = gateMarkerPath(originWorktree, gateMarkerId(gate));
-  await ensureRunStateGitExcluded(originWorktree);
   let createdAt = new Date().toISOString();
   let terminalHandle = abortReap.terminalHandle;
   try {
@@ -1303,6 +1297,7 @@ async function writeMarker(
     | ConfiguredLauncherMarker
     | OrcaLauncherMarker,
 ): Promise<void> {
+  ensureRunStateGitExcluded(marker.originWorktree);
   const temporaryPath = `${markerPath}.${randomUUID()}.tmp`;
   await mkdir(path.dirname(markerPath), { recursive: true });
   try {
@@ -1400,6 +1395,7 @@ function writeMarkerSync(
   markerPath: string,
   marker: DirectRunMarker | GateRunMarker,
 ): void {
+  ensureRunStateGitExcluded(marker.originWorktree);
   const directory = path.dirname(markerPath);
   const temporaryPath = `${markerPath}.${randomUUID()}.tmp`;
   mkdirSync(directory, { recursive: true });
@@ -5034,7 +5030,10 @@ function isRepairableWorkerReportError(error: unknown): boolean {
   );
 }
 
-function repairWorkerReportLaunch(launch: WorkerLaunch): WorkerLaunch {
+function repairWorkerReportLaunch(
+  launch: WorkerLaunch,
+  error: unknown,
+): WorkerLaunch {
   const shape = `{"findings":[...],"summary":"...","tested":[...],"artifacts":[...]${launch.stage === "test" && launch.role === "reviewer" ? ',"liveValidation":{"verdict":"go|no-go|inconclusive|no-surface","reason":"justification","scenarios":[{"name":"scenario","result":"pass|fail|untested","live":true,"evidence":["observed output"],"limitation":""}]}' : ''}}`;
   const delivery = deliveryChannel(launch.agent);
   if (delivery === "orca" && !launch.reportPath?.trim()) {
@@ -5044,7 +5043,7 @@ function repairWorkerReportLaunch(launch: WorkerLaunch): WorkerLaunch {
     ...launch,
     prompt: `${launch.prompt}
 
-REPORT REPAIR: the previous response did not produce a valid report. Retry the task and follow the delivery contract exactly.
+REPORT REPAIR: ${error instanceof Error ? error.message : String(error)}. Retry the task and follow the delivery contract exactly.
 ${deliveryInstruction(delivery, launch.reportPath ?? "", shape, launch.stage, launch.role)}`,
     ...(launch.retainedWorktreeId || launch.terminal
       ? {
@@ -5157,7 +5156,7 @@ export async function startWorkerWithFallback(
         const retryOutcome = await startWorkerWithFallback(
           orca,
           createTask,
-          [repairWorkerReportLaunch(launch)],
+          [repairWorkerReportLaunch(launch, error)],
           undefined,
           fence,
           onReportRetry,
@@ -5413,7 +5412,7 @@ async function runReviewer(
           throw error;
         }
         reportRetry += 1;
-        retryLaunches = [repairWorkerReportLaunch(outcome.launch)];
+        retryLaunches = [repairWorkerReportLaunch(outcome.launch, error)];
         continue;
       }
       if (worker.failedOutcome === true) {
@@ -5724,7 +5723,7 @@ async function runFixer(
         reportRetry += 1;
         sessionToReuse = undefined;
         retainedSession = undefined;
-        retryLaunches = [repairWorkerReportLaunch(outcome.launch)];
+        retryLaunches = [repairWorkerReportLaunch(outcome.launch, error)];
         continue;
       }
       if (!worktreePath) {
