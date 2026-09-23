@@ -1,6 +1,6 @@
 # orca-no-mistakes
 
-An Orca-native pipeline that reviews committed changes, runs validation in isolated worktrees, and publishes the validated candidate to GitHub.
+An Orca-native pipeline that reviews committed changes, runs validation in isolated worktrees, and publishes the validated candidate to GitHub. Based on [no-mistakes](https://github.com/kunchenguid/no-mistakes) by [kunchenguid](https://github.com/kunchenguid)
 
 ```text
 intent -> rebase -> review -> test -> document -> lint -> push -> pr -> ci
